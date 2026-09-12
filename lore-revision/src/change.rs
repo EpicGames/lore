@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
 
 use bitflags::bitflags;
 use lore_error_set::prelude::*;
@@ -10,8 +9,7 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::lore::Address;
 use crate::lore::RepositoryId;
 use crate::node::*;
-use crate::repository::RepositoryContext;
-use crate::state::State;
+use crate::state::NodeMapping;
 use crate::state::StateError;
 use crate::util::path::RelativePath;
 
@@ -124,52 +122,56 @@ impl Flags {
     }
 }
 
+/// One side of a change: the node it names, mapped to the path it stands at, with what that node
+/// carries.
 #[derive(Clone, Debug)]
 pub struct NodeChangeState {
-    pub repository: Arc<RepositoryContext>,
-    pub state: Arc<State>,
-    pub node: NodeID,
+    /// Where this side stands, which every change carries on both of its sides.
+    ///
+    /// The mapping's path is set even where it holds no node: the `from` of an add and the `to` of
+    /// a delete stand at the path the change is made at and hold nothing there. A move records its
+    /// source here, so an empty path on the `from` of a move is a source the walk could not spell.
+    pub mapping: NodeMapping,
     pub flags: NodeFlags,
     pub address: Address,
 }
 
 impl NodeChangeState {
-    pub fn invalid(&self) -> Self {
+    /// The side a change does not have, standing at `path` and holding no node there: an add has
+    /// no `from` and a delete no `to`. `path` is the change's own, which is not this side's own
+    /// path where it is derived from an ancestor.
+    pub fn invalid(&self, path: RelativePath) -> Self {
         NodeChangeState {
-            repository: self.repository.clone(),
-            state: self.state.clone(),
-            node: INVALID_NODE,
+            mapping: NodeMapping {
+                repository: self.mapping.repository.clone(),
+                state: self.mapping.state.clone(),
+                path,
+                node: INVALID_NODE,
+            },
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         }
     }
 
-    /// Create a `NodeChangeState` for a child node, inheriting repository and state from parent.
-    pub fn from_child(&self, child_id: NodeID, child_node: &Node) -> Self {
+    /// The child `path` names, in the tree this side walks.
+    pub fn from_child(&self, child_id: NodeID, child_node: &Node, path: RelativePath) -> Self {
         NodeChangeState {
-            repository: self.repository.clone(),
-            state: self.state.clone(),
-            node: child_id,
+            mapping: NodeMapping {
+                repository: self.mapping.repository.clone(),
+                state: self.mapping.state.clone(),
+                path,
+                node: child_id,
+            },
             flags: NodeFlags::from_bits_retain(child_node.flags),
             address: child_node.address,
         }
     }
 
-    pub async fn subtree(&self, node_id: NodeID) -> Self {
-        let Ok(node) = self.state.node(self.repository.clone(), node_id).await else {
-            return self.invalid();
-        };
-        NodeChangeState {
-            repository: self.repository.clone(),
-            state: self.state.clone(),
-            node: node_id,
-            flags: NodeFlags::from_bits_retain(node.flags),
-            address: node.address,
-        }
-    }
-
     pub async fn get_node(&self) -> Result<Node, StateError> {
-        self.state.node(self.repository.clone(), self.node).await
+        self.mapping
+            .state
+            .node(self.mapping.repository.clone(), self.mapping.node)
+            .await
     }
 }
 
@@ -179,17 +181,25 @@ pub struct NodeChange {
     pub flags: Flags,
     pub from: NodeChangeState,
     pub to: NodeChangeState,
-    /// Path of the node, relative to the root of the working tree.
-    pub path: RelativePath,
-    /// Path the node was at before a move, relative to the root of the working tree. `None` for
-    /// a change that is not a move, and for a move whose old path the walk cannot spell.
-    pub from_path: Option<RelativePath>,
-    /// What a filesystem diff measured at `path`, so a consumer does not re-stat
-    /// it. `None` for a change between two revisions, which consulted no filesystem.
+    /// What a filesystem diff measured at [`Self::path`], so a consumer does not re-stat it.
+    /// `None` for a change between two revisions, which consulted no filesystem.
     pub observed: Option<FileInfo>,
 }
 
 impl NodeChange {
+    /// The path the change stands at, as a relative path from the top-level repository instance
+    /// root. A move stands at its destination and records its source in [`Self::move_source`].
+    pub fn path(&self) -> &RelativePath {
+        &self.resolved_side().mapping.path
+    }
+
+    /// The path a move came from, which its `from` side stands at. `None` where the change is not
+    /// a move, and where it is one whose source the walk could not spell.
+    pub fn move_source(&self) -> Option<&RelativePath> {
+        (self.action == FileAction::Move && !self.from.mapping.path.is_empty())
+            .then_some(&self.from.mapping.path)
+    }
+
     /// The side the change resolves to: `from` for a delete, `to` otherwise.
     pub fn resolved_side(&self) -> &NodeChangeState {
         match self.action {
@@ -206,7 +216,7 @@ impl NodeChange {
         if side.flags.contains(NodeFlags::Link) {
             side.address.context.into()
         } else {
-            side.repository.id
+            side.mapping.repository.id
         }
     }
 
@@ -217,11 +227,12 @@ impl NodeChange {
         if !side.flags.contains(NodeFlags::Link) {
             return false;
         }
-        side.state
+        side.mapping
+            .state
             .link_find(
-                side.repository.clone(),
+                side.mapping.repository.clone(),
                 side.address.context.into(),
-                side.node,
+                side.mapping.node,
             )
             .await
             .is_ok_and(|link_reference| link_reference.is_tracking())
@@ -238,12 +249,6 @@ impl NodeChange {
             }
         } else if self.action == FileAction::Add || self.action == FileAction::Copy {
             self.action = FileAction::Delete;
-        } else if self.action == FileAction::Move
-            && let Some(from_path) = self.from_path.take()
-        {
-            let path = self.path.clone();
-            self.path = from_path;
-            self.from_path = Some(path);
         }
 
         // Reverse nodes
@@ -258,23 +263,25 @@ impl NodeChange {
     }
 
     pub async fn is_directory(&self) -> Result<bool, StateError> {
-        if self.to.node.is_valid_node_id() {
-            let iblock = NodeBlock::index(self.to.node);
-            let inode = Node::index(self.to.node);
+        if self.to.mapping.node.is_valid_node_id() {
+            let iblock = NodeBlock::index(self.to.mapping.node);
+            let inode = Node::index(self.to.mapping.node);
             let block = self
                 .to
+                .mapping
                 .state
-                .block(self.to.repository.clone(), iblock)
+                .block(self.to.mapping.repository.clone(), iblock)
                 .await?;
             let noderef = block.node(inode);
             Ok(noderef.is_directory())
         } else {
-            let iblock = NodeBlock::index(self.from.node);
-            let inode = Node::index(self.from.node);
+            let iblock = NodeBlock::index(self.from.mapping.node);
+            let inode = Node::index(self.from.mapping.node);
             let block = self
                 .from
+                .mapping
                 .state
-                .block(self.from.repository.clone(), iblock)
+                .block(self.from.mapping.repository.clone(), iblock)
                 .await?;
             let noderef = block.node(inode);
             Ok(noderef.is_directory())
@@ -304,12 +311,12 @@ pub async fn is_conflict(
         if path_equal {
             return Ok(true);
         }
-        if first.path.len() <= second.path.len()
+        if first.path().len() <= second.path().len()
             && (!is_first_directory || first.action == FileAction::Delete)
         {
             return Ok(true);
         }
-        if second.path.len() <= first.path.len()
+        if second.path().len() <= first.path().len()
             && (!is_second_directory || second.action == FileAction::Delete)
         {
             return Ok(true);
@@ -329,11 +336,11 @@ pub async fn is_conflict(
 }
 
 pub fn sort_by_path(changes: &mut [NodeChange]) {
-    changes.sort_unstable_by(|lhs, rhs| lhs.path.as_str().cmp(rhs.path.as_str()));
+    changes.sort_unstable_by(|lhs, rhs| lhs.path().as_str().cmp(rhs.path().as_str()));
 }
 
 pub fn sort_conflict_by_path(conflicts: &mut [(NodeChange, NodeChange)]) {
-    conflicts.sort_unstable_by(|lhs, rhs| lhs.1.path.as_str().cmp(rhs.1.path.as_str()));
+    conflicts.sort_unstable_by(|lhs, rhs| lhs.1.path().as_str().cmp(rhs.1.path().as_str()));
 }
 
 pub fn reverse(changes: &mut [NodeChange]) {

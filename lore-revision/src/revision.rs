@@ -229,11 +229,11 @@ fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
         return None;
     }
     for change in source_changes.iter() {
-        if let Err(err) = filter.view.add_inclusion(change.path.as_str()) {
+        if let Err(err) = filter.view.add_inclusion(change.path().as_str()) {
             lore_warn!("Failed to add target filter re-inclusion: {err}");
             return None;
         }
-        if let Some(from_path) = change.from_path.as_ref()
+        if let Some(from_path) = change.move_source()
             && let Err(err) = filter.view.add_inclusion(from_path.as_str())
         {
             lore_warn!("Failed to add target filter re-inclusion of from path: {err}");
@@ -498,7 +498,8 @@ pub async fn diff3_with_source_cap(
         if is_file_id_only_churn {
             continue;
         }
-        match source_changes.binary_search_by(|c| c.path.as_str().cmp(target_change.path.as_str()))
+        match source_changes
+            .binary_search_by(|c| c.path().as_str().cmp(target_change.path().as_str()))
         {
             Ok(idx) => {
                 source_consumed[idx] = true;
@@ -510,7 +511,7 @@ pub async fn diff3_with_source_cap(
                     joined_conflicts.push((sc, target_change));
                 } else if include_same
                     && (joined_changes.is_empty()
-                        || joined_changes[joined_changes.len() - 1].path != source_change.path)
+                        || joined_changes[joined_changes.len() - 1].path() != source_change.path())
                 {
                     joined_changes.push(source_change.clone());
                 }
@@ -544,7 +545,7 @@ pub async fn diff3_with_source_cap(
         joined_changes.retain(|item| {
             if item.from.flags.is_directory() && item.action == FileAction::Delete {
                 for (from, _to) in joined_conflicts.iter() {
-                    if from.path.overlaps(&item.path) {
+                    if from.path().overlaps(item.path()) {
                         return false;
                     }
                 }
@@ -715,10 +716,11 @@ fn apply_move_from_path_pass(
     let mut from_path_absorbed: Vec<usize> = Vec::new();
     for (outer_index, change_move) in changes.iter().enumerate() {
         if change_move.action == FileAction::Move
-            && let Some(ref from_path) = change_move.from_path
+            && let Some(from_path) = change_move.move_source()
         {
             for (inner_index, change_match) in changes.iter().enumerate() {
-                if outer_index != inner_index && change_match.path.as_str() == from_path.as_str() {
+                if outer_index != inner_index && change_match.path().as_str() == from_path.as_str()
+                {
                     if change_match.action == FileAction::Delete {
                         from_path_conflict_pairs.push((outer_index, inner_index));
                     } else if change_move.from.address.hash == change_move.to.address.hash {
@@ -804,13 +806,13 @@ async fn is_last_change_merged(
 ) -> Result<bool, StateError> {
     lore_debug!(
         "{} find last modified source revision",
-        source_conflict.path.as_str()
+        source_conflict.path().as_str()
     );
     let (last_source_modified_revision, last_source_modified_revision_number) =
         find_last_modified_revision(&source_conflict, state_branch_point.clone()).await?;
     lore_debug!(
         "{} last modified source {} revision {} -> {}",
-        source_conflict.path.as_str(),
+        source_conflict.path().as_str(),
         source_branch,
         last_source_modified_revision,
         last_source_modified_revision_number,
@@ -818,7 +820,7 @@ async fn is_last_change_merged(
 
     lore_debug!(
         "{} find last merged source {} -> target {} revision",
-        source_conflict.path.as_str(),
+        source_conflict.path().as_str(),
         source_branch,
         target_branch,
     );
@@ -833,7 +835,7 @@ async fn is_last_change_merged(
     {
         lore_debug!(
             "{} last merged from source {} into target {} revision {} -> {}",
-            source_conflict.path.as_str(),
+            source_conflict.path().as_str(),
             source_branch,
             target_branch,
             last_merged_from_source_revision,
@@ -843,7 +845,7 @@ async fn is_last_change_merged(
         if last_source_modified_revision_number <= last_merged_from_source_revision_number {
             lore_debug!(
                 "Final change check for {} is MERGED - last source merged revision {}, last source modified revision {}",
-                source_conflict.path.as_str(),
+                source_conflict.path().as_str(),
                 last_merged_from_source_revision_number,
                 last_source_modified_revision_number,
             );
@@ -851,7 +853,7 @@ async fn is_last_change_merged(
         } else {
             lore_debug!(
                 "Final change merge check for {} is UNMERGED - last source merged revision {}, last source modified revision {}",
-                source_conflict.path.as_str(),
+                source_conflict.path().as_str(),
                 last_merged_from_source_revision_number,
                 last_source_modified_revision_number,
             );
@@ -860,7 +862,7 @@ async fn is_last_change_merged(
     } else {
         lore_debug!(
             "Final change merge check for {} is UNMERGED - no merged revision found",
-            source_conflict.path.as_str()
+            source_conflict.path().as_str()
         );
         Ok(false)
     }
@@ -870,30 +872,30 @@ async fn find_last_modified_revision(
     change: &NodeChange,
     state_branch_point: Arc<State>,
 ) -> Result<(Hash, u64), StateError> {
-    if !change.to.node.is_valid_node_id() {
+    if !change.to.mapping.node.is_valid_node_id() {
         // File was deleted from the target state, need to walk history to find it
         // TODO(mjansson): Figure out a better way to store this metadata around file deletions
         lore_debug!("Find last modified revision without to state, iterate revisions");
 
-        let repository = change.from.repository.clone();
-        let mut state_current = change.to.state.clone();
+        let repository = change.from.mapping.repository.clone();
+        let mut state_current = change.to.mapping.state.clone();
         let mut state_parent = state_current.clone();
         while state_current.revision_number() >= state_branch_point.revision_number() {
             if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path.as_str())
+                .find_node_link(repository.clone(), change.path().as_str())
                 .await
             {
                 // If the node was existing in the current state, it means it was deleted in the previous (parent) revision
                 lore_debug!(
                     "Found {} existing in revision {} - {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     state_current.revision(),
                     state_current.revision_number()
                 );
                 if node_link.is_valid() {
                     lore_debug!(
                         "Last modified {} in parent revision {} - {}",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_parent.revision(),
                         state_parent.revision_number()
                     );
@@ -912,7 +914,7 @@ async fn find_last_modified_revision(
 
         lore_debug!(
             "Did not find node {} last modified, using branch point revision {} - {}",
-            change.path.as_str(),
+            change.path().as_str(),
             state_branch_point.revision(),
             state_branch_point.revision_number()
         );
@@ -923,9 +925,9 @@ async fn find_last_modified_revision(
         ));
     };
 
-    let repository = change.to.repository.clone();
-    let state = change.to.state.clone();
-    let node_id = change.to.node;
+    let repository = change.to.mapping.repository.clone();
+    let state = change.to.mapping.state.clone();
+    let node_id = change.to.mapping.node;
 
     let mut last_modified_revision = state.revision();
     let mut last_modified_revision_number = state.revision_number();
@@ -934,14 +936,14 @@ async fn find_last_modified_revision(
     if let Ok(Some(_node_delta)) = state.node_delta(repository.clone(), node_id).await {
         lore_debug!(
             "{} found last modified revision {} -> {} (HEAD)",
-            change.path.as_str(),
+            change.path().as_str(),
             last_modified_revision,
             last_modified_revision_number
         );
     } else {
         lore_debug!(
             "{} not modified in HEAD, walk file history",
-            change.path.as_str()
+            change.path().as_str()
         );
         // Node was not modified in the target LATEST revision, find the
         // previous revision from file history block
@@ -950,7 +952,7 @@ async fn find_last_modified_revision(
             .await
         {
             let node = block.node(NodeFileMetadata::index(node_id));
-            lore_debug!("{} node history {:?}", change.path.as_str(), node);
+            lore_debug!("{} node history {:?}", change.path().as_str(), node);
             if let Ok(state_modified) =
                 state::State::deserialize(repository.clone(), node.revision[0]).await
             {
@@ -958,20 +960,20 @@ async fn find_last_modified_revision(
                 last_modified_revision_number = state_modified.revision_number();
                 lore_debug!(
                     "{} found last modified revision {} -> {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     last_modified_revision_number,
                     last_modified_revision
                 );
             } else {
                 lore_warn!(
                     "Failed to deserialize last modified state when searching history for {}",
-                    change.path.as_str()
+                    change.path().as_str()
                 );
             }
         } else {
             lore_warn!(
                 "Failed to deserialize file metadata block when searching history for {}",
-                change.path.as_str()
+                change.path().as_str()
             );
         }
     }
@@ -985,23 +987,23 @@ async fn find_last_merged_revision(
     target_branch: BranchId,
     state_branch_point: Arc<State>,
 ) -> Result<Option<(Hash, u64)>, StateError> {
-    let (state_start, node_current) = if change.to.node.is_valid_node_id() {
-        (change.to.state.clone(), change.to.node)
+    let (state_start, node_current) = if change.to.mapping.node.is_valid_node_id() {
+        (change.to.mapping.state.clone(), change.to.mapping.node)
     } else {
         // TODO(mjansson): Figure out a better way to store this metadata around file deletions
         lore_debug!("Find last merged revision without to state, iterate revisions");
 
-        let repository = change.to.repository.clone();
-        let mut state_current = change.to.state.clone();
+        let repository = change.to.mapping.repository.clone();
+        let mut state_current = change.to.mapping.state.clone();
         let mut state_parent = state_current.clone();
         loop {
             if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path.as_str())
+                .find_node_link(repository.clone(), change.path().as_str())
                 .await
             {
                 lore_debug!(
                     "Found {} existing in revision {} - {} for last merged",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     state_current.revision(),
                     state_current.revision_number()
                 );
@@ -1010,7 +1012,7 @@ async fn find_last_merged_revision(
                 if node_link.is_valid() {
                     lore_debug!(
                         "Using {} parent revision {} - {} as last merged start revision",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_parent.revision(),
                         state_parent.revision_number()
                     );
@@ -1021,14 +1023,14 @@ async fn find_last_merged_revision(
             if state_current.revision_number() <= state_branch_point.revision_number() {
                 lore_debug!(
                     "Did not find node {} last modified, no merged revision",
-                    change.path.as_str()
+                    change.path().as_str()
                 );
                 return Ok(None);
             }
 
             lore_debug!(
                 "Node {} not present in revision {} - {} for last merged start, move to parent",
-                change.path.as_str(),
+                change.path().as_str(),
                 state_current.revision(),
                 state_current.revision_number()
             );
@@ -1042,7 +1044,7 @@ async fn find_last_merged_revision(
     // Now walk the history for the file from the target branch LATEST revision and
     // see if we arrive on source branch along any merge, and if that target revision
     // is later than the last modified revision we identified from the source branch file history
-    let repository = change.to.repository.clone();
+    let repository = change.to.mapping.repository.clone();
     let mut state_current = state_start.clone();
     while state_current.revision_number() > state_branch_point.revision_number()
         && node_current.is_valid_node_id()
@@ -1058,7 +1060,7 @@ async fn find_last_merged_revision(
                 // to also catch merges that happen through other branches
                 lore_debug!(
                     "{} branch {} revision {} node {} history is a merge, {:?} check if other parent {} is from branch {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     target_branch,
                     node_current,
                     state_current.revision(),
@@ -1075,7 +1077,7 @@ async fn find_last_merged_revision(
                         if state_metadata.branch == source_branch {
                             lore_debug!(
                                 "{} revision merged from branch {} revision {} -> {}",
-                                change.path.as_str(),
+                                change.path().as_str(),
                                 source_branch,
                                 state_other.revision(),
                                 state_other.revision_number()
@@ -1087,7 +1089,7 @@ async fn find_last_merged_revision(
                         } else {
                             lore_debug!(
                                 "{} revision {} -> {} is NOT a merge from branch {}",
-                                change.path.as_str(),
+                                change.path().as_str(),
                                 state_other.revision(),
                                 state_other.revision_number(),
                                 source_branch,
@@ -1105,7 +1107,7 @@ async fn find_last_merged_revision(
             } else {
                 lore_debug!(
                     "{} revision {} node history {:?} is not a merge, continue search in branch node history {}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     state_current.revision_number(),
                     node,
                     node.revision[0]
@@ -1118,7 +1120,7 @@ async fn find_last_merged_revision(
                 if state_previous.revision_number() < state_branch_point.revision_number() {
                     lore_debug!(
                         "{} stop iterating revisions, reached revision {} < branch point modified revision {}",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_previous.revision_number(),
                         state_branch_point.revision_number()
                     );
@@ -1126,7 +1128,7 @@ async fn find_last_merged_revision(
                 } else {
                     lore_debug!(
                         "{} step to revision {} -> {}",
-                        change.path.as_str(),
+                        change.path().as_str(),
                         state_previous.revision_number(),
                         state_previous.revision()
                     );

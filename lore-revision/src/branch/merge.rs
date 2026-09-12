@@ -19,7 +19,6 @@ use crate::branch::push::push_query;
 use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
-use crate::change::NodeChangeState;
 use crate::commit;
 use crate::commit::CommitOptions;
 use crate::errors::*;
@@ -81,6 +80,7 @@ use crate::stage;
 use crate::stage::StageError;
 use crate::state;
 use crate::state::LinkMergeEntry;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util::path::RelativePath;
@@ -1024,31 +1024,32 @@ struct PendingConflictRealize {
     context: ConflictRealizeContext,
 }
 
-/// Where `side`'s node is materialized under `mount_path`, or `None` where the link exposes no
+/// Where `mapping`'s node is materialized under `mount_path`, or `None` where the link exposes no
 /// subtree holding it.
 ///
-/// `source_path` is resolved against `side`'s own revision: each revision of the linked
+/// `source_path` is resolved against `mapping`'s own revision: each revision of the linked
 /// repository numbers its nodes as it pleases, so the subtree the link exposes is a different
 /// node in each.
 async fn mounted_node_path(
-    side: &NodeChangeState,
+    mapping: &NodeMapping,
     mount_path: &RelativePath,
     source_path: &RelativePath,
 ) -> Option<RelativePath> {
     let subtree_node = if source_path.is_empty() {
         ROOT_NODE
     } else {
-        side.state
-            .find_node_link(side.repository.clone(), source_path.as_str())
+        mapping
+            .state
+            .find_node_link(mapping.repository.clone(), source_path.as_str())
             .await
             .ok()
             .filter(NodeLink::is_valid)?
             .node
     };
 
-    let below = side
+    let below = mapping
         .state
-        .node_path_below(side.repository.clone(), side.node, subtree_node)
+        .node_path_below(mapping.repository.clone(), mapping.node, subtree_node)
         .await
         .ok()??;
     Some(mount_path.join(below.as_str()))
@@ -1061,25 +1062,36 @@ async fn conflict_mount_path(
     mount_path: &RelativePath,
     source_path: &RelativePath,
 ) -> Option<RelativePath> {
-    let side = if change.to.node.is_valid_or_root_node_id() {
+    let side = if change.to.mapping.node.is_valid_or_root_node_id() {
         &change.to
     } else {
         &change.from
     };
-    mounted_node_path(side, mount_path, source_path).await
+    mounted_node_path(&side.mapping, mount_path, source_path).await
 }
 
-/// Where the source of a change's move is materialized under `mount_path`, for a change that
-/// records one.
+/// `change` with both its sides spelled from `mount_path`, or `None` where the link exposes
+/// nothing holding it.
 ///
-/// A move's source is where its node was, which is the node the pre-merge side holds.
-async fn conflict_mount_from_path(
+/// A move stands at two paths, so its source is re-derived from the node the pre-merge side
+/// holds; one the link does not expose leaves that side empty, as a source that cannot be
+/// spelled. Every other change stands at one path, which both sides take.
+async fn mount_conflict_change(
     change: &NodeChange,
     mount_path: &RelativePath,
     source_path: &RelativePath,
-) -> Option<RelativePath> {
-    change.from_path.as_ref()?;
-    mounted_node_path(&change.from, mount_path, source_path).await
+) -> Option<NodeChange> {
+    let mounted = conflict_mount_path(change, mount_path, source_path).await?;
+    let mut change = change.clone();
+    if change.action == FileAction::Move {
+        change.from.mapping.path = mounted_node_path(&change.from.mapping, mount_path, source_path)
+            .await
+            .unwrap_or_default();
+    } else {
+        change.from.mapping.path = mounted.clone();
+    }
+    change.to.mapping.path = mounted;
+    Some(change)
 }
 
 /// The conflicts a link's merge produced, spelled from the mount they are materialized at.
@@ -1101,23 +1113,17 @@ async fn mount_conflicts(
     let mut mounted = Vec::with_capacity(pending.context.conflicts.len());
     for (from, to) in pending.context.conflicts.iter() {
         let (Some(from_mounted), Some(to_mounted)) = (
-            conflict_mount_path(from, mount_path, &source_path).await,
-            conflict_mount_path(to, mount_path, &source_path).await,
+            mount_conflict_change(from, mount_path, &source_path).await,
+            mount_conflict_change(to, mount_path, &source_path).await,
         ) else {
             lore_debug!(
                 "Conflict at {} is outside what the link at {mount_path} exposes, not realized",
-                to.path
+                to.path()
             );
             continue;
         };
 
-        let mut from = from.clone();
-        let mut to = to.clone();
-        from.from_path = conflict_mount_from_path(&from, mount_path, &source_path).await;
-        to.from_path = conflict_mount_from_path(&to, mount_path, &source_path).await;
-        from.path = from_mounted;
-        to.path = to_mounted;
-        mounted.push((from, to));
+        mounted.push((from_mounted, to_mounted));
     }
     Ok(mounted)
 }
@@ -1533,7 +1539,7 @@ async fn finalize_link_conflict_state(
         // same shape as for parent-level conflicts.
         for (from, _to) in conflicts.iter() {
             event::LoreEvent::BranchMergeConflictFile(LoreBranchMergeConflictFileEventData {
-                path: LoreString::from(from.path.as_str()),
+                path: LoreString::from(from.path().as_str()),
             })
             .send();
         }
@@ -1854,7 +1860,7 @@ async fn apply_graft_copy(
     change: &NodeChange,
 ) -> Result<usize, MergeError> {
     let link = state_staged
-        .find_node_link(repository.clone(), change.path.as_str())
+        .find_node_link(repository.clone(), change.path().as_str())
         .await
         .forward::<MergeError>("resolving graft path")?;
     if !link.is_valid_or_root() {
@@ -1872,9 +1878,9 @@ async fn apply_graft_copy(
         state::diff(
             repository.clone(),
             state_staged.clone(),
-            change.to.repository.clone(),
-            change.to.state.clone(),
-            Some(change.path.clone()),
+            change.to.mapping.repository.clone(),
+            change.to.mapping.state.clone(),
+            Some(change.path().clone()),
             None,
             &mut sink,
             FilterMode::empty(),
@@ -1893,13 +1899,17 @@ async fn apply_graft_copy(
         }
         let source_node = adopted
             .to
+            .mapping
             .state
-            .node(adopted.to.repository.clone(), adopted.to.node)
+            .node(
+                adopted.to.mapping.repository.clone(),
+                adopted.to.mapping.node,
+            )
             .await
             .forward::<MergeError>("resolving adopted node")?;
 
         let staged = state_staged
-            .find_node_link(repository.clone(), adopted.path.as_str())
+            .find_node_link(repository.clone(), adopted.path().as_str())
             .await
             .unwrap_or(NodeLink::invalid());
         let staged_id = if staged.is_valid_or_root() {
@@ -1917,7 +1927,7 @@ async fn apply_graft_copy(
             graft_add_node(
                 repository.clone(),
                 state_staged.clone(),
-                &adopted.path,
+                adopted.path(),
                 &source_node,
             )
             .await?
@@ -1926,9 +1936,9 @@ async fn apply_graft_copy(
         graft_copy_file_metadata(
             repository.clone(),
             state_staged.clone(),
-            adopted.to.repository.clone(),
-            adopted.to.state.clone(),
-            adopted.to.node,
+            adopted.to.mapping.repository.clone(),
+            adopted.to.mapping.state.clone(),
+            adopted.to.mapping.node,
             staged_id,
         )
         .await?;
@@ -1940,7 +1950,7 @@ async fn apply_graft_copy(
             continue;
         }
         let staged = state_staged
-            .find_node_link(repository.clone(), adopted.path.as_str())
+            .find_node_link(repository.clone(), adopted.path().as_str())
             .await
             .unwrap_or(NodeLink::invalid());
         if !staged.is_valid_or_root() {
@@ -2224,7 +2234,8 @@ pub async fn apply_diff(
     // `stage_link_pin` handles pin + filesystem updates in the parent. So
     // sub-link changes here are redundant — filter them out before verify.
     if !repository.is_link() {
-        diff.changes.retain(|c| c.to.repository.id == repository.id);
+        diff.changes
+            .retain(|c| c.to.mapping.repository.id == repository.id);
         // Drop cross-link conflicts on non-link parents too. For
         // `MergeScope::MainOnly` (`--ignore-links`) we never visit the link
         // contexts, so realizing those conflicts at the parent mount path
@@ -2236,7 +2247,8 @@ pub async fn apply_diff(
         // at this layer. Either way the parent diff path is the wrong place
         // to realize these.
         diff.conflicts.retain(|(from, to)| {
-            from.to.repository.id == repository.id && to.to.repository.id == repository.id
+            from.to.mapping.repository.id == repository.id
+                && to.to.mapping.repository.id == repository.id
         });
     }
 
@@ -2576,7 +2588,7 @@ pub async fn emit_conflict_events(
 ) {
     for conflict in conflicts.iter() {
         if let Ok(node) = state_staged
-            .find_node(repository.clone(), conflict.0.path.as_str())
+            .find_node(repository.clone(), conflict.0.path().as_str())
             .await
             && (!node.is_staged_merge_conflict() || node.is_staged_merge_resolved())
         {
@@ -2588,20 +2600,20 @@ pub async fn emit_conflict_events(
             MergeType::CherryPick => {
                 event::LoreEvent::CherryPickConflictFile(
                     crate::revision::cherry_pick::LoreCherryPickConflictFileEventData {
-                        path: conflict.0.path.clone().into(),
+                        path: conflict.0.path().clone().into(),
                     },
                 )
                 .send();
             }
             MergeType::BranchMerge => {
                 event::LoreEvent::BranchMergeConflictFile(LoreBranchMergeConflictFileEventData {
-                    path: conflict.0.path.clone().into(),
+                    path: conflict.0.path().clone().into(),
                 })
                 .send();
             }
             MergeType::Revert => {
                 event::LoreEvent::RevertConflictFile(LoreRevertConflictFileEventData {
-                    path: conflict.0.path.clone().into(),
+                    path: conflict.0.path().clone().into(),
                 })
                 .send();
             }
@@ -3003,7 +3015,7 @@ pub async fn merge_abort(
     // Clean up theirs/base files
     for change in changes.iter() {
         sync::unlink_merge_mine_theirs_base(
-            change.path.to_absolute_path(repository.require_path()?),
+            change.path().to_absolute_path(repository.require_path()?),
         )
         .await;
     }
@@ -3127,7 +3139,7 @@ pub async fn apply_restart_diff(
         .changes
         .iter()
         .filter_map(|change| {
-            if relative_paths.contains(&change.path) {
+            if relative_paths.contains(change.path()) {
                 Some(change.clone())
             } else {
                 None
@@ -3138,8 +3150,8 @@ pub async fn apply_restart_diff(
         .conflicts
         .iter()
         .filter_map(|change_tuple| {
-            if relative_paths.contains(&change_tuple.0.path)
-                || relative_paths.contains(&change_tuple.1.path)
+            if relative_paths.contains(change_tuple.0.path())
+                || relative_paths.contains(change_tuple.1.path())
             {
                 Some(change_tuple.clone())
             } else {
@@ -3875,7 +3887,7 @@ async fn merge_metadata_task(
     let metadata_hash;
 
     if let Ok(node_link) = state_source
-        .find_node_link(repository.clone(), change.path.as_str())
+        .find_node_link(repository.clone(), change.path().as_str())
         .await
         && node_link.is_valid()
     {
@@ -3895,13 +3907,13 @@ async fn merge_metadata_task(
     } else {
         lore_debug!(
             "Merge metadata skipped due to missing 'source' node for {}",
-            change.path
+            change.path()
         );
         return Ok(());
     }
 
     if let Ok(node_link) = state_staged
-        .find_node_link(repository.clone(), change.path.as_str())
+        .find_node_link(repository.clone(), change.path().as_str())
         .await
         && node_link.is_valid()
     {
@@ -3928,11 +3940,11 @@ async fn merge_metadata_task(
             state_staged.mark_dirty();
         }
 
-        lore_trace!("Merged metadata for {}", change.path);
+        lore_trace!("Merged metadata for {}", change.path());
     } else {
         lore_debug!(
             "Merge metadata skipped due to missing 'staged' node for {}",
-            change.path
+            change.path()
         );
         return Ok(());
     }
@@ -4346,7 +4358,7 @@ pub async fn merge_into(
     // Realizing a linked repository's changes against the parent state attaches
     // its file nodes under the parent's link node and overwrites
     // `link_node.child`. Link contents go through `merge into --link`.
-    changes.retain(|c| c.to.repository.id == repository.id);
+    changes.retain(|c| c.to.mapping.repository.id == repository.id);
 
     change::sort_by_path(&mut changes);
 
@@ -4361,30 +4373,32 @@ pub async fn merge_into(
             if change.action == change::FileAction::Delete {
                 let block = change
                     .from
+                    .mapping
                     .state
                     .block(
-                        change.from.repository.clone(),
-                        NodeBlock::index(change.from.node),
+                        change.from.mapping.repository.clone(),
+                        NodeBlock::index(change.from.mapping.node),
                     )
                     .await
                     .forward::<MergeError>("deserializing block")?;
-                block.node(Node::index(change.from.node))
+                block.node(Node::index(change.from.mapping.node))
             } else {
                 let block = change
                     .to
+                    .mapping
                     .state
                     .block(
-                        change.to.repository.clone(),
-                        NodeBlock::index(change.to.node),
+                        change.to.mapping.repository.clone(),
+                        NodeBlock::index(change.to.mapping.node),
                     )
                     .await
                     .forward::<MergeError>("deserializing block")?;
-                block.node(Node::index(change.to.node))
+                block.node(Node::index(change.to.mapping.node))
             }
         };
 
         LoreEvent::BranchMergeIntoFile(LoreBranchMergeIntoFileEventData {
-            path: LoreString::from(&change.path),
+            path: LoreString::from(change.path()),
             action: change.action.into(),
             size: node.size,
             is_file: node.is_file() as u8,

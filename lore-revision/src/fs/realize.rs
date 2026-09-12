@@ -197,8 +197,8 @@ pub async fn realize_state(
         let filtered: Vec<NodeChange> = changes
             .into_iter()
             .filter(|change| match change.action {
-                change::FileAction::Delete => inclusion_set.contains(&change.from.node),
-                _ => inclusion_set.contains(&change.to.node),
+                change::FileAction::Delete => inclusion_set.contains(&change.from.mapping.node),
+                _ => inclusion_set.contains(&change.to.mapping.node),
             })
             .collect();
         lore_info!(
@@ -353,7 +353,7 @@ async fn holds_the_replaced_content(
     incoming: crate::lore::Address,
     content: &lore_storage::ContentHashMemo<'_>,
 ) -> Result<bool, SyncError> {
-    if !change.from.node.is_valid_node_id() {
+    if !change.from.mapping.node.is_valid_node_id() {
         return Ok(false);
     }
 
@@ -370,9 +370,9 @@ async fn holds_the_replaced_content(
     Ok(matches!(
         operation
             .compare_file_to_node(
-                change.from.repository.clone(),
+                change.from.mapping.repository.clone(),
                 &node_from,
-                &change.path,
+                change.path(),
                 file_size,
                 content,
             )
@@ -407,11 +407,11 @@ async fn modification_against_measured_node(
         });
     }
 
-    let from_is_current = change.from.state.revision() == current.state.revision();
+    let from_is_current = change.from.mapping.state.revision() == current.state.revision();
     let node_link = if from_is_current {
         NodeLink::invalid()
     } else {
-        current.node_at(&change.path).await
+        current.node_at(change.path()).await
     };
 
     let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
@@ -426,13 +426,17 @@ async fn modification_against_measured_node(
             .await
             .forward::<SyncError>("Failed loading the node the current revision holds")?;
         (Some(node), repository_current, true)
-    } else if change.from.node.is_valid_node_id() {
+    } else if change.from.mapping.node.is_valid_node_id() {
         let node = change
             .from
             .get_node()
             .await
             .forward::<SyncError>("Failed to find node")?;
-        (Some(node), change.from.repository.clone(), from_is_current)
+        (
+            Some(node),
+            change.from.mapping.repository.clone(),
+            from_is_current,
+        )
     } else {
         (None, repository, from_is_current)
     };
@@ -445,7 +449,7 @@ async fn modification_against_measured_node(
                     node,
                     info.mtime,
                     info.size,
-                    &change.path,
+                    change.path(),
                     true,
                     Some(content),
                 )
@@ -456,7 +460,7 @@ async fn modification_against_measured_node(
                     node,
                     info.mtime,
                     info.size,
-                    &change.path,
+                    change.path(),
                     is_current,
                     Some(content),
                 )
@@ -490,7 +494,7 @@ pub async fn verify_filesystem(
     filter_mode: FilterMode,
 ) -> Result<Option<NodeChange>, SyncError> {
     lore_trace!("Verify path: {change:?}");
-    let repository_path = change.path.clone();
+    let repository_path = change.path().clone();
     let absolute_path = repository_path.to_absolute_path(repository.require_path()?);
     let content = lore_storage::ContentHashMemo::new(&absolute_path);
     let modifications = modification_against_measured_node(
@@ -510,7 +514,7 @@ pub async fn verify_filesystem(
                 // Nothing exist in file system, safe to add
                 lore_trace!(
                     "Nothing exist in file system for {}, safe to add",
-                    change.path
+                    change.path()
                 );
                 Ok(Some(change))
             }
@@ -518,18 +522,21 @@ pub async fn verify_filesystem(
                 // Nothing exists, delete is a no-op
                 lore_trace!(
                     "Nothing exist in file system for {}, delete is no-op",
-                    change.path
+                    change.path()
                 );
                 Ok(Some(change))
             }
             _ => {
                 if forward_changes {
-                    lore_info!("Keeping modified file as locally deleted: {}", change.path);
+                    lore_info!(
+                        "Keeping modified file as locally deleted: {}",
+                        change.path()
+                    );
                     Ok(None)
                 } else {
                     lore_trace!(
                         "Restoring modified file which was locally deleted: {}",
-                        change.path
+                        change.path()
                     );
                     Ok(Some(change))
                 }
@@ -550,8 +557,8 @@ pub async fn verify_filesystem(
                 && measured.node.address == incoming_address(&change).await
             {
                 operation.record_modified_time(
-                    &change.from.repository,
-                    &change.path,
+                    &change.from.mapping.repository,
+                    change.path(),
                     modifications.info.mtime,
                 );
                 return Ok(None);
@@ -589,12 +596,15 @@ pub async fn verify_filesystem(
         if !should_be_file || is_delete {
             if is_delete {
                 if forward_changes {
-                    lore_info!("Keeping deleted file as locally modified: {}", change.path);
+                    lore_info!(
+                        "Keeping deleted file as locally modified: {}",
+                        change.path()
+                    );
                     return Ok(None);
                 }
                 lore_error!(
                     "Deleted file is currently modified in file system: {}",
-                    change.path
+                    change.path()
                 );
 
                 return Err(LocalModifications.into());
@@ -606,14 +616,14 @@ pub async fn verify_filesystem(
             if forward_changes {
                 lore_info!(
                     "Keeping created directory as a locally modified file: {}",
-                    change.path
+                    change.path()
                 );
                 return Ok(None);
             }
 
             lore_trace!(
                 "Change {} from file to directory, previous change will have deleted it",
-                change.path
+                change.path()
             );
             return Ok(Some(change));
         }
@@ -627,9 +637,9 @@ pub async fn verify_filesystem(
         } else {
             operation
                 .compare_file_to_node(
-                    change.from.repository.clone(),
+                    change.from.mapping.repository.clone(),
                     &node_to,
-                    &change.path,
+                    change.path(),
                     file_size,
                     &content,
                 )
@@ -639,7 +649,10 @@ pub async fn verify_filesystem(
         match comparison {
             NodeComparison::Differs => {
                 if forward_changes {
-                    lore_info!("Keeping modified file as locally modified: {}", change.path);
+                    lore_info!(
+                        "Keeping modified file as locally modified: {}",
+                        change.path()
+                    );
                     return Ok(None);
                 }
 
@@ -658,7 +671,7 @@ pub async fn verify_filesystem(
 
                 lore_error!(
                     "File has local changes: {} (incoming size {} bytes, file system size {} bytes)",
-                    change.path,
+                    change.path(),
                     node_to.size,
                     file_size
                 );
@@ -671,18 +684,18 @@ pub async fn verify_filesystem(
             NodeComparison::Unreadable => {
                 return Err(SyncError::internal(format!(
                     "Failed to read {} to compare it against the incoming revision",
-                    change.path
+                    change.path()
                 )));
             }
             NodeComparison::Matches => {
                 lore_trace!(
                     "File {} already holds the incoming content, nothing to realize",
-                    change.path
+                    change.path()
                 );
 
                 operation.record_modified_time(
-                    &change.from.repository,
-                    &change.path,
+                    &change.from.mapping.repository,
+                    change.path(),
                     modifications.info.mtime,
                 );
 
@@ -704,13 +717,13 @@ pub async fn verify_filesystem(
         if forward_changes {
             lore_info!(
                 "Keeping modified/deleted file as a local directory: {}",
-                change.path
+                change.path()
             );
             return Ok(None);
         }
 
         if is_delete {
-            let current_node_link = current.node_at(&change.path).await;
+            let current_node_link = current.node_at(change.path()).await;
             let (repository_current, state_current) = current_node_link
                 .resolve(repository.clone(), current.state.clone())
                 .await
@@ -718,23 +731,23 @@ pub async fn verify_filesystem(
                     format!("Failed to deserialize state {}", current_node_link.revision)
                 })?;
             let subnode_current = current_node_link.node;
-            let state_from = change.from.state.clone();
+            let state_from = change.from.mapping.state.clone();
             let mut directory_changes = Vec::new();
             state::diff_filesystem_subtree(
                 &operation,
                 NodeMapping {
-                    repository: change.from.repository.clone(),
+                    repository: change.from.mapping.repository.clone(),
                     state: state_from.clone(),
-                    path: change.path.clone(),
-                    node: change.from.node,
+                    path: change.path().clone(),
+                    node: change.from.mapping.node,
                 },
                 NodeMapping {
                     repository: repository_current,
                     state: state_current.clone(),
-                    path: change.path.clone(),
+                    path: change.path().clone(),
                     node: subnode_current,
                 },
-                change.path.clone(),
+                change.path().clone(),
                 filter_mode,
                 FilesystemDiffIntent::Report,
                 Arc::new(Vec::new()),
@@ -747,15 +760,15 @@ pub async fn verify_filesystem(
             if !directory_changes.is_empty() {
                 let mut has_modified_file = false;
                 for subchange in directory_changes {
-                    let subchange_path = subchange.path.clone();
+                    let subchange_path = subchange.path().clone();
 
                     if subchange.action == change::FileAction::Add {
                         // Allow locally added files to remain and keep directory
                         lore_trace!(
                             "Allow locally added file in {}",
                             subchange
-                                .path
-                                .to_absolute_path(change.from.repository.require_path()?)
+                                .path()
+                                .to_absolute_path(change.from.mapping.repository.require_path()?)
                                 .display()
                         );
                         continue;
@@ -772,7 +785,7 @@ pub async fn verify_filesystem(
                     {
                         lore_trace!(
                             "Skip already-missing tracked entry inside deleted directory: {}",
-                            subchange.path
+                            subchange.path()
                         );
                         continue;
                     }
@@ -780,7 +793,7 @@ pub async fn verify_filesystem(
                     if !has_modified_file {
                         lore_error!(
                             "Deleted directory has modified files in file system: {}",
-                            change.path
+                            change.path()
                         );
                     }
                     has_modified_file = true;
@@ -791,12 +804,12 @@ pub async fn verify_filesystem(
                             lore_info!(
                                 "  {} {}/",
                                 subchange.action.as_string_short(),
-                                subchange.path
+                                subchange.path()
                             );
                         } else {
                             let file_hash = operation
                                 .file_hash(
-                                    change.from.repository.clone(),
+                                    change.from.mapping.repository.clone(),
                                     &subchange_path,
                                     from_node.as_ref().ok(),
                                 )
@@ -805,7 +818,7 @@ pub async fn verify_filesystem(
                             lore_info!(
                                 "  {} {} : size {} hash {} mtime {}",
                                 subchange.action.as_string_short(),
-                                subchange.path,
+                                subchange.path(),
                                 file_info.size,
                                 file_hash,
                                 file_info.mtime
@@ -815,7 +828,7 @@ pub async fn verify_filesystem(
                         lore_info!("  Failed to get local file info");
                     }
 
-                    if subchange.from.node.is_valid_node_id() {
+                    if subchange.from.mapping.node.is_valid_node_id() {
                         if let Ok(node) = from_node {
                             lore_info!(
                                 "  Revision state   : mode {:o} size {} hash {}",
@@ -840,7 +853,7 @@ pub async fn verify_filesystem(
         // state already - just allow the new file to be written
         lore_trace!(
             "Change {} from directory to file, previous change will have deleted it",
-            change.path
+            change.path()
         );
         return Ok(Some(change));
     }
@@ -904,7 +917,7 @@ pub async fn realize_changes(
             ) {
                 continue;
             }
-            if let Some(parent) = change.path.parent() {
+            if let Some(parent) = change.path().parent() {
                 parent_paths.push(
                     RelativePath::new_from_initial_path(parent)
                         .expect("parent derived from valid change path"),
@@ -1004,7 +1017,7 @@ pub async fn realize_conflicts(
         // They can be removed in case they were deleted but resolved as keep
         let mut parent_paths: Vec<RelativePath> = Vec::with_capacity(conflicts.len());
         for (change_from, change_to) in conflicts.iter() {
-            if let Some(parent) = change_to.path.parent() {
+            if let Some(parent) = change_to.path().parent() {
                 parent_paths.push(
                     RelativePath::new_from_initial_path(parent)
                         .expect("parent is valid from above"),
@@ -1012,8 +1025,8 @@ pub async fn realize_conflicts(
             }
             // Also ensure parent directories for source change path exist
             // (needed for divergent move conflicts where paths differ)
-            if change_from.path != change_to.path
-                && let Some(parent) = change_from.path.parent()
+            if change_from.path() != change_to.path()
+                && let Some(parent) = change_from.path().parent()
             {
                 parent_paths.push(
                     RelativePath::new_from_initial_path(parent)
@@ -1253,7 +1266,7 @@ async fn realize_changes_delete(
     for change in delete_changes.iter().rev() {
         let change = change.clone();
 
-        let (state_from, stats) = (change.from.state.clone(), stats.clone());
+        let (state_from, stats) = (change.from.mapping.state.clone(), stats.clone());
 
         // TODO(mjansson): File system virtualization
         /*
@@ -1263,21 +1276,21 @@ async fn realize_changes_delete(
         }
         */
 
-        let change_path = change.path.clone();
+        let change_path = change.path().clone();
 
         let is_link = change.from.flags.bits() & NodeFlags::Link != 0;
 
         let is_file = if is_link {
             false
-        } else if change.from.node.is_valid_node_id() {
+        } else if change.from.mapping.node.is_valid_node_id() {
             let block = state_from
                 .block(
-                    change.from.repository.clone(),
-                    NodeBlock::index(change.from.node),
+                    change.from.mapping.repository.clone(),
+                    NodeBlock::index(change.from.mapping.node),
                 )
                 .await
                 .forward::<SyncError>("Failed deserializing state node block")?;
-            let node = block.node(Node::index(change.from.node));
+            let node = block.node(Node::index(change.from.mapping.node));
 
             node.is_file()
         } else {
@@ -1286,7 +1299,7 @@ async fn realize_changes_delete(
             operation.file_info(&change_path).await?.is_file
         };
 
-        lore_trace!("D {}", change.path);
+        lore_trace!("D {}", change.path());
         let mut deleted = true;
         if !dry_run {
             let mut retry = util::fs::file_unlink_retry();
@@ -1335,7 +1348,7 @@ async fn realize_changes_delete(
                 }
             }
 
-            state::file_modified_time_clear(repository.clone(), &change.path).await;
+            state::file_modified_time_clear(repository.clone(), change.path()).await;
         }
 
         stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
@@ -1349,7 +1362,10 @@ async fn realize_changes_delete(
 
         if let Some(state_stage) = state_stage.clone() {
             let node_link = match state_stage
-                .find_node_link(change.from.repository.clone(), change.path.as_str())
+                .find_node_link(
+                    change.from.mapping.repository.clone(),
+                    change.path().as_str(),
+                )
                 .await
             {
                 Ok(node_link) => node_link,
@@ -1359,9 +1375,9 @@ async fn realize_changes_delete(
 
             if node_link.is_valid() {
                 stage::stage_delete(
-                    change.from.repository.clone(),
+                    change.from.mapping.repository.clone(),
                     state_stage.clone(),
-                    change.path.clone(),
+                    change.path().clone(),
                     node_link.node,
                     if is_merge {
                         NodeFlags::StagedMerge
@@ -1376,7 +1392,7 @@ async fn realize_changes_delete(
 
                 if is_link {
                     remove_link_registry_entry(
-                        &change.from.repository,
+                        &change.from.mapping.repository,
                         &state_stage,
                         change.from.address.context.into(),
                         node_link.node,
@@ -1405,12 +1421,15 @@ async fn sync_discover_modify_add(
             continue;
         }
 
-        let (repository, state_to) = (change.to.repository.clone(), change.to.state.clone());
+        let (repository, state_to) = (
+            change.to.mapping.repository.clone(),
+            change.to.mapping.state.clone(),
+        );
         let block = state_to
-            .block(repository.clone(), NodeBlock::index(change.to.node))
+            .block(repository.clone(), NodeBlock::index(change.to.mapping.node))
             .await
             .forward::<SyncError>("Failed deserializing state node block")?;
-        let node = block.node(Node::index(change.to.node));
+        let node = block.node(Node::index(change.to.mapping.node));
 
         if node.is_file() {
             stats.discovery.total_files.fetch_add(1, Ordering::Relaxed);
@@ -1521,15 +1540,20 @@ async fn stage_link_registry_entry(
     {
         lore_trace!(
             "Link {link_id} at {} is already in the registry",
-            change.path
+            change.path()
         );
         return Ok(());
     }
 
     let (branch, flags) = match change
         .to
+        .mapping
         .state
-        .link_find(change.to.repository.clone(), link_id, change.to.node)
+        .link_find(
+            change.to.mapping.repository.clone(),
+            link_id,
+            change.to.mapping.node,
+        )
         .await
     {
         Ok(reference) => (
@@ -1539,7 +1563,7 @@ async fn stage_link_registry_entry(
         Err(err) => {
             lore_warn!(
                 "Incoming state has no link registry entry for link {link_id} at {}: {err}. Tracking the parent branch",
-                change.path
+                change.path()
             );
             (BranchId::default(), LinkFlags::NoFlags)
         }
@@ -1547,7 +1571,7 @@ async fn stage_link_registry_entry(
 
     lore_debug!(
         "Adding link {link_id} at {} to the link registry, node {staged_node} revision {} branch {branch}",
-        change.path,
+        change.path(),
         node.address.hash
     );
 
@@ -1564,7 +1588,7 @@ async fn stage_link_registry_entry(
         .forward_with::<SyncError, _>(|| {
             format!(
                 "Failed to add link {link_id} at {} to the link registry",
-                change.path
+                change.path()
             )
         })
 }
@@ -1605,10 +1629,10 @@ async fn realize_change_modify_add(
     // During a merge this is the filter-free walk context, not the instance's.
     // The instance's view arrives separately as `view_filter`. The staging
     // below needs the first, the disk writes need the second.
-    let repository = change.to.repository.clone();
+    let repository = change.to.mapping.repository.clone();
     let size = node.size;
     let is_file = node.is_file();
-    let path = &change.path;
+    let path = change.path();
 
     // Only on-disk work honours the view. This gates directory creation, link
     // cloning and the file write. The move rename below is not gated, because
@@ -1620,7 +1644,7 @@ async fn realize_change_modify_add(
     // when the source was in view and so had a file to rename. A sparse working
     // tree holds nothing at an excluded source, so the rename finds no file and
     // the destination has to be written from the immutable store like any add.
-    let moved_from_in_view = change.from_path.as_ref().is_some_and(|from_path| {
+    let moved_from_in_view = change.move_source().is_some_and(|from_path| {
         !view_filter.excludes_tree(from_path, node.is_directory(), FilterMode::View)
     });
 
@@ -1638,7 +1662,7 @@ async fn realize_change_modify_add(
 
     if !dry_run
         && change.action == change::FileAction::Move
-        && let Some(from_path) = change.from_path.as_ref()
+        && let Some(from_path) = change.move_source()
     {
         let from_path = from_path.clone();
         if operation
@@ -1689,7 +1713,7 @@ async fn realize_change_modify_add(
                     format!("Failed to deserialize state {link_revision}")
                 })?;
 
-            let clone_path = change.path.clone();
+            let clone_path = change.path().clone();
 
             let clone_ctx = CloneContext {
                 repository: link.clone(),
@@ -1720,7 +1744,7 @@ async fn realize_change_modify_add(
                 let repository = repository.clone();
                 let operation = operation.clone();
                 let stats = stats.clone();
-                let change_path = change.path.clone();
+                let change_path = change.path().clone();
                 async move { realize_file(repository, operation, &change_path, node, stats).await }
             });
         }
@@ -1728,7 +1752,7 @@ async fn realize_change_modify_add(
 
     if let Some(state_stage) = state_stage.clone() {
         if change.action == change::FileAction::Move
-            && let Some(from_path) = change.from_path.as_ref()
+            && let Some(from_path) = change.move_source()
         {
             // For move actions, relink the existing node instead of creating a new one to preserve node identity and from_path tracking.
             // Find the node at the original path in the staged state
@@ -1745,7 +1769,7 @@ async fn realize_change_modify_add(
             let mut from_node = block.node(node_index);
 
             // Determine the new parent node
-            let mut parent_path = change.path.clone();
+            let mut parent_path = change.path().clone();
             parent_path.pop();
             let new_parent_node_link = state_stage
                 .find_node_link(repository.clone(), parent_path.as_str())
@@ -1835,7 +1859,7 @@ async fn realize_change_modify_add(
 
             // Update node name if changed
             let from_name = from_path.name();
-            let to_name = change.path.name();
+            let to_name = change.path().name();
             if from_name != to_name {
                 block
                     .deserialize_nametable(repository.clone())
@@ -1881,7 +1905,7 @@ async fn realize_change_modify_add(
             let staged_node = stage::stage_single_node(
                 repository.clone(),
                 state_stage.clone(),
-                change.path.clone(),
+                change.path().clone(),
                 node,
                 Arc::new(stage::StageStats::default()),
                 None, // TODO(vri): UCS-18008 - Investigate link tracking for sync/realize_changes
@@ -1999,12 +2023,12 @@ async fn realize_file_merge(
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
     // Handle conflicts
-    lore_trace!("Try merge file {}", change_to.path);
+    lore_trace!("Try merge file {}", change_to.path());
     let mut resolved = false;
     let mut conflict = true;
     let mut size = 0;
 
-    let in_view = !view_filter.excludes_tree(&change_to.path, false, FilterMode::View);
+    let in_view = !view_filter.excludes_tree(change_to.path(), false, FilterMode::View);
 
     // A view-excluded path has no working-tree file, so there is nothing to
     // compare and no merge result to edit. Adopt the incoming side, recorded
@@ -2014,26 +2038,29 @@ async fn realize_file_merge(
         conflict = false;
     }
 
-    if change_from.path == change_to.path {
+    if change_from.path() == change_to.path() {
         // Fetch base / theirs version for conflicting files and try to text merge,
         // if that fails fall back to leaving mine/theirs/base in the file system
-        let mine_path = change_from.path.append_into_buf(MINE_SUFFIX).freeze();
-        let theirs_path = change_from.path.append_into_buf(THEIRS_SUFFIX).freeze();
-        let base_path = change_from.path.append_into_buf(BASE_SUFFIX).freeze();
-        let change_to_path = change_to.path.clone();
+        let mine_path = change_from.path().append_into_buf(MINE_SUFFIX).freeze();
+        let theirs_path = change_from.path().append_into_buf(THEIRS_SUFFIX).freeze();
+        let base_path = change_from.path().append_into_buf(BASE_SUFFIX).freeze();
+        let change_to_path = change_to.path().clone();
 
         if in_view {
             let mut has_theirs = false;
-            if change_from.to.node.is_valid_node_id() {
+            if change_from.to.mapping.node.is_valid_node_id() {
                 lore_trace!(
                     "Change from has valid to node, realize theirs file {}",
                     &theirs_path
                 );
                 let node_to = state_from
-                    .block(repository.clone(), NodeBlock::index(change_from.to.node))
+                    .block(
+                        repository.clone(),
+                        NodeBlock::index(change_from.to.mapping.node),
+                    )
                     .await
                     .forward::<SyncError>("Failed deserializing state node block")?
-                    .node(Node::index(change_from.to.node));
+                    .node(Node::index(change_from.to.mapping.node));
 
                 // TODO(vri): Implement merging links/link nodes
 
@@ -2055,13 +2082,13 @@ async fn realize_file_merge(
                 lore_trace!("Change from has no valid to node, no theirs file");
             }
 
-            if change_to.to.node.is_valid_node_id() {
+            if change_to.to.mapping.node.is_valid_node_id() {
                 // Diff3 function takes care of identifying identical files
                 // and mergeable operations such as delete in both branches etc
                 // Only thing remaining is identifying diffable files and split
                 // the mergeable files from unresolvable conflicts
                 let absolute_path = change_from
-                    .path
+                    .path()
                     .to_absolute_path(repository.require_path()?);
                 if has_theirs && operation.infer_is_diffable(&change_to_path).await? {
                     lore_trace!(
@@ -2069,16 +2096,19 @@ async fn realize_file_merge(
                         absolute_path.display()
                     );
 
-                    if change_from.from.node.is_valid_node_id() {
+                    if change_from.from.mapping.node.is_valid_node_id() {
                         lore_trace!(
                             "Change from has valid from node, realize base file {}",
                             &base_path
                         );
                         let node_from = state_base
-                            .block(repository.clone(), NodeBlock::index(change_from.from.node))
+                            .block(
+                                repository.clone(),
+                                NodeBlock::index(change_from.from.mapping.node),
+                            )
                             .await
                             .forward::<SyncError>("Failed deserializing state node block")?
-                            .node(Node::index(change_from.from.node));
+                            .node(Node::index(change_from.from.mapping.node));
                         realize_sidecar_file(
                             repository.clone(),
                             operation.clone(),
@@ -2167,13 +2197,16 @@ async fn realize_file_merge(
                     );
 
                     // Realize the base file for binary conflicts so users can compare
-                    if change_from.from.node.is_valid_node_id() {
+                    if change_from.from.mapping.node.is_valid_node_id() {
                         lore_trace!("Realize base file for binary conflict {}", &base_path);
                         let node_from = state_base
-                            .block(repository.clone(), NodeBlock::index(change_from.from.node))
+                            .block(
+                                repository.clone(),
+                                NodeBlock::index(change_from.from.mapping.node),
+                            )
                             .await
                             .forward::<SyncError>("Failed deserializing state node block")?
-                            .node(Node::index(change_from.from.node));
+                            .node(Node::index(change_from.from.mapping.node));
                         if node_from.is_file() {
                             realize_sidecar_file(
                                 repository.clone(),
@@ -2198,25 +2231,37 @@ async fn realize_file_merge(
         }
 
         if let Some(state_stage) = state_stage.clone() {
-            let mut node = if take_theirs && change_from.to.node.is_valid_node_id() {
+            let mut node = if take_theirs && change_from.to.mapping.node.is_valid_node_id() {
                 change_from
                     .to
+                    .mapping
                     .state
-                    .node(change_from.to.repository.clone(), change_from.to.node)
+                    .node(
+                        change_from.to.mapping.repository.clone(),
+                        change_from.to.mapping.node,
+                    )
                     .await
                     .forward::<SyncError>("Failed to resolve node in merge revisions")?
-            } else if change_to.to.node.is_valid_node_id() {
+            } else if change_to.to.mapping.node.is_valid_node_id() {
                 change_to
                     .to
+                    .mapping
                     .state
-                    .node(change_to.to.repository.clone(), change_to.to.node)
+                    .node(
+                        change_to.to.mapping.repository.clone(),
+                        change_to.to.mapping.node,
+                    )
                     .await
                     .forward::<SyncError>("Failed to resolve node in merge revisions")?
-            } else if change_from.to.node.is_valid_node_id() {
+            } else if change_from.to.mapping.node.is_valid_node_id() {
                 change_from
                     .to
+                    .mapping
                     .state
-                    .node(change_from.to.repository.clone(), change_from.to.node)
+                    .node(
+                        change_from.to.mapping.repository.clone(),
+                        change_from.to.mapping.node,
+                    )
                     .await
                     .forward::<SyncError>("Failed to resolve node in merge revisions")?
             } else {
@@ -2227,10 +2272,10 @@ async fn realize_file_merge(
             if take_theirs {
                 size = node.size;
             }
-            if take_theirs && !change_from.to.node.is_valid_node_id() {
+            if take_theirs && !change_from.to.mapping.node.is_valid_node_id() {
                 // The incoming side deleted the path, so adopting it deletes.
                 node.flags |= NodeFlags::StagedDelete;
-            } else if conflict && !change_to.to.node.is_valid_node_id() {
+            } else if conflict && !change_to.to.mapping.node.is_valid_node_id() {
                 node.flags |= NodeFlags::StagedDelete;
 
                 operation.remove(&change_to_path).await?;
@@ -2264,14 +2309,14 @@ async fn realize_file_merge(
             // view-excluded node reaches the staged state instead of being
             // filtered out of it.
             let stage_repository = if take_theirs {
-                change_to.to.repository.clone()
+                change_to.to.mapping.repository.clone()
             } else {
                 repository.clone()
             };
             stage::stage_single_node(
                 stage_repository,
                 state_stage.clone(),
-                change_to.path.clone(),
+                change_to.path().clone(),
                 node,
                 Arc::default(),
                 None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
@@ -2289,7 +2334,7 @@ async fn realize_file_merge(
                 }
             }
         }
-    } else if change_from.path.overlaps(&change_to.path) {
+    } else if change_from.path().overlaps(change_to.path()) {
         // A conflict on paths that are NOT equal.
         // For example:
         //   File 'some_path' vs file 'some_path/some_file'
@@ -2297,26 +2342,34 @@ async fn realize_file_merge(
         // conflicted in the target state if given
         lore_info!(
             "Merge overlapping paths {} and {}",
-            change_from.path,
-            change_to.path
+            change_from.path(),
+            change_to.path()
         );
         lore_trace!("Change from: {change_from:?}");
         lore_trace!("Change to: {change_to:?}");
 
         if let Some(state_stage) = state_stage.clone() {
             lore_trace!("Staging conflict node in target state");
-            let mut node = if change_to.to.node.is_valid_node_id() {
+            let mut node = if change_to.to.mapping.node.is_valid_node_id() {
                 change_to
                     .to
+                    .mapping
                     .state
-                    .node(change_to.to.repository.clone(), change_to.to.node)
+                    .node(
+                        change_to.to.mapping.repository.clone(),
+                        change_to.to.mapping.node,
+                    )
                     .await
                     .forward::<SyncError>("Failed to resolve node in merge revisions")?
-            } else if change_from.to.node.is_valid_node_id() {
+            } else if change_from.to.mapping.node.is_valid_node_id() {
                 change_from
                     .to
+                    .mapping
                     .state
-                    .node(change_from.to.repository.clone(), change_from.to.node)
+                    .node(
+                        change_from.to.mapping.repository.clone(),
+                        change_from.to.mapping.node,
+                    )
                     .await
                     .forward::<SyncError>("Failed to resolve node in merge revisions")?
             } else {
@@ -2330,7 +2383,7 @@ async fn realize_file_merge(
             stage::stage_single_node(
                 repository.clone(),
                 state_stage.clone(),
-                change_to.path.clone(),
+                change_to.path().clone(),
                 node,
                 Arc::default(),
                 None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
@@ -2352,16 +2405,20 @@ async fn realize_file_merge(
         // branch also changed (moved/deleted) the file at the original location.
         lore_debug!(
             "Merge divergent move conflict: source {} vs target {}",
-            change_from.path,
-            change_to.path
+            change_from.path(),
+            change_to.path()
         );
 
         if let Some(state_stage) = state_stage.clone() {
-            let node = if change_from.to.node.is_valid_node_id() {
+            let node = if change_from.to.mapping.node.is_valid_node_id() {
                 change_from
                     .to
+                    .mapping
                     .state
-                    .node(change_from.to.repository.clone(), change_from.to.node)
+                    .node(
+                        change_from.to.mapping.repository.clone(),
+                        change_from.to.mapping.node,
+                    )
                     .await
                     .forward::<SyncError>("Failed to resolve node in merge revisions")?
             } else {
@@ -2369,7 +2426,7 @@ async fn realize_file_merge(
                 return Err(SyncError::internal("Invalid change data"));
             };
 
-            let change_from_path = change_from.path.clone();
+            let change_from_path = change_from.path().clone();
 
             // Realize the source file content on disk at the source move destination
             if !dry_run && node.is_file() {
@@ -2431,7 +2488,7 @@ async fn realize_file_merge(
 impl LoreRevisionSyncFileEventData {
     fn new(node_change: &NodeChange, size: u64, file: bool) -> Self {
         Self {
-            path: LoreString::from(&node_change.path),
+            path: LoreString::from(node_change.path()),
             size,
             action: node_change.action.into(),
             flag_file: file.into(),
@@ -2546,11 +2603,18 @@ mod tests {
             .expect("write working file");
     }
 
-    fn side(repository: &Arc<RepositoryContext>, staged: &Staged) -> NodeChangeState {
+    fn side(
+        repository: &Arc<RepositoryContext>,
+        staged: &Staged,
+        path: RelativePath,
+    ) -> NodeChangeState {
         NodeChangeState {
-            repository: repository.clone(),
-            state: staged.state.clone(),
-            node: staged.node,
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: staged.state.clone(),
+                path,
+                node: staged.node,
+            },
             flags: NodeFlags::File,
             address: staged.address,
         }
@@ -2593,10 +2657,8 @@ mod tests {
         let change = NodeChange {
             action,
             flags: change::Flags::None,
-            from: side(repository, base),
-            to: side(repository, source),
-            path: path.clone(),
-            from_path: None,
+            from: side(repository, base, path.clone()),
+            to: side(repository, source, path.clone()),
             observed: None,
         };
 

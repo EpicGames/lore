@@ -15,6 +15,7 @@ mod tests {
     use lore_revision::revision;
     use lore_revision::revision::ResolveSearchLocation;
     use lore_revision::revision::diff::LoreRevisionDiffFileEventData;
+    use lore_revision::state::NodeMapping;
     use lore_revision::state::State;
     use lore_revision::util::path::RelativePathBuf;
 
@@ -239,20 +240,21 @@ mod tests {
         path: &str,
         from_path: Option<&str>,
     ) -> NodeChange {
-        let side = |node| NodeChangeState {
-            repository: repository.clone(),
-            state: state.clone(),
-            node,
+        let side = |node, side_path: &str| NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: RelativePathBuf::new().push_and_freeze(side_path),
+                node,
+            },
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         };
         NodeChange {
             action,
             flags: change::Flags::None,
-            from: side(1),
-            to: side(2),
-            path: RelativePathBuf::new().push_and_freeze(path),
-            from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
+            from: side(1, from_path.unwrap_or_default()),
+            to: side(2, path),
             observed: None,
         }
     }

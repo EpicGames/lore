@@ -10491,3 +10491,56 @@ def test_link_update_of_a_subtree_reports_paths_at_the_mount(new_lore_repo):
         assert source_dir not in path, (
             f"no staged path carries the linked repository's own spelling, got {path!r}"
         )
+
+
+@pytest.mark.smoke
+def test_link_move_realizes_at_the_mount(new_lore_repo):
+    """A file moved inside a linked repository is realized at the mount, old path and all.
+
+    Advancing the pin diffs the two linked revisions, which report the move as a delete and an add
+    that are coalesced by the identity the two share. Both halves have to reach the mount: the new
+    path materialized there and the old one gone.
+    """
+    link_path = "vendor/b"
+    moved_from = f"{link_path}/dir/f1.txt"
+    moved_to = f"{link_path}/dir/f2.txt"
+    parent_repo, link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"dir/f1.txt": "content\n"}
+    )
+
+    link_repo.move("dir/f1.txt", "dir/f2.txt")
+    link_repo.file_stage_move("dir/f1.txt", "dir/f2.txt")
+    link_repo.commit("Move a file")
+    link_repo.push()
+
+    parent_repo.link_update(link_path)
+
+    assert parent_repo.file_exists(moved_to), (
+        f"the move should land at the mount.\nStatus:\n{parent_repo.status()}"
+    )
+    assert not parent_repo.file_exists(moved_from), (
+        f"the path moved from should not survive at the mount.\nStatus:\n{parent_repo.status()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_stage_move_inside_a_link_is_refused(new_lore_repo):
+    """Staging a move of a path inside a link is refused rather than acted on.
+
+    Resolving the path crosses the link, so the node it answers with is numbered by the linked
+    repository's state and names nothing in the parent's. The move reads and relinks it in the
+    parent, so it has to stop at the boundary, as the destination side already does.
+    """
+    link_path = "vendor/b"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"dir/f1.txt": "content\n"}
+    )
+
+    moved_from = f"{link_path}/dir/f1.txt"
+    moved_to = f"{link_path}/dir/f2.txt"
+    parent_repo.move(moved_from, moved_to)
+
+    output = parent_repo.stage_move(moved_from, moved_to, check=False)
+    assert "Links not yet implemented" in output, (
+        f"A move across a link boundary should be refused, got: {output}"
+    )

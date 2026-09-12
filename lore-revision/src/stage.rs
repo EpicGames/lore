@@ -898,9 +898,13 @@ pub(crate) async fn stage_merge_path(
     // If so, mark as in conflict
     // If not, mark as merged
     for change in diff.changes.iter() {
-        lore_debug!("Merge change: {} (node {})", change.path, change.to.node);
+        lore_debug!(
+            "Merge change: {} (node {})",
+            change.path(),
+            change.to.mapping.node
+        );
 
-        let absolute_path = change.path.to_absolute_path(repository.require_path()?);
+        let absolute_path = change.path().to_absolute_path(repository.require_path()?);
 
         let mut merge_flags = NodeFlags::StagedMerge;
 
@@ -911,25 +915,39 @@ pub(crate) async fn stage_merge_path(
         {
             lore_debug!(
                 "Merge change filesystem state is conflicted: {}",
-                change.path
+                change.path()
             );
             merge_flags |= NodeFlags::StagedMergeConflict;
         }
 
         state_stage
-            .node_mark(repository.clone(), change.to.node, merge_flags, true)
+            .node_mark(
+                repository.clone(),
+                change.to.mapping.node,
+                merge_flags,
+                true,
+            )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
     }
 
     for conflict in diff.conflicts.iter() {
         let change = &conflict.1;
-        lore_debug!("Merge conflict: {} (node {})", change.path, change.to.node);
+        lore_debug!(
+            "Merge conflict: {} (node {})",
+            change.path(),
+            change.to.mapping.node
+        );
 
         let merge_flags = NodeFlags::StagedMergeConflict;
 
         state_stage
-            .node_mark(repository.clone(), change.to.node, merge_flags, true)
+            .node_mark(
+                repository.clone(),
+                change.to.mapping.node,
+                merge_flags,
+                true,
+            )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
     }
@@ -3563,15 +3581,15 @@ pub(crate) async fn stage_from_parent_state(
 
     // Unstage nodes that were already staged but whose disk state had to change to have them included in output
     for change in changes.iter().rev() {
-        if !change.to.node.is_valid_node_id() {
+        if !change.to.mapping.node.is_valid_node_id() {
             // Change is a new file in file system, ignore
             continue;
         }
 
-        let block_index = NodeBlock::index(change.to.node);
-        let node_index = Node::index(change.to.node);
+        let block_index = NodeBlock::index(change.to.mapping.node);
+        let node_index = Node::index(change.to.mapping.node);
         let block = state_current
-            .block(change.to.repository.clone(), block_index)
+            .block(change.to.mapping.repository.clone(), block_index)
             .await
             .forward::<StageError>("Failed deserializing state node block")?;
         let dirtied = {
@@ -3602,16 +3620,16 @@ pub(crate) async fn stage_from_parent_state(
     let mut tasks = JoinSet::new();
     let dispatch_result: Result<(), StageError> = async {
         for change in changes.iter() {
-            let mut parent_path = change.path.clone();
+            let mut parent_path = change.path().clone();
             parent_path.pop();
             let parent_node_link = state_current
                 .find_node_link(repository_current.clone(), parent_path.as_str())
                 .await
                 .forward::<StageError>("Failed to find subnode")?;
             let file_name = if parent_path.is_empty() {
-                change.path.to_string()
+                change.path().to_string()
             } else {
-                change.path.as_str()[(parent_path.len() + 1)..].to_string()
+                change.path().as_str()[(parent_path.len() + 1)..].to_string()
             };
 
             let (repository, state) = parent_node_link
@@ -3619,7 +3637,7 @@ pub(crate) async fn stage_from_parent_state(
                 .await
                 .forward::<StageError>("Failed to resolve node path in state")?;
             let stats = stats.clone();
-            let file_path = change.path.clone();
+            let file_path = change.path().clone();
             let operation = operation.clone();
             lore_spawn!(tasks, async move {
                 let info = operation

@@ -57,7 +57,7 @@ pub async fn map_to_path_diff(
     match change.action {
         FileAction::Delete => Some(PathDiff {
             from: Some(Path {
-                path: change.path.to_string(),
+                path: change.path().to_string(),
                 address: change.from.address.into(),
                 r#type: node_flags_to_type(change.from.flags),
                 tracking,
@@ -70,7 +70,7 @@ pub async fn map_to_path_diff(
         FileAction::Add => Some(PathDiff {
             from: None,
             to: Some(Path {
-                path: change.path.to_string(),
+                path: change.path().to_string(),
                 address: change.to.address.into(),
                 r#type: node_flags_to_type(change.to.flags),
                 tracking,
@@ -81,13 +81,13 @@ pub async fn map_to_path_diff(
         }),
         FileAction::Keep => Some(PathDiff {
             from: Some(Path {
-                path: change.path.to_string(),
+                path: change.path().to_string(),
                 address: change.from.address.into(),
                 r#type: node_flags_to_type(change.from.flags),
                 tracking,
             }),
             to: Some(Path {
-                path: change.path.to_string(),
+                path: change.path().to_string(),
                 address: change.to.address.into(),
                 r#type: node_flags_to_type(change.to.flags),
                 tracking,
@@ -245,21 +245,25 @@ mod tests {
 
         let addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::File,
             },
@@ -296,21 +300,25 @@ mod tests {
 
         let deletion = NodeChange {
             action: lore_revision::change::FileAction::Delete,
-            path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_from,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::File,
             },
@@ -351,21 +359,25 @@ mod tests {
 
         let modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_from,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::File,
             },
@@ -407,21 +419,25 @@ mod tests {
 
         let addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::File,
             },
@@ -458,21 +474,25 @@ mod tests {
 
         let link_addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::Link,
             },
@@ -509,21 +529,25 @@ mod tests {
 
         let link_deletion = NodeChange {
             action: lore_revision::change::FileAction::Delete,
-            path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_from,
                 flags: NodeFlags::Link,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::Link,
             },
@@ -565,21 +589,25 @@ mod tests {
 
         let link_modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_from,
                 flags: NodeFlags::Link,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::Link,
             },
@@ -626,21 +654,25 @@ mod tests {
 
         let automerged_change = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            path: RelativePath::from_str("Samples/Content/merged.txt").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::ConflictAutomerged,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/merged.txt").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_from,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/merged.txt").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::File,
             },
@@ -684,21 +716,25 @@ mod tests {
 
         let link_addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::Link,
             },
@@ -731,21 +767,25 @@ mod tests {
 
         let link_addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+                    node: 2,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: address_to,
                 flags: NodeFlags::Link,
             },
@@ -777,14 +817,15 @@ mod tests {
 
         let modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            path: RelativePath::from_str("libs/shared/a.txt").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 3,
-                repository: linked_repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("libs/shared/a.txt").unwrap(),
+                    node: 3,
+                    repository: linked_repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address {
                     hash: hash_from,
                     context: file_context,
@@ -792,9 +833,12 @@ mod tests {
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
-                node: 4,
-                repository: linked_repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("libs/shared/a.txt").unwrap(),
+                    node: 4,
+                    repository: linked_repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address {
                     hash: hash_to,
                     context: file_context,
@@ -835,14 +879,15 @@ mod tests {
 
         let deletion = NodeChange {
             action: lore_revision::change::FileAction::Delete,
-            path: RelativePath::from_str("libs/shared/gone.txt").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 3,
-                repository: linked_repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("libs/shared/gone.txt").unwrap(),
+                    node: 3,
+                    repository: linked_repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address {
                     hash: Hash::hash_buffer(&[60, 61, 62, 63]),
                     context: Context::default(),
@@ -850,9 +895,12 @@ mod tests {
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
-                node: INVALID_NODE,
-                repository: linked_repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("libs/shared/gone.txt").unwrap(),
+                    node: INVALID_NODE,
+                    repository: linked_repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
@@ -876,14 +924,15 @@ mod tests {
 
         let modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            path: RelativePath::from_str("README.txt").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("README.txt").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address {
                     hash: Hash::hash_buffer(&[70, 71]),
                     context: Context::default(),
@@ -891,9 +940,12 @@ mod tests {
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
-                node: 1,
-                repository: repository.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("README.txt").unwrap(),
+                    node: 1,
+                    repository: repository.clone(),
+                    state: state.clone(),
+                },
                 address: Address {
                     hash: Hash::hash_buffer(&[72, 73]),
                     context: Context::default(),

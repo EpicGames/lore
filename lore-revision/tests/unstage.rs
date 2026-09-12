@@ -224,7 +224,7 @@ mod tests {
                     println!(
                         "{}: {} {:?}",
                         change.action.as_string_short(),
-                        change.path,
+                        change.path(),
                         change.flags
                     );
                 }

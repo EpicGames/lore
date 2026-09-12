@@ -12,6 +12,7 @@ mod tests {
     use lore_revision::change::NodeChangeState;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::state::NodeMapping;
     use lore_revision::state::State;
     use lore_revision::util::path::RelativePath;
     use lore_revision::util::path::RelativePathBuf;
@@ -65,66 +66,78 @@ mod tests {
         changes.push(NodeChange {
             action: change::FileAction::Add,
             from: NodeChangeState {
-                repository: repository.clone(),
-                state: state.clone(),
-                node: 1,
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: RelativePath::default(),
+                    node: 1,
+                },
                 address: Address::zero_context_hash(hashes[0]),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                repository: repository.clone(),
-                state: state.clone(),
-                node: 2,
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: RelativePath::default(),
+                    node: 2,
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
             flags: change::Flags::None,
-            path: RelativePath::default(),
-            from_path: None,
             observed: None,
         });
 
         changes.push(NodeChange {
             action: change::FileAction::Keep,
             from: NodeChangeState {
-                repository: repository.clone(),
-                state: state.clone(),
-                node: 4,
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: RelativePathBuf::new().push_and_freeze("name"),
+                    node: 4,
+                },
                 address: Address::default(),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                repository: repository.clone(),
-                state: state.clone(),
-                node: 3,
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: RelativePathBuf::new().push_and_freeze("name"),
+                    node: 3,
+                },
                 address: Address::zero_context_hash(hashes[1]),
                 flags: NodeFlags::NoFlags,
             },
             flags: change::Flags::Modify | change::Flags::Conflict,
-            path: RelativePathBuf::new().push_and_freeze("name"),
-            from_path: None,
             observed: None,
         });
 
         changes.push(NodeChange {
             action: change::FileAction::Copy,
             from: NodeChangeState {
-                repository: repository.clone(),
-                state: state.clone(),
-                node: 5,
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: RelativePath::default(),
+                    node: 5,
+                },
                 address: Address::zero_context_hash(hashes[3]),
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
-                repository: repository.clone(),
-                state: state.clone(),
-                node: 6,
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: RelativePath::default(),
+                    node: 6,
+                },
                 address: Address::zero_context_hash(hashes[2]),
                 flags: NodeFlags::NoFlags,
             },
             flags: change::Flags::Merge,
-            path: RelativePath::default(),
-            from_path: None,
             observed: None,
         });
 
@@ -135,28 +148,28 @@ mod tests {
         assert_eq!(changes.len(), 3);
 
         assert_eq!(changes[0].action, change::FileAction::Delete);
-        assert_eq!(changes[0].from.node, changes_ref[2].to.node);
-        assert_eq!(changes[0].to.node, changes_ref[2].from.node);
+        assert_eq!(changes[0].from.mapping.node, changes_ref[2].to.mapping.node);
+        assert_eq!(changes[0].to.mapping.node, changes_ref[2].from.mapping.node);
         assert_eq!(changes[0].flags, change::Flags::None);
         assert_eq!(changes[0].from.address, changes_ref[2].to.address);
         assert_eq!(changes[0].to.address, changes_ref[2].from.address);
-        assert_eq!(changes[0].path.as_str(), changes_ref[2].path.as_str());
+        assert_eq!(changes[0].path().as_str(), changes_ref[2].path().as_str());
 
         assert_eq!(changes[1].action, changes_ref[1].action);
-        assert_eq!(changes[1].from.node, changes_ref[1].to.node);
-        assert_eq!(changes[1].to.node, changes_ref[1].from.node);
+        assert_eq!(changes[1].from.mapping.node, changes_ref[1].to.mapping.node);
+        assert_eq!(changes[1].to.mapping.node, changes_ref[1].from.mapping.node);
         assert_eq!(changes[1].flags, change::Flags::Modify);
         assert_eq!(changes[1].from.address, changes_ref[1].to.address);
         assert_eq!(changes[1].to.address, changes_ref[1].from.address);
-        assert_eq!(changes[1].path.as_str(), changes_ref[1].path.as_str());
+        assert_eq!(changes[1].path().as_str(), changes_ref[1].path().as_str());
 
         assert_eq!(changes[2].action, change::FileAction::Delete);
-        assert_eq!(changes[2].from.node, changes_ref[0].to.node);
-        assert_eq!(changes[2].to.node, changes_ref[0].from.node);
+        assert_eq!(changes[2].from.mapping.node, changes_ref[0].to.mapping.node);
+        assert_eq!(changes[2].to.mapping.node, changes_ref[0].from.mapping.node);
         assert_eq!(changes[2].flags, change::Flags::None);
         assert_eq!(changes[2].from.address, changes_ref[0].to.address);
         assert_eq!(changes[2].to.address, changes_ref[0].from.address);
-        assert_eq!(changes[2].path.as_str(), changes_ref[0].path.as_str());
+        assert_eq!(changes[2].path().as_str(), changes_ref[0].path().as_str());
     }
     /*
     #[test]
@@ -377,9 +390,12 @@ mod tests {
         let state = Arc::new(State::new());
 
         let link_side = |target: &Arc<RepositoryContext>| NodeChangeState {
-            repository: parent.clone(),
-            state: state.clone(),
-            node: 1,
+            mapping: NodeMapping {
+                repository: parent.clone(),
+                state: state.clone(),
+                path: RelativePath::default(),
+                node: 1,
+            },
             address: Address {
                 hash: Hash::from(rand::random::<[u8; 32]>()),
                 context: target.id.into(),
@@ -387,9 +403,12 @@ mod tests {
             flags: NodeFlags::Link,
         };
         let file_side = || NodeChangeState {
-            repository: parent.clone(),
-            state: state.clone(),
-            node: 2,
+            mapping: NodeMapping {
+                repository: parent.clone(),
+                state: state.clone(),
+                path: RelativePath::default(),
+                node: 2,
+            },
             address: Address::zero_context_hash(Hash::from(rand::random::<[u8; 32]>())),
             flags: NodeFlags::File,
         };
@@ -399,8 +418,6 @@ mod tests {
             from: file_side(),
             to: link_side(&mounted),
             flags: change::Flags::None,
-            path: RelativePath::default(),
-            from_path: None,
             observed: None,
         };
         assert_eq!(
@@ -414,8 +431,6 @@ mod tests {
             from: link_side(&unmounted),
             to: file_side(),
             flags: change::Flags::None,
-            path: RelativePath::default(),
-            from_path: None,
             observed: None,
         };
         assert_eq!(
@@ -429,14 +444,58 @@ mod tests {
             from: file_side(),
             to: file_side(),
             flags: change::Flags::None,
-            path: RelativePath::default(),
-            from_path: None,
             observed: None,
         };
         assert_eq!(
             file_change.content_repository_id(),
             parent.id,
             "A non-link change's content lives in the repository it was walked from",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_change_stands_at_the_path_of_the_side_it_resolves_to() {
+        let repository = new_test_context().await;
+        let state = Arc::new(State::new());
+
+        let side = |name: &str| NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: RelativePathBuf::new().push_and_freeze(name),
+                node: 1,
+            },
+            address: Address::default(),
+            flags: NodeFlags::File,
+        };
+        let change = |action| NodeChange {
+            action,
+            from: side("source.txt"),
+            to: side("destination.txt"),
+            flags: change::Flags::None,
+            observed: None,
+        };
+
+        assert_eq!(
+            change(change::FileAction::Delete).path().as_str(),
+            "source.txt",
+            "A delete stands where the node it removes was",
+        );
+        assert_eq!(
+            change(change::FileAction::Add).path().as_str(),
+            "destination.txt",
+        );
+
+        let moved = change(change::FileAction::Move);
+        assert_eq!(
+            moved.path().as_str(),
+            "destination.txt",
+            "A move stands at its destination",
+        );
+        assert_eq!(
+            moved.move_source().map(|path| path.as_str()),
+            Some("source.txt"),
+            "A move reports the source its from side stands at",
         );
     }
 }

@@ -220,7 +220,7 @@ async fn verify_no_local_changes_under_link(
 
     if changes
         .iter()
-        .any(|change| link_path.covers_ignore_case(&change.path))
+        .any(|change| link_path.covers_ignore_case(change.path()))
     {
         lore_warn!(
             "Link at '{}' has locally modified files (use --force to discard)",

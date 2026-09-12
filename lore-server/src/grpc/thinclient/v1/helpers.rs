@@ -261,8 +261,7 @@ pub(super) async fn node_change_to_diff_change(
         _ => node_flags_to_node_type(change.to.flags),
     };
     let path_from = change
-        .from_path
-        .as_ref()
+        .move_source()
         .map(|p| p.to_string())
         .unwrap_or_default();
     let content_from = if action == thin_client_v1::Action::Add {
@@ -276,7 +275,7 @@ pub(super) async fn node_change_to_diff_change(
         change.to.address.hash.into()
     };
     thin_client_v1::DiffChange {
-        path: change.path.to_string(),
+        path: change.path().to_string(),
         path_from,
         action: action as i32,
         node_type: node_type as i32,
@@ -380,21 +379,25 @@ mod tests {
         };
         NodeChange {
             action,
-            path: RelativePath::from_str("dir/file.txt").unwrap(),
-            from_path: None,
             observed: None,
             flags: Flags::None,
             from: NodeChangeState {
-                node: 1,
-                repository: ctx.clone(),
-                state: state.clone(),
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("dir/file.txt").unwrap(),
+                    node: 1,
+                    repository: ctx.clone(),
+                    state: state.clone(),
+                },
                 address,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
-                node: 2,
-                repository: ctx,
-                state,
+                mapping: lore_revision::state::NodeMapping {
+                    path: RelativePath::from_str("dir/file.txt").unwrap(),
+                    node: 2,
+                    repository: ctx,
+                    state,
+                },
                 address,
                 flags: NodeFlags::File,
             },

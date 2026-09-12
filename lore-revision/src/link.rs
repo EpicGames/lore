@@ -1346,8 +1346,20 @@ pub async fn realize_link_pin_change(
     };
 
     let changes = state::diff_collect_subtree(
-        state::node_change_state(&link_context, &link_state_current, node_current).await,
-        state::node_change_state(&link_context, &link_state_target, node_target).await,
+        state::node_change_state(
+            &link_context,
+            &link_state_current,
+            node_current,
+            link_path.clone(),
+        )
+        .await,
+        state::node_change_state(
+            &link_context,
+            &link_state_target,
+            node_target,
+            link_path.clone(),
+        )
+        .await,
         link_path,
         FilterMode::View,
     )
@@ -1507,15 +1519,17 @@ pub async fn check_incoming_mount_overlaps(
     let mut incoming: Vec<(RepositoryId, RelativePath)> = Vec::new();
 
     for change in changes.iter() {
-        if change.action == crate::change::FileAction::Delete || !change.to.node.is_valid_node_id()
+        if change.action == crate::change::FileAction::Delete
+            || !change.to.mapping.node.is_valid_node_id()
         {
             continue;
         }
 
         let node = change
             .to
+            .mapping
             .state
-            .node(change.to.repository.clone(), change.to.node)
+            .node(change.to.mapping.repository.clone(), change.to.mapping.node)
             .await?;
 
         if !node.is_link() {
@@ -1531,7 +1545,7 @@ pub async fn check_incoming_mount_overlaps(
             repository.clone(),
             link_context,
             source_path.clone(),
-            change.from.node,
+            change.from.mapping.node,
         )
         .await?;
 

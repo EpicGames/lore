@@ -55,19 +55,21 @@ mod tests {
                 assert!(
                     changes
                         .iter()
-                        .any(|c| c.path.as_str() == "ghost" && c.action == FileAction::Add),
+                        .any(|c| c.path().as_str() == "ghost" && c.action == FileAction::Add),
                     "expected the new directory to be indexed as an add, found: {:?}",
                     changes
                         .iter()
-                        .map(|c| (c.path.as_str().to_string(), c.action))
+                        .map(|c| (c.path().as_str().to_string(), c.action))
                         .collect::<Vec<_>>()
                 );
                 assert!(
-                    changes.iter().any(|c| c.path.as_str() == "ghost/inner.txt"),
+                    changes
+                        .iter()
+                        .any(|c| c.path().as_str() == "ghost/inner.txt"),
                     "expected the directory's contents to be indexed too, found: {:?}",
                     changes
                         .iter()
-                        .map(|c| (c.path.as_str().to_string(), c.action))
+                        .map(|c| (c.path().as_str().to_string(), c.action))
                         .collect::<Vec<_>>()
                 );
 
@@ -89,11 +91,11 @@ mod tests {
                 assert!(
                     changes
                         .iter()
-                        .all(|c| !c.path.as_str().starts_with("ghost")),
+                        .all(|c| !c.path().as_str().starts_with("ghost")),
                     "removed uncommitted directory must be discarded, not reported, found: {:?}",
                     changes
                         .iter()
-                        .map(|c| (c.path.as_str().to_string(), c.action))
+                        .map(|c| (c.path().as_str().to_string(), c.action))
                         .collect::<Vec<_>>()
                 );
 
@@ -119,11 +121,11 @@ mod tests {
                 assert!(
                     changes
                         .iter()
-                        .all(|c| !c.path.as_str().starts_with("ghost")),
+                        .all(|c| !c.path().as_str().starts_with("ghost")),
                     "discarded directory must not resurface on a later scan, found: {:?}",
                     changes
                         .iter()
-                        .map(|c| (c.path.as_str().to_string(), c.action))
+                        .map(|c| (c.path().as_str().to_string(), c.action))
                         .collect::<Vec<_>>()
                 );
             }))

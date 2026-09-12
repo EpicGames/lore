@@ -272,7 +272,7 @@ mod tests {
                 let changes = collect_diff(parent.clone(), parent_v1, parent_v2).await;
                 let paths: Vec<String> = changes
                     .iter()
-                    .map(|change| change.path.to_string())
+                    .map(|change| change.path().to_string())
                     .collect();
                 assert_eq!(
                     paths,
@@ -365,7 +365,7 @@ mod tests {
                 let changes = collect_diff(restricted.clone(), parent_v1, parent_v2).await;
                 let paths: Vec<String> = changes
                     .iter()
-                    .map(|change| change.path.to_string())
+                    .map(|change| change.path().to_string())
                     .collect();
                 assert_eq!(
                     paths,

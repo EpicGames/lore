@@ -233,15 +233,16 @@ pub struct LayerState {
 /// so the same subtree is a different node in each. A revision holding no such subtree names no
 /// node, which is one side of an add or a delete.
 ///
-/// `source_path` reaches no further. What a diff of two of these reports is spelled from the
-/// mount, so no change carries the drawn-from spelling.
+/// `source_path` reaches no further. What a diff of two of these reports is spelled from
+/// `mount_path`, so no change carries the drawn-from spelling.
 pub(crate) async fn drawn_subtree_state(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
     source_path: &RelativePath,
+    mount_path: &RelativePath,
 ) -> change::NodeChangeState {
     if source_path.is_empty() {
-        return state::node_change_state(repository, state, ROOT_NODE).await;
+        return state::node_change_state(repository, state, ROOT_NODE, mount_path.clone()).await;
     }
 
     let node_link = state
@@ -250,14 +251,16 @@ pub(crate) async fn drawn_subtree_state(
         .ok()
         .filter(NodeLink::is_valid);
     let Some(node_link) = node_link else {
-        return state::node_change_state(repository, state, INVALID_NODE).await;
+        return state::node_change_state(repository, state, INVALID_NODE, mount_path.clone()).await;
     };
 
     match node_link.resolve(repository.clone(), state.clone()).await {
         Ok((repository, state)) => {
-            state::node_change_state(&repository, &state, node_link.node).await
+            state::node_change_state(&repository, &state, node_link.node, mount_path.clone()).await
         }
-        Err(_) => state::node_change_state(repository, state, INVALID_NODE).await,
+        Err(_) => {
+            state::node_change_state(repository, state, INVALID_NODE, mount_path.clone()).await
+        }
     }
 }
 
@@ -908,13 +911,14 @@ async fn sync_in_operation(
     options: SyncOptions,
 ) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
-    let current = drawn_subtree_state(&repository, &state_current, &source_path).await;
-    let target = drawn_subtree_state(&repository, &state_target, &source_path).await;
+    let current =
+        drawn_subtree_state(&repository, &state_current, &source_path, &target_path).await;
+    let target = drawn_subtree_state(&repository, &state_target, &source_path, &target_path).await;
     let current_tree = NodeMapping {
-        repository: current.repository.clone(),
-        state: current.state.clone(),
+        repository: current.mapping.repository.clone(),
+        state: current.mapping.state.clone(),
         path: target_path.clone(),
-        node: current.node,
+        node: current.mapping.node,
     };
 
     let changes = if !options.reset {
@@ -937,16 +941,16 @@ async fn sync_in_operation(
         state::diff_filesystem_subtree(
             &operation,
             NodeMapping {
-                repository: target.repository,
-                state: target.state,
+                repository: target.mapping.repository,
+                state: target.mapping.state,
                 path: target_path.clone(),
-                node: target.node,
+                node: target.mapping.node,
             },
             NodeMapping {
-                repository: current.repository,
-                state: current.state,
+                repository: current.mapping.repository,
+                state: current.mapping.state,
                 path: target_path.clone(),
-                node: current.node,
+                node: current.mapping.node,
             },
             target_path,
             options.filter_mode,

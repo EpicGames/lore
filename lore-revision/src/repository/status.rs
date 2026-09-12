@@ -185,7 +185,7 @@ impl LoreRepositoryStatusFileEventData {
     pub fn from_node_change(change: &NodeChange, size: u64) -> Self {
         let node_type = if change.action == FileAction::Add
             || change.action == FileAction::Move
-            || change.to.node.is_valid_node_id()
+            || change.to.mapping.node.is_valid_node_id()
         {
             change.to.flags
         } else {
@@ -199,7 +199,7 @@ impl LoreRepositoryStatusFileEventData {
             LoreNodeType::Directory
         };
         LoreRepositoryStatusFileEventData {
-            path: LoreString::from(&change.path),
+            path: LoreString::from(change.path()),
             size,
             action: LoreFileAction::from(change.action),
             r#type: node_type,
@@ -211,7 +211,7 @@ impl LoreRepositoryStatusFileEventData {
             flag_conflict_automerged: change.flags.is_conflict_automerged().into(),
             flag_conflict_mine: change.flags.is_conflict_mine().into(),
             flag_conflict_theirs: change.flags.is_conflict_theirs().into(),
-            from_path: change.from_path.as_ref().map(|path| path.as_str()).into(),
+            from_path: change.move_source().map(|path| path.as_str()).into(),
         }
     }
 
@@ -460,8 +460,9 @@ async fn file_size_from_node_change_id(change: &NodeChange) -> Result<u64, Statu
     } else {
         let size = change
             .to
+            .mapping
             .state
-            .node(change.to.repository.clone(), change.to.node)
+            .node(change.to.mapping.repository.clone(), change.to.mapping.node)
             .await
             .forward::<StatusError>("accessing node path")?
             .size;
@@ -487,7 +488,7 @@ async fn file_size_from_node_change_path(
     if let Some(observed) = &change.observed {
         return Ok(observed.size);
     }
-    let repository_path = change.path.clone();
+    let repository_path = change.path().clone();
     let info = operation
         .file_info(&repository_path)
         .await
@@ -518,7 +519,7 @@ async fn dirty_change_is_modified(
     }
 
     let node_state = &change.to;
-    if !node_state.node.is_valid_node_id() {
+    if !node_state.mapping.node.is_valid_node_id() {
         return Ok(true);
     }
     let node = node_state
@@ -529,7 +530,7 @@ async fn dirty_change_is_modified(
         return Ok(true);
     }
 
-    let absolute_path = change.path.to_absolute_path(repository.require_path()?);
+    let absolute_path = change.path().to_absolute_path(repository.require_path()?);
     let Ok(metadata) = lore_io::IoDriver::global().metadata(&absolute_path).await else {
         return Ok(true);
     };
@@ -543,7 +544,7 @@ async fn dirty_change_is_modified(
         &node,
         file_mtime,
         file_size,
-        &change.path,
+        change.path(),
         !node.is_staged(),
         None,
     )
@@ -553,8 +554,12 @@ async fn dirty_change_is_modified(
 
     if !modification.is_modified() {
         node_state
+            .mapping
             .state
-            .node_clear_dirty(node_state.repository.clone(), node_state.node)
+            .node_clear_dirty(
+                node_state.mapping.repository.clone(),
+                node_state.mapping.node,
+            )
             .await
             .forward::<StatusError>("clearing stale dirty flag")?;
     }
@@ -1118,7 +1123,7 @@ async fn scan_paths(
                             )
                             .send();
                         } else {
-                            lore_debug!("Ignore staged file {}", change.path);
+                            lore_debug!("Ignore staged file {}", change.path());
                         }
                     }
 
@@ -1519,12 +1524,14 @@ pub async fn status(
                                 &repository,
                                 &state_current,
                                 &selection.source_path,
+                                &selection.mount_path,
                             )
                             .await,
                             layer::drawn_subtree_state(
                                 &repository,
                                 &state_staged,
                                 &selection.source_path,
+                                &selection.mount_path,
                             )
                             .await,
                             selection.mount_path.clone(),

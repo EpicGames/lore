@@ -51,12 +51,12 @@ mod tests {
 
                 let added = changes
                     .iter()
-                    .find(|change| change.path.as_str() == "script.sh")
+                    .find(|change| change.path().as_str() == "script.sh")
                     .expect("the walk must report the new file");
                 assert_eq!(FileAction::Add, added.action);
 
                 let node = staged
-                    .node(repository.clone(), added.to.node)
+                    .node(repository.clone(), added.to.mapping.node)
                     .await
                     .expect("the staged node must read back");
                 let flags = NodeFlags::from_bits_retain(node.flags);
@@ -117,10 +117,10 @@ mod tests {
 
                 let added = changes
                     .iter()
-                    .find(|change| change.path.as_str() == "script.sh")
+                    .find(|change| change.path().as_str() == "script.sh")
                     .expect("the walk must report the new file");
                 let node = staged
-                    .node(repository.clone(), added.to.node)
+                    .node(repository.clone(), added.to.mapping.node)
                     .await
                     .expect("the marked node must read back");
                 let flags = NodeFlags::from_bits_retain(node.flags);
@@ -332,10 +332,10 @@ mod tests {
 
                 let added = changes
                     .iter()
-                    .find(|change| change.path.as_str() == "script.sh")
+                    .find(|change| change.path().as_str() == "script.sh")
                     .expect("the walk must report the file the scan marked");
                 let node = staged
-                    .node(repository.clone(), added.to.node)
+                    .node(repository.clone(), added.to.mapping.node)
                     .await
                     .expect("the staged node must read back");
                 let flags = NodeFlags::from_bits_retain(node.flags);
@@ -415,7 +415,7 @@ mod tests {
                     .find(|change| change.action == FileAction::Move)
                     .expect("the walk must report the rename");
                 let node = staged
-                    .node(repository.clone(), moved.from.node)
+                    .node(repository.clone(), moved.from.mapping.node)
                     .await
                     .expect("the renamed node must read back");
                 let flags = NodeFlags::from_bits_retain(node.flags);
@@ -518,10 +518,10 @@ mod tests {
 
                 let inner = changes
                     .iter()
-                    .find(|change| change.path.as_str() == "thing/inner.txt")
+                    .find(|change| change.path().as_str() == "thing/inner.txt")
                     .expect("the walk must descend into the directory that replaced the file");
                 assert_eq!(FileAction::Add, inner.action);
-                let flags = staged_flags(&repository, &staged, inner.to.node).await;
+                let flags = staged_flags(&repository, &staged, inner.to.mapping.node).await;
                 assert!(
                     flags.contains(NodeFlags::StagedAdd),
                     "content below the replacement must be staged, flags {flags:?}"
@@ -646,11 +646,11 @@ mod tests {
                 let added = changes
                     .iter()
                     .find(|change| {
-                        change.path.as_str() == "thing" && change.action == FileAction::Add
+                        change.path().as_str() == "thing" && change.action == FileAction::Add
                     })
                     .expect("the walk must report the file that replaced the directory");
                 let node = staged
-                    .node(repository.clone(), added.to.node)
+                    .node(repository.clone(), added.to.mapping.node)
                     .await
                     .expect("the replacement must read back");
                 let flags = NodeFlags::from_bits_retain(node.flags);
@@ -717,12 +717,12 @@ mod tests {
 
                 for path in ["thing/shown.txt", "thing/hidden.txt"] {
                     assert!(
-                        changes.iter().any(|change| change.path.as_str() == path
+                        changes.iter().any(|change| change.path().as_str() == path
                             && change.action == FileAction::Delete),
                         "a forced walk must report {path} as deleted, reported {:?}",
                         changes
                             .iter()
-                            .map(|change| (change.path.as_str(), change.action))
+                            .map(|change| (change.path().as_str(), change.action))
                             .collect::<Vec<_>>()
                     );
                 }
@@ -757,7 +757,7 @@ mod tests {
                 assert!(
                     first
                         .iter()
-                        .any(|change| change.path.as_str() == "script.sh"),
+                        .any(|change| change.path().as_str() == "script.sh"),
                     "the first pass must stage the file"
                 );
 
@@ -771,9 +771,9 @@ mod tests {
                 assert!(
                     !second
                         .iter()
-                        .any(|change| change.path.as_str() == "script.sh"),
+                        .any(|change| change.path().as_str() == "script.sh"),
                     "a node already staged must not be staged again, reported {:?}",
-                    second.iter().map(|c| c.path.as_str()).collect::<Vec<_>>()
+                    second.iter().map(|c| c.path().as_str()).collect::<Vec<_>>()
                 );
             }))
             .await
@@ -840,7 +840,7 @@ mod tests {
                 assert!(
                     changes
                         .iter()
-                        .any(|change| change.path.as_str() == "script.sh"
+                        .any(|change| change.path().as_str() == "script.sh"
                             && change.action == FileAction::Add),
                     "the file must be reported back"
                 );
@@ -916,7 +916,7 @@ mod tests {
                 );
                 for path in ["dir", "dir/script.sh"] {
                     assert!(
-                        changes.iter().any(|change| change.path.as_str() == path),
+                        changes.iter().any(|change| change.path().as_str() == path),
                         "what force staged must be reported, missing {path}"
                     );
                 }
@@ -1001,7 +1001,7 @@ mod tests {
                 assert!(
                     !staged_changes
                         .iter()
-                        .any(|change| change.path.as_str() == sibling),
+                        .any(|change| change.path().as_str() == sibling),
                     "staging must leave the merge sibling alone"
                 );
 
@@ -1014,7 +1014,9 @@ mod tests {
                 )
                 .await;
                 assert!(
-                    marked.iter().any(|change| change.path.as_str() == sibling),
+                    marked
+                        .iter()
+                        .any(|change| change.path().as_str() == sibling),
                     "a marking walk must report what the working tree holds"
                 );
             }))

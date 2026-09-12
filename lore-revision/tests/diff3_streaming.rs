@@ -255,7 +255,7 @@ mod tests {
     fn changes_as_summary(changes: &[lore_revision::change::NodeChange]) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = changes
             .iter()
-            .map(|c| (c.path.as_str().to_string(), format!("{:?}", c.action)))
+            .map(|c| (c.path().as_str().to_string(), format!("{:?}", c.action)))
             .collect();
         out.sort();
         out
@@ -322,7 +322,7 @@ mod tests {
                 let same_path_changes: Vec<_> = diff
                     .changes
                     .iter()
-                    .filter(|c| c.path.as_str() == "shared.txt")
+                    .filter(|c| c.path().as_str() == "shared.txt")
                     .collect();
                 assert_eq!(
                     same_path_changes.len(),
@@ -399,7 +399,7 @@ mod tests {
                 .expect("diff3_collect failed");
 
                 let summary = changes_as_summary(&diff.changes);
-                let paths: Vec<&str> = diff.changes.iter().map(|c| c.path.as_str()).collect();
+                let paths: Vec<&str> = diff.changes.iter().map(|c| c.path().as_str()).collect();
 
                 // The target-only change (beta.txt, untouched by source) is
                 // dropped: target's walk is scoped to source-touched paths.
@@ -524,9 +524,10 @@ mod tests {
 
                 let full_summary = changes_as_summary(&full.changes);
                 let scoped_summary = changes_as_summary(&scoped.changes);
-                let full_paths: Vec<&str> = full.changes.iter().map(|c| c.path.as_str()).collect();
+                let full_paths: Vec<&str> =
+                    full.changes.iter().map(|c| c.path().as_str()).collect();
                 let scoped_paths: Vec<&str> =
-                    scoped.changes.iter().map(|c| c.path.as_str()).collect();
+                    scoped.changes.iter().map(|c| c.path().as_str()).collect();
 
                 // The view-scoped diff hides the out-of-view file.
                 assert!(
@@ -622,7 +623,7 @@ mod tests {
         .expect("diff3_collect failed");
         diff.changes
             .iter()
-            .map(|change| change.path.as_str().to_string())
+            .map(|change| change.path().as_str().to_string())
             .collect()
     }
 
@@ -1028,7 +1029,7 @@ mod tests {
                 let conflict_paths: Vec<_> = diff
                     .conflicts
                     .iter()
-                    .map(|(s, _)| s.path.as_str().to_string())
+                    .map(|(s, _)| s.path().as_str().to_string())
                     .collect();
                 assert!(
                     conflict_paths.iter().any(|p| p == "sub/conflicted.txt"),
@@ -1044,7 +1045,7 @@ mod tests {
                 // the directory's path; the overlap filter strips
                 // them when a conflict overlaps.
                 let dir_delete_in_changes = diff.changes.iter().any(|c| {
-                    c.path.as_str() == "sub" && c.action == FileAction::Delete
+                    c.path().as_str() == "sub" && c.action == FileAction::Delete
                 });
                 assert!(
                     !dir_delete_in_changes,
@@ -1056,7 +1057,7 @@ mod tests {
                 // still be present — it is not in conflict, so it is
                 // a clean delete and stays in changes.
                 let keep_deleted = diff.changes.iter().any(|c| {
-                    c.path.as_str() == "sub/keep.txt"
+                    c.path().as_str() == "sub/keep.txt"
                         && c.action == FileAction::Delete
                 });
                 assert!(
@@ -1151,7 +1152,7 @@ mod tests {
                     .conflicts
                     .iter()
                     .flat_map(|(s, t)| {
-                        vec![s.path.as_str().to_string(), t.path.as_str().to_string()]
+                        vec![s.path().as_str().to_string(), t.path().as_str().to_string()]
                     })
                     .collect();
                 let total_a_mentions = summary.iter().filter(|(p, _)| p == "a.txt").count()
@@ -1279,7 +1280,7 @@ mod tests {
                 let conflict_paths: Vec<_> = diff
                     .conflicts
                     .iter()
-                    .map(|(s, _)| s.path.as_str().to_string())
+                    .map(|(s, _)| s.path().as_str().to_string())
                     .collect();
                 assert!(
                     !conflict_paths.iter().any(|p| p == "shared.txt"),
@@ -1292,7 +1293,7 @@ mod tests {
                 let in_changes = diff
                     .changes
                     .iter()
-                    .any(|c| c.path.as_str() == "shared.txt");
+                    .any(|c| c.path().as_str() == "shared.txt");
                 assert!(
                     in_changes,
                     "shared.txt should appear in changes after history-walk resolution; got changes {:?}",

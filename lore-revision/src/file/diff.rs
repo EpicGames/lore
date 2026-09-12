@@ -295,17 +295,17 @@ async fn coalesce_staged_moves(
         if staged_change.action != change::FileAction::Move {
             continue;
         }
-        let Some(from_path) = staged_change.from_path.as_ref() else {
+        let Some(from_path) = staged_change.move_source() else {
             continue;
         };
-        let to_path = &staged_change.path;
+        let to_path = staged_change.path();
 
         let delete_idx = changes
             .iter()
-            .position(|c| c.action == change::FileAction::Delete && c.path == *from_path);
+            .position(|c| c.action == change::FileAction::Delete && c.path() == from_path);
         let add_idx = changes
             .iter()
-            .position(|c| c.action == change::FileAction::Add && c.path == *to_path);
+            .position(|c| c.action == change::FileAction::Add && c.path() == to_path);
 
         let (Some(delete_idx), Some(add_idx)) = (delete_idx, add_idx) else {
             continue;
@@ -313,7 +313,6 @@ async fn coalesce_staged_moves(
 
         changes[add_idx].action = change::FileAction::Move;
         changes[add_idx].from = changes[delete_idx].from.clone();
-        changes[add_idx].from_path = Some(from_path.clone());
 
         changes.remove(delete_idx);
     }
@@ -415,9 +414,9 @@ async fn emit_diff3_changes(
 ) -> Result<(), DiffError> {
     for change in changes {
         if change.action == change::FileAction::Move
-            && let Some(from_path) = change.from_path.as_ref()
+            && let Some(from_path) = change.move_source()
         {
-            if !move_matches_paths(paths, &change.path, from_path) {
+            if !move_matches_paths(paths, change.path(), from_path) {
                 continue;
             }
             emit_move_diff(
@@ -425,7 +424,7 @@ async fn emit_diff3_changes(
                 state_base,
                 state_target,
                 from_path,
-                &change.path,
+                change.path(),
                 options,
             )
             .await?;
@@ -439,17 +438,17 @@ async fn emit_diff3_changes(
             continue;
         }
 
-        if !paths.is_empty() && !paths.contains(&change.path) {
+        if !paths.is_empty() && !paths.contains(change.path()) {
             continue;
         }
 
         let base_content = if is_from_file {
-            diff_read_file(repository.clone(), Some(state_base.clone()), &change.path).await?
+            diff_read_file(repository.clone(), Some(state_base.clone()), change.path()).await?
         } else {
             DiffContent::empty()
         };
         let target_content = if is_to_file {
-            diff_read_file(repository.clone(), state_target.clone(), &change.path).await?
+            diff_read_file(repository.clone(), state_target.clone(), change.path()).await?
         } else {
             DiffContent::empty()
         };
@@ -457,7 +456,7 @@ async fn emit_diff3_changes(
         let source_content = match diff_read_file(
             repository.clone(),
             Some(state_source.clone()),
-            &change.path,
+            change.path(),
         )
         .await
         {
@@ -478,24 +477,28 @@ async fn emit_diff3_changes(
 
         // Binary content: emit a marker instead of rendering bytes as text.
         if base_content.is_binary() || source_content.is_binary() || target_content.is_binary() {
-            emit_binary_diff(&change.path, action);
+            emit_binary_diff(change.path(), action);
             continue;
         }
 
         let target_label = if let Some(state_target) = state_target.as_ref() {
             format!(
                 "{}@{}",
-                change.path.as_str(),
+                change.path().as_str(),
                 state_target.revision_number()
             )
         } else {
-            change.path.as_str().to_string()
+            change.path().as_str().to_string()
         };
 
         if base_content.text() == source_content.text() {
             // Only the target branch modified this file
             let from_label = if is_from_file {
-                format!("{}@{}", change.path.as_str(), state_base.revision_number())
+                format!(
+                    "{}@{}",
+                    change.path().as_str(),
+                    state_base.revision_number()
+                )
             } else {
                 "/dev/null".to_string()
             };
@@ -509,7 +512,7 @@ async fn emit_diff3_changes(
                 target_content.text(),
                 &from_label,
                 &to_label,
-                &change.path,
+                change.path(),
                 action,
                 options,
             );
@@ -527,7 +530,7 @@ async fn emit_diff3_changes(
                 Err(text) => {
                     lore_warn!(
                         "Unexpected merge conflict for auto-resolved file {}: skipping",
-                        change.path.as_str()
+                        change.path().as_str()
                     );
                     lore_debug!("Conflict output: {text}");
                     continue;
@@ -539,11 +542,11 @@ async fn emit_diff3_changes(
                 &merge_result,
                 &format!(
                     "{}@{}",
-                    change.path.as_str(),
+                    change.path().as_str(),
                     state_source.revision_number()
                 ),
                 &format!("{target_label} (merged)"),
-                &change.path,
+                change.path(),
                 action,
                 options,
             );
@@ -576,7 +579,7 @@ async fn emit_diff3_conflicts(
             continue;
         }
 
-        if !paths.is_empty() && !paths.contains(&source_change.path) {
+        if !paths.is_empty() && !paths.contains(source_change.path()) {
             continue;
         }
 
@@ -588,7 +591,7 @@ async fn emit_diff3_conflicts(
             diff_read_file(
                 repository.clone(),
                 Some(state_base.clone()),
-                &source_change.path,
+                source_change.path(),
             )
             .await?
         } else {
@@ -598,7 +601,7 @@ async fn emit_diff3_conflicts(
             diff_read_file(
                 repository.clone(),
                 Some(state_source.clone()),
-                &source_change.path,
+                source_change.path(),
             )
             .await?
         } else {
@@ -608,7 +611,7 @@ async fn emit_diff3_conflicts(
             diff_read_file(
                 repository.clone(),
                 state_target.clone(),
-                &source_change.path,
+                source_change.path(),
             )
             .await?
         } else {
@@ -617,7 +620,7 @@ async fn emit_diff3_conflicts(
 
         // Binary content: emit a marker instead of three-way merging bytes.
         if base.is_binary() || source.is_binary() || target.is_binary() {
-            emit_binary_diff(&source_change.path, LoreFileAction::Keep);
+            emit_binary_diff(source_change.path(), LoreFileAction::Keep);
             continue;
         }
 
@@ -645,14 +648,14 @@ async fn emit_diff3_conflicts(
                     &merge_result,
                     &source_label,
                     &format!("{target_label} (merged)"),
-                    &source_change.path,
+                    source_change.path(),
                     LoreFileAction::Keep,
                     options,
                 );
             }
             Err(conflict_text) => {
                 event::LoreEvent::FileDiff(LoreFileDiffEventData {
-                    path: source_change.path.clone().into(),
+                    path: source_change.path().clone().into(),
                     patch: conflict_text.into(),
                     action: LoreFileAction::Keep,
                 })
@@ -674,9 +677,9 @@ async fn emit_unified_diffs(
 ) -> Result<(), DiffError> {
     for change in changes {
         if change.action == change::FileAction::Move
-            && let Some(from_path) = change.from_path.as_ref()
+            && let Some(from_path) = change.move_source()
         {
-            if !move_matches_paths(paths, &change.path, from_path) {
+            if !move_matches_paths(paths, change.path(), from_path) {
                 continue;
             }
             emit_move_diff(
@@ -684,7 +687,7 @@ async fn emit_unified_diffs(
                 state_source,
                 state_target,
                 from_path,
-                &change.path,
+                change.path(),
                 options,
             )
             .await?;
@@ -695,7 +698,7 @@ async fn emit_unified_diffs(
         let is_to_file = if state_target.is_some() {
             change.to.flags.contains(NodeFlags::File)
         } else {
-            let check_absolute_path = change.path.to_absolute_path(repository.require_path()?);
+            let check_absolute_path = change.path().to_absolute_path(repository.require_path()?);
             lore_io::IoDriver::global()
                 .metadata(check_absolute_path)
                 .await
@@ -706,7 +709,7 @@ async fn emit_unified_diffs(
             continue;
         }
 
-        if !paths.is_empty() && !paths.contains(&change.path) {
+        if !paths.is_empty() && !paths.contains(change.path()) {
             continue;
         }
 
@@ -722,17 +725,20 @@ async fn emit_unified_diffs(
             continue;
         };
 
-        let source_label = diff_label(&change.path, Some(state_source));
-        let target_label = diff_label(&change.path, state_target.as_ref());
+        let source_label = diff_label(change.path(), Some(state_source));
+        let target_label = diff_label(change.path(), state_target.as_ref());
 
         if action == LoreFileAction::Keep {
-            let source =
-                diff_read_file(repository.clone(), Some(state_source.clone()), &change.path)
-                    .await?;
+            let source = diff_read_file(
+                repository.clone(),
+                Some(state_source.clone()),
+                change.path(),
+            )
+            .await?;
             let target =
-                diff_read_file(repository.clone(), state_target.clone(), &change.path).await?;
+                diff_read_file(repository.clone(), state_target.clone(), change.path()).await?;
             if source.is_binary() || target.is_binary() {
-                emit_binary_diff(&change.path, action);
+                emit_binary_diff(change.path(), action);
                 continue;
             }
             emit_diff_event(
@@ -740,16 +746,19 @@ async fn emit_unified_diffs(
                 target.text(),
                 &source_label,
                 &target_label,
-                &change.path,
+                change.path(),
                 action,
                 options,
             );
         } else if action == LoreFileAction::Delete {
-            let source =
-                diff_read_file(repository.clone(), Some(state_source.clone()), &change.path)
-                    .await?;
+            let source = diff_read_file(
+                repository.clone(),
+                Some(state_source.clone()),
+                change.path(),
+            )
+            .await?;
             if source.is_binary() {
-                emit_binary_diff(&change.path, action);
+                emit_binary_diff(change.path(), action);
                 continue;
             }
             emit_diff_event(
@@ -757,23 +766,23 @@ async fn emit_unified_diffs(
                 "",
                 &source_label,
                 "/dev/null",
-                &change.path,
+                change.path(),
                 action,
                 options,
             );
         } else if action == LoreFileAction::Add {
             let target =
-                diff_read_file(repository.clone(), state_target.clone(), &change.path).await?;
+                diff_read_file(repository.clone(), state_target.clone(), change.path()).await?;
             if target.is_binary() {
-                emit_binary_diff(&change.path, action);
+                emit_binary_diff(change.path(), action);
                 continue;
             }
             emit_diff_event(
                 "",
                 target.text(),
                 "/dev/null",
-                change.path.as_str(),
-                &change.path,
+                change.path().as_str(),
+                change.path(),
                 action,
                 options,
             );

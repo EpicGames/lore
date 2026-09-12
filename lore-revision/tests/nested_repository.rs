@@ -71,33 +71,35 @@ mod tests {
                 let reported = || {
                     changes
                         .iter()
-                        .map(|c| c.path.as_str().to_string())
+                        .map(|c| c.path().as_str().to_string())
                         .collect::<Vec<_>>()
                 };
 
                 assert!(
-                    changes.iter().any(|c| c.path.as_str() == "parent_file.txt"),
+                    changes
+                        .iter()
+                        .any(|c| c.path().as_str() == "parent_file.txt"),
                     "expected the parent's own file to be indexed, found: {:?}",
                     reported()
                 );
                 assert!(
                     changes
                         .iter()
-                        .all(|c| !c.path.as_str().starts_with("nested")),
+                        .all(|c| !c.path().as_str().starts_with("nested")),
                     "nested repository contents must not be indexed, found: {:?}",
                     reported()
                 );
                 assert!(
                     changes
                         .iter()
-                        .any(|c| c.path.as_str() == "outer/outer_file.txt"),
+                        .any(|c| c.path().as_str() == "outer/outer_file.txt"),
                     "expected a new directory's own file to be indexed, found: {:?}",
                     reported()
                 );
                 assert!(
                     changes
                         .iter()
-                        .all(|c| !c.path.as_str().starts_with("outer/deep")),
+                        .all(|c| !c.path().as_str().starts_with("outer/deep")),
                     "a nested repository below a new directory must not be indexed, found: {:?}",
                     reported()
                 );
@@ -139,7 +141,7 @@ mod tests {
                 assert!(
                     changes
                         .iter()
-                        .any(|c| c.path.as_str().starts_with("nested")),
+                        .any(|c| c.path().as_str().starts_with("nested")),
                     "expected the plain directory to be indexed by the first scan"
                 );
 
@@ -161,12 +163,12 @@ mod tests {
                 assert!(
                     changes
                         .iter()
-                        .all(|c| !c.path.as_str().starts_with("nested")),
+                        .all(|c| !c.path().as_str().starts_with("nested")),
                     "zombie entry for a staged directory turned nested repository must be \
                      discarded, found: {:?}",
                     changes
                         .iter()
-                        .map(|c| c.path.as_str().to_string())
+                        .map(|c| c.path().as_str().to_string())
                         .collect::<Vec<_>>()
                 );
 
@@ -250,12 +252,12 @@ mod tests {
                 assert!(
                     changes
                         .iter()
-                        .any(|c| c.path.as_str() == "nested/inner.txt"),
+                        .any(|c| c.path().as_str() == "nested/inner.txt"),
                     "a directory committed before becoming a nested repository root \
                      must stay tracked, with its contents still indexed, found: {:?}",
                     changes
                         .iter()
-                        .map(|c| c.path.as_str().to_string())
+                        .map(|c| c.path().as_str().to_string())
                         .collect::<Vec<_>>()
                 );
             }))

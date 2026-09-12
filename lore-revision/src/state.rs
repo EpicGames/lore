@@ -5515,19 +5515,21 @@ async fn load_node_for_change(
 ) -> Option<Node> {
     match source {
         NodeSource::From => {
-            let block_index = NodeBlock::index(from.node);
-            let node_index = Node::index(from.node);
-            from.state
-                .block(from.repository.clone(), block_index)
+            let block_index = NodeBlock::index(from.mapping.node);
+            let node_index = Node::index(from.mapping.node);
+            from.mapping
+                .state
+                .block(from.mapping.repository.clone(), block_index)
                 .await
                 .ok()
                 .map(|block| block.node(node_index))
         }
         NodeSource::To => {
-            let block_index = NodeBlock::index(to.node);
-            let node_index = Node::index(to.node);
-            to.state
-                .block(to.repository.clone(), block_index)
+            let block_index = NodeBlock::index(to.mapping.node);
+            let node_index = Node::index(to.mapping.node);
+            to.mapping
+                .state
+                .block(to.mapping.repository.clone(), block_index)
                 .await
                 .ok()
                 .map(|block| block.node(node_index))
@@ -5545,8 +5547,6 @@ async fn emit_change(
     from: NodeChangeState,
     to: NodeChangeState,
     action: change::FileAction,
-    path: &RelativePath,
-    from_path: Option<&RelativePath>,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
@@ -5554,17 +5554,7 @@ async fn emit_change(
         !matches!(action, FileAction::Delete | FileAction::Add),
         "{action:?} walks the hierarchy and needs a verdict"
     );
-    add_change(
-        from,
-        to,
-        action,
-        path,
-        from_path,
-        sink,
-        filter_mode,
-        FilterStates::ROOT,
-    )
-    .await
+    add_change(from, to, action, sink, filter_mode, FilterStates::ROOT).await
 }
 
 /// `states` is the filter's verdict for `path`, which the hierarchy walk below
@@ -5574,16 +5564,17 @@ async fn add_change(
     from: NodeChangeState,
     to: NodeChangeState,
     action: change::FileAction,
-    path: &RelativePath,
-    from_path: Option<&RelativePath>,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
     // Avoid adding repository root node in case it was to/from an empty repository
-    if from.node != ROOT_NODE || to.node != ROOT_NODE {
+    if from.mapping.node != ROOT_NODE || to.mapping.node != ROOT_NODE {
         // Determine which node to use and load it
-        let source = match (from.node.is_valid_node_id(), to.node.is_valid_node_id()) {
+        let source = match (
+            from.mapping.node.is_valid_node_id(),
+            to.mapping.node.is_valid_node_id(),
+        ) {
             (_, true) => NodeSource::To,
             (true, false) => NodeSource::From,
             (false, false) => NodeSource::Invalid,
@@ -5609,15 +5600,13 @@ async fn add_change(
         let recursion_node = recursion_node_storage.as_ref().unwrap_or(&node);
 
         // Compute flags and create change record
-        let flags = compute_change_flags(&node, action, to.node.is_valid_node_id());
+        let flags = compute_change_flags(&node, action, to.mapping.node.is_valid_node_id());
 
         sink.emit(NodeChange {
             action,
             flags,
             from: from.clone(),
             to: to.clone(),
-            path: path.clone(),
-            from_path: from_path.cloned(),
             observed: None,
         })
         .await?;
@@ -5632,10 +5621,8 @@ async fn add_change(
         return Ok(());
     }
 
-    Box::pin(async move {
-        add_change_hierarchy(from, to, action, path, sink, filter_mode, states).await
-    })
-    .await
+    Box::pin(async move { add_change_hierarchy(from, to, action, sink, filter_mode, states).await })
+        .await
 }
 
 /// Dispatch hierarchy traversal to the appropriate handler based on action.
@@ -5643,16 +5630,15 @@ async fn add_change_hierarchy(
     from: NodeChangeState,
     to: NodeChangeState,
     action: change::FileAction,
-    path: &RelativePath,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
     match action {
         FileAction::Delete => {
-            add_hierarchy_delete(from, to, path, sink, filter_mode, states).await?;
+            add_hierarchy_delete(from, to, sink, filter_mode, states).await?;
         }
-        FileAction::Add => add_hierarchy_add(from, to, path, sink, filter_mode, states).await?,
+        FileAction::Add => add_hierarchy_add(from, to, sink, filter_mode, states).await?,
         _ => {} // Keep/Copy/Move don't recurse here
     }
     Ok(())
@@ -5660,27 +5646,31 @@ async fn add_change_hierarchy(
 
 /// Recursively add delete changes for an entire directory hierarchy.
 ///
-/// `states` is the filter's verdict for `path`, which each child steps from.
+/// `states` is the filter's verdict for the path being walked, which each child steps from.
 async fn add_hierarchy_delete(
     from: NodeChangeState,
     to: NodeChangeState,
-    path: &RelativePath,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
     // Try to get nodes from both states first
-    let from_node = if from.node.is_valid_or_root_node_id() {
-        from.state
-            .node(from.repository.clone(), from.node)
+    let from_node = if from.mapping.node.is_valid_or_root_node_id() {
+        from.mapping
+            .state
+            .node(from.mapping.repository.clone(), from.mapping.node)
             .await
             .ok()
     } else {
         None
     };
 
-    let to_node = if to.node.is_valid_or_root_node_id() {
-        to.state.node(to.repository.clone(), to.node).await.ok()
+    let to_node = if to.mapping.node.is_valid_or_root_node_id() {
+        to.mapping
+            .state
+            .node(to.mapping.repository.clone(), to.mapping.node)
+            .await
+            .ok()
     } else {
         None
     };
@@ -5706,34 +5696,35 @@ async fn add_hierarchy_delete(
 
     // Iterate children from whichever state has the node
     let mut children = StateNodeChildrenWithNameIterator::new(
-        iteration_state.state.clone(),
-        iteration_state.repository.clone(),
-        iteration_state.node,
+        iteration_state.mapping.state.clone(),
+        iteration_state.mapping.repository.clone(),
+        iteration_state.mapping.node,
     )
     .await?;
 
     while let Some((child_id, child_node, child_name)) = children.next().await? {
-        let child_path = path.push_into_buf(child_name).freeze();
+        let child_path = iteration_state
+            .mapping
+            .path
+            .push_into_buf(child_name)
+            .freeze();
 
         // Skip excluded paths
-        let (child_states, excluded) = iteration_state.repository.filter.child_emit_excludes(
-            states,
-            &child_path,
-            child_node.is_directory(),
-            filter_mode,
-        );
+        let (child_states, excluded) = iteration_state
+            .mapping
+            .repository
+            .filter
+            .child_emit_excludes(states, &child_path, child_node.is_directory(), filter_mode);
         if excluded {
             continue;
         }
 
-        let child_from = iteration_state.from_child(child_id, &child_node);
+        let child_from = iteration_state.from_child(child_id, &child_node, child_path.clone());
 
         Box::pin(add_change(
             child_from,
-            to.invalid(),
+            to.invalid(child_path),
             FileAction::Delete,
-            &child_path,
-            None,
             sink,
             filter_mode,
             child_states,
@@ -5745,18 +5736,21 @@ async fn add_hierarchy_delete(
 
 /// Recursively add add changes for an entire directory hierarchy.
 ///
-/// `states` is the filter's verdict for `path`, which each child steps from.
+/// `states` is the filter's verdict for the path being walked, which each child steps from.
 async fn add_hierarchy_add(
     from: NodeChangeState,
     to: NodeChangeState,
-    path: &RelativePath,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
     // Check early exit conditions
-    let to_node = if to.node.is_valid_or_root_node_id() {
-        to.state.node(to.repository.clone(), to.node).await.ok()
+    let to_node = if to.mapping.node.is_valid_or_root_node_id() {
+        to.mapping
+            .state
+            .node(to.mapping.repository.clone(), to.mapping.node)
+            .await
+            .ok()
     } else {
         None
     };
@@ -5774,15 +5768,18 @@ async fn add_hierarchy_add(
         return Ok(());
     }
 
-    let mut children =
-        StateNodeChildrenWithNameIterator::new(to.state.clone(), to.repository.clone(), to.node)
-            .await?;
+    let mut children = StateNodeChildrenWithNameIterator::new(
+        to.mapping.state.clone(),
+        to.mapping.repository.clone(),
+        to.mapping.node,
+    )
+    .await?;
 
     while let Some((child_id, child_node, child_name)) = children.next().await? {
-        let child_path = path.push_into_buf(child_name).freeze();
+        let child_path = to.mapping.path.push_into_buf(child_name).freeze();
 
         // Skip excluded paths
-        let (child_states, excluded) = to.repository.filter.child_emit_excludes(
+        let (child_states, excluded) = to.mapping.repository.filter.child_emit_excludes(
             states,
             &child_path,
             child_node.is_directory(),
@@ -5792,13 +5789,11 @@ async fn add_hierarchy_add(
             continue;
         }
 
-        let child_to = to.from_child(child_id, &child_node);
+        let child_to = to.from_child(child_id, &child_node, child_path.clone());
         Box::pin(add_change(
-            from.invalid(),
+            from.invalid(child_path),
             child_to,
             FileAction::Add,
-            &child_path,
-            None,
             sink,
             filter_mode,
             child_states,
@@ -5808,19 +5803,17 @@ async fn add_hierarchy_add(
     Ok(())
 }
 
-/// Detect and coalesce add/delete pairs that represent file moves.
+/// Coalesce the add/delete pairs that name one file into moves.
 ///
-/// Files are identified by their context (file ID) in the node address.
-/// When an add and delete have the same non-zero context, they represent
-/// a move operation and should be coalesced into a single move change.
+/// A file is identified by the context in its node address, so an add and a delete sharing a
+/// non-zero context are the two halves of a move.
 ///
-/// This function modifies the changes vector in-place:
-/// - Matching add/delete pairs are converted to move actions
-/// - The delete change is marked for removal (action set to Keep with empty path)
-/// - The add change is converted to a Move with `from_path` set
+/// The vector is modified in place: the add becomes the move, taking the delete's `from` as its
+/// source, and the delete is dropped. Changes that are not coalesced keep their order.
 pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
     let mut adds: Vec<(usize, Context)> = Vec::new();
     let mut deletes: Vec<(usize, Context)> = Vec::new();
+    let mut coalesced: Vec<usize> = Vec::new();
 
     for index in 0..changes.len() {
         match changes[index].action {
@@ -5835,25 +5828,19 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
                     .position(|(_, delete_context)| *delete_context == context);
 
                 if let Some(delete_vec_index) = matching_delete_pos {
-                    // Found a match - coalesce into a move immediately
                     let (delete_index, _) = deletes.remove(delete_vec_index);
-
-                    // Extract data from the delete change
-                    let from_path = changes[delete_index].path.clone();
                     let from_state = changes[delete_index].from.clone();
 
                     lore_trace!(
                         "Detected move: {} -> {}",
-                        from_path.as_str(),
-                        changes[index].path.as_str()
+                        from_state.mapping.path.as_str(),
+                        changes[index].path().as_str()
                     );
 
                     changes[index].action = FileAction::Move;
-                    changes[index].from_path = Some(from_path);
                     changes[index].from = from_state;
 
-                    changes[delete_index].action = FileAction::Keep;
-                    changes[delete_index].path = RelativePath::new();
+                    coalesced.push(delete_index);
                 } else {
                     adds.push((index, context));
                 }
@@ -5871,21 +5858,18 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
                 if let Some(add_vec_index) = matching_add_pos {
                     let (add_index, _) = adds.remove(add_vec_index);
 
-                    let from_path = changes[index].path.clone();
                     let from_state = changes[index].from.clone();
 
                     lore_trace!(
                         "Detected move: {} -> {}",
-                        from_path.as_str(),
-                        changes[add_index].path.as_str()
+                        from_state.mapping.path.as_str(),
+                        changes[add_index].path().as_str()
                     );
 
                     changes[add_index].action = FileAction::Move;
-                    changes[add_index].from_path = Some(from_path);
                     changes[add_index].from = from_state;
 
-                    changes[index].action = FileAction::Keep;
-                    changes[index].path = RelativePath::new();
+                    coalesced.push(index);
                 } else {
                     deletes.push((index, context));
                 }
@@ -5894,14 +5878,16 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
         }
     }
 
-    let mut i = 0;
-    while i < changes.len() {
-        if changes[i].action == FileAction::Keep && changes[i].path.is_empty() {
-            changes.swap_remove(i);
-        } else {
-            i += 1;
-        }
+    if coalesced.is_empty() {
+        return;
     }
+    coalesced.sort_unstable();
+    let mut position = 0;
+    changes.retain(|_| {
+        let keep = coalesced.binary_search(&position).is_err();
+        position += 1;
+        keep
+    });
 }
 
 /// Calculate the set of changes between two revision states and emit them
@@ -5947,23 +5933,30 @@ pub async fn diff(
             state_to
         };
 
-        let from = node_change_state(&repository_from, &state_from, from_link.node).await;
-        let to = node_change_state(&repository_to, &state_to, to_link.node).await;
+        let from =
+            node_change_state(&repository_from, &state_from, from_link.node, path.clone()).await;
+        let to = node_change_state(&repository_to, &state_to, to_link.node, path.clone()).await;
 
         diff::diff_subtree(from, to, path, 0, graft, sink, filter_mode).await?;
     } else {
         diff::diff_subtree(
             NodeChangeState {
-                repository: repository_from,
-                state: state_from,
-                node: ROOT_NODE,
+                mapping: NodeMapping {
+                    repository: repository_from,
+                    state: state_from,
+                    path: RelativePath::new(),
+                    node: ROOT_NODE,
+                },
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
             },
             NodeChangeState {
-                repository: repository_to,
-                state: state_to,
-                node: ROOT_NODE,
+                mapping: NodeMapping {
+                    repository: repository_to,
+                    state: state_to,
+                    path: RelativePath::new(),
+                    node: ROOT_NODE,
+                },
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
             },
@@ -5979,12 +5972,14 @@ pub async fn diff(
     Ok(())
 }
 
-/// The node `node_id` of `state` as one side of a change, carrying the flags and address it
-/// holds. A node the state does not hold is one side of an add or a delete, and carries none.
+/// The node `node_id` of `state` at `path`, as one side of a change, carrying the flags and
+/// address it holds. A node the state does not hold is one side of an add or a delete, and
+/// carries none.
 pub(crate) async fn node_change_state(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
     node_id: NodeID,
+    path: RelativePath,
 ) -> NodeChangeState {
     let (address, flags) = if let Ok(node) = state.node(repository.clone(), node_id).await {
         (node.address, NodeFlags::from_bits_retain(node.flags))
@@ -5992,9 +5987,12 @@ pub(crate) async fn node_change_state(
         (Address::default(), NodeFlags::NoFlags)
     };
     NodeChangeState {
-        repository: repository.clone(),
-        state: state.clone(),
-        node: node_id,
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path,
+            node: node_id,
+        },
         flags,
         address,
     }
@@ -6049,7 +6047,6 @@ pub async fn diff_collect(
         .await?;
     }
     detect_and_coalesce_moves(&mut changes);
-    // Re-sort after move coalescing which uses swap_remove and can break path order.
     crate::change::sort_by_path(&mut changes);
     Ok(changes)
 }
@@ -6059,8 +6056,8 @@ pub async fn diff_collect(
 /// `path` is as seen from the top-level repository instance root, which every repository context
 /// shares, while `node` names the same subtree in `state`'s own repository tree. The two part
 /// wherever a link or layer mount draws its subtree from a path other than the one it is mounted
-/// at. An invalid `node` is one side of an add or a delete, where the state holds nothing and the
-/// path answers for nothing either.
+/// at. An invalid `node` is a path the state holds nothing at, which is where a file the file
+/// system alone holds stands.
 ///
 /// As an example, a link mounting a linked repository at `mount`, for the file that repository
 /// holds at `dir/file.txt`:
@@ -6070,7 +6067,7 @@ pub async fn diff_collect(
 /// - `state`: the linked repository's revision state
 /// - `path`: `mount/dir/file.txt`
 /// - `node`: the node ID for `dir/file.txt` in `state`, loaded from `repository`
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NodeMapping {
     /// The repository `node` and its content exist in.
     pub repository: Arc<RepositoryContext>,
@@ -6704,12 +6701,15 @@ struct FileDiffContext {
 }
 
 impl FileDiffContext {
-    /// Create a `NodeChangeState` for the 'from' side of a change.
-    fn create_from_change_state(&self) -> NodeChangeState {
+    /// The 'from' side of a change, at `path`.
+    fn create_from_change_state(&self, path: RelativePath) -> NodeChangeState {
         NodeChangeState {
-            repository: self.repository_from.clone(),
-            state: self.state_from.clone(),
-            node: self.from_node_id,
+            mapping: NodeMapping {
+                repository: self.repository_from.clone(),
+                state: self.state_from.clone(),
+                path,
+                node: self.from_node_id,
+            },
             flags: self
                 .from_node
                 .map_or(NodeFlags::NoFlags, |n| NodeFlags::from_bits_retain(n.flags)),
@@ -6717,34 +6717,43 @@ impl FileDiffContext {
         }
     }
 
-    /// Create a `NodeChangeState` representing an invalid/empty state.
-    fn invalid_change_state(&self) -> NodeChangeState {
+    /// The side a change does not have, standing at `path` and holding no node there.
+    fn invalid_change_state(&self, path: RelativePath) -> NodeChangeState {
         NodeChangeState {
-            repository: self.repository_from.clone(),
-            state: self.state_from.clone(),
-            node: INVALID_NODE,
+            mapping: NodeMapping {
+                repository: self.repository_from.clone(),
+                state: self.state_from.clone(),
+                path,
+                node: INVALID_NODE,
+            },
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         }
     }
 
-    /// Create a `NodeChangeState` for a new file (filesystem path not in state).
-    fn new_file_change_state(&self) -> NodeChangeState {
+    /// A new file at `path`, which the file system holds and the state does not.
+    fn new_file_change_state(&self, path: RelativePath) -> NodeChangeState {
         NodeChangeState {
-            repository: self.repository_from.clone(),
-            state: self.state_from.clone(),
-            node: INVALID_NODE,
+            mapping: NodeMapping {
+                repository: self.repository_from.clone(),
+                state: self.state_from.clone(),
+                path,
+                node: INVALID_NODE,
+            },
             flags: NodeFlags::File,
             address: Address::default(),
         }
     }
 
-    /// Create a `NodeChangeState` for a new directory (filesystem path not in state).
-    fn new_directory_change_state(&self) -> NodeChangeState {
+    /// A new directory at `path`, which the file system holds and the state does not.
+    fn new_directory_change_state(&self, path: RelativePath) -> NodeChangeState {
         NodeChangeState {
-            repository: self.repository_from.clone(),
-            state: self.state_from.clone(),
-            node: INVALID_NODE,
+            mapping: NodeMapping {
+                repository: self.repository_from.clone(),
+                state: self.state_from.clone(),
+                path,
+                node: INVALID_NODE,
+            },
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         }
@@ -6752,15 +6761,22 @@ impl FileDiffContext {
 
     /// The `to` side of a change for a node this context added, carrying the flags it
     /// settled with rather than the ones it was created with.
-    async fn settled_change_state(&self, node_id: NodeID) -> Result<NodeChangeState, StateError> {
+    async fn settled_change_state(
+        &self,
+        node_id: NodeID,
+        path: RelativePath,
+    ) -> Result<NodeChangeState, StateError> {
         let node = self
             .state_from
             .node(self.repository_from.clone(), node_id)
             .await?;
         Ok(NodeChangeState {
-            repository: self.repository_from.clone(),
-            state: self.state_from.clone(),
-            node: node_id,
+            mapping: NodeMapping {
+                repository: self.repository_from.clone(),
+                state: self.state_from.clone(),
+                path,
+                node: node_id,
+            },
             flags: NodeFlags::from_bits_retain(node.flags),
             address: node.address,
         })
@@ -6967,11 +6983,9 @@ async fn settle_insisted_modification(
     )
     .await?;
     emit_change(
-        ctx.create_from_change_state(),
-        ctx.new_file_change_state(),
+        ctx.create_from_change_state(file_path.clone()),
+        ctx.new_file_change_state(file_path.clone()),
         FileAction::Keep,
-        file_path,
-        None,
         sink,
         filter_mode,
     )
@@ -6982,6 +6996,10 @@ async fn settle_insisted_modification(
 ///
 /// A directory holds no content to compare, so it is settled on being asked rather than on
 /// anything the walk found. The descent below it runs either way.
+///
+/// The keep it emits holds no node on its `to` side, which is what marks a change as measured
+/// against the file system rather than another revision and what [`compute_change_flags`] reports
+/// as a modification.
 #[allow(clippy::too_many_arguments)]
 async fn settle_insisted_directory(
     node_list: &StateChildrenNodes,
@@ -7001,14 +7019,17 @@ async fn settle_insisted_directory(
     )
     .await?;
     let from = NodeChangeState {
-        repository: node_list.repository.clone(),
-        state: node_list.state.clone(),
-        node: node_id,
+        mapping: NodeMapping {
+            repository: node_list.repository.clone(),
+            state: node_list.state.clone(),
+            path: path.clone(),
+            node: node_id,
+        },
         flags: NodeFlags::from_bits_retain(node.flags),
         address: node.address,
     };
-    let to = from.invalid();
-    emit_change(from, to, FileAction::Keep, path, None, sink, filter_mode).await
+    let to = from.invalid(path.clone());
+    emit_change(from, to, FileAction::Keep, sink, filter_mode).await
 }
 
 /// Report the delete of the node a type change displaced and the add of what replaced it,
@@ -7038,11 +7059,9 @@ async fn emit_type_replacement(
     }
 
     add_change(
-        ctx.create_from_change_state(),
-        ctx.invalid_change_state(),
+        ctx.create_from_change_state(file_path.clone()),
+        ctx.invalid_change_state(file_path.clone()),
         FileAction::Delete,
-        file_path,
-        None,
         sink,
         filter_mode,
         ctx.states,
@@ -7055,19 +7074,18 @@ async fn emit_type_replacement(
         INVALID_NODE
     };
     let to_state = if replacement.is_valid_node_id() {
-        ctx.settled_change_state(replacement).await?
+        ctx.settled_change_state(replacement, file_path.clone())
+            .await?
     } else if is_directory {
-        ctx.new_directory_change_state()
+        ctx.new_directory_change_state(file_path.clone())
     } else {
-        ctx.new_file_change_state()
+        ctx.new_file_change_state(file_path.clone())
     };
 
     add_change(
-        ctx.invalid_change_state(),
+        ctx.invalid_change_state(file_path.clone()),
         to_state,
         FileAction::Add,
-        file_path,
-        None,
         sink,
         filter_mode,
         ctx.states,
@@ -7126,22 +7144,26 @@ async fn emit_unstaged_add(
     let node = block.node(node_index);
     add_change(
         NodeChangeState {
-            repository: repository.clone(),
-            state: state.clone(),
-            node: INVALID_NODE,
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: file_path.clone(),
+                node: INVALID_NODE,
+            },
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         },
         NodeChangeState {
-            repository: repository.clone(),
-            state: state.clone(),
-            node: from_node_id,
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: file_path.clone(),
+                node: from_node_id,
+            },
             flags: NodeFlags::from_bits_retain(node.flags),
             address: node.address,
         },
         change::FileAction::Add,
-        file_path,
-        None,
         sink,
         filter_mode,
         states,
@@ -7220,21 +7242,25 @@ async fn emit_add_node_single(
         action: change::FileAction::Add,
         flags: compute_change_flags(&node, change::FileAction::Add, true),
         from: NodeChangeState {
-            repository: repository.clone(),
-            state: state.clone(),
-            node: INVALID_NODE,
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: path.clone(),
+                node: INVALID_NODE,
+            },
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         },
         to: NodeChangeState {
-            repository: repository.clone(),
-            state: state.clone(),
-            node: node_id,
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: path.clone(),
+                node: node_id,
+            },
             flags: NodeFlags::from_bits_retain(node.flags),
             address: node.address,
         },
-        path: path.clone(),
-        from_path: None,
         observed: None,
     })
     .await?;
@@ -7297,12 +7323,13 @@ async fn handle_single_file_compare_result(
                     )
                     .await?;
                 }
+                let item_path = file_path.to_path();
                 add_change(
-                    ctx.create_from_change_state(),
-                    ctx.new_file_change_state(),
+                    ctx.create_from_change_state(
+                        from_path.cloned().unwrap_or_else(|| item_path.clone()),
+                    ),
+                    ctx.new_file_change_state(item_path.clone()),
                     change::FileAction::Move,
-                    &file_path.to_path(),
-                    from_path,
                     sink,
                     filter_mode,
                     ctx.states,
@@ -7364,12 +7391,13 @@ async fn handle_single_file_compare_result(
                 .await?;
             }
 
+            let item_path = file_path.to_path();
             add_change(
-                ctx.create_from_change_state(),
-                ctx.new_file_change_state(),
+                ctx.create_from_change_state(
+                    from_path.cloned().unwrap_or_else(|| item_path.clone()),
+                ),
+                ctx.new_file_change_state(item_path.clone()),
                 action,
-                &file_path.to_path(),
-                from_path,
                 sink,
                 filter_mode,
                 ctx.states,
@@ -7385,24 +7413,25 @@ async fn handle_single_file_compare_result(
             // through its NodeID so compute_change_flags loads it and sets Dirty.
             let to_state = if !is_filesystem_directory && ctx.intent.marks_dirty() {
                 NodeChangeState {
-                    repository: ctx.repository_from.clone(),
-                    state: ctx.state_from.clone(),
-                    node: ctx.add_new_node(&file_path.to_path(), false).await?,
+                    mapping: NodeMapping {
+                        repository: ctx.repository_from.clone(),
+                        state: ctx.state_from.clone(),
+                        path: file_path.to_path(),
+                        node: ctx.add_new_node(&file_path.to_path(), false).await?,
+                    },
                     flags: NodeFlags::File | NodeFlags::DirtyAdd,
                     address: Address::default(),
                 }
             } else if is_filesystem_directory {
-                ctx.new_directory_change_state()
+                ctx.new_directory_change_state(file_path.to_path())
             } else {
-                ctx.new_file_change_state()
+                ctx.new_file_change_state(file_path.to_path())
             };
 
             add_change(
-                ctx.invalid_change_state(),
+                ctx.invalid_change_state(file_path.to_path()),
                 to_state,
                 FileAction::Add,
-                &file_path.to_path(),
-                None,
                 sink,
                 filter_mode,
                 ctx.states,
@@ -7539,20 +7568,21 @@ async fn emit_single_delete(
     let node = block.node(Node::index(node_id));
     let flags = compute_change_flags(&node, FileAction::Delete, false);
     let from = NodeChangeState {
-        repository,
-        state,
-        node: node_id,
+        mapping: NodeMapping {
+            repository,
+            state,
+            path: path.clone(),
+            node: node_id,
+        },
         flags: NodeFlags::from_bits_retain(node.flags),
         address: node.address,
     };
-    let to = from.invalid();
+    let to = from.invalid(path.clone());
     sink.emit(NodeChange {
         action: FileAction::Delete,
         flags,
         from,
         to,
-        path: path.clone(),
-        from_path: None,
         observed: None,
     })
     .await
@@ -8165,22 +8195,26 @@ async fn diff_filesystem_directory_walk(
             } else if is_rename {
                 add_change(
                     NodeChangeState {
-                        repository: node_list.repository.clone(),
-                        state: node_list.state.clone(),
-                        node: from_named_node.node,
+                        mapping: NodeMapping {
+                            repository: node_list.repository.clone(),
+                            state: node_list.state.clone(),
+                            path: from_path.clone(),
+                            node: from_named_node.node,
+                        },
                         flags: NodeFlags::from_bits_retain(from_node.flags),
                         address: from_node.address,
                     },
                     NodeChangeState {
-                        repository: current_node_list.repository.clone(),
-                        state: current_node_list.state.clone(),
-                        node: current_node_id,
+                        mapping: NodeMapping {
+                            repository: current_node_list.repository.clone(),
+                            state: current_node_list.state.clone(),
+                            path: item_path.clone(),
+                            node: current_node_id,
+                        },
                         flags: NodeFlags::from_bits_retain(current_node.flags),
                         address: current_node.address,
                     },
                     FileAction::Move,
-                    &item_path,
-                    Some(&from_path),
                     &mut ChangeSink::Vec(&mut *changes),
                     ctx.filter_mode,
                     item_states,
@@ -8432,22 +8466,26 @@ async fn diff_filesystem_directory_walk(
 
         add_change(
             NodeChangeState {
-                repository: node_list.repository.clone(),
-                state: node_list.state.clone(),
-                node: from_named_node.node,
+                mapping: NodeMapping {
+                    repository: node_list.repository.clone(),
+                    state: node_list.state.clone(),
+                    path: from_node.path.clone(),
+                    node: from_named_node.node,
+                },
                 flags: NodeFlags::from_bits_retain(from_node.node.flags),
                 address: from_node.node.address,
             },
             NodeChangeState {
-                repository: node_list.repository.clone(),
-                state: node_list.state.clone(),
-                node: INVALID_NODE,
+                mapping: NodeMapping {
+                    repository: node_list.repository.clone(),
+                    state: node_list.state.clone(),
+                    path: from_node.path.clone(),
+                    node: INVALID_NODE,
+                },
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
             },
             FileAction::Delete,
-            &from_node.path,
-            None,
             &mut ChangeSink::Vec(&mut *changes),
             ctx.filter_mode,
             from_node_states,
@@ -8932,22 +8970,26 @@ async fn diff_filesystem_missing(
 
         add_change(
             NodeChangeState {
-                repository: from.repository.clone(),
-                state: from.state.clone(),
-                node: from.node,
+                mapping: NodeMapping {
+                    repository: from.repository.clone(),
+                    state: from.state.clone(),
+                    path: from.path.clone(),
+                    node: from.node,
+                },
                 flags: NodeFlags::from_bits_retain(from_node.flags),
                 address: from_node.address,
             },
             NodeChangeState {
-                repository: from.repository,
-                state: from.state,
-                node: INVALID_NODE,
+                mapping: NodeMapping {
+                    repository: from.repository,
+                    state: from.state,
+                    path: from.path,
+                    node: INVALID_NODE,
+                },
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
             },
             FileAction::Delete,
-            &filesystem_path,
-            None,
             &mut ChangeSink::Vec(&mut changes),
             filter_mode,
             states,
@@ -10612,11 +10654,11 @@ pub async fn apply_tree_changes(
         .iter()
         .filter(|c| c.action == FileAction::Delete)
         .collect();
-    delete_changes.sort_by_key(|b| std::cmp::Reverse(b.path.as_str().len()));
+    delete_changes.sort_by_key(|b| std::cmp::Reverse(b.path().as_str().len()));
 
     for change in &delete_changes {
         let node_link = match target_state
-            .find_node_link(repository.clone(), change.path.as_str())
+            .find_node_link(repository.clone(), change.path().as_str())
             .await
         {
             Ok(node_link) => node_link,
@@ -10628,7 +10670,7 @@ pub async fn apply_tree_changes(
             crate::stage::stage_delete(
                 repository.clone(),
                 target_state.clone(),
-                change.path.clone(),
+                change.path().clone(),
                 node_link.node,
                 NodeFlags::StagedMerge,
                 stats.clone(),
@@ -10647,7 +10689,7 @@ pub async fn apply_tree_changes(
 
         // For move actions, delete the old path first
         if change.action == FileAction::Move
-            && let Some(from_path) = change.from_path.as_ref()
+            && let Some(from_path) = change.move_source()
         {
             let node_link = match target_state
                 .find_node_link(repository.clone(), from_path.as_str())
@@ -10674,21 +10716,21 @@ pub async fn apply_tree_changes(
         }
 
         // Get the source node data from the change
-        let source_state = &change.to.state;
-        let source_node_id = change.to.node;
+        let source_state = &change.to.mapping.state;
+        let source_node_id = change.to.mapping.node;
         if !source_node_id.is_valid_node_id() {
             continue;
         }
 
         let node = source_state
-            .node(change.to.repository.clone(), source_node_id)
+            .node(change.to.mapping.repository.clone(), source_node_id)
             .await?;
 
         // Stage the node into the target state at the change path
         crate::stage::stage_single_node(
             repository.clone(),
             target_state.clone(),
-            change.path.clone(),
+            change.path().clone(),
             node,
             stats.clone(),
             None,

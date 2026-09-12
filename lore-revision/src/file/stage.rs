@@ -1188,6 +1188,15 @@ pub async fn stage_move(
             "Path {from_path} does not exist in repository "
         )));
     }
+    if from_node_link.repository != repository.id {
+        // TODO(vri): UCS-18009 - Implement stage move for linked changes
+        // The lookup crossed a link, so the node it answers with is numbered by that
+        // repository's state and names nothing in this one. Everything below reads and
+        // relinks it here.
+        return Err(StageError::internal(
+            "Links not yet implemented, cannot perform actions in other repositories",
+        ));
+    }
 
     let from_node = state
         .node(repository.clone(), from_node_link.node)

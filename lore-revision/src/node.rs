@@ -21,8 +21,6 @@ use zerocopy::IntoBytes;
 
 use crate::bitflagsops;
 use crate::change;
-use crate::change::FileAction;
-use crate::change::NodeChange;
 use crate::errors::InvalidArguments;
 use crate::errors::InvalidNodeHierarchy;
 use crate::errors::Oversized;
@@ -1893,23 +1891,6 @@ impl NodeDelta {
             _unused: 0,
             action: change::FileAction::from_node_flags(node_flags) as u16,
             flags: change_flags.bits(),
-        }
-    }
-
-    pub fn from_node_change(change: NodeChange) -> Self {
-        let node = match change.action {
-            FileAction::Delete => change.from.node,
-            FileAction::Add
-            | FileAction::Move
-            | FileAction::Copy
-            | FileAction::Graft
-            | FileAction::Keep => change.to.node,
-        };
-        NodeDelta {
-            node,
-            _unused: 0,
-            action: change.action as u16,
-            flags: change.flags.bits(),
         }
     }
 }

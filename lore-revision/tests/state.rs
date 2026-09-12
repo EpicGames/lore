@@ -1327,11 +1327,18 @@ mod single_file_compare_result_tests {
         );
     }
 
-    fn make_change_state(repository: Arc<RepositoryContext>, context: Context) -> NodeChangeState {
+    fn make_change_state(
+        repository: Arc<RepositoryContext>,
+        context: Context,
+        path: &str,
+    ) -> NodeChangeState {
         NodeChangeState {
-            repository,
-            state: Arc::new(State::new()),
-            node: INVALID_NODE,
+            mapping: lore_revision::state::NodeMapping {
+                repository,
+                state: Arc::new(State::new()),
+                path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
+                node: INVALID_NODE,
+            },
             flags: NodeFlags::NoFlags,
             address: Address {
                 hash: Hash::default(),
@@ -1340,6 +1347,8 @@ mod single_file_compare_result_tests {
         }
     }
 
+    /// Both sides stand where the change does, as a walk leaves them: coalescing a delete and an
+    /// add into a move carries the delete side across, and the source it reports comes from there.
     fn make_change(
         repository: Arc<RepositoryContext>,
         action: FileAction,
@@ -1350,10 +1359,8 @@ mod single_file_compare_result_tests {
         NodeChange {
             action,
             flags: change::Flags::None,
-            from: make_change_state(repository.clone(), from_context),
-            to: make_change_state(repository, to_context),
-            path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
-            from_path: None,
+            from: make_change_state(repository.clone(), from_context, path),
+            to: make_change_state(repository, to_context, path),
             observed: None,
         }
     }
@@ -1408,7 +1415,7 @@ mod single_file_compare_result_tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Add);
-        assert_eq!(changes[0].path.as_str(), "new_file.txt");
+        assert_eq!(changes[0].path().as_str(), "new_file.txt");
     }
 
     #[tokio::test]
@@ -1427,7 +1434,7 @@ mod single_file_compare_result_tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Delete);
-        assert_eq!(changes[0].path.as_str(), "deleted_file.txt");
+        assert_eq!(changes[0].path().as_str(), "deleted_file.txt");
     }
 
     #[tokio::test]
@@ -1457,9 +1464,9 @@ mod single_file_compare_result_tests {
         // Should have exactly one move change
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Move);
-        assert_eq!(changes[0].path.as_str(), "new/path.txt");
+        assert_eq!(changes[0].path().as_str(), "new/path.txt");
         assert_eq!(
-            changes[0].from_path.as_ref().map(|p| p.as_str()),
+            changes[0].move_source().map(|p| p.as_str()),
             Some("old/path.txt")
         );
     }
@@ -1510,7 +1517,7 @@ mod single_file_compare_result_tests {
         assert!(changes.iter().all(|c| c.action == FileAction::Move));
 
         // Both should have from_path set
-        assert!(changes.iter().all(|c| c.from_path.is_some()));
+        assert!(changes.iter().all(|c| c.move_source().is_some()));
     }
 
     #[tokio::test]
@@ -1682,10 +1689,61 @@ mod single_file_compare_result_tests {
             .iter()
             .find(|c| c.action == FileAction::Move)
             .unwrap();
-        assert_eq!(move_change.path.as_str(), "moved_to.txt");
+        assert_eq!(move_change.path().as_str(), "moved_to.txt");
         assert_eq!(
-            move_change.from_path.as_ref().map(|p| p.as_str()),
+            move_change.move_source().map(|p| p.as_str()),
             Some("moved_from.txt")
+        );
+    }
+
+    /// Dropping the folded delete leaves the changes around it where they were, which a caller
+    /// that does not sort afterwards reports in the order the walk found them.
+    #[tokio::test]
+    async fn changes_not_folded_into_a_move_keep_their_order() {
+        let repo = new_test_context().await;
+        let moved = context_from_u128(1);
+        let kept_first = context_from_u128(2);
+        let kept_last = context_from_u128(3);
+
+        let mut changes = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Keep,
+                "first.txt",
+                kept_first,
+                kept_first,
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "moved_from.txt",
+                moved,
+                Context::default(),
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Keep,
+                "last.txt",
+                kept_last,
+                kept_last,
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "moved_to.txt",
+                Context::default(),
+                moved,
+            ),
+        ];
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| c.path().as_str())
+                .collect::<Vec<_>>(),
+            vec!["first.txt", "last.txt", "moved_to.txt"],
         );
     }
 
