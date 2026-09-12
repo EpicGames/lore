@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 // The included files do not pass this lint
 #![allow(clippy::doc_markdown)]
+#![allow(clippy::large_enum_variant)]
 
 #[rustfmt::skip]
 #[path = "grpc/epic_urc.rs"]

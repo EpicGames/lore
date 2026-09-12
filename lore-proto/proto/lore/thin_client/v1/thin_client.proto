@@ -124,6 +124,12 @@ message RevisionTreeRequest {
   // emits only direct children of the prefix root; 2 emits direct
   // children plus grandchildren; etc. 0 or unset means unbounded.
   optional uint32 max_depth = 4;
+  // If true, populate `TreeNode.last_revision_index` and emit the
+  // referenced revisions as `TreeRevision` payloads on the stream. Off
+  // by default. Attribution costs one delta-block read per state plus
+  // one file-metadata-block read per entry; each unique revision costs
+  // one state + metadata load for its `Revision` payload.
+  bool include_last_revision = 5;
 }
 
 // Header for a RevisionTree stream. Echoes the resolved revision so
@@ -136,14 +142,37 @@ message RevisionTreeHeader {
   bytes signature = 2;
 }
 
+// Per-stream revision record referenced by TreeNode.last_revision_index.
+// Server emits each entry at most once in discovery order, starting at
+// index 1 (strictly before the first TreeNode whose last_revision_index
+// equals its index). Index 0 is reserved and never emitted.
+message TreeRevision {
+  // Stable per-stream index; server assigns in discovery order
+  uint32 index = 1;
+  // Revision record. The same message type RevisionInfo returns, but
+  // under RevisionTree, the server populates only the attribution-facing
+  // subset: `signature`, `identifier`, `number`, `commit_message`,
+  // `timestamp` and `committed_by`. The other properties are left unset
+  // as loading them would double the state+metadata reads per unique
+  // revision and a tree listing does not use them. Clients that need the
+  // full record should follow up with a RevisionInfo call keyed by
+  // `signature`.
+  Revision revision = 2;
+}
+
 // Server-streamed response for RevisionTree. First message carries
 // `payload.header`; subsequent messages stream `TreeNode` items in
-// server-natural order.
+// server-natural order, interleaved with `TreeRevision` payloads when
+// attribution is requested.
 message RevisionTreeResponse {
   oneof payload {
     // Header echoing the resolved revision.
     RevisionTreeHeader header = 1;
     // A tree entry (directory, file, or link).
     TreeNode node = 2;
+    // A revision record announced lazily as the walk discovers it.
+    // Each TreeRevision is emitted strictly before the first TreeNode
+    // that references its index.
+    TreeRevision revision = 3;
   }
 }

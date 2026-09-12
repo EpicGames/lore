@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use lore_proto::lore::thin_client::v1 as thin_client_v1;
 use lore_proto::lore::thin_client::v1::RevisionTreeRequest;
 use lore_proto::lore::thin_client::v1::RevisionTreeResponse;
 use lore_proto::lore::thin_client::v1::revision_tree_response::Payload;
+use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::tree;
 use lore_revision::util::path::RelativePath;
@@ -26,6 +28,7 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
 
+use super::helpers::load_revision_attribution;
 use super::helpers::node_flags_to_node_type;
 use super::helpers::resolve_to_identifier;
 use crate::grpc::extract_correlation_id;
@@ -73,6 +76,7 @@ pub async fn handler(
         _ => RelativePath::new(),
     };
     let max_depth = req.max_depth.map_or(usize::MAX, |d| d as usize);
+    let include_last_revision = req.include_last_revision;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(RepositoryContext::new_server_context(
@@ -104,7 +108,17 @@ pub async fn handler(
 
             lore_spawn!(
                 async move {
-                    stream_tree(repository, signature, path, max_depth, can_read, header, tx).await;
+                    stream_tree(
+                        repository,
+                        signature,
+                        path,
+                        max_depth,
+                        can_read,
+                        header,
+                        tx,
+                        include_last_revision,
+                    )
+                    .await;
                 }
                 .in_current_span()
             );
@@ -124,6 +138,7 @@ async fn stream_tree(
     can_read: lore_revision::state::CanReadRepository,
     header: thin_client_v1::RevisionTreeHeader,
     tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
+    include_last_revision: bool,
 ) {
     // Emit header first. If the client has already dropped, just bail.
     if tx
@@ -137,7 +152,16 @@ async fn stream_tree(
         return;
     }
 
-    let result = match tree(repository.clone(), signature, path, max_depth, can_read).await {
+    let result = match tree(
+        repository.clone(),
+        signature,
+        path,
+        max_depth,
+        can_read,
+        include_last_revision,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => {
             let status = if err.is_slow_down() {
@@ -158,8 +182,139 @@ async fn stream_tree(
         }
     };
 
-    let mut emitted: u64 = 0;
-    for tree_path in result.paths {
+    // Resolve every attribution referenced by the walk into `(RepositoryId,
+    // Hash) -> Option<Revision>`. Pulled out of the emission loop so the
+    // loop stays synchronous and the resolver's I/O is testable in
+    // isolation. `None` inside the map means the resolver saw the key but
+    // could not load it (revision missing, metadata corrupt), which is
+    // distinct from "key not present" - the latter never happens because
+    // the walk never puts an attribution the resolver was not asked about.
+    let revisions = resolve_attributions(&repository, &result.paths).await;
+
+    emit_tree_stream(result.paths, revisions, tx).await;
+}
+
+/// Resolve every `(RepositoryId, Hash)` attribution referenced by the walk.
+///
+/// Deduplicates by `(RepositoryId, Hash)` so a large listing with a small
+/// number of touching revisions costs one resolution per unique revision.
+/// Uses the walked context when the revision belongs to the walked repo,
+/// building a linked context only when the tree spans a link.
+///
+/// Failure is reported as `Some(key -> None)` in the map: siblings on the
+/// same key must not retry, and the caller distinguishes "unresolvable"
+/// (map contains `None`) from "not attributed" (walk produced a zero
+/// `last_revision`, key never lands in the map).
+async fn resolve_attributions(
+    repository: &Arc<RepositoryContext>,
+    paths: &[lore_revision::state::TreePath],
+) -> HashMap<(RepositoryId, Hash), Option<thin_client_v1::Revision>> {
+    let mut resolved: HashMap<(RepositoryId, Hash), Option<thin_client_v1::Revision>> =
+        HashMap::new();
+    for tree_path in paths {
+        if tree_path.last_revision.is_zero() {
+            continue;
+        }
+        let key = (tree_path.last_revision_repository, tree_path.last_revision);
+        if resolved.contains_key(&key) {
+            continue;
+        }
+        let (repository_id, revision) = key;
+        let value = if repository_id == repository.id {
+            load_revision_attribution(repository, revision).await
+        } else {
+            let linked = repository.to_link_context(repository_id).await;
+            load_revision_attribution(&linked, revision).await
+        };
+        resolved.insert(key, value);
+    }
+    resolved
+}
+
+/// Interleaved emission: Streams `TreeRevision` payloads inline with
+/// `TreeNode`s so a client can render rows as they arrive rather than
+/// waiting on the full revision set up front.
+///
+/// - First reference to a `(repository, revision)` allocates the next index
+///   and emits a `TreeRevision` on the stream strictly before the
+///   referencing `TreeNode`.
+/// - Repeat references reuse the allocated index and emit only the
+///   `TreeNode`.
+/// - Zero `last_revision` (walk did not attribute the entry) emits the
+///   `TreeNode` with `last_revision_index = None`; the map is not touched.
+/// - An unresolvable key (present in `revisions` with a `None` value) also
+///   emits `last_revision_index = None`; the map keeps the miss so siblings
+///   do not retry.
+async fn emit_tree_stream(
+    paths: Vec<lore_revision::state::TreePath>,
+    revisions: HashMap<(RepositoryId, Hash), Option<thin_client_v1::Revision>>,
+    tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
+) {
+    // `Some(index)` = TreeRevision already announced under this key;
+    // `None` = key was unresolvable, siblings should not retry.
+    let mut indices: HashMap<(RepositoryId, Hash), Option<u32>> = HashMap::new();
+    let mut next_index: u32 = 1;
+    let mut emitted_nodes: u64 = 0;
+    let mut emitted_revisions: u64 = 0;
+
+    for tree_path in paths {
+        let last_revision_index = if tree_path.last_revision.is_zero() {
+            None
+        } else {
+            let key = (tree_path.last_revision_repository, tree_path.last_revision);
+            match indices.get(&key).copied() {
+                Some(cached) => cached,
+                None => {
+                    let allocated = match revisions.get(&key) {
+                        Some(Some(revision_msg)) => {
+                            let index = next_index;
+                            // Guards a 4-billion-distinct-revision walk from silently
+                            // wrapping past `u32::MAX`. On overflow, the stream reports
+                            // `Status::internal` and terminates.
+                            let Some(next) = next_index.checked_add(1) else {
+                                warn!("RevisionTree attribution index space exhausted");
+                                let _ = tx
+                                    .send(Err(Status::internal(
+                                        "RevisionTree attribution index space exhausted",
+                                    )))
+                                    .await;
+                                return;
+                            };
+                            next_index = next;
+                            // Emit TreeRevision strictly before the referencing TreeNode.
+                            if tx
+                                .send(Ok(RevisionTreeResponse {
+                                    payload: Some(Payload::Revision(
+                                        thin_client_v1::TreeRevision {
+                                            index,
+                                            revision: Some(revision_msg.clone()),
+                                        },
+                                    )),
+                                }))
+                                .await
+                                .is_err()
+                            {
+                                debug!(
+                                    emitted_nodes,
+                                    emitted_revisions,
+                                    "RevisionTree receiver dropped before TreeRevision",
+                                );
+                                return;
+                            }
+                            emitted_revisions += 1;
+                            Some(index)
+                        }
+                        // Key resolved to `None`, or key not in the map at all (the
+                        // walk emitted an attribution the resolver did not see; treat
+                        // as unresolvable so the loop defends against a producer bug).
+                        Some(None) | None => None,
+                    };
+                    indices.insert(key, allocated);
+                    allocated
+                }
+            }
+        };
+
         let node = thin_client_v1::TreeNode {
             path: tree_path.path.to_string(),
             node_type: node_flags_to_node_type(tree_path.flags) as i32,
@@ -170,6 +325,7 @@ async fn stream_tree(
             size: tree_path.size,
             mode: tree_path.mode,
             tracking: tree_path.tracking,
+            last_revision_index,
         };
         if tx
             .send(Ok(RevisionTreeResponse {
@@ -178,13 +334,16 @@ async fn stream_tree(
             .await
             .is_err()
         {
-            debug!(emitted, "RevisionTree receiver dropped mid-stream");
+            debug!(
+                emitted_nodes,
+                emitted_revisions, "RevisionTree receiver dropped mid-stream",
+            );
             return;
         }
-        emitted += 1;
+        emitted_nodes += 1;
     }
 
-    debug!(emitted, "RevisionTree complete");
+    debug!(emitted_nodes, emitted_revisions, "RevisionTree complete");
 }
 
 #[cfg(test)]
@@ -223,11 +382,23 @@ mod test {
             query: Some(query),
             path_prefix,
             max_depth,
+            include_last_revision: false,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
+        request
+    }
+
+    /// `make_request` with attribution asked for.
+    fn make_attributed_request(
+        repository: RepositoryId,
+        query: Query,
+        max_depth: Option<u32>,
+    ) -> Request<RevisionTreeRequest> {
+        let mut request = make_request(repository, query, None, max_depth);
+        request.get_mut().include_last_revision = true;
         request
     }
 
@@ -508,6 +679,7 @@ mod test {
                 query: None,
                 path_prefix: None,
                 max_depth: None,
+                include_last_revision: false,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -1600,6 +1772,369 @@ mod test {
             ));
             let err = items[1].as_ref().expect_err("expected error item");
             assert_eq!(err.code(), tonic::Code::NotFound);
+        }))
+        .await;
+    }
+
+    /// The existing fixtures push through `branch_push::push`, which does
+    /// not run the delta-block / file-metadata write path that populates
+    /// per-entry attribution, so even an attributed request sees no
+    /// `TreeRevision` on the wire.
+    ///
+    /// Real attribution correctness is proved in
+    /// `lore-revision/tests/file_revision_history.rs`. Here, we just ensure
+    /// the request flag is honoured and the stream still emits the same nodes.
+    #[tokio::test]
+    async fn last_revision_is_gated_by_the_request_flag() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signatures) =
+                push_branch_with_revisions(&repository_context, &[&["top.txt"]]).await;
+            let tip = *signatures.last().expect("one revision");
+
+            let items = async |request| {
+                collect(
+                    handler(
+                        request,
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        DEFAULT_HISTORY_STEP_SIZE,
+                        RevisionListAcceleration::default(),
+                    )
+                    .await
+                    .expect("handler ok"),
+                )
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .collect::<Vec<_>>()
+            };
+
+            let split = |items: Vec<RevisionTreeResponse>| {
+                let mut nodes: Vec<thin_client_v1::TreeNode> = Vec::new();
+                let mut revisions: Vec<thin_client_v1::TreeRevision> = Vec::new();
+                for item in items {
+                    match item.payload {
+                        Some(Payload::Node(n)) => nodes.push(n),
+                        Some(Payload::Revision(r)) => revisions.push(r),
+                        _ => {}
+                    }
+                }
+                (nodes, revisions)
+            };
+
+            let (unattributed_nodes, unattributed_revisions) = split(
+                items(make_request(
+                    repository,
+                    Query::Signature(tip.into()),
+                    None,
+                    None,
+                ))
+                .await,
+            );
+            assert!(!unattributed_nodes.is_empty(), "the walk must emit nodes");
+            assert!(
+                unattributed_nodes
+                    .iter()
+                    .all(|node| node.last_revision_index.is_none()),
+                "last_revision_index must be absent when not requested",
+            );
+            assert!(
+                unattributed_revisions.is_empty(),
+                "no TreeRevision payloads without the flag",
+            );
+
+            let (attributed_nodes, attributed_revisions) = split(
+                items(make_attributed_request(
+                    repository,
+                    Query::Signature(tip.into()),
+                    None,
+                ))
+                .await,
+            );
+            assert_eq!(
+                attributed_nodes.len(),
+                unattributed_nodes.len(),
+                "attribution must not change which nodes are emitted",
+            );
+            // The fixture does not populate delta-block back-pointers, so
+            // every entry attributes to zero and no TreeRevision goes out.
+            // Real attribution is proved in `file_revision_history.rs`.
+            assert!(
+                attributed_revisions.is_empty(),
+                "hand-serialised-state fixture: no TreeRevision payloads even attributed",
+            );
+            assert!(
+                attributed_nodes
+                    .iter()
+                    .all(|node| node.last_revision_index.is_none()),
+                "hand-serialised-state fixture: no last_revision_index populated",
+            );
+        }))
+        .await;
+    }
+
+    /// The `emit_tree_stream` mechanics, driven by a hand-crafted walk result
+    /// and a hand-crafted revisions map. No fixture is needed because emission
+    /// is a pure state machine over its two inputs.
+    ///
+    /// The wire-level counterpart lives in `scripts/test/`: a real committed
+    /// fixture, end-to-end, proving the same mechanics against a running server.
+    mod emission {
+        use bytes::Bytes;
+
+        use super::*;
+
+        fn tree_path(
+            path: &str,
+            last_revision_repository: RepositoryId,
+            last_revision: Hash,
+        ) -> lore_revision::state::TreePath {
+            lore_revision::state::TreePath {
+                path: lore_revision::util::path::RelativePath::new_from_initial_path(path)
+                    .expect("valid path"),
+                address: None,
+                flags: NodeFlags::File,
+                size: 0,
+                mode: 0,
+                tracking: false,
+                last_revision,
+                last_revision_repository,
+            }
+        }
+
+        fn attribution(signature: Hash, message: &str) -> thin_client_v1::Revision {
+            thin_client_v1::Revision {
+                signature: Bytes::from(signature),
+                commit_message: message.into(),
+                ..Default::default()
+            }
+        }
+
+        async fn drain(
+            paths: Vec<lore_revision::state::TreePath>,
+            revisions: HashMap<(RepositoryId, Hash), Option<thin_client_v1::Revision>>,
+        ) -> (
+            Vec<thin_client_v1::TreeRevision>,
+            Vec<thin_client_v1::TreeNode>,
+            Vec<u32>,
+        ) {
+            // Channel capacity comfortably exceeds any test's emission volume,
+            // so `emit_tree_stream` never blocks on the sender side. We can
+            // therefore run emission inline, drop `tx`, and drain the receiver
+            // - no spawn needed. Avoiding `tokio::spawn` here is deliberate:
+            // production spawns propagate LORE_CONTEXT via lore_base::lore_spawn,
+            // and a test using bare `tokio::spawn` would violate the
+            // clippy::disallowed_methods gate.
+            let (tx, mut rx) = mpsc::channel(1024);
+            emit_tree_stream(paths, revisions, tx).await;
+            let mut in_order_revisions: Vec<thin_client_v1::TreeRevision> = Vec::new();
+            let mut in_order_nodes: Vec<thin_client_v1::TreeNode> = Vec::new();
+            // Track the *stream* order of TreeRevision indices as seen by a
+            // client; a duplicate here would falsify the "announce once"
+            // requirement, and a missing referenced index would falsify the
+            // "before the referencing node" requirement.
+            let mut announced: Vec<u32> = Vec::new();
+            while let Some(item) = rx.recv().await {
+                match item.expect("stream item").payload {
+                    Some(Payload::Revision(r)) => {
+                        announced.push(r.index);
+                        in_order_revisions.push(r);
+                    }
+                    Some(Payload::Node(n)) => {
+                        if let Some(idx) = n.last_revision_index {
+                            assert!(
+                                announced.contains(&idx),
+                                "TreeNode referenced index {idx} that has not been announced yet: {announced:?}",
+                            );
+                        }
+                        in_order_nodes.push(n);
+                    }
+                    other => panic!("unexpected payload {other:?}"),
+                }
+            }
+            (in_order_revisions, in_order_nodes, announced)
+        }
+
+        /// Two entries sharing one revision: exactly one `TreeRevision` at
+        /// index 1, both `TreeNode`s point to it.
+        #[tokio::test]
+        async fn dedupes_by_repository_hash() {
+            let repo = random::<RepositoryId>();
+            let rev = Hash::from_u64(0x11);
+            let paths = vec![tree_path("a.txt", repo, rev), tree_path("b.txt", repo, rev)];
+            let revisions = HashMap::from([((repo, rev), Some(attribution(rev, "shared")))]);
+            let (announced, nodes, _order) = drain(paths, revisions).await;
+
+            assert_eq!(announced.len(), 1, "one shared revision announced once");
+            assert_eq!(announced[0].index, 1, "indexing starts at 1");
+            assert_eq!(nodes.len(), 2);
+            assert_eq!(nodes[0].last_revision_index, Some(1));
+            assert_eq!(nodes[1].last_revision_index, Some(1));
+        }
+
+        /// Distinct revisions on the same repo: two `TreeRevision`s at
+        /// indices 1 and 2, in the order they are first referenced.
+        #[tokio::test]
+        async fn distinct_revisions_get_sequential_indices() {
+            let repo = random::<RepositoryId>();
+            let older = Hash::from_u64(0x11);
+            let newer = Hash::from_u64(0x22);
+            let paths = vec![
+                tree_path("old.txt", repo, older),
+                tree_path("new.txt", repo, newer),
+            ];
+            let revisions = HashMap::from([
+                ((repo, older), Some(attribution(older, "r1"))),
+                ((repo, newer), Some(attribution(newer, "r2"))),
+            ]);
+            let (announced, nodes, order) = drain(paths, revisions).await;
+
+            assert_eq!(order, vec![1, 2], "sequential in first-seen order");
+            assert_eq!(announced.len(), 2);
+            assert_eq!(nodes[0].last_revision_index, Some(1));
+            assert_eq!(nodes[1].last_revision_index, Some(2));
+        }
+
+        /// An unresolvable key (map contains `None`) never announces a
+        /// `TreeRevision` and leaves `TreeNode.last_revision_index` unset.
+        /// Siblings sharing the same key must not retry the resolver -
+        /// there is no resolver on this side of the boundary.
+        #[tokio::test]
+        async fn unresolvable_key_leaves_index_none() {
+            let repo = random::<RepositoryId>();
+            let rev = Hash::from_u64(0xdead);
+            let paths = vec![tree_path("a.txt", repo, rev), tree_path("b.txt", repo, rev)];
+            let revisions = HashMap::from([((repo, rev), None)]);
+            let (announced, nodes, _order) = drain(paths, revisions).await;
+
+            assert!(
+                announced.is_empty(),
+                "no TreeRevision for an unresolvable key"
+            );
+            assert_eq!(nodes.len(), 2);
+            assert!(nodes.iter().all(|n| n.last_revision_index.is_none()));
+        }
+
+        /// Zero `last_revision` (walk did not attribute the entry) emits
+        /// the `TreeNode` with `last_revision_index = None` and touches
+        /// neither the map nor the resolver.
+        #[tokio::test]
+        async fn zero_last_revision_skips_the_map() {
+            let paths = vec![tree_path(
+                "root.txt",
+                RepositoryId::default(),
+                Hash::default(),
+            )];
+            let (announced, nodes, _order) = drain(paths, HashMap::new()).await;
+
+            assert!(announced.is_empty());
+            assert_eq!(nodes.len(), 1);
+            assert!(nodes[0].last_revision_index.is_none());
+        }
+
+        /// Same signature under two different repositories (a link
+        /// crossing) - keys are distinct, indices must be distinct too.
+        /// Otherwise the walked repo's revision would silently attribute
+        /// the linked side's entry.
+        #[tokio::test]
+        async fn cross_repo_same_signature_gets_distinct_indices() {
+            let walked = random::<RepositoryId>();
+            let linked = random::<RepositoryId>();
+            let shared_sig = Hash::from_u64(0xabc);
+            let paths = vec![
+                tree_path("top.txt", walked, shared_sig),
+                tree_path("linked/inner.txt", linked, shared_sig),
+            ];
+            let revisions = HashMap::from([
+                (
+                    (walked, shared_sig),
+                    Some(attribution(shared_sig, "walked")),
+                ),
+                (
+                    (linked, shared_sig),
+                    Some(attribution(shared_sig, "linked")),
+                ),
+            ]);
+            let (announced, nodes, order) = drain(paths, revisions).await;
+
+            assert_eq!(order, vec![1, 2], "two distinct keys, two distinct indices");
+            assert_eq!(announced.len(), 2);
+            assert_eq!(
+                announced[0].revision.as_ref().unwrap().commit_message,
+                "walked"
+            );
+            assert_eq!(
+                announced[1].revision.as_ref().unwrap().commit_message,
+                "linked"
+            );
+            assert_eq!(nodes[0].last_revision_index, Some(1));
+            assert_eq!(nodes[1].last_revision_index, Some(2));
+        }
+    }
+
+    /// The signature-to-`Revision` resolution the handler applies to every
+    /// attributed entry. Uses a pushed revision because
+    /// `load_revision_attribution` reads real state + metadata.
+    #[tokio::test]
+    async fn load_revision_attribution_reads_the_revision_record() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository,
+            ));
+            let (branch, signatures) =
+                push_branch_with_revisions(&repository_context, &[&["a.txt"], &["b.txt"]]).await;
+            let second = signatures[1];
+
+            let revision = super::load_revision_attribution(&repository_context, second)
+                .await
+                .expect("a pushed revision must resolve");
+            assert_eq!(
+                revision.signature,
+                Into::<bytes::Bytes>::into(second),
+                "the record must describe the revision it was asked for",
+            );
+
+            // The identifier is what makes attribution usable as provenance:
+            // the number alone is per-branch and cannot say which branch it
+            // counts on.
+            let identifier = revision
+                .identifier
+                .as_ref()
+                .expect("a resolved commit must carry its identifier");
+            assert_eq!(identifier.number, 2, "second revision on the branch");
+            assert_eq!(
+                identifier.branch_id,
+                Into::<bytes::Bytes>::into(branch),
+                "the identifier must name the branch the revision was committed to",
+            );
+            assert_eq!(
+                revision.number, 2,
+                "the top-level number field mirrors identifier.number",
+            );
+
+            // An unknown revision resolves to None, not an error - a walk
+            // must not fail because a metadata pointer is stale.
+            assert!(
+                super::load_revision_attribution(&repository_context, Hash::from_u64(0xdead))
+                    .await
+                    .is_none(),
+                "an unknown revision must be skipped, not fatal",
+            );
         }))
         .await;
     }
