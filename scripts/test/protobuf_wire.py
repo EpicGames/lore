@@ -122,3 +122,18 @@ def field_strings(fields: Fields, field_number: int) -> list[str]:
             raise TypeError(f"Field {field_number} is a varint, not a string")
         decoded.append(value.decode("utf-8"))
     return decoded
+
+
+def field_message(fields: Fields, field_number: int) -> Fields | None:
+    """Decoded fields of a nested message field; `None` when the field is
+    absent, distinct from empty which parses to `{}`. Nested messages are
+    length-delimited, so this is a `parse_fields` of the payload bytes."""
+    values = fields.get(field_number)
+    if not values:
+        return None
+    value = values[-1]
+    if not isinstance(value, bytes):
+        raise TypeError(
+            f"Field {field_number} is a varint, not a length-delimited message"
+        )
+    return parse_fields(value)

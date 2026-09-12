@@ -24,6 +24,7 @@ use lore_proto::lore::thin_client::v1::RevisionTreeHeader;
 use lore_proto::lore::thin_client::v1::RevisionTreeRequest;
 use lore_proto::lore::thin_client::v1::RevisionTreeResponse;
 use lore_proto::lore::thin_client::v1::TreeNode;
+use lore_proto::lore::thin_client::v1::TreeRevision;
 use lore_proto::lore::thin_client::v1::content_diff_response::Payload as ContentDiffPayload;
 use lore_proto::lore::thin_client::v1::revision::Parent as RevisionParent;
 use lore_proto::lore::thin_client::v1::revision_diff_request::QueryFrom as RevisionDiffQueryFrom;
@@ -43,6 +44,7 @@ fn v1_thin_client_model_types_default() {
     let _ = DiffConflict::default();
     let _ = DiffPartition::default();
     let _ = TreeNode::default();
+    let _ = TreeRevision::default();
     let _ = Revision::default();
     let _ = Metadata::default();
 
@@ -119,7 +121,12 @@ fn v1_thin_client_field_shapes() {
         size: _,
         mode: _,
         tracking: _,
+        last_revision_index: _,
     } = TreeNode::default();
+    let TreeRevision {
+        index: _,
+        revision: _,
+    } = TreeRevision::default();
 
     // Revision + nested Parent + Metadata
     let Revision {
@@ -179,6 +186,7 @@ fn v1_thin_client_field_shapes() {
         query: _,
         path_prefix: _,
         max_depth: _,
+        include_last_revision: _,
     } = RevisionTreeRequest::default();
     let _ = RevisionTreeQuery::Identifier(Default::default());
     let _ = RevisionTreeQuery::Signature(Default::default());
@@ -189,4 +197,5 @@ fn v1_thin_client_field_shapes() {
     let RevisionTreeResponse { payload: _ } = RevisionTreeResponse::default();
     let _ = RevisionTreePayload::Header(Default::default());
     let _ = RevisionTreePayload::Node(Default::default());
+    let _ = RevisionTreePayload::Revision(Default::default());
 }

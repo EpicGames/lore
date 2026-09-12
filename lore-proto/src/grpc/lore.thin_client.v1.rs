@@ -126,6 +126,14 @@ pub struct TreeNode {
     /// and non-link entries.
     #[prost(bool, tag = "6")]
     pub tracking: bool,
+    /// Stream-scoped index into the RevisionTree stream's TreeRevision payloads,
+    /// naming the revision that last modified this entry. Set only when the
+    /// request asks for attribution. Absent wherever the server cannot attribute
+    /// an entry, most commonly the repository root. The referenced TreeRevision
+    /// must have appeared earlier on the same stream. Index 0 is reserved and
+    /// never emitted, mirroring the DiffPartition convention.
+    #[prost(uint32, optional, tag = "7")]
+    pub last_revision_index: ::core::option::Option<u32>,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -714,6 +722,13 @@ pub struct RevisionTreeRequest {
     /// children plus grandchildren; etc. 0 or unset means unbounded.
     #[prost(uint32, optional, tag = "4")]
     pub max_depth: ::core::option::Option<u32>,
+    /// If true, populate `TreeNode.last_revision_index` and emit the
+    /// referenced revisions as `TreeRevision` payloads on the stream. Off
+    /// by default. Attribution costs one delta-block read per state plus
+    /// one file-metadata-block read per entry; each unique revision costs
+    /// one state + metadata load for its `Revision` payload.
+    #[prost(bool, tag = "5")]
+    pub include_last_revision: bool,
     /// Revision specifier.
     #[prost(oneof = "revision_tree_request::Query", tags = "1, 2")]
     pub query: ::core::option::Option<revision_tree_request::Query>,
@@ -764,17 +779,48 @@ impl ::prost::Name for RevisionTreeHeader {
         "/lore.thin_client.v1.RevisionTreeHeader".into()
     }
 }
+/// Per-stream revision record referenced by TreeNode.last_revision_index.
+/// Server emits each entry at most once in discovery order, starting at
+/// index 1 (strictly before the first TreeNode whose last_revision_index
+/// equals its index). Index 0 is reserved and never emitted.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TreeRevision {
+    /// Stable per-stream index; server assigns in discovery order
+    #[prost(uint32, tag = "1")]
+    pub index: u32,
+    /// Revision record. The same message type RevisionInfo returns, but
+    /// under RevisionTree, the server populates only the attribution-facing
+    /// subset: `signature`, `identifier`, `number`, `commit_message`,
+    /// `timestamp` and `committed_by`. The other properties are left unset
+    /// as loading them would double the state+metadata reads per unique
+    /// revision and a tree listing does not use them. Clients that need the
+    /// full record should follow up with a RevisionInfo call keyed by
+    /// `signature`.
+    #[prost(message, optional, tag = "2")]
+    pub revision: ::core::option::Option<Revision>,
+}
+impl ::prost::Name for TreeRevision {
+    const NAME: &'static str = "TreeRevision";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.TreeRevision".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.TreeRevision".into()
+    }
+}
 /// Server-streamed response for RevisionTree. First message carries
 /// `payload.header`; subsequent messages stream `TreeNode` items in
-/// server-natural order.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// server-natural order, interleaved with `TreeRevision` payloads when
+/// attribution is requested.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RevisionTreeResponse {
-    #[prost(oneof = "revision_tree_response::Payload", tags = "1, 2")]
+    #[prost(oneof = "revision_tree_response::Payload", tags = "1, 2, 3")]
     pub payload: ::core::option::Option<revision_tree_response::Payload>,
 }
 /// Nested message and enum types in `RevisionTreeResponse`.
 pub mod revision_tree_response {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
         /// Header echoing the resolved revision.
         #[prost(message, tag = "1")]
@@ -782,6 +828,11 @@ pub mod revision_tree_response {
         /// A tree entry (directory, file, or link).
         #[prost(message, tag = "2")]
         Node(super::TreeNode),
+        /// A revision record announced lazily as the walk discovers it.
+        /// Each TreeRevision is emitted strictly before the first TreeNode
+        /// that references its index.
+        #[prost(message, tag = "3")]
+        Revision(super::TreeRevision),
     }
 }
 impl ::prost::Name for RevisionTreeResponse {
