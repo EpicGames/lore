@@ -181,6 +181,45 @@ impl ::prost::Name for RepositoryListResponse {
         "/lore.repository.v1.RepositoryListResponse".into()
     }
 }
+/// Request to count repositories the caller is authorised to see. Filter
+/// semantics mirror `RepositoryListRequest`; a repository is counted iff
+/// `RepositoryList` with the same filters would emit it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryCountRequest {
+    /// If set, only repositories whose `creator` field is an exact
+    /// byte-for-byte case-sensitive match are counted.
+    #[prost(string, optional, tag = "1")]
+    pub creator: ::core::option::Option<::prost::alloc::string::String>,
+}
+impl ::prost::Name for RepositoryCountRequest {
+    const NAME: &'static str = "RepositoryCountRequest";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryCountRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryCountRequest".into()
+    }
+}
+/// Response carrying the count of matching repositories. `count` defaults
+/// to zero, so an absent or unset value is safe to read as zero.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryCountResponse {
+    /// Number of repositories matching the request's filters and the
+    /// caller's authorisation.
+    #[prost(uint64, tag = "1")]
+    pub count: u64,
+}
+impl ::prost::Name for RepositoryCountResponse {
+    const NAME: &'static str = "RepositoryCountResponse";
+    const PACKAGE: &'static str = "lore.repository.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.repository.v1.RepositoryCountResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.repository.v1.RepositoryCountResponse".into()
+    }
+}
 /// Request for a cheap hash-only read of a repository's metadata pointer.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RepositoryMetadataGetRequest {
@@ -484,6 +523,40 @@ pub mod repository_service_client {
                 );
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Count the repositories the caller is authorised to see, without
+        /// enumerating them. Applies the same optional filters as
+        /// `RepositoryList`. Cheaper than `RepositoryList` because no per-repo
+        /// metadata is streamed back to the caller; when no filter is set, the
+        /// server can answer from the repository id set alone.
+        pub async fn repository_count(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryCountRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryCountResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.repository.v1.RepositoryService/RepositoryCount",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.repository.v1.RepositoryService",
+                        "RepositoryCount",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Cheap hash-only read of a repository's current metadata pointer.
         pub async fn repository_metadata_get(
             &mut self,
@@ -601,6 +674,18 @@ pub mod repository_service_server {
             request: tonic::Request<super::RepositoryListRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::RepositoryListStream>,
+            tonic::Status,
+        >;
+        /// Count the repositories the caller is authorised to see, without
+        /// enumerating them. Applies the same optional filters as
+        /// `RepositoryList`. Cheaper than `RepositoryList` because no per-repo
+        /// metadata is streamed back to the caller; when no filter is set, the
+        /// server can answer from the repository id set alone.
+        async fn repository_count(
+            &self,
+            request: tonic::Request<super::RepositoryCountRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryCountResponse>,
             tonic::Status,
         >;
         /// Cheap hash-only read of a repository's current metadata pointer.
@@ -883,6 +968,52 @@ pub mod repository_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.repository.v1.RepositoryService/RepositoryCount" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryCountSvc<T: RepositoryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryService,
+                    > tonic::server::UnaryService<super::RepositoryCountRequest>
+                    for RepositoryCountSvc<T> {
+                        type Response = super::RepositoryCountResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryCountRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryService>::repository_count(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryCountSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)
