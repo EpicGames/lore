@@ -30,6 +30,7 @@ use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
+use crate::fs::filesystem_provider::with_operation_if;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreNodeType;
@@ -49,6 +50,7 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
+use crate::state::State;
 use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
@@ -509,8 +511,16 @@ async fn file_size_from_node_change_path(
 ///
 /// A missing or unreadable file is reported as modified — the dirty flag then
 /// reflects a real change that the regular diff will surface.
+///
+/// The measurement — whether a file is there, and its size and modified time — is read through
+/// `operation`. Comparing content reads the working tree directly, which is the one part of this a
+/// provider's own view does not answer for.
+///
+/// What the check settles is written, not only reported: a flag it finds stale is cleared on the
+/// node.
 async fn dirty_change_is_modified(
-    repository: Arc<RepositoryContext>,
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
     change: &NodeChange,
     summary: &StatusSummaryStats,
 ) -> Result<bool, StatusError> {
@@ -530,20 +540,18 @@ async fn dirty_change_is_modified(
         return Ok(true);
     }
 
-    let absolute_path = change.path().to_absolute_path(repository.require_path()?);
-    let Ok(metadata) = lore_io::IoDriver::global().metadata(&absolute_path).await else {
+    let Ok(info) = operation.file_info(change.path()).await else {
         return Ok(true);
     };
-    if !metadata.is_file() {
+    if !info.is_file() {
         return Ok(true);
     }
 
-    let (file_mtime, file_size) = crate::util::fs::file_mtime_and_size(&metadata);
     let modification = state::file_modified_against_node(
         repository.clone(),
         &node,
-        file_mtime,
-        file_size,
+        info.mtime(),
+        info.size(),
         change.path(),
         !node.is_staged(),
         None,
@@ -619,31 +627,40 @@ fn reported_by_state_diff(change: &NodeChange, show_scan: bool) -> bool {
         && change.action != FileAction::Move)
 }
 
+/// What every task comparing a tree against its staged state shares: the counts it folds into,
+/// whether a scan will re-detect what it finds, and the operation a dirty flag is checked through
+/// where one was asked for.
+#[derive(Clone)]
+struct StagedDiff {
+    summary: Arc<StatusSummaryStats>,
+    show_scan: bool,
+    check_dirty: Option<Arc<InstanceOperationImpl>>,
+}
+
 /// Report every change the diff against the staged state answers for.
 ///
-/// A dirty node is verified against the file on disk when asked for, and one that turns out
-/// unmodified has its flag cleared and is reported without it — or dropped, where the flag was
-/// all it had. A node still dirty once verified counts toward `summary`; a purely staged one
-/// does not.
+/// A dirty node is verified against the working tree where `check_dirty` supplies an operation to
+/// read it through, and one that turns out unmodified has its flag cleared and is reported without
+/// it — or dropped, where the flag was all it had. A node still dirty once verified counts toward
+/// `summary`; a purely staged one does not.
 ///
 /// `repository` is the one holding the nodes, which for a layer is the layer's own. The working
 /// tree is the parent's either way, since a layer context keeps it.
 async fn report_staged_changes(
     repository: &Arc<RepositoryContext>,
     changes: &[NodeChange],
-    summary: &StatusSummaryStats,
-    show_scan: bool,
-    check_dirty: bool,
+    diff: &StagedDiff,
 ) -> Result<(), StatusError> {
+    let summary = diff.summary.as_ref();
     for change in changes {
-        if !reported_by_state_diff(change, show_scan) {
+        if !reported_by_state_diff(change, diff.show_scan) {
             continue;
         }
 
         let mut cleared_dirty = false;
-        if check_dirty
+        if let Some(operation) = diff.check_dirty.as_deref()
             && change.flags.is_dirty()
-            && !dirty_change_is_modified(repository.clone(), change, summary).await?
+            && !dirty_change_is_modified(operation, repository, change, summary).await?
         {
             if !change.flags.is_stage() {
                 continue;
@@ -697,6 +714,66 @@ async fn layer_holds_staging(layer: &layer::Layer, layer_state: &layer::LayerSta
     }
 
     state::count_staged_files(repository.clone(), state.clone(), source_node).await > 0
+}
+
+/// Compare a repository's own tree against its staged state below `path`, or the whole of it where
+/// no path is given, and report what differs.
+async fn report_repository_staged_diff(
+    diff: StagedDiff,
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    path: Option<RelativePath>,
+) -> Result<(), StatusError> {
+    let changes = state::diff_collect(
+        repository.clone(),
+        state_current,
+        repository.clone(),
+        state_staged,
+        path,
+        FilterMode::Full,
+    )
+    .await
+    .forward::<StatusError>("computing diff against staged state")?;
+    lore_debug!("Found {} changes in staged revision", changes.len());
+
+    report_staged_changes(&repository, &changes, &diff).await
+}
+
+/// Compare the subtree a layer draws against its staged state, and report what differs at the
+/// mount it is materialized at.
+async fn report_layer_staged_diff(
+    diff: StagedDiff,
+    layer_state: layer::LayerState,
+    selection: LayerSelection,
+) -> Result<(), StatusError> {
+    let changes = state::diff_collect_subtree(
+        layer::drawn_subtree_state(
+            &layer_state.repository,
+            &layer_state.state_current,
+            &selection.source_path,
+            &selection.mount_path,
+        )
+        .await,
+        layer::drawn_subtree_state(
+            &layer_state.repository,
+            &layer_state.state_staged,
+            &selection.source_path,
+            &selection.mount_path,
+        )
+        .await,
+        selection.mount_path.clone(),
+        FilterMode::Full,
+    )
+    .await
+    .forward::<StatusError>("computing diff against staged state")?;
+    lore_debug!(
+        "Found {} changes in layer at \"{}\" staged revision",
+        changes.len(),
+        selection.mount_path,
+    );
+
+    report_staged_changes(&layer_state.repository, &changes, &diff).await
 }
 
 /// What a request for a path selects of a layer: where the selection sits in the working tree,
@@ -1483,82 +1560,45 @@ pub async fn status(
     if show_staged && has_staged {
         lore_debug!("Calculating deltas against staged revision");
 
-        let mut tasks = JoinSet::new();
-        for path in paths.iter() {
-            lore_spawn!(tasks, {
-                let repository = repository.clone();
-                let state_current = state_current.clone();
-                let state_staged = state_staged.clone();
-                let path = path.clone();
-                let summary = summary.clone();
-                async move {
-                    let changes = state::diff_collect(
-                        repository.clone(),
-                        state_current,
-                        repository.clone(),
-                        state_staged.clone(),
-                        path,
-                        FilterMode::Full,
-                    )
-                    .await
-                    .forward::<StatusError>("computing diff against staged state")?;
-                    lore_debug!("Found {} changes in staged revision", changes.len());
-
-                    report_staged_changes(&repository, &changes, &summary, show_scan, check_dirty)
-                        .await
-                }
-            });
-
-            for (layer, layer_state) in layers.iter() {
-                let Some(selection) = layer_selection(layer, path.as_ref()) else {
-                    continue;
+        with_operation_if(
+            repository.file_system(),
+            check_dirty,
+            false, /* Reads the working tree, writes only the staged tree */
+            async |operation| {
+                let diff = StagedDiff {
+                    summary: summary.clone(),
+                    show_scan,
+                    check_dirty: operation,
                 };
-                lore_spawn!(tasks, {
-                    let repository = layer_state.repository.clone();
-                    let state_current = layer_state.state_current.clone();
-                    let state_staged = layer_state.state_staged.clone();
-                    let summary = summary.clone();
-                    async move {
-                        let changes = state::diff_collect_subtree(
-                            layer::drawn_subtree_state(
-                                &repository,
-                                &state_current,
-                                &selection.source_path,
-                                &selection.mount_path,
-                            )
-                            .await,
-                            layer::drawn_subtree_state(
-                                &repository,
-                                &state_staged,
-                                &selection.source_path,
-                                &selection.mount_path,
-                            )
-                            .await,
-                            selection.mount_path.clone(),
-                            FilterMode::Full,
+                let mut tasks = JoinSet::new();
+                for path in paths.iter() {
+                    lore_spawn!(
+                        tasks,
+                        report_repository_staged_diff(
+                            diff.clone(),
+                            repository.clone(),
+                            state_current.clone(),
+                            state_staged.clone(),
+                            path.clone(),
                         )
-                        .await
-                        .forward::<StatusError>("computing diff against staged state")?;
-                        lore_debug!(
-                            "Found {} changes in layer at \"{}\" staged revision",
-                            changes.len(),
-                            selection.mount_path,
+                    );
+
+                    for (layer, layer_state) in layers.iter() {
+                        let Some(selection) = layer_selection(layer, path.as_ref()) else {
+                            continue;
+                        };
+                        lore_spawn!(
+                            tasks,
+                            report_layer_staged_diff(diff.clone(), layer_state.clone(), selection)
                         );
-
-                        report_staged_changes(
-                            &repository,
-                            &changes,
-                            &summary,
-                            show_scan,
-                            check_dirty,
-                        )
-                        .await
                     }
-                });
-            }
-        }
+                }
 
-        lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
+                lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
+                Ok::<(), StatusError>(())
+            },
+        )
+        .await?;
     }
 
     // Compare current/staged state against filesystem

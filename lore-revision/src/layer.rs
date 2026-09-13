@@ -220,6 +220,7 @@ pub fn layer_config_path(repository: &Arc<RepositoryContext>) -> Result<PathBuf,
         .map(|path| path.join(repository::LAYER))
 }
 
+#[derive(Clone)]
 pub struct LayerState {
     pub repository: Arc<RepositoryContext>,
     pub state_current: Arc<State>,

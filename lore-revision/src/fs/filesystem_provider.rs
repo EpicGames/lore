@@ -283,6 +283,31 @@ where
     Ok(value)
 }
 
+/// [`with_operation`] for work that reads the filesystem only under some conditions.
+///
+/// Opening an operation freezes a virtual filesystem and snapshots it, so work that reads the
+/// working tree only when asked to takes one only then, and the same one for the whole of it.
+/// `work` is handed nothing where none was opened, which is the instruction not to read.
+pub async fn with_operation_if<T, E, F>(
+    filesystem: Arc<dyn FilesystemProvider>,
+    needed: bool,
+    changes_made: bool,
+    work: F,
+) -> Result<T, E>
+where
+    E: ErrorSet,
+    F: AsyncFnOnce(Option<Arc<InstanceOperationImpl>>) -> Result<T, E>,
+{
+    if !needed {
+        return work(None).await;
+    }
+
+    with_operation(filesystem, changes_made, async |operation| {
+        work(Some(operation)).await
+    })
+    .await
+}
+
 /// Instance operation trait - performs file operations within a context.
 ///
 /// Operations are performed against a consistent snapshot (for SWFS) or directly
@@ -743,6 +768,7 @@ pub mod tests {
     use crate::fs::filesystem_provider::InstanceOperationImpl;
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
     use crate::fs::filesystem_provider::with_operation;
+    use crate::fs::filesystem_provider::with_operation_if;
     use crate::lore::Hash;
     use crate::lore::RepositoryId;
     use crate::merge::MergeTextMode;
@@ -1021,6 +1047,68 @@ pub mod tests {
 
         assert_eq!(1, filesystem.begins());
         assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+    }
+
+    #[tokio::test]
+    async fn work_that_needs_no_operation_opens_none() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let handed: Option<()> =
+            with_operation_if(repository.file_system(), false, false, async |operation| {
+                Ok::<_, FsError>(operation.map(|_| ()))
+            })
+            .await
+            .expect("The work succeeded");
+
+        assert!(
+            handed.is_none(),
+            "Work that needs no operation was handed one"
+        );
+        assert_eq!(0, filesystem.begins());
+        assert!(
+            filesystem.finalize_events.lock().is_empty(),
+            "An operation that was never opened was finalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_that_needs_an_operation_opens_one_and_finalizes_it() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let handed: Option<()> =
+            with_operation_if(repository.file_system(), true, false, async |operation| {
+                Ok::<_, FsError>(operation.map(|_| ()))
+            })
+            .await
+            .expect("The work succeeded");
+
+        assert!(
+            handed.is_some(),
+            "Work that needs an operation was handed none"
+        );
+        assert_eq!(1, filesystem.begins());
+        assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
+    }
+
+    #[tokio::test]
+    async fn a_failing_operation_is_still_finalized_where_one_was_needed() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let result: Result<(), FsError> =
+            with_operation_if(repository.file_system(), true, false, async |_operation| {
+                Err(FsError::internal("Work failed"))
+            })
+            .await;
+
+        result.expect_err("The work's error should be reported");
+        assert_eq!(
+            vec![false],
+            *(filesystem.finalize_events.lock()),
+            "A failed operation was left unfinalized"
+        );
     }
 
     #[tokio::test]
