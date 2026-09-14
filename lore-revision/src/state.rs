@@ -4805,9 +4805,12 @@ pub struct TreePath {
 }
 
 /// Per-state context for resolving [`TreePath::last_revision`]. If the walked
-/// revision changed the entry, that is the answer. Otherwise it is
-/// `revision[0]` from the entry's file-metadata record, or zero when the
-/// entry has no metadata record.
+/// revision changed the entry, that is the answer; otherwise it is the
+/// entry's file-metadata back-pointer (slot 0, falling back to slot 1 for
+/// entries a merge carried across from the other parent), or zero when the
+/// entry has no metadata record. The short-circuit is skipped when the
+/// walked revision is a merge, so merge-carried nodes fall through to the
+/// metadata read.
 ///
 /// Bound to one `(state, repository)` pair. The walker crosses link
 /// boundaries into linked repositories with their own state; each side of
@@ -4822,6 +4825,8 @@ struct TreeAttribution {
     revision: Hash,
     /// Repository the walked revision belongs to.
     repository_id: RepositoryId,
+    /// Walked revision is a merge.
+    is_merge: bool,
 }
 
 impl TreeAttribution {
@@ -4840,6 +4845,7 @@ impl TreeAttribution {
             changed,
             revision: state.revision(),
             repository_id,
+            is_merge: !state.parent_other().is_zero(),
         })
     }
 
@@ -4849,15 +4855,17 @@ impl TreeAttribution {
 
     /// Revision that last modified `node`.
     ///
-    /// Reads slot 0 only. Slot 1 holds the other side of a merge, which
-    /// does not matter when naming the most recent change.
+    /// Reads slot 0. Falls back to slot 1 for entries a merge carried across
+    /// from the other parent: `weave_history` writes the incoming branch's
+    /// per-entry back-pointer to slot 1 for such entries, and leaves slot 0
+    /// zero because they are not in the parent_self delta.
     async fn last_revision(
         &self,
         state: &State,
         repository: Arc<RepositoryContext>,
         node: NodeID,
     ) -> Result<Hash, StateError> {
-        if self.changed.contains(&node) {
+        if !self.is_merge && self.changed.contains(&node) {
             return Ok(self.revision);
         }
         let metadata_node = node_to_file_metadata(node);
@@ -4874,7 +4882,12 @@ impl TreeAttribution {
             return Ok(Hash::default());
         };
         let reader = block.read();
-        Ok(reader.node(NodeFileMetadata::index(metadata_node)).revision[0])
+        let record = reader.node(NodeFileMetadata::index(metadata_node));
+        Ok(if record.revision[0].is_zero() {
+            record.revision[1]
+        } else {
+            record.revision[0]
+        })
     }
 }
 

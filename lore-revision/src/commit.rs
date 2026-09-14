@@ -3222,7 +3222,7 @@ async fn generate_delta_block(
     Ok(())
 }
 
-pub(crate) async fn weave_history(
+pub async fn weave_history(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
 ) -> Result<(), CommitError> {

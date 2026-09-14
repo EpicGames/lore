@@ -24,6 +24,8 @@
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
+    use std::io::Write;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
@@ -33,13 +35,23 @@ mod tests {
     use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_revision::branch;
+    use lore_revision::commit;
+    use lore_revision::commit::CommitOptions;
     use lore_revision::commit::commit_in_memory_revision;
+    use lore_revision::file;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreString;
+    use lore_revision::lore::RepositoryId;
     use lore_revision::metadata::Metadata;
+    use lore_revision::metadata::MetadataInherit;
     use lore_revision::node::*;
+    use lore_revision::repository;
     use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::revision::tree;
+    use lore_revision::stage;
+    use lore_revision::stage::StageOptions;
     use lore_revision::state::State;
     use lore_revision::state::allow_all_repositories;
     use lore_revision::util::path::RelativePath;
@@ -732,6 +744,365 @@ mod tests {
                 assert_eq!(
                     shallow[0].last_revision_repository, repository.id,
                     "attribution carries the repository at depth 1 too"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// Identity every merge-fixture operation runs as. Without one the commit
+    /// path never writes `created-by` or `committed-by`.
+    const MERGE_OPERATOR: &str = "operator@example.com";
+
+    /// `merge_start` reads the remote unless `globals.offline` is set.
+    async fn offline_execution() -> Arc<lore_revision::interface::ExecutionContext> {
+        let _ = test_store_create().await.expect("Failed to create stores");
+        let execution = Arc::new(lore_revision::interface::ExecutionContext::new_client(
+            lore_revision::interface::LoreGlobalArgs::default().set_offline(),
+            lore_revision::relay::EventDispatcher::no_dispatch(),
+        ));
+        execution.set_user_id(MERGE_OPERATOR).await;
+        execution
+    }
+
+    /// A filesystem-backed repository that drives the real commit/branch/merge
+    /// primitives, so a walk sees what a client would see. In-memory helpers
+    /// above cannot produce a merge revision because
+    /// `commit_in_memory_revision` hard-sets `parent_other = default`.
+    struct MergeFixture {
+        repository: Arc<RepositoryContext>,
+        write_token: RepositoryWriteToken,
+        repo_path: PathBuf,
+        _tempdir: TempDir,
+    }
+
+    impl MergeFixture {
+        async fn new() -> Self {
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let tempdir = generate_tempdir();
+            let repo_path = tempdir.to_path_buf();
+            std::fs::create_dir_all(repo_path.as_path()).expect("Create repo directory failed");
+
+            let main_branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let write_token = repository::RepositoryWriteToken::acquire(repo_path.as_path()).await;
+            let repository = repository::create_local(
+                repo_path.as_path(),
+                &write_token,
+                repository_id,
+                main_branch_id,
+                branch::DEFAULT_DEFAULT_NAME.to_string(),
+                repository::RepositoryConfig::default(),
+                false,
+            )
+            .await
+            .expect("Failed to initialize repository");
+
+            Self {
+                repository,
+                write_token,
+                repo_path,
+                _tempdir: tempdir,
+            }
+        }
+
+        fn write_file(&self, relative: &str, content: &[u8]) {
+            let absolute = self.repo_path.join(relative);
+            if let Some(parent) = absolute.parent() {
+                std::fs::create_dir_all(parent).expect("Failed to create parent dir");
+            }
+            let mut file = std::fs::File::options()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(absolute.as_path())
+                .expect("Failed to open file");
+            file.write_all(content).expect("Failed to write file");
+        }
+
+        fn delete_file(&self, relative: &str) {
+            let _ = std::fs::remove_file(self.repo_path.join(relative));
+        }
+
+        async fn stage_all(&self) {
+            file::stage::stage(
+                self.repository.clone(),
+                &self.write_token,
+                LoreArray::from_vec(vec![LoreString::from(&self.repo_path)]),
+                StageOptions {
+                    case_change: stage::StageCaseChange::Error,
+                    node_flags: NodeFlags::NoFlags,
+                    file_id: None,
+                    no_children: false,
+                    scan: true,
+                },
+            )
+            .await
+            .expect("Failed to stage repository");
+        }
+
+        async fn commit(&self, message: &str) -> Hash {
+            Box::pin(commit::commit(
+                self.repository.clone(),
+                &self.write_token,
+                CommitOptions {
+                    message: message.to_string(),
+                    link_messages: std::collections::HashMap::new(),
+                    link: None,
+                    layer_messages: std::collections::HashMap::new(),
+                    layer: None,
+                },
+            ))
+            .await
+            .expect("Failed to commit revision")
+        }
+
+        async fn stage_and_commit(&self, message: &str) -> Hash {
+            self.stage_all().await;
+            self.commit(message).await
+        }
+
+        async fn create_branch(&self, name: &str) -> BranchId {
+            branch::create::create(
+                self.repository.clone(),
+                &self.write_token,
+                name.to_string(),
+                None,
+                String::new(),
+                false,
+            )
+            .await
+            .expect("Failed to create branch");
+            let (_revision, branch_id) =
+                lore_revision::instance::load_current_anchor(&self.repository)
+                    .await
+                    .expect("Failed to load current anchor after branch create");
+            branch_id
+        }
+
+        async fn switch_to(&self, branch_id: BranchId, revision: Hash) {
+            lore_revision::instance::store_current_anchor_branch(&self.repository, branch_id)
+                .await
+                .expect("Failed to store anchor branch");
+            lore_revision::instance::store_current_anchor(&self.repository, revision)
+                .await
+                .expect("Failed to store anchor revision");
+        }
+
+        async fn merge(&self, branch_id: BranchId, message: &str) -> Hash {
+            Box::pin(branch::merge::merge_start(
+                self.repository.clone(),
+                &self.write_token,
+                branch_id,
+                branch::merge::MergeStartOptions {
+                    message: message.to_string(),
+                    no_commit: false,
+                    scope: branch::merge::MergeScope::MainOnly,
+                    inherit_metadata: MetadataInherit::default(),
+                },
+            ))
+            .await
+            .expect("merge_start failed")
+        }
+    }
+
+    /// Build the `ahead`/`side` merge fixture: main → ahead (branched, commits
+    /// `ahead-feature.txt`) → side (branched off ahead, commits `side-work.txt`);
+    /// ahead diverges with `ahead-second.txt`; side is merged back into ahead.
+    /// Returns the revisions the tests need to name in assertions.
+    struct AheadSideFixture {
+        fixture: MergeFixture,
+        ahead1: Hash,
+        side1: Hash,
+        ahead2: Hash,
+        merge_rev: Hash,
+        main_rev: Hash,
+    }
+
+    async fn build_ahead_side_fixture() -> AheadSideFixture {
+        let fixture = MergeFixture::new().await;
+
+        // main: main-advance.txt
+        fixture.write_file("main-advance.txt", b"zero\n");
+        let main_rev = fixture.stage_and_commit("Add main-advance.txt on main").await;
+
+        // ahead: branch off main; commit ahead-feature.txt.
+        let ahead_branch = fixture.create_branch("ahead").await;
+        fixture.write_file("ahead-feature.txt", b"one\n");
+        let ahead1 = fixture.stage_and_commit("Add ahead-feature.txt on ahead").await;
+
+        // side: branch off ahead; commit side-work.txt.
+        let side_branch = fixture.create_branch("side").await;
+        fixture.write_file("side-work.txt", b"two\n");
+        let side1 = fixture.stage_and_commit("Add side-work.txt on side").await;
+
+        // Switch anchor back to ahead@ahead1. Working tree still has
+        // side-work.txt from the side commit; delete it so the ahead commit
+        // that follows does not re-add it.
+        fixture.switch_to(ahead_branch, ahead1).await;
+        fixture.delete_file("side-work.txt");
+
+        // ahead: commit ahead-second.txt so ahead diverges from side.
+        fixture.write_file("ahead-second.txt", b"three\n");
+        let ahead2 = fixture.stage_and_commit("Add ahead-second.txt on ahead").await;
+
+        // Merge side into ahead.
+        let merge_rev = fixture.merge(side_branch, "merge side into ahead").await;
+
+        AheadSideFixture {
+            fixture,
+            ahead1,
+            side1,
+            ahead2,
+            merge_rev,
+            main_rev,
+        }
+    }
+
+    /// Walk a revision's tree with attribution, indexed by path.
+    async fn walk_by_path(
+        repository: Arc<RepositoryContext>,
+        revision: Hash,
+    ) -> std::collections::HashMap<String, lore_revision::state::TreePath> {
+        tree(
+            repository,
+            revision,
+            RelativePath::default(),
+            0,
+            allow_all_repositories(),
+            true,
+        )
+        .await
+        .expect("the tree walk must succeed")
+        .paths
+        .into_iter()
+        .map(|entry| (entry.path.as_str().to_string(), entry))
+        .collect()
+    }
+
+    /// An entry a merge carried across from the other parent attributes via
+    /// slot 1 (that parent's back-pointer), not to the merge revision itself.
+    #[tokio::test]
+    async fn tree_attributes_a_merge_carried_entry_via_slot_1() {
+        let execution = offline_execution().await;
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let f = build_ahead_side_fixture().await;
+                let entries = walk_by_path(f.fixture.repository.clone(), f.merge_rev).await;
+
+                let side_work = entries
+                    .get("side-work.txt")
+                    .expect("side-work.txt must appear in the walk");
+
+                assert_ne!(
+                    side_work.last_revision, f.merge_rev,
+                    "side-work.txt must not attribute to the merge revision — a merge \
+                     revision carries no commit message of its own, so this reads as \
+                     wrong-and-meaningless when rendered"
+                );
+                assert_eq!(
+                    side_work.last_revision, f.side1,
+                    "side-work.txt must attribute to the side revision that added it"
+                );
+                assert_eq!(
+                    side_work.last_revision_repository, f.fixture.repository.id,
+                    "attribution stays within the walked repository (no links here)"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// The three entries that ordinary weaving already attributes correctly stay
+    /// that way. Regression guard against a merge-delta change that would put
+    // carried-across nodes into `changed`.
+    #[tokio::test]
+    async fn tree_attributes_across_a_merge_does_not_misattribute_carried_entries() {
+        let execution = offline_execution().await;
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let f = build_ahead_side_fixture().await;
+                let entries = walk_by_path(f.fixture.repository.clone(), f.merge_rev).await;
+
+                let attribution_of = |path: &str| -> Hash {
+                    entries
+                        .get(path)
+                        .unwrap_or_else(|| panic!("{path} must appear in the walk"))
+                        .last_revision
+                };
+
+                assert_eq!(
+                    attribution_of("main-advance.txt"),
+                    f.main_rev,
+                    "main-advance.txt must attribute to the main-side revision that added it"
+                );
+                assert_eq!(
+                    attribution_of("ahead-feature.txt"),
+                    f.ahead1,
+                    "ahead-feature.txt must attribute to the ahead revision that added it"
+                );
+                assert_eq!(
+                    attribution_of("ahead-second.txt"),
+                    f.ahead2,
+                    "ahead-second.txt must attribute to the ahead revision that added it, \
+                     not to the merge revision"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// A merge that genuinely reconciled an entry (both sides modified it)
+    /// attributes that entry to `parent_self`, not to the merge itself:
+    /// `weave_history` writes slot 0 = parent_self for every node in the merge's
+    /// parent_self delta, and the merge revision carries no message of its own
+    /// to attribute to.
+    #[tokio::test]
+    async fn tree_attributes_a_merge_reconciled_entry_to_parent_self() {
+        let execution = offline_execution().await;
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = MergeFixture::new().await;
+
+                // base: common.txt on main.
+                fixture.write_file("common.txt", b"base line\n");
+                let _base = fixture.stage_and_commit("Add common.txt on main").await;
+
+                // ahead: branch off main; modify common.txt on ahead.
+                let ahead_branch = fixture.create_branch("ahead").await;
+                fixture.write_file("common.txt", b"base line\nahead line\n");
+                let ahead1 = fixture
+                    .stage_and_commit("Extend common.txt on ahead")
+                    .await;
+
+                // side: branch off ahead's current tip; modify common.txt
+                // differently.
+                let side_branch = fixture.create_branch("side").await;
+                fixture.write_file("common.txt", b"base line\nahead line\nside line\n");
+                let _side1 = fixture
+                    .stage_and_commit("Extend common.txt further on side")
+                    .await;
+
+                // Switch anchor back to ahead@ahead1 and set the working tree
+                // to what ahead sees, so the merge that follows reconciles
+                // common.txt rather than carrying it across.
+                fixture.switch_to(ahead_branch, ahead1).await;
+                fixture.write_file("common.txt", b"base line\nahead line\n");
+                fixture.stage_all().await;
+
+                // Merge side into ahead. Both branches modified common.txt off
+                // the same base, so the merge reconciles.
+                let merge_rev = fixture.merge(side_branch, "merge side into ahead").await;
+
+                let entries = walk_by_path(fixture.repository.clone(), merge_rev).await;
+                let common = entries
+                    .get("common.txt")
+                    .expect("common.txt must appear in the walk");
+
+                assert_eq!(
+                    common.last_revision, ahead1,
+                    "a merge-reconciled entry attributes to parent_self (the last non-merge \
+                     revision on the walked line that touched it), not to the merge itself"
                 );
             }))
             .await
