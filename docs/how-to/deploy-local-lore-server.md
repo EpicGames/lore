@@ -15,7 +15,7 @@ In this guide, you'll deploy local Lore Servers — with durable storage and a c
 The binary and Docker paths are mutually exclusive, and each is complete on its own — follow one top to bottom.
 
 - **[Run from the binary](#run-from-the-binary):** Fewer moving parts and native performance. Pick this to run `loreserver` directly on the host.
-- **[Run with Docker](#run-with-docker):** An isolated container. Pick this if you'd rather not put a binary on the host — but note the `linux/amd64` emulation caveat on Apple Silicon in the build step.
+- **[Run with Docker](#run-with-docker):** An isolated container. Pick this if you'd rather not put a binary on the host. Builds natively on both `amd64` and `arm64`, Apple Silicon included.
 
 ## Run from the binary
 
@@ -196,11 +196,11 @@ The binary and Docker paths are mutually exclusive, and each is complete on its 
     This needs Docker (and WSL2 on Windows) and the Lore repository cloned locally. Building the image compiles the server, so it needs several GB of free RAM. From the repository root:
 
     ```bash
-    docker build --platform linux/amd64 -f lore-server/Dockerfile -t lore-server .
+    docker build -f lore-server/Dockerfile -t lore-server .
     ```
 
     > [!NOTE]
-    > On Apple Silicon or Windows (both arm64 and amd64), build and run with `--platform linux/amd64` as shown. The `linux/arm64` server image targets AWS Graviton3 (SVE), an instruction set those CPUs lack.
+    > The image builds for your host architecture. On Apple Silicon or Windows on arm64 that is a baseline `armv8-a` build which runs natively — no `--platform` override is needed. To tune arm64 for AWS Graviton3 and newer instead, add `--build-arg ARM64_TARGET_CPU=neoverse-512tvb`; that binary uses SVE and will not run on other arm64 hardware.
 
 2. **Run it with default settings.**
 

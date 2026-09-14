@@ -6,8 +6,11 @@ telemetry integration, or replication is configured.
 ## Prerequisites
 
 - Docker with BuildKit support
-- On Apple Silicon (M-series Macs), builds must target `linux/amd64` due to Graviton-specific
-  compiler flags in `.cargo/config.toml` for `aarch64-unknown-linux-gnu`
+
+Both `linux/amd64` and `linux/arm64` build. `.cargo/config.toml` pins `aarch64-unknown-linux-gnu`
+to Graviton3+ via `-C target-cpu=neoverse-512tvb`, which faults on older arm64 parts, so the
+Dockerfile assembles `RUSTFLAGS` itself and leaves that tuning off by default. An arm64 image you
+build here therefore runs on any armv8-a host, Apple Silicon included.
 
 `lore-server/Dockerfile` is the one to build from source, and is what the rest of this section
 describes. `lore-server/Dockerfile.release` packages a binary already published as a release asset
@@ -19,11 +22,18 @@ and compiles nothing; it is used only by the publish workflow, and needs that as
 From the repository root:
 
 ```sh
-docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver .
+docker build -f lore-server/Dockerfile -t loreserver .
 ```
 
-The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC
-using `scripts/server/make-certs.sh`.
+Pass `--platform linux/amd64` or `--platform linux/arm64` to cross-build; expect it to be slow,
+since a release Rust build under emulation is far slower than a native one.
+
+To tune arm64 for Graviton3 and newer, as Lore is deployed, pass the microarchitecture. The
+resulting binary will not run on older arm64 hardware:
+
+```sh
+docker build -f lore-server/Dockerfile --build-arg ARM64_TARGET_CPU=neoverse-512tvb -t loreserver .
+```
 
 ## Published images
 
