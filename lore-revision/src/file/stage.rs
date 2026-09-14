@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::hash::hash_string;
@@ -1209,17 +1210,23 @@ pub async fn stage_move(
         .await
         .unwrap_or_default();
 
-    // Get target file/directory metadata
-    let to_absolute_path = to_path.to_absolute_path(repository.require_path()?);
-    let to_metadata = lore_io::IoDriver::global()
-        .metadata(to_absolute_path)
-        .await
-        .internal_with(|| format!("Path {to_path} does not exist in repository "))?;
+    let to_info = with_operation(repository.file_system(), false, async |operation| {
+        operation
+            .file_info(&to_path)
+            .await
+            .forward::<StageError>("Failed to read the move target")
+    })
+    .await?;
+    if !to_info.exists() {
+        return Err(StageError::internal(format!(
+            "Path {to_path} does not exist in repository "
+        )));
+    }
 
-    if from_node.is_directory() && !to_metadata.is_dir() {
+    if from_node.is_directory() && !to_info.is_dir() {
         return Err(StageError::internal("Cannot move a directory to a file"));
     }
-    if !from_node.is_directory() && to_metadata.is_dir() {
+    if !from_node.is_directory() && to_info.is_dir() {
         return Err(StageError::internal("Cannot move a file to a directory"));
     }
 
@@ -1597,6 +1604,64 @@ pub(crate) fn classify_stage_path(relative_path: &str, layer_target_paths: &[&st
             layer_indices: ancestor_indices,
         }
     }
+}
+
+/// Splits paths into those the parent repository owns and, per layer, the mount-relative
+/// suffixes that layer owns.
+///
+/// Layer content is deliberately absent from the parent's tree, so a path under a mount
+/// evaluated against the parent's states matches nothing at all.
+pub(crate) fn route_layer_paths(
+    layers: &[crate::layer::Layer],
+    paths: Vec<RelativePath>,
+) -> (Vec<RelativePath>, Vec<(usize, Vec<RelativePath>)>) {
+    if layers.is_empty() {
+        return (paths, Vec::new());
+    }
+
+    let targets: Vec<&str> = layers
+        .iter()
+        .map(|layer| layer.target_path.as_str())
+        .collect();
+
+    let mut parent_paths = Vec::new();
+    let mut remains_per_layer: Vec<Vec<RelativePath>> = vec![Vec::new(); layers.len()];
+
+    for path in paths {
+        match classify_stage_path(path.as_str(), &targets) {
+            LayerRoute::Inside {
+                layer_index,
+                remain,
+            } => remains_per_layer[layer_index].push(remain),
+            LayerRoute::AncestorOf { layer_indices } => {
+                parent_paths.push(path);
+                for layer_index in layer_indices {
+                    remains_per_layer[layer_index].push(RelativePath::new());
+                }
+            }
+            LayerRoute::Disjoint => parent_paths.push(path),
+        }
+    }
+
+    let layer_jobs = remains_per_layer
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut remains)| {
+            if remains.is_empty() {
+                return None;
+            }
+            // A mount root subsumes any suffix beneath it.
+            if remains.iter().any(RelativePath::is_empty) {
+                remains = vec![RelativePath::new()];
+            } else {
+                remains.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                remains.dedup_by(|a, b| a.as_str() == b.as_str());
+            }
+            Some((index, remains))
+        })
+        .collect();
+
+    (parent_paths, layer_jobs)
 }
 
 /// Returns true if `relative_path` is at or inside any of the masked subtree paths.

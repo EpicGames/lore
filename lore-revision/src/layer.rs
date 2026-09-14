@@ -220,6 +220,7 @@ pub fn layer_config_path(repository: &Arc<RepositoryContext>) -> Result<PathBuf,
         .map(|path| path.join(repository::LAYER))
 }
 
+#[derive(Clone)]
 pub struct LayerState {
     pub repository: Arc<RepositoryContext>,
     pub state_current: Arc<State>,
@@ -593,14 +594,22 @@ pub async fn remove(
     let mut tracked_directories: Vec<RelativePath> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
 
-    walk_layer_subtree(
-        layer_repository.clone(),
-        layer_state.clone(),
-        source_node_link.node,
-        target_path.clone(),
-        &mut tracked_files,
-        &mut tracked_directories,
-        &mut modified,
+    with_operation(
+        repository.file_system(),
+        false, /* Reads the layer's files to report them, and removes them below */
+        async |operation| {
+            walk_layer_subtree(
+                &operation,
+                layer_repository.clone(),
+                layer_state.clone(),
+                source_node_link.node,
+                target_path.clone(),
+                &mut tracked_files,
+                &mut tracked_directories,
+                &mut modified,
+            )
+            .await
+        },
     )
     .await?;
 
@@ -693,7 +702,9 @@ pub async fn remove(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_layer_subtree<'a>(
+    operation: &'a Arc<InstanceOperationImpl>,
     layer_repository: Arc<RepositoryContext>,
     layer_state: Arc<State>,
     node: NodeID,
@@ -726,6 +737,7 @@ fn walk_layer_subtree<'a>(
             if child_node.is_directory() {
                 tracked_directories.push(child_path.clone());
                 walk_layer_subtree(
+                    operation,
                     layer_repository.clone(),
                     layer_state.clone(),
                     child_id,
@@ -736,20 +748,18 @@ fn walk_layer_subtree<'a>(
                 )
                 .await?;
             } else if !child_node.is_staged_delete() {
-                let absolute = child_path.to_absolute_path(layer_repository.require_path()?);
-                match lore_io::IoDriver::global().metadata(&absolute).await {
-                    Ok(metadata) if metadata.is_file() => {
-                        let (file_mtime, file_size) =
-                            crate::util::fs::file_mtime_and_size(&metadata);
+                match operation.file_info(&child_path).await {
+                    Ok(info) if info.is_file() => {
                         if !child_node.is_staged() {
                             let is_modified = state::file_modification(
                                 layer_repository.clone(),
                                 &child_node,
-                                file_mtime,
-                                file_size,
+                                info.mtime(),
+                                info.size(),
                                 &child_path,
                                 true,
-                                None,
+                                operation,
+                                &lore_storage::ContentHashes::default(),
                             )
                             .await
                             .map_or(true, |modification| modification.is_modified());
@@ -759,15 +769,15 @@ fn walk_layer_subtree<'a>(
                         }
                         tracked_files.push(child_path);
                     }
-                    Ok(_) => {
+                    Ok(info) if info.exists() => {
                         modified.push(format!("{} (type changed)", child_path.as_str()));
                         tracked_files.push(child_path);
                     }
-                    Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+                    Ok(_) => {
                         modified.push(format!("{} (missing)", child_path.as_str()));
                     }
                     Err(err) => {
-                        lore_warn!("Failed to stat layer file {}: {err}", absolute.display());
+                        lore_warn!("Failed to stat layer file {}: {err}", child_path.as_str());
                         modified.push(format!("{} (stat failed)", child_path.as_str()));
                     }
                 }
@@ -1258,4 +1268,48 @@ pub async fn store_layer_staged(
     }
 
     Err(LayerNotFound.into())
+}
+
+/// Pin `state`'s staged revision on the layer, writing a zero pin when nothing is left staged.
+///
+/// A pin that differs from `current` without staged content makes the next commit produce an
+/// empty revision in the layer.
+pub async fn store_staged_or_clear(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    layer: &Layer,
+    state: &LayerState,
+) -> Result<Hash, LayerError> {
+    let has_staged = state
+        .state_staged
+        .node_has_staged_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .await
+        .forward::<LayerError>("Failed to check staged nodes")?;
+    let has_dirty = state
+        .state_staged
+        .node_has_dirty_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .await
+        .forward::<LayerError>("Failed to check dirty nodes")?;
+
+    let signature = if has_staged || has_dirty {
+        state.state_staged.mark_dirty();
+        state
+            .state_staged
+            .serialize(state.repository.clone(), token)
+            .await
+            .forward::<LayerError>("Failed to serialize layer staged revision state")?
+    } else {
+        Hash::default()
+    };
+
+    store_layer_staged(
+        repository,
+        token,
+        layer.target_path.as_str(),
+        layer.repository,
+        signature,
+    )
+    .await?;
+
+    Ok(signature)
 }

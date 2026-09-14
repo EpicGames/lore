@@ -16,6 +16,10 @@ use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -36,6 +40,7 @@ use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::revision;
 use crate::state;
+use crate::state::NodeComparison;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -141,7 +146,7 @@ pub struct LoreFileInfoEventData {
     pub size: u64,
     /// Size of the entry on the local filesystem, in bytes.
     pub local_size: u64,
-    /// Content hash of the entry on the local filesystem.
+    /// Address the entry's local content hashes to, zero where nothing was compared.
     pub local_hash: Hash,
     /// Size of the entry after filters are applied, in bytes.
     pub filter_size: u64,
@@ -185,36 +190,53 @@ pub async fn info(
         .await
         .forward::<InfoError>("Failed deserializing revision state")?;
 
-    let mut tasks = JoinSet::new();
-    for path in paths.iter() {
-        lore_debug!("Info path: {path}");
+    with_operation(
+        repository.file_system(),
+        false, /* Reads the working tree and leaves it alone */
+        async |operation| {
+            let mut tasks = JoinSet::new();
+            for path in paths.iter() {
+                lore_debug!("Info path: {path}");
 
-        let repository = repository.clone();
-        let state = state.clone();
-        let path = path.clone();
+                let operation = operation.clone();
+                let repository = repository.clone();
+                let state = state.clone();
+                let path = path.clone();
 
-        lore_spawn!(tasks, async move {
-            info_path(repository, state, path, options.local, options.filtered).await
-        });
-    }
+                lore_spawn!(tasks, async move {
+                    info_path(
+                        operation,
+                        repository,
+                        state,
+                        path,
+                        options.local,
+                        options.filtered,
+                    )
+                    .await
+                });
+            }
 
-    let mut failure: Option<InfoError> = None;
-    while let Some(result) = tasks.join_next().await {
-        let inner = result
-            .internal("Internal task failure")
-            .map_err(InfoError::from)
-            .flatten();
-        failure = failure.or(inner.err());
-    }
+            let mut failure: Option<InfoError> = None;
+            while let Some(result) = tasks.join_next().await {
+                let inner = result
+                    .internal("Internal task failure")
+                    .map_err(InfoError::from)
+                    .flatten();
+                failure = failure.or(inner.err());
+            }
 
-    if let Some(err) = failure {
-        return Err(err);
-    }
+            if let Some(err) = failure {
+                return Err(err);
+            }
 
-    Ok(())
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn info_path(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     path: RelativePath,
@@ -259,52 +281,35 @@ async fn info_path(
         let mut local_filtered = if local || filtered {
             // Calculate the local size and hash
             calculate_local_filtered_size_hash(
+                operation.clone(),
                 repository.clone(),
                 path.clone(),
                 state_current.clone(),
                 node,
                 node_link.node,
-                local,
-                filtered,
+                RequestedSizes { local, filtered },
             )
             .await?
         } else {
             LocalFiltered::default()
         };
 
-        let mut is_modified = false;
         let mut is_deleted = false;
         if local_filtered.local_size == 0 {
-            let absolute_path = path.to_absolute_path(repository.require_path()?);
-            let file_metadata = lore_io::IoDriver::global()
-                .metadata(absolute_path.as_path())
-                .await;
-            if let Ok(file_metadata) = file_metadata {
-                if file_metadata.is_file() {
-                    local_filtered.local_size = util::fs::file_size(&file_metadata);
-                    if local_filtered.local_size != node.size {
-                        is_modified = true;
-                    } else {
-                        local_filtered.local_hash = immutable::hash_file(
-                            repository.clone(),
-                            absolute_path.as_path(),
-                            Some(node.address),
-                            Some(node.size as usize),
-                        )
-                        .await
-                        .forward_with::<InfoError, _>(|| {
-                            format!("Failed to hash local file: {path}")
-                        })?;
-                    }
+            match operation.file_info(&path).await {
+                Ok(info) if info.is_file() => {
+                    let (comparison, local_hash) =
+                        compare_to_node(&operation, &repository, &node, info.size(), &path).await?;
+                    local_filtered.local_size = info.size();
+                    local_filtered.local_hash = local_hash;
+                    local_filtered.comparison = Some(comparison);
                 }
-            } else {
-                is_deleted = true;
+                Ok(info) if info.exists() => {}
+                _ => is_deleted = true,
             }
         }
 
-        if !local_filtered.local_hash.is_zero() {
-            is_modified = local_filtered.local_hash != node.address.hash;
-        }
+        let is_modified = matches!(local_filtered.comparison, Some(NodeComparison::Differs));
 
         let node_size = if node_link.node == ROOT_NODE {
             let tree = state_current
@@ -357,24 +362,24 @@ async fn info_path(
             event::metadata::send(&metadata);
         }
     } else {
-        let absolute_path = path.to_absolute_path(repository.require_path()?);
-        let file_metadata = lore_io::IoDriver::global().metadata(absolute_path).await;
-        if let Ok(file_metadata) = file_metadata
-            && (file_metadata.is_file() || file_metadata.is_dir())
-        {
+        let info = operation
+            .file_info(&path)
+            .await
+            .unwrap_or(FileInfo::NotExist);
+        if info.exists() {
             event::LoreEvent::FileInfo(LoreFileInfoEventData {
                 path: path.into(),
                 context: Context::default(),
                 hash: Hash::default(),
-                is_file: file_metadata.is_file().into(),
-                is_dir: file_metadata.is_dir().into(),
+                is_file: info.is_file().into(),
+                is_dir: info.is_dir().into(),
                 flag_modified: 0,
                 flag_deleted: 0,
                 flag_added: 1,
                 flag_conflict: 0,
                 size: 0,
                 mode: 0,
-                local_size: util::fs::file_size(&file_metadata),
+                local_size: info.size(),
                 local_hash: Hash::default(),
                 filter_size: 0,
             })
@@ -385,21 +390,73 @@ async fn info_path(
     Ok(())
 }
 
+/// Which sizes a request asked to be walked for, neither of which is cheap on a directory.
+#[derive(Clone, Copy)]
+struct RequestedSizes {
+    /// Walk the working tree below the path.
+    local: bool,
+    /// Walk the state below the path, counting what the filter admits.
+    filtered: bool,
+}
+
+/// How the working tree's file at `relative_path` compares to `node`.
+///
+/// Measured through `operation` against the fragmentation the content was stored under, which is
+/// what a hash of the file taken on its own cannot answer for. `file_size` is the size already
+/// measured, which settles a differing one without reading anything.
+async fn compare_to_node(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    node: &Node,
+    file_size: u64,
+    relative_path: &RelativePath,
+) -> Result<(NodeComparison, Hash), InfoError> {
+    let comparison = crate::state::file_matches_node(
+        repository.clone(),
+        node,
+        file_size,
+        relative_path,
+        operation,
+        &lore_storage::ContentHashes::default(),
+    )
+    .await
+    .forward_with::<InfoError, _>(|| format!("Failed to compare local file: {relative_path}"))?;
+
+    let local_hash = match comparison {
+        NodeComparison::Matches => node.address.hash,
+        NodeComparison::Differs => {
+            immutable::hash_file(repository.clone(), &operation.content_source(relative_path))
+                .await
+                .forward_with::<InfoError, _>(|| {
+                    format!("Failed to hash local file: {relative_path}")
+                })?
+        }
+        NodeComparison::Unreadable => Hash::default(),
+    };
+
+    Ok((comparison, local_hash))
+}
+
+/// What a path holds locally, and how that compared to the node where it was compared at all.
+///
+/// `comparison` is `None` where nothing was compared: a directory, a path the filter excludes, or
+/// one the working tree holds no file at, and `local_hash` is zero for the same.
 #[derive(Default)]
 struct LocalFiltered {
     local_size: u64,
     local_hash: Hash,
+    comparison: Option<NodeComparison>,
     filtered_size: u64,
 }
 
 async fn calculate_local_filtered_size_hash(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     relative_path: RelativePath,
     state: Arc<State>,
     node: Node,
     node_id: NodeID,
-    local: bool,
-    filtered: bool,
+    sizes: RequestedSizes,
 ) -> Result<LocalFiltered, InfoError> {
     let parent_states = repository.filter.parent_exclusion_states(&relative_path);
     let (_, excluded) = repository.filter.child_emit_excludes(
@@ -412,45 +469,38 @@ async fn calculate_local_filtered_size_hash(
         return Ok(LocalFiltered::default());
     }
 
-    let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
     if node.is_file() {
-        if let Ok(metadata) = lore_io::IoDriver::global()
-            .metadata(absolute_path.as_path())
+        let info = operation
+            .file_info(&relative_path)
             .await
-        {
-            let size = util::fs::file_size(&metadata);
-            let hash = if size > 0 {
-                immutable::hash_file(
-                    repository.clone(),
-                    absolute_path.as_path(),
-                    Some(node.address),
-                    Some(node.size as usize),
-                )
-                .await
-                .forward_with::<InfoError, _>(|| {
-                    format!("Failed to hash local file: {relative_path}")
-                })?
-            } else {
-                Hash::default()
-            };
-            Ok(LocalFiltered {
-                local_size: size,
-                local_hash: hash,
+            .unwrap_or(FileInfo::NotExist);
+        if !info.is_file() {
+            return Ok(LocalFiltered {
                 filtered_size: node.size,
-            })
-        } else {
-            Ok(LocalFiltered {
-                local_size: 0,
-                local_hash: Hash::default(),
-                filtered_size: node.size,
-            })
+                ..LocalFiltered::default()
+            });
         }
+
+        let (comparison, local_hash) = if info.size() > 0 {
+            let compared =
+                compare_to_node(&operation, &repository, &node, info.size(), &relative_path)
+                    .await?;
+            (Some(compared.0), compared.1)
+        } else {
+            (None, Hash::default())
+        };
+        Ok(LocalFiltered {
+            local_size: info.size(),
+            local_hash,
+            comparison,
+            filtered_size: node.size,
+        })
     } else if node.is_directory() {
         // Get the local file sizes
         let local_size_repository = repository.clone();
         let local_size_relative_path = relative_path.clone();
         let local_size_task = lore_spawn!(async move {
-            if local {
+            if sizes.local {
                 lore_debug!("Calculating local size");
                 calculate_local_size_recurse(
                     local_size_repository,
@@ -468,7 +518,7 @@ async fn calculate_local_filtered_size_hash(
         let filtered_size_relative_path = relative_path.clone();
         let filtered_state = state.clone();
         let filtered_size_task = lore_spawn!(async move {
-            if filtered {
+            if sizes.filtered {
                 lore_debug!("Calculating filtered size");
                 calculate_filtered_size_recurse(
                     filtered_size_repository,
@@ -498,8 +548,8 @@ async fn calculate_local_filtered_size_hash(
 
         Ok(LocalFiltered {
             local_size,
-            local_hash: Hash::default(),
             filtered_size,
+            ..LocalFiltered::default()
         })
     } else if node.is_link() {
         // TODO(vri): UCS-19229 - Links: Handle link nodes in file info lookup

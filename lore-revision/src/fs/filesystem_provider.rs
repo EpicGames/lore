@@ -21,8 +21,8 @@ use crate::change::NodeChange;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::os::OsOperation;
+use crate::lore::Address;
 use crate::lore::Context;
-use crate::lore::Hash;
 use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::node::NodeFlags;
@@ -47,46 +47,82 @@ impl From<std::io::Error> for FsError {
     }
 }
 
-/// Basic file information returned by `InstanceOperation::file_info`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FileInfo {
-    /// Whether the path exists on the filesystem.
-    pub exists: bool,
-    /// Whether the path is a file (false if directory or doesn't exist).
-    pub is_file: bool,
-    /// Whether the path is a directory.
-    pub is_dir: bool,
-    /// Whether the file carries the executable bit, `None` where the platform has no
-    /// such bit to read. See [`FileInfo::mode`].
-    pub executable: Option<bool>,
-    /// File size in bytes (0 if doesn't exist or is directory).
-    pub size: u64,
-    /// Modification time as Unix timestamp in milliseconds.
-    pub mtime: u64,
+/// What a walk measured at a path, as returned by `InstanceOperation::file_info`.
+///
+/// The repository tracks files and directories. Anything else the file system holds — a device, a
+/// socket — answers as holding nothing, and a directory listing skips a link rather than
+/// describing what it points at. A path named on its own is stat'd through a link, so one naming
+/// a link answers for the target it resolves to. Supporting links means giving them a variant of
+/// their own rather than widening one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileInfo {
+    /// The path holds nothing, which a path the walk skipped also answers.
+    NotExist,
+    /// A directory, which stores none of the size, time or mode a file does.
+    Directory,
+    /// A file, with what the walk measured of it.
+    File {
+        /// Whether the file carries the executable bit, `None` where the platform has no
+        /// such bit to read. See [`FileInfo::mode`].
+        executable: Option<bool>,
+        /// File size in bytes.
+        size: u64,
+        /// Modification time as Unix timestamp in milliseconds.
+        mtime: u64,
+    },
 }
 
 impl FileInfo {
-    /// A directory, as every component a walk resolved a path through must be. Carries
-    /// no size, mtime or mode, none of which a directory node stores.
-    pub const DIRECTORY: Self = FileInfo {
-        exists: true,
-        is_file: false,
-        is_dir: true,
-        executable: None,
-        size: 0,
-        mtime: 0,
-    };
-
     pub fn from_metadata(metadata: &Metadata) -> Self {
+        if metadata.is_dir() {
+            return FileInfo::Directory;
+        }
+        if !metadata.is_file() {
+            return FileInfo::NotExist;
+        }
         let (mtime, size) = crate::util::fs::file_mtime_and_size(metadata);
-        let executable = crate::util::fs::file_executable_observed(metadata);
-        FileInfo {
-            exists: true,
-            is_file: metadata.is_file(),
-            is_dir: metadata.is_dir(),
-            executable,
+        FileInfo::File {
+            executable: crate::util::fs::file_executable_observed(metadata),
             size,
             mtime,
+        }
+    }
+
+    /// Whether the file system holds anything here that the repository tracks.
+    pub fn exists(&self) -> bool {
+        !matches!(self, FileInfo::NotExist)
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self, FileInfo::File { .. })
+    }
+
+    pub fn is_dir(&self) -> bool {
+        matches!(self, FileInfo::Directory)
+    }
+
+    /// The size of a file, and zero for anything else, which stores none.
+    pub fn size(&self) -> u64 {
+        match self {
+            FileInfo::File { size, .. } => *size,
+            _ => 0,
+        }
+    }
+
+    /// The modification time of a file, and zero for anything else, which stores none.
+    pub fn mtime(&self) -> u64 {
+        match self {
+            FileInfo::File { mtime, .. } => *mtime,
+            _ => 0,
+        }
+    }
+
+    /// Whether a file carries the executable bit, `None` where the platform has no such bit to
+    /// read and where the path holds no file to read it from.
+    pub fn executable(&self) -> Option<bool> {
+        match self {
+            FileInfo::File { executable, .. } => *executable,
+            _ => None,
         }
     }
 
@@ -94,7 +130,7 @@ impl FileInfo {
     /// [`crate::util::fs::metadata_to_mode`] answers it for the metadata this was read
     /// from.
     pub fn mode(&self, previous: u16) -> u16 {
-        crate::util::fs::mode_from_observed(self.is_file, self.executable, previous)
+        crate::util::fs::mode_from_observed(self.is_file(), self.executable(), previous)
     }
 }
 
@@ -152,6 +188,9 @@ impl FilesystemDiffIntent {
 /// `current` is what the working copy last held, which is how an unstaged add is told
 /// apart from a tracked file.
 pub struct FilesystemDiffContext {
+    /// The operation the walk reads the working tree through, carried here because the walk
+    /// spawns tasks and so needs one it can own rather than borrow.
+    pub operation: Arc<InstanceOperationImpl>,
     pub from: NodeMapping,
     pub current: NodeMapping,
     /// The path as the file system spells it, which parts from the mappings' own spelling only
@@ -187,7 +226,7 @@ pub struct MeasuredNode {
 }
 
 /// Result of checking whether a file differs from a node.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct FileModifiedCheck {
     /// Basic file information.
     pub info: FileInfo,
@@ -247,6 +286,31 @@ where
     Ok(value)
 }
 
+/// [`with_operation`] for work that reads the filesystem only under some conditions.
+///
+/// Opening an operation freezes a virtual filesystem and snapshots it, so work that reads the
+/// working tree only when asked to takes one only then, and the same one for the whole of it.
+/// `work` is handed nothing where none was opened, which is the instruction not to read.
+pub async fn with_operation_if<T, E, F>(
+    filesystem: Arc<dyn FilesystemProvider>,
+    needed: bool,
+    changes_made: bool,
+    work: F,
+) -> Result<T, E>
+where
+    E: ErrorSet,
+    F: AsyncFnOnce(Option<Arc<InstanceOperationImpl>>) -> Result<T, E>,
+{
+    if !needed {
+        return work(None).await;
+    }
+
+    with_operation(filesystem, changes_made, async |operation| {
+        work(Some(operation)).await
+    })
+    .await
+}
+
 /// Instance operation trait - performs file operations within a context.
 ///
 /// Operations are performed against a consistent snapshot (for SWFS) or directly
@@ -298,30 +362,39 @@ pub trait InstanceOperation: Send + Sync {
         name: &str,
     ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
 
-    /// Gets the hash of a file in the repository, optionally providing the Node if it has
-    /// separately been loaded.
-    fn file_hash(
-        &self,
-        repository: Arc<RepositoryContext>,
-        path: &RelativePath,
-        node_hint: Option<&Node>,
-    ) -> impl Future<Output = Result<Hash, FsError>> + Send;
-
-    /// How the file at `path` compares to the content `node` addresses.
+    /// Where the content at `path` is read from, in this operation's view of the working tree.
     ///
-    /// Takes the node to compare against rather than deriving it from a change, so a caller
-    /// holding both sides of a change can ask about either. Compares content rather than
-    /// consulting a recorded modification time, which speaks only for the current revision's
-    /// node and so cannot answer for the other side of a change. A file that cannot be read
-    /// is reported as such rather than as either answer, so a caller does not act on a
-    /// comparison that never happened.
-    fn compare_file_to_node(
+    /// The provider's own business is where content is held, so it answers with a source rather
+    /// than with content, a hash or a comparison: nothing here commits it to reading. Whether a
+    /// file holds content already stored is [`file_holds_content`](Self::file_holds_content),
+    /// which a provider keeping its own record answers without reading at all.
+    ///
+    /// A caller that needs the bytes — to address content matching nothing stored — takes its
+    /// source from here rather than naming a host path the provider may not read through.
+    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static>;
+
+    /// Whether the file at `path` holds the content `previous` addresses, and `previous_size`
+    /// bytes of it.
+    ///
+    /// How the answer is reached is the operation's own business. One materializing its files
+    /// reads and measures them; one that records what it wrote answers from that record without
+    /// reading anything. A file that cannot be read is reported as such rather than as either
+    /// answer, so a caller does not act on a comparison that never happened.
+    ///
+    /// Takes the address to compare against rather than a change, so a caller holding both sides
+    /// of one can ask about either. Reads no recorded modification time: a recorded time speaks
+    /// for the node the current revision holds and answers for no other.
+    ///
+    /// `established` carries what comparing this file has already settled, so a caller measuring
+    /// one path against several addresses reads it no more than the answers require. A provider
+    /// answering without reading leaves it untouched.
+    fn file_holds_content(
         &self,
         repository: Arc<RepositoryContext>,
-        node: &Node,
         path: &RelativePath,
-        file_size: u64,
-        content: &lore_storage::ContentHashMemo<'_>,
+        previous: Address,
+        previous_size: u64,
+        established: &lore_storage::ContentHashes,
     ) -> impl Future<Output = Result<NodeComparison, FsError>> + Send;
 
     /// Make a file executable (Unix) or set executable bit equivalent.
@@ -477,7 +550,9 @@ impl InstanceOperation for InstanceOperationImpl {
     ) -> Result<FilesystemDiffStats, FsError> {
         match &self.dispatch {
             #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.changes_from_filesystem_to_state(diff, changes).await
+            }
             StaticDispatchInstanceOperation::Os(this) => {
                 this.changes_from_filesystem_to_state(diff, changes).await
             }
@@ -512,34 +587,27 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn file_hash(
-        &self,
-        repository: Arc<RepositoryContext>,
-        path: &RelativePath,
-        node_hint: Option<&Node>,
-    ) -> Result<Hash, FsError> {
+    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => {
-                this.file_hash(repository, path, node_hint).await
-            }
+            StaticDispatchInstanceOperation::Os(this) => this.content_source(path),
         }
     }
 
-    async fn compare_file_to_node(
+    async fn file_holds_content(
         &self,
         repository: Arc<RepositoryContext>,
-        node: &Node,
         path: &RelativePath,
-        file_size: u64,
-        content: &lore_storage::ContentHashMemo<'_>,
+        previous: Address,
+        previous_size: u64,
+        established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.compare_file_to_node(repository, node, path, file_size, content)
+                this.file_holds_content(repository, path, previous, previous_size, established)
                     .await
             }
         }
@@ -707,7 +775,8 @@ pub mod tests {
     use crate::fs::filesystem_provider::InstanceOperationImpl;
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
     use crate::fs::filesystem_provider::with_operation;
-    use crate::lore::Hash;
+    use crate::fs::filesystem_provider::with_operation_if;
+    use crate::lore::Address;
     use crate::lore::RepositoryId;
     use crate::merge::MergeTextMode;
     use crate::node::Node;
@@ -772,7 +841,9 @@ pub mod tests {
     }
 
     /// A repository over `filesystem`, with the stores every context needs.
-    async fn test_repository(filesystem: Arc<TestFilesystemProvider>) -> Arc<RepositoryContext> {
+    pub async fn test_repository(
+        filesystem: Arc<TestFilesystemProvider>,
+    ) -> Arc<RepositoryContext> {
         let (immutable_store, mutable_store, _context) =
             test_store_create().await.expect("Making test stores");
         Arc::new(RepositoryContext::new(
@@ -808,8 +879,8 @@ pub mod tests {
     }
 
     impl InstanceOperation for TestOperation {
-        /// The only actually implemented member, the rest are unimplemented which will fail any
-        /// test that calls them.
+        /// Members beyond finalizing, the walk and the name lookups are unimplemented, which will
+        /// fail any test that calls them.
         async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
             self.finalize_events.lock().push(changes_made);
             if self.finalize_fails {
@@ -818,12 +889,14 @@ pub mod tests {
             Ok(())
         }
 
+        /// Reports a working tree holding exactly what the state does, which is what a walk over a
+        /// tree with nothing to reconcile answers.
         async fn changes_from_filesystem_to_state(
             &self,
             _diff: FilesystemDiffContext,
             _changes: &mut Vec<NodeChange>,
         ) -> Result<FilesystemDiffStats, FsError> {
-            panic!("Test operation unimplemented except finalize")
+            Ok(FilesystemDiffStats::default())
         }
 
         /// Counts the lookup and reports what the provider was told to hold, which for the
@@ -832,13 +905,13 @@ pub mod tests {
         async fn file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
             Ok(if self.holds_paths {
-                FileInfo {
-                    exists: true,
-                    is_file: true,
-                    ..Default::default()
+                FileInfo::File {
+                    executable: None,
+                    size: 0,
+                    mtime: 0,
                 }
             } else {
-                FileInfo::default()
+                FileInfo::NotExist
             })
         }
 
@@ -862,22 +935,17 @@ pub mod tests {
             })
         }
 
-        async fn file_hash(
-            &self,
-            _repository: Arc<RepositoryContext>,
-            _path: &RelativePath,
-            _node_hint: Option<&Node>,
-        ) -> Result<Hash, FsError> {
+        fn content_source(&self, _path: &RelativePath) -> lore_storage::ContentSource<'static> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn compare_file_to_node(
+        async fn file_holds_content(
             &self,
             _repository: Arc<RepositoryContext>,
-            _node: &Node,
             _path: &RelativePath,
-            _file_size: u64,
-            _content: &lore_storage::ContentHashMemo<'_>,
+            _previous: Address,
+            _previous_size: u64,
+            _established: &lore_storage::ContentHashes,
         ) -> Result<NodeComparison, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
@@ -985,6 +1053,68 @@ pub mod tests {
 
         assert_eq!(1, filesystem.begins());
         assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+    }
+
+    #[tokio::test]
+    async fn work_that_needs_no_operation_opens_none() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let handed: Option<()> =
+            with_operation_if(repository.file_system(), false, false, async |operation| {
+                Ok::<_, FsError>(operation.map(|_| ()))
+            })
+            .await
+            .expect("The work succeeded");
+
+        assert!(
+            handed.is_none(),
+            "Work that needs no operation was handed one"
+        );
+        assert_eq!(0, filesystem.begins());
+        assert!(
+            filesystem.finalize_events.lock().is_empty(),
+            "An operation that was never opened was finalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_that_needs_an_operation_opens_one_and_finalizes_it() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let handed: Option<()> =
+            with_operation_if(repository.file_system(), true, false, async |operation| {
+                Ok::<_, FsError>(operation.map(|_| ()))
+            })
+            .await
+            .expect("The work succeeded");
+
+        assert!(
+            handed.is_some(),
+            "Work that needs an operation was handed none"
+        );
+        assert_eq!(1, filesystem.begins());
+        assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
+    }
+
+    #[tokio::test]
+    async fn a_failing_operation_is_still_finalized_where_one_was_needed() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let result: Result<(), FsError> =
+            with_operation_if(repository.file_system(), true, false, async |_operation| {
+                Err(FsError::internal("Work failed"))
+            })
+            .await;
+
+        result.expect_err("The work's error should be reported");
+        assert_eq!(
+            vec![false],
+            *(filesystem.finalize_events.lock()),
+            "A failed operation was left unfinalized"
+        );
     }
 
     #[tokio::test]
@@ -1103,17 +1233,18 @@ pub mod tests {
     /// a directory that holds nothing a directory node would store.
     #[test]
     fn a_directory_info_is_an_existing_directory_with_no_content() {
-        let info = FileInfo::DIRECTORY;
-        assert!(info.exists);
-        assert!(info.is_dir);
-        assert!(!info.is_file);
-        assert_eq!(0, info.size);
-        assert_eq!(0, info.mtime);
+        let info = FileInfo::Directory;
+        assert!(info.exists());
+        assert!(info.is_dir());
+        assert!(!info.is_file());
+        assert_eq!(0, info.size());
+        assert_eq!(0, info.mtime());
     }
 
     /// A node staged from a `FileInfo` has to land the size, time and mode a node
     /// staged from the metadata itself would, since the two are the same walk before
-    /// and after the file information became the currency between them.
+    /// and after the file information became the currency between them. A directory
+    /// states none of what a file stores, which is none of what a directory node takes.
     #[test]
     fn file_information_answers_what_the_metadata_helpers_answer() {
         let dir = lore_base::test_util::TempDir::new("lore-fs-provider-test-");
@@ -1123,10 +1254,10 @@ pub mod tests {
         let check = |path: &Path| {
             let metadata = std::fs::metadata(path).expect("metadata");
             let info = FileInfo::from_metadata(&metadata);
-            assert_eq!(crate::util::fs::file_size(&metadata), info.size);
-            assert_eq!(crate::util::fs::file_mtime(&metadata), info.mtime);
-            assert_eq!(metadata.is_dir(), info.is_dir);
-            assert_eq!(metadata.is_file(), info.is_file);
+            assert_eq!(crate::util::fs::file_size(&metadata), info.size());
+            assert_eq!(crate::util::fs::file_mtime(&metadata), info.mtime());
+            assert_eq!(metadata.is_dir(), info.is_dir());
+            assert_eq!(metadata.is_file(), info.is_file());
             for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
                 assert_eq!(
                     crate::util::fs::metadata_to_mode(&metadata, previous),
@@ -1138,7 +1269,17 @@ pub mod tests {
         };
 
         check(&path);
-        check(dir.path());
+
+        let metadata = std::fs::metadata(dir.path()).expect("metadata");
+        let directory = FileInfo::from_metadata(&metadata);
+        assert_eq!(FileInfo::Directory, directory);
+        for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
+            assert_eq!(
+                crate::util::fs::metadata_to_mode(&metadata, previous),
+                directory.mode(previous),
+                "mode for a directory from previous {previous}"
+            );
+        }
 
         #[cfg(target_family = "unix")]
         {
@@ -1168,7 +1309,7 @@ pub mod tests {
             .await
             .expect("a lookup is answered");
 
-        assert!(!info.exists);
+        assert!(!info.exists());
         assert_eq!(1, filesystem.file_infos());
     }
 

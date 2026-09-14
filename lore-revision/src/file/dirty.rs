@@ -7,9 +7,8 @@ use std::sync::atomic::Ordering;
 use lore_error_set::prelude::*;
 
 use crate::errors::*;
-use crate::file::stage::LayerRoute;
-use crate::file::stage::classify_stage_path;
 use crate::file::stage::is_path_under_layer_mask;
+use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::interface::LoreArray;
@@ -138,7 +137,7 @@ pub(crate) async fn dirty_relative_paths(
     let layers = layer::list(repository.clone())
         .await
         .forward::<DirtyError>("Failed to list layers")?;
-    let (parent_paths, layer_jobs) = route_dirty_paths(&layers, paths);
+    let (parent_paths, layer_jobs) = route_layer_paths(&layers, paths);
 
     let mask = (!layers.is_empty()).then(|| Arc::new(layer::target_paths(&layers)));
 
@@ -164,64 +163,6 @@ pub(crate) async fn dirty_relative_paths(
     }
 
     Ok(signature)
-}
-
-/// Splits paths into those the parent repository owns and, per layer, the mount-relative suffixes
-/// that layer owns.
-///
-/// Layer content is deliberately absent from the parent's tree, so a path under a mount evaluated
-/// against the parent's states matches nothing and every dispatch arm in [`dirty_path`] misfires.
-fn route_dirty_paths(
-    layers: &[layer::Layer],
-    paths: Vec<RelativePath>,
-) -> (Vec<RelativePath>, Vec<(usize, Vec<RelativePath>)>) {
-    if layers.is_empty() {
-        return (paths, Vec::new());
-    }
-
-    let targets: Vec<&str> = layers
-        .iter()
-        .map(|layer| layer.target_path.as_str())
-        .collect();
-
-    let mut parent_paths = Vec::new();
-    let mut remains_per_layer: Vec<Vec<RelativePath>> = vec![Vec::new(); layers.len()];
-
-    for path in paths {
-        match classify_stage_path(path.as_str(), &targets) {
-            LayerRoute::Inside {
-                layer_index,
-                remain,
-            } => remains_per_layer[layer_index].push(remain),
-            LayerRoute::AncestorOf { layer_indices } => {
-                parent_paths.push(path);
-                for layer_index in layer_indices {
-                    remains_per_layer[layer_index].push(RelativePath::new());
-                }
-            }
-            LayerRoute::Disjoint => parent_paths.push(path),
-        }
-    }
-
-    let layer_jobs = remains_per_layer
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, mut remains)| {
-            if remains.is_empty() {
-                return None;
-            }
-            // A mount root subsumes any suffix beneath it.
-            if remains.iter().any(RelativePath::is_empty) {
-                remains = vec![RelativePath::new()];
-            } else {
-                remains.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
-                remains.dedup_by(|a, b| a.as_str() == b.as_str());
-            }
-            Some((index, remains))
-        })
-        .collect();
-
-    (parent_paths, layer_jobs)
 }
 
 /// Each `remain` names a path below the layer's mount, which the layer draws from the same offset

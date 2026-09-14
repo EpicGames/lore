@@ -15,14 +15,17 @@ use serde::Serialize;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
+use crate::layer;
 use crate::link;
 use crate::link::LinkContext;
 use crate::link::LinkTracker;
@@ -38,7 +41,7 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
-use crate::path::emit_path_ignore;
+use crate::path::resolve_user_paths;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
@@ -199,6 +202,72 @@ pub async fn unstage(
     paths: LoreArray<LoreString>,
     options: UnstageOptions,
 ) -> Result<(), UnstageError> {
+    let relative_paths = resolve_user_paths(&repository, &paths).await?;
+
+    let layers = layer::list(repository.clone())
+        .await
+        .forward::<UnstageError>("Failed to list layers")?;
+    let (parent_paths, layer_jobs) = route_layer_paths(&layers, relative_paths);
+
+    event::LoreEvent::FileUnstageBegin(LoreFileUnstageBeginEventData {
+        path_count: parent_paths.len() + layer_jobs.iter().map(|(_, r)| r.len()).sum::<usize>(),
+    })
+    .send();
+
+    let stats = Arc::new(UnstageStats::default());
+
+    if !parent_paths.is_empty() {
+        unstage_parent(
+            repository.clone(),
+            token,
+            parent_paths,
+            options,
+            stats.clone(),
+        )
+        .await?;
+    }
+
+    for (layer_index, remains) in layer_jobs {
+        Box::pin(unstage_from_layer(
+            repository.clone(),
+            token,
+            &layers[layer_index],
+            &remains,
+            options,
+            stats.clone(),
+        ))
+        .await?;
+    }
+
+    let directory_unstaged_count = stats.directory_unstaged_count.load(Ordering::Relaxed);
+    let directory_discarded_count = stats.directory_discarded_count.load(Ordering::Relaxed);
+    let file_unstaged_count = stats.file_unstaged_count.load(Ordering::Relaxed);
+    let file_discarded_count = stats.file_discarded_count.load(Ordering::Relaxed);
+
+    event::LoreEvent::FileUnstageEnd(LoreFileUnstageEndEventData {
+        count: LoreFileUnstageCountData {
+            directory_unstaged_count,
+            directory_discarded_count,
+            file_unstaged_count,
+            file_discarded_count,
+            total_count: directory_unstaged_count
+                + directory_discarded_count
+                + file_unstaged_count
+                + file_discarded_count,
+        },
+    })
+    .send();
+
+    Ok(())
+}
+
+async fn unstage_parent(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: Vec<RelativePath>,
+    options: UnstageOptions,
+    stats: Arc<UnstageStats>,
+) -> Result<(), UnstageError> {
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<UnstageError>("Failed to deserialize current revision anchor")?;
@@ -224,12 +293,6 @@ pub async fn unstage(
             format!("Failed to deserialize revision state {staged_revision}")
         })?;
 
-    event::LoreEvent::FileUnstageBegin(LoreFileUnstageBeginEventData {
-        path_count: paths.len(),
-    })
-    .send();
-
-    let stats = Arc::new(UnstageStats::default());
     let discard = Arc::new(DashMap::<RepositoryId, Vec<u32>>::new());
     let link_tracker = LinkTracker::new();
     let is_merge_or_cherry_pick_or_revert = state_staged.is_merge_or_cherry_pick_or_revert();
@@ -306,25 +369,10 @@ pub async fn unstage(
     )
     .await?;
 
-    let directory_unstaged_count = stats.directory_unstaged_count.load(Ordering::Relaxed);
-    let directory_discarded_count = stats.directory_discarded_count.load(Ordering::Relaxed);
-    let file_unstaged_count = stats.file_unstaged_count.load(Ordering::Relaxed);
-    let file_discarded_count = stats.file_discarded_count.load(Ordering::Relaxed);
-    let total_count = directory_unstaged_count
-        + directory_discarded_count
-        + file_unstaged_count
-        + file_discarded_count;
-
-    event::LoreEvent::FileUnstageEnd(LoreFileUnstageEndEventData {
-        count: LoreFileUnstageCountData {
-            directory_unstaged_count,
-            directory_discarded_count,
-            file_unstaged_count,
-            file_discarded_count,
-            total_count,
-        },
-    })
-    .send();
+    let total_count = stats.directory_unstaged_count.load(Ordering::Relaxed)
+        + stats.directory_discarded_count.load(Ordering::Relaxed)
+        + stats.file_unstaged_count.load(Ordering::Relaxed)
+        + stats.file_discarded_count.load(Ordering::Relaxed);
 
     if total_count == 0 || clear {
         lore_debug!(
@@ -352,6 +400,92 @@ pub async fn unstage(
     Ok(())
 }
 
+/// Unstage the mount-relative `remains` against the layer's own current and staged states.
+///
+/// Each `remain` resolves under the layer's `source_path` for the state lookup. One operation
+/// covers the whole layer, for the same reason the parent walk opens one for all its paths.
+async fn unstage_from_layer(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    layer: &layer::Layer,
+    remains: &[RelativePath],
+    options: UnstageOptions,
+    stats: Arc<UnstageStats>,
+) -> Result<(), UnstageError> {
+    if layer.staged_revision().is_none() {
+        lore_debug!(
+            "Layer at {} holds no staged state, nothing to unstage",
+            layer.target_path
+        );
+        return Ok(());
+    }
+
+    let source_path = RelativePath::new_from_initial_path(&layer.source_path)
+        .forward_with::<UnstageError, _>(|| {
+            format!("Invalid layer source path {}", layer.source_path)
+        })?;
+
+    let layer_state = layer
+        .deserialize_current_and_staged(repository.clone())
+        .await
+        .forward::<UnstageError>("Failed to deserialize layer state")?;
+
+    let discard = Arc::new(DashMap::<RepositoryId, Vec<u32>>::new());
+    let link_tracker = LinkTracker::new();
+
+    with_operation(repository.file_system(), false, async |operation| {
+        for remain in remains {
+            Box::pin(unstage_path(
+                operation.clone(),
+                layer_state.repository.clone(),
+                layer_state.state_current.clone(),
+                layer_state.state_staged.clone(),
+                source_path.join(remain.as_str()),
+                discard.clone(),
+                options,
+                stats.clone(),
+                link_tracker.clone(),
+            ))
+            .await?;
+        }
+        Ok::<_, UnstageError>(())
+    })
+    .await?;
+
+    discard_nodes(
+        layer_state.repository.clone(),
+        layer_state.state_staged.clone(),
+        discard,
+        link_tracker.clone(),
+    )
+    .await?;
+
+    process_link_unstage_updates(
+        layer_state.repository.clone(),
+        token,
+        layer_state.state_current.clone(),
+        layer_state.state_staged.clone(),
+        link_tracker,
+    )
+    .await?;
+
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+
+    let signature = layer::store_staged_or_clear(repository, token, layer, &layer_state)
+        .await
+        .forward::<UnstageError>("Failed to store layer staged state")?;
+
+    event::LoreEvent::FileUnstageRevision(LoreFileUnstageRevisionEventData {
+        repository: layer_state.repository.id,
+        revision: signature,
+    })
+    .send();
+
+    Ok(())
+}
+
 /// What unstaging each path needs: the trees it rewrites and the filesystem operation it
 /// resolves path cases through.
 struct UnstagePaths<'a> {
@@ -359,7 +493,7 @@ struct UnstagePaths<'a> {
     repository: &'a Arc<RepositoryContext>,
     state_current: &'a Arc<State>,
     state_staged: &'a Arc<State>,
-    paths: &'a LoreArray<LoreString>,
+    paths: &'a [RelativePath],
     discard: &'a Arc<DashMap<RepositoryId, Vec<u32>>>,
     options: UnstageOptions,
     stats: &'a Arc<UnstageStats>,
@@ -385,27 +519,14 @@ async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<bool, UnstageError>
         is_merge_or_cherry_pick_or_revert,
     } = args;
     let mut clear = false;
-    for path in paths.as_slice().iter() {
-        let Ok(relative_path) =
-            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-        else {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid path: {path}");
-            continue;
-        };
+    for relative_path in paths {
+        let relative_path = relative_path.clone();
 
         // If we unstage everything, mark for potential clearing, unless we're in a merge/cherry-pick.
         // The actual deletion check also considers dirty nodes (checked later).
         if !is_merge_or_cherry_pick_or_revert && relative_path.is_empty() {
             clear = true;
         }
-
-        lore_debug!(
-            "User path [{}] transformed to relative path [{}] in repository {}",
-            path.as_str(),
-            relative_path.as_str(),
-            repository.path_for_display()
-        );
 
         lore_debug!("Unstage options: {:?}", options);
 
@@ -516,6 +637,7 @@ async fn unstage_path(
         lore_debug!("Unstaging the repository from root");
 
         return unstage_directory(
+            operation,
             NodeMapping {
                 repository: repository.clone(),
                 state: state_staged.clone(),
@@ -546,6 +668,7 @@ async fn unstage_path(
     };
 
     Box::pin(unstage_node(
+        operation,
         NodeMapping {
             repository: target.repository,
             state: target.state_staged,
@@ -655,6 +778,7 @@ async fn resolve_unstage_target(
 /// Each child of `at`'s path steps from the verdict `states` carries.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_directory(
+    operation: Arc<InstanceOperationImpl>,
     at: NodeMapping,
     state_current: Arc<State>,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
@@ -702,6 +826,7 @@ async fn unstage_directory(
         );
 
         unstage_node_recurse(
+            operation.clone(),
             NodeMapping {
                 repository: repository.clone(),
                 state: state_staged.clone(),
@@ -785,6 +910,7 @@ async fn unstage_parent_chain(
 /// `at`'s path from.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_node(
+    operation: Arc<InstanceOperationImpl>,
     at: NodeMapping,
     state_current: Arc<State>,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
@@ -998,39 +1124,40 @@ async fn unstage_node(
 
         // After clearing Staged, re-check filesystem: clear Dirty if file matches current
         // revision. If still differs, preserve Dirty.
-        if node.is_dirty() && node.is_file() {
-            let absolute_path = node_path.to_absolute_path(repository.require_path()?);
-            if let Ok(file_metadata) = lore_io::IoDriver::global().metadata(&absolute_path).await {
-                let (file_mtime, file_size) = crate::util::fs::file_mtime_and_size(&file_metadata);
-                let file_modified = crate::state::file_modification(
-                    repository.clone(),
-                    &current_node,
-                    file_mtime,
-                    file_size,
-                    &node_path,
-                    true, /* Force hash check */
-                    None,
-                )
-                .await
-                .forward::<UnstageError>("Failed to check if file was modified")?
-                .is_modified();
+        if node.is_dirty()
+            && node.is_file()
+            && let Ok(info) = operation.file_info(&node_path).await
+            && info.is_file()
+        {
+            let file_modified = crate::state::file_modification(
+                repository.clone(),
+                &current_node,
+                info.mtime(),
+                info.size(),
+                &node_path,
+                true, /* Force hash check */
+                &operation,
+                &lore_storage::ContentHashes::default(),
+            )
+            .await
+            .forward::<UnstageError>("Failed to check if file was modified")?
+            .is_modified();
 
-                if !file_modified {
-                    // File matches current revision — clear Dirty
-                    node.clear_dirty_flags();
-                    let dirtied = {
-                        let mut block_writer = block.write();
-                        block_writer.node(node_index).flags = node.flags;
-                        block_writer.mark_dirty()
-                    };
-                    if dirtied {
-                        state_staged.block_modified(block.clone(), block_index);
-                        state_staged.mark_dirty();
-                    }
+            if !file_modified {
+                // File matches current revision — clear Dirty
+                node.clear_dirty_flags();
+                let dirtied = {
+                    let mut block_writer = block.write();
+                    block_writer.node(node_index).flags = node.flags;
+                    block_writer.mark_dirty()
+                };
+                if dirtied {
+                    state_staged.block_modified(block.clone(), block_index);
+                    state_staged.mark_dirty();
                 }
             }
-            // If file doesn't exist on disk — could be a delete, preserve Dirty
         }
+        // If file doesn't exist on disk — could be a delete, preserve Dirty
     }
 
     unstage_parent_chain(
@@ -1146,6 +1273,7 @@ async fn unstage_node(
                     .forward::<UnstageError>("Failed to unstage link nodes")?;
 
             unstage_directory(
+                operation.clone(),
                 NodeMapping {
                     repository: linked_repository.clone(),
                     state: linked_state.clone(),
@@ -1167,6 +1295,7 @@ async fn unstage_node(
         }
 
         unstage_directory(
+            operation.clone(),
             NodeMapping {
                 repository: repository.clone(),
                 state: state_staged.clone(),
@@ -1199,6 +1328,7 @@ async fn unstage_node(
 
 #[allow(clippy::too_many_arguments)]
 fn unstage_node_recurse<'a>(
+    operation: Arc<InstanceOperationImpl>,
     at: NodeMapping,
     state_current: Arc<State>,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
@@ -1208,6 +1338,7 @@ fn unstage_node_recurse<'a>(
     states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), UnstageError>> + Send + 'a>> {
     Box::pin(unstage_node(
+        operation,
         at,
         state_current,
         discard,

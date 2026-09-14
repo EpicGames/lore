@@ -1231,7 +1231,7 @@ typedef struct lore_file_info_event_data_t {
   uint64_t size;
   // Size of the entry on the local filesystem, in bytes.
   uint64_t local_size;
-  // Content hash of the entry on the local filesystem.
+  // Address the entry's local content hashes to, zero where nothing was compared.
   struct lore_hash_t local_hash;
   // Size of the entry after filters are applied, in bytes.
   uint64_t filter_size;

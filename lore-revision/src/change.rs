@@ -7,6 +7,7 @@ use lore_error_set::prelude::*;
 use crate::bitflagsops;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::lore::Address;
+use crate::lore::Context;
 use crate::lore::RepositoryId;
 use crate::node::*;
 use crate::state::NodeMapping;
@@ -209,6 +210,12 @@ impl NodeChangeState {
             .node(self.mapping.repository.clone(), self.mapping.node)
             .await
     }
+
+    /// Whether this side is a link node, whose `address.context` names the
+    /// repository it mounts rather than a file identity.
+    pub fn is_link(&self) -> bool {
+        self.flags.contains(NodeFlags::Link)
+    }
 }
 
 /// What a walk found at one path between two sides: a node's two ends, and what became of it.
@@ -252,12 +259,24 @@ impl NodeChange {
         }
     }
 
+    /// The identity a move is keyed on, or zero where the change has none to
+    /// offer. A link node's context is shared by every mount of the repository
+    /// it names, so it identifies no single node.
+    pub fn move_identity(&self) -> Context {
+        let side = self.resolved_side();
+        if side.is_link() {
+            Context::default()
+        } else {
+            side.address.context
+        }
+    }
+
     /// Repository a consumer must fetch this change's content from. A link
     /// node's content is the revision it points at, which lives in the target
     /// repository rather than the one the change was walked from.
     pub fn content_repository_id(&self) -> RepositoryId {
         let side = self.resolved_side();
-        if side.flags.contains(NodeFlags::Link) {
+        if side.is_link() {
             side.address.context.into()
         } else {
             side.mapping.repository.id
@@ -268,7 +287,7 @@ impl NodeChange {
     /// An unresolvable link reference falls back to pinned.
     pub async fn is_tracking_link(&self) -> bool {
         let side = self.resolved_side();
-        if !side.flags.contains(NodeFlags::Link) {
+        if !side.is_link() {
             return false;
         }
         side.mapping

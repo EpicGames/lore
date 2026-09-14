@@ -515,7 +515,7 @@ pub async fn filesystem_path_and_info(
     {
         let initial_path = candidate_path(base, find_path.as_str());
         if let Ok(info) = operation.file_info(&initial_path).await
-            && info.exists
+            && info.exists()
         {
             return Ok((find_path.clone(), Some(info)));
         }
@@ -669,8 +669,9 @@ pub enum PathListingResult {
     /// For example, querying `/foo/bar/file.txt` yields `item.name = "file.txt"`.
     File { item: FileListItem },
 
-    /// The path did not exist, was not accessible, or was a special file type
-    /// (symlink, device, etc.) that we don't handle.
+    /// The path did not exist, was not accessible, or was a special file type (device, socket)
+    /// that we don't handle. A link is stat'd through to what it points at, so one naming a file
+    /// or a directory answers as that rather than as a kind we hold nothing for.
     NotFound,
 }
 
@@ -693,10 +694,12 @@ impl PathListingResult {
 
 /// Describes one listing entry.
 ///
-/// `Ok(None)` is an entry that says nothing about what is there: a name the walk could not
-/// read, or one whose metadata would not resolve — a broken link, or a name unlinked while
-/// the walk was running. A caller enumerating what is present skips those; one unreadable
-/// name says nothing about the rest of the directory.
+/// `Ok(None)` is an entry the walk carries nothing for: a name it could not read, or one whose
+/// metadata would not resolve — a broken link, or a name unlinked while the walk was running —
+/// and one the repository does not track, which is a link and anything the file system holds as
+/// neither a file nor a directory. A link is answered for by what it is rather than by what it
+/// points at, so one naming a file is skipped as the link it is. A caller enumerating what is
+/// present skips all of those; one unreadable name says nothing about the rest of the directory.
 ///
 /// An error is a name that is not text. Nothing can be done with such a name that is not a
 /// guess: it hashes to a node the tree does not hold, and staging it would record a name no
@@ -707,9 +710,15 @@ pub fn file_list_item(
     let Ok(entry) = entry else {
         return Ok(None);
     };
+    if entry.is_symlink {
+        return Ok(None);
+    }
     let Some(metadata) = entry.metadata else {
         return Ok(None);
     };
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Ok(None);
+    }
     let name = entry_name(entry.file_name)?;
     let name_hash = hash_string(name.as_str());
     Ok(Some(FileListItem {
@@ -1240,6 +1249,30 @@ mod tests {
             }
         }
         assert_eq!(names, vec!["child".to_string()]);
+    }
+
+    /// A link is not a kind the repository tracks, and the listing describes what a name holds
+    /// rather than what it points at, so one naming a file is skipped as the link it is.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_listing_skips_a_link_to_a_file_it_would_otherwise_track() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("target"), b"data").expect("write target");
+        std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("link"))
+            .expect("link the target");
+
+        let PathListingResult::Directory { mut listing } =
+            list_path(dir.path().to_path_buf()).await.expect("listing")
+        else {
+            panic!("a directory must list");
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = listing.next().await {
+            if let Some(item) = file_list_item(entry).expect("entry name") {
+                names.push(item.name);
+            }
+        }
+        assert_eq!(names, vec!["target".to_string()]);
     }
 
     #[tokio::test]

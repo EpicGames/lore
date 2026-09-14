@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod compress;
 pub mod concurrency;
 pub mod conformance;
+pub mod content;
 pub mod defragment;
 pub mod error;
 pub mod errors;
@@ -57,6 +58,7 @@ pub use concurrency::file_count_limit_acquire;
 pub use concurrency::file_count_limiter;
 pub use concurrency::fragment_limiter;
 pub use concurrency::fragment_permit_count;
+pub use content::ContentSource;
 // Re-export new read/write/defragment types
 pub use defragment::DefragmentSink;
 pub use error::StorageError;
@@ -153,7 +155,7 @@ pub use types::deserialize_context;
 pub use types::deserialize_hash;
 /// Serde field-level helpers for hex encoding. Use with `#[serde(serialize_with = "...")]`.
 pub use types::serialize_hex;
-pub use write::ContentHashMemo;
+pub use write::ContentHashes;
 pub use write::FileMatch;
 pub use write::FusedPublish;
 pub use write::StoreResult;

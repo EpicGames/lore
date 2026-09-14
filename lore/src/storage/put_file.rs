@@ -200,7 +200,7 @@ async fn resolve_put_file_item(
         write_from_file(
             store.immutable.clone(),
             item.partition,
-            Path::new(path_str),
+            &lore_storage::ContentSource::file(Path::new(path_str)),
             item.context,
             write_options,
             remote_session,

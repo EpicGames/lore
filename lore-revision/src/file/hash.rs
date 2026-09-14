@@ -63,9 +63,12 @@ pub async fn hash(
     }
 
     // TODO(mjansson): If this is a file in the repository, get the current address
-    let hash = immutable::hash_file(repository.clone(), path.as_ref(), None, None)
-        .await
-        .forward_any::<HashError>("hashing file")?;
+    let hash = immutable::hash_file(
+        repository.clone(),
+        &lore_storage::ContentSource::file(path.as_ref()),
+    )
+    .await
+    .forward_any::<HashError>("hashing file")?;
 
     event::LoreEvent::FileHash(LoreFileHashEventData {
         path: LoreString::from_path(path),

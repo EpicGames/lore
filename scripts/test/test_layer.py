@@ -2852,3 +2852,193 @@ def test_layer_source_path_inside_link_is_rejected(new_lore_repo):
     assert middle.get_id() not in target.layer_list(), (
         "No layer should be added when the source path belongs to a linked repository"
     )
+
+
+def _assert_layer_staged_cleared(repo: Lore, target_path: str) -> None:
+    """Assert the layer at `target_path` holds no staged revision."""
+    staged = _layer_config_staged(repo, target_path)
+    current = _layer_config_current(repo, target_path)
+    assert staged in ("", ZERO_HASH, current), (
+        f"Layer at {target_path} still pins staged {staged!r} against current {current!r}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_unstage_releases_the_staged_layer_sync_guard(new_lore_repo):
+    """`unstage` on a layer path clears the layer's staged state and lets sync proceed.
+
+    The sync guard refuses to advance a layer holding staged content, so `unstage` is the
+    only exit from that state that keeps the file.
+    """
+    from error_types import LoreException
+
+    repo, _ = _setup_layer_behind(new_lore_repo, advance_layer=True)
+    pinned_before = _layer_pinned_revision(repo, "lay")
+
+    _stage_layer_change(repo)
+    _assert_layer_staged_advanced(repo, "lay")
+
+    with pytest.raises(LoreException) as excinfo:
+        repo.sync()
+    assert "Unable to sync when layer lay has a staged state" in str(excinfo.value), (
+        f"setup: sync should refuse while the layer holds staged content, got:\n{excinfo.value}"
+    )
+
+    repo.unstage(LAYER_STAGED_FILE)
+
+    # Unstaging an add demotes it to a dirty marker, which is what the parent does too. The
+    # guard only refuses on staged content, so a dirty-only pin is what a sync may carry
+    # forward.
+    status_entries = parse_status_json(repo.status(json=True))
+    assert [
+        (entry.get("path"), entry.get("flagStaged"), entry.get("flagDirty"))
+        for entry in status_entries
+    ] == [("lay/staged_new.txt", False, True)], (
+        f"Expected the layer file left dirty and no longer staged, got {status_entries}"
+    )
+    with repo.open_file(LAYER_STAGED_FILE, mode="rb") as out:
+        assert out.read() == b"layer staged addition", (
+            "unstage must keep the file on disk, it only drops the staged record"
+        )
+
+    repo.sync()
+
+    assert _layer_pinned_revision(repo, "lay") != pinned_before, (
+        "The sync following the unstage should advance the layer's pinned revision"
+    )
+    with repo.open_file(LAYER_FILE, mode="rb") as out:
+        assert out.read() == b"layer content v2", (
+            "The sync did not bring the layer's incoming content into the mount"
+        )
+    with repo.open_file(LAYER_STAGED_FILE, mode="rb") as out:
+        assert out.read() == b"layer staged addition", (
+            "The sync must carry the dirty-only layer tracking forward, not discard it"
+        )
+
+
+@pytest.mark.smoke
+def test_layer_reset_refuses_then_restores_a_modified_layer_file(new_lore_repo):
+    """What `reset` refuses on a layer path, and what it restores.
+
+    Layer content is absent from the parent's tree, so the path has to be walked against the
+    layer's own current and staged states. Two refusals: an explicit revision names a
+    revision of the parent, which says nothing about which revision of the layer to restore;
+    and a staged node reaches the same refusal the parent gives, so the pair is `unstage`
+    then `reset`. The parent holds staged content of its own throughout, which none of these
+    may touch.
+    """
+    from error_types import LoreException
+
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+
+    repo.write_files({"parent_new.txt": b"parent staged addition"})
+    repo.stage("parent_new.txt")
+
+    with repo.open_file(LAYER_FILE, mode="wb") as out:
+        out.write(b"layer content v2")
+    repo.stage(LAYER_FILE)
+    pinned = _layer_config_current(repo, "lay")
+    _assert_layer_staged_advanced(repo, "lay")
+
+    with pytest.raises(LoreException) as excinfo:
+        repo.reset(LAYER_FILE, revision="1")
+    assert "Unable to reset a path in layer lay to an explicit revision" in str(
+        excinfo.value
+    ), f"reset --revision should refuse and name the layer, got:\n{excinfo.value}"
+
+    with pytest.raises(LoreException) as excinfo:
+        repo.reset(LAYER_FILE)
+    assert "Failed to reset staged node" in str(excinfo.value), (
+        f"reset should refuse a staged layer node, got:\n{excinfo.value}"
+    )
+
+    assert _layer_config_current(repo, "lay") == pinned, (
+        "A refused reset must leave the layer's pinned revision alone"
+    )
+    with repo.open_file(LAYER_FILE, mode="rb") as out:
+        assert out.read() == b"layer content v2", (
+            "A refused reset must leave the working copy alone"
+        )
+
+    repo.unstage(LAYER_FILE)
+    repo.reset(LAYER_FILE)
+
+    with repo.open_file(LAYER_FILE, mode="rb") as out:
+        assert out.read() == b"layer content v1", (
+            "reset should restore the layer file from the layer's pinned revision"
+        )
+    _assert_layer_staged_cleared(repo, "lay")
+    status_entries = parse_status_json(repo.status(json=True))
+    assert [
+        (entry.get("path"), entry.get("flagStaged")) for entry in status_entries
+    ] == [("parent_new.txt", True)], (
+        f"Expected only the parent's own staged file to remain, got {status_entries}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_reset_mount_path_differs_from_source_path(new_lore_repo):
+    """`reset` resolves against the layer's tree but writes at the mount.
+
+    The two paths coincide only when `target_path` equals `source_path`. Here the
+    layer's `src/` subtree is mounted at `mnt`, so reading `src/nested.txt` out of
+    the layer's pinned revision has to pair with a disk write at `mnt/nested.txt`.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(
+        None, {os.path.join("src", "nested.txt"): b"nested v1"}
+    )
+
+    repo.layer_add("mnt", layer_repo, "src/")
+    mounted_file = os.path.join("mnt", "nested.txt")
+
+    with repo.open_file(mounted_file, mode="wb") as out:
+        out.write(b"nested v2")
+    repo.dirty(mounted_file)
+    _assert_layer_staged_advanced(repo, "mnt")
+
+    repo.reset(mounted_file)
+
+    with repo.open_file(mounted_file, mode="rb") as out:
+        assert out.read() == b"nested v1", (
+            "reset should restore the mounted file from the layer's pinned revision"
+        )
+    _assert_layer_staged_cleared(repo, "mnt")
+    assert parse_status_json(repo.status(json=True)) == [], (
+        "Expected a clean status after resetting the only change"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_unstage_and_reset_leave_a_clean_layer_unpinned(new_lore_repo):
+    """`unstage .` and `reset .` still act on the parent's own files, and pin nothing.
+
+    The root path is the only one that routes to the parent *and* to every layer below it,
+    so it is the case where a layer with nothing to do still gets visited. The parent's file
+    must come back, and the untouched layer must be left unpinned: a pin that differs from
+    `current` without staged content makes the next `commit` produce an empty revision.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+
+    with repo.open_file(MAIN_FILE, mode="wb") as out:
+        out.write(b"main content v2")
+    repo.stage(MAIN_FILE)
+
+    repo.unstage(".")
+    _assert_layer_staged_cleared(repo, "lay")
+
+    repo.reset(".")
+    _assert_layer_staged_cleared(repo, "lay")
+
+    with repo.open_file(MAIN_FILE, mode="rb") as out:
+        assert out.read() == b"main content", (
+            "reset over the root should still restore the parent's own file"
+        )
+    assert parse_status_json(repo.status(json=True)) == [], (
+        "Expected a clean status once the parent change is reset"
+    )

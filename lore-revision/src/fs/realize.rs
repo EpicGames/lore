@@ -351,7 +351,7 @@ async fn holds_the_replaced_content(
     file_size: u64,
     measured: Option<crate::lore::Address>,
     incoming: crate::lore::Address,
-    content: &lore_storage::ContentHashMemo<'_>,
+    established: &lore_storage::ContentHashes,
 ) -> Result<bool, SyncError> {
     if !change.from.mapping.node.is_valid_node_id() {
         return Ok(false);
@@ -368,15 +368,16 @@ async fn holds_the_replaced_content(
     }
 
     Ok(matches!(
-        operation
-            .compare_file_to_node(
-                change.from.mapping.repository.clone(),
-                &node_from,
-                change.path(),
-                file_size,
-                content,
-            )
-            .await?,
+        state::file_matches_node(
+            change.from.mapping.repository.clone(),
+            &node_from,
+            file_size,
+            change.path(),
+            operation,
+            established,
+        )
+        .await
+        .forward::<SyncError>("Failed to compare the file to the node the change starts from")?,
         NodeComparison::Matches
     ))
 }
@@ -396,10 +397,10 @@ async fn modification_against_measured_node(
     current: &NodeMapping,
     force_full_check: bool,
     repository_path: &RelativePath,
-    content: &lore_storage::ContentHashMemo<'_>,
+    established: &lore_storage::ContentHashes,
 ) -> Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError> {
     let info = operation.file_info(repository_path).await?;
-    if !info.exists {
+    if !info.exists() {
         return Ok(crate::fs::filesystem_provider::FileModifiedCheck {
             info,
             measured: None,
@@ -442,27 +443,29 @@ async fn modification_against_measured_node(
     };
 
     let modification = match node.as_ref() {
-        Some(node) if info.is_file && node.is_file() => {
+        Some(node) if info.is_file() && node.is_file() => {
             let modification = if force_full_check {
                 state::file_modification(
                     repository_measured,
                     node,
-                    info.mtime,
-                    info.size,
+                    info.mtime(),
+                    info.size(),
                     change.path(),
                     true,
-                    Some(content),
+                    operation,
+                    established,
                 )
                 .await
             } else {
                 state::file_modified_against_node(
                     repository_measured,
                     node,
-                    info.mtime,
-                    info.size,
+                    info.mtime(),
+                    info.size(),
                     change.path(),
                     is_current,
-                    Some(content),
+                    operation,
+                    established,
                 )
                 .await
             }
@@ -495,8 +498,9 @@ pub async fn verify_filesystem(
 ) -> Result<Option<NodeChange>, SyncError> {
     lore_trace!("Verify path: {change:?}");
     let repository_path = change.path().clone();
-    let absolute_path = repository_path.to_absolute_path(repository.require_path()?);
-    let content = lore_storage::ContentHashMemo::new(&absolute_path);
+    // One file is measured against the node it was realized from, the incoming node and the
+    // node the change starts at. What comparing it establishes serves all three.
+    let established = lore_storage::ContentHashes::default();
     let modifications = modification_against_measured_node(
         &operation,
         repository.clone(),
@@ -504,11 +508,11 @@ pub async fn verify_filesystem(
         &current,
         force_full_check,
         &repository_path,
-        &content,
+        &established,
     )
     .await?;
 
-    if !modifications.info.exists {
+    if !modifications.info.exists() {
         return match change.action {
             change::FileAction::Add => {
                 // Nothing exist in file system, safe to add
@@ -544,8 +548,8 @@ pub async fn verify_filesystem(
         };
     }
 
-    let is_file = modifications.info.is_file;
-    let file_size = modifications.info.size;
+    let is_file = modifications.info.is_file();
+    let file_size = modifications.info.size();
 
     if let Some(modification) = modifications.modification {
         // Check if file is modified
@@ -559,7 +563,7 @@ pub async fn verify_filesystem(
                 operation.record_modified_time(
                     &change.from.mapping.repository,
                     change.path(),
-                    modifications.info.mtime,
+                    modifications.info.mtime(),
                 );
                 return Ok(None);
             }
@@ -570,7 +574,7 @@ pub async fn verify_filesystem(
     }
 
     let is_delete = change.action == change::FileAction::Delete;
-    let was_link = change.from.flags.bits() & NodeFlags::Link != 0;
+    let was_link = change.from.is_link();
 
     if is_delete && was_link {
         lore_debug!("Link is for delete, skipping filesystem verification");
@@ -635,15 +639,16 @@ pub async fn verify_filesystem(
         let comparison = if differs_from == Some(node_to.address) {
             NodeComparison::Differs
         } else {
-            operation
-                .compare_file_to_node(
-                    change.from.mapping.repository.clone(),
-                    &node_to,
-                    change.path(),
-                    file_size,
-                    &content,
-                )
-                .await?
+            state::file_matches_node(
+                change.from.mapping.repository.clone(),
+                &node_to,
+                file_size,
+                change.path(),
+                &operation,
+                &established,
+            )
+            .await
+            .forward::<SyncError>("Failed to compare the file to the incoming node")?
         };
 
         match comparison {
@@ -662,7 +667,7 @@ pub async fn verify_filesystem(
                     file_size,
                     differs_from,
                     node_to.address,
-                    &content,
+                    &established,
                 )
                 .await?
                 {
@@ -696,7 +701,7 @@ pub async fn verify_filesystem(
                 operation.record_modified_time(
                     &change.from.mapping.repository,
                     change.path(),
-                    modifications.info.mtime,
+                    modifications.info.mtime(),
                 );
 
                 return Ok(None);
@@ -781,7 +786,7 @@ pub async fn verify_filesystem(
                     // destination branch is performing. There is nothing to
                     // lose by letting the switch proceed.
                     if subchange.action == change::FileAction::Delete
-                        && file_info.as_ref().is_none_or(|info| !info.exists)
+                        && file_info.as_ref().is_none_or(|info| !info.exists())
                     {
                         lore_trace!(
                             "Skip already-missing tracked entry inside deleted directory: {}",
@@ -800,28 +805,19 @@ pub async fn verify_filesystem(
 
                     let from_node = subchange.from.get_node().await;
                     if let Some(file_info) = file_info {
-                        if file_info.is_dir {
+                        if file_info.is_dir() {
                             lore_info!(
                                 "  {} {}/",
                                 subchange.action.as_string_short(),
                                 subchange.path()
                             );
                         } else {
-                            let file_hash = operation
-                                .file_hash(
-                                    change.from.mapping.repository.clone(),
-                                    &subchange_path,
-                                    from_node.as_ref().ok(),
-                                )
-                                .await
-                                .unwrap_or_default();
                             lore_info!(
-                                "  {} {} : size {} hash {} mtime {}",
+                                "  {} {} : size {} mtime {}",
                                 subchange.action.as_string_short(),
                                 subchange.path(),
-                                file_info.size,
-                                file_hash,
-                                file_info.mtime
+                                file_info.size(),
+                                file_info.mtime()
                             );
                         }
                     } else {
@@ -1179,7 +1175,7 @@ pub async fn realize_file(
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     let info = write_node_to_path(&repository, &operation, path, &node, &stats).await?;
-    operation.record_modified_time(&repository, path, info.mtime);
+    operation.record_modified_time(&repository, path, info.mtime());
     Ok(())
 }
 
@@ -1217,7 +1213,7 @@ async fn write_node_to_path(
         "Realized file {} {} bytes (target file {} bytes) {}",
         &path,
         node.size,
-        info.size,
+        info.size(),
         node.address.hash
     );
 
@@ -1278,7 +1274,7 @@ async fn realize_changes_delete(
 
         let change_path = change.path().clone();
 
-        let is_link = change.from.flags.bits() & NodeFlags::Link != 0;
+        let is_link = change.from.is_link();
 
         let is_file = if is_link {
             false
@@ -1296,7 +1292,7 @@ async fn realize_changes_delete(
         } else {
             // This can happen if a local path needs to be deleted as a
             // result of a <state> vs <filesystem> diff.
-            operation.file_info(&change_path).await?.is_file
+            operation.file_info(&change_path).await?.is_file()
         };
 
         lore_trace!("D {}", change.path());
@@ -1684,7 +1680,7 @@ async fn realize_change_modify_add(
             && operation
                 .file_info(&to_path)
                 .await
-                .is_ok_and(|info| !info.is_dir)
+                .is_ok_and(|info| !info.is_dir())
         {
             return Err(SyncError::internal(format!(
                 "Failed to create directory {path}"
@@ -2687,7 +2683,7 @@ mod tests {
             .await
             .expect("filesystem operation");
         let info = operation.file_info(path).await.expect("file info");
-        state::file_modified_time_store(repository.clone(), path, info.mtime).await;
+        state::file_modified_time_store(repository.clone(), path, info.mtime()).await;
     }
 
     /// A file the branch never touched, holding what the current revision says it should.

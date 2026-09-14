@@ -15,6 +15,14 @@ pub struct WriteOptions {
     pub remote_write: bool,
     /// Fixed size chunking if nonzero
     pub fixed_size_chunk: usize,
+    /// Compute the address the content would be stored under, storing nothing.
+    ///
+    /// Every fragment is still cut and hashed, since an address is a function of the chunking as
+    /// much as of the content, but none is written locally or remotely.
+    ///
+    /// Not for a resolved write, which exists to publish a mapping to stored content and would
+    /// publish one to content nobody stored.
+    pub hash_only: bool,
 }
 
 impl WriteOptions {
@@ -68,6 +76,12 @@ impl WriteOptions {
 
     pub fn with_max_size_chunk(mut self) -> Self {
         self.fixed_size_chunk = FRAGMENT_SIZE_THRESHOLD;
+        self
+    }
+
+    /// Address the content without storing it. See [`hash_only`](Self::hash_only).
+    pub fn hash_only(mut self) -> Self {
+        self.hash_only = true;
         self
     }
 }

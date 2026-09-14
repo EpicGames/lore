@@ -50,6 +50,19 @@ def encode_bytes_field(field_number: int, value: bytes) -> bytes:
     )
 
 
+def encode_string_field(field_number: int, value: str) -> bytes:
+    """Encode one `string` field."""
+    return encode_bytes_field(field_number, value.encode("utf-8"))
+
+
+def encode_varint_field(field_number: int, value: int) -> bytes:
+    """Encode one varint field (int32/int64/bool/enum). Negative values use the
+    standard protobuf two's-complement 64-bit encoding."""
+    if value < 0:
+        value += 1 << 64
+    return _encode_varint(field_number << 3 | _WIRE_VARINT) + _encode_varint(value)
+
+
 def parse_fields(message: bytes) -> Fields:
     """Split a message into `{field_number: [values]}`, repeated fields in wire
     order. Varint and fixed-width fields decode to ints, length-delimited fields

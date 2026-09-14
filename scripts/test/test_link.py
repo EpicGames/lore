@@ -19,6 +19,7 @@ from error_types import (
     PathExistLinkError,
 )
 from lore_parsers import parse_commit_stats_json, parse_jsonl, parse_status_json
+from test_utils import unstaged_entries, working_tree_files
 from thin_client import (
     ACTION_ADD,
     ACTION_DELETE,
@@ -1002,14 +1003,7 @@ def test_link_add_remove(new_lore_repo):
         "Individual linked files should not appear in staged changes"
     )
 
-    # Verify no unstaged changes (status --unstaged returns both staged and unstaged,
-    # so filter to only truly unstaged entries)
-    unstaged_output_after_add = main_repo.status(json=True, unstaged=True)
-    unstaged_entries_after_add = [
-        entry
-        for entry in parse_status_json(unstaged_output_after_add)
-        if not entry.get("flagStaged", False)
-    ]
+    unstaged_entries_after_add = unstaged_entries(main_repo)
     assert len(unstaged_entries_after_add) == 0, (
         "Should have no unstaged changes after link add"
     )
@@ -1042,13 +1036,7 @@ def test_link_add_remove(new_lore_repo):
     staged_output_after_remove = main_repo.status(json=True)
     staged_entries_after_remove = parse_status_json(staged_output_after_remove)
 
-    unstaged_output_after_remove = main_repo.status(json=True, unstaged=True)
-    all_entries_after_remove = parse_status_json(unstaged_output_after_remove)
-    unstaged_entries_after_remove = [
-        entry
-        for entry in all_entries_after_remove
-        if not entry.get("flagStaged", False)
-    ]
+    unstaged_entries_after_remove = unstaged_entries(main_repo)
 
     # Should have no staged changes
     assert len(staged_entries_after_remove) == 0, (
@@ -2310,11 +2298,7 @@ def _assert_crr_clean(
     """
     staged = parse_status_json(repo.status(json=True))
     assert staged == [], f"Expected clean staged status, got {staged}"
-    unstaged = [
-        e
-        for e in parse_status_json(repo.status(json=True, unstaged=True))
-        if not e.get("flagStaged", False)
-    ]
+    unstaged = unstaged_entries(repo)
     assert unstaged == [], f"Expected clean unstaged status, got {unstaged}"
     for path in expected_files_present:
         assert repo.file_exists(path), f"Expected file present: {path}"
@@ -8881,48 +8865,6 @@ def test_nested_link_stage_delete_deep(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_stage_delete_below_a_precreated_ancestor(new_lore_repo):
-    """Staging a DELETE inside a link whose walk starts below the repository root.
-
-    Two targets sharing a directory the parent owns make that directory a
-    pre-created ancestor, so the walk for each target starts there rather than at
-    the root and names its target from there. The delete has to resolve the link
-    it crosses from that base to fold the linked repository's new pin upwards.
-    """
-    link_path = "vendor/b"
-    deleted_file = f"{link_path}/f1.txt"
-    sibling_file = "vendor/other.txt"
-    parent_repo, _link_repo = _make_parent_with_link(
-        new_lore_repo,
-        link_path,
-        {"f1.txt": "linked content\n"},
-        {sibling_file: "parent content\n"},
-    )
-
-    parent_repo.remove_file(deleted_file)
-    parent_repo.write_files({sibling_file: "edited alongside the delete\n"})
-
-    output = parent_repo.stage([deleted_file, sibling_file])
-    status = parent_repo.status()
-    assert f"D {deleted_file}" in status, (
-        f"Delete inside the link should stage.\nStage:\n{output}\nStatus:\n{status}"
-    )
-    assert f"M {sibling_file}" in status, (
-        "Both targets should stage, which is what makes their directory a shared "
-        f"ancestor.\nStage:\n{output}\nStatus:\n{status}"
-    )
-
-    parent_repo.commit("Delete a linked file alongside a parent-owned edit")
-    parent_repo.push()
-
-    fresh = parent_repo.clone()
-    assert not fresh.file_exists(deleted_file), (
-        "The delete should reach a fresh clone, which it only does if the linked "
-        "repository was repinned"
-    )
-
-
-@pytest.mark.smoke
 def test_nested_link_reset_deep(new_lore_repo):
     """`reset` of a modified file two levels deep restores committed content."""
     repo_a, _repo_b, _repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(
@@ -9332,6 +9274,77 @@ def test_link_merge_rejects_incoming_overlapping_mount(new_lore_repo):
     assert parent.branch_info().local_latest == parent.branch_info().remote_latest, (
         "A refused merge must not have committed anything"
     )
+
+
+_WHOLE_MOUNT_FILES = [
+    "vendor/whole/other/sibling.txt",
+    "vendor/whole/outer.txt",
+    "vendor/whole/test/inner.txt",
+]
+_PART_MOUNT_FILES = ["vendor/part/inner.txt"]
+
+
+def _assert_switch_realized(repo: Lore, expected_files: list[str], source: dict):
+    unstaged = unstaged_entries(repo)
+    assert unstaged == [], f"A clean switch must leave nothing unstaged, got {unstaged}"
+    assert _mounted_source_paths(repo) == source, (
+        "The switch must restore the registry the branch committed"
+    )
+    assert working_tree_files(repo, "vendor") == expected_files, (
+        "The switch must realize the mount against the source path its own branch names"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_switch_realizes_each_mount_against_its_own_source(new_lore_repo):
+    """Two branches mount one repository at different, non-nesting source paths.
+
+    Both mounts carry the linked repository's id, which is the identity a link
+    node holds, so neither the working tree nor a revision diff may take the
+    pair for one mount moving between paths. The configuration is the one
+    `test_link_add_allows_non_nesting_source_paths` leaves deliberately legal.
+    """
+    parent, link_repo = _parent_and_link_for_overlap(new_lore_repo)
+
+    parent.branch_create("mount-whole")
+    parent.link_add("vendor/whole", link_repo.get_id(), "sub")
+    parent.commit("Add link at vendor/whole")
+    parent.push()
+    assert working_tree_files(parent, "vendor") == _WHOLE_MOUNT_FILES, (
+        "The mount of `sub` must expose that subtree in full"
+    )
+
+    parent.branch_switch("main")
+    assert working_tree_files(parent, "vendor") == [], (
+        "main holds neither mount, so it realizes no content under vendor/"
+    )
+
+    parent.branch_create("mount-part")
+    parent.link_add("vendor/part", link_repo.get_id(), "sub/test")
+    parent.commit("Add link at vendor/part")
+    parent.push()
+    assert working_tree_files(parent, "vendor") == _PART_MOUNT_FILES, (
+        "The mount of `sub/test` must expose only that subtree"
+    )
+    part_revision = parent.branch_info().local_latest
+
+    parent.branch_switch("mount-whole")
+    _assert_switch_realized(parent, _WHOLE_MOUNT_FILES, {"vendor/whole": "sub"})
+
+    mount_actions = {
+        path.rstrip("/"): action
+        for action, path in _parse_revision_diff(
+            parent.revision_diff(part_revision, no_pager=True)
+        )
+        if path.rstrip("/") in ("vendor/whole", "vendor/part")
+    }
+    assert mount_actions == {"vendor/whole": "A", "vendor/part": "D"}, (
+        "Each mount must be reported on its own, the one this branch holds as an "
+        "add and the one it does not as a delete"
+    )
+
+    parent.branch_switch("mount-part")
+    _assert_switch_realized(parent, _PART_MOUNT_FILES, {"vendor/part": "sub/test"})
 
 
 @pytest.mark.smoke

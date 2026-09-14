@@ -18,16 +18,19 @@ use crate::branch;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::file::stage::route_layer_paths;
 use crate::file::unstage;
 use crate::file::unstage::UnstageOptions;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
+use crate::layer;
 use crate::link;
 use crate::lore::BranchId;
 use crate::lore::Hash;
@@ -40,7 +43,7 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
-use crate::path::emit_path_ignore;
+use crate::path::resolve_user_paths;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
@@ -270,7 +273,8 @@ struct ResetWalk {
     repository: Arc<RepositoryContext>,
     target: ResetTarget,
     state_staged: Arc<State>,
-    paths: LoreArray<LoreString>,
+    paths: Vec<RelativePath>,
+    layer_walks: Vec<ResetLayerWalk>,
     options: ResetOptions,
     stats: Arc<ResetStats>,
     file_tx: mpsc::Sender<ResetFileWorkItem>,
@@ -283,32 +287,8 @@ struct ResetWalk {
 /// half-applied. A path that does not name anything inside the repository is reported
 /// ignored and skipped.
 async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
-    let repository_root = match walk.repository.require_path() {
-        Ok(path) => path.to_path_buf(),
-        Err(err) => return Some(ResetError::from(err)),
-    };
-
-    for path in walk.paths.as_slice().iter() {
-        let Ok(relative_path) =
-            RelativePath::new_from_user_path(repository_root.as_path(), path.as_str())
-        else {
-            emit_path_ignore(path.as_str()).await;
-            lore_trace!("Ignoring invalid path: {path}");
-            continue;
-        };
-
-        lore_debug!(
-            "User path [{}] transformed to relative path [{}] in repository {}",
-            path.as_str(),
-            relative_path.as_str(),
-            walk.repository.path_for_display()
-        );
-
-        let walked = match walk
-            .target
-            .state_for(&walk.repository, &relative_path)
-            .await
-        {
+    for relative_path in walk.paths.iter() {
+        let walked = match walk.target.state_for(&walk.repository, relative_path).await {
             Ok(state_target) => {
                 reset_walk_path(
                     ResetContext {
@@ -321,6 +301,7 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
                         file_tx: walk.file_tx.clone(),
                     },
                     relative_path.clone(),
+                    relative_path.clone(),
                 )
                 .await
             }
@@ -328,11 +309,47 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
         };
 
         if let Err(err) = walked {
-            return wrap_path_error(walk.repository.clone(), &relative_path, path.as_str(), err)
-                .await
-                .err();
+            return wrap_path_error(
+                walk.repository.clone(),
+                relative_path,
+                relative_path.as_str(),
+                err,
+            )
+            .await
+            .err();
         }
     }
+
+    for layer in walk.layer_walks.iter() {
+        for (mount_path, state_path) in layer.paths.iter() {
+            let walked = reset_walk_path(
+                ResetContext {
+                    operation: walk.operation.clone(),
+                    repository: layer.state.repository.clone(),
+                    state_target: layer.state.state_current.clone(),
+                    state_staged: layer.state.state_staged.clone(),
+                    options: walk.options,
+                    stats: walk.stats.clone(),
+                    file_tx: walk.file_tx.clone(),
+                },
+                mount_path.clone(),
+                state_path.clone(),
+            )
+            .await;
+
+            if let Err(err) = walked {
+                return wrap_path_error(
+                    walk.repository.clone(),
+                    mount_path,
+                    mount_path.as_str(),
+                    err,
+                )
+                .await
+                .err();
+            }
+        }
+    }
+
     None
 }
 
@@ -343,6 +360,82 @@ fn count_data(stats: &ResetStats) -> LoreFileResetCountData {
         file_reset_count: stats.file_reset_count.load(Ordering::Relaxed),
         file_delete_count: stats.file_delete_count.load(Ordering::Relaxed),
     }
+}
+
+/// A routed layer's states, and its paths paired as (on disk under the mount, in the
+/// layer's tree under `source_path`).
+#[derive(Clone)]
+struct ResetLayerWalk {
+    layer: layer::Layer,
+    state: Arc<layer::LayerState>,
+    paths: Vec<(RelativePath, RelativePath)>,
+}
+
+async fn resolve_layer_walks(
+    repository: Arc<RepositoryContext>,
+    layers: &[layer::Layer],
+    layer_jobs: &[(usize, Vec<RelativePath>)],
+) -> Result<Vec<ResetLayerWalk>, ResetError> {
+    let mut walks = Vec::with_capacity(layer_jobs.len());
+    for (layer_index, remains) in layer_jobs {
+        let layer = &layers[*layer_index];
+
+        let target_path = RelativePath::new_from_initial_path(&layer.target_path)
+            .forward_with::<ResetError, _>(|| {
+                format!("Invalid layer target path {}", layer.target_path)
+            })?;
+        let source_path = RelativePath::new_from_initial_path(&layer.source_path)
+            .forward_with::<ResetError, _>(|| {
+                format!("Invalid layer source path {}", layer.source_path)
+            })?;
+
+        let state = layer
+            .deserialize_current_and_staged(repository.clone())
+            .await
+            .forward::<ResetError>("Failed to deserialize layer state")?;
+
+        walks.push(ResetLayerWalk {
+            layer: layer.clone(),
+            state: Arc::new(state),
+            paths: remains
+                .iter()
+                .map(|remain| {
+                    (
+                        target_path.join(remain.as_str()),
+                        source_path.join(remain.as_str()),
+                    )
+                })
+                .collect(),
+        });
+    }
+    Ok(walks)
+}
+
+async fn store_layer_walk_states(
+    repository: Arc<RepositoryContext>,
+    walks: &[ResetLayerWalk],
+) -> Result<(), ResetError> {
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+
+    for walk in walks {
+        // An untouched staged state means the walk found nothing to clear, so the layer's
+        // existing pin still describes work this reset did not address.
+        if !walk.state.state_staged.is_dirty() {
+            continue;
+        }
+
+        let token = repository
+            .try_write_token()
+            .expect("reset requires write access");
+
+        layer::store_staged_or_clear(repository.clone(), token, &walk.layer, &walk.state)
+            .await
+            .forward::<ResetError>("Failed to store layer staged state")?;
+    }
+
+    Ok(())
 }
 
 /// Per-file work item handed from the directory walker (producer) to the
@@ -391,8 +484,34 @@ pub async fn reset(
     revision: LoreString,
     options: ResetOptions,
 ) -> Result<(), ResetError> {
-    let reset_link_count =
-        reset_staged_links_under_paths(repository.clone(), token, &paths).await?;
+    let relative_paths = resolve_user_paths(&repository, &paths).await?;
+
+    let layers = layer::list(repository.clone())
+        .await
+        .forward::<ResetError>("Failed to list layers")?;
+    let (parent_paths, layer_jobs) = route_layer_paths(&layers, relative_paths);
+
+    // A revision spec names a revision of this repository, which says nothing about which
+    // revision of a layer to restore. Silently substituting the layer's pin would reset a
+    // path to something other than what was asked for.
+    if !revision.is_empty()
+        && let Some((layer_index, _)) = layer_jobs.first()
+    {
+        return Err(InvalidArguments {
+            reason: format!(
+                "Unable to reset a path in layer {} to an explicit revision",
+                layers[*layer_index].target_path
+            ),
+        }
+        .into());
+    }
+
+    let reset_link_count = Box::pin(reset_staged_links_under_paths(
+        repository.clone(),
+        token,
+        &paths,
+    ))
+    .await?;
 
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -429,6 +548,8 @@ pub async fn reset(
     })
     .send();
 
+    let layer_walks = resolve_layer_walks(repository.clone(), &layers, &layer_jobs).await?;
+
     let stats = Arc::new(ResetStats::default());
     // Staged link nodes are reset by the prelude above, before the walk runs;
     // count them here so the summary reflects the work done. Links are
@@ -440,6 +561,7 @@ pub async fn reset(
     let producer_repository = repository.clone();
     let producer_stats = stats.clone();
     let outer_state_staged = state_staged.clone();
+    let producer_layer_walks = layer_walks.clone();
 
     let target_revision = state_target.revision();
     let modified_times = Arc::new(crate::state::RecordedModifiedTimes::default());
@@ -453,7 +575,8 @@ pub async fn reset(
                 repository: producer_repository,
                 target: ResetTarget::Revision(state_target),
                 state_staged,
-                paths,
+                paths: parent_paths,
+                layer_walks: producer_layer_walks,
                 options,
                 stats: producer_stats,
                 file_tx,
@@ -509,6 +632,8 @@ pub async fn reset(
         }
     }
 
+    store_layer_walk_states(repository.clone(), &layer_walks).await?;
+
     // Only a reset to the revision the working copy is on leaves files holding what that
     // revision addresses; a reset to any other revision states nothing about it.
     if target_revision == state_current_revision {
@@ -559,6 +684,8 @@ pub async fn reset_to_last_merged(
         }
         .into());
     }
+
+    let paths = resolve_user_paths(&repository, &paths).await?;
 
     let (state_current, state_staged, current_branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -637,6 +764,7 @@ pub async fn reset_to_last_merged(
                 },
                 state_staged,
                 paths,
+                layer_walks: Vec::new(),
                 options,
                 stats: producer_stats,
                 file_tx,
@@ -718,12 +846,12 @@ async fn reset_staged_links_under_paths(
     }
 
     let reset_count = matched.len();
-    unstage::unstage(
+    Box::pin(unstage::unstage(
         repository,
         token,
         LoreArray::from_vec(matched),
         UnstageOptions::default(),
-    )
+    ))
     .await
     .forward::<ResetError>("Failed to reset staged link nodes")?;
 
@@ -994,7 +1122,16 @@ fn reset_walk_directory_recurse(
 /// path to a node and dispatches a single walk through `reset_walk_node`.
 /// Files end up on the `file_tx` channel for the consumer; directories
 /// recurse via the same scheme.
-async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Result<(), ResetError> {
+///
+/// `state_path` names the path in `state_target` and `state_staged`, `relative_path` names
+/// it on disk. The two differ only for a layer mounted somewhere other than the path it
+/// occupies in its own repository. Only the entry lookup needs `state_path`: the walk
+/// proceeds by node id from there and builds every path below it from `relative_path`.
+async fn reset_walk_path(
+    ctx: ResetContext,
+    relative_path: RelativePath,
+    state_path: RelativePath,
+) -> Result<(), ResetError> {
     let ResetContext {
         operation,
         repository,
@@ -1013,11 +1150,19 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
         state_target.revision_number()
     );
 
-    let relative_path = if relative_path.is_empty() {
-        relative_path
+    let (relative_path, state_path) = if relative_path.is_empty() {
+        (relative_path, state_path)
     } else {
         let resolved = util::fs::filesystem_path(&operation, "", &relative_path, None).await;
-        resolved.unwrap_or(relative_path)
+        match resolved {
+            // The case the filesystem reports is the case the state holds too, unless the
+            // two paths were already distinct.
+            Ok(resolved) if state_path.as_str() == relative_path.as_str() => {
+                (resolved.clone(), resolved)
+            }
+            Ok(resolved) => (resolved, state_path),
+            Err(_) => (relative_path, state_path),
+        }
     };
 
     if relative_path.is_empty() {
@@ -1055,7 +1200,7 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
     let node_name = relative_path.name().to_string();
 
     let node_link = state_target
-        .find_node_link(repository.clone(), relative_path.as_str())
+        .find_node_link(repository.clone(), state_path.as_str())
         .await;
 
     match node_link {
@@ -1107,7 +1252,7 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
             // untracked file (keep on disk unless --purge, discarding add tracking).
             let mut delete_path = options.purge;
             if let Ok(staged_link) = state_staged
-                .find_node_link(repository.clone(), relative_path.as_str())
+                .find_node_link(repository.clone(), state_path.as_str())
                 .await
             {
                 let staged_node = state_staged
@@ -1745,25 +1890,26 @@ async fn reset_file_realize(
         node,
     } = item;
 
-    let node_path = relative_path.clone();
-    let node_absolute = node_path.to_absolute_path(repository.require_path()?);
-    let metadata = lore_io::IoDriver::global().metadata(&node_absolute).await;
+    let info = operation.file_info(&relative_path).await;
 
     let force = execution_context().globals().force();
 
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
-    if !force && let Ok(file_metadata) = metadata.as_ref() {
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(file_metadata);
+    if !force
+        && let Ok(info) = info.as_ref()
+        && info.is_file()
+    {
         let file_modified = state::file_modification(
             repository.clone(),
             &node,
-            mtime,
-            size,
+            info.mtime(),
+            info.size(),
             &relative_path,
             true, /* Force hash check */
-            None,
+            &operation,
+            &lore_storage::ContentHashes::default(),
         )
         .await
         .forward::<ResetError>("Failed to check whether file changed")?
@@ -1795,10 +1941,10 @@ async fn reset_file_realize(
                 })
                 .send();
 
-                let to_path = to_path.to_absolute_path(repository.require_path()?);
-                util::fs::unify_name_case_rename(&node_absolute, to_path.as_path())
+                operation
+                    .unify_case_rename(&relative_path, &to_path)
                     .await
-                    .internal("Failed renaming file")?;
+                    .forward::<ResetError>("Failed renaming file")?;
             } else {
                 lore_trace!("File {relative_path} is not modified, no reset");
             }
@@ -1813,9 +1959,7 @@ async fn reset_file_realize(
 
     // If being reset from a directory to a file the directory must be deleted before the file is
     // created.
-    if let Ok(metadata) = metadata
-        && metadata.is_dir()
-    {
+    if info.is_ok_and(|info| info.is_dir()) {
         reset_delete_path(&repository, &stats, relative_path.clone()).await?;
     }
 
@@ -1830,7 +1974,7 @@ async fn reset_file_realize(
     crate::fs::realize::realize_file(
         repository.clone(),
         operation,
-        &node_path,
+        &relative_path,
         node,
         Arc::new(SyncRealizeStats::default()),
     )

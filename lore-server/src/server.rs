@@ -418,7 +418,7 @@ async fn launch_quinn_server(
 /// compiled with. Reported through the `ServerInfo` RPC so clients and tests
 /// can detect capabilities that are only present in some builds (for example
 /// `failure_generator`, which enables fault-injection used by smoke tests).
-fn compiled_features() -> Vec<String> {
+pub fn compiled_features() -> Vec<String> {
     let mut features = Vec::new();
     if cfg!(feature = "failure_generator") {
         features.push("failure_generator".to_string());
