@@ -132,6 +132,13 @@ message TreeNode {
   // True when a link entry tracks its parent's branch; false for pinned links
   // and non-link entries.
   bool tracking = 6;
+  // Stream-scoped index into the RevisionTree stream's TreeRevision payloads,
+  // naming the revision that last modified this entry. Set only when the
+  // request asks for attribution. Absent wherever the server cannot attribute
+  // an entry, most commonly the repository root. The referenced TreeRevision
+  // must have appeared earlier on the same stream. Index 0 is reserved and
+  // never emitted, mirroring the DiffPartition convention.
+  optional uint32 last_revision_index = 7;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier
