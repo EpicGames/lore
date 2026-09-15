@@ -3,6 +3,9 @@
 **/target/
 *.dSYM
 
+# mkdocs build output
+/site/
+
 # Local files
 lore-server/config/local*.toml
 **/.grafana.local.yaml
