@@ -47,6 +47,15 @@ Pick this path for a normal install from a published release.
 
 Pick this path to run a CLI built from your own checkout.
 
+0. **If RUSTFLAGS environment variable is set:**
+
+    Unset it or run the following command prior to building in next step:
+
+    ```bash
+    export RUSTFLAGS="$RUSTFLAGS --cfg tokio_unstable --cfg uuid_unstable"
+    ```
+
+
 1. **Build the binary.**
 
     From the Lore repository root:
