@@ -16,9 +16,8 @@ pub struct SwfsPath<'a>(pub &'a str);
 
 impl SwfsPath<'_> {
     pub fn relative_path_string(&self) -> Result<&str, SwfsWorkError> {
-        self.0.strip_prefix("\\").ok_or_else(|| {
-            SwfsWorkError::internal(format!("SwfsPath does not start with '\\: {}", self.0))
-        })
+        // SWFS may provide paths with or without leading backslash
+        Ok(self.0.strip_prefix("\\").unwrap_or(self.0))
     }
 
     pub fn node_path(&self) -> Result<NodePath, SwfsWorkError> {

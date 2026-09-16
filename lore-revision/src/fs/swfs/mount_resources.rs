@@ -286,8 +286,12 @@ impl MountResources {
             .find_node(self.repository.clone(), path.as_str())
             .await
             .internal("Unable to find file node")?;
-        let mtime = file_modified_time(self.repository.clone(), path).await;
-        Ok(FileInfo::from_node_and_mtime(&node, mtime))
+        if node.is_directory() {
+            Ok(FileInfo::Directory)
+        } else {
+            let mtime = file_modified_time(self.repository.clone(), path).await;
+            Ok(FileInfo::from_node_and_mtime(&node, mtime))
+        }
     }
 
     pub async fn read_file(
@@ -296,26 +300,49 @@ impl MountResources {
         swfs_path: SwfsPath<'_>,
         file_range: Range<usize>,
         output_bytes: &mut [u8],
-    ) -> Result<usize, SwfsWorkError> {
+    ) -> Result<(usize, FileInfo), SwfsWorkError> {
         let Some(state) = self.current_state()? else {
-            return Ok(0);
+            crate::lore_debug!("SWFS read_file: no state available");
+            return Ok((0, FileInfo::NotExist));
         };
+        let node_path = swfs_path.node_path()?;
+        crate::lore_trace!(
+            "SWFS MountResources::read_file: swfs_path={:?}, node_path={:?}, range={:?}",
+            swfs_path.0,
+            node_path.0.as_str(),
+            file_range
+        );
         let file_node = state
-            .find_node(self.repository.clone(), swfs_path.relative_path_string()?)
+            .find_node(self.repository.clone(), node_path.0.as_str())
             .await
             .forward::<SwfsWorkError>("Finding node in state")?;
-        let read_size = file_range.end - file_range.start;
-        let read_options = immutable::read_options_from_repository(&self.repository);
-        immutable::read_into(
-            self.repository.clone(),
+        crate::lore_trace!(
+            "SWFS MountResources::read_file: found node with address={:?}, size={}",
             file_node.address,
-            Some(file_range),
-            output_bytes,
-            read_options,
-        )
-        .await
-        .forward::<SwfsWorkError>("Reading immutable store into buffer")?;
-        Ok(read_size)
+            file_node.size
+        );
+        // Clamp the range to the actual file size - SWFS may request more than the file contains
+        let file_size = file_node.size as usize;
+        let clamped_start = file_range.start.min(file_size);
+        let clamped_end = file_range.end.min(file_size);
+        let clamped_range = clamped_start..clamped_end;
+        let read_size = clamped_range.end - clamped_range.start;
+
+        if read_size > 0 {
+            let read_options = immutable::read_options_from_repository(&self.repository);
+            immutable::read_into(
+                self.repository.clone(),
+                file_node.address,
+                Some(clamped_range),
+                &mut output_bytes[..read_size],
+                read_options,
+            )
+            .await
+            .forward::<SwfsWorkError>("Reading immutable store into buffer")?;
+        }
+        let mtime = file_modified_time(self.repository.clone(), &node_path.0).await;
+        let file_info = FileInfo::from_node_and_mtime(&file_node, mtime);
+        Ok((read_size, file_info))
     }
 
     pub async fn enumerate_directory(
@@ -362,15 +389,16 @@ impl MountResources {
                     node_path.join(child_node_name),
                 )
             };
-            let mtime = file_modified_time(self.repository.clone(), &child_node_path.0).await;
+            let file_info = if child.is_directory() {
+                FileInfo::Directory {}
+            } else {
+                let mtime = file_modified_time(self.repository.clone(), &child_node_path.0).await;
+                FileInfo::from_node_and_mtime(&child, mtime)
+            };
 
             files.push(
-                SwfsFile::new(
-                    child_node_name,
-                    &FileInfo::from_node_and_mtime(&child, mtime),
-                    None,
-                )
-                .forward::<SwfsWorkError>("Constructing file info")?,
+                SwfsFile::new(child_node_name, &file_info, None)
+                    .forward::<SwfsWorkError>("Constructing file info")?,
             );
 
             child

@@ -220,7 +220,9 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
     lore_service_runner.start()
 
     original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
-    file_contents = {f"f{i}.txt": os.urandom(1024) for i in range(4)}
+    file_contents = {f"f{i}.txt": os.urandom(1024) for i in range(4)} | {
+        f"nested/f{i}.txt": os.urandom(1024) for i in range(4)
+    }
     original_repo.write_commit_push(
         "test message",
         file_contents,
@@ -234,7 +236,9 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
     # not running.
     assert os.path.exists(swfs_repo.path)
     for file_name in file_contents:
-        original_repo.compare_file(swfs_repo, file_name)
+        assert original_repo.compare_file(swfs_repo, file_name), (
+            f"File mismatch: {file_name}"
+        )
 
     lore_service_runner.terminate()
 
@@ -244,4 +248,4 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
 
     assert os.path.exists(swfs_repo.path)
     for file_name in file_contents:
-        original_repo.compare_file(swfs_repo, file_name)
+        assert original_repo.compare_file(swfs_repo, file_name)

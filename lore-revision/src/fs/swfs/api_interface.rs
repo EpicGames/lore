@@ -252,7 +252,7 @@ mod swfs_impl {
             read_offset: swfs_u64,
             num_bytes_to_read: swfs_u64,
         ) -> swfs_u64 {
-            let file = unsafe { &*file };
+            let file = unsafe { &mut *file };
             let file_name = unsafe { CStr::from_ptr(file.path).to_string_lossy() };
             let out_buffer = unsafe {
                 &mut *slice_from_raw_parts_mut(out_buffer as *mut u8, num_bytes_to_read as usize)
@@ -269,8 +269,14 @@ mod swfs_impl {
                         )
                         .await
                 });
-            let read_count = Self::handle_lore_result(read_result).unwrap_or_default() as swfs_u64;
-            read_count
+            let Some((read_count, file_info)) = Self::handle_lore_result(read_result) else {
+                return 0;
+            };
+            file.finfo.time_create = file_info.mtime();
+            file.finfo.time_write = file_info.mtime();
+            file.finfo.size = file_info.size();
+            file.finfo.attrs = 0;
+            read_count as swfs_u64
         }
 
         fn fill_dir_begin(&self, path: *const c_char) {
@@ -375,6 +381,7 @@ mod swfs_impl {
         }
 
     handle_redirect!(swfs_c_read_file, read_file, (file: *mut SWFSFile, out_buffer: *mut c_void, read_offset: swfs_u64, num_bytes_to_read: swfs_u64) -> swfs_u64);
+
     handle_redirect!(swfs_c_fill_dir_begin, fill_dir_begin, (path: *const c_char));
     handle_redirect!(swfs_c_notify_write, notify_write, (file: *mut SWFSFile));
     handle_redirect!(swfs_c_notify_create, notify_create, (file: *mut SWFSFile));
