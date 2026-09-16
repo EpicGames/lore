@@ -2963,6 +2963,51 @@ def test_link_remove_keeps_ignored_file_under_mount(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_remove_of_staged_add_leaves_an_empty_mount_directory(new_lore_repo):
+    """A link removed before it was ever committed leaves its mount path behind, empty.
+
+    The path held a directory the repository never committed, so removal empties
+    it rather than reporting a deletion of committed content.
+    """
+    link_path = "libs/shared"
+    parent_repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo()
+
+    parent_repo.write_commit_push("Baseline", {_DEFAULT_PARENT_FILE: "baseline\n"})
+    link_repo.write_commit_push(
+        "Initial linked content", {"deep/inner.txt": "linked content\n"}
+    )
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/")
+    assert parent_repo.file_exists(f"{link_path}/deep/inner.txt"), (
+        "Precondition: linked content is mounted"
+    )
+
+    parent_repo.link_remove(link_path)
+
+    mount = os.path.join(parent_repo.path, link_path)
+    assert os.path.isdir(mount), (
+        "Removing a link staged for add must leave the mount path as a directory"
+    )
+    assert os.listdir(mount) == [], "The mount directory left behind must be empty"
+
+
+@pytest.mark.smoke
+def test_link_remove_of_committed_link_deletes_the_mount_directory(new_lore_repo):
+    """Removing a committed link deletes its mount directory outright."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.link_remove(link_path)
+
+    assert not parent_repo.file_exists(link_path), (
+        "Removing a committed link must delete the mount directory"
+    )
+
+
+@pytest.mark.smoke
 def test_link_remove_on_branch_merge_start(new_lore_repo):
     """A link removed on a branch is gone from the registry after merging."""
     repo = _commit_initial_main(new_lore_repo, "main-file.txt")

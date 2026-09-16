@@ -9,6 +9,8 @@ use crate::branch;
 use crate::errors::InvalidPath;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
@@ -36,6 +38,7 @@ use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 
 pub async fn add(
     repository: Arc<RepositoryContext>,
@@ -336,51 +339,17 @@ pub async fn add(
     let mut remainder_parent = remainder_path.clone();
     remainder_parent.pop();
 
-    let parent_path = clone_path
-        .parent_path()
-        .to_absolute_path(repository.require_path()?);
-    if lore_io::IoDriver::global()
-        .metadata(&parent_path)
+    with_operation(repository.file_system(), true, async |operation| {
+        create_link_mount(
+            &operation,
+            chain.innermost.clone(),
+            remainder_parent,
+            &clone_path,
+            link_path_exists,
+        )
         .await
-        .is_err()
-    {
-        lore_debug!("Creating directory {}", parent_path.display());
-        lore_io::IoDriver::global()
-            .create_dir_all(&parent_path)
-            .await
-            .internal_with(|| format!("Failed to create directory {}", parent_path.display()))?;
-    }
-
-    if !remainder_parent.is_empty() {
-        lore_debug!("Staging link parent path in innermost repository");
-        with_operation(repository.file_system(), true, async |operation| {
-            Box::pin(stage::stage_filesystem_path(
-                operation,
-                chain.innermost.clone(),
-                remainder_parent.freeze(),
-                Arc::default(),
-                StageOptions {
-                    no_children: true,
-                    ..Default::default()
-                },
-                None, // No link tracking when adding links
-                None, // No layer mask
-                None, // Prefixes resolved for the outer repository do not apply
-                None, // Node ids here index the inner repository's own state
-            ))
-            .await
-            .forward::<LinkError>("Failed staging the link node")
-        })
-        .await?;
-    }
-
-    if !link_path_exists {
-        lore_debug!("Creating directory {}", link_path);
-        lore_io::IoDriver::global()
-            .create_dir_all(clone_path.to_absolute_path(repository.require_path()?))
-            .await
-            .internal_with(|| format!("Failed to create directory {clone_path}"))?;
-    }
+    })
+    .await?;
 
     lore_debug!("Staging link node");
     let node = Node {
@@ -501,6 +470,62 @@ pub async fn add(
         LoreFileAction::Add,
     ))
     .send();
+
+    Ok(())
+}
+
+/// Creates the directory the link mounts at and the one holding it, and stages the intermediate
+/// path against the innermost repository.
+///
+/// One operation covers all three: the directory the link is placed in, the path staged against
+/// the innermost repository, and the mount directory itself are in the same filesystem.
+async fn create_link_mount(
+    operation: &Arc<InstanceOperationImpl>,
+    innermost: NodeMapping,
+    remainder_parent: RelativePathBuf,
+    clone_path: &RelativePath,
+    link_path_exists: bool,
+) -> Result<(), LinkError> {
+    let parent_path = clone_path.parent_path();
+    if !operation
+        .file_info(&parent_path)
+        .await
+        .is_ok_and(|info| info.exists())
+    {
+        lore_debug!("Creating directory {parent_path}");
+        operation
+            .create_dir_all(&parent_path)
+            .await
+            .forward_with::<LinkError, _>(|| format!("Failed to create directory {parent_path}"))?;
+    }
+
+    if !remainder_parent.is_empty() {
+        lore_debug!("Staging link parent path in innermost repository");
+        Box::pin(stage::stage_filesystem_path(
+            operation.clone(),
+            innermost,
+            remainder_parent.freeze(),
+            Arc::default(),
+            StageOptions {
+                no_children: true,
+                ..Default::default()
+            },
+            None, // No link tracking when adding links
+            None, // No layer mask
+            None, // Prefixes resolved for the outer repository do not apply
+            None, // Node ids here index the inner repository's own state
+        ))
+        .await
+        .forward::<LinkError>("Failed staging the link node")?;
+    }
+
+    if !link_path_exists {
+        lore_debug!("Creating directory {clone_path}");
+        operation
+            .create_dir_all(clone_path)
+            .await
+            .forward_with::<LinkError, _>(|| format!("Failed to create directory {clone_path}"))?;
+    }
 
     Ok(())
 }
