@@ -1160,6 +1160,10 @@ pub async fn stage_merge(
     Ok(signature)
 }
 
+/// Stages the move of `from_path` to `to_path`, which the working tree already holds moved.
+///
+/// One operation covers the move: measuring the target and staging the directory it lands in both
+/// read the working tree, and a filesystem holds one operation at a time.
 #[allow(clippy::too_many_arguments)]
 pub async fn stage_move(
     repository: Arc<RepositoryContext>,
@@ -1236,67 +1240,64 @@ pub async fn stage_move(
         .await
         .unwrap_or_default();
 
-    let to_info = with_operation(repository.file_system(), false, async |operation| {
-        operation
-            .file_info(&to_path)
-            .await
-            .forward::<StageError>("Failed to read the move target")
-    })
-    .await?;
-    if !to_info.exists() {
-        return Err(StageError::internal(format!(
-            "Path {to_path} does not exist in repository "
-        )));
-    }
-
-    if from_node.is_directory() && !to_info.is_dir() {
-        return Err(StageError::internal("Cannot move a directory to a file"));
-    }
-    if !from_node.is_directory() && to_info.is_dir() {
-        return Err(StageError::internal("Cannot move a file to a directory"));
-    }
-
     let stats = Arc::new(StageStats::default());
-
-    if to_node_link.is_valid() {
-        // Stage existing target node as deleted, it is being replaced by the source file
-        lore_debug!(
-            "Staging existing target node {} as deleted",
-            to_node_link.node
-        );
-        if to_node_link.repository != repository.id {
-            // TODO(vri): UCS-18009 - Implement stage move for linked changes
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
-        }
-
-        stage::stage_delete(
-            repository.clone(),
-            state.clone(),
-            to_path.clone(),
-            to_node_link.node,
-            options.node_flags,
-            stats.clone(),
-            None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
-        )
-        .await?;
-    }
-
-    // Make sure the target parent node exist
-    let mut parent_path = to_path.clone();
-    parent_path.pop();
-    let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
-    lore_debug!(
-        "New parent node path: {}/ ({})",
-        parent_path,
-        parent_absolute_path.display()
-    );
 
     let mut parent_options = options;
     parent_options.no_children = true;
 
     let parent_node_link = with_operation(repository.file_system(), true, async |operation| {
+        let to_info = operation
+            .file_info(&to_path)
+            .await
+            .forward::<StageError>("Failed to read the move target")?;
+        if !to_info.exists() {
+            return Err(StageError::internal(format!(
+                "Path {to_path} does not exist in repository "
+            )));
+        }
+
+        if from_node.is_directory() && !to_info.is_dir() {
+            return Err(StageError::internal("Cannot move a directory to a file"));
+        }
+        if !from_node.is_directory() && to_info.is_dir() {
+            return Err(StageError::internal("Cannot move a file to a directory"));
+        }
+
+        if to_node_link.is_valid() {
+            // Stage existing target node as deleted, it is being replaced by the source file
+            lore_debug!(
+                "Staging existing target node {} as deleted",
+                to_node_link.node
+            );
+            if to_node_link.repository != repository.id {
+                // TODO(vri): UCS-18009 - Implement stage move for linked changes
+                return Err(StageError::internal(
+                    "Links not yet implemented, cannot perform actions in other repositories",
+                ));
+            }
+
+            stage::stage_delete(
+                repository.clone(),
+                state.clone(),
+                to_path.clone(),
+                to_node_link.node,
+                options.node_flags,
+                stats.clone(),
+                None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
+            )
+            .await?;
+        }
+
+        // Make sure the target parent node exist
+        let mut parent_path = to_path.clone();
+        parent_path.pop();
+        let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
+        lore_debug!(
+            "New parent node path: {}/ ({})",
+            parent_path,
+            parent_absolute_path.display()
+        );
+
         Box::pin(stage::stage_filesystem_path(
             operation,
             NodeMapping::root(repository.clone(), state.clone()),

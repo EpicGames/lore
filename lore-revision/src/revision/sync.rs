@@ -925,8 +925,8 @@ fn discard_modified_times<T>((result, modified_times): (T, RecordedModifiedTimes
 /// caller that advances the current revision stores them and every other caller discards
 /// them.
 ///
-/// `changes_made` is the caller's: every realize wrapper here writes the working copy, and
-/// a dry run reports the write it would have made rather than skipping the operation.
+/// `changes_made` reports whether the callback leaves the working copy changed, which a dry run
+/// does not: it reports the writes it would have made and leaves nothing of them behind.
 async fn shim_with_operation<T>(
     filesystem: Arc<dyn FilesystemProvider>,
     changes_made: bool,
@@ -1031,7 +1031,7 @@ pub async fn realize_changes(
     is_merge: bool,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), true, async |operation| {
+    shim_with_operation(repository.file_system(), !dry_run, async |operation| {
         crate::fs::realize::realize_changes(
             repository,
             operation,
@@ -1059,7 +1059,7 @@ pub async fn realize_conflicts(
     stats: Arc<SyncRealizeStats>,
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), true, async |operation| {
+    shim_with_operation(repository.file_system(), !dry_run, async |operation| {
         crate::fs::realize::realize_conflicts(
             repository,
             operation,
@@ -1076,24 +1076,6 @@ pub async fn realize_conflicts(
     })
     .await
     .map(discard_modified_times)?
-}
-
-/// Writes `node`'s content to `path`, collecting the modified time it lands with into
-/// `modified_times` for the caller to record once it knows the revision that leaves current.
-pub async fn realize_file(
-    repository: Arc<RepositoryContext>,
-    path: RelativePath,
-    node: Node,
-    stats: Arc<SyncRealizeStats>,
-    modified_times: &RecordedModifiedTimes,
-) -> Result<(), SyncError> {
-    let (result, realized_times) =
-        shim_with_operation(repository.file_system(), true, async |operation| {
-            crate::fs::realize::realize_file(repository, operation, &path, node, stats).await
-        })
-        .await?;
-    modified_times.absorb(realized_times);
-    result
 }
 
 pub async fn realize_scratch_file(

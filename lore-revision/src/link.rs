@@ -18,6 +18,7 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -1297,11 +1298,22 @@ pub async fn is_staged_pin_change(
     Ok(!has_staged_children)
 }
 
+/// What a link pin move changes on disk, and the tree those changes are measured against.
+struct LinkPinDiff {
+    /// The changes from the pin in place to the pin asked for, spelled from the mount.
+    changes: Arc<Vec<NodeChange>>,
+    /// The pinned subtree as it stands, which the working tree is verified against.
+    current: NodeMapping,
+}
+
 /// Realizes on-disk content changes when a link pin changes.
 ///
 /// Deserializes the old and new link states, computes a 2-way diff scoped to
 /// the linked node and spelled from the mount, verifies filesystem consistency,
 /// and realizes the changes on disk.
+///
+/// Opens the filesystem operation the realize takes, so a caller already holding one calls
+/// [`realize_link_pin_change_in_operation`] instead.
 pub async fn realize_link_pin_change(
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
@@ -1310,6 +1322,42 @@ pub async fn realize_link_pin_change(
     new_sig: Hash,
     linked_node: NodeID,
 ) -> Result<(), LinkError> {
+    let diff = link_pin_diff(&link_context, link_path, old_sig, new_sig, linked_node).await?;
+
+    with_operation(repository.file_system(), true, async |operation| {
+        realize_link_pin_diff(&operation, repository, link_context, new_sig, diff).await
+    })
+    .await
+}
+
+/// [`realize_link_pin_change`] for a caller that already holds the filesystem operation.
+///
+/// A filesystem holds one operation at a time, and a link context shares its parent's provider, so
+/// the realize takes the caller's rather than opening a second one on a frozen filesystem.
+pub(crate) async fn realize_link_pin_change_in_operation(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    link_context: Arc<RepositoryContext>,
+    link_path: RelativePath,
+    old_sig: Hash,
+    new_sig: Hash,
+    linked_node: NodeID,
+) -> Result<(), LinkError> {
+    let diff = link_pin_diff(&link_context, link_path, old_sig, new_sig, linked_node).await?;
+
+    realize_link_pin_diff(operation, repository, link_context, new_sig, diff).await
+}
+
+/// Diffs the pinned subtree between the two pins, spelled from the mount path.
+///
+/// Reads state alone, so it runs outside the filesystem operation the realize needs.
+async fn link_pin_diff(
+    link_context: &Arc<RepositoryContext>,
+    link_path: RelativePath,
+    old_sig: Hash,
+    new_sig: Hash,
+    linked_node: NodeID,
+) -> Result<LinkPinDiff, LinkError> {
     lore_debug!("Load link revision states");
     let link_state_current = state::State::deserialize(link_context.clone(), old_sig)
         .await
@@ -1321,7 +1369,7 @@ pub async fn realize_link_pin_change(
 
     lore_debug!("Find link target node");
     let (node_current, node_target) = pinned_subtree_nodes(
-        &link_context,
+        link_context,
         &link_state_current,
         &link_state_target,
         linked_node,
@@ -1337,14 +1385,14 @@ pub async fn realize_link_pin_change(
 
     let changes = state::diff_collect_subtree(
         state::node_change_state(
-            &link_context,
+            link_context,
             &link_state_current,
             node_current,
             link_path.clone(),
         )
         .await,
         state::node_change_state(
-            &link_context,
+            link_context,
             &link_state_target,
             node_target,
             link_path.clone(),
@@ -1355,55 +1403,66 @@ pub async fn realize_link_pin_change(
     )
     .await
     .forward::<LinkError>("Failed syncing target link")?;
-    let changes = Arc::new(changes);
+    Ok(LinkPinDiff {
+        changes: Arc::new(changes),
+        current: current_tree,
+    })
+}
 
-    with_operation(repository.file_system(), true, async |operation| {
-        let changes = if !changes.is_empty() {
-            lore_info!(
-                "Verifying {} link changes with local file system",
-                changes.len()
-            );
+/// Verifies the working tree against the changes the pin move makes and realizes them there.
+async fn realize_link_pin_diff(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    link_context: Arc<RepositoryContext>,
+    new_sig: Hash,
+    diff: LinkPinDiff,
+) -> Result<(), LinkError> {
+    let LinkPinDiff { changes, current } = diff;
 
-            let options = Arc::new(SyncOptions {
-                revision: Some(new_sig.to_string()),
-                ..Default::default()
-            });
+    let changes = if !changes.is_empty() {
+        lore_info!(
+            "Verifying {} link changes with local file system",
+            changes.len()
+        );
 
-            sync_verify_filesystem(
-                link_context.clone(),
-                Arc::new(SyncVerifyArgs {
-                    changes: changes.clone(),
-                    repository_current: link_context.clone(),
-                    operation: operation.clone(),
-                    current: current_tree,
-                    options: options.clone(),
-                }),
-            )
-            .await
-            .forward::<LinkError>("Failed verifying local file system")?
-        } else {
-            changes
-        };
+        let options = Arc::new(SyncOptions {
+            revision: Some(new_sig.to_string()),
+            ..Default::default()
+        });
 
-        let stats: Arc<sync::SyncRealizeStats> = Arc::default();
-
-        lore_debug!("Realize link changes");
-
-        crate::fs::realize::realize_changes(
-            repository,
-            operation.clone(),
-            changes,
-            None,
-            false, /* Not dry run */
-            false, /* Not a merge */
-            stats,
+        sync_verify_filesystem(
+            link_context.clone(),
+            Arc::new(SyncVerifyArgs {
+                changes: changes.clone(),
+                repository_current: link_context,
+                operation: operation.clone(),
+                current,
+                options,
+            }),
         )
         .await
-        .forward::<LinkError>("Failed synchronizing link changes")?;
+        .forward::<LinkError>("Failed verifying local file system")?
+    } else {
+        changes
+    };
 
-        Ok(())
-    })
+    let stats: Arc<sync::SyncRealizeStats> = Arc::default();
+
+    lore_debug!("Realize link changes");
+
+    crate::fs::realize::realize_changes(
+        repository,
+        operation.clone(),
+        changes,
+        None,
+        false, /* Not dry run */
+        false, /* Not a merge */
+        stats,
+    )
     .await
+    .forward::<LinkError>("Failed synchronizing link changes")?;
+
+    Ok(())
 }
 
 /// Result of resolving a link path to its full context.

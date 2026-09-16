@@ -261,6 +261,11 @@ pub async fn unstage(
     Ok(())
 }
 
+/// Unstages `paths` against the repository's own current and staged states.
+///
+/// One operation covers every path: unstaging reads the working copy to resolve the case each path
+/// is held in, and one per path would freeze a filesystem per path. It is opened as one that
+/// writes: putting a staged link change back realizes the pinned content at its mount through it.
 async fn unstage_parent(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -297,9 +302,7 @@ async fn unstage_parent(
     let link_tracker = LinkTracker::new();
     let is_merge_or_cherry_pick_or_revert = state_staged.is_merge_or_cherry_pick_or_revert();
 
-    // One operation covers every path: unstaging reads the working copy to resolve the case
-    // each path is held in, and one per path would freeze a filesystem per path.
-    let mut clear = with_operation(repository.file_system(), false, async |operation| {
+    let mut clear = with_operation(repository.file_system(), true, async |operation| {
         unstage_each_path(UnstagePaths {
             operation: &operation,
             repository: &repository,
@@ -403,7 +406,8 @@ async fn unstage_parent(
 /// Unstage the mount-relative `remains` against the layer's own current and staged states.
 ///
 /// Each `remain` resolves under the layer's `source_path` for the state lookup. One operation
-/// covers the whole layer, for the same reason the parent walk opens one for all its paths.
+/// covers the whole layer, and writes, for the same reasons [`unstage_parent`] opens one for all
+/// its paths.
 async fn unstage_from_layer(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -433,7 +437,7 @@ async fn unstage_from_layer(
     let discard = Arc::new(DashMap::<RepositoryId, Vec<u32>>::new());
     let link_tracker = LinkTracker::new();
 
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), true, async |operation| {
         for remain in remains {
             Box::pin(unstage_path(
                 operation.clone(),
@@ -486,8 +490,8 @@ async fn unstage_from_layer(
     Ok(())
 }
 
-/// What unstaging each path needs: the trees it rewrites and the filesystem operation it
-/// resolves path cases through.
+/// What unstaging each path needs: the trees it rewrites and the filesystem operation it resolves
+/// path cases through and puts a staged link change back through.
 struct UnstagePaths<'a> {
     operation: &'a Arc<InstanceOperationImpl>,
     repository: &'a Arc<RepositoryContext>,
@@ -1081,13 +1085,16 @@ async fn unstage_node(
             true
         } else if is_staged_update_link {
             link::reset::reset_staged_update_link(
-                repository.clone(),
+                &operation,
+                NodeMapping {
+                    repository: repository.clone(),
+                    state: state_staged.clone(),
+                    path: node_path.clone(),
+                    node: node_id,
+                },
                 state_current.clone(),
-                state_staged.clone(),
-                node_id,
                 node,
                 current_node,
-                node_path.clone(),
             )
             .await
             .forward::<UnstageError>("Failed to reset staged-update link")?;
@@ -1237,12 +1244,15 @@ async fn unstage_node(
         // entry and re-materialize the linked content on disk.
         if was_staged_delete {
             link::reset::reset_staged_remove_link(
-                repository.clone(),
+                &operation,
+                NodeMapping {
+                    repository: repository.clone(),
+                    state: state_staged.clone(),
+                    path: node_path.clone(),
+                    node: node_id,
+                },
                 state_current.clone(),
-                state_staged.clone(),
-                node_id,
                 current_node,
-                node_path.clone(),
             )
             .await
             .forward::<UnstageError>("Failed to reset staged-remove link")?;
