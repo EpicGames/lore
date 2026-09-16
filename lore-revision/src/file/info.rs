@@ -3,14 +3,17 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use zerocopy::FromZeros;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
@@ -565,6 +568,68 @@ async fn calculate_local_filtered_size_hash(
     }
 }
 
+/// Whether `path` names the repository's own directory, which no walk measures or descends into.
+fn is_dot_directory(path: &RelativePath) -> bool {
+    path.as_str() == DOT_URC || path.as_str() == DOT_LORE
+}
+
+/// What the file at `path` adds to the local size, which is nothing where the repository's own
+/// directory stands there or the filter leaves the path out.
+///
+/// Measured where it is listed rather than in a walk of its own: the listing carries what the file
+/// holds, so nothing here reads the working tree and a file costs no task and no boxed walk.
+fn local_file_size(
+    repository: &RepositoryContext,
+    path: &RelativePath,
+    info: FileInfo,
+    parent_states: FilterStates,
+) -> u64 {
+    if is_dot_directory(path) {
+        return 0;
+    }
+    let (_, excluded) =
+        repository
+            .filter
+            .child_emit_excludes(parent_states, path, false, FilterMode::Full);
+    if excluded { 0 } else { info.size() }
+}
+
+/// The subtree walks a directory has in flight, each answering with what it measured.
+type LocalSizeTasks = JoinSet<Result<u64, InfoError>>;
+
+static LOCAL_SIZE_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+/// Process-wide rather than per-walk: `file info` measures every path it was given at once, so a
+/// budget owned by one walk would let a run fan out once for every path it names.
+fn local_size_task_semaphore() -> &'static Arc<Semaphore> {
+    LOCAL_SIZE_TASK_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TREE_TASKS)))
+}
+
+/// Measures the subtree at `path`, spawned while the budget allows and walked inline once it does
+/// not, answering with what an inline walk measured and zero for one left to a task.
+///
+/// Inline rather than a blocking acquire: a parent holds its permit until its children finish, so
+/// waiting on one would wait on a descendant that cannot start.
+async fn local_size_subtree_dispatch(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    path: RelativePath,
+    info: FileInfo,
+    states: FilterStates,
+    tasks: &mut LocalSizeTasks,
+) -> Result<u64, InfoError> {
+    if let Ok(permit) = local_size_task_semaphore().clone().try_acquire_owned() {
+        let operation = operation.clone();
+        let repository = repository.clone();
+        lore_spawn!(tasks, async move {
+            let _permit = permit;
+            calculate_local_size_recurse(operation, repository, path, info, states).await
+        });
+        return Ok(0);
+    }
+    calculate_local_size_recurse(operation.clone(), repository.clone(), path, info, states).await
+}
+
 /// `info` is what the working tree holds at `relative_path`, which the listing a directory is
 /// reached through already measured: a child is not measured again to be walked. A path holding
 /// nothing measures zero without the filter being asked about it.
@@ -580,29 +645,33 @@ fn calculate_local_size_recurse(
     parent_states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<u64, InfoError>> + Send>> {
     Box::pin(async move {
-        if relative_path.as_str() == DOT_URC || relative_path.as_str() == DOT_LORE {
+        if !info.exists() {
             return Ok(0);
         }
-        if !info.exists() {
+        if !info.is_dir() {
+            return Ok(local_file_size(
+                &repository,
+                &relative_path,
+                info,
+                parent_states,
+            ));
+        }
+        if is_dot_directory(&relative_path) {
             return Ok(0);
         }
 
         let (states, excluded) = repository.filter.child_emit_excludes(
             parent_states,
             &relative_path,
-            info.is_dir(),
+            true,
             FilterMode::Full,
         );
         if excluded {
             return Ok(0);
         }
 
-        if !info.is_dir() {
-            return Ok(info.size());
-        }
-
         let mut local_size = 0;
-        let mut local_size_tasks = JoinSet::new();
+        let mut local_size_tasks = LocalSizeTasks::new();
         let mut list = operation
             .read_directory(&relative_path)
             .await
@@ -612,13 +681,20 @@ fn calculate_local_size_recurse(
 
         while let Some(item) = list.next().await {
             let item = item.forward_any::<InfoError>("Unusable directory entry")?;
-            let operation = operation.clone();
-            let repository = repository.clone();
             let child_path = relative_path.push_into_buf(item.name.as_str()).freeze();
-            lore_spawn!(local_size_tasks, async move {
-                calculate_local_size_recurse(operation, repository, child_path, item.info, states)
-                    .await
-            });
+            if !item.info.is_dir() {
+                local_size += local_file_size(&repository, &child_path, item.info, states);
+                continue;
+            }
+            local_size += local_size_subtree_dispatch(
+                &operation,
+                &repository,
+                child_path,
+                item.info,
+                states,
+                &mut local_size_tasks,
+            )
+            .await?;
         }
 
         let mut failure: Option<InfoError> = None;
@@ -737,4 +813,97 @@ fn calculate_filtered_size_recurse(
 
         Ok(filtered_size)
     })
+}
+
+#[cfg(test)]
+// A fixture builds working-tree state directly, outside any revision; what these test is what the
+// walk measures of it.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::fs::filesystem_provider::tests::test_store_create;
+    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::repository::test_helpers::default_repository_creation_args;
+
+    /// A repository over the working tree at `root`, admitting every path in it.
+    async fn os_repository(root: &Path) -> Arc<RepositoryContext> {
+        let (immutable_store, mutable_store, _context) =
+            test_store_create().await.expect("making test stores");
+        Arc::new(RepositoryContext::new(
+            default_repository_creation_args(immutable_store, mutable_store).with_path(root),
+        ))
+    }
+
+    /// A directory holding two files and a subdirectory holding a third, 175 bytes in all.
+    fn write_tree(root: &Path) {
+        let tree = root.join("tree");
+        std::fs::create_dir_all(tree.join("inner")).expect("create directory");
+        std::fs::write(tree.join("first.txt"), vec![b'a'; 100]).expect("write file");
+        std::fs::write(tree.join("third.txt"), vec![b'c'; 25]).expect("write file");
+        std::fs::write(tree.join("inner").join("second.txt"), vec![b'b'; 50]).expect("write file");
+    }
+
+    /// What the walk measures at `path`, under the working tree at `root`.
+    async fn measure(root: &Path, path: RelativePath) -> u64 {
+        let repository = os_repository(root).await;
+        let operation = repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("an operation over the working tree");
+        calculate_local_size_recurse(
+            operation,
+            repository,
+            path,
+            FileInfo::Directory,
+            FilterStates::ROOT,
+        )
+        .await
+        .expect("a measured tree")
+    }
+
+    /// What the walk measures of the tree [`write_tree`] wrote under `root`.
+    async fn measure_tree(root: &Path) -> u64 {
+        measure(
+            root,
+            RelativePath::new_from_initial_path("tree").expect("relative path"),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_directory_measures_every_file_below_it() {
+        let dir = lore_base::test_util::TempDir::new("lore-info-local-size-");
+        write_tree(dir.path());
+
+        assert_eq!(175, measure_tree(dir.path()).await);
+    }
+
+    /// The repository's own directory adds nothing, whatever the working tree holds at its name.
+    #[tokio::test]
+    async fn the_repository_directory_is_not_measured() {
+        let dir = lore_base::test_util::TempDir::new("lore-info-local-size-");
+        write_tree(dir.path());
+        std::fs::write(dir.path().join(DOT_LORE), vec![b'd'; 40]).expect("write file");
+
+        assert_eq!(175, measure(dir.path(), RelativePath::default()).await);
+    }
+
+    /// A subtree is walked inline once the fan-out budget is spent, measuring what a walk of its
+    /// own would have.
+    #[tokio::test]
+    async fn a_subtree_is_measured_inline_once_the_budget_is_spent() {
+        let dir = lore_base::test_util::TempDir::new("lore-info-local-size-");
+        write_tree(dir.path());
+
+        let _permits = local_size_task_semaphore()
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_TREE_TASKS as u32)
+            .await
+            .expect("the whole fan-out budget");
+
+        assert_eq!(175, measure_tree(dir.path()).await);
+    }
 }
