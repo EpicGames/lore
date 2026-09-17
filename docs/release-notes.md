@@ -3,6 +3,12 @@
 Release notes for the open source Lore project. Releases before v0.8.4 predate this file; see the
 [GitHub releases](https://github.com/EpicGames/lore/releases) page for the published record.
 
+## Nightly
+
+### Fixes & Improvements
+
+- Fix a command carried out by the service being answered without part of its output. A relayed call returned its result while its events were still being delivered to the caller's callback, so `lore status` could report a repository with no staged changes. The events are now delivered before the call returns
+
 ## v0.10.0 (Sep 17th 2026) [#1170]
 
 ### Breaking changes

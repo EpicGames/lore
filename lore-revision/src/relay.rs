@@ -148,18 +148,12 @@ impl EventDispatcher {
         )));
     }
 
-    pub async fn complete(&self, error: LoreErrorDetail) -> i32 {
-        // `status` is the detail's `error_code` so the two agree by
-        // construction: `0` with the empty default detail on success, the
-        // detail's `error_code` with that detail on failure.
-        let status = error.error_code;
-        // Log a failing completion so consumers that surface log events (the
-        // CLI, the server) show the message and trace.
-        if status != 0 {
-            crate::lore_error!("{}", error.message_with_trace());
-        }
-        self.send(LoreEvent::Complete(LoreCompleteEventData { status, error }));
-
+    /// Waits for every event sent so far to have been through the callback, so a
+    /// caller reading what its callback collected sees all of it.
+    ///
+    /// Called by [`complete`](Self::complete), and directly by a relayed call,
+    /// which the service completes instead.
+    pub async fn drain(&self) {
         // Drop this strong reference, let the dispatcher task exit out and signal the end event
         // if this is the only strong reference to the event channel
         drop(self.strong_sender.lock().await.take());
@@ -183,6 +177,20 @@ impl EventDispatcher {
                 None => self.completed.cancelled().await,
             }
         }
+    }
+
+    pub async fn complete(&self, error: LoreErrorDetail) -> i32 {
+        // `status` is the detail's `error_code` so the two agree by
+        // construction: `0` with the empty default detail on success, the
+        // detail's `error_code` with that detail on failure.
+        let status = error.error_code;
+        // Log a failing completion so consumers that surface log events (the
+        // CLI, the server) show the message and trace.
+        if status != 0 {
+            crate::lore_error!("{}", error.message_with_trace());
+        }
+        self.send(LoreEvent::Complete(LoreCompleteEventData { status, error }));
+        self.drain().await;
 
         status
     }

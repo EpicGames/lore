@@ -93,7 +93,7 @@ async fn run_service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
     fill_working_directory(&mut globals);
     let mut event_dispatcher = EventDispatcher::new(callback);
 
-    service_call_impl(&mut event_dispatcher, globals, args, connection)
+    let status = service_call_impl(&mut event_dispatcher, globals, args, connection)
         .await
         .unwrap_or_else(|err| {
             // The failure's own code, not a flat 1: a caller has to be able to
@@ -107,7 +107,14 @@ async fn run_service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
             )));
             event_dispatcher.send_error(err);
             status
-        })
+        });
+
+    // The read loop returns on the result, leaving events queued for this
+    // process's forwarder. Drained so a caller reading what its callback
+    // collected sees all of it; a local call's `complete` does the same.
+    event_dispatcher.drain().await;
+
+    status
 }
 
 pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
