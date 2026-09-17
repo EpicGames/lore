@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.0-nightly"
+version = "0.10.1-nightly"
 
 [workspace.dependencies]
 lore = { path = "lore" }
