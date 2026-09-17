@@ -122,6 +122,8 @@ pub enum LoreCommand {
     RevisionSync(crate::revision::LoreRevisionSyncArgs),
     ServiceStart(crate::service::LoreServiceStartArgs),
     ServiceStop(crate::service::LoreServiceStopArgs),
+    ServiceSetExecutable(crate::service::LoreServiceSetExecutableArgs),
+    ServiceSetUseAutomatically(crate::service::LoreServiceSetUseAutomaticallyArgs),
     NotificationSubscribe(crate::notification::LoreNotificationSubscribeArgs),
     NotificationUnsubscribe(crate::notification::LoreNotificationUnsubscribeArgs),
     SharedStoreCreate(crate::shared_store::LoreSharedStoreCreateArgs),

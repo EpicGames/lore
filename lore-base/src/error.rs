@@ -155,8 +155,11 @@ pub struct WriteRequired;
 // ---------------------------------------------------------------------------
 // Connectivity and availability (28–39)
 //
-// The remote could not be reached, dropped the connection, or is reachable but
-// declining work. Retrying later is often the right response.
+// Something the operation had to talk to could not be reached, dropped the
+// connection, or is reachable but declining work. Usually the remote; also the
+// local service process, which a call is relayed through and which the caller
+// reaches the same way — over a connection that may not be there. Retrying
+// later is often the right response.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Error, FfiError)]
@@ -180,6 +183,20 @@ pub struct Maintenance;
 #[error("Store overloaded, slow down")]
 #[ffi_code(31)]
 pub struct SlowDown;
+
+/// No Lore service could be reached, and none could be started.
+///
+/// Distinct from [`NotConnected`], which reports a remote: a caller that relays
+/// its calls through the local service handles this differently, because it is
+/// the one failure that means the operation did not run at all rather than ran
+/// and failed. Running the operation in this process instead is a reasonable
+/// answer to it and not to any other error here.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Lore service unavailable: {reason}")]
+#[ffi_code(32)]
+pub struct ServiceUnavailable {
+    pub reason: String,
+}
 
 // ---------------------------------------------------------------------------
 // Repository state (40–55)
@@ -616,6 +633,11 @@ mod tests {
             ),
             ("Maintenance", Group::Connectivity, Maintenance.ffi_code()),
             ("SlowDown", Group::Connectivity, SlowDown.ffi_code()),
+            (
+                "ServiceUnavailable",
+                Group::Connectivity,
+                ServiceUnavailable { reason: text() }.ffi_code(),
+            ),
             (
                 "NothingStaged",
                 Group::RepositoryState,

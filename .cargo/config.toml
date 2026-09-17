@@ -134,3 +134,43 @@ rustflags = [
 
 [registry]
 global-credential-providers = ["cargo:token"]
+
+[env]
+# Keeps a machine's service configuration out of anything cargo runs here.
+#
+# `[service] use_automatically` in the user-level config turns relaying on for
+# every Lore call on the machine, this repository's tests included: with it on,
+# `cargo test -p lore` fails 202 of its unit tests and every one of its
+# integration targets, because each call goes to a service that knows nothing of
+# the fixture it was set up against. A developer who turns the service on for
+# their own use should not thereby be unable to run the tests.
+#
+# Set without `force`, so a value already in the environment still wins —
+# `LORE_USE_SERVICE=1 cargo run -- status` relays as it says. It also applies to
+# `cargo run`, which is right for the same reason: the binary cargo just built is
+# not the one `[service] executable` names, so relaying to that service would run
+# a different build than the one asked for.
+#
+# The unit tests are covered a second way, in the routing decision itself, since
+# they are not always run through cargo.
+LORE_USE_SERVICE = "0"
+
+# Keeps anything cargo runs off the socket a developer's own service answers on.
+#
+# The setting above is no protection here: `service stop` connects to whatever is
+# listening whether or not calls relay, so a test calling it would end the service
+# a developer had running and say it succeeded. Every service on a machine answers
+# on one per-user socket by default, which is what makes one service serve every
+# command — and what makes a test able to stop the wrong one.
+#
+# A fixed name rather than a unique one, because this file cannot compute one. It
+# is the floor: it holds for every test written from here on without any of them
+# remembering it, which is the failure this guards against — `LORE_SERVICE_SOCKET`
+# was added for exactly this and the first Rust test to call `stop` still went to
+# the default. A target that runs concurrently with another names its own on top
+# of this, as `lore/tests/service_api.rs` does.
+#
+# Applies to `cargo run` too, and should: the binary cargo just built is not the
+# one a machine's service is running, so sharing a socket would have it served by
+# a different build than the one being run.
+LORE_SERVICE_SOCKET = "lore_service-cargo"

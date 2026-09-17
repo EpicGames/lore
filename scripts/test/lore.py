@@ -48,6 +48,7 @@ from lore_parsers import (
     parse_shared_store_info,
     parse_shared_store_list,
 )
+from service_util import name_service_executable
 
 logger = logging.getLogger(__name__)
 
@@ -237,7 +238,7 @@ class Lore:
         # Isolate the auth token store per test so a developer's
         # locally cached credentials don't leak into smoke runs.
         env.setdefault("LORE_AUTH_PATH", self.global_dir)
-        return env
+        return name_service_executable(env, self.lore_executable_path)
 
     def run(
         self,
@@ -1705,6 +1706,7 @@ class Lore:
         command_args = [
             sys.executable,
             str(Path(__file__).with_name("lore_ffi.py")),
+            "auth-user-info",
             library_path,
             self.path,
             *user_ids,
@@ -1725,6 +1727,39 @@ class Lore:
         logger.info(
             "Lore C API driver (%s) exited %s, output:\n%s",
             command_string,
+            result.returncode,
+            result.stdout + result.stderr,
+        )
+        return result.returncode
+
+    def service_capi(self, library_path: str, command: str) -> int:
+        """Start or stop the service through the public C API, returning the FFI
+        code. `command` is `service-start` or `service-stop`.
+
+        The CLI's `service start`/`stop` wrap these, so a test driving the CLI
+        covers the wrapper rather than the entry point an SDK consumer calls.
+        Run in a subprocess for the reasons `auth_user_info_capi` is: this
+        repository's isolated directories, and a crash failing one test rather
+        than the pytest worker. It matters twice over here — the library records
+        a service running in its own process, which no later test could undo.
+        """
+        command_args = [
+            sys.executable,
+            str(Path(__file__).with_name("lore_ffi.py")),
+            command,
+            library_path,
+        ]
+        logger.info("Executing Lore C API driver: %s", " ".join(command_args))
+        result = subprocess.run(
+            command_args,
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+            cwd=self.path if os.path.isdir(self.path) else None,
+        )
+        logger.info(
+            "Lore C API driver (%s) exited %s, output:\n%s",
+            command,
             result.returncode,
             result.stdout + result.stderr,
         )
@@ -2418,8 +2453,8 @@ class Lore:
     def service_start(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["service", "start"], **kwargs)
 
-    def service_stop(self, stop_all: bool = False, **kwargs: Unpack[GlobalOptions]):
-        return self.run(["service", "stop", "true" if stop_all else "false"], **kwargs)
+    def service_stop(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["service", "stop"], **kwargs)
 
     def notification_subscribe(
         self, timeout: int | None = None, **kwargs: Unpack[GlobalOptions]

@@ -33,7 +33,11 @@ lore-macro = { workspace = true }
 lore-notification = { workspace = true }
 
 [target.'cfg(target_family = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Console",
+] }
 
 [build-dependencies]
 anyhow = { workspace = true }

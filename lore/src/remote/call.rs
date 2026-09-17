@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::io::Write;
 
+use lore_base::error::ServiceUnavailable;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
 use lore_revision::event::EventError;
@@ -20,13 +21,22 @@ use crate::remote::message::blocking_read_v1_message;
 use crate::remote::message::write_v1_message;
 use crate::remote::network::UdsStream;
 use crate::remote::network::uds_supported;
+use crate::remote::service_process::connect_or_spawn_service;
 
 #[error_set]
-pub enum ServiceCallError {}
+pub enum ServiceCallError {
+    ServiceUnavailable,
+}
 
 impl EventError for ServiceCallError {
     fn translated(&self) -> LoreError {
-        LoreError::Internal
+        match self {
+            // Carried through from resolving the service, and the only failure
+            // here that means the call never reached one. Everything else went
+            // wrong while talking to a service that was there.
+            Self::ServiceUnavailable(_) => LoreError::ServiceUnavailable,
+            Self::Internal(_) => LoreError::Internal,
+        }
     }
 
     fn inner(&self) -> String {
@@ -50,7 +60,32 @@ fn fill_working_directory(globals: &mut LoreGlobalArgs) {
     }
 }
 
+/// Runs the call on the service, starting one when none is running.
 pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
+    globals: LoreGlobalArgs,
+    args: ArgsType,
+    callback: LoreEventCallback,
+) -> i32 {
+    run_service_call(None, globals, args, callback).await
+}
+
+/// Runs the call over a connection the caller already holds, rather than one
+/// resolved here.
+///
+/// A caller that acts on the service only when one is already running connects
+/// itself, so that its check for a service and the call it makes cannot
+/// disagree about whether there was one to act on.
+pub async fn service_call_over<ArgsType: LoreArgs + Clone + Send + 'static>(
+    connection: UdsStream,
+    globals: LoreGlobalArgs,
+    args: ArgsType,
+    callback: LoreEventCallback,
+) -> i32 {
+    run_service_call(Some(connection), globals, args, callback).await
+}
+
+async fn run_service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
+    connection: Option<UdsStream>,
     mut globals: LoreGlobalArgs,
     args: ArgsType,
     callback: LoreEventCallback,
@@ -58,15 +93,20 @@ pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
     fill_working_directory(&mut globals);
     let mut event_dispatcher = EventDispatcher::new(callback);
 
-    service_call_impl(&mut event_dispatcher, globals, args)
+    service_call_impl(&mut event_dispatcher, globals, args, connection)
         .await
         .unwrap_or_else(|err| {
+            // The failure's own code, not a flat 1: a caller has to be able to
+            // tell a call that never reached a service from one the service ran
+            // and reported on, and 1 is also the CLI's own general failure, which
+            // would make a routed failure indistinguishable from any other.
+            let status = err.ffi_code();
             event_dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
                 LoreLogLevel::Error,
                 format!("Failed to send command to Lore service because: {err}"),
             )));
             event_dispatcher.send_error(err);
-            1
+            status
         })
 }
 
@@ -74,14 +114,26 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     event_dispatcher: &mut EventDispatcher,
     globals: LoreGlobalArgs,
     args: ArgsType,
+    connection: Option<UdsStream>,
 ) -> Result<i32, ServiceCallError> {
     if !uds_supported() {
-        return Err(ServiceCallError::internal("OS doesn't support IPC"));
+        // No service can be reached here at all, which is the same answer for a
+        // caller as one that could not be started.
+        return Err(ServiceUnavailable {
+            reason: "OS doesn't support IPC".to_string(),
+        }
+        .into());
     }
 
-    let connection = lore_base::lore_spawn_blocking!(|| {
-        let mut connection =
-            UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
+    let connection = match connection {
+        Some(connection) => connection,
+        None => connect_or_spawn_service()
+            .await
+            .forward::<ServiceCallError>("reaching a Lore service")?,
+    };
+
+    let connection = lore_base::lore_spawn_blocking!(move || {
+        let mut connection = connection;
 
         let message = MessageToServer {
             globals,

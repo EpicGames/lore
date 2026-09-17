@@ -75,6 +75,12 @@ pub fn shutdown() -> bool {
 
     lore_revision::interface::shutdown();
 
+    // Services this process started are otherwise collected when the next
+    // service call comes, and after a shutdown none will. A program whose
+    // service has already exited — stopped by someone else, or died — would
+    // hold that child unreaped for however long it outlives its Lore use.
+    remote::service_process::collect_exited_services();
+
     true
 }
 
@@ -88,6 +94,35 @@ pub fn runtime() -> tokio::runtime::Handle {
 /// applied, `false` if a limit was already set.
 pub fn set_thread_limit(count: usize) -> bool {
     lore_base::runtime::set_thread_limit(count)
+}
+
+/// Whether calls will be carried out by the Lore service rather than in this
+/// process.
+///
+/// Answered without a runtime, so a caller that builds one can ask first — see
+/// [`size_threads_for_relaying`]. Decided once per process and cached, so asking
+/// costs one config read however often it is asked.
+pub fn will_use_service() -> bool {
+    remote::service_process::service_in_use_blocking()
+}
+
+/// Sizes this process's thread pools for relaying its calls to the service, when
+/// that is what it will do. A no-op otherwise, and a no-op once a runtime exists.
+///
+/// Call it before the first Lore operation, and before building a runtime of your
+/// own. A relaying process writes a request to a socket and reads events back
+/// while the service does the work, so pools sized for that work are threads a
+/// whole machine's worth of clients pays for and none of them uses.
+///
+/// A program that runs the service itself must not call this: it does the work
+/// rather than relaying it, whatever this machine's clients do.
+pub fn size_threads_for_relaying() {
+    if !will_use_service() {
+        return;
+    }
+    lore_base::runtime::runtime_with_settings(
+        Some(lore_base::runtime::TokioSettings::relay_only()),
+    );
 }
 
 pub fn log_file_path() -> LoreString {

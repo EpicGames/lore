@@ -1237,6 +1237,9 @@ pub enum LoreError {
     InvalidArguments = 3,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 31,
+    /// No Lore service could be reached, and none could be started, so the
+    /// operation did not run.
+    ServiceUnavailable = 32,
     /// A content-addressable object could not be found in any store.
     AddressNotFound = 80,
     /// A payload blob could not be found with the associated hash.

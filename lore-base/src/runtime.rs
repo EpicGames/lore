@@ -874,6 +874,26 @@ impl Default for TokioSettings {
     }
 }
 
+impl TokioSettings {
+    /// Settings for a process that relays its calls to the Lore service.
+    ///
+    /// A relaying process writes a request to a socket and reads events back,
+    /// and the service does the work. Sizing its pools for work it will not do
+    /// costs threads a whole machine's worth of clients pays for. Both pools sit
+    /// at [`MIN_THREADS_PER_POOL`], which every pool keeps regardless, so none
+    /// can starve another. The net pool is left at the process default: a
+    /// relaying process makes no remote calls of its own, and that default is
+    /// already small.
+    pub fn relay_only() -> Self {
+        TokioSettings {
+            max_blocking_threads: MIN_THREADS_PER_POOL,
+            thread_keep_alive_seconds: default_thread_keep_alive(),
+            worker_threads: Some(MIN_THREADS_PER_POOL),
+            net_threads: None,
+        }
+    }
+}
+
 /// Returns a handle to the shared tokio runtime, creating it lazily with default settings.
 pub fn runtime() -> Handle {
     runtime_with_settings(None)
@@ -1121,6 +1141,34 @@ pub fn runtime_shutdown_timeout(wait_timeout: Duration) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A relaying process does no work of its own, so its pools sit at the
+    /// minimum every pool keeps anyway.
+    #[test]
+    fn relay_settings_ask_for_the_least_a_pool_keeps() {
+        let relay = TokioSettings::relay_only();
+
+        assert_eq!(relay.worker_threads, Some(MIN_THREADS_PER_POOL));
+        assert_eq!(relay.max_blocking_threads, MIN_THREADS_PER_POOL);
+        assert_eq!(relay.thread_keep_alive_seconds, default_thread_keep_alive());
+        assert_eq!(
+            relay.net_threads, None,
+            "the net pool keeps the process default, which is already small"
+        );
+    }
+
+    /// Sizing for relaying must never ask for more than sizing for working.
+    #[test]
+    fn relay_settings_are_never_larger_than_the_default_ones() {
+        let relay = TokioSettings::relay_only();
+        let default = TokioSettings::default();
+
+        assert!(relay.max_blocking_threads <= default.max_blocking_threads);
+        assert!(
+            relay.worker_threads.unwrap_or(usize::MAX)
+                <= default.worker_threads.unwrap_or(usize::MAX)
+        );
+    }
     use super::*;
 
     /// The net runtime has `max_blocking_threads(1)`, so blocking work dispatched there

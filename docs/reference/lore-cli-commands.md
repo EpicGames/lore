@@ -164,6 +164,8 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * [`lore service run`↴](#lore-service-run)
 * [`lore service start`↴](#lore-service-start)
 * [`lore service stop`↴](#lore-service-stop)
+* [`lore service set-executable`↴](#lore-service-set-executable)
+* [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
 * [`lore notification`↴](#lore-notification)
 * [`lore notification subscribe`↴](#lore-notification-subscribe)
 * [`lore completions`↴](#lore-completions)
@@ -2662,8 +2664,10 @@ Manage the repository in a service process
 ###### **Subcommands:**
 
 * `run` — Run this process as the service
-* `start` — Start service for a repository
-* `stop` — Stop service for a repository
+* `start` — Start the service, unless one is already running
+* `stop` — Stop the running service
+* `set-executable` — Set which executable is started as the service
+* `set-use-automatically` — Set whether commands are carried out by the service
 
 
 
@@ -2677,7 +2681,7 @@ Run this process as the service
 
 ## `lore service start`
 
-Start service for a repository
+Start the service, unless one is already running
 
 **Usage:** `lore service start`
 
@@ -2685,13 +2689,35 @@ Start service for a repository
 
 ## `lore service stop`
 
-Stop service for a repository
+Stop the running service
 
-**Usage:** `lore service stop [all]`
+**Usage:** `lore service stop`
+
+
+
+## `lore service set-executable`
+
+Set which executable is started as the service
+
+**Usage:** `lore service set-executable [path]`
 
 ###### **Arguments:**
 
-* `<all>` — Flag to stop servicing all repositories
+* `<path>` — Path of the executable to start as the service. Leave empty to clear it
+
+
+
+## `lore service set-use-automatically`
+
+Set whether commands are carried out by the service
+
+**Usage:** `lore service set-use-automatically <enabled>`
+
+###### **Arguments:**
+
+* `<enabled>` — Whether to carry commands out in the service
+
+   `Set` rather than the default a `bool` field is given: this reads a value rather than being present or absent, and clap refuses a positional whose action takes none.
 
   Possible values: `true`, `false`
 

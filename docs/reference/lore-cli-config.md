@@ -112,6 +112,67 @@ The file is optional; when it's absent, Lore uses the defaults below.
 
 `pager` is the only field Lore reads from `cli.toml` today. The CLI's other behavioral settings — JSON output, log level, debug logging, and non-interactive mode — are set per invocation through command-line flags, not through this file. Passing `--no-pager` (or requesting JSON output) overrides `pager` for that command and disables paging.
 
+## User-level `config.toml`
+
+### Location
+
+`config.toml` sits beside `cli.toml` in the same OS user config directory (`~/.config/lore/config.toml` on a typical Linux setup), and holds settings that apply to every repository rather than to one. It is optional. Don't confuse it with the per-repository `config.toml` documented above, which lives in a repository's `.lore/` folder.
+
+### `[service]` table
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `executable` | string | unset | Path of the `lore` executable to run as the [background service](lore-cli-commands.md#lore-service). |
+| `use_automatically` | boolean | `false` | Whether commands are carried out by the service rather than in the process you ran. |
+
+**Both are required.** Commands are carried out by the service only when `use_automatically` is on *and* an executable is named. Turning the setting on by itself changes nothing, and Lore says so on each command rather than leaving you to wonder.
+
+```toml
+[service]
+executable = "/opt/lore/1.9/bin/lore"
+use_automatically = true
+```
+
+Set both with commands rather than by hand:
+
+```bash
+lore service set-executable /opt/lore/1.9/bin/lore
+lore service set-use-automatically true
+```
+
+`lore service set-executable` with an empty path clears the setting, which also stops commands being carried out by the service.
+
+Naming the executable is required because it decides which build serves the machine. A command that finds no service running starts one, so without a name that would be whichever program relayed first — an editor's bundled plugin as readily as the client you installed, and every client on the machine served by it thereafter. Requiring the name makes the version serving a machine something you chose and can read back, rather than an accident of ordering. This matters most where clients or plugins of different versions share a machine.
+
+Lore resolves the executable to start in this order, and the order is stable — a client released later still reads this setting, which is what lets an existing installation be pointed at a specific build after the fact:
+
+1. The `LORE_SERVICE_EXECUTABLE` environment variable, which overrides the setting for a single command. Use it for a build under test, not as a permanent choice.
+2. `[service] executable` in this file.
+3. The running program, when it is the `lore` client itself.
+4. A `lore` executable in the same directory as the running program. This is the case for a program that links `liblore` and ships the client beside it.
+
+Steps 3 and 4 serve `lore service start`, which asks for a service outright and so needs no name. They are not enough for commands to be carried out by the service automatically: that needs step 1 or 2.
+
+If none of those resolve, starting a service fails and names both places one can be set. Running `lore service run` by hand always serves from the build you ran, whatever this setting says; the service reports on startup when that isn't the configured one.
+
+`use_automatically` is what turns the service on and leaves it on. `LORE_USE_SERVICE` overrides it for a single command, and reads `0`, `false`, `no` and `off` as off — so `LORE_USE_SERVICE=0 lore status` runs in the process you ran even where the setting turns the service on. A blank value reads as unset and defers to the setting, as a blank `executable` does. Turning it on through the environment still requires an executable to be named, in either of the two places above.
+
+### Giving a run its own service
+
+| Variable | Effect |
+| --- | --- |
+| `LORE_SERVICE_SOCKET` | Names the socket a service listens on. Processes sharing a value share a service; processes with different values get one each. |
+
+Every service belonging to a user answers on the same socket by default, which is what makes one service serve every command that user runs. It is also why a test suite, or a second checkout, would otherwise take over the service already running: stopping and starting one affects whatever else was using it.
+
+Set `LORE_SERVICE_SOCKET` to give a group of processes a service of their own. The value names a single file, not a path — anything containing a path separator is refused in favour of the default rather than honoured, since the socket's directory is chosen for being private to your user and a path could move it somewhere with weaker permissions.
+
+```bash
+export LORE_SERVICE_SOCKET=lore_service-my-checkout
+```
+
+The Python test suite sets this per run, so running it leaves a service you have running alone.
+
 ## Examples
 
 ### Minimal `config.toml`

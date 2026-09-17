@@ -16,6 +16,7 @@ use crate::args::InvokableLoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
 use crate::remote::call::service_call;
+use crate::remote::service_process::service_in_use;
 
 /// Rejection of a call whose arguments are malformed, before the verb runs.
 #[error_set]
@@ -79,9 +80,16 @@ pub(crate) fn run_synchronously<
     callback: LoreEventCallbackConfig,
     handler: Handler,
 ) -> i32 {
+    // Ahead of the sizing below, which would build the runtime that shutdown is
+    // taking away.
     if lore_base::runtime::runtime_shutdown_started() {
         return reject_after_shutdown(callback);
     }
+    // Every entry point here reaches the runtime, and by the time a call is
+    // dispatched it has been built, so a relaying process is sized before then.
+    // A no-op once one exists, which is the case for a caller that sized it
+    // itself — the client does, since it builds the runtime before calling in.
+    crate::size_threads_for_relaying();
     let callback = lore_revision::event::convert_event_callback(callback);
     if let Err(error) = validate_call_text(globals, args) {
         return crate::runtime().block_on(reject_call(globals.clone(), callback, error));
@@ -113,6 +121,7 @@ pub(crate) fn run_asynchronously<
         reject_after_shutdown(callback);
         return;
     }
+    crate::size_threads_for_relaying();
     let callback = lore_revision::event::convert_event_callback(callback);
     if let Err(error) = validate_call_text(globals, args) {
         drop(lore_base::lore_spawn!(reject_call(
@@ -164,9 +173,7 @@ pub(crate) async fn dispatch_call<
     callback: LoreEventCallback,
     handler: Handler,
 ) -> i32 {
-    if let Ok(environment_value) = std::env::var("LORE_USE_SERVICE")
-        && !environment_value.is_empty()
-    {
+    if service_in_use().await {
         service_call(globals, args, callback).await
     } else {
         handler(globals, args, callback).await

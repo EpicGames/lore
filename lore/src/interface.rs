@@ -7064,7 +7064,11 @@ pub extern "C" fn lore_storage_upload_async(
 
 pub type LoreServiceStartArgs = crate::service::LoreServiceStartArgs;
 
-/// Start the Lore background service.
+/// Start the Lore background service, unless one is already running.
+///
+/// Connects to the running service, and starts one when nothing is listening.
+/// Returns `0` once a service is reachable, whether it was already running or
+/// was started by this call.
 ///
 /// # Events
 ///
@@ -7116,7 +7120,10 @@ pub extern "C" fn lore_service_start_async(
 
 pub type LoreServiceStopArgs = crate::service::LoreServiceStopArgs;
 
-/// Stop the Lore background service.
+/// Stop the running Lore background service.
+///
+/// Does not start a service in order to stop one. Returns `0` when no service
+/// is running, since that is the state the call asks for.
 ///
 /// # Events
 ///
@@ -7164,6 +7171,129 @@ pub extern "C" fn lore_service_stop_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::service::stop);
+}
+
+pub type LoreServiceSetExecutableArgs = crate::service::LoreServiceSetExecutableArgs;
+
+/// Name the executable the Lore background service runs from, for this machine.
+///
+/// Written to the user-level global config, so it holds for later commands and
+/// for other clients that read it. An empty `executable` clears the setting.
+/// Naming it decides which build serves the machine, rather than leaving that to
+/// whichever client happens to start a service first.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_executable(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetExecutableArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::service::set_executable)
+}
+
+/// Asynchronous version of `lore_service_set_executable`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_executable_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetExecutableArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::service::set_executable);
+}
+
+pub type LoreServiceSetUseAutomaticallyArgs = crate::service::LoreServiceSetUseAutomaticallyArgs;
+
+/// Set whether commands are carried out by the Lore background service.
+///
+/// Written to the user-level global config, so the service stays in use for
+/// later commands rather than for one command at a time. A non-zero `enabled`
+/// turns it on; zero turns it off.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_use_automatically(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetUseAutomaticallyArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::service::set_use_automatically,
+    )
+}
+
+/// Asynchronous version of `lore_service_set_use_automatically`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_use_automatically_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetUseAutomaticallyArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::service::set_use_automatically,
+    );
 }
 
 pub type LoreNotificationSubscribeArgs = crate::notification::LoreNotificationSubscribeArgs;
