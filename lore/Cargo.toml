@@ -54,6 +54,7 @@ oodle = ["lore-revision/oodle"]
 swfs = ["lore-revision/swfs"]
 
 [dev-dependencies]
+ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 rand = { workspace = true }
 serial_test = { workspace = true }

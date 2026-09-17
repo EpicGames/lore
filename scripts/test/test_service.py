@@ -13,7 +13,6 @@ from service_util import (
     LORE_SERVICE_ENVIRONMENT,
     LORE_SERVICE_RUNNING_MESSAGE,
     MACHINE_SETTINGS_PREFIX,
-    name_service_executable,
     stop_lore_service,
 )
 
@@ -27,11 +26,7 @@ CONCURRENT_COMMAND_COUNT = 5
 def service_command_environment(repo: Lore) -> dict[str, str]:
     """The environment a command run outside the `Lore` wrapper needs to reach
     the service, matching what the wrapper sets for its own commands."""
-    env = os.environ.copy()
-    env.update(LORE_SERVICE_ENVIRONMENT)
-    env["LORE_GLOBAL_PATH"] = repo.global_dir
-    env.setdefault("LORE_AUTH_PATH", repo.global_dir)
-    return name_service_executable(env, repo.lore_executable_path)
+    return repo.sandboxed_env(**LORE_SERVICE_ENVIRONMENT)
 
 
 @pytest.mark.smoke
@@ -106,12 +101,9 @@ def test_relaying_without_a_named_executable_runs_locally(
     """
     repo: Lore = new_lore_repo()
 
-    env = os.environ.copy()
-    env.update(LORE_SERVICE_ENVIRONMENT)
-    env["LORE_GLOBAL_PATH"] = repo.global_dir
-    env.setdefault("LORE_AUTH_PATH", repo.global_dir)
-    # Left unnamed on purpose, which is the whole of what this test is about, and
-    # so not passed through `name_service_executable` as the others are.
+    env = repo.sandboxed_env(**LORE_SERVICE_ENVIRONMENT)
+    # Left unnamed on purpose, which is the whole of what this test is about, so
+    # the name `sandboxed_env` supplies for the other tests is dropped again.
     env.pop("LORE_SERVICE_EXECUTABLE", None)
 
     command = subprocess.run(

@@ -54,6 +54,7 @@ lore-proto = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true }
 lore-transport = { workspace = true }

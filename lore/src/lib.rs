@@ -30,6 +30,35 @@ pub use lore_base::version::LORE_LIBRARY_VERSION;
 /// consumer aliases this into scope as `lore_error_set`.
 pub use lore_error_set as error_set;
 
+/// Points this crate's unit tests at a global config, credential store and
+/// service socket of their own, rather than the machine's.
+///
+/// `cfg!(test)` keeps a unit test from relaying but does not stop one binding a
+/// socket, and `remote::network`'s round trip binds whatever name it is given.
+/// `.cargo/config.toml` names a fixed socket for everything cargo runs, which
+/// leaves a concurrent run of this crate, and a test binary run directly.
+///
+/// A constructor because the environment is process-wide: this runs before the
+/// harness starts the threads that would make writing to it a data race.
+#[cfg(test)]
+#[ctor::ctor]
+fn sandbox_machine_settings() {
+    let sandbox = std::env::temp_dir().join(format!("lore-unit-tests-{}", std::process::id()));
+    std::fs::create_dir_all(&sandbox)
+        .unwrap_or_else(|error| panic!("creating the sandbox at {}: {error}", sandbox.display()));
+
+    // Safety: constructors run before `main`, so this is the single-threaded
+    // window where writing to the environment has no reader to race.
+    unsafe {
+        std::env::set_var("LORE_GLOBAL_PATH", &sandbox);
+        std::env::set_var("LORE_AUTH_PATH", &sandbox);
+        std::env::set_var(
+            "LORE_SERVICE_SOCKET",
+            format!("lore_service-unit-{}", std::process::id()),
+        );
+    }
+}
+
 /// Time allowed for the shutdown work that has to be driven from a synchronous caller.
 /// Matches the runtime shutdown timeout in `lore_revision::interface::shutdown`, which
 /// runs immediately after it.
@@ -127,4 +156,34 @@ pub fn size_threads_for_relaying() {
 
 pub fn log_file_path() -> LoreString {
     log::get_logs_path().into()
+}
+
+#[cfg(test)]
+mod sandbox_tests {
+    /// Asserted on what the library resolves rather than on the variable, since
+    /// a name that did not take effect is the failure worth catching.
+    #[test]
+    fn the_global_config_resolves_inside_the_sandbox() {
+        let configured =
+            std::env::var("LORE_GLOBAL_PATH").expect("the constructor names the sandbox");
+        let resolved = lore_revision::global::get_global_config_dir()
+            .expect("the global config directory resolves");
+
+        assert!(
+            resolved.starts_with(&configured),
+            "the library resolved {}, outside the sandbox at {configured}",
+            resolved.display()
+        );
+    }
+
+    /// On the default name, the round trip in `remote::network` binds the socket
+    /// a developer's own service answers on.
+    #[test]
+    fn the_service_socket_is_this_processs_own() {
+        assert_ne!(
+            crate::remote::service_socket_name(),
+            crate::remote::LORE_SERVICE_SOCKET_NAME,
+            "the default socket is the one every service on the machine answers on"
+        );
+    }
 }

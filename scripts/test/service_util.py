@@ -28,6 +28,7 @@ def name_service_executable(
         env["LORE_SERVICE_EXECUTABLE"] = lore_executable_path
     return env
 
+
 # Names the socket a service listens on. Set once per test run so the suite gets
 # a service of its own: without it every service on a machine answers on the same
 # per-user socket, so a run would stop a service the developer is using, and two
@@ -67,6 +68,11 @@ def stop_lore_service(lore_executable_path: str, global_dir_name: str) -> str:
     """
     env = os.environ.copy()
     env["LORE_GLOBAL_PATH"] = global_dir_name
+    # Alongside the global config, as the `Lore` wrapper does for its own
+    # commands. Assigned rather than defaulted, for the same reason it is there:
+    # `env` starts from the ambient environment, so a `LORE_AUTH_PATH` already
+    # exported would win and this would read that credential store.
+    env["LORE_AUTH_PATH"] = global_dir_name
     stop = subprocess.run(
         [lore_executable_path, "service", "stop"],
         capture_output=True,

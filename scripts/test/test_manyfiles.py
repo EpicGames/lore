@@ -68,6 +68,7 @@ def test_file(new_lore_repo, lore_executable_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=repo.sandboxed_env(),
     )
 
     # Wait for commit to announce it has started fragmenting files, then give the

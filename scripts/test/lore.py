@@ -229,16 +229,37 @@ class Lore:
             return ".urcignore"
         return ".loreignore"
 
-    def _subprocess_env(self) -> dict[str, str]:
-        """Environment for any subprocess this repository drives."""
+    def sandboxed_env(self, **extra: str) -> dict[str, str]:
+        """The environment a Lore command must run in to stay inside this test.
+
+        Commands run through this wrapper get it already. A test that spawns the
+        binary itself -- to kill it, or to read its output as it streams -- has
+        to ask for it, or the command reads the developer's global config and
+        credentials rather than the ones this test set up. `extra` wins over
+        what this repository sets.
+        """
         env = os.environ.copy()
         for k, v in self.environment_vars.items():
             env[k] = v
         env["LORE_GLOBAL_PATH"] = self.global_dir
-        # Isolate the auth token store per test so a developer's
-        # locally cached credentials don't leak into smoke runs.
-        env.setdefault("LORE_AUTH_PATH", self.global_dir)
+        # Isolate the auth token store per test so a developer's locally cached
+        # credentials don't leak into smoke runs. Assigned rather than defaulted:
+        # `env` starts from the ambient environment, so a `LORE_AUTH_PATH` a
+        # developer or CI already exports would win and the command would read
+        # that store. A test that names its own keeps it -- `test_auth_online`
+        # gives each actor a store through `environment_vars`.
+        if "LORE_AUTH_PATH" not in self.environment_vars:
+            env["LORE_AUTH_PATH"] = self.global_dir
+        # Ahead of naming the executable, which reads `LORE_USE_SERVICE`: a
+        # caller turning relaying on through `extra` has to be the value that
+        # decision sees, or the command relays with no executable named and
+        # quietly runs locally instead.
+        env.update(extra)
         return name_service_executable(env, self.lore_executable_path)
+
+    def _subprocess_env(self) -> dict[str, str]:
+        """Environment for any subprocess this repository drives."""
+        return self.sandboxed_env()
 
     def run(
         self,

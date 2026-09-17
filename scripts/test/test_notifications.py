@@ -41,7 +41,11 @@ def notification_subscribe(
     logger.info(f"Starting notification subscribe: {' '.join(command_args)}")
 
     process = subprocess.Popen(
-        command_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        command_args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=repo.sandboxed_env(),
     )
 
     collected_output = ""
