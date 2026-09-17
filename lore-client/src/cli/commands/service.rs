@@ -5,6 +5,7 @@ pub mod run;
 use clap::Args;
 use clap::Subcommand;
 use lore::interface::LoreEvent;
+use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreServiceSetExecutableArgs;
 use lore::interface::LoreServiceSetUseAutomaticallyArgs;
@@ -86,10 +87,12 @@ fn handle_service_run(globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
     }
 }
 
-fn handle_service_start(globals: LoreGlobalArgs, _args: &ServiceStartArgs) -> u8 {
-    let start_args = LoreServiceStartArgs {};
-
-    let callback = output_formatter().unwrap_or(Some(
+/// What every `service` command reports through: the default handlers, which put
+/// errors on stderr, and the maintenance notices a server can send. `Complete`
+/// is swallowed because each of these commands says its own outcome. The JSON
+/// formatter replaces it wholesale when that output mode is on.
+fn service_callback() -> LoreEventCallback {
+    output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
@@ -98,26 +101,19 @@ fn handle_service_start(globals: LoreGlobalArgs, _args: &ServiceStartArgs) -> u8
             _ => (),
         }) as EventCallbackFn)
             .with_defaults(),
-    ));
+    ))
+}
 
-    return runtime().block_on(service::start(globals, start_args, callback)) as u8;
+fn handle_service_start(globals: LoreGlobalArgs, _args: &ServiceStartArgs) -> u8 {
+    let start_args = LoreServiceStartArgs {};
+
+    return runtime().block_on(service::start(globals, start_args, service_callback())) as u8;
 }
 
 fn handle_service_stop(globals: LoreGlobalArgs, _args: &ServiceStopArgs) -> u8 {
     let stop_args = LoreServiceStopArgs {};
 
-    let callback = output_formatter().unwrap_or(Some(
-        (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Complete(_) => {}
-            LoreEvent::Maintenance(data) => {
-                util::handle_maintenance_event(data);
-            }
-            _ => (),
-        }) as EventCallbackFn)
-            .with_defaults(),
-    ));
-
-    return runtime().block_on(service::stop(globals, stop_args, callback)) as u8;
+    return runtime().block_on(service::stop(globals, stop_args, service_callback())) as u8;
 }
 
 fn handle_service_set_executable(globals: LoreGlobalArgs, args: &ServiceSetExecutableArgs) -> u8 {
@@ -125,18 +121,11 @@ fn handle_service_set_executable(globals: LoreGlobalArgs, args: &ServiceSetExecu
         executable: args.executable.clone().unwrap_or_default().into(),
     };
 
-    let callback = output_formatter().unwrap_or(Some(
-        (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Complete(_) => {}
-            LoreEvent::Maintenance(data) => {
-                util::handle_maintenance_event(data);
-            }
-            _ => (),
-        }) as EventCallbackFn)
-            .with_defaults(),
-    ));
-
-    return runtime().block_on(service::set_executable(globals, set_args, callback)) as u8;
+    return runtime().block_on(service::set_executable(
+        globals,
+        set_args,
+        service_callback(),
+    )) as u8;
 }
 
 fn handle_service_set_use_automatically(
@@ -147,18 +136,11 @@ fn handle_service_set_use_automatically(
         enabled: u8::from(args.enabled),
     };
 
-    let callback = output_formatter().unwrap_or(Some(
-        (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Complete(_) => {}
-            LoreEvent::Maintenance(data) => {
-                util::handle_maintenance_event(data);
-            }
-            _ => (),
-        }) as EventCallbackFn)
-            .with_defaults(),
-    ));
-
-    return runtime().block_on(service::set_use_automatically(globals, set_args, callback)) as u8;
+    return runtime().block_on(service::set_use_automatically(
+        globals,
+        set_args,
+        service_callback(),
+    )) as u8;
 }
 
 pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -> u8 {
