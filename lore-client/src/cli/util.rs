@@ -328,39 +328,83 @@ pub fn merge_result_display(progress: &LoreRevisionSyncProgressEventData) -> Str
     )
 }
 
-pub async fn listen_for_termination(timeout: Option<Duration>) -> tokio::io::Result<()> {
-    let timeout = timeout.unwrap_or(Duration::from_secs(u64::MAX));
-
+/// The termination signals, registered separately from the wait on them.
+///
+/// A signal ends the process outright until a handler is in place, so a caller
+/// that must not be killed between becoming reachable and reaching the wait
+/// registers these first. [`listen_for_termination`] registers on its own, which
+/// is the right shape for a caller with no such window.
+pub struct TerminationSignals {
     #[cfg(unix)]
-    let (mut ctrl_c, mut sigterm, timeout) = {
-        use tokio::signal::unix::SignalKind;
-        use tokio::signal::unix::signal;
-        (
-            signal(SignalKind::interrupt())?,
-            signal(SignalKind::terminate())?,
-            tokio::time::sleep(timeout),
-        )
-    };
-
+    interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
-    tokio::select! {
-        _ = ctrl_c.recv() => { println!(); },
-        _ = sigterm.recv() => { println!("SIGTERM received"); },
-        _ = timeout => {}
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    ctrl_c: tokio::signal::windows::CtrlC,
+}
+
+impl TerminationSignals {
+    /// Registers the handlers, which needs a runtime context: the signal driver
+    /// belongs to the runtime.
+    pub fn register() -> tokio::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            use tokio::signal::unix::signal;
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                ctrl_c: tokio::signal::windows::ctrl_c()?,
+            })
+        }
+        // No signals to register, matching `remote::network::stub`, which reports
+        // no IPC on the same targets. A caller that cannot register them reports
+        // it and carries on without a signal path.
+        #[cfg(not(any(unix, windows)))]
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "termination signals are not supported on this OS",
+        ))
     }
 
-    #[cfg(windows)]
-    let (mut ctrl_c, timeout) = {
-        (
-            tokio::signal::windows::ctrl_c()?,
-            tokio::time::sleep(timeout),
-        )
-    };
+    /// Resolves on the first of the signals to arrive.
+    pub async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => { println!(); },
+            _ = self.terminate.recv() => { println!("SIGTERM received"); },
+        }
 
-    #[cfg(windows)]
-    tokio::select! {
-        _ = ctrl_c.recv() => { println!(); },
-        _ = timeout => {}
+        #[cfg(windows)]
+        {
+            self.ctrl_c.recv().await;
+            println!();
+        }
+
+        // Unreachable, since `register` yields nothing to wait on here. Pending
+        // rather than returning, so a wait on no signals never reads as one
+        // arriving.
+        #[cfg(not(any(unix, windows)))]
+        std::future::pending::<()>().await
+    }
+}
+
+/// Waits for a termination signal, or for `timeout` to pass where one is given.
+///
+/// Registers the handlers here, so a caller that must not be killed before it
+/// reaches this await registers its own [`TerminationSignals`] earlier instead.
+pub async fn listen_for_termination(timeout: Option<Duration>) -> tokio::io::Result<()> {
+    let mut signals = TerminationSignals::register()?;
+    match timeout {
+        Some(timeout) => {
+            let _ = tokio::time::timeout(timeout, signals.recv()).await;
+        }
+        None => signals.recv().await,
     }
 
     Ok(())
@@ -432,5 +476,29 @@ mod format_bytes_tests {
             format_bytes_to_string(3 * 1024 * 1024 * 1024 / 2),
             "1.50 GiB"
         );
+    }
+}
+
+#[cfg(test)]
+mod termination_signal_tests {
+    use std::time::Duration;
+
+    use super::TerminationSignals;
+
+    /// What registering ahead of the socket relies on: the handler is what holds
+    /// a signal, so one delivered between registering and waiting reaches the
+    /// wait rather than ending the process.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_signal_delivered_before_the_wait_still_ends_it() {
+        let mut signals = TerminationSignals::register().expect("the handlers must register");
+
+        // Safety: raises a signal in this process, which the handler registered
+        // above now holds rather than the default disposition that would end it.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+
+        tokio::time::timeout(Duration::from_secs(5), signals.recv())
+            .await
+            .expect("a signal delivered before the wait must still end it");
     }
 }

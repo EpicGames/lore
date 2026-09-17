@@ -87,6 +87,9 @@ pub struct UdsListener {
 impl UdsListener {
     pub fn new() -> Result<UdsListener, UdsListenerError> {
         let wide_file_name = uds_sock_path();
+        // Ahead of the delete, so an address that cannot be built does not first
+        // remove the socket a running service is listening on.
+        let addr: SOCKADDR_UN = uds_sockaddr().map_err(UdsListenerError::internal)?;
 
         // Safety: Necessary to call windows APIs, only const pointers are passed to windows
         unsafe {
@@ -112,7 +115,6 @@ impl UdsListener {
         // Owned from here, so the bind and listen failures below close it rather
         // than leaving it open for the life of the process that tried to serve.
         let sock = OwnedSocket::new().map_err(UdsListenerError::internal)?;
-        let addr: SOCKADDR_UN = uds_sockaddr().map_err(UdsListenerError::internal)?;
         // Safety: Necessary to call windows APIs, only const pointers are passed to windows
         unsafe {
             if WinSock::bind(

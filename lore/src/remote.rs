@@ -68,9 +68,18 @@ fn socket_name_from(named: Option<OsString>) -> String {
     named.to_string()
 }
 
+static SOCKET_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
 /// The name of the socket a service listens on.
-pub fn service_socket_name() -> String {
-    socket_name_from(std::env::var_os(LORE_SERVICE_SOCKET_VAR))
+///
+/// Read once. Every connect asks for it and a start or stop wait asks hundreds
+/// of times, while reading the environment takes a process-global lock in `std`.
+/// Fixing it also keeps a process from splitting its calls across two sockets if
+/// the variable were to change underneath it.
+pub fn service_socket_name() -> &'static str {
+    SOCKET_NAME
+        .get_or_init(|| socket_name_from(std::env::var_os(LORE_SERVICE_SOCKET_VAR)))
+        .as_str()
 }
 
 #[cfg(test)]

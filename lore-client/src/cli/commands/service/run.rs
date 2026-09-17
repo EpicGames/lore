@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 
 use crate::eprintln;
 use crate::println;
-use crate::util::listen_for_termination;
+use crate::util::TerminationSignals;
 
 /// Bounds how long shutdown waits for the accept loop to unwind, so that a
 /// wake-up connection that never lands cannot keep the process alive. Anything
@@ -76,6 +76,19 @@ pub async fn service_main(
     if !uds_supported() {
         return Err(ServiceMainError::internal("IPC not supported on this OS"));
     }
+
+    // Ahead of the socket, because a signal ends the process outright until a
+    // handler is in place: registering after binding leaves a window in which a
+    // service callers can already reach dies rather than stopping, leaving the
+    // socket behind. A registration that fails leaves it stoppable over IPC
+    // alone, which beats refusing to serve.
+    let termination = match TerminationSignals::register() {
+        Ok(signals) => Some(signals),
+        Err(error) => {
+            eprintln!("Failed to listen for termination signals: {error}");
+            None
+        }
+    };
 
     let detached = detached_working_directory();
     if let Err(error) = std::env::set_current_dir(&detached) {
@@ -135,7 +148,7 @@ pub async fn service_main(
         }
     });
 
-    wait_for_stop(&stop_request).await;
+    wait_for_stop(&stop_request, termination).await;
 
     println!("Shutting down Lore service");
     shutting_down.store(true, Ordering::SeqCst);
@@ -184,22 +197,24 @@ async fn report_build_that_is_not_the_configured_one() {
 /// Waits for whichever comes first: a termination signal, or a stop asked for
 /// over IPC by `lore service stop`.
 ///
-/// Without signal handling there is no graceful path from a signal, so the IPC
-/// request becomes the only way to stop serving rather than a reason to stop.
-async fn wait_for_stop(stop_request: &ServiceStopRequest) {
-    let signal = tokio::select! {
-        result = listen_for_termination(None) => Some(result),
-        () = stop_request.requested() => None,
+/// `termination` is registered before the socket binds, so the handlers are in
+/// place for the whole time this service is reachable. Without them there is no
+/// graceful path from a signal, and the IPC request becomes the only way to stop
+/// serving rather than a reason to stop.
+async fn wait_for_stop(stop_request: &ServiceStopRequest, termination: Option<TerminationSignals>) {
+    let stopped_by_signal = if let Some(mut termination) = termination {
+        tokio::select! {
+            () = termination.recv() => true,
+            () = stop_request.requested() => false,
+        }
+    } else {
+        stop_request.requested().await;
+        false
     };
 
-    match signal {
-        // A signal carries no reply, so nothing has to drain before shutdown.
-        Some(Ok(())) => return,
-        Some(Err(error)) => {
-            eprintln!("Failed to listen for termination signals: {error}");
-            stop_request.requested().await;
-        }
-        None => {}
+    // A signal carries no reply, so nothing has to drain before shutdown.
+    if stopped_by_signal {
+        return;
     }
 
     // The caller that asked for the stop is waiting for its reply on a
