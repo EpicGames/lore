@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import platform
+import signal
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +16,7 @@ from service_util import (
     LORE_SERVICE_ENVIRONMENT,
     LORE_SERVICE_RUNNING_MESSAGE,
     MACHINE_SETTINGS_PREFIX,
+    SERVICE_UNAVAILABLE,
     stop_lore_service,
 )
 
@@ -372,3 +376,152 @@ def test_service_resolves_relative_paths_against_caller(
     assert "A " + file_name in map(
         lambda line: line.strip(" "), status_output.splitlines()
     ), f"Staged file should show as added: {status_output}"
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    platform.system() not in ("Linux", "Darwin"),
+    reason="POSIX termination signals",
+)
+@pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
+def test_the_service_shuts_down_cleanly_on_a_signal(
+    lore_service_runner, tmp_path, termination_signal
+):
+    """A termination signal stops the service rather than ending it outright, so
+    it releases its socket and exits 0.
+
+    The handlers are registered before the socket is bound, which is what makes
+    this hold for the whole time the service is reachable rather than only once
+    it has reached its wait.
+    """
+    service_directory = tmp_path / f"service_{termination_signal}"
+    service_directory.mkdir()
+    service = lore_service_runner.start(str(service_directory))
+
+    service.send_signal(termination_signal)
+    try:
+        code = service.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        service.kill()
+        pytest.fail(f"the service did not exit on {termination_signal!r}")
+
+    assert code == 0, (
+        f"the service must stop rather than be killed by {termination_signal!r}, "
+        f"got exit code {code}"
+    )
+
+
+@pytest.mark.smoke
+def test_stops_run_at_once_all_report_success(new_lore_repo, no_lore_service):
+    """Two stops racing one live service both report success.
+
+    The one whose request finds the service already gone must still exit 0: it
+    asked for no service to be running, and none is.
+    """
+    repo: Lore = new_lore_repo()
+
+    env = repo.sandboxed_env()
+
+    # Repeated, because which stop loses the race is timing rather than
+    # something the test can choose.
+    for attempt in range(3):
+        started = repo.run(["service", "start"])
+        assert LORE_SERVICE_RUNNING_MESSAGE in started, (
+            f"attempt {attempt} must have a service to stop: {started}"
+        )
+
+        stops = [
+            subprocess.Popen(
+                [repo.lore_executable_path, "service", "stop"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env,
+            )
+            for _ in range(2)
+        ]
+        for index, stop in enumerate(stops):
+            output = stop.communicate(timeout=30)[0]
+            assert stop.returncode == 0, (
+                f"stop {index} of attempt {attempt} failed with "
+                f"{stop.returncode}: {output}"
+            )
+
+
+@pytest.mark.smoke
+def test_the_setters_write_the_settings_the_config_reference_documents(new_lore_repo):
+    """Both settings reach the shared config under the documented names, and
+    clearing them removes them rather than storing a value that reads as unset.
+
+    Asserted on the file rather than on what the setter printed: a setter that
+    reports correctly while writing the wrong key passes otherwise, and the file
+    is what the next process reads.
+    """
+    repo: Lore = new_lore_repo()
+    config = Path(repo.global_dir) / "config" / "config.toml"
+
+    repo.run(["service", "set-executable", repo.lore_executable_path])
+    repo.run(["service", "set-use-automatically", "true"])
+
+    written = config.read_text(encoding="utf-8")
+    assert "[service]" in written, written
+    assert "executable = " in written, written
+    assert "use_automatically = true" in written, written
+
+    repo.run(["service", "set-executable", ""])
+    repo.run(["service", "set-use-automatically", "false"])
+
+    cleared = config.read_text(encoding="utf-8")
+    assert "executable = " not in cleared, cleared
+    assert "use_automatically" not in cleared, cleared
+
+
+@pytest.mark.smoke
+def test_a_command_that_reaches_no_service_reports_service_unavailable(
+    new_lore_repo, no_lore_service
+):
+    """The exit code an integrator driving the CLI branches on: the command never
+    ran, because no service could be reached or started.
+
+    Distinct from the command itself failing, which is the whole point of the
+    code. Shown without a real service by naming an executable that cannot be
+    spawned, and controlled against the same command forced to run locally.
+    """
+    repo: Lore = new_lore_repo()
+
+    env = repo.sandboxed_env(
+        **LORE_SERVICE_ENVIRONMENT,
+        LORE_SERVICE_EXECUTABLE=str(Path(repo.global_dir) / "no-such-lore-binary"),
+    )
+
+    command_args = [repo.lore_executable_path, "--repository", repo.path, "status"]
+    routed = subprocess.run(
+        command_args,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=repo.path,
+        check=False,
+    )
+    output = routed.stdout + routed.stderr
+    assert routed.returncode == SERVICE_UNAVAILABLE, (
+        f"expected the service-unavailable code {SERVICE_UNAVAILABLE}, got "
+        f"{routed.returncode}: {output}"
+    )
+
+    # Control: the same command forced to run where it was called succeeds, so
+    # the failure above was the routing rather than the command.
+    local_env = dict(env)
+    local_env["LORE_USE_SERVICE"] = "0"
+    local = subprocess.run(
+        command_args,
+        capture_output=True,
+        text=True,
+        env=local_env,
+        cwd=repo.path,
+        check=False,
+    )
+    assert local.returncode == 0, (
+        f"forcing local execution must not reach for the service: "
+        f"{local.stdout}{local.stderr}"
+    )
