@@ -1615,6 +1615,13 @@ pub mod tests {
 
     /// A name that is not text is reported rather than passed over: it hashes to a node the tree
     /// does not hold, so nothing can be done with it that is not a guess.
+    ///
+    /// This covers the listing end to end, which takes a filesystem willing to hold such a name.
+    /// One enforcing UTF-8 -- ZFS with `utf8only=on`, APFS -- refuses it in the write below,
+    /// before any of the code under test runs, and the test steps aside there rather than
+    /// reporting that limit as a failure of the listing.
+    /// [`crate::util::fs::tests::a_listed_name_that_is_not_text_is_reported`] covers the same
+    /// reporting from an assembled entry, so the invariant stays covered on such a filesystem.
     #[cfg(target_family = "unix")]
     #[tokio::test]
     async fn a_name_that_is_not_text_is_reported() {
@@ -1624,8 +1631,13 @@ pub mod tests {
         let operation = os_operation(dir.path()).await;
         let held = dir.path().join("held");
         std::fs::create_dir_all(&held).expect("create directory");
-        std::fs::write(held.join(std::ffi::OsStr::from_bytes(b"\xff")), b"content")
-            .expect("write file");
+        let name = held.join(std::ffi::OsStr::from_bytes(b"\xff"));
+        // Any failure here is the filesystem refusing the name: the write is the same one the
+        // neighbouring tests do, so a temp directory that could not be written to at all would
+        // take those with it rather than showing up only here.
+        if std::fs::write(&name, b"content").is_err() {
+            return;
+        }
 
         let mut listing = operation
             .read_directory(&relative("held"))

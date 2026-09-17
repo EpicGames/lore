@@ -1262,6 +1262,55 @@ mod tests {
         assert_eq!(names, vec!["target".to_string()]);
     }
 
+    /// A name a listing can yield that has no text spelling: bytes that are not UTF-8 on unix, an
+    /// unpaired surrogate on Windows.
+    #[cfg(target_family = "unix")]
+    fn name_that_is_not_text() -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        std::ffi::OsString::from_vec(vec![0xff])
+    }
+
+    #[cfg(target_family = "windows")]
+    fn name_that_is_not_text() -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt as _;
+
+        std::ffi::OsString::from_wide(&[0xd800])
+    }
+
+    /// A name that is not text is reported, and named lossily in the report, rather than passed
+    /// over: it hashes to a node the tree does not hold, so nothing can be done with it that is
+    /// not a guess.
+    ///
+    /// The entry is assembled rather than read off a disk so this runs wherever the crate builds.
+    /// A filesystem enforcing UTF-8 -- ZFS with `utf8only=on`, APFS -- refuses to create such a
+    /// name at all, which leaves
+    /// [`crate::fs::filesystem_provider::tests::a_name_that_is_not_text_is_reported`], the
+    /// end-to-end cover over a real listing, with nothing to list there.
+    #[test]
+    fn a_listed_name_that_is_not_text_is_reported() {
+        let dir = temp_dir();
+        let path = dir.path().join("named");
+        std::fs::write(&path, b"data").expect("write file");
+        // A real file's metadata: an entry carrying none, or naming neither a file nor a
+        // directory, is passed over before its name is read.
+        let metadata = std::fs::metadata(&path).expect("read metadata");
+
+        let listed = file_list_item(Ok(lore_io::DirEntry {
+            file_name: name_that_is_not_text(),
+            metadata: Some(metadata),
+            is_symlink: false,
+        }));
+
+        let Err(error) = listed else {
+            panic!("a name with no text spelling must be reported, not listed");
+        };
+        assert!(
+            error.to_string().contains('\u{fffd}'),
+            "the report names the entry lossily, not by a spelling it does not have: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn list_path_describes_a_file_by_its_own_name() {
         let dir = temp_dir();

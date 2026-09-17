@@ -3,7 +3,7 @@
 Release notes for the open source Lore project. Releases before v0.8.4 predate this file; see the
 [GitHub releases](https://github.com/EpicGames/lore/releases) page for the published record.
 
-## v0.10.0 (Sep 17th 2026) [#1167]
+## v0.10.0 (Sep 17th 2026) [#1170]
 
 ### Breaking changes
 
