@@ -5,7 +5,7 @@
 # Loaded via LORE_ENV=compose.
 
 # =============================================================================
-# Store Configuration — AWS mode backed by MinIO (S3) and DynamoDB Local
+# Store Configuration — AWS mode backed by RustFS (S3) and DynamoDB Local
 # =============================================================================
 
 [immutable_store]
@@ -54,12 +54,12 @@ enabled = false
 presigned_url_hmac_key = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
 
 # =============================================================================
-# AWS Plugin — S3 (MinIO) and DynamoDB Local endpoints
+# AWS Plugin — S3 (RustFS) and DynamoDB Local endpoints
 # =============================================================================
 
 [plugins.aws.immutable_store]
 s3_bucket = "lore-immutable-store-dev"
-s3_endpoint_url = "http://minio:9000"
+s3_endpoint_url = "http://rustfs:9000"
 s3_region = "us-east-1"
 s3_force_path_style = true
 dynamodb_fragments_table = "lore-fragments-dev"

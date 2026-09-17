@@ -5,10 +5,11 @@ This module currently contains the following tests:
 ## AWS Store Tests
 
 These tests exercise the AWS store against "real" AWS resources (where "real" in this case means
-local approximations of S3 and DynamoDB). In this case we're using [MinIO](https://min.io/) as an
-approximation of S3
+local approximations of S3 and DynamoDB). In this case we're using [RustFS](https://rustfs.com/) as
+an approximation of S3
 and [DynamoDB-Local](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBLocal.html)
-for DynamoDB.
+for DynamoDB. See [ADR-00020](../docs/developing/decisions/00020-s3-test-double.md) for why the S3
+stand-in is RustFS and not MinIO.
 
 ### Running Locally
 
@@ -24,9 +25,9 @@ From the root of the repo just run:
 $ docker compose --file lore-integration-tests/compose.yaml up
 ```
 
-This will start up both MinIO and DynamoDB local. MinIO will run on port 9000 with
-its UI on port 9001 (accessible via http://localhost:9001/, the login info is found
-in `MINIO_ROOT_USER` and `MINIO_ROOT_PASSWORD` in the docker-comppase.yaml file).
+This will start up both RustFS and DynamoDB local. RustFS will run on port 9000 with
+its console on port 9001 (accessible via <http://localhost:9001/rustfs/console/>, the login info is
+found in `RUSTFS_ACCESS_KEY` and `RUSTFS_SECRET_KEY` in the compose.yaml file).
 
 Once the services are up, you can run the tests via the following:
 
@@ -39,13 +40,16 @@ This will run *only* the integration tests.
 #### A Note on Storage
 
 DynamoDB is configured to store everything in memory, so its contents will be wiped whenever the
-container is restarted. Unfortunately MinIO does not have a comparable setting, so you'll probably
-want to be sure to clear out the bucket contents over time if you're running tests frequently. This
-can be done via the UI, or via
-the [MinIO client](https://min.io/docs/minio/linux/reference/minio-mc.html) (`mc`).
+container is restarted. RustFS has no in-memory mode of its own, so compose mounts its data
+directory as `tmpfs` instead — same outcome, the bucket is empty again after a restart, and there is
+no bucket to clear out by hand between runs.
+
+If you do want to inspect or clear the bucket while the stack is up, the console on port 9001 works,
+as does any S3 client pointed at the endpoint:
 
 ```shell
-$ MC_HOST_local=http://lorelocal:lorelocal@localhost:9000 mc rb --force --insecure local/lore-immutable-store-test
+$ AWS_ACCESS_KEY_ID=lorelocal AWS_SECRET_ACCESS_KEY=lorelocal AWS_REGION=us-east-1 \
+    aws --endpoint-url http://localhost:9000 s3 rb --force s3://lore-immutable-store-local
 ```
 
 ## gRPC Integration Tests

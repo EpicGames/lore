@@ -219,7 +219,7 @@ Not part of migrating a store. This is how a change to the tool, or to the migra
 From the root of the repository:
 
 ```sh
-docker compose --file lore-integration-tests/compose.yaml up --detach minio dynamodb
+docker compose --file lore-integration-tests/compose.yaml up --detach rustfs dynamodb
 cd contrib/aws-migrate-0.9.0
 cargo test --features integration_tests
 ```
