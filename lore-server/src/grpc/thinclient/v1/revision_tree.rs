@@ -950,6 +950,74 @@ mod test {
         .await;
     }
 
+    /// Answers only the async question, like an authorizer backed by a
+    /// policy engine or a store: the link-read closure gets no synchronous
+    /// verdict from it.
+    struct PolicyOnly;
+
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for PolicyOnly {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&crate::authnz::repository_authorizer::VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            _action: Option<&str>,
+        ) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+    }
+
+    /// A prefix inside the caller's own repository needs no link-read
+    /// verdict: the partition layer already admitted the request. An
+    /// authorizer that cannot answer synchronously must not turn every
+    /// prefixed walk into NotFound.
+    #[tokio::test]
+    async fn path_prefix_in_own_repository_needs_no_sync_link_verdict() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signature) = push_branch_with_subdir(&repository_context).await;
+
+            let response = handler(
+                make_request(
+                    repository,
+                    Query::Signature(signature.into()),
+                    Some("subdir".into()),
+                    None,
+                ),
+                immutable_store,
+                mutable_store,
+                Arc::new(PolicyOnly),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("handler ok");
+
+            let paths: Vec<String> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .filter_map(|item| match item.payload {
+                    Some(Payload::Node(n)) => Some(n.path),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                paths.iter().any(|p| p == "subdir/inner.txt"),
+                "expected subdir/inner.txt in {paths:?}",
+            );
+        }))
+        .await;
+    }
+
     #[tokio::test]
     async fn max_depth_one_excludes_grandchildren() {
         let repository = random::<RepositoryId>();
