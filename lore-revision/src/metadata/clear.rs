@@ -37,7 +37,7 @@ pub struct LoreMetadataClearFileEventData {
     pub path: LoreString,
 }
 
-pub async fn clear_revision(
+pub(crate) async fn clear_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
 ) -> Result<(), MetadataErrors> {
@@ -81,6 +81,14 @@ pub async fn clear_revision(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`clear_revision`] for cross-crate use.
+pub fn clear_revision_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+) -> crate::BoxFuture<'_, Result<(), MetadataErrors>> {
+    Box::pin(clear_revision(repository, token))
 }
 
 pub async fn clear_file(

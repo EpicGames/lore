@@ -472,7 +472,7 @@ mod tests {
                     test_repository(immutable_store, mutable_store, InstanceId::generate()).await;
 
                 // No branch key stored — should return NotFound
-                let result = instance::load_current_anchor(&repository).await;
+                let result = instance::load_current_anchor_boxed(&repository).await;
                 assert!(result.is_err(), "Expected NotFound for empty anchor");
             }))
             .await
@@ -496,7 +496,7 @@ mod tests {
                     .await
                     .expect("store branch failed");
 
-                let (revision, loaded_branch) = instance::load_current_anchor(&repository)
+                let (revision, loaded_branch) = instance::load_current_anchor_boxed(&repository)
                     .await
                     .expect("load_current_anchor failed");
                 assert!(revision.is_zero(), "Revision should be zero");

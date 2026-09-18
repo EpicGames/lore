@@ -134,7 +134,7 @@ fn link_path_in_scope(link_path: &str, paths: Option<&[RelativePath]>) -> bool {
 
 /// Calculate the difference between two revisions, as the set of changes that describe
 /// going from revision 'source' to revision 'target', optionally filtered by a set of paths
-pub async fn diff(
+pub(crate) async fn diff(
     repository: Arc<RepositoryContext>,
     source: Hash,
     target: Hash,
@@ -223,6 +223,16 @@ pub async fn diff(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`diff`] for cross-crate use.
+pub fn diff_boxed(
+    repository: Arc<RepositoryContext>,
+    source: Hash,
+    target: Hash,
+    paths: Option<Vec<RelativePath>>,
+) -> crate::BoxFuture<'static, Result<(), DiffError>> {
+    Box::pin(diff(repository, source, target, paths))
 }
 
 #[cfg(test)]

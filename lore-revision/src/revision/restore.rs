@@ -215,7 +215,7 @@ pub struct RestoreOptions {
     pub message: Option<String>,
 }
 
-pub async fn restore(
+pub(crate) async fn restore(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: RestoreOptions,
@@ -626,4 +626,13 @@ pub async fn restore(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`restore`] for cross-crate use.
+pub fn restore_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: RestoreOptions,
+) -> crate::BoxFuture<'_, Result<(), RestoreError>> {
+    Box::pin(restore(repository, token, options))
 }

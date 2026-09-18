@@ -106,7 +106,7 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let signature = Box::pin(commit::commit(repository.clone(), &write_token, options))
+                let signature = commit::commit_boxed(repository.clone(), &write_token, options)
                     .await
                     .expect("Failed to commit revision");
 
@@ -239,10 +239,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
             }))
             .await
             .expect("Test task failed");
@@ -369,7 +368,7 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                Box::pin(commit::commit(repository.clone(), &write_token, options))
+                commit::commit_boxed(repository.clone(), &write_token, options)
                     .await
                     .expect("Failed to commit revision");
 
@@ -485,7 +484,7 @@ mod tests {
                 LORE_CONTEXT
                     .scope(
                         dry_run,
-                        Box::pin(commit::commit(repository.clone(), &write_token, options)),
+                        commit::commit_boxed(repository.clone(), &write_token, options),
                     )
                     .await
                     .expect("Failed to commit revision");
@@ -572,8 +571,7 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let result =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options)).await;
+                let result = commit::commit_boxed(repository.clone(), &write_token, options).await;
                 assert!(result.is_err(), "commit without staged changes should fail");
             }))
             .await

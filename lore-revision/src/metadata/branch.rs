@@ -251,7 +251,7 @@ async fn commit_metadata_hash(
 /// is `None`, emits all metadata entries.
 ///
 /// When `local` is true, reads from the local mutable store cache without contacting the remote.
-pub async fn get(
+pub(crate) async fn get(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
     key: Option<&str>,
@@ -275,11 +275,21 @@ pub async fn get(
     Ok(())
 }
 
+/// Boxed version of [`get`] for cross-crate use.
+pub fn get_boxed(
+    repo: Arc<RepositoryContext>,
+    branch: BranchId,
+    key: Option<&str>,
+    local: bool,
+) -> crate::BoxFuture<'_, Result<(), BranchMetadataError>> {
+    Box::pin(get(repo, branch, key, local))
+}
+
 /// Set one or more metadata key-value pairs on the branch metadata. Always contacts the remote.
 ///
 /// `keys`, `values`, and `formats` must be parallel slices of equal length. For binary values,
 /// the value is treated as a file path whose contents are stored in the immutable store.
-pub async fn set(
+pub(crate) async fn set(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
     keys: &[&[u8]],
@@ -377,11 +387,22 @@ pub async fn set(
     Ok(())
 }
 
+/// Boxed version of [`set`] for cross-crate use.
+pub fn set_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    branch: BranchId,
+    keys: &'a [&'a [u8]],
+    values: &'a [&'a [u8]],
+    formats: &'a [MetadataType],
+) -> crate::BoxFuture<'a, Result<(), BranchMetadataError>> {
+    Box::pin(set(repo, branch, keys, values, formats))
+}
+
 /// Remove metadata keys from the branch metadata. Always contacts the remote.
 ///
 /// If `keys` is non-empty, removes only those keys (rejecting built-in keys). If `keys` is
 /// empty, removes all non-built-in keys.
-pub async fn clear(
+pub(crate) async fn clear(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
     keys: &[&str],
@@ -432,4 +453,13 @@ pub async fn clear(
     commit_metadata_hash(repo, branch, &metadata, old_hash, new_hash).await?;
 
     Ok(())
+}
+
+/// Boxed version of [`clear`] for cross-crate use.
+pub fn clear_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    branch: BranchId,
+    keys: &'a [&'a str],
+) -> crate::BoxFuture<'a, Result<(), BranchMetadataError>> {
+    Box::pin(clear(repo, branch, keys))
 }

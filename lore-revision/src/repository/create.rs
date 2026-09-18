@@ -143,15 +143,16 @@ fn directory_name(path: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-pub async fn create(
+/// Boxed version of [`create_with_metadata`] for cross-crate use, without metadata.
+pub fn create_boxed(
     repository_url: &str,
-    path: impl AsRef<Path>,
+    path: impl AsRef<Path> + Send,
     options: CreateOptions,
-) -> Result<(), CreateError> {
-    create_with_metadata(repository_url, path, options, None).await
+) -> crate::BoxFuture<'_, Result<(), CreateError>> {
+    create_with_metadata_boxed(repository_url, path, options, None)
 }
 
-pub async fn create_with_metadata(
+pub(crate) async fn create_with_metadata(
     repository_url: &str,
     path: impl AsRef<Path>,
     options: CreateOptions,
@@ -371,4 +372,20 @@ pub async fn create_with_metadata(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`create_with_metadata`] for cross-crate use.
+pub fn create_with_metadata_boxed(
+    repository_url: &str,
+    path: impl AsRef<Path> + Send,
+    options: CreateOptions,
+    metadata: Option<CreateMetadata>,
+) -> crate::BoxFuture<'_, Result<(), CreateError>> {
+    let path = path.as_ref().to_path_buf();
+    Box::pin(create_with_metadata(
+        repository_url,
+        path,
+        options,
+        metadata,
+    ))
 }

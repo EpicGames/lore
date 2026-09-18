@@ -92,7 +92,7 @@ mod tests {
                     layer: None,
                 };
                 let committed_signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
+                    commit::commit_boxed(repository.clone(), &write_token, options)
                         .await
                         .expect("Failed to commit revision");
 
@@ -1709,7 +1709,7 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let signature = Box::pin(commit::commit(repository.clone(), &write_token, options))
+                let signature = commit::commit_boxed(repository.clone(), &write_token, options)
                     .await
                     .expect("Failed to commit");
 
@@ -1821,7 +1821,7 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let signature = Box::pin(commit::commit(repository.clone(), &write_token, options))
+                let signature = commit::commit_boxed(repository.clone(), &write_token, options)
                     .await
                     .expect("Failed to commit");
 
@@ -1975,7 +1975,7 @@ mod tests {
         ))
         .await
         .expect("Failed to stage the seed tree");
-        Box::pin(commit::commit(
+        commit::commit_boxed(
             repository.clone(),
             &write_token,
             CommitOptions {
@@ -1985,7 +1985,7 @@ mod tests {
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
             },
-        ))
+        )
         .await
         .expect("Failed to commit the seed tree");
 
@@ -2170,7 +2170,7 @@ mod tests {
                     "an executable file must record the bit"
                 );
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     &write_token,
                     CommitOptions {
@@ -2180,7 +2180,7 @@ mod tests {
                         layer_messages: std::collections::HashMap::new(),
                         layer: None,
                     },
-                ))
+                )
                 .await
                 .expect("Failed to commit the executable file");
 

@@ -1370,7 +1370,7 @@ async fn report_tree_diffs(
     .await
 }
 
-pub async fn status(
+pub(crate) async fn status(
     repository: Arc<RepositoryContext>,
     paths: Option<Vec<RelativePath>>,
     options: StatusOptions,
@@ -1837,6 +1837,15 @@ pub async fn status(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`status`] for cross-crate use.
+pub fn status_boxed(
+    repository: Arc<RepositoryContext>,
+    paths: Option<Vec<RelativePath>>,
+    options: StatusOptions,
+) -> crate::BoxFuture<'static, Result<(), StatusError>> {
+    Box::pin(status(repository, paths, options))
 }
 
 #[cfg(test)]

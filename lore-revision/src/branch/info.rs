@@ -112,7 +112,10 @@ pub struct LoreBranchInfoEventData {
     pub archived: u8,
 }
 
-pub async fn info(repository: Arc<RepositoryContext>, branch: String) -> Result<(), InfoError> {
+pub(crate) async fn info(
+    repository: Arc<RepositoryContext>,
+    branch: String,
+) -> Result<(), InfoError> {
     let branch_name = if branch.is_empty() {
         let (_revision, branch) =
             crate::instance::load_current_anchor(&repository)
@@ -220,4 +223,12 @@ pub async fn info(repository: Arc<RepositoryContext>, branch: String) -> Result<
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`info`] for cross-crate use.
+pub fn info_boxed(
+    repository: Arc<RepositoryContext>,
+    branch: String,
+) -> crate::BoxFuture<'static, Result<(), InfoError>> {
+    Box::pin(info(repository, branch))
 }

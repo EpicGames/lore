@@ -369,11 +369,14 @@ async fn resolve_start(
                 })
             } else {
                 let signature = format!("{branch}@{}", identifier.number);
-                let hash =
-                    revision::resolve(repository.clone(), signature, ResolveSearchLocation::Local)
-                        .await
-                        .filter_slow_down()?
-                        .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
+                let hash = revision::resolve_boxed(
+                    repository.clone(),
+                    signature,
+                    ResolveSearchLocation::Local,
+                )
+                .await
+                .filter_slow_down()?
+                .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
                 Ok(ResolveStart::Walk {
                     start: hash,
                     strategy: RevisionListStrategy::FullIteration,

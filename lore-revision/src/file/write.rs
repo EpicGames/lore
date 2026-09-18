@@ -128,7 +128,7 @@ fn check_destination_access(
     Ok(())
 }
 
-pub async fn write_file(
+pub(crate) async fn write_file(
     repository: Arc<RepositoryContext>,
     token: Option<&RepositoryWriteToken>,
     path: String,
@@ -281,6 +281,17 @@ pub async fn write_file(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`write_file`] for cross-crate use.
+pub fn write_file_boxed(
+    repository: Arc<RepositoryContext>,
+    token: Option<&RepositoryWriteToken>,
+    path: String,
+    output: String,
+    options: WriteFileOptions,
+) -> crate::BoxFuture<'_, Result<(), WriteError>> {
+    Box::pin(write_file(repository, token, path, output, options))
 }
 
 pub async fn write_address(

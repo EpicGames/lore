@@ -317,7 +317,7 @@ pub async fn test_anchor_states(
     std::sync::Arc<lore_revision::state::State>,
     std::sync::Arc<lore_revision::state::State>,
 ) {
-    let (revision, _branch) = lore_revision::instance::load_current_anchor(repository)
+    let (revision, _branch) = lore_revision::instance::load_current_anchor_boxed(repository)
         .await
         .expect("Failed to load current anchor");
     let current = lore_revision::state::State::deserialize(repository.clone(), revision)

@@ -96,7 +96,7 @@ pub struct LoreAuthIdentityEventData {
 /// only from an identity token supplied to the call: both the auth service and
 /// the auth URL the token store is keyed by come from the connection. Every
 /// other id is left for the caller to display raw.
-pub async fn resolve_user_info(
+pub(crate) async fn resolve_user_info(
     repository: Arc<RepositoryContext>,
     ids: LoreArray<LoreString>,
 ) -> Result<(), UserInfoError> {
@@ -210,6 +210,14 @@ pub async fn resolve_user_info(
     lore_debug!("User info query successful");
 
     Ok(())
+}
+
+/// Boxed version of [`resolve_user_info`] for cross-crate use.
+pub fn resolve_user_info_boxed(
+    repository: Arc<RepositoryContext>,
+    ids: LoreArray<LoreString>,
+) -> crate::BoxFuture<'static, Result<(), UserInfoError>> {
+    Box::pin(resolve_user_info(repository, ids))
 }
 
 /// Emits the authorization (access) token for the repository as an
@@ -446,7 +454,10 @@ fn display_name(info: &lore_credential::UserInfo) -> String {
 /// For remote resolution of user IDs (e.g. other users), use
 /// [`resolve_user_info`] or [`user_display_name`] which perform a proper
 /// authorization exchange scoped to a repository.
-pub async fn resolve_local_user_info(auth_url: &str, user_ids: &[String]) -> Vec<ResolvedIdentity> {
+pub(crate) async fn resolve_local_user_info(
+    auth_url: &str,
+    user_ids: &[String],
+) -> Vec<ResolvedIdentity> {
     let mut results = vec![];
     let execution = execution_context();
     let globals = execution.globals();
@@ -485,6 +496,14 @@ pub async fn resolve_local_user_info(auth_url: &str, user_ids: &[String]) -> Vec
     }
 
     results
+}
+
+/// Boxed version of [`resolve_local_user_info`] for cross-crate use.
+pub fn resolve_local_user_info_boxed<'a>(
+    auth_url: &'a str,
+    user_ids: &'a [String],
+) -> crate::BoxFuture<'a, Vec<ResolvedIdentity>> {
+    Box::pin(resolve_local_user_info(auth_url, user_ids))
 }
 
 /// Resolves a single user ID to a display name.

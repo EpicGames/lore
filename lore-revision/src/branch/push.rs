@@ -475,7 +475,7 @@ fn push_stats_event() -> Option<LoreBranchPushStatsEventData> {
     )
 }
 
-pub async fn push(
+pub(crate) async fn push(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: PushOptions,
@@ -564,6 +564,15 @@ pub async fn push(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`push`] for cross-crate use.
+pub fn push_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: PushOptions,
+) -> crate::BoxFuture<'_, Result<(), PushError>> {
+    Box::pin(push(repository, token, options))
 }
 
 /// The revision the peer holds as latest for `branch`, remembered in `known`, or zero when

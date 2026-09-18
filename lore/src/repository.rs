@@ -386,7 +386,7 @@ async fn dump_impl(
     let revision = if args.revision.is_empty() {
         None
     } else {
-        revision::resolve(
+        revision::resolve_boxed(
             repository.clone(),
             args.revision.as_str(),
             execution_context().globals().search_location(),
@@ -405,7 +405,7 @@ async fn dump_impl(
         None
     };
 
-    lore_revision::repository::dump::dump(repository, revision, path, args.max_depth).await
+    lore_revision::repository::dump::dump_boxed(repository, revision, path, args.max_depth).await
 }
 
 /// Arguments for creating a new repository.
@@ -509,7 +509,7 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         vfs_options: args.vfs.to_config(),
     };
 
-    lore_revision::repository::create::create(repository_url, repository_path, options).await
+    lore_revision::repository::create::create_boxed(repository_url, repository_path, options).await
 }
 
 /// Optional creator and creation-time metadata to record on a new repository.
@@ -577,7 +577,7 @@ async fn create_with_metadata_impl(
         created: metadata.created,
     });
 
-    lore_revision::repository::create::create_with_metadata(
+    lore_revision::repository::create::create_with_metadata_boxed(
         repository_url,
         repository_path,
         options,
@@ -972,7 +972,7 @@ async fn status_impl(
         None
     };
 
-    lore_revision::repository::status::status(repository, paths, options).await
+    lore_revision::repository::status::status_boxed(repository, paths, options).await
 }
 
 /// Arguments for verifying the integrity of the local repository state.
@@ -1048,7 +1048,7 @@ async fn verify_state_impl(
     } else {
         None
     };
-    lore_revision::repository::verify::verify(repository, path, args.heal != 0).await
+    lore_revision::repository::verify::verify_boxed(repository, path, args.heal != 0).await
 }
 
 /// Arguments for verifying a single fragment in the local store.
@@ -1096,7 +1096,7 @@ async fn verify_fragment_impl(
         context: args.context,
         heal: args.heal != 0,
     };
-    lore_revision::repository::verify::verify_fragment(repository, core_args).await
+    lore_revision::repository::verify::verify_fragment_boxed(repository, core_args).await
 }
 
 /// Arguments for querying the local immutable store by fragment address.
@@ -1196,7 +1196,7 @@ async fn metadata_get_local(
                 Some(args.key.to_string())
             };
             async move {
-                lore_revision::metadata::repository::get(
+                lore_revision::metadata::repository::get_boxed(
                     repository,
                     key.as_deref(),
                     execution_context().globals().local(),
@@ -1279,7 +1279,7 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    lore_revision::metadata::repository::set(repository, &keys, &values, &formats).await
+    lore_revision::metadata::repository::set_boxed(repository, &keys, &values, &formats).await
 }
 
 /// Arguments for removing metadata keys from the current repository.
@@ -1314,7 +1314,7 @@ async fn metadata_clear_local(
             let keys: Vec<String> = args.keys.as_slice().iter().map(|k| k.to_string()).collect();
             async move {
                 let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                lore_revision::metadata::repository::clear(repository, &key_refs).await
+                lore_revision::metadata::repository::clear_boxed(repository, &key_refs).await
             }
         },
     )

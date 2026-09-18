@@ -88,7 +88,7 @@ mod tests {
                     layer: None,
                 };
                 let first_signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
+                    commit::commit_boxed(repository.clone(), &write_token, options)
                         .await
                         .expect("Failed to commit revision");
 
@@ -128,12 +128,12 @@ mod tests {
                     layer: None,
                 };
                 let second_signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
+                    commit::commit_boxed(repository.clone(), &write_token, options)
                         .await
                         .expect("Failed to commit revision");
 
                 // Sync back to first revision
-                Box::pin(sync::sync(
+                sync::sync_boxed(
                     repository.clone(),
                     &write_token,
                     SyncOptions {
@@ -141,7 +141,7 @@ mod tests {
                         filter_mode: lore_revision::filter::FilterMode::Full,
                         ..Default::default()
                     },
-                ))
+                )
                 .await
                 .expect("Failed to sync back to first revision");
 
@@ -158,7 +158,7 @@ mod tests {
                 );
 
                 // Sync forward to second revision
-                Box::pin(sync::sync(
+                sync::sync_boxed(
                     repository.clone(),
                     &write_token,
                     SyncOptions {
@@ -166,7 +166,7 @@ mod tests {
                         filter_mode: lore_revision::filter::FilterMode::Full,
                         ..Default::default()
                     },
-                ))
+                )
                 .await
                 .expect("Failed to sync forward to second revision");
 

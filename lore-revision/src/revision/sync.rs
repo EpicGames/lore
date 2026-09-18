@@ -247,7 +247,7 @@ impl Default for SyncOptions {
     }
 }
 
-pub async fn sync(
+pub(crate) async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: SyncOptions,
@@ -722,6 +722,15 @@ pub async fn sync(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`sync`] for cross-crate use.
+pub fn sync_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: SyncOptions,
+) -> crate::BoxFuture<'_, Result<(), SyncError>> {
+    Box::pin(sync(repository, token, options))
 }
 
 async fn sync_load_layer_list(

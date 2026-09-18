@@ -106,15 +106,16 @@ pub struct BisectOptions {
     pub start: String,
     pub end: String,
 }
-pub async fn bisect(
+/// Boxed version of [`bisect`] for cross-crate use.
+pub fn bisect_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: BisectOptions,
-) -> Result<(), BisectError> {
-    Box::pin(bisect_impl(repository, token, options)).await
+) -> crate::BoxFuture<'_, Result<(), BisectError>> {
+    Box::pin(bisect(repository, token, options))
 }
 
-async fn bisect_impl(
+pub(crate) async fn bisect(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: BisectOptions,

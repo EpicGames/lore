@@ -127,10 +127,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Create a new directory
                 // - dir_added
@@ -188,7 +187,7 @@ mod tests {
                 .expect("Failed to unstage repository");
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository_context)
+                    lore_revision::instance::load_current_anchor_boxed(&repository_context)
                         .await
                         .expect("Failed to load current anchor");
 

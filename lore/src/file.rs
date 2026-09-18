@@ -1102,7 +1102,8 @@ async fn write_impl(
 
         let path = args.path.to_string();
 
-        lore_revision::file::write::write_file(repository, token, path, output, options).await?;
+        lore_revision::file::write::write_file_boxed(repository, token, path, output, options)
+            .await?;
     }
 
     Ok(())
@@ -1174,11 +1175,11 @@ async fn obliterate_impl(
             })
         })?;
 
-        lore_revision::file::obliterate::obliterate_address(repository, address).await?;
+        lore_revision::file::obliterate::obliterate_address_boxed(repository, address).await?;
     } else {
         let path = args.path.to_string();
 
-        lore_revision::file::obliterate::obliterate_file(repository, token, path).await?;
+        lore_revision::file::obliterate::obliterate_file_boxed(repository, token, path).await?;
     }
 
     Ok(())
@@ -1239,11 +1240,11 @@ async fn dump_impl(
         let address =
             Address::from_str(args.address.as_str()).internal("invalid address for dump")?;
 
-        lore_revision::file::dump::dump_address(repository, address).await?;
+        lore_revision::file::dump::dump_address_boxed(repository, address).await?;
     } else {
         let path = args.path.to_string();
 
-        lore_revision::file::dump::dump_file(repository, path).await?;
+        lore_revision::file::dump::dump_file_boxed(repository, path).await?;
     }
 
     Ok(())

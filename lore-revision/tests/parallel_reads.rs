@@ -150,7 +150,7 @@ mod tests {
                 let total_wall = started.elapsed();
 
                 let (rev_after, branch_after) =
-                    instance::load_current_anchor(&repository)
+                    instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("final load_current_anchor");
                 assert!(
@@ -234,7 +234,7 @@ mod tests {
                 }
                 let phase1_wall = phase1_started.elapsed();
 
-                let (rev_mid, branch_mid) = instance::load_current_anchor(&repository)
+                let (rev_mid, branch_mid) = instance::load_current_anchor_boxed(&repository)
                     .await
                     .expect("mid load_current_anchor");
                 assert_eq!(rev_mid, sig2, "phase 1 must not mutate anchor");
@@ -278,7 +278,7 @@ mod tests {
                 let phase2_wall = phase2_started.elapsed();
 
                 let (rev_after, branch_after) =
-                    instance::load_current_anchor(&repository)
+                    instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("final load_current_anchor");
                 assert_eq!(rev_after, new_sig, "phase 2 must observe the post-commit sig");
@@ -406,7 +406,7 @@ mod tests {
                         let mut scans = 0usize;
                         while !done.load(Ordering::Relaxed) && scans < RACE_MAX_SCANS_PER_TASK {
                             scans += 1;
-                            let res = repository::status::status(
+                            let res = repository::status::status_boxed(
                                 repo.clone(),
                                 None,
                                 repository::status::StatusOptions {
@@ -529,7 +529,7 @@ mod tests {
         let mut samples = Vec::with_capacity(iters);
         for _ in 0..iters {
             let t = Instant::now();
-            let (rev, branch) = instance::load_current_anchor(&repo)
+            let (rev, branch) = instance::load_current_anchor_boxed(&repo)
                 .await
                 .expect("load_current_anchor");
             assert!(
@@ -586,7 +586,7 @@ mod tests {
         )
         .await
         .expect("Failed to stage seed files");
-        Box::pin(commit::commit(
+        commit::commit_boxed(
             repository.clone(),
             token,
             CommitOptions {
@@ -596,7 +596,7 @@ mod tests {
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
             },
-        ))
+        )
         .await
         .expect("Failed to commit seed revision")
     }
@@ -640,7 +640,7 @@ mod tests {
         )
         .await
         .expect("Failed to stage race files");
-        Box::pin(commit::commit(
+        commit::commit_boxed(
             repository.clone(),
             token,
             CommitOptions {
@@ -650,7 +650,7 @@ mod tests {
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
             },
-        ))
+        )
         .await
         .expect("Failed to commit race revision")
     }

@@ -84,11 +84,11 @@ mod tests {
                 )
                 .await
                 .expect("Failed to stage the fixture");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     &fixture.write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 

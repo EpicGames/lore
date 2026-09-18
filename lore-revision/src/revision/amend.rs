@@ -83,15 +83,7 @@ pub struct AmendRevisionOptions {
     pub message: Option<String>,
 }
 
-pub async fn amend_revision(
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    options: AmendRevisionOptions,
-) -> Result<Hash, AmendRevisionError> {
-    amend_revision_impl(repository, token, options).await
-}
-
-async fn amend_revision_impl(
+pub(crate) async fn amend_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: AmendRevisionOptions,
@@ -179,4 +171,13 @@ async fn amend_revision_impl(
     event::metadata::send(&amended_metadata);
 
     Ok(signature)
+}
+
+/// Boxed version of [`amend_revision`] for cross-crate use.
+pub fn amend_revision_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: AmendRevisionOptions,
+) -> crate::BoxFuture<'_, Result<Hash, AmendRevisionError>> {
+    Box::pin(amend_revision(repository, token, options))
 }

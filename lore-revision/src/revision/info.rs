@@ -170,7 +170,7 @@ pub struct InfoOptions {
 /// A revision naming metadata that cannot be read is reported without the branch, date and
 /// message that blob carries, and warned about, rather than leaving those fields silently
 /// empty.
-pub async fn info(
+pub(crate) async fn info(
     repository: Arc<RepositoryContext>,
     options: InfoOptions,
 ) -> Result<(), InfoError> {
@@ -332,4 +332,12 @@ pub async fn info(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`info`] for cross-crate use.
+pub fn info_boxed(
+    repository: Arc<RepositoryContext>,
+    options: InfoOptions,
+) -> crate::BoxFuture<'static, Result<(), InfoError>> {
+    Box::pin(info(repository, options))
 }

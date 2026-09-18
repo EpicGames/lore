@@ -1,5 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+
+use std::future::Future;
+use std::pin::Pin;
+
+/// Boxed future for external API boundaries.
+///
+/// Used to reduce monomorphization pressure at crate boundaries by erasing
+/// the concrete future type behind a trait object.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 pub mod anchor;
 pub mod auth;
 pub mod branch;

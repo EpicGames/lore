@@ -165,13 +165,9 @@ mod tests {
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
             };
-            Box::pin(commit::commit(
-                self.repository.clone(),
-                &self.write_token,
-                options,
-            ))
-            .await
-            .expect("Failed to commit revision")
+            commit::commit_boxed(self.repository.clone(), &self.write_token, options)
+                .await
+                .expect("Failed to commit revision")
         }
 
         /// Convenience: stage and commit in one step.
@@ -225,7 +221,7 @@ mod tests {
             // create::create stores the new branch as the current
             // anchor branch — read it back so callers can address it.
             let (_revision, branch_id) =
-                lore_revision::instance::load_current_anchor(&self.repository)
+                lore_revision::instance::load_current_anchor_boxed(&self.repository)
                     .await
                     .expect("Failed to load current anchor after branch create");
             branch_id

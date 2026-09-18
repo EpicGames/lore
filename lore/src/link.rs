@@ -174,7 +174,7 @@ async fn remove_impl(
         RelativePath::new_from_user_path(repository.require_path()?, args.link_path.as_str())
             .forward::<LinkError>("resolving link path")?;
 
-    lore_revision::link::remove::remove(repository, token, link_path).await
+    lore_revision::link::remove::remove_boxed(repository, token, link_path).await
 }
 
 /// Arguments for listing all linked repositories in the current repository.
@@ -276,7 +276,7 @@ async fn info_local(
             )
             .forward::<LinkError>("resolving link path")?;
 
-            lore_revision::link::info::info(repository, link_path).await
+            lore_revision::link::info::info_boxed(repository, link_path).await
         },
     )
     .await
@@ -356,5 +356,5 @@ async fn update_impl(
         RelativePath::new_from_user_path(repository.require_path()?, args.link_path.as_str())
             .forward::<LinkError>("resolving link path")?;
 
-    lore_revision::link::update::update(repository, token, link_path, args.pin.into()).await
+    lore_revision::link::update::update_boxed(repository, token, link_path, args.pin.into()).await
 }

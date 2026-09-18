@@ -354,7 +354,7 @@ pub enum FindOptions {
     Number(u64),
 }
 
-pub async fn find_impl(
+pub(crate) async fn find(
     repository: Arc<RepositoryContext>,
     options: FindOptions,
 ) -> Result<(), FindError> {
@@ -401,4 +401,12 @@ pub async fn find_impl(
             Err(err)
         }
     }
+}
+
+/// Boxed version of [`find`] for cross-crate use.
+pub fn find_boxed(
+    repository: Arc<RepositoryContext>,
+    options: FindOptions,
+) -> crate::BoxFuture<'static, Result<(), FindError>> {
+    Box::pin(find(repository, options))
 }

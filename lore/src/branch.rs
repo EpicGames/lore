@@ -172,7 +172,7 @@ async fn info_local(
                     .forward::<lore_revision::branch::info::InfoError>("resolving link path")?
             };
 
-            lore_revision::branch::info::info(repository, branch_name).await
+            lore_revision::branch::info::info_boxed(repository, branch_name).await
         }
     })
     .await
@@ -934,7 +934,7 @@ async fn push_impl(
     // Push is never local
     repository.set_disable_upload(false);
 
-    lore_revision::branch::push::push(repository, token, options).await
+    lore_revision::branch::push::push_boxed(repository, token, options).await
 }
 
 #[repr(C)]
@@ -1213,7 +1213,7 @@ async fn archive_impl(
     // Make sure branch is not current
     let mut local_current = false;
     if let Ok((_revision, current_branch)) =
-        lore_revision::instance::load_current_anchor(&repository).await
+        lore_revision::instance::load_current_anchor_boxed(&repository).await
         && current_branch == branch.id
     {
         lore_error!("Cannot archive the current branch");
@@ -1518,11 +1518,12 @@ async fn resolve_branch_id_or_current(
     branch: &str,
 ) -> Result<BranchId, BranchMetadataError> {
     if branch.is_empty() {
-        let (_revision, current_branch) = lore_revision::instance::load_current_anchor(&repository)
-            .await
-            .map_err(|_err| lore_base::error::InvalidArguments {
-                reason: "no current branch to operate on; specify --branch".into(),
-            })?;
+        let (_revision, current_branch) =
+            lore_revision::instance::load_current_anchor_boxed(&repository)
+                .await
+                .map_err(|_err| lore_base::error::InvalidArguments {
+                    reason: "no current branch to operate on; specify --branch".into(),
+                })?;
         return Ok(current_branch);
     }
 
@@ -1565,7 +1566,7 @@ async fn metadata_get_local(
                 let branch_id =
                     resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
-                lore_revision::metadata::branch::get(
+                lore_revision::metadata::branch::get_boxed(
                     repository,
                     branch_id,
                     key.as_deref(),
@@ -1653,7 +1654,8 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    lore_revision::metadata::branch::set(repository, branch_id, &keys, &values, &formats).await
+    lore_revision::metadata::branch::set_boxed(repository, branch_id, &keys, &values, &formats)
+        .await
 }
 
 #[repr(C)]
@@ -1694,7 +1696,7 @@ async fn metadata_clear_local(
                     resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
                 let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                lore_revision::metadata::branch::clear(repository, branch_id, &key_refs).await
+                lore_revision::metadata::branch::clear_boxed(repository, branch_id, &key_refs).await
             }
         },
     )

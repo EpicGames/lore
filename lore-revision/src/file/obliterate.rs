@@ -100,7 +100,7 @@ impl EventError for ObliterateError {
     }
 }
 
-pub async fn obliterate_file(
+pub(crate) async fn obliterate_file(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     path: String,
@@ -185,7 +185,16 @@ pub async fn obliterate_file(
     Ok(())
 }
 
-pub async fn obliterate_address(
+/// Boxed version of [`obliterate_file`] for cross-crate use.
+pub fn obliterate_file_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    path: String,
+) -> crate::BoxFuture<'_, Result<(), ObliterateError>> {
+    Box::pin(obliterate_file(repository, token, path))
+}
+
+pub(crate) async fn obliterate_address(
     repository: Arc<RepositoryContext>,
     address: Address,
 ) -> Result<(), ObliterateError> {
@@ -218,4 +227,12 @@ pub async fn obliterate_address(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`obliterate_address`] for cross-crate use.
+pub fn obliterate_address_boxed(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+) -> crate::BoxFuture<'static, Result<(), ObliterateError>> {
+    Box::pin(obliterate_address(repository, address))
 }

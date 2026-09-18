@@ -550,7 +550,7 @@ pub async fn resolve_revision_number(
         return Ok(signature);
     }
 
-    revision::resolve(
+    revision::resolve_boxed(
         repository.clone(),
         format!("{branch}@{revision_number}"),
         ResolveSearchLocation::Local,

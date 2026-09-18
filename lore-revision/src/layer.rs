@@ -833,7 +833,7 @@ pub struct StagedLayerInfo {
 ///
 /// Mirrors `link::list::list_staged` for use by the CLI's per-layer message
 /// prompt.
-pub async fn list_staged(
+pub(crate) async fn list_staged(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<StagedLayerInfo>, LayerError> {
     let layers = list(repository.clone()).await?;
@@ -879,6 +879,13 @@ pub async fn list_staged(
         result.push(info);
     }
     Ok(result)
+}
+
+/// Boxed version of [`list_staged`] for cross-crate use.
+pub fn list_staged_boxed(
+    repository: Arc<RepositoryContext>,
+) -> crate::BoxFuture<'static, Result<Vec<StagedLayerInfo>, LayerError>> {
+    Box::pin(list_staged(repository))
 }
 
 pub async fn sync(

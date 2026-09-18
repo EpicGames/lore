@@ -214,7 +214,7 @@ async fn load_remote_latest(repository: Arc<RepositoryContext>, branch: BranchId
     }
 }
 
-pub async fn history(
+pub(crate) async fn history(
     repository: Arc<RepositoryContext>,
     options: HistoryOptions,
 ) -> Result<(), RevisionHistoryError> {
@@ -307,4 +307,12 @@ pub async fn history(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`history`] for cross-crate use.
+pub fn history_boxed(
+    repository: Arc<RepositoryContext>,
+    options: HistoryOptions,
+) -> crate::BoxFuture<'static, Result<(), RevisionHistoryError>> {
+    Box::pin(history(repository, options))
 }

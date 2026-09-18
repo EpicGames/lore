@@ -23,7 +23,7 @@ use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
-pub async fn info(
+pub(crate) async fn info(
     repository: Arc<RepositoryContext>,
     link_path: RelativePath,
 ) -> Result<(), LinkError> {
@@ -152,6 +152,14 @@ pub async fn info(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`info`] for cross-crate use.
+pub fn info_boxed(
+    repository: Arc<RepositoryContext>,
+    link_path: RelativePath,
+) -> crate::BoxFuture<'static, Result<(), LinkError>> {
+    Box::pin(info(repository, link_path))
 }
 
 /// `None` when the remote is not consulted or unreachable.

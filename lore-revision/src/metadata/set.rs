@@ -78,7 +78,7 @@ impl event::EventError for SetError {
     }
 }
 
-pub async fn set_revision(
+pub(crate) async fn set_revision(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     keys: &[&[u8]],
@@ -206,6 +206,17 @@ pub async fn set_revision(
     event::metadata::send(&metadata);
 
     Ok(())
+}
+
+/// Boxed version of [`set_revision`] for cross-crate use.
+pub fn set_revision_boxed<'a>(
+    repository: Arc<RepositoryContext>,
+    token: &'a RepositoryWriteToken,
+    keys: &'a [&'a [u8]],
+    values: &'a [&'a [u8]],
+    formats: &'a [MetadataType],
+) -> crate::BoxFuture<'a, Result<(), SetError>> {
+    Box::pin(set_revision(repository, token, keys, values, formats))
 }
 
 #[allow(clippy::too_many_arguments)]

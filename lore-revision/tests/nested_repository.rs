@@ -227,11 +227,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     &fixture.write_token,
                     CommitOptions::new("Commit nested directory".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -344,11 +344,11 @@ mod tests {
                     .await
                     .expect("staging the plain directory succeeds");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     fixture.repository.clone(),
                     &fixture.write_token,
                     CommitOptions::new("Commit nested directory".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 

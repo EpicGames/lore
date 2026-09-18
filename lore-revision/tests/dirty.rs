@@ -62,11 +62,11 @@ mod tests {
                 .expect("Stage failed");
 
                 // Commit to create a base revision with the file
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -190,11 +190,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -295,11 +295,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -360,11 +360,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -480,11 +480,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -569,11 +569,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -670,11 +670,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -811,11 +811,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -912,11 +912,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1030,11 +1030,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1132,11 +1132,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1219,11 +1219,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1338,11 +1338,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1446,11 +1446,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1557,11 +1557,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1689,11 +1689,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1804,11 +1804,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1955,11 +1955,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2045,11 +2045,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2096,11 +2096,11 @@ mod tests {
                 .expect("Stage committed.txt failed");
 
                 // Commit — committed.txt should be committed, dirty_only.txt preserved
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Second commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2195,11 +2195,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2240,11 +2240,11 @@ mod tests {
                 .await
                 .expect("Stage nested/committed.txt failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Second commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2350,16 +2350,16 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
                 let (current_revision, _) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Load current anchor failed");
 
@@ -2464,16 +2464,16 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
                 let (current_revision, _) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Load current anchor failed");
 

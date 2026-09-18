@@ -281,7 +281,7 @@ async fn layer_list_staged_local(
         args,
         layer_list_staged,
         move |repository, _args| async move {
-            lore_revision::layer::list_staged(repository).await?;
+            lore_revision::layer::list_staged_boxed(repository).await?;
             Ok::<(), LayerError>(())
         },
     )

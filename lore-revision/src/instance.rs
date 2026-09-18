@@ -579,7 +579,7 @@ pub async fn warn_branch_multiple_instance(
 /// The revision comes from `ANCHOR_CURRENT`, the branch from
 /// `ANCHOR_CURRENT_BRANCH`. If the branch key exists but the revision
 /// is zero, the repository has no revisions yet (fresh repo after create).
-pub async fn load_current_anchor(
+pub(crate) async fn load_current_anchor(
     repository: &Arc<RepositoryContext>,
 ) -> Result<(Hash, BranchId), AnchorError> {
     let (rev_key, rev_key_type) =
@@ -625,6 +625,13 @@ pub async fn load_current_anchor(
     }
 
     Err(AnchorError::internal("anchor branch is missing"))
+}
+
+/// Boxed version of [`load_current_anchor`] for cross-crate use.
+pub fn load_current_anchor_boxed(
+    repository: &Arc<RepositoryContext>,
+) -> crate::BoxFuture<'_, Result<(Hash, BranchId), AnchorError>> {
+    Box::pin(load_current_anchor(repository))
 }
 
 /// Load the staged revision hash for this instance from the mutable store.

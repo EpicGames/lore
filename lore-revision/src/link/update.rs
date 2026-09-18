@@ -26,7 +26,7 @@ use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
-pub async fn update(
+pub(crate) async fn update(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     link_path: RelativePath,
@@ -235,4 +235,14 @@ pub async fn update(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`update`] for cross-crate use.
+pub fn update_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    link_path: RelativePath,
+    pin: Option<String>,
+) -> crate::BoxFuture<'_, Result<(), LinkError>> {
+    Box::pin(update(repository, token, link_path, pin))
 }

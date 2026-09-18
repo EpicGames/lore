@@ -983,7 +983,7 @@ async fn merge_start_link(
             layer_messages: std::collections::HashMap::new(),
             layer: None,
         };
-        let signature = Box::pin(commit::commit(repository, token, commit_options))
+        let signature = commit::commit_boxed(repository, token, commit_options)
             .await
             .forward::<MergeError>("auto-committing merge")?;
         return Ok(signature);
@@ -1686,7 +1686,7 @@ async fn auto_commit_merge(
         layer_messages: std::collections::HashMap::new(),
         layer: None,
     };
-    Box::pin(commit::commit(repository, token, commit_options))
+    commit::commit_boxed(repository, token, commit_options)
         .await
         .forward::<MergeError>("auto-committing merge")
 }

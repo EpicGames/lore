@@ -1569,7 +1569,7 @@ async fn resolve_revision_number(
 /// See [`resolve_in_branch`] for the specifier forms. This reads nothing of the
 /// revision itself, so a caller that only needs the revision does not pay for
 /// the branch it is taken on.
-pub async fn resolve(
+pub(crate) async fn resolve(
     repository: Arc<RepositoryContext>,
     signature: impl AsRef<str>,
     search_location: ResolveSearchLocation,
@@ -1577,6 +1577,16 @@ pub async fn resolve(
     resolve_revision(repository, signature, search_location)
         .await
         .map(|(revision, _named_branch)| revision)
+}
+
+/// Boxed version of [`resolve`] for cross-crate use.
+pub fn resolve_boxed(
+    repository: Arc<RepositoryContext>,
+    signature: impl AsRef<str> + Send,
+    search_location: ResolveSearchLocation,
+) -> crate::BoxFuture<'static, Result<Hash, StateError>> {
+    let signature = signature.as_ref().to_owned();
+    Box::pin(resolve(repository, signature, search_location))
 }
 
 /// Resolves a revision specifier to the revision it names and the branch it is

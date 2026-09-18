@@ -515,37 +515,23 @@ impl Drop for CommitStatsReport {
     }
 }
 
-pub async fn commit(
+/// Boxed version of [`commit_with_metadata`] for cross-crate use, without metadata.
+pub fn commit_boxed(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: CommitOptions,
-) -> Result<Hash, CommitError> {
-    Box::pin(commit_impl(
+) -> crate::BoxFuture<'_, Result<Hash, CommitError>> {
+    commit_with_metadata_boxed(
         repository,
         token,
         options,
         LoreArray::from_vec(Vec::default()),
         LoreArray::from_vec(Vec::default()),
         LoreArray::from_vec(Vec::default()),
-    ))
-    .await
+    )
 }
 
-pub async fn commit_with_metadata(
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    options: CommitOptions,
-    keys: LoreArray<LoreString>,
-    values: LoreArray<LoreString>,
-    formats: LoreArray<LoreMetadataType>,
-) -> Result<Hash, CommitError> {
-    Box::pin(commit_impl(
-        repository, token, options, keys, values, formats,
-    ))
-    .await
-}
-
-pub async fn commit_impl(
+pub(crate) async fn commit_with_metadata(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: CommitOptions,
@@ -871,6 +857,20 @@ pub async fn commit_impl(
     }
 
     Ok(signature)
+}
+
+/// Boxed version of [`commit_with_metadata`] for cross-crate use.
+pub fn commit_with_metadata_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: CommitOptions,
+    keys: LoreArray<LoreString>,
+    values: LoreArray<LoreString>,
+    formats: LoreArray<LoreMetadataType>,
+) -> crate::BoxFuture<'_, Result<Hash, CommitError>> {
+    Box::pin(commit_with_metadata(
+        repository, token, options, keys, values, formats,
+    ))
 }
 
 /// Commits staged changes in a single layer without committing the parent.

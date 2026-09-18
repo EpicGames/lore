@@ -243,7 +243,7 @@ async fn commit_metadata_hash(
 /// is `None`, emits all metadata entries.
 ///
 /// When `local` is true, reads from the local mutable store cache without contacting the remote.
-pub async fn get(
+pub(crate) async fn get(
     repo: Arc<RepositoryContext>,
     key: Option<&str>,
     local: bool,
@@ -266,11 +266,20 @@ pub async fn get(
     Ok(())
 }
 
+/// Boxed version of [`get`] for cross-crate use.
+pub fn get_boxed(
+    repo: Arc<RepositoryContext>,
+    key: Option<&str>,
+    local: bool,
+) -> crate::BoxFuture<'_, Result<(), RepositoryMetadataError>> {
+    Box::pin(get(repo, key, local))
+}
+
 /// Set one or more metadata key-value pairs on the current repository. Always contacts the remote.
 ///
 /// `keys`, `values`, and `formats` must be parallel slices of equal length. For binary values,
 /// the value is treated as a file path whose contents are stored in the immutable store.
-pub async fn set(
+pub(crate) async fn set(
     repo: Arc<RepositoryContext>,
     keys: &[&[u8]],
     values: &[&[u8]],
@@ -367,11 +376,21 @@ pub async fn set(
     Ok(())
 }
 
+/// Boxed version of [`set`] for cross-crate use.
+pub fn set_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    keys: &'a [&'a [u8]],
+    values: &'a [&'a [u8]],
+    formats: &'a [MetadataType],
+) -> crate::BoxFuture<'a, Result<(), RepositoryMetadataError>> {
+    Box::pin(set(repo, keys, values, formats))
+}
+
 /// Remove metadata keys from the current repository. Always contacts the remote.
 ///
 /// If `keys` is non-empty, removes only those keys (rejecting built-in keys). If `keys` is
 /// empty, removes all non-built-in keys.
-pub async fn clear(
+pub(crate) async fn clear(
     repo: Arc<RepositoryContext>,
     keys: &[&str],
 ) -> Result<(), RepositoryMetadataError> {
@@ -421,4 +440,12 @@ pub async fn clear(
     commit_metadata_hash(repo, &metadata, old_hash, new_hash).await?;
 
     Ok(())
+}
+
+/// Boxed version of [`clear`] for cross-crate use.
+pub fn clear_boxed<'a>(
+    repo: Arc<RepositoryContext>,
+    keys: &'a [&'a str],
+) -> crate::BoxFuture<'a, Result<(), RepositoryMetadataError>> {
+    Box::pin(clear(repo, keys))
 }

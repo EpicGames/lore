@@ -147,7 +147,7 @@ mod tests {
         }
 
         async fn commit(&self, message: &str) -> Hash {
-            Box::pin(commit::commit(
+            commit::commit_boxed(
                 self.repository.clone(),
                 &self.write_token,
                 CommitOptions {
@@ -157,7 +157,7 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 },
-            ))
+            )
             .await
             .expect("Failed to commit revision")
         }
@@ -175,7 +175,7 @@ mod tests {
                 .map(|(_, value)| value.as_bytes())
                 .collect();
             let formats = vec![MetadataType::String; SOURCE_KEYS.len()];
-            metadata::set::set_revision(
+            metadata::set::set_revision_boxed(
                 self.repository.clone(),
                 &self.write_token,
                 &keys,
@@ -198,7 +198,7 @@ mod tests {
             .await
             .expect("Failed to create branch");
             let (_revision, branch_id) =
-                lore_revision::instance::load_current_anchor(&self.repository)
+                lore_revision::instance::load_current_anchor_boxed(&self.repository)
                     .await
                     .expect("Failed to load current anchor after branch create");
             branch_id
@@ -424,7 +424,7 @@ mod tests {
                 fixture.switch_to(main_branch, base_revision).await;
                 fixture.delete_file("feature.txt");
 
-                let picked = lore_revision::revision::cherry_pick::cherry_pick(
+                let picked = lore_revision::revision::cherry_pick::cherry_pick_boxed(
                     fixture.repository.clone(),
                     &fixture.write_token,
                     feature_revision,

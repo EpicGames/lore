@@ -170,7 +170,7 @@ mod tests {
         )
         .await
         .expect("Failed to stage the fixture");
-        Box::pin(lore_revision::commit::commit(
+        lore_revision::commit::commit_boxed(
             repository.clone(),
             &fixture.write_token,
             lore_revision::commit::CommitOptions {
@@ -180,7 +180,7 @@ mod tests {
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
             },
-        ))
+        )
         .await
         .expect("Failed to commit the fixture");
     }
