@@ -13,6 +13,7 @@ use lore_storage::StoreMatchResult;
 use lore_transport::quic::storage_service::QueryStatus;
 use tracing::debug;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
@@ -92,6 +93,7 @@ impl Message for Query {
         &self,
         context: Arc<AttributeMap>,
         immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -122,6 +124,10 @@ mod tests {
 
     use super::*;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+    }
     use crate::util::address_with_random_context;
 
     #[tokio::test]
@@ -145,7 +151,7 @@ mod tests {
                     Query {
                         address: Bytes::copy_from_slice(Address { hash, context }.as_bytes()),
                     }
-                    .handle(context_map, immutable_store)
+                    .handle(context_map, immutable_store, allow_all())
                     .await
                     .unwrap()
                 );
@@ -191,7 +197,7 @@ mod tests {
                             address_with_random_context(address).as_bytes()
                         )
                     }
-                    .handle(context_map, immutable_store)
+                    .handle(context_map, immutable_store, allow_all())
                     .await
                     .unwrap()
                 );
@@ -253,7 +259,7 @@ mod tests {
                     Query {
                         address: Bytes::copy_from_slice(address.as_bytes())
                     }
-                    .handle(context_map, immutable_store)
+                    .handle(context_map, immutable_store, allow_all())
                     .await
                     .unwrap()
                 );
@@ -297,7 +303,7 @@ mod tests {
                     Query {
                         address: Bytes::copy_from_slice(address.as_bytes())
                     }
-                    .handle(context_map, immutable_store)
+                    .handle(context_map, immutable_store, allow_all())
                     .await
                     .unwrap()
                 );
@@ -380,7 +386,10 @@ mod tests {
                     LoreResponse::Query(QueryResponse {
                         results: results_clone.values().cloned().collect()
                     }),
-                    message.handle(context_map, immutable_store).await.unwrap()
+                    message
+                        .handle(context_map, immutable_store, allow_all())
+                        .await
+                        .unwrap()
                 );
             })
             .await;

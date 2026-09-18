@@ -34,7 +34,7 @@ import grpc
 import pytest
 from error_types import LoreException
 from grpc_probe import REVISION_INFO, STORAGE_QUERY, call, repository_metadata
-from protobuf_wire import encode_bytes_field
+from protobuf_wire import encode_bytes_field, field_bytes, field_int, parse_fields
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -722,6 +722,79 @@ def test_every_partition_scoped_service_enforces_partition_access(
     assert len(denied_checks) >= len(PARTITION_SCOPED_PROBES) + 1, (
         "every denial must be the online check's verdict: one CheckUserPermission "
         f"per probed service, got {len(denied_checks)}"
+    )
+
+
+STORAGE_COPY = "/lore.storage.v1.StorageService/Copy"
+
+# google.rpc.Code values as `ItemStatus.code` carries them.
+CODE_NOT_FOUND = 5
+CODE_PERMISSION_DENIED = 7
+
+
+def copy_item_code(
+    target: str, destination_hex: str, source_hex: str, token: str
+) -> int:
+    """One item through the v1 Copy stream, reporting its `ItemStatus.code`.
+
+    The destination rides in the metadata (the partition-access layer's
+    check); each item's source rides in its body, and a denied source answers
+    in-band in the item's status with the stream itself OK. A stream-level
+    error (the destination check) folds into the same numeric code so the
+    caller reads one verdict either way."""
+    address = encode_bytes_field(1, b"\x00" * 32) + encode_bytes_field(2, b"\x00" * 16)
+    request = encode_bytes_field(1, bytes.fromhex(source_hex)) + encode_bytes_field(
+        2, address
+    )
+    metadata = repository_metadata(destination_hex) + (
+        ("authorization", f"Bearer {token}"),
+    )
+    with grpc.insecure_channel(target) as channel:
+        invoke = channel.stream_stream(STORAGE_COPY, lambda b: b, lambda b: b)
+        stream = invoke(iter([request]), metadata=metadata, timeout=10.0)
+        try:
+            item = next(stream)
+        except grpc.RpcError as error:
+            return error.code().value[0]
+    return field_int(parse_fields(field_bytes(parse_fields(item), 3)), 1)
+
+
+@pytest.mark.smoke
+def test_cross_partition_copy_requires_a_source_grant(auth_env):
+    """Cross-partition copy authorizes its *source* partition per item: an
+    access token granting the destination alone is denied, and one granting
+    both partitions reaches the store — which answers NOT_FOUND for the absent
+    address, proving the denial above was the missing grant rather than the
+    missing fragment. Both verdicts come from the token's own `resources`
+    claim: no CheckUserPermission rule is scripted, and the stub's records
+    prove nothing asked for one."""
+    mock = auth_env.mock
+    target = grpc_target(auth_env.remote_url)
+    destination = uuid.uuid4().hex
+    source = uuid.uuid4().hex
+
+    destination_only = mock.mint_token(
+        USER1, resources=authz_resources(f"urc-{destination}")
+    )
+    both = mock.mint_token(
+        USER1,
+        resources=authz_resources(f"urc-{destination}")
+        + authz_resources(f"urc-{source}"),
+    )
+
+    denied = copy_item_code(target, destination, source, destination_only)
+    assert denied == CODE_PERMISSION_DENIED, (
+        f"a source the caller holds no grant for must be denied, got code {denied}"
+    )
+
+    granted = copy_item_code(target, destination, source, both)
+    assert granted == CODE_NOT_FOUND, (
+        f"a granted source must pass the check and reach the store, got code {granted}"
+    )
+
+    assert not mock.requests_for("CheckUserPermission"), (
+        "both verdicts must come from the access token's resources claim, "
+        "not an online check"
     )
 
 

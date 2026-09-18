@@ -118,8 +118,12 @@ mod tests {
                 .await
                 .expect("Direct put should succeed");
 
-            let service =
-                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            );
 
             let v1_address: model_v1::Address = address.into();
             let other_v1_address: model_v1::Address = other_address.into();
@@ -150,8 +154,12 @@ mod tests {
             test_store_create().await.expect("Failed to create store");
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-            let service =
-                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            );
 
             let query_request = storage_v1::QueryRequest { addresses: vec![] };
             let request = Request::new(query_request);
@@ -204,8 +212,12 @@ mod tests {
                 .await
                 .expect("Put fragment 2 should succeed");
 
-            let service =
-                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            );
 
             let v1_addr1: model_v1::Address = address1.into();
             let v1_addr2: model_v1::Address = address2.into();

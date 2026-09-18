@@ -22,6 +22,7 @@ use tracing::info;
 use tracing::warn;
 use zerocopy::IntoBytes;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -216,6 +217,7 @@ impl Message for Get {
         &self,
         context: Arc<AttributeMap>,
         immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -257,6 +259,7 @@ impl Message for GetMetadata {
         &self,
         context: Arc<AttributeMap>,
         immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -296,6 +299,10 @@ mod tests {
 
     use super::*;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+    }
 
     impl From<&Get> for Vec<u8> {
         fn from(value: &Get) -> Self {
@@ -363,7 +370,10 @@ mod tests {
                         },
                         payload: payload.clone(),
                     }),
-                    message.handle(context_map, immutable_store).await.unwrap()
+                    message
+                        .handle(context_map, immutable_store, allow_all())
+                        .await
+                        .unwrap()
                 );
             })
             .await;
@@ -403,7 +413,10 @@ mod tests {
                     .await
                     .expect("Failed to put immutable data in store");
 
-                let response = message.handle(context_map, immutable_store).await.unwrap();
+                let response = message
+                    .handle(context_map, immutable_store, allow_all())
+                    .await
+                    .unwrap();
                 let LoreResponse::Get(GetResponse { fragment, payload }) = response else {
                     panic!("Expected GetResponse variant");
                 };
@@ -434,7 +447,9 @@ mod tests {
             test_store_create().await.expect("Failed to create stores");
         LORE_CONTEXT
             .scope(execution.clone(), async move {
-                let response = message.handle(context_map, immutable_store).await;
+                let response = message
+                    .handle(context_map, immutable_store, allow_all())
+                    .await;
                 assert!(matches!(
                     response,
                     Err(MessageHandleError::FragmentNotFound)

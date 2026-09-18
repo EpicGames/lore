@@ -25,6 +25,7 @@ use smallvec::SmallVec;
 use tracing::debug;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -319,6 +320,7 @@ impl Message for Put {
         &self,
         context: Arc<AttributeMap>,
         immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -358,6 +360,10 @@ mod tests {
 
     use super::*;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+    }
 
     fn mock_message() -> Put {
         let (fragment, address, payload) = fragment::generate_random();
@@ -461,7 +467,10 @@ mod tests {
 
         assert_eq!(
             LoreResponse::Put(PutResponse::default()),
-            message.handle(context, immutable_store).await.unwrap()
+            message
+                .handle(context, immutable_store, allow_all())
+                .await
+                .unwrap()
         );
     }
 
@@ -478,7 +487,7 @@ mod tests {
         let (immutable_store, _mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
 
-        match message.handle(context, immutable_store).await {
+        match message.handle(context, immutable_store, allow_all()).await {
             Err(MessageHandleError::HashMismatch) => (),
             Err(e) => panic!("Expected hash mismatch error, but got {e:?}"),
             _ => panic!("Expected hash mismatch error"),

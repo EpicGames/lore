@@ -13,7 +13,9 @@ use lore_storage::ImmutableStore;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -74,17 +76,15 @@ impl Copy {
     }
 }
 
-/// Source-repo authorization check for v4 sessions.
-/// When `session_map` is provided (v4 path), checks that the source repository has been
-/// authorized (had at least one session started) on this connection.
-/// When `None` (urc/0.2 path), uses the legacy `AuthorizationToken` check.
+/// Performs the copy itself; the caller has already authorized the source
+/// partition (each transport's dispatch asks the shared authorizer with its
+/// own caller's token).
 ///
 /// `destination_context` selects the destination tuple's dedup tag — destination address is
 /// `(destination_repository, source_address.hash, destination_context)`. Legacy urc/0.2 callers
 /// pass the source's context so behavior is unchanged; lore-storage/0.4 callers can pass a
 /// different context to perform in-partition or cross-partition duplication without payload
 /// transfer.
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_copy(
     source_repository: RepositoryId,
     source_address: Address,
@@ -92,17 +92,8 @@ pub async fn handle_copy(
     destination_context: Context,
     correlation_id: String,
     user_id: String,
-    session_map: Option<&crate::protocol::storage::session::SessionMap>,
     immutable_store: Arc<dyn ImmutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
-    if let Some(session_map) = session_map
-        && !session_map.is_repository_authorized(source_repository)
-    {
-        return Err(MessageHandleError::AuthorizationFailure(
-            "source repository not authorized".to_string(),
-        ));
-    }
-
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     LORE_CONTEXT
@@ -135,13 +126,29 @@ impl Message for Copy {
         &self,
         context: Arc<AttributeMap>,
         immutable_store: Arc<dyn ImmutableStore>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let destination_repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
 
-        if let Some(token) = context.get::<AuthorizationToken>() {
-            verify_authorization(&token, self.source_repository)
-                .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+        // Cross-partition copy needs to verify also the source partition authorization.
+        // In-partition copies are authorized by the connection.
+        if self.source_repository != destination_repository {
+            let raw = context.get::<RawToken>();
+            let claims = context.get::<AuthorizationToken>();
+            let token = match (raw.as_deref(), claims.as_deref()) {
+                (Some(raw), Some(claims)) => Some(VerifiedToken {
+                    raw: &raw.0,
+                    claims,
+                }),
+                _ => None,
+            };
+            repository_authorizer
+                .check_repository_access(token.as_ref(), self.source_repository, None)
+                .await
+                .map_err(|status| {
+                    MessageHandleError::AuthorizationFailure(status.message().to_string())
+                })?;
         }
 
         let user_id = get_user_id_from_context(&context);
@@ -156,7 +163,6 @@ impl Message for Copy {
             self.target_context,
             correlation_id.to_string(),
             user_id,
-            None, // urc/0.2 path: no SessionMap, auth check done above via AuthorizationToken
             immutable_store,
         )
         .await
@@ -187,7 +193,48 @@ mod tests {
 
     use super::*;
     use crate::auth::jwt::ResourcePermission;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
+
+    /// Grants exactly the partitions it was built with, whatever the token —
+    /// the claim-tier shape for a caller holding some partitions and not
+    /// others.
+    struct FixedPartitionsAuthorizer(Vec<RepositoryId>);
+
+    #[async_trait]
+    impl RepositoryAuthorizer for FixedPartitionsAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            repository_id: RepositoryId,
+            _action: Option<&str>,
+        ) -> Result<(), tonic::Status> {
+            if self.0.contains(&repository_id) {
+                Ok(())
+            } else {
+                Err(tonic::Status::permission_denied(
+                    "Not permitted for resource",
+                ))
+            }
+        }
+    }
+
+    /// Both halves of a verified token, as connect inserts them, with a
+    /// `resources` claim granting `resource_id`.
+    fn insert_verified_token(context: &AttributeMap, resource_id: &str) {
+        context.insert(RawToken("raw.jwt".to_string()));
+        context.insert(AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: resource_id.to_string(),
+                permission: vec![],
+            }]),
+            ..Default::default()
+        });
+    }
 
     /// A mock `ImmutableStore` whose `copy` method returns an `AddressNotFound` error.
     struct MockCopyFailStore;
@@ -448,7 +495,10 @@ mod tests {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                match message.handle(context_map, immutable_store).await {
+                match message
+                    .handle(context_map, immutable_store, allow_all())
+                    .await
+                {
                     Err(MessageHandleError::NotConnected) => (),
                     Err(e) => panic!("Expected NotConnected error, got {e:?}"),
                     Ok(_) => panic!("Expected NotConnected error, got Ok"),
@@ -464,27 +514,129 @@ mod tests {
         let destination_repository = random::<RepositoryId>();
         let context_map = Arc::new(AttributeMap::default());
         context_map.insert(destination_repository);
-
-        // Token that only permits a fixed, different repository — not the source_repository
-        let token = AuthorizationToken {
-            resources: Some(vec![ResourcePermission {
-                resource_id: "urc-00000000000000000000000000000000".to_string(),
-                permission: vec![],
-            }]),
-            ..Default::default()
-        };
-        context_map.insert(token);
+        insert_verified_token(&context_map, "urc-00000000000000000000000000000000");
 
         let (immutable_store, _mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
         LORE_CONTEXT
             .scope(execution, async move {
-                match message.handle(context_map, immutable_store).await {
+                // The caller holds only the destination — the cross-partition
+                // shape this check exists for.
+                let authorizer: Arc<dyn RepositoryAuthorizer> =
+                    Arc::new(FixedPartitionsAuthorizer(vec![destination_repository]));
+                match message
+                    .handle(context_map, immutable_store, authorizer)
+                    .await
+                {
                     Err(MessageHandleError::AuthorizationFailure(_)) => (),
                     Err(e) => panic!("Expected AuthorizationFailure error, got {e:?}"),
                     Ok(_) => panic!("Expected AuthorizationFailure error, got Ok"),
                 }
+            })
+            .await;
+    }
+
+    /// An in-partition copy — the dedup hot path — never asks the
+    /// authorizer: connect already answered for the partition. Proven by
+    /// pairing it with an authorizer that denies everything.
+    #[tokio::test]
+    async fn test_handle_in_partition_copy_skips_the_authorizer() {
+        let message = make_copy_message();
+
+        let context_map = Arc::new(AttributeMap::default());
+        context_map.insert(message.source_repository);
+
+        let store: Arc<dyn ImmutableStore> = Arc::new(MockCopySuccessStore);
+        let (_unused_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let deny_all: Arc<dyn RepositoryAuthorizer> =
+                    Arc::new(FixedPartitionsAuthorizer(vec![]));
+                match message.handle(context_map, store, deny_all).await {
+                    Ok(LoreResponse::Copy(_)) => (),
+                    other => panic!("Expected Copy response, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// A granted source passes the same authorizer that denies an ungranted
+    /// one, so the denial above is the check and not a broken wiring.
+    #[tokio::test]
+    async fn test_handle_source_grant_permits() {
+        let message = make_copy_message();
+
+        let destination_repository = random::<RepositoryId>();
+        let context_map = Arc::new(AttributeMap::default());
+        context_map.insert(destination_repository);
+        insert_verified_token(&context_map, "urc-00000000000000000000000000000000");
+
+        let store: Arc<dyn ImmutableStore> = Arc::new(MockCopySuccessStore);
+        let (_unused_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let authorizer: Arc<dyn RepositoryAuthorizer> =
+                    Arc::new(FixedPartitionsAuthorizer(vec![
+                        destination_repository,
+                        message.source_repository,
+                    ]));
+                match message.handle(context_map, store, authorizer).await {
+                    Ok(LoreResponse::Copy(_)) => (),
+                    other => panic!("Expected Copy response, got {other:?}"),
+                }
+            })
+            .await;
+    }
+
+    /// Legacy-tier shape: `AuthClientAuthorizer` answers an access token's
+    /// `resources` claim in place, so the source grant must name the source
+    /// partition. The URL points nowhere — reaching for the network here
+    /// would error, proving the claim decided.
+    #[tokio::test]
+    async fn test_handle_source_check_on_the_legacy_tier() {
+        let destination_repository = random::<RepositoryId>();
+
+        let run = |resource_id: String| {
+            let message = make_copy_message();
+            let context_map = Arc::new(AttributeMap::default());
+            context_map.insert(destination_repository);
+            insert_verified_token(&context_map, &resource_id);
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(
+                crate::authnz::repository_authorizer::AuthClientAuthorizer::new(
+                    "https://auth.invalid".to_string(),
+                ),
+            );
+            let store: Arc<dyn ImmutableStore> = Arc::new(MockCopySuccessStore);
+            async move {
+                (
+                    message.handle(context_map, store, authorizer).await,
+                    message.source_repository,
+                )
+            }
+        };
+
+        let (_unused_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                // A claim granting some other partition denies the source.
+                let (denied, _) = run("urc-00000000000000000000000000000000".to_string()).await;
+                assert!(
+                    matches!(denied, Err(MessageHandleError::AuthorizationFailure(_))),
+                    "expected AuthorizationFailure, got {denied:?}"
+                );
+
+                // A wildcard grant reaches every source, as everywhere else.
+                let (permitted, _) = run("urc-*".to_string()).await;
+                assert!(
+                    matches!(permitted, Ok(LoreResponse::Copy(_))),
+                    "expected Copy response, got {permitted:?}"
+                );
             })
             .await;
     }
@@ -504,7 +656,7 @@ mod tests {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                match message.handle(context_map, store).await {
+                match message.handle(context_map, store, allow_all()).await {
                     Err(MessageHandleError::FragmentNotFound) => (),
                     Err(e) => panic!("Expected FragmentNotFound error, got {e:?}"),
                     Ok(_) => panic!("Expected FragmentNotFound error, got Ok"),
@@ -528,7 +680,7 @@ mod tests {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                match message.handle(context_map, store).await {
+                match message.handle(context_map, store, allow_all()).await {
                     Ok(LoreResponse::Copy(resp)) => {
                         assert_eq!(resp, CopyResponse::default());
                     }
@@ -603,7 +755,10 @@ mod tests {
 
                 // First copy — must return LoreResponse::Copy (R1/R2/R3)
                 let store_dyn: Arc<dyn ImmutableStore> = store.clone();
-                match copy_message.handle(context_map.clone(), store_dyn).await {
+                match copy_message
+                    .handle(context_map.clone(), store_dyn, allow_all())
+                    .await
+                {
                     Ok(LoreResponse::Copy(resp)) => {
                         assert_eq!(
                             resp,
@@ -633,7 +788,10 @@ mod tests {
 
                 // Second copy call — idempotency (R6)
                 let store_dyn: Arc<dyn ImmutableStore> = store.clone();
-                match copy_message.handle(context_map, store_dyn).await {
+                match copy_message
+                    .handle(context_map, store_dyn, allow_all())
+                    .await
+                {
                     Ok(LoreResponse::Copy(resp)) => {
                         assert_eq!(
                             resp,
@@ -699,7 +857,10 @@ mod tests {
 
                 for call_number in 1..=2 {
                     let store_dyn: Arc<dyn ImmutableStore> = store.clone();
-                    match copy_message.handle(context_map.clone(), store_dyn).await {
+                    match copy_message
+                        .handle(context_map.clone(), store_dyn, allow_all())
+                        .await
+                    {
                         Ok(LoreResponse::Copy(_)) => {}
                         Ok(other) => {
                             panic!("Call {call_number}: expected LoreResponse::Copy, got {other:?}")
@@ -753,7 +914,10 @@ mod tests {
                 };
 
                 let store_dyn: Arc<dyn ImmutableStore> = store;
-                match copy_message.handle(context_map, store_dyn).await {
+                match copy_message
+                    .handle(context_map, store_dyn, allow_all())
+                    .await
+                {
                     Err(MessageHandleError::FragmentNotFound) => {}
                     Err(e) => panic!("Expected FragmentNotFound, got {e:?}"),
                     Ok(_) => panic!("Expected FragmentNotFound error, got Ok"),
@@ -818,7 +982,10 @@ mod tests {
                     target_context: address1.context,
                 };
                 let store_dyn: Arc<dyn ImmutableStore> = store.clone();
-                match msg1.handle(context_map.clone(), store_dyn).await {
+                match msg1
+                    .handle(context_map.clone(), store_dyn, allow_all())
+                    .await
+                {
                     Ok(LoreResponse::Copy(_)) => {}
                     other => panic!("Item 1: expected success, got {other:?}"),
                 }
@@ -834,7 +1001,10 @@ mod tests {
                     target_context: missing_address.context,
                 };
                 let store_dyn: Arc<dyn ImmutableStore> = store.clone();
-                match msg2.handle(context_map.clone(), store_dyn).await {
+                match msg2
+                    .handle(context_map.clone(), store_dyn, allow_all())
+                    .await
+                {
                     Err(MessageHandleError::FragmentNotFound) => {}
                     other => panic!("Item 2: expected FragmentNotFound, got {other:?}"),
                 }
@@ -846,7 +1016,10 @@ mod tests {
                     target_context: address2.context,
                 };
                 let store_dyn: Arc<dyn ImmutableStore> = store.clone();
-                match msg3.handle(context_map.clone(), store_dyn).await {
+                match msg3
+                    .handle(context_map.clone(), store_dyn, allow_all())
+                    .await
+                {
                     Ok(LoreResponse::Copy(_)) => {}
                     other => panic!("Item 3: expected success after previous error, got {other:?}"),
                 }

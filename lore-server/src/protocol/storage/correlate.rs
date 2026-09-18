@@ -10,6 +10,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::LoreResponse;
@@ -54,6 +55,7 @@ impl Message for Correlate {
         &self,
         context: Arc<AttributeMap>,
         _immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let correlation_id = match self.correlation_id.as_ref() {
             Some(correlation_id) => {
@@ -110,6 +112,10 @@ mod tests {
 
     use super::*;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+    }
 
     #[test]
     fn test_parse() {
@@ -173,7 +179,7 @@ mod tests {
             test_store_create().await.expect("Failed to create stores");
 
         let response = message
-            .handle(context.clone(), immutable_store)
+            .handle(context.clone(), immutable_store, allow_all())
             .await
             .unwrap();
         assert_eq!(
@@ -209,7 +215,7 @@ mod tests {
                 correlation_id: correlation_id.clone()
             }),
             message
-                .handle(context.clone(), immutable_store)
+                .handle(context.clone(), immutable_store, allow_all())
                 .await
                 .unwrap()
         );
@@ -235,7 +241,7 @@ mod tests {
                 correlation_id: correlation_id.to_string()
             }),
             message
-                .handle(context.clone(), immutable_store)
+                .handle(context.clone(), immutable_store, allow_all())
                 .await
                 .unwrap()
         );
@@ -258,7 +264,7 @@ mod tests {
             test_store_create().await.expect("Failed to create stores");
 
         match message
-            .handle(context.clone(), immutable_store)
+            .handle(context.clone(), immutable_store, allow_all())
             .await
             .unwrap()
         {

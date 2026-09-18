@@ -20,6 +20,8 @@ use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -90,8 +92,6 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
 
 pub struct StorageServiceV4 {
     jwt_verifier: Arc<Option<JwtVerifier>>,
-    // TODO(UCS-23410): read by the partition check at session start.
-    #[allow(dead_code)]
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -191,6 +191,8 @@ impl QuicService for StorageServiceV4 {
                 auth_token,
             } => {
                 let mut user_id = String::new();
+                let mut grants = None;
+                let mut token = None;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
@@ -208,14 +210,24 @@ impl QuicService for StorageServiceV4 {
                         .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
-                    crate::auth::jwt::verify_authorization(&authorization, repository)
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                    let verified = VerifiedToken {
+                        raw: &token_str,
+                        claims: &authorization,
+                    };
+                    grants = self
+                        .repository_authorizer
+                        .granted_access(Some(&verified), repository)
+                        .await
+                        .map_err(|status| {
+                            MessageHandleError::AuthorizationFailure(status.message().to_string())
+                        })?;
+                    token = Some(Arc::new(verified.owned()));
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id) {
+                match session_map.start(repository, correlation_id, user_id, grants, token) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -256,6 +268,8 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
+                let token = session.token.clone();
+                let authorized_sources = session.authorized_sources.clone();
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -316,6 +330,31 @@ impl QuicService for StorageServiceV4 {
                         .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::Copy(copy) => {
+                        // The destination was checked at this session's start;
+                        // a cross-partition source is this command's own
+                        // question, asked with this session's token — another
+                        // session's authorization on the connection must not
+                        // vouch for it. A source this session's token already
+                        // cleared is remembered, so a repeated copy from it
+                        // skips the check.
+                        if copy.source_repository != repository
+                            && !authorized_sources.contains(&copy.source_repository)
+                        {
+                            let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
+                            self.repository_authorizer
+                                .check_repository_access(
+                                    verified.as_ref(),
+                                    copy.source_repository,
+                                    None,
+                                )
+                                .await
+                                .map_err(|status| {
+                                    MessageHandleError::AuthorizationFailure(
+                                        status.message().to_string(),
+                                    )
+                                })?;
+                            authorized_sources.insert(copy.source_repository);
+                        }
                         handle_copy(
                             copy.source_repository,
                             copy.source_address,
@@ -323,7 +362,6 @@ impl QuicService for StorageServiceV4 {
                             copy.target_context,
                             correlation_id,
                             user_id,
-                            Some(&session_map),
                             self.immutable_store.clone(),
                         )
                         .await
@@ -649,5 +687,301 @@ mod tests {
         assert_eq!(error_info.message_handle_label, "SessionLimitReached");
         assert!(!error_info.is_internal_error);
         assert!(!error_info.is_appropriate_for_logging);
+    }
+
+    mod authorized_session {
+        use std::ops::Add;
+        use std::time::Duration;
+        use std::time::SystemTime;
+        use std::time::UNIX_EPOCH;
+
+        use jsonwebtoken::Algorithm;
+        use jsonwebtoken::DecodingKey;
+        use jsonwebtoken::EncodingKey;
+        use jsonwebtoken::Header;
+        use jsonwebtoken::encode;
+
+        use super::*;
+        use crate::auth::jwk::JWKService;
+        use crate::auth::jwk::JWKServiceError;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::auth::jwt::JwtVerifier;
+        use crate::auth::jwt::ResourcePermission;
+        use crate::authnz::repository_authorizer::AuthClientAuthorizer;
+
+        const ALGORITHM: Algorithm = Algorithm::HS256;
+        const SIGNING_SECRET: &str = "storage-v4-test-secret";
+        const TEST_AUDIENCE: &str = "lore-test";
+
+        mockall::mock! {
+            TestJWKService {}
+
+            #[async_trait]
+            impl JWKService for TestJWKService {
+                async fn get_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
+
+                fn get_cached_key(
+                    &self,
+                    kid: &str,
+                ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
+
+                async fn refresh_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
+            }
+        }
+
+        fn verifier() -> JwtVerifier {
+            let mut jwk_service = MockTestJWKService::new();
+            jwk_service
+                .expect_get_key()
+                .returning(|_| Ok((DecodingKey::from_secret(SIGNING_SECRET.as_ref()), ALGORITHM)));
+            JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            }
+        }
+
+        fn signed_token(resource_ids: &[&str], permissions: &[&str]) -> String {
+            let claims = AuthorizationToken {
+                user_id: "test-user".to_string(),
+                issuer: "test-issuer".to_string(),
+                issued_at: 1,
+                audience: vec![TEST_AUDIENCE.to_string()],
+                expires: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .add(Duration::from_secs(60))
+                    .as_secs(),
+                resources: Some(
+                    resource_ids
+                        .iter()
+                        .map(|resource_id| ResourcePermission {
+                            resource_id: (*resource_id).to_string(),
+                            permission: permissions.iter().map(ToString::to_string).collect(),
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            };
+            let mut header = Header::new(ALGORITHM);
+            header.kid = Some("test-kid".to_string());
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_secret(SIGNING_SECRET.as_ref()),
+            )
+            .unwrap()
+        }
+
+        async fn authenticated_service() -> StorageServiceV4 {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("Failed to create stores");
+            StorageServiceV4::new(
+                Arc::new(Some(verifier())),
+                Arc::new(AuthClientAuthorizer::new(
+                    "https://auth.invalid".to_string(),
+                )),
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(UserAgentFilter::default()),
+            )
+        }
+
+        async fn start_session(
+            service: &StorageServiceV4,
+            repository: lore_revision::lore::RepositoryId,
+            token: &str,
+        ) -> Result<u32, MessageHandleError> {
+            let response = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStart {
+                        repository,
+                        correlation_id: "corr".to_string(),
+                        auth_token: token.as_bytes().to_vec(),
+                    },
+                )
+                .await?;
+            Ok(u32::from_le_bytes(response[0][..4].try_into().unwrap()))
+        }
+
+        /// A granted session stores the enumerated grants and the verified
+        /// token, so a per-operation action check answers from the session.
+        #[tokio::test]
+        async fn session_start_stores_grants_and_token() {
+            let service = authenticated_service().await;
+            let repository = random::<lore_revision::lore::RepositoryId>();
+            let token = signed_token(&[&format!("urc-{repository}")], &["read", "migrate"]);
+
+            let session_id = start_session(&service, repository, &token).await.unwrap();
+
+            let session = service.session_map.get(session_id).unwrap();
+            assert_eq!(session.token.as_ref().unwrap().raw, token);
+            assert!(
+                session
+                    .permits(&*service.repository_authorizer, "migrate")
+                    .await
+            );
+            assert!(
+                !session
+                    .permits(&*service.repository_authorizer, "obliterate")
+                    .await
+            );
+        }
+
+        fn copy_command(
+            session_id: u32,
+            source: lore_revision::lore::RepositoryId,
+        ) -> ParsedStorageRequestV4 {
+            use zerocopy::IntoBytes;
+            let mut payload = bytes::BytesMut::with_capacity(80);
+            payload.extend_from_slice(source.as_bytes());
+            payload.extend_from_slice(&[0u8; 32]); // hash
+            payload.extend_from_slice(&[0u8; 16]); // source context
+            payload.extend_from_slice(&[0u8; 16]); // target context
+            ParsedStorageRequestV4::StorageCommand {
+                session_id,
+                opcode: Command::Copy as u8,
+                payload: payload.freeze(),
+            }
+        }
+
+        /// One connection, two sessions with different credentials: the
+        /// destination session's own token decides the copy source, so a
+        /// grant another session brought to the connection must not vouch
+        /// for it.
+        #[tokio::test]
+        async fn copy_source_is_checked_against_the_sessions_own_token() {
+            let service = authenticated_service().await;
+            let repo_a = random::<lore_revision::lore::RepositoryId>();
+            let repo_b = random::<lore_revision::lore::RepositoryId>();
+            let token_a = signed_token(&[&format!("urc-{repo_a}")], &["read", "write"]);
+            let token_b = signed_token(&[&format!("urc-{repo_b}")], &["read", "write"]);
+
+            let _session_a = start_session(&service, repo_a, &token_a).await.unwrap();
+            let session_b = start_session(&service, repo_b, &token_b).await.unwrap();
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    copy_command(session_b, repo_a),
+                )
+                .await
+                .expect_err("session A's grant must not vouch for session B's copy source");
+            assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+        }
+
+        /// The same shape with the destination session's token granting both
+        /// partitions passes the source check and reaches the store, which
+        /// answers `FragmentNotFound` for the absent address.
+        #[tokio::test]
+        async fn copy_source_granted_to_the_sessions_token_is_permitted() {
+            let service = authenticated_service().await;
+            let repo_a = random::<lore_revision::lore::RepositoryId>();
+            let repo_b = random::<lore_revision::lore::RepositoryId>();
+            let token = signed_token(
+                &[&format!("urc-{repo_a}"), &format!("urc-{repo_b}")],
+                &["read", "write"],
+            );
+
+            let session_b = start_session(&service, repo_b, &token).await.unwrap();
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    copy_command(session_b, repo_a),
+                )
+                .await
+                .expect_err("the absent address must be the only failure");
+            assert!(matches!(err, MessageHandleError::FragmentNotFound));
+        }
+
+        /// A repeated cross-partition copy from a source the session's token
+        /// already cleared reuses the cached decision instead of re-asking the
+        /// authorizer — the per-session form of the retired connection-wide
+        /// skip, safe because the cache is scoped to one token.
+        #[tokio::test]
+        async fn repeated_copy_from_a_cleared_source_skips_the_authorizer() {
+            use std::sync::atomic::AtomicUsize;
+            use std::sync::atomic::Ordering;
+
+            use tonic::Status;
+
+            struct CountingAuthorizer {
+                watched: lore_revision::lore::RepositoryId,
+                source_checks: Arc<AtomicUsize>,
+            }
+
+            #[async_trait]
+            impl RepositoryAuthorizer for CountingAuthorizer {
+                async fn check_repository_access(
+                    &self,
+                    token: Option<&VerifiedToken<'_>>,
+                    repository_id: lore_revision::lore::RepositoryId,
+                    _action: Option<&str>,
+                ) -> Result<(), Status> {
+                    if repository_id == self.watched {
+                        self.source_checks.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if token.is_some() {
+                        Ok(())
+                    } else {
+                        Err(Status::permission_denied("no token"))
+                    }
+                }
+            }
+
+            let repo_a = random::<lore_revision::lore::RepositoryId>();
+            let repo_b = random::<lore_revision::lore::RepositoryId>();
+            let source_checks = Arc::new(AtomicUsize::new(0));
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let service = StorageServiceV4::new(
+                Arc::new(Some(verifier())),
+                Arc::new(CountingAuthorizer {
+                    watched: repo_a,
+                    source_checks: source_checks.clone(),
+                }),
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(UserAgentFilter::default()),
+            );
+
+            let token = signed_token(&[&format!("urc-{repo_b}")], &["read", "write"]);
+            let session_b = start_session(&service, repo_b, &token).await.unwrap();
+
+            for _ in 0..2 {
+                let err = service
+                    .run_request_handler(
+                        AttributeMap::default().into(),
+                        copy_command(session_b, repo_a),
+                    )
+                    .await
+                    .expect_err("the absent address must be the only failure");
+                assert!(matches!(err, MessageHandleError::FragmentNotFound));
+            }
+
+            assert_eq!(source_checks.load(Ordering::Relaxed), 1);
+        }
+
+        #[tokio::test]
+        async fn ungranted_session_start_is_refused() {
+            let service = authenticated_service().await;
+            let repository = random::<lore_revision::lore::RepositoryId>();
+            let token = signed_token(&["urc-somewhere-else"], &["read"]);
+
+            let err = start_session(&service, repository, &token)
+                .await
+                .expect_err("a token granting another partition must be refused");
+            assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+        }
     }
 }

@@ -706,6 +706,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.immutable_store.clone(),
             self.0.local_store.clone(),
             self.0.mutable_store.clone(),
+            repository_authorizer.clone(),
         );
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),

@@ -264,8 +264,13 @@ pub(crate) fn metadata_to_attribute(
     let attr_map = AttributeMap::default();
     attr_map.insert(repository);
 
+    // Both halves of the verified token, so a handler working from the
+    // attribute map (copy's source check) can rebuild a `VerifiedToken`.
     if let Ok(token) = get_authorization(extensions) {
         attr_map.insert(token);
+    }
+    if let Some(raw) = extensions.get::<RawToken>() {
+        attr_map.insert(raw.clone());
     }
 
     Ok(attr_map)

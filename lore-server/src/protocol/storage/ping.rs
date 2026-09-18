@@ -7,6 +7,7 @@ use bytes::Bytes;
 use lore_storage::ImmutableStore;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
@@ -42,6 +43,7 @@ impl Message for Ping {
         &self,
         _context: Arc<AttributeMap>,
         _immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         Ok(LoreResponse::Ping(PingResponse { value: self.value }))
     }
@@ -65,6 +67,10 @@ mod tests {
     use super::*;
     use crate::store::test_store_create;
 
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+    }
+
     #[test]
     fn test_parse() {
         let value = random::<i64>();
@@ -82,7 +88,11 @@ mod tests {
             test_store_create().await.expect("Failed to create stores");
 
         match ping_message
-            .handle(Arc::new(AttributeMap::default()), immutable_store)
+            .handle(
+                Arc::new(AttributeMap::default()),
+                immutable_store,
+                allow_all(),
+            )
             .await
         {
             Ok(LoreResponse::Ping(response)) => assert_eq!(response, PingResponse { value }),

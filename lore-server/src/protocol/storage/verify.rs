@@ -21,6 +21,7 @@ use tracing::info;
 use tracing::warn;
 use zerocopy::FromBytes;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -131,6 +132,7 @@ impl Message for Verify {
         &self,
         context: Arc<AttributeMap>,
         local_immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -174,6 +176,10 @@ mod tests {
 
     use super::*;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+    }
 
     fn make_verify_bytes(address: Address, heal: bool) -> Bytes {
         #[allow(unused_imports)]
@@ -243,7 +249,10 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let message = Verify { address, heal: 0 };
-                match message.handle(context_map, immutable_store).await {
+                match message
+                    .handle(context_map, immutable_store, allow_all())
+                    .await
+                {
                     Err(MessageHandleError::NotConnected) => (),
                     Err(e) => panic!("Expected NotConnected error, got {e:?}"),
                     Ok(_) => panic!("Expected NotConnected error, got Ok"),
@@ -296,7 +305,7 @@ mod tests {
                     heal: 0,
                 };
 
-                match message.handle(context_map, store).await {
+                match message.handle(context_map, store, allow_all()).await {
                     Err(MessageHandleError::FragmentNotFound) => (),
                     Err(e) => panic!("Expected FragmentNotFound error, got {e:?}"),
                     Ok(_) => panic!("Expected FragmentNotFound error, got Ok"),
@@ -336,7 +345,7 @@ mod tests {
 
                 let message = Verify { address, heal: 0 };
 
-                match message.handle(context_map, store).await {
+                match message.handle(context_map, store, allow_all()).await {
                     Ok(LoreResponse::Verify(resp)) => {
                         assert_eq!(resp.corrupted, 0);
                         assert_eq!(resp.healed, HealResult::NotAttempted);
@@ -436,7 +445,7 @@ mod tests {
                 context_map.insert(repository);
 
                 let message = Verify { address, heal: 1 };
-                match message.handle(context_map, store).await {
+                match message.handle(context_map, store, allow_all()).await {
                     Ok(LoreResponse::Verify(resp)) => {
                         assert_eq!(resp.corrupted, 1);
                         assert_eq!(resp.healed, HealResult::Healed);
@@ -502,7 +511,7 @@ mod tests {
                 context_map.insert(repository);
 
                 let message = Verify { address, heal: 0 };
-                match message.handle(context_map, store).await {
+                match message.handle(context_map, store, allow_all()).await {
                     Ok(LoreResponse::Verify(resp)) => {
                         assert_eq!(resp.corrupted, 1);
                         assert_eq!(resp.healed, HealResult::NotAttempted);

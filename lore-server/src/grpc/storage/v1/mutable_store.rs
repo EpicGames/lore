@@ -82,8 +82,12 @@ mod tests {
         let new_value = random::<Hash>();
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-            let service =
-                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            );
 
             let store_request = storage_v1::MutableStoreRequest {
                 key: bytes::Bytes::copy_from_slice(key.as_bytes()),

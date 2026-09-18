@@ -46,6 +46,7 @@ use super::rpc_code_to_str;
 use super::send_err;
 use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::get_user_id;
 use crate::legacy::rpc::storage_service_server::StorageService;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -73,6 +74,7 @@ pub struct LoreStorageService {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     local_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 }
 
 impl LoreStorageService {
@@ -80,16 +82,22 @@ impl LoreStorageService {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         local_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Self {
         Self {
             immutable_store,
             local_store,
             mutable_store,
+            repository_authorizer,
         }
     }
 
     pub fn local_immutable_store(&self) -> &Arc<dyn lore_storage::ImmutableStore> {
         &self.local_store
+    }
+
+    pub fn repository_authorizer(&self) -> &Arc<dyn RepositoryAuthorizer> {
+        &self.repository_authorizer
     }
 
     pub fn immutable_store(&self) -> &Arc<dyn lore_storage::ImmutableStore> {
@@ -121,6 +129,7 @@ impl StorageService for LoreStorageService {
         // TODO(psharpe): Make channel capacity configurable
         let (tx, rx) = mpsc::channel(8192);
         let immutable_store = self.immutable_store.clone();
+        let repository_authorizer = self.repository_authorizer.clone();
 
         let execution = setup_execution(module_path!(), correlation_id.clone(), user_id);
 
@@ -130,6 +139,7 @@ impl StorageService for LoreStorageService {
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
             while let Some(request) = stream.next().await {
                 let immutable_store = immutable_store.clone();
+                let repository_authorizer = repository_authorizer.clone();
                 let tx = tx.clone();
                 let attrs = attrs.clone();
                 let correlation_id = correlation_id.clone();
@@ -175,7 +185,10 @@ impl StorageService for LoreStorageService {
                                 }
                             };
 
-                            let response = match request.handle(attrs, immutable_store).await {
+                            let response = match request
+                                .handle(attrs, immutable_store, repository_authorizer)
+                                .await
+                            {
                                 Ok(LoreResponse::Get(response)) => Ok(lore_proto::GetResponse {
                                     address: Some(request.address.into()),
                                     fragment: Some(response.fragment.into()),
@@ -263,6 +276,7 @@ impl StorageService for LoreStorageService {
         // TODO(psharpe): make this capacity configurable or unbounded
         let (tx, rx) = mpsc::channel(8192);
         let immutable_store = self.immutable_store.clone();
+        let repository_authorizer = self.repository_authorizer.clone();
 
         let execution = setup_execution(module_path!(), correlation_id.clone(), user_id);
 
@@ -272,6 +286,7 @@ impl StorageService for LoreStorageService {
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
             while let Some(req) = stream.next().await {
                 let immutable_store = immutable_store.clone();
+                let repository_authorizer = repository_authorizer.clone();
                 let tx = tx.clone();
                 let attrs = attrs.clone();
                 let correlation_id = correlation_id.clone();
@@ -336,7 +351,9 @@ impl StorageService for LoreStorageService {
                                     }
                                     let request = request.unwrap();
 
-                                    let response = request.handle(attrs, immutable_store).await;
+                                    let response = request
+                                        .handle(attrs, immutable_store, repository_authorizer)
+                                        .await;
 
                                     let response = match response {
                                         Ok(LoreResponse::Put(_)) => Ok(lore_proto::PutResponse {
@@ -435,17 +452,21 @@ impl StorageService for LoreStorageService {
                     address: address.freeze(),
                 };
 
-                msg.handle(context, self.immutable_store.clone())
-                    .await
-                    .map(|resp| {
-                        let LoreResponse::Query(resp) = resp else {
-                            panic!("Query handler returned the wrong response type");
-                        };
+                msg.handle(
+                    context,
+                    self.immutable_store.clone(),
+                    self.repository_authorizer.clone(),
+                )
+                .await
+                .map(|resp| {
+                    let LoreResponse::Query(resp) = resp else {
+                        panic!("Query handler returned the wrong response type");
+                    };
 
-                        let results = resp.results.iter().map(|res| *res as i32).collect();
-                        Response::new(lore_proto::QueryResponse { results })
-                    })
-                    .map_err(simple_map_message_handle_error)
+                    let results = resp.results.iter().map(|res| *res as i32).collect();
+                    Response::new(lore_proto::QueryResponse { results })
+                })
+                .map_err(simple_map_message_handle_error)
             })
             .await
     }
@@ -468,6 +489,7 @@ impl StorageService for LoreStorageService {
 
         let (tx, rx) = mpsc::channel(8192);
         let immutable_store = self.immutable_store.clone();
+        let repository_authorizer = self.repository_authorizer.clone();
         let execution = setup_execution(module_path!(), correlation_id.clone(), user_id);
         let histogram =
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
@@ -478,6 +500,7 @@ impl StorageService for LoreStorageService {
                 async move {
                     while let Some(req) = stream.next().await {
                         let immutable_store = immutable_store.clone();
+                        let repository_authorizer = repository_authorizer.clone();
                         let tx = tx.clone();
                         let attrs = attrs.clone();
                         let histogram = histogram.clone();
@@ -537,7 +560,9 @@ impl StorageService for LoreStorageService {
 
                                 let response = match request {
                                     Ok(msg) => {
-                                        let resp = msg.handle(attrs, immutable_store).await;
+                                        let resp = msg
+                                            .handle(attrs, immutable_store, repository_authorizer)
+                                            .await;
                                         match resp {
                                             Ok(LoreResponse::Copy(_)) => {
                                                 Ok(lore_proto::CopyResponse {
@@ -649,19 +674,23 @@ impl StorageService for LoreStorageService {
                         heal: if req.heal { 1 } else { 0 },
                     };
 
-                    msg.handle(context, self.local_store.clone())
-                        .await
-                        .map(|resp| {
-                            let LoreResponse::Verify(resp) = resp else {
-                                panic!("Verify handler returned the wrong response type");
-                            };
+                    msg.handle(
+                        context,
+                        self.local_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
+                    .map(|resp| {
+                        let LoreResponse::Verify(resp) = resp else {
+                            panic!("Verify handler returned the wrong response type");
+                        };
 
-                            Response::new(lore_proto::VerifyResponse {
-                                corrupted: resp.corrupted != 0,
-                                healed: resp.healed as i32,
-                            })
+                        Response::new(lore_proto::VerifyResponse {
+                            corrupted: resp.corrupted != 0,
+                            healed: resp.healed as i32,
                         })
-                        .map_err(simple_map_message_handle_error)
+                    })
+                    .map_err(simple_map_message_handle_error)
                 }
                 .in_current_span(),
             )

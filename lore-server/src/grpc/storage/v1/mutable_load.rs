@@ -69,6 +69,8 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use lore_base::lore_spawn;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Context;
@@ -91,8 +93,12 @@ mod tests {
         let key = random::<Hash>();
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-            let service =
-                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            );
 
             let load_request = storage_v1::MutableLoadRequest {
                 key: bytes::Bytes::copy_from_slice(key.as_bytes()),

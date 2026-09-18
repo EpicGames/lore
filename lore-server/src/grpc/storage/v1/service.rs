@@ -97,7 +97,13 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
-        copy::handler(request, self.immutable_store().clone(), self).await
+        copy::handler(
+            request,
+            self.immutable_store().clone(),
+            self.repository_authorizer().clone(),
+            self,
+        )
+        .await
     }
 
     async fn verify(

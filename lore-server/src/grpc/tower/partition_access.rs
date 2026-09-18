@@ -151,21 +151,9 @@ where
                 timeout_grpc(request_timeout, async move {
                     let token = get_verified_token(extensions);
                     Ok(
-                        match authorizer.granted_actions(token.as_ref(), repository).await {
-                            Ok(Some(grants)) if grants.reachable() => Access::Granted(Some(grants)),
-                            // Not enumerable: ask the reachability question
-                            // directly.
-                            Ok(None) => {
-                                match authorizer
-                                    .check_repository_access(token.as_ref(), repository, None)
-                                    .await
-                                {
-                                    Ok(()) => Access::Granted(None),
-                                    Err(_denied) => Access::Denied,
-                                }
-                            }
-                            // An enumerated denial, or a failed enumeration.
-                            _ => Access::Denied,
+                        match authorizer.granted_access(token.as_ref(), repository).await {
+                            Ok(grants) => Access::Granted(grants),
+                            Err(_denied) => Access::Denied,
                         },
                     )
                 })

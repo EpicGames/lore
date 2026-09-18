@@ -440,8 +440,6 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
-    // TODO(UCS-23410): read by the partition check at connect.
-    #[allow(dead_code)]
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -492,7 +490,11 @@ impl QuicService for StorageService {
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
-                    .handle_auth(context, self.jwt_verifier.clone())
+                    .handle_auth(
+                        context,
+                        self.jwt_verifier.clone(),
+                        self.repository_authorizer.clone(),
+                    )
                     .await
             }
             ParsedStorageRequest::MutableLoad(_)
@@ -503,9 +505,23 @@ impl QuicService for StorageService {
                     .await
             }
             ParsedStorageRequest::Verify(verify) => {
-                verify.handle(context, self.local_store.clone()).await
+                verify
+                    .handle(
+                        context,
+                        self.local_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
             }
-            other => other.handle(context, self.immutable_store.clone()).await,
+            other => {
+                other
+                    .handle(
+                        context,
+                        self.immutable_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
+            }
         }?;
 
         Ok(lore_response.data())

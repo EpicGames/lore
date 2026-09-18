@@ -32,11 +32,12 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::map_message_handle_error_to_status;
 use crate::protocol::storage::copy::handle_copy;
@@ -56,13 +57,15 @@ const METRICS_STREAMING_MESSAGE_HANDLER_LATENCY: &str = "stream.message.handler.
 /// missing source fragment in particular is an expected outcome that the caller's tier-2 upload
 /// fallback pattern-matches on, so it must not be fatal to the stream.
 ///
-/// The authorization check happens here rather than via the `SessionMap` that `handle_copy`
-/// uses for QUIC v4 callers, because on the urc/0.2 path gRPC carries the JWT in the request
-/// extensions.
+/// The source-partition check happens here rather than via the `SessionMap` that `handle_copy`
+/// uses for QUIC v4 callers, because on the gRPC path the JWT rides in the request extensions.
+/// The partition-access layer already checked the destination (the metadata partition); each
+/// item's source is this handler's own question to the shared authorizer.
 async fn copy_item(
     request: Result<storage_v1::CopyRequest, Status>,
     destination_repository: RepositoryId,
-    auth_token: Option<crate::auth::jwt::AuthorizationToken>,
+    auth_token: Option<Arc<VerifiedTokenOwned>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     correlation_id: String,
     user_id: String,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
@@ -79,10 +82,17 @@ async fn copy_item(
     };
     let source_repository: RepositoryId = request.source_repository_id.clone().into();
 
-    let outcome = if let Some(token) = auth_token.as_ref()
-        && let Err(err) = verify_authorization(token, source_repository)
-    {
-        Err(Status::new(Code::PermissionDenied, err.to_string()))
+    // A cross-partition copy needs to authorize also the source partition
+    let source_check = if source_repository == destination_repository {
+        Ok(())
+    } else {
+        let token = auth_token.as_deref().map(VerifiedTokenOwned::as_token);
+        repository_authorizer
+            .check_repository_access(token.as_ref(), source_repository, None)
+            .await
+    };
+    let outcome = if let Err(status) = source_check {
+        Err(status)
     } else {
         match handle_copy(
             source_repository,
@@ -91,7 +101,6 @@ async fn copy_item(
             target_context,
             correlation_id,
             user_id,
-            None,
             immutable_store,
         )
         .await
@@ -131,10 +140,13 @@ async fn copy_item(
 pub async fn handler(
     request: Request<Streaming<storage_v1::CopyRequest>>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<CopyResponseStream>, Status> {
     let destination_repository = get_repository(request.metadata())?;
-    let auth_token = get_authorization(request.extensions()).ok();
+    // Owned halves of the verified token: the per-item tasks outlive the
+    // request extensions the borrowed form points into.
+    let auth_token = get_verified_token(request.extensions()).map(|token| Arc::new(token.owned()));
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
@@ -160,6 +172,7 @@ pub async fn handler(
                     };
 
                     let immutable_store = immutable_store.clone();
+                    let repository_authorizer = repository_authorizer.clone();
                     let tx = tx.clone();
                     let correlation_id = correlation_id.clone();
                     let user_id = user_id.clone();
@@ -186,6 +199,7 @@ pub async fn handler(
                                 req,
                                 destination_repository,
                                 auth_token,
+                                repository_authorizer,
                                 correlation_id,
                                 user_id,
                                 immutable_store,
@@ -209,4 +223,146 @@ pub async fn handler(
 
     let recv_stream = ReceiverStream::from(rx);
     Ok(Response::new(Box::pin(recv_stream) as CopyResponseStream))
+}
+
+#[cfg(test)]
+mod tests {
+    use lore_base::runtime::LORE_CONTEXT;
+    use rand::random;
+    use zerocopy::IntoBytes;
+
+    use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::auth::jwt::ResourcePermission;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::AuthClientAuthorizer;
+    use crate::store::test_store_create;
+
+    fn copy_request(source_repository: RepositoryId) -> storage_v1::CopyRequest {
+        storage_v1::CopyRequest {
+            source_repository_id: source_repository.as_bytes().to_vec().into(),
+            source_address: Some(lore_proto::lore::model::v1::Address {
+                hash: vec![0u8; 32].into(),
+                context: vec![0u8; 16].into(),
+            }),
+            target_context: Vec::new().into(),
+        }
+    }
+
+    /// Both halves of a verified access token whose `resources` claim grants
+    /// exactly `resource_ids`.
+    fn access_token(resource_ids: &[String]) -> Arc<VerifiedTokenOwned> {
+        Arc::new(VerifiedTokenOwned {
+            raw: "raw.jwt".to_string(),
+            claims: AuthorizationToken {
+                resources: Some(
+                    resource_ids
+                        .iter()
+                        .map(|resource_id| ResourcePermission {
+                            resource_id: resource_id.clone(),
+                            permission: vec![],
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn item_code(
+        auth_token: Option<Arc<VerifiedTokenOwned>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        source_repository: RepositoryId,
+        destination_repository: RepositoryId,
+    ) -> i32 {
+        let (store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let response = copy_item(
+                    Ok(copy_request(source_repository)),
+                    destination_repository,
+                    auth_token,
+                    repository_authorizer,
+                    "correlation".to_string(),
+                    "user".to_string(),
+                    store,
+                )
+                .await
+                .expect("per-item outcomes travel in-band");
+                response.status.expect("every item reports a status").code as i32
+            })
+            .await
+    }
+
+    /// The cross-partition shape on the legacy tier: the access token's
+    /// `resources` claim holds the destination but not the source, and the
+    /// claim is answered in place — the URL points nowhere, so reaching for
+    /// the network would error instead of denying.
+    #[tokio::test]
+    async fn source_without_a_grant_is_denied_in_band() {
+        let source = random::<RepositoryId>();
+        let destination = random::<RepositoryId>();
+        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AuthClientAuthorizer::new(
+            "https://auth.invalid".to_string(),
+        ));
+        let code = item_code(
+            Some(access_token(&[format!("urc-{destination}")])),
+            authorizer,
+            source,
+            destination,
+        )
+        .await;
+        assert_eq!(code, Code::PermissionDenied as i32);
+    }
+
+    /// The same claim with the source granted passes the check and reaches
+    /// the store, which answers `NOT_FOUND` for the absent address — so the
+    /// denial above is the source check, not the missing fragment.
+    #[tokio::test]
+    async fn granted_source_reaches_the_store() {
+        let source = random::<RepositoryId>();
+        let destination = random::<RepositoryId>();
+        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AuthClientAuthorizer::new(
+            "https://auth.invalid".to_string(),
+        ));
+        let code = item_code(
+            Some(access_token(&[
+                format!("urc-{destination}"),
+                format!("urc-{source}"),
+            ])),
+            authorizer,
+            source,
+            destination,
+        )
+        .await;
+        assert_eq!(code, Code::NotFound as i32);
+    }
+
+    /// An in-partition item — the dedup hot path — never asks the
+    /// authorizer: the partition-access layer already answered for the
+    /// destination. Proven with a token granting nothing at all.
+    #[tokio::test]
+    async fn in_partition_item_skips_the_authorizer() {
+        let repository = random::<RepositoryId>();
+        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AuthClientAuthorizer::new(
+            "https://auth.invalid".to_string(),
+        ));
+        let code = item_code(Some(access_token(&[])), authorizer, repository, repository).await;
+        assert_eq!(code, Code::NotFound as i32);
+    }
+
+    /// No `[server.auth]`: no interceptor ran, so no token — the allow-all
+    /// authorizer keeps cross-partition copy open exactly as today.
+    #[tokio::test]
+    async fn tokenless_caller_stays_open_under_allow_all() {
+        let code = item_code(
+            None,
+            Arc::new(AllowAllRepositoryAuthorizer),
+            random::<RepositoryId>(),
+            random::<RepositoryId>(),
+        )
+        .await;
+        assert_eq!(code, Code::NotFound as i32);
+    }
 }
