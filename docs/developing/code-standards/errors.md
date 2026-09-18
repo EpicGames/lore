@@ -62,19 +62,9 @@ The macro adds an `Internal` variant, `is_*()` predicates, `From` impls, and the
 
 ## 2. Public error interface (LoreError)
 
-Defined in `lore-revision/src/interface.rs`. `LoreError` is the public error code returned across the FFI boundary; every internal error translates to one of its variants:
+Defined in `lore-revision/src/interface.rs`. `LoreError` is a legacy, coarse-grained category kept for API compatibility; `EventError::translated()` maps each error set to one of its variants. It is not the code a consumer should key logic on — that is `error_code` (see [section 4](#4-ffi-error-reporting-contract)), which comes from the discrete type's own `#[ffi_code(N)]`.
 
-| Variant | Value | Meaning |
-| --- | --- | --- |
-| `InvalidArguments` | 3 | The arguments supplied to the operation were invalid. |
-| `SlowDown` | 31 | The backing store is overloaded; the caller should retry later. |
-| `AddressNotFound` | 80 | A content-addressable object wasn't found in any store. |
-| `PayloadNotFound` | 81 | A payload blob wasn't found for the associated hash. |
-| `FileNotFound` | 82 | A file path couldn't be resolved to a tracked node or found on disk. |
-| `Oversized` | 118 | A blob exceeded a size limit enforced by the caller or the protocol. |
-| `Internal` | -1 | All other errors. |
-
-Each value matches the `#[ffi_code(..)]` of the same-named struct in `lore-base/src/error.rs`, so the two agree for any code a caller reads. See [Error code allocation](#error-code-allocation) for how those codes are assigned.
+The variants and their values are the `LoreError` enum itself, each documented where it is declared. Every value matches the `#[ffi_code(..)]` of the same-named struct in `lore-base/src/error.rs`, so the two agree for any code a caller reads. See [Error code allocation](#error-code-allocation) for how those codes are assigned.
 
 The `NotFound` (101), `AlreadyExists` (102), and `Connection` (103) variants are legacy categories kept for transition and will be removed. They sit in the 100–109 range that `lore-base` reserves for them, so no discrete error type is allocated a code that collides with one of them.
 
@@ -82,19 +72,19 @@ The `NotFound` (101), `AlreadyExists` (102), and `Connection` (103) variants are
 
 ## 3. EventError trait
 
-Defined in `lore-revision/src/event.rs`. Domain errors in `lore-revision` that surface to users MUST implement this trait:
+Defined in `lore-revision/src/event.rs`. Domain errors in `lore-revision` that surface to users MUST implement this trait. Both methods have default bodies — `translated()` returns `LoreError::Internal`, `inner()` returns `self.to_string()` — so a set whose variants all surface as internal needs no body at all:
 
 ```rust
-impl EventError for ModuleError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ModuleError::NotFound(_) => LoreError::NotFound,
-            _ => LoreError::Internal,
-        }
-    }
+impl EventError for ModuleError {}
+```
 
-    fn inner(&self) -> String {
-        self.to_string()
+Override `translated()` for the variants that must surface as something other than `Internal`, matching through the generated `Matched*` view:
+
+```rust
+fn translated(&self) -> LoreError {
+    match self {
+        MatchedModuleError::FileNotFound(_) => LoreError::NotFound,
+        _ => LoreError::Internal,
     }
 }
 ```

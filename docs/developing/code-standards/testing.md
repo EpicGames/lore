@@ -13,7 +13,31 @@ This document defines the standard patterns for testing across the Lore codebase
 
 ---
 
-## 1. Rust unit tests
+## 1. Target risk at the cheapest tier that can find the fault
+
+Test effort follows risk, not line count. Business logic — session state, ordering guarantees, allocation and placement decisions — earns thorough tests. Plumbing and trivial code earn few or none. A test that restates the implementation costs maintenance and finds nothing.
+
+Then split by what you are checking:
+
+- **Edge cases, variants, boundaries, and error paths → unit tests.** They are cheap, so be exhaustive.
+- **Happy paths → tests that run against real things.** Mocks cannot tell you whether this works wired to a real dependency or assembled into the binary we ship, and it is not worth asking twenty times over.
+
+Assert on outcomes, not on wording. Check `Ok` or `Err` and the error variant, never a substring of the message. Message text is presentation: it changes for readability and the test fails for no reason, or it stops matching a real regression and passes for no reason.
+
+### The tiers
+
+Cheapest first. Cost tracks how much must be standing before the test can run.
+
+| Tier | Answers | Location | Needs |
+| --- | --- | --- | --- |
+| Unit | Is this logic correct across all its cases? | Inline `#[cfg(test)]` | Nothing |
+| Smoke | Does a real user flow work across the binaries? | `scripts/test/`, `@pytest.mark.smoke` | `lore` and `loreserver` binaries built |
+
+Edge cases belong in unit tests. The smoke test covers the happy path only.
+
+---
+
+## 2. Rust unit tests
 
 Inline in source modules with `#[cfg(test)]`:
 
@@ -31,7 +55,7 @@ mod tests {
 
 ---
 
-## 2. Rust async tests
+## 3. Rust async tests
 
 **Frameworks:** `tokio`, `mockall`, `async-trait`
 
@@ -128,9 +152,24 @@ tests in a module would otherwise share it.
 it to another crate: a second guard type is a second set of rules, and it does not
 honour `LORE_KEEP_TEST_DATA`.
 
+### Polling for async state
+
+Poll for a condition instead of sleeping. Fixed sleeps are flaky on slow CI, wasteful on fast machines, and opaque — a failure does not say whether the timeout was wrong or the code is broken.
+
+```rust
+// BAD
+sleep(Duration::from_millis(500)).await;
+// GOOD
+wait_for_condition(|| async { manager.session_count() == 2 }, Duration::from_secs(5))
+    .await
+    .expect("sessions should appear within 5 seconds");
+```
+
+Fixed sleeps are acceptable only for time-based behavior such as TTL expiry, or pauses under 20ms to let a spawned task start.
+
 ---
 
-## 3. Smoke tests (`scripts/test/`)
+## 4. Smoke tests (`scripts/test/`)
 
 **Framework:** pytest
 
@@ -251,19 +290,21 @@ is legitimately slower.
 
 ---
 
-## 4. Load tests
+## 5. Load tests
 
 Lore has a load-testing suite that exercises concurrent clone, commit, sync, lock, and compaction workloads. It runs on internal infrastructure and isn't part of the open-source repository, so its harness and scenarios aren't documented here.
 
 ---
 
-## 5. Best practices
+## 6. Best practices
 
-1. **All Lore commands must have smoke tests** in `scripts/test/`.
-2. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
-3. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
-4. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
+1. **Target risk, not line count** — spend test effort on business logic; leave plumbing and trivial code with few or no tests.
+2. **All Lore commands must have smoke tests** in `scripts/test/`.
+3. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
+4. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
+5. **Poll instead of sleeping** for async state; reserve fixed sleeps for time-based behavior or sub-20ms task startup.
+6. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
    a test creates outside its repository — both remove what they hand out.
-5. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
-6. **Use `offline=True`** for operations that don't need the server.
-7. **Feature-gate integration tests** that require external dependencies.
+7. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
+8. **Use `offline=True`** for operations that don't need the server.
+9. **Feature-gate integration tests** that require external dependencies.

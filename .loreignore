@@ -167,7 +167,6 @@ xcuserdata
 *.local.*
 .claude/skills/review-feedback/
 .claude-worktrees/
-.claude/
 context/
 
 # test report
