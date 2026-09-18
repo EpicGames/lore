@@ -262,6 +262,12 @@ impl MetadataMigrator {
         if (original_fragment.flags & FragmentFlags::PayloadObliteration) != 0 {
             return Ok(ConvertOutcome::SkippedObliterated);
         }
+        if (original_fragment.flags & FragmentFlags::PayloadCompressed > 0)
+            && (original_fragment.flags & FragmentFlags::PayloadFragmented > 0)
+        {
+            warn!(hash = %hash, "a valid fragment cannot be compressed and fragmented");
+            return Ok(ConvertOutcome::SkippedMaliciousFragment);
+        }
 
         let is_oodle = original_fragment.flags & FragmentFlags::PayloadCompressedOodle2 != 0;
 
@@ -1342,6 +1348,69 @@ mod tests {
             );
         }
 
+        /// Do not decompress a fragment that is fragmented, as a malicious one
+        /// could be magnitudes larger than what is enforced on ingress.
+        /// This is needed as some fragments exist before stricter ingress was enforced
+        #[tokio::test]
+        async fn skips_malicious_when_compressed_and_fragmented() {
+            let fake = Fake::default();
+            let migrator = make_migrator(&fake).await;
+            let content = vec![0x99u8; 500];
+            let (_, compressed, hash) = make_zstd_payload(&content);
+            fake.put_object_without_metadata(hash, &compressed);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: FragmentFlags::PayloadCompressedZstd.bits()
+                        | FragmentFlags::PayloadFragmented.bits(),
+                    size_payload: compressed.len() as u32,
+                    size_content: lore_storage::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
+                },
+            );
+            let stats = RewriteStats::default();
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::SkippedMaliciousFragment
+            );
+            assert_eq!(fake.state_of(hash), None);
+        }
+
+        /// A fragment list is addressed by the hash of the references it holds, so an uncompressed
+        /// fragmented payload verifies against its own bytes and migrates like any other.
+        #[tokio::test]
+        async fn fragmented_alone_is_migrated() {
+            let fake = Fake::default();
+            let migrator = make_migrator(&fake).await;
+            let references = vec![0x0Fu8; 256];
+            let hash = lore_storage::hash_slice(&references);
+            fake.put_object_without_metadata(hash, &references);
+            fake.set_legacy_metadata_row(
+                hash,
+                Fragment {
+                    flags: FragmentFlags::PayloadFragmented.bits(),
+                    size_payload: references.len() as u32,
+                    size_content: lore_storage::FRAGMENT_SIZE_THRESHOLD as u64 + 1,
+                },
+            );
+            let stats = RewriteStats::default();
+            assert_eq!(
+                migrator.process_fragment(hash, &stats).await.unwrap(),
+                ConvertOutcome::Maintained
+            );
+            assert_eq!(fake.state_of(hash), Some(FragmentState::Stored));
+
+            let stored = fake
+                .stored_fragment(hash)
+                .expect("a maintained fragment is re-uploaded to carry its metadata headers");
+            assert_ne!(stored.flags & FragmentFlags::PayloadFragmented, 0);
+            assert_eq!(stored.flags & FragmentFlags::PayloadCompressed, 0);
+            assert_eq!(stored.size_payload as usize, references.len());
+            assert_eq!(
+                stored.size_content,
+                lore_storage::FRAGMENT_SIZE_THRESHOLD as u64 + 1
+            );
+        }
+
         #[tokio::test]
         async fn deduced_codec_increments_payloads_deduced_stat() {
             let fake = Fake::default();
@@ -1501,8 +1570,28 @@ mod tests {
             fake.put_object_without_metadata(lz4_hash, &lz4_compressed);
             fake.set_legacy_metadata_row(lz4_hash, lz4_frag);
 
+            // compressed and fragmented at once — no valid fragment carries both
+            let malicious_content = vec![0x60u8; 500];
+            let (malicious_frag, malicious_compressed, malicious_hash) =
+                make_zstd_payload(&malicious_content);
+            fake.put_object_without_metadata(malicious_hash, &malicious_compressed);
+            fake.set_legacy_metadata_row(
+                malicious_hash,
+                Fragment {
+                    flags: malicious_frag.flags | FragmentFlags::PayloadFragmented.bits(),
+                    ..malicious_frag
+                },
+            );
+
             let (tx, rx) = mpsc::channel(10);
-            for h in [migrated, obl_hash, unc_hash, zstd_hash, lz4_hash] {
+            for h in [
+                migrated,
+                obl_hash,
+                unc_hash,
+                zstd_hash,
+                lz4_hash,
+                malicious_hash,
+            ] {
                 tx.send(h).await.unwrap();
             }
             drop(tx);
@@ -1516,6 +1605,7 @@ mod tests {
 
             assert_eq!(stats.skipped_migrated.load(Ordering::Relaxed), 1);
             assert_eq!(stats.skipped_obliterated.load(Ordering::Relaxed), 1);
+            assert_eq!(stats.skipped_malicious.load(Ordering::Relaxed), 1);
             // uncompressed, zstd, and lz4 fragments all have accurate codecs: maintained in place
             assert_eq!(stats.maintained.load(Ordering::Relaxed), 3);
         }
