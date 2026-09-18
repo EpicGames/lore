@@ -68,9 +68,10 @@ use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourceMatcher;
-use crate::auth::jwt::verify_authorization;
 use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
@@ -224,15 +225,26 @@ pub fn get_verified_token(extensions: &Extensions) -> Option<VerifiedToken<'_>> 
     })
 }
 
+/// The cross-partition link-read check for a revision-graph traversal: may
+/// the caller behind `extensions` reach a partition a link points into?
+///
+/// Asked synchronously, potentially many times per request, so it consults
+/// [`RepositoryAuthorizer::check_repository_access_sync`] with the verified
+/// token and denies when the authorizer cannot answer without I/O. The
+/// partition-access layer's `PartitionGrants` extension does not apply: it
+/// answers for the request's own partition, and a link points elsewhere.
 pub fn link_read_authorizer(
-    authorization: Option<AuthorizationToken>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
 ) -> lore_revision::state::CanReadRepository {
-    match authorization {
-        Some(token) => {
-            Arc::new(move |repository_id| verify_authorization(&token, repository_id).is_ok())
-        }
-        None => lore_revision::state::allow_all_repositories(),
-    }
+    let authorizer = authorizer.clone();
+    let token = get_verified_token(extensions).map(|token| token.owned());
+    Arc::new(move |repository_id| {
+        let token = token.as_ref().map(VerifiedTokenOwned::as_token);
+        authorizer
+            .check_repository_access_sync(token.as_ref(), repository_id, None)
+            .is_some_and(|verdict| verdict.is_ok())
+    })
 }
 
 pub fn get_user_id(extensions: &Extensions) -> String {
@@ -534,6 +546,142 @@ mod tests {
 
     use super::*;
     use crate::auth::jwt::ResourcePermission;
+
+    mod link_read {
+        use std::collections::HashSet;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        use async_trait::async_trait;
+
+        use super::*;
+        use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+        use crate::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
+
+        fn repository(hex: &str) -> RepositoryId {
+            Context::from_str(hex).unwrap().into()
+        }
+
+        const GRANTED: &str = "0194b726b34e72b0b45550b88a967076";
+        const UNGRANTED: &str = "f6ca55437aa34198ba0f0fdc33154d51";
+
+        /// Answers in memory from a fixed partition set, and records if the
+        /// async path is ever entered. `answers: false` models an authorizer
+        /// that needs I/O for every question.
+        struct Recording {
+            answers: bool,
+            granted: HashSet<RepositoryId>,
+            async_entered: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl RepositoryAuthorizer for Recording {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                _repository_id: RepositoryId,
+                _action: Option<&str>,
+            ) -> Result<(), Status> {
+                self.async_entered.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn check_repository_access_sync(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                repository_id: RepositoryId,
+                action: Option<&str>,
+            ) -> Option<Result<(), Status>> {
+                assert_eq!(action, None, "a link read asks reachability only");
+                self.answers.then(|| {
+                    if self.granted.contains(&repository_id) {
+                        Ok(())
+                    } else {
+                        Err(Status::permission_denied("not granted"))
+                    }
+                })
+            }
+        }
+
+        fn extensions_with_token(claims: AuthorizationToken) -> Extensions {
+            let mut extensions = Extensions::new();
+            extensions.insert(claims);
+            extensions.insert(RawToken("raw.jwt".to_string()));
+            extensions
+        }
+
+        /// The closure never enters the authorizer's async path: it takes
+        /// the synchronous verdict as-is.
+        #[test]
+        fn answers_from_the_sync_verdict_without_entering_the_async_path() {
+            let async_entered = Arc::new(AtomicBool::new(false));
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(Recording {
+                answers: true,
+                granted: [repository(GRANTED)].into(),
+                async_entered: async_entered.clone(),
+            });
+            let can_read =
+                link_read_authorizer(&authorizer, &extensions_with_token(Default::default()));
+            assert!(can_read(repository(GRANTED)));
+            assert!(!can_read(repository(UNGRANTED)));
+            assert!(!async_entered.load(Ordering::SeqCst));
+        }
+
+        /// An authorizer that cannot answer without I/O denies the link read;
+        /// the async path — which would permit here — is not consulted.
+        #[test]
+        fn denies_when_the_authorizer_cannot_answer_synchronously() {
+            let async_entered = Arc::new(AtomicBool::new(false));
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(Recording {
+                answers: false,
+                granted: [repository(GRANTED)].into(),
+                async_entered: async_entered.clone(),
+            });
+            let can_read =
+                link_read_authorizer(&authorizer, &extensions_with_token(Default::default()));
+            assert!(!can_read(repository(GRANTED)));
+            assert!(!async_entered.load(Ordering::SeqCst));
+        }
+
+        /// No verifier configured: no token in the extensions, and the
+        /// allow-all authorizer selected alongside lets every link through.
+        #[test]
+        fn no_token_under_allow_all_reads_every_partition() {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
+            let can_read = link_read_authorizer(&authorizer, &Extensions::new());
+            assert!(can_read(repository(GRANTED)));
+            assert!(can_read(repository(UNGRANTED)));
+        }
+
+        /// Tier 2 end to end: the verified token's claim decides, per
+        /// partition, with no network.
+        #[test]
+        fn resource_grants_answers_from_the_verified_token() {
+            let authorizer: Arc<dyn RepositoryAuthorizer> =
+                Arc::new(ResourceGrantsAuthorizer::new(
+                    "resources".to_string(),
+                    "resource_id".to_string(),
+                    None,
+                    "urc-{id}".to_string(),
+                    "urc-*".to_string(),
+                ));
+            let claims = AuthorizationToken {
+                resources: Some(vec![ResourcePermission {
+                    resource_id: format!("urc-{}", repository(GRANTED)),
+                    permission: vec![],
+                }]),
+                ..Default::default()
+            };
+            let can_read = link_read_authorizer(&authorizer, &extensions_with_token(claims));
+            assert!(can_read(repository(GRANTED)));
+            assert!(!can_read(repository(UNGRANTED)));
+
+            // A verifier is configured but this request carries no token:
+            // nothing is granted.
+            let can_read = link_read_authorizer(&authorizer, &Extensions::new());
+            assert!(!can_read(repository(GRANTED)));
+        }
+    }
 
     #[test]
     fn revision_signature_reads_a_whole_signature() {

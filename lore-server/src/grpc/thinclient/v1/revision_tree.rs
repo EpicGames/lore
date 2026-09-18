@@ -28,8 +28,8 @@ use tracing::warn;
 
 use super::helpers::node_flags_to_node_type;
 use super::helpers::resolve_to_identifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::link_read_authorizer;
@@ -52,12 +52,13 @@ pub async fn handler(
     request: Request<RevisionTreeRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionTreeStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
-    let authorization = get_authorization(request.extensions()).ok();
+    let can_read = link_read_authorizer(&repository_authorizer, request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
@@ -80,7 +81,6 @@ pub async fn handler(
         mutable_store,
         repository_id,
     ));
-    let can_read = link_read_authorizer(authorization);
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -208,10 +208,29 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::RawToken;
+    use crate::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
+
+    /// A Tier 2 deployment reading the legacy `resources` claim shape, so
+    /// the link-read verdict comes from the token in the request.
+    fn resource_grants() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(ResourceGrantsAuthorizer::new(
+            "resources".to_string(),
+            "resource_id".to_string(),
+            None,
+            "urc-{id}".to_string(),
+            "urc-*".to_string(),
+        ))
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -517,6 +536,7 @@ mod test {
                 request,
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -549,6 +569,7 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -619,6 +640,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -658,6 +680,7 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -687,6 +710,7 @@ mod test {
                 make_request(repository, Query::Signature(bogus.into()), None, None),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -716,6 +740,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -755,6 +780,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -796,6 +822,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -847,6 +874,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -892,6 +920,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -947,6 +976,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -1010,6 +1040,7 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -1089,6 +1120,7 @@ mod test {
                 make_request(originating, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -1159,6 +1191,7 @@ mod test {
             make_request(repository, Query::Signature(signature.into()), None, None),
             immutable_store,
             mutable_store,
+            allow_all(),
             DEFAULT_HISTORY_STEP_SIZE,
             RevisionListAcceleration::default(),
         )
@@ -1292,11 +1325,15 @@ mod test {
             request
                 .extensions_mut()
                 .insert(token_authorized_for(&[originating]));
+            request
+                .extensions_mut()
+                .insert(RawToken("raw.jwt".to_string()));
 
             let response = handler(
                 request,
                 immutable_store,
                 mutable_store,
+                resource_grants(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -1365,6 +1402,7 @@ mod test {
                 make_request(a, Query::Signature(a_sig.into()), None, None),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -1502,6 +1540,7 @@ mod test {
                 make_request(a, Query::Signature(a_sig.into()), None, None),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
@@ -1581,11 +1620,15 @@ mod test {
             request
                 .extensions_mut()
                 .insert(token_authorized_for(&[originating]));
+            request
+                .extensions_mut()
+                .insert(RawToken("raw.jwt".to_string()));
 
             let response = handler(
                 request,
                 immutable_store,
                 mutable_store,
+                resource_grants(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )

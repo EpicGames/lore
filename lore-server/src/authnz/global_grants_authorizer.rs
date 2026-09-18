@@ -41,11 +41,10 @@ impl GlobalGrantsAuthorizer {
                 .collect(),
         )
     }
-}
 
-#[async_trait]
-impl RepositoryAuthorizer for GlobalGrantsAuthorizer {
-    async fn check_repository_access(
+    /// The whole verdict is in the token, so the async and sync trait
+    /// methods share this body.
+    fn check(
         &self,
         token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
@@ -60,6 +59,27 @@ impl RepositoryAuthorizer for GlobalGrantsAuthorizer {
             Some(action) if self.grants_for(token).permits(action) => Ok(()),
             Some(_) => Err(Status::permission_denied("Action not permitted")),
         }
+    }
+}
+
+#[async_trait]
+impl RepositoryAuthorizer for GlobalGrantsAuthorizer {
+    async fn check_repository_access(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        self.check(token, repository_id, action)
+    }
+
+    fn check_repository_access_sync(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Option<Result<(), Status>> {
+        Some(self.check(token, repository_id, action))
     }
 
     async fn granted_actions(
@@ -202,6 +222,29 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// The verdict is in the token, so the sync check always answers and
+    /// agrees with the async one.
+    #[tokio::test]
+    async fn sync_check_answers_and_agrees_with_the_async_path() {
+        let authorizer = GlobalGrantsAuthorizer::new(Some("groups".to_string()));
+        let claims = token_with_extra(json!({ "groups": ["obliterate"] }));
+        let token = VerifiedToken {
+            raw: "raw",
+            claims: &claims,
+        };
+        for token in [None, Some(&token)] {
+            for action in [None, Some("obliterate"), Some("admin")] {
+                let sync = authorizer
+                    .check_repository_access_sync(token, RepositoryId::default(), action)
+                    .expect("the token holds the verdict");
+                let asynchronous = authorizer
+                    .check_repository_access(token, RepositoryId::default(), action)
+                    .await;
+                assert_eq!(sync.is_ok(), asynchronous.is_ok(), "{action:?}");
+            }
+        }
     }
 
     #[tokio::test]

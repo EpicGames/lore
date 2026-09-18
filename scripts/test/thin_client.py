@@ -3,9 +3,10 @@
 """Minimal gRPC client for `lore.thin_client.v1.ThinClientService`.
 
 The CLI never calls this service, so a test asserting what reaches its wire has
-to talk to it directly. The test server runs gRPC in plaintext and registers the
-service without an auth interceptor, so an insecure channel carrying only the
-repository-id metadata works. Only the fields the tests assert on are decoded.
+to talk to it directly. The test server runs gRPC in plaintext, so an insecure
+channel carrying the repository-id metadata works; against an auth-enabled
+server the caller also passes the bearer token. Only the fields the tests assert
+on are decoded.
 """
 
 import logging
@@ -148,18 +149,20 @@ def _collect_stream(
     repository_id: bytes,
     deserializer,
     timeout: float,
+    authorization: str | None,
 ) -> list:
+    metadata: tuple[tuple[str, str | bytes], ...] = (
+        (_REPOSITORY_ID_METADATA_KEY, repository_id),
+    )
+    if authorization is not None:
+        metadata += (("authorization", f"Bearer {authorization}"),)
     with grpc.insecure_channel(grpc_target) as channel:
         call = channel.unary_stream(
             method,
             request_serializer=_already_encoded,
             response_deserializer=deserializer,
         )
-        responses = call(
-            request,
-            timeout=timeout,
-            metadata=((_REPOSITORY_ID_METADATA_KEY, repository_id),),
-        )
+        responses = call(request, timeout=timeout, metadata=metadata)
         return [item for message in responses for item in message]
 
 
@@ -168,8 +171,10 @@ def revision_tree(
     repository_id: bytes,
     signature: bytes,
     timeout: float = 30.0,
+    authorization: str | None = None,
 ) -> list[TreeNode]:
-    """Every `TreeNode` the server streams for `signature`, in stream order."""
+    """Every `TreeNode` the server streams for `signature`, in stream order.
+    `authorization` is the bearer token for an auth-enabled server."""
     nodes = _collect_stream(
         grpc_target,
         _REVISION_TREE_METHOD,
@@ -177,6 +182,7 @@ def revision_tree(
         repository_id,
         _tree_nodes,
         timeout,
+        authorization,
     )
     logger.info("RevisionTree(%s) returned %d nodes", signature.hex(), len(nodes))
     return nodes
@@ -188,9 +194,11 @@ def revision_diff(
     signature_from: bytes,
     signature_to: bytes,
     timeout: float = 30.0,
+    authorization: str | None = None,
 ) -> list[DiffChange]:
     """Every `DiffChange` the server streams between the two revisions, in
-    stream order."""
+    stream order. `authorization` is the bearer token for an auth-enabled
+    server."""
     request = encode_bytes_field(
         _DIFF_REQUEST_SIGNATURE_FROM, signature_from
     ) + encode_bytes_field(_DIFF_REQUEST_SIGNATURE_TO, signature_to)
@@ -202,6 +210,7 @@ def revision_diff(
         repository_id,
         lambda response: _diff_changes(response, partitions),
         timeout,
+        authorization,
     )
     logger.info(
         "RevisionDiff(%s -> %s) returned %d changes",

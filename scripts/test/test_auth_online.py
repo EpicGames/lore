@@ -58,6 +58,7 @@ from mock_auth_server import (
     tamper_token,
     user_token_response,
 )
+from thin_client import revision_tree
 
 from lore import Lore
 
@@ -795,6 +796,91 @@ def test_cross_partition_copy_requires_a_source_grant(auth_env):
     assert not mock.requests_for("CheckUserPermission"), (
         "both verdicts must come from the access token's resources claim, "
         "not an online check"
+    )
+
+
+LINKER_API_KEY = "linker-api-key"
+
+
+@pytest.mark.smoke
+def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor):
+    """A revision tree walk follows a link into another partition only when
+    the caller's token grants that partition: with the parent's grant alone
+    the link node is reported and nothing beneath it, with both grants the
+    linked content streams. The walk asks the authorizer synchronously, so
+    both verdicts must come from the access token's own `resources` claim:
+    no CheckUserPermission rule is scripted for either probe token, and the
+    stub's records prove nothing asked for one."""
+    mock = auth_env.mock
+    parent_id, linked_id = uuid.uuid4().hex, uuid.uuid4().hex
+    parent_resource, linked_resource = f"urc-{parent_id}", f"urc-{linked_id}"
+    login_token = mock.mint_token(USER1)
+    # The CLI's setup work — creating both repositories, mounting the link —
+    # exchanges for one partition at a time; a token granting both keeps
+    # the mount's read of the linked partition working whichever one it
+    # exchanged for.
+    setup_token = mock.mint_token(
+        USER1,
+        resources=authz_resources(parent_resource) + authz_resources(linked_resource),
+    )
+    script_api_key_login(mock, USER1, login_token, LINKER_API_KEY)
+    for resource in (parent_resource, linked_resource):
+        script_repository_lifecycle(mock, resource)
+        script_partition_access(mock, USER1, login_token, resource, setup_token)
+
+    actor = make_actor("linker")
+    login_api_key(actor.make_repo(), auth_env.remote_url, LINKER_API_KEY)
+    linked = actor.make_repo(repo_id=linked_id)
+    linked.repository_create(repo_id=linked_id, identity=USER1.user_id)
+    commit_file(linked, "inner.txt", "linked content")
+    parent = actor.make_repo(repo_id=parent_id)
+    parent.repository_create(repo_id=parent_id, identity=USER1.user_id)
+    commit_file(parent, "own.txt", "parent content")
+    parent.link_add("linked", linked_id, "/")
+    parent.commit("mount the link")
+    parent.push()
+
+    latest = parent.branch_info().local_latest
+    assert len(latest) == 64, f"expected a full revision signature, got {latest!r}"
+    target = grpc_target(auth_env.remote_url)
+    repository_id, signature = bytes.fromhex(parent_id), bytes.fromhex(latest)
+
+    parent_only = mock.mint_token(USER1, resources=authz_resources(parent_resource))
+    both = mock.mint_token(
+        USER1,
+        resources=authz_resources(parent_resource) + authz_resources(linked_resource),
+    )
+
+    def tree_paths(token: str) -> set[str]:
+        return {
+            node.path
+            for node in revision_tree(
+                target, repository_id, signature, authorization=token
+            )
+        }
+
+    granted = tree_paths(both)
+    assert {"own.txt", "linked", "linked/inner.txt"} <= granted, (
+        f"a token granting both partitions must see the linked content, got {granted}"
+    )
+
+    denied = tree_paths(parent_only)
+    assert {"own.txt", "linked"} <= denied, (
+        f"the parent's own files and the link node must still be reported, got {denied}"
+    )
+    assert not [path for path in denied if path.startswith("linked/")], (
+        f"a token without the linked partition's grant must not see beneath the "
+        f"link, got {denied}"
+    )
+
+    probed = [
+        check
+        for check in mock.requests_for("CheckUserPermission")
+        if check["bearer"] in (parent_only, both)
+    ]
+    assert not probed, (
+        "the link-read verdicts must come from the access token's resources "
+        f"claim, not an online check: {probed}"
     )
 
 

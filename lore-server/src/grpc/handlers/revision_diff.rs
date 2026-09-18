@@ -19,9 +19,9 @@ use tracing::warn;
 
 use super::path_diff::link_pin_path_diffs;
 use super::path_diff::map_to_path_diff;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::link_read_authorizer;
@@ -32,10 +32,11 @@ pub async fn handler(
     request: Request<RevisionDiffRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<RevisionDiffResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
-    let authorization = get_authorization(request.extensions()).ok();
+    let can_read = link_read_authorizer(&repository_authorizer, request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
     let revision_from = Hash::from(req.revision_from);
@@ -49,7 +50,7 @@ pub async fn handler(
 
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(authorization)),
+            .with_link_read(can_read),
     );
 
     LORE_CONTEXT

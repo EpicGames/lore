@@ -40,9 +40,9 @@ use super::helpers::identifier_for_signature;
 use super::helpers::link_pin_change_to_diff_change;
 use super::helpers::node_change_to_diff_change;
 use super::helpers::resolve_to_identifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::link_read_authorizer;
@@ -112,13 +112,14 @@ pub async fn handler(
     request: Request<RevisionDiffRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     config: RevisionDiffConfig,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
-    let authorization = get_authorization(request.extensions()).ok();
+    let can_read = link_read_authorizer(&repository_authorizer, request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
@@ -137,7 +138,7 @@ pub async fn handler(
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(authorization)),
+            .with_link_read(can_read),
     );
 
     LORE_CONTEXT
@@ -782,10 +783,15 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -921,6 +927,7 @@ mod test {
                 request,
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -966,6 +973,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1030,6 +1038,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1125,6 +1134,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1221,6 +1231,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1281,6 +1292,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1329,6 +1341,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1401,6 +1414,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1459,6 +1473,7 @@ mod test {
                 request,
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1520,6 +1535,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
@@ -1618,6 +1634,7 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                allow_all(),
                 RevisionDiffConfig::default(),
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),

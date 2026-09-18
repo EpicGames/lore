@@ -17,10 +17,10 @@ use tonic::Status;
 use tracing::debug;
 use tracing::info;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::link_read_authorizer;
@@ -31,10 +31,11 @@ pub async fn handler(
     request: Request<RevisionTreeRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<RevisionTreeResponse>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
-    let authorization = get_authorization(request.extensions()).ok();
+    let can_read = link_read_authorizer(&repository_authorizer, request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
     let revision = req.revision.into();
@@ -57,7 +58,6 @@ pub async fn handler(
         mutable_store,
         repository,
     ));
-    let can_read = link_read_authorizer(authorization);
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -114,9 +114,14 @@ mod tests {
     use rand::random;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     #[tokio::test]
     async fn tree_on_file_returns_invalid_argument() {
@@ -190,9 +195,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let err = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect_err("Expected error for tree on non-directory path");
+                let err = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all(),
+                )
+                .await
+                .expect_err("Expected error for tree on non-directory path");
                 assert_eq!(err.code(), tonic::Code::InvalidArgument);
                 assert_eq!(
                     err.message(),
@@ -265,9 +275,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let err = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect_err("Expected NotFound for non-existent path");
+                let err = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all(),
+                )
+                .await
+                .expect_err("Expected NotFound for non-existent path");
                 assert_eq!(err.code(), tonic::Code::NotFound);
                 assert_eq!(err.message(), "A node in the tree could not be found");
             })
@@ -355,9 +370,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect("handler ok");
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all(),
+                )
+                .await
+                .expect("handler ok");
                 let paths = response.into_inner().paths;
 
                 assert_eq!(
@@ -471,7 +491,7 @@ mod tests {
             REPOSITORY_ID_KEY,
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
         );
-        let response = handler(request, immutable_store, mutable_store)
+        let response = handler(request, immutable_store, mutable_store, allow_all())
             .await
             .expect("handler ok");
         let mut paths = response.into_inner().paths;

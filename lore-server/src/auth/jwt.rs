@@ -86,6 +86,22 @@ impl ResourceMatcher {
             .any(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
     }
 
+    /// Whether some entry matching `repository` grants `action`. The
+    /// per-question form of [`merged_permissions`](Self::merged_permissions):
+    /// it visits the entries in place rather than building the merged set.
+    pub fn permits(
+        &self,
+        resources: &[ResourcePermission],
+        repository: lore_base::types::RepositoryId,
+        action: &str,
+    ) -> bool {
+        let resource_id = self.resource_for(repository);
+        resources
+            .iter()
+            .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
+            .any(|entry| entry.permission.iter().any(|granted| granted == action))
+    }
+
     /// The actions granted on `repository`, merged across every matching
     /// entry, wildcard included.
     pub fn merged_permissions(
@@ -176,8 +192,6 @@ pub enum JwtVerifierError {
     KeyNotFound(#[from] JWKServiceError),
     #[error("JWT validation failed")]
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
-    #[error("JWT authorization failed")]
-    NotAuthorized,
 }
 
 #[derive(Clone)]
@@ -299,19 +313,6 @@ impl JwtVerifier {
     }
 }
 
-pub fn verify_authorization(
-    authorization: &AuthorizationToken,
-    repository: lore_revision::lore::RepositoryId,
-) -> Result<(), JwtVerifierError> {
-    if let Some(resources) = authorization.resources.as_ref()
-        && ResourceMatcher::default().any_match(resources, repository)
-    {
-        return Ok(());
-    }
-
-    Err(JwtVerifierError::NotAuthorized)
-}
-
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -322,6 +323,38 @@ mod tests {
     use lore_revision::lore::RepositoryId;
 
     use super::*;
+
+    /// The in-place action check agrees with the merged set it stands in for:
+    /// only entries matching the partition count, the wildcard included.
+    #[test]
+    fn permits_reads_only_matching_entries() {
+        let matcher = ResourceMatcher::default();
+        let repository: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
+            .unwrap()
+            .into();
+        let entry = |resource_id: &str, permissions: &[&str]| ResourcePermission {
+            resource_id: resource_id.to_string(),
+            permission: permissions.iter().map(ToString::to_string).collect(),
+        };
+        let resources = vec![
+            entry(&format!("urc-{repository}"), &["read"]),
+            entry("urc-somewhere-else", &["obliterate"]),
+            entry("urc-*", &["migrate"]),
+        ];
+        for action in ["read", "migrate", "obliterate", "presign"] {
+            assert_eq!(
+                matcher.permits(&resources, repository, action),
+                matcher
+                    .merged_permissions(&resources, repository)
+                    .iter()
+                    .any(|granted| granted == action),
+                "{action}"
+            );
+        }
+        assert!(matcher.permits(&resources, repository, "migrate"));
+        assert!(!matcher.permits(&resources, repository, "obliterate"));
+        assert!(!matcher.permits(&[], repository, "read"));
+    }
 
     #[test]
     fn resource_permission_matches_wildcard_resource() {
@@ -418,81 +451,6 @@ mod tests {
                     "obliterate".to_string()
                 ]
             );
-        }
-    }
-
-    #[test]
-    fn verify_authorization_allows_repo_from_token() {
-        let allowed_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-        let resource_permission = ResourcePermission {
-            permission: vec![],
-            resource_id: allowed_repository_id.clone(),
-        };
-        let authorization_token = AuthorizationToken {
-            audience: vec!["test".to_string()],
-            env: Some("test".to_string()),
-            expires: 1234,
-            user_id: "test".to_string(),
-            idp: Some("test".to_string()),
-            issuer: "test".to_string(),
-            name: Some("test".to_string()),
-            preferred_username: Some("test".to_string()),
-            client_id: None,
-            groups: None,
-            is_service_account: Some(false),
-            issued_at: 123,
-            resources: Some(vec![resource_permission]),
-            extra: Default::default(),
-        };
-        let allowed_context: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
-            .unwrap()
-            .into();
-        let unexpected_context: RepositoryId =
-            Context::from_str("f6ca55437aa34198ba0f0fdc33154d51")
-                .unwrap()
-                .into();
-        verify_authorization(&authorization_token, allowed_context).expect("verify auth failed");
-        verify_authorization(&authorization_token, unexpected_context)
-            .expect_err("verify auth should have failed");
-    }
-
-    #[test]
-    fn verify_authorization_allows_all_repos_for_wildcard_token() {
-        let resource_permission = ResourcePermission {
-            permission: vec![],
-            resource_id: "urc-*".to_string(),
-        };
-        let wildcard_authorization_token = AuthorizationToken {
-            audience: vec!["test".to_string()],
-            env: Some("test".to_string()),
-            expires: 1234,
-            user_id: "test".to_string(),
-            idp: Some("test".to_string()),
-            issuer: "test".to_string(),
-            name: Some("test".to_string()),
-            preferred_username: Some("test".to_string()),
-            client_id: None,
-            groups: None,
-            is_service_account: Some(false),
-            issued_at: 123,
-            resources: Some(vec![resource_permission]),
-            extra: Default::default(),
-        };
-        let test_contexts: Vec<RepositoryId> = vec![
-            Context::from_str("0194b726b34e72b0b45550b88a967076")
-                .unwrap()
-                .into(),
-            Context::from_str("f6ca55437aa34198ba0f0fdc33154d51")
-                .unwrap()
-                .into(),
-            Context::from_str("54006a8ca619475881f7083d625a7947")
-                .unwrap()
-                .into(),
-        ];
-
-        for context in test_contexts {
-            verify_authorization(&wildcard_authorization_token, context)
-                .expect("verify auth failed");
         }
     }
 

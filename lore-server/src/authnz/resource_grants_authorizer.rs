@@ -103,6 +103,31 @@ impl ResourceGrantsAuthorizer {
                 .collect(),
         )
     }
+
+    /// The whole verdict is in the token, so the async and sync trait
+    /// methods share this body. Answers in place rather than through
+    /// [`grants_on`](Self::grants_on): the link-read closure asks this per
+    /// link, and the merged permission set is only worth building for an
+    /// enumeration.
+    fn check(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        let Some(token) = token else {
+            return Err(Status::unauthenticated("No token"));
+        };
+        let entries = self.grants(token);
+        if !self.matcher.any_match(&entries, repository_id) {
+            return Err(Status::permission_denied("No grant for repository"));
+        }
+        match action {
+            None => Ok(()),
+            Some(action) if self.matcher.permits(&entries, repository_id, action) => Ok(()),
+            Some(_) => Err(Status::permission_denied("Action not permitted")),
+        }
+    }
 }
 
 #[async_trait]
@@ -113,18 +138,16 @@ impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
         repository_id: RepositoryId,
         action: Option<&str>,
     ) -> Result<(), Status> {
-        let Some(token) = token else {
-            return Err(Status::unauthenticated("No token"));
-        };
-        let grants = self.grants_on(token, repository_id);
-        if !grants.reachable() {
-            return Err(Status::permission_denied("No grant for repository"));
-        }
-        match action {
-            None => Ok(()),
-            Some(action) if grants.permits(action) => Ok(()),
-            Some(_) => Err(Status::permission_denied("Action not permitted")),
-        }
+        self.check(token, repository_id, action)
+    }
+
+    fn check_repository_access_sync(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Option<Result<(), Status>> {
+        Some(self.check(token, repository_id, action))
     }
 
     async fn granted_actions(
@@ -428,6 +451,38 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    /// The verdict is in the token, so the sync check always answers and
+    /// agrees with the async one, for the granted partition and another.
+    #[tokio::test]
+    async fn sync_check_answers_and_agrees_with_the_async_path() {
+        let authorizer = default_authorizer();
+        let claims = claims_with_resources(vec![entry(
+            &format!("urc-{REPOSITORY_HEX}"),
+            &["obliterate"],
+        )]);
+        let token = VerifiedToken {
+            raw: "raw",
+            claims: &claims,
+        };
+        for token in [None, Some(&token)] {
+            for repository in [repository(REPOSITORY_HEX), repository(UNRELATED_HEX)] {
+                for action in [None, Some("obliterate"), Some("admin")] {
+                    let sync = authorizer
+                        .check_repository_access_sync(token, repository, action)
+                        .expect("the token holds the verdict");
+                    let asynchronous = authorizer
+                        .check_repository_access(token, repository, action)
+                        .await;
+                    assert_eq!(
+                        sync.is_ok(),
+                        asynchronous.is_ok(),
+                        "{action:?} on {repository}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]

@@ -692,6 +692,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         let thin_client_v1_svc = LoreThinClientV1Service::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
+            repository_authorizer.clone(),
             rpc_timeout,
             revision_diff_config,
             history_step_size,
@@ -713,6 +714,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.mutable_store.clone(),
             self.0.notification_sender.clone(),
             self.0.hook_dispatcher.clone(),
+            repository_authorizer.clone(),
             history_step_size,
             acceleration,
             rpc_timeout,

@@ -123,6 +123,25 @@ pub trait RepositoryAuthorizer: Send + Sync {
     ) -> Result<Option<Grants>, Status> {
         Ok(None)
     }
+
+    /// [`check_repository_access`](Self::check_repository_access) for call
+    /// sites that cannot await: the cross-partition link-read closure runs
+    /// inside revision-graph traversal, potentially many times per request.
+    /// `None` means the answer needs I/O this authorizer cannot do here.
+    /// Such callers must deny, and the online paths keep today's behaviour
+    /// because they never granted a link read without an in-token claim.
+    ///
+    /// The token-based authorizers always answer: the verdict is in a token
+    /// the interceptor already verified, so no cache, preload or staleness
+    /// bound is needed on those paths.
+    fn check_repository_access_sync(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        _action: Option<&str>,
+    ) -> Option<Result<(), Status>> {
+        None
+    }
 }
 
 impl dyn RepositoryAuthorizer {
@@ -204,6 +223,15 @@ impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
         _repository_id: RepositoryId,
     ) -> Result<Option<Grants>, Status> {
         Ok(Some(Grants::All))
+    }
+
+    fn check_repository_access_sync(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        _action: Option<&str>,
+    ) -> Option<Result<(), Status>> {
+        Some(Ok(()))
     }
 }
 
@@ -313,16 +341,19 @@ fn grants_from_response(response: &CheckUserPermissionResponse, resource_id: &st
 
 /// Answer an access question from the `resources` claim of an exchanged
 /// access token. `action: None` asks whether any entry names the partition.
-/// `action: Some` asks for membership in the merged permission lists.
+/// `action: Some` asks whether a matching entry grants the action. Answered
+/// in place rather than through [`grants_from_resources_claim`]: the
+/// link-read closure asks this per link, and the merged permission set is
+/// only worth building for an enumeration.
 fn evaluate_resources_claim(
     resources: &[crate::auth::jwt::ResourcePermission],
     repository_id: RepositoryId,
     action: Option<&str>,
 ) -> Result<(), Status> {
-    let grants = grants_from_resources_claim(resources, repository_id);
+    let matcher = ResourceMatcher::default();
     let permitted = match action {
-        None => grants.reachable(),
-        Some(action) => grants.permits(action),
+        None => matcher.any_match(resources, repository_id),
+        Some(action) => matcher.permits(resources, repository_id, action),
     };
     if permitted {
         Ok(())
@@ -386,11 +417,24 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         // claim and are checked online — the identity-token paths are where
         // revocation is observable. An access token's grants hold for its
         // lifetime, on this path as on QUIC.
-        if let Some(resources) = token.and_then(|token| token.claims.resources.as_deref()) {
-            return evaluate_resources_claim(resources, repository_id, action);
+        if let Some(verdict) = self.check_repository_access_sync(token, repository_id, action) {
+            return verdict;
         }
         self.check_access_with_header(bearer_header(token), repository_id, action)
             .await
+    }
+
+    /// An access token is answered from its `resources` claim, exactly as
+    /// the async path does. An identity token needs `CheckUserPermission`,
+    /// so `None`.
+    fn check_repository_access_sync(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Option<Result<(), Status>> {
+        let resources = token.and_then(|token| token.claims.resources.as_deref())?;
+        Some(evaluate_resources_claim(resources, repository_id, action))
     }
 
     async fn granted_actions(
@@ -658,6 +702,119 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    mod sync_check {
+        use std::str::FromStr;
+
+        use lore_base::types::Context;
+
+        use super::*;
+
+        fn repository() -> RepositoryId {
+            Context::from_str("0194b726b34e72b0b45550b88a967076")
+                .unwrap()
+                .into()
+        }
+
+        /// Implements only the required method, so the sync check is the
+        /// trait's default.
+        struct PolicyOnly;
+
+        #[async_trait]
+        impl RepositoryAuthorizer for PolicyOnly {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                _repository_id: RepositoryId,
+                _action: Option<&str>,
+            ) -> Result<(), Status> {
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn default_cannot_answer_without_io() {
+            assert!(
+                PolicyOnly
+                    .check_repository_access_sync(None, repository(), None)
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn allow_all_answers_everything() {
+            let claims = AuthorizationToken::default();
+            let token = VerifiedToken {
+                raw: "raw",
+                claims: &claims,
+            };
+            for token in [None, Some(&token)] {
+                for action in [None, Some("obliterate")] {
+                    AllowAllRepositoryAuthorizer
+                        .check_repository_access_sync(token, repository(), action)
+                        .expect("allow-all needs no I/O")
+                        .unwrap();
+                }
+            }
+        }
+
+        /// An access token's `resources` claim is the auth service's own
+        /// signed answer, so the legacy authorizer answers it in place and
+        /// agrees with its async path. An identity token needs the network.
+        #[tokio::test]
+        async fn auth_client_answers_access_tokens_and_declines_identity_tokens() {
+            let authorizer = AuthClientAuthorizer::new("https://auth.invalid".to_string());
+            let granted = AuthorizationToken {
+                resources: Some(vec![crate::auth::jwt::ResourcePermission {
+                    resource_id: format!("urc-{}", repository()),
+                    permission: vec!["migrate".to_string()],
+                }]),
+                ..Default::default()
+            };
+            let elsewhere = AuthorizationToken {
+                resources: Some(vec![crate::auth::jwt::ResourcePermission {
+                    resource_id: "urc-somewhere-else".to_string(),
+                    permission: vec![],
+                }]),
+                ..Default::default()
+            };
+            for claims in [&granted, &elsewhere] {
+                let token = VerifiedToken {
+                    raw: "raw.jwt",
+                    claims,
+                };
+                for action in [None, Some("migrate"), Some("obliterate")] {
+                    let sync = authorizer
+                        .check_repository_access_sync(Some(&token), repository(), action)
+                        .expect("access tokens are answered in place");
+                    let asynchronous = authorizer
+                        .check_repository_access(Some(&token), repository(), action)
+                        .await;
+                    assert_eq!(
+                        sync.is_ok(),
+                        asynchronous.is_ok(),
+                        "{action:?} on {claims:?}"
+                    );
+                }
+            }
+
+            let identity = AuthorizationToken::default();
+            let token = VerifiedToken {
+                raw: "raw.jwt",
+                claims: &identity,
+            };
+            assert!(
+                authorizer
+                    .check_repository_access_sync(Some(&token), repository(), None)
+                    .is_none()
+            );
+            assert!(
+                authorizer
+                    .check_repository_access_sync(None, repository(), None)
+                    .is_none()
+            );
         }
     }
 
