@@ -165,9 +165,9 @@ xcuserdata
 
 # claude
 *.local.*
+.claude/settings.local.json
 .claude/skills/review-feedback/
 .claude-worktrees/
-context/
 
 # test report
 ctrf/

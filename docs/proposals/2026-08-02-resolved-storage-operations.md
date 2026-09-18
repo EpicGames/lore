@@ -3,9 +3,9 @@ lep: 2026-08-02-resolved-storage-operations
 title: Resolved Storage Operations for Foreign-Keyed Data
 authors:
   - mattias.jansson
-status: Draft
+status: Accepted
 created: 2026-08-02
-updated: 2026-09-01
+updated: 2026-09-04
 discussion: <TBD — fill in CR link when discussion CR is opened>
 ---
 

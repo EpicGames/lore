@@ -3,9 +3,9 @@ lep: 2026-08-04-unify-store-existence-and-metadata
 title: Unify store existence, query and metadata
 authors:
   - Mattias Jansson
-status: Draft
+status: Accepted
 created: 2026-08-04
-updated: 2026-08-07
+updated: 2026-09-04
 ---
 
 # Unify store existence, query and metadata

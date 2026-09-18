@@ -5,7 +5,7 @@ authors:
   - mattias.jansson
 status: Approved
 created: 2026-06-19
-updated: 2026-09-32
+updated: 2026-08-31
 discussion: https://github.com/EpicGames/lore/pull/39
 ---
 

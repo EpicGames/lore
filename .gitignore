@@ -158,6 +158,9 @@ xcuserdata
 *.local.*
 .claude/
 .claude-worktrees/
+context/
+AGENTS.md
+CLAUDE.md
 
 # test report
 ctrf/

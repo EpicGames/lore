@@ -1,6 +1,6 @@
 # The Lore Version Control System
 
-> **Status:** Draft
+> **Status:** Accepted
 
 A reference document explaining the rationale, goals, and theoretical design of Lore. This is not a
 peer-reviewed paper; it is a public-facing standalone description of the system, intended to make

@@ -1,10 +1,10 @@
 ---
-status: proposed
+status: accepted
 date: 2026-08-03
 deciders: Mattias Jansson
 ---
 
-# ADR-00018: Store fragment metadata as S3 object metadata
+# ADR-00020: Store fragment metadata as S3 object metadata
 
 ## Context and Problem Statement
 

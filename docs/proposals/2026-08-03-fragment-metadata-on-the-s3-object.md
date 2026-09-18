@@ -3,9 +3,9 @@ lep: 2026-08-03-fragment-metadata-on-the-s3-object
 title: Carry fragment metadata on the S3 object
 authors:
   - Mattias Jansson
-status: Draft
+status: Accepted
 created: 2026-08-03
-updated: 2026-08-04
+updated: 2026-09-04
 discussion: https://github.com/EpicGames/lore/pull/157
 ---
 
@@ -102,7 +102,7 @@ also helps: keeping the fragment out of the body means no offset arithmetic on r
 noted downside — an empty sentinel object per association — is moot now that associations live in
 `DynamoDB`.
 
-[ADR-00018](../developing/decisions/00018-fragment-metadata-on-s3-objects.md) accompanies this
+[ADR-00020](../developing/decisions/00020-fragment-metadata-on-s3-objects.md) accompanies this
 proposal and supersedes ADR-00006. It carries the intervening history — the move into `DynamoDB` and
 why — so no separate record of that move is needed.
 

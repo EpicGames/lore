@@ -1,5 +1,5 @@
 ---
-status: superseded by [ADR-00018](00018-fragment-metadata-on-s3-objects.md)
+status: superseded by [ADR-00020](00020-fragment-metadata-on-s3-objects.md)
 date: 2024-05-19
 deciders: Mattias Jansson
 ---

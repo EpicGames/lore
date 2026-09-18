@@ -4,7 +4,7 @@ date: 2026-07-29
 deciders: Raghav Narula
 ---
 
-# ADR-00018: View-independent merges, subtree adoption, and out-of-view conflicts
+# ADR-00021: View-independent merges, subtree adoption, and out-of-view conflicts
 
 ## Context and Problem Statement
 
