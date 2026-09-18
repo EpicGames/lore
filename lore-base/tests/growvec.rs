@@ -199,6 +199,29 @@ mod tests {
         assert_eq!(gv.to_vec(), vv);
     }
 
+    /// Two references into one chunk, alive at the same time. The second must not invalidate the
+    /// first, which it did while the iterator borrowed the whole chunk for every element.
+    #[test]
+    fn iter_mut_yields_references_that_outlive_each_other() {
+        let mut gv: GrowVec<u64, N> = GrowVec::new();
+        for value in 0..4 {
+            gv.push(value);
+        }
+
+        {
+            let mut iter = gv.iter_mut();
+            let first = iter.next().expect("first element");
+            let second = iter.next().expect("second element");
+            *first += 10;
+            *second += 20;
+            assert_eq!(*first, 10);
+            assert_eq!(*second, 21);
+        }
+
+        // Both writes landed in the vector, not in copies of its elements.
+        assert_eq!(gv.to_vec(), vec![10, 21, 2, 3]);
+    }
+
     #[test]
     fn zst_support() {
         let mut gv: GrowVec<(), N> = GrowVec::new();
@@ -209,6 +232,19 @@ mod tests {
         gv.insert(5, ());
         assert_eq!(gv.len(), 11);
         assert_eq!(gv.iter().count(), 11);
+
+        // A zero-sized element has no bytes, so its references cannot conflict.
+        assert_eq!(gv.iter_mut().count(), 11);
+
+        // Cloning allocates a chunk per chunk, so it takes the zero-sized path too.
+        let clone = gv.clone();
+        assert_eq!(clone.len(), 11);
+        assert_eq!(clone.iter().count(), 11);
+
+        // SAFETY: A zero-sized chunk holds no bytes, so no read can observe uninitialised memory.
+        let unzeroed: GrowVec<(), N> = unsafe { GrowVec::new_unzeroed_with_size(11) };
+        assert_eq!(unzeroed.len(), 11);
+        assert_eq!(unzeroed.iter().count(), 11);
     }
 
     #[test]
