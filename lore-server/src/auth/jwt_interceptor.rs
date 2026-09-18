@@ -44,15 +44,19 @@ fn authorize(verifier: &JwtVerifier, token: &str) -> Result<AuthorizationToken, 
 /// Authentication only: verifies the signature, parses the bearer token claims, and hands
 /// the verified halves to the handler as extensions ([`RawToken`] for the raw token
 /// string, and [`AuthorizationToken`] for the parsed claims).
+///
+/// With no verifier (no `[server.auth]`), every request passes through untouched: no
+/// bearer token is required, one that is present is not read, and no extension is
+/// inserted.
 #[derive(Clone)]
 pub struct JWTInterceptor {
-    jwt_verifier: JwtVerifier,
+    jwt_verifier: Option<JwtVerifier>,
 }
 
 impl JWTInterceptor {
-    pub fn new(jwt_verifier: &JwtVerifier) -> Self {
+    pub fn new(jwt_verifier: Option<&JwtVerifier>) -> Self {
         Self {
-            jwt_verifier: jwt_verifier.clone(),
+            jwt_verifier: jwt_verifier.cloned(),
         }
     }
 }
@@ -62,11 +66,15 @@ impl Interceptor for JWTInterceptor {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
+        let Some(jwt_verifier) = &self.jwt_verifier else {
+            return Ok(request);
+        };
+
         let token = extract_bearer_token(request.metadata()).ok_or(
             tonic::Status::unauthenticated("authorization header required"),
         )?;
 
-        let authorization = authorize(&self.jwt_verifier, &token)?;
+        let authorization = authorize(jwt_verifier, &token)?;
         add_auth_fields_to_current_span(&authorization);
 
         request.extensions_mut().insert(RawToken(token));
@@ -145,12 +153,12 @@ mod tests {
     }
 
     fn interceptor_with_identity_claim(identity_claim: &str) -> JWTInterceptor {
-        JWTInterceptor::new(&JwtVerifier {
+        JWTInterceptor::new(Some(&JwtVerifier {
             jwk_service: Arc::new(CachedJWKService),
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             identity_claim: identity_claim.to_string(),
-        })
+        }))
     }
 
     fn encode_token(claims: &serde_json::Value) -> String {
@@ -274,6 +282,27 @@ mod tests {
             .call(tonic::Request::new(()))
             .expect_err("no bearer token");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    /// The no-auth server's registration path: with no verifier the interceptor stands
+    /// aside. A request without a token passes, and one carrying a token that would
+    /// never verify passes too, with nothing inserted for a handler to mistake for a
+    /// verified caller.
+    #[test]
+    fn without_a_verifier_every_request_passes_untouched() {
+        let mut interceptor = JWTInterceptor::new(None);
+
+        let request = interceptor
+            .call(tonic::Request::new(()))
+            .expect("no verifier means no token is required");
+        assert!(request.extensions().get::<AuthorizationToken>().is_none());
+        assert!(request.extensions().get::<RawToken>().is_none());
+
+        let request = interceptor
+            .call(request_with("not.a.jwt", None))
+            .expect("no verifier means the token is not read");
+        assert!(request.extensions().get::<AuthorizationToken>().is_none());
+        assert!(request.extensions().get::<RawToken>().is_none());
     }
 
     /// Authentication still lives here: a token that fails on its own claims is refused

@@ -54,6 +54,15 @@ use crate::grpc::timeout_grpc;
 /// only place the body is decoded. All such calls still use the common
 /// [`RepositoryAuthorizer`], so that all the authorization decisions are done
 /// using the same logic.
+///
+/// A caller with no verified token (the interceptor stands aside on a
+/// no-auth server) is still the authorizer's reachability question, but is
+/// exposed no grants even when the authorizer enumerates some: grants are the
+/// caller's, and `permits` grants nothing without a verified token. The QUIC
+/// connect and the HTTP middleware enumerate behind a verified token only,
+/// and this keeps the three entry points agreeing that an allow-all verdict
+/// opens a no-auth server's partitions without elevating anonymous callers
+/// to its privileged actions.
 #[derive(Clone)]
 pub struct PartitionAccessLayer {
     authorizer: Arc<dyn RepositoryAuthorizer>,
@@ -152,7 +161,7 @@ where
                     let token = get_verified_token(extensions);
                     Ok(
                         match authorizer.granted_access(token.as_ref(), repository).await {
-                            Ok(grants) => Access::Granted(grants),
+                            Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
                             Err(_denied) => Access::Denied,
                         },
                     )
@@ -515,6 +524,24 @@ mod tests {
         );
     }
 
+    /// An anonymous caller reaches the service when the authorizer permits
+    /// (the no-auth server under allow-all) but is exposed no grants, so a
+    /// handler's action check still finds nothing to grant.
+    #[tokio::test]
+    async fn an_anonymous_caller_is_exposed_no_grants() {
+        let authorizer = EnumeratingAuthorizer::new(Grants::All);
+        let inner = GrantsInner::default();
+        let mut service =
+            PartitionAccessLayer::new(authorizer.clone(), TEST_TIMEOUT).layer(inner.clone());
+
+        service
+            .call(request(Some(repository()), false))
+            .await
+            .unwrap();
+
+        assert_eq!(*inner.0.lock().unwrap(), vec![None]);
+    }
+
     /// An enumeration holding no access denies without consulting the
     /// per-question path — `Denied` is a verdict, not a fallback.
     #[tokio::test]
@@ -741,12 +768,12 @@ mod tests {
         #[tokio::test]
         async fn the_authorizer_sees_the_claims_the_interceptor_verified() {
             let authorizer = RecordingAuthorizer::new(false);
-            let interceptor = JWTInterceptor::new(&JwtVerifier {
+            let interceptor = JWTInterceptor::new(Some(&JwtVerifier {
                 jwk_service: Arc::new(CachedJWKService),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
-            });
+            }));
             let inner = Inner::default();
             let mut stack = InterceptedService::new(
                 PartitionAccessLayer::new(authorizer.clone(), TEST_TIMEOUT).layer(inner.clone()),
