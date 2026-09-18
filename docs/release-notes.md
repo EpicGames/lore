@@ -53,6 +53,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore revision sync` warns when the remote is reachable but its revision could not be read, instead of silently syncing against local history: `LoreRevisionSyncTargetEventData` gains `remote_available` and `remote_authorized`
 - `loreserver` container images are published from each GitHub release's own binaries to `ghcr.io/epicgames/lore/loreserver`, signed with cosign. `X.Y.Z`, `X.Y` and `latest` are `linux/amd64`; the `-graviton` tags are `linux/arm64` tuned for Graviton3 and newer. See `DOCKER.md`
 - `aarch64-unknown-linux-gnu` builds portable by default rather than always tuning for `neoverse-512tvb`, which SIGILLs on older arm64. Opt in with `--config .cargo/neoverse-512tvb.toml --features lore-base/neoverse-512tvb`
+- `lore`: `LoreRevisionSyncArgs` and `LoreBranchMergeStartArgs` take `metadata_keys`, `metadata_values` and `metadata_formats`, the triple `lore_revision_commit_with_metadata` takes, so the merge a diverged sync commits and a conflict-free branch merge record the caller's own metadata. A caller whose connecting identity is an account id can name the author in `created-by` as it does for a plain commit; empty leaves the auto commit as before. Distinct from `--inherit-metadata`, which carries keys from the source revision
 
 ### Fixes & Improvements
 
