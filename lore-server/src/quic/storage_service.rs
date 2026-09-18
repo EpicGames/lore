@@ -261,7 +261,7 @@ fn request_identifiers_from_context(
     let correlation_id =
         correlation_id.map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
     let user_id = authorization_token
-        .map(|token| token.user_id.clone())
+        .map(|token| token.identity().to_string())
         .filter(|user_id| !user_id.is_empty())
         .unwrap_or_else(|| NO_USER_ID.to_string());
     (

@@ -1781,6 +1781,7 @@ mod tests {
             jwk_service: Arc::new(service),
             jwt_issuer: Some(vec![provider.base.clone()]),
             jwt_audience: Some(vec!["Lore".to_string()]),
+            identity_claim: crate::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
         };
         let token = {
             let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);

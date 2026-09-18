@@ -699,6 +699,7 @@ mod tests {
         use super::*;
         use crate::auth::jwk::JWKService;
         use crate::auth::jwk::JWKServiceError;
+        use crate::auth::jwt::DEFAULT_IDENTITY_CLAIM;
         use crate::auth::jwt::JwtVerifier;
         use crate::auth::jwt_interceptor::JWTInterceptor;
 
@@ -744,6 +745,7 @@ mod tests {
                 jwk_service: Arc::new(CachedJWKService),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             });
             let inner = Inner::default();
             let mut stack = InterceptedService::new(

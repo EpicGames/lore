@@ -50,7 +50,7 @@ pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::Execut
 
 pub fn get_user_id_from_token_ref(maybe_token: Option<&AuthorizationToken>) -> String {
     if let Some(token) = maybe_token {
-        token.user_id.clone()
+        token.identity().to_string()
     } else {
         "<unknown>".to_string()
     }

@@ -283,6 +283,7 @@ mod test {
         use crate::auth::jwk::JWKService;
         use crate::auth::jwk::JWKServiceError;
         use crate::auth::jwt::AuthorizationToken;
+        use crate::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 
         const ALGORITHM: Algorithm = Algorithm::HS256;
         const SIGNING_SECRET: &str = "forwarded-get-test-secret";
@@ -319,6 +320,7 @@ mod test {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+                identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }
         }
 

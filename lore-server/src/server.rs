@@ -1855,6 +1855,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 jwk_service: Arc::new(jwk_service),
                 jwt_issuer: Some(auth.jwt_issuer.clone()),
                 jwt_audience: Some(auth.jwt_audience.clone()),
+                identity_claim: auth.identity_claim.clone(),
             })
         }
         None => None,

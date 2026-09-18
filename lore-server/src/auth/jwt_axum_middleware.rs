@@ -48,7 +48,7 @@ pub async fn jwt_axum_verify_authorization(
                     .granted_access(Some(&token), repository)
                     .await
                 {
-                    Span::current().record(USER_ID, &user_info.user_id);
+                    Span::current().record(USER_ID, user_info.identity());
                     if let Some(grants) = grants {
                         request.extensions_mut().insert(PartitionGrants {
                             repository_id: repository,
@@ -117,6 +117,7 @@ mod tests {
     use super::*;
     use crate::auth::jwk::JWKService;
     use crate::auth::jwk::JWKServiceError;
+    use crate::auth::jwt::DEFAULT_IDENTITY_CLAIM;
     use crate::auth::jwt::JwtVerifier;
     use crate::auth::jwt::ResourcePermission;
     use crate::authnz::repository_authorizer::AuthClientAuthorizer;
@@ -161,6 +162,7 @@ mod tests {
             jwk_service: Arc::new(jwk_service),
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
         }
     }
 

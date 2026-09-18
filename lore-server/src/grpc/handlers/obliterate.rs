@@ -157,6 +157,7 @@ mod tests {
     use super::*;
     use crate::auth::jwk::JWKService;
     use crate::auth::jwk::JWKServiceError;
+    use crate::auth::jwt::DEFAULT_IDENTITY_CLAIM;
     use crate::auth::jwt::ResourcePermission;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
@@ -194,6 +195,7 @@ mod tests {
             jwk_service: Arc::new(jwk_service),
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
         }
     }
 
@@ -217,6 +219,7 @@ mod tests {
             is_service_account: Some(false),
             idp: Some("test".to_string()),
             extra: Default::default(),
+            identity: None,
         };
         let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
         let mut header = Header::new(ALGORITHM);

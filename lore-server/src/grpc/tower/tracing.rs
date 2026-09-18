@@ -130,7 +130,7 @@ fn user_agent_field(headers: &http::HeaderMap) -> &str {
 fn user_id_from_extensions(extensions: &Extensions) -> Option<String> {
     extensions
         .get::<AuthorizationToken>()
-        .map(|auth| auth.user_id.clone())
+        .map(|auth| auth.identity().to_string())
 }
 
 const UNKNOWN_RPC_SEGMENT: &str = "<unknown>";

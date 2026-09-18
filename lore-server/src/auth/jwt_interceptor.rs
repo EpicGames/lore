@@ -14,7 +14,7 @@ use crate::authnz::repository_authorizer::RawToken;
 
 fn add_auth_fields_to_current_span(auth: &AuthorizationToken) {
     let span = Span::current();
-    span.record(USER_ID, auth.user_id.clone());
+    span.record(USER_ID, auth.identity().to_string());
 }
 
 /// Resolve the bearer token to an [`AuthorizationToken`]. The cached signing key serves the
@@ -110,6 +110,7 @@ mod tests {
     use super::*;
     use crate::auth::jwk::JWKService;
     use crate::auth::jwk::JWKServiceError;
+    use crate::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 
     const SIGNING_SECRET: &str = "the-secret";
 
@@ -140,10 +141,15 @@ mod tests {
     }
 
     fn interceptor() -> JWTInterceptor {
+        interceptor_with_identity_claim(DEFAULT_IDENTITY_CLAIM)
+    }
+
+    fn interceptor_with_identity_claim(identity_claim: &str) -> JWTInterceptor {
         JWTInterceptor::new(&JwtVerifier {
             jwk_service: Arc::new(CachedJWKService),
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
+            identity_claim: identity_claim.to_string(),
         })
     }
 
@@ -212,6 +218,44 @@ mod tests {
         // extensions, so both halves must ride along.
         assert!(request.extensions().get::<AuthorizationToken>().is_some());
         assert!(request.extensions().get::<RawToken>().is_some());
+    }
+
+    /// The identity every handler records and compares comes out of the extensions the
+    /// interceptor inserts, so this is where `identity_claim` takes effect end to end.
+    #[test]
+    fn the_identity_claim_decides_what_handlers_read_as_the_user_id() {
+        let token = encode_token(&json!({
+            "iss": "the issuer",
+            "sub": "f7d3a1c2-0000-0000-0000-000000000000",
+            "preferred_username": "alice",
+            "aud": "Lore",
+            "iat": 1,
+            "exp": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .checked_add(Duration::from_secs(60))
+                .unwrap()
+                .as_secs(),
+        }));
+
+        let request = interceptor()
+            .call(request_with(&token, None))
+            .expect("verifies");
+        assert_eq!(
+            crate::grpc::get_user_id(request.extensions()),
+            "f7d3a1c2-0000-0000-0000-000000000000"
+        );
+
+        let request = interceptor_with_identity_claim("preferred_username")
+            .call(request_with(&token, None))
+            .expect("verifies");
+        assert_eq!(crate::grpc::get_user_id(request.extensions()), "alice");
+
+        let status = interceptor_with_identity_claim("oid")
+            .call(request_with(&token, None))
+            .expect_err("no `oid` claim to attribute the caller by");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+        assert_eq!(status.message(), "Not allowed");
     }
 
     /// A request carrying no partition metadata needs no claim naming the zero partition
