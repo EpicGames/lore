@@ -33,6 +33,13 @@ pub struct Filter {
     memo: AncestorMemo,
 }
 
+/// One filter's rules, with the indexes that answer subtree questions about them.
+///
+/// The footprint is load-bearing. [`Filter`] holds two of these by value and a
+/// whole-path query reads across both, so a field costs several percent of that
+/// query whether or not anything reads it, and removing one costs as much as
+/// adding one. A dead field of the same width separates that from the cost of
+/// whatever the new field does.
 #[derive(Clone, Default, Debug)]
 pub struct FilterInstance {
     /// Match lines in authored order. Every authored rule contributes exactly
@@ -41,7 +48,11 @@ pub struct FilterInstance {
     pub lines: Vec<FilterLine>,
     /// Answers whether any inclusion can land below a directory, which is what
     /// decides descent into an excluded one. Built as the lines are added.
-    reinclude: ReincludeIndex,
+    reinclude: RuleIndex,
+    /// The same question asked of the exclusions, which is what decides whether
+    /// an included directory holds anything this filter could exclude. See
+    /// [`covers_subtree`](Self::covers_subtree).
+    exclude: RuleIndex,
 }
 
 /// One glob and the two facts about the authored rule that the glob text cannot
@@ -238,54 +249,65 @@ pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
 /// Reads the authored rules from a filter file, one per line.
 ///
 /// A file that cannot be read is not an error: there is no filter, so nothing is
-/// excluded. A file that can be read but not understood is, and the whole file
-/// is refused rather than the offending line skipped — a filter missing a rule
+/// excluded. A caller that needs to tell an absent filter from an empty one — an
+/// operation replacing the view, say, where the two mean different things —
+/// reads the bytes itself and calls [`parse_filter`].
+pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError> {
+    let path = path.as_ref();
+    match std::fs::read(path) {
+        Ok(bytes) => parse_filter(&bytes, path),
+        Err(_) => Ok(FilterInstance::default()),
+    }
+}
+
+/// Parses the authored rules in `bytes`, one per line. `path` names the file
+/// they came from, for the error message.
+///
+/// A file that can be read but not understood is an error, and the whole file is
+/// refused rather than the offending line skipped — a filter missing a rule
 /// excludes less than the file asks for, and the caller has no way to tell that
 /// from a filter that matched everything it named.
 ///
-/// The file is read whole because its encoding is a property of its leading
-/// bytes and a UTF-16 one has to be transcoded before it has lines at all;
+/// The bytes arrive whole because the encoding is a property of the leading ones
+/// and a UTF-16 file has to be transcoded before it has lines at all;
 /// [`decode_text_for_parsing`] names the encodings accepted.
-pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError> {
-    let path = path.as_ref();
+pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterError> {
+    let text = decode_text_for_parsing(bytes).map_err(|error| InvalidArguments {
+        reason: format!("{}: {}", path.display(), error.reason),
+    })?;
     let mut filter = FilterInstance::default();
-    if let Ok(bytes) = std::fs::read(path) {
-        let text = decode_text_for_parsing(&bytes).map_err(|error| InvalidArguments {
-            reason: format!("{}: {}", path.display(), error.reason),
-        })?;
-        let mut has_include = false;
-        let mut has_exclude = false;
-        for line in text.lines() {
-            let mut glob = line.trim();
-            if glob.is_empty() || glob.starts_with('#') {
-                continue;
-            }
-
-            let mut negated = false;
-            while glob.starts_with('!') {
-                negated = !negated;
-                glob = &glob[1..];
-            }
-
-            // Allow exclamation marks in path/file names through escape backslash
-            if glob.starts_with("\\!") {
-                glob = &glob[1..];
-            }
-
-            if negated {
-                filter.add_inclusion(glob)?;
-                has_include = true;
-            } else {
-                filter.add_exclusion(glob)?;
-                has_exclude = true;
-            }
+    let mut has_include = false;
+    let mut has_exclude = false;
+    for line in text.lines() {
+        let mut glob = line.trim();
+        if glob.is_empty() || glob.starts_with('#') {
+            continue;
         }
 
-        if has_include && !has_exclude {
-            lore_warn!(
-                "Filter only has inclusions but no exclusions, this will not have any effect - did you forget to exclude all?"
-            );
+        let mut negated = false;
+        while glob.starts_with('!') {
+            negated = !negated;
+            glob = &glob[1..];
         }
+
+        // Allow exclamation marks in path/file names through escape backslash
+        if glob.starts_with("\\!") {
+            glob = &glob[1..];
+        }
+
+        if negated {
+            filter.add_inclusion(glob)?;
+            has_include = true;
+        } else {
+            filter.add_exclusion(glob)?;
+            has_exclude = true;
+        }
+    }
+
+    if has_include && !has_exclude {
+        lore_warn!(
+            "Filter only has inclusions but no exclusions, this will not have any effect - did you forget to exclude all?"
+        );
     }
     Ok(filter)
 }
@@ -364,6 +386,16 @@ fn component_count(path: &str) -> u32 {
     path.bytes().filter(|byte| *byte == b'/').count() as u32 + 1
 }
 
+/// How deep a query about `path` stands, which bounds which rules can reach
+/// below it. The repository root arrives empty and names no component.
+fn query_depth(path: &str) -> u32 {
+    if path.is_empty() {
+        0
+    } else {
+        component_count(path)
+    }
+}
+
 /// Whether a whole glob is plain text, so a comparison decides it.
 ///
 /// A backslash counts, because the glob engine unescapes it and a comparison
@@ -376,8 +408,87 @@ fn is_literal(glob: &str) -> bool {
 
 /// Whether a single path component holds a glob metacharacter, so no literal
 /// text can stand in for it.
+///
+/// A brace group counts. An alternative inside one may hold a separator, so
+/// neither the group's text nor what follows it names a component. A
+/// [`RuleIndex`] enumerates the alternatives rather than stop here, and this is
+/// what answers for the forms it declines to enumerate: a rule compared as text,
+/// an escaped brace, and one with more alternatives than the cap.
 fn has_wildcard(component: &str) -> bool {
-    component.contains(['*', '?', '['])
+    component.contains(['*', '?', '[', '{'])
+}
+
+/// The first brace group in `glob`, as the offsets of its `{` and its matching
+/// `}`.
+///
+/// Mirrors the matcher's own scan of a group: a bracket expression suppresses
+/// brace syntax, and a backslash escapes the byte after it. Braces that never
+/// balance form no group, which is what the matcher makes of such a pattern --
+/// it calls it invalid and matches nothing with it.
+fn first_brace_group(glob: &str) -> Option<(usize, usize)> {
+    let bytes = glob.as_bytes();
+    let mut open = None;
+    let mut depth = 0u32;
+    let mut in_brackets = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => index += 1,
+            b'{' if !in_brackets => {
+                open = open.or(Some(index));
+                depth += 1;
+            }
+            b'}' if !in_brackets && depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    return open.map(|start| (start, index));
+                }
+            }
+            b'[' if !in_brackets => in_brackets = true,
+            b']' => in_brackets = false,
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The top-level alternatives in a brace group's body, which
+/// [`first_brace_group`] delimits.
+///
+/// A comma inside a nested group or a bracket expression belongs to that
+/// construct, and one behind a backslash is text.
+fn brace_alternatives(body: &str) -> impl Iterator<Item = &str> {
+    let bytes = body.as_bytes();
+    let mut start = 0;
+    let mut index = 0;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        if finished {
+            return None;
+        }
+        let mut depth = 0u32;
+        let mut in_brackets = false;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'\\' => index += 1,
+                b'{' if !in_brackets => depth += 1,
+                b'}' if !in_brackets => depth = depth.saturating_sub(1),
+                b',' if depth == 0 && !in_brackets => {
+                    let alternative = &body[start..index];
+                    index += 1;
+                    start = index;
+                    return Some(alternative);
+                }
+                b'[' if !in_brackets => in_brackets = true,
+                b']' => in_brackets = false,
+                _ => {}
+            }
+            index += 1;
+        }
+        finished = true;
+        Some(&body[start..])
+    })
 }
 
 /// Yields every ancestor of `full` from the root down, and finally `full`
@@ -417,60 +528,98 @@ fn path_prefixes(full: &str, is_directory: bool) -> impl Iterator<Item = (&str, 
     })
 }
 
-/// Stands for "no inclusion here", so comparing against a line index needs no
-/// `Option` unwrapping.
-const NO_LINE: i64 = -1;
-
-/// Literal-prefix index over the inclusion lines, answering whether any
-/// re-inclusion can land below a directory without evaluating a glob.
+/// How far the rules recorded at one point in a [`RuleIndex`] reach: the highest
+/// line any of them sits on, and the deepest path any of them can match.
 ///
-/// A walk needs that answer for every excluded directory it meets, to decide
-/// whether to descend anyway. Deriving it from the lines would cost a scan of
-/// every inclusion per directory, and a filter built from diff paths carries up
-/// to `SOURCE_FILTER_THRESHOLD` of them.
+/// The line is held as a count -- one past the highest index -- so that
+/// [`Default`] means "no rule here" and a query needs neither a sentinel nor
+/// signed arithmetic. A query floored at `floor` asks `lines > floor`, which is
+/// "the highest line is at or after the floor".
 ///
-/// Only the wildcard-free leading components of a glob can be indexed. An
-/// inclusion whose first component holds a wildcard could match at any depth, so
-/// it forces descent everywhere; that is recorded once in `unanchored`.
-/// Over-approximating costs traversal, under-approximating drops re-included
-/// content, so every uncertain case answers "descend".
-#[derive(Clone, Debug)]
-struct ReincludeIndex {
-    root: ReincludeNode,
-    /// Highest line of an inclusion that can match at any depth, because its
-    /// first component holds a wildcard and so no prefix rules it out.
-    unanchored: i64,
+/// Pairing a maximum line with a maximum depth over-approximates: it can pair
+/// one rule's line with another rule's depth and so answer for a rule that is
+/// neither. Only ever towards "a rule reaches here", which is the direction the
+/// index answers every uncertain case in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RuleReach {
+    /// One past the highest line of a rule recorded here; zero for none.
+    lines: u32,
+    /// Most path components the deepest of those rules can match.
+    depth: u32,
 }
 
-impl Default for ReincludeIndex {
-    fn default() -> Self {
+impl RuleReach {
+    /// The reach of the one rule on line `line`, which matches at most `depth`
+    /// path components.
+    fn rule(line: usize, depth: u32) -> Self {
         Self {
-            root: ReincludeNode::default(),
-            unanchored: NO_LINE,
+            lines: line as u32 + 1,
+            depth,
         }
+    }
+
+    /// Widens this reach to cover `other` as well.
+    fn widen(&mut self, other: Self) {
+        self.lines = self.lines.max(other.lines);
+        self.depth = self.depth.max(other.depth);
+    }
+
+    /// Whether a rule recorded here can still matter to a query standing `depth`
+    /// components deep whose earlier lines are floored at `floor`.
+    ///
+    /// The depth comparison is strict because every query asks about what lies
+    /// *below* a path: a rule that cannot match more than `depth` components
+    /// cannot match anything deeper than the directory being asked about.
+    fn reaches(self, floor: u32, depth: u32) -> bool {
+        self.lines > floor && self.depth > depth
     }
 }
 
-#[derive(Clone, Debug)]
-struct ReincludeNode {
+/// Most alternation-free forms of one rule a [`RuleIndex`] enumerates.
+///
+/// Nested groups multiply, so this bounds what a filter can cost to index. Six
+/// two-way groups reach it; a rule written by hand carries a handful.
+const MAX_ALTERNATIVES: usize = 64;
+
+/// Literal-prefix index over the lines of one polarity, answering whether any of
+/// them can match below a directory without evaluating a glob.
+///
+/// A walk needs that answer for every directory it meets. Over the inclusions it
+/// decides whether to descend into an excluded directory anyway; over the
+/// exclusions it decides whether an included one can be taken whole, which is
+/// what [`FilterInstance::covers_subtree`] asks. Deriving either from the lines
+/// would cost a scan of every line per directory, and a filter built from diff
+/// paths carries up to `SOURCE_FILTER_THRESHOLD` of them.
+///
+/// Two independent bounds keep a rule out of an answer, and a rule escapes the
+/// index only by escaping both. The trie bounds *where* it can match: only the
+/// wildcard-free leading components of a glob can be indexed, so one whose first
+/// component holds a wildcard is recorded in `unanchored` and reaches any path.
+/// The [`RuleReach`] depth bounds *how deep*: the `/*` that opens a filter
+/// written as "exclude the top, then re-include what is wanted" compiles to
+/// `*`, which is unanchored and so reaches every path, but which cannot match
+/// below the first level.
+///
+/// Over-approximating costs traversal, under-approximating drops content, so
+/// every uncertain case answers "a rule reaches here".
+#[derive(Clone, Debug, Default)]
+struct RuleIndex {
+    root: RuleNode,
+    /// Rules no prefix can rule out, because the first component of the glob
+    /// holds a wildcard or the rule is matched against a name at any depth.
+    unanchored: RuleReach,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RuleNode {
     /// Component to child. Shallow and narrow in practice, so a `Vec` beats a
     /// map: lookup is a handful of string compares with no hashing.
-    children: Vec<(String, ReincludeNode)>,
-    /// Highest line of an inclusion sitting strictly below this node.
-    below: i64,
-    /// Highest line of an inclusion with a wildcard tail starting here, which
-    /// could match anything at or below this node.
-    wildcard_tail: i64,
-}
-
-impl Default for ReincludeNode {
-    fn default() -> Self {
-        Self {
-            children: Vec::new(),
-            below: NO_LINE,
-            wildcard_tail: NO_LINE,
-        }
-    }
+    children: Vec<(String, RuleNode)>,
+    /// Rules sitting strictly below this node.
+    below: RuleReach,
+    /// Rules with a wildcard tail starting here, which could match anything at
+    /// or below this node.
+    wildcard_tail: RuleReach,
 }
 
 /// Passes a `u64` key straight through.
@@ -551,61 +700,117 @@ impl AncestorMemo {
     }
 }
 
-impl ReincludeIndex {
-    /// Records that the inclusion on line `line` matches `glob`.
+impl RuleIndex {
+    /// Records that the rule on line `line` matches `glob` and can match at most
+    /// `depth` path components. `expand` enumerates the rule's brace
+    /// alternatives.
     ///
-    /// Each node on the way down gains `line` as something below it -- at least
+    /// Each alternative is a separate path the rule can name, and every one has
+    /// to be recorded: the group's text names no component, so a walk prunes
+    /// wherever an alternative was left out. They are enumerated up to
+    /// [`MAX_ALTERNATIVES`], beyond which the rule is recorded at its group
+    /// instead and reaches everything below that point.
+    ///
+    /// A caller passes `false` for a rule holding no group, and for one
+    /// [`FilterInstance::step`] compares as text rather than evaluating as a
+    /// glob: that rule's own text is the only thing it matches, so enumerating
+    /// would record paths it never names and leave out the one it does.
+    fn insert(&mut self, glob: &str, expand: bool, line: usize, depth: u32) {
+        if !expand {
+            self.insert_form(glob, line, depth);
+            return;
+        }
+
+        let mut pending = vec![glob.to_owned()];
+        let mut enumerated = 0;
+        while let Some(form) = pending.pop() {
+            let Some((open, close)) = first_brace_group(&form) else {
+                self.insert_form(&form, line, FilterInstance::depth_range(&form, false).1);
+                enumerated += 1;
+                continue;
+            };
+            for alternative in brace_alternatives(&form[open + 1..close]) {
+                if enumerated + pending.len() >= MAX_ALTERNATIVES {
+                    self.insert_form(glob, line, depth);
+                    return;
+                }
+                pending.push(format!(
+                    "{}{alternative}{}",
+                    &form[..open],
+                    &form[close + 1..]
+                ));
+            }
+        }
+    }
+
+    /// Records one alternation-free form of a rule, as [`insert`](Self::insert)
+    /// enumerates them.
+    ///
+    /// Each node on the way down gains the rule as something below it -- at least
     /// the next component, maybe deeper. A wildcard component ends the descent and
     /// marks the node it stops at, because no literal text stands in for it. A
     /// glob that is literal throughout names its final node and marks nothing
     /// below it.
-    fn insert(&mut self, glob: &str, line: usize) {
-        let line = line as i64;
+    fn insert_form(&mut self, glob: &str, line: usize, depth: u32) {
+        let reach = RuleReach::rule(line, depth);
         let mut node = &mut self.root;
         for (index, component) in glob.split('/').enumerate() {
             if has_wildcard(component) {
                 if index == 0 {
-                    self.unanchored = self.unanchored.max(line);
+                    self.unanchored.widen(reach);
                 }
-                node.wildcard_tail = node.wildcard_tail.max(line);
+                node.wildcard_tail.widen(reach);
                 return;
             }
-            node.below = node.below.max(line);
+            node.below.widen(reach);
             let position = node
                 .children
                 .iter()
                 .position(|(name, _)| name == component)
                 .unwrap_or_else(|| {
                     node.children
-                        .push((component.to_owned(), ReincludeNode::default()));
+                        .push((component.to_owned(), RuleNode::default()));
                     node.children.len() - 1
                 });
             node = &mut node.children[position].1;
         }
     }
 
-    /// Whether an inclusion on line `floor` or later can match a path strictly
-    /// below `path`.
+    /// Records the rule on line `line` as one no prefix bounds, so it reaches any
+    /// path. `depth` bounds it as in [`insert`](Self::insert).
+    fn insert_unanchored(&mut self, line: usize, depth: u32) {
+        self.unanchored.widen(RuleReach::rule(line, depth));
+    }
+
+    /// Whether a rule on line `floor` or later can match a path strictly below
+    /// `path`, which stands `depth` components deep.
     ///
-    /// `floor` is the line that excluded `path`. An inclusion before it already
-    /// lost there and [`FilterInstance::step`] will not consult it again below,
-    /// so it cannot re-include anything and must not force a descent. Without
+    /// `floor` is the line that decided the verdict at `path`. A rule before it
+    /// already lost there and [`FilterInstance::step`] will not consult it again
+    /// below, so it cannot change anything and must not force a descent. Without
     /// that comparison the subtree companion of any re-inclusion would keep every
-    /// excluded sibling of its own directory reachable.
+    /// excluded sibling of its own directory reachable. A caller below which
+    /// every line still applies passes `0` -- see
+    /// [`FilterInstance::covers_subtree`].
     ///
-    /// Returns early when nothing in the index is late enough to matter, and when
-    /// the walk falls off the indexed branches.
-    fn below(&self, path: &str, floor: u32) -> bool {
-        let floor = floor as i64;
-        if self.unanchored >= floor {
+    /// Returns early when nothing in the index is late enough or deep enough to
+    /// matter, and when the walk falls off the indexed branches.
+    ///
+    /// An empty `path` is the repository root, which names no component and
+    /// holds everything: any rule the index carries at all lands below it.
+    fn below(&self, path: &str, floor: u32, depth: u32) -> bool {
+        if self.unanchored.reaches(floor, depth) {
             return true;
         }
         let mut node = &self.root;
-        if node.below < floor {
+        if !node.below.reaches(floor, depth) {
             return false;
         }
+        if path.is_empty() {
+            return true;
+        }
         for component in path.split('/') {
-            if node.wildcard_tail >= floor {
+            if node.wildcard_tail.reaches(floor, depth) {
                 return true;
             }
             match node
@@ -617,7 +822,7 @@ impl ReincludeIndex {
                 None => return false,
             }
         }
-        node.below >= floor || node.wildcard_tail >= floor
+        node.below.reaches(floor, depth) || node.wildcard_tail.reaches(floor, depth)
     }
 }
 
@@ -656,26 +861,52 @@ impl FilterInstance {
         (glob, filename, ending_separator)
     }
 
-    /// Fewest path components `glob` can match.
+    /// How many path components `glob` can match: fewest, and most or
+    /// [`u32::MAX`] where nothing bounds it. A name rule is matched against the
+    /// last component alone, so it applies at any depth.
     ///
-    /// Each component consumes one, except a `**` that is not the last: that one
-    /// may absorb nothing, so `a/**/b` can match `a/b`. A trailing `**` needs a
-    /// component of its own, which is what makes `a/**` not match `a`. A name rule
-    /// is matched against the last component and so applies at any depth.
-    fn min_depth(glob: &str, filename: bool) -> u32 {
+    /// The lower bound lets [`step`](Self::step) skip a line against a prefix
+    /// too short for it to match: each component consumes one, except a `**`
+    /// that is not the last, which may absorb nothing, so `a/**/b` can match
+    /// `a/b` while `a/**` does not match `a`.
+    ///
+    /// The upper bound is what a [`RuleIndex`] records, so that a rule unable to
+    /// reach below a directory does not force a walk into it -- without it the
+    /// `*` that a leading `/*` compiles to would reach every path. A `**`
+    /// consumes one component or more, so a glob holding one is unbounded.
+    ///
+    /// Sound because of the matcher's own arithmetic: every component other than
+    /// `**` consumes exactly one path component, since `*` and `?` do not cross
+    /// a separator. It is an over-estimate under every construct the matcher
+    /// supports, which is the direction that has to hold -- brace alternation
+    /// picks a subset of the glob's separators, and classes and escapes only
+    /// make a `/` stop separating, so no expansion has more components than the
+    /// glob text. Over-estimating costs traversal; under-estimating drops
+    /// content.
+    ///
+    /// Both bounds come from one pass because both callers want both, and
+    /// `filter_from_source_changes` builds a filter per three-way diff with up
+    /// to `SOURCE_FILTER_THRESHOLD` rules in it, so a second scan per rule is
+    /// paid there.
+    fn depth_range(glob: &str, filename: bool) -> (u32, u32) {
         if filename {
-            return 1;
+            return (1, u32::MAX);
         }
         let mut total = 0u32;
         let mut optional = 0u32;
         // Reaching another component proves the previous `**` was not the last.
         let mut previous_was_globstar = false;
+        let mut unbounded = false;
         for component in glob.split('/') {
             optional += u32::from(previous_was_globstar);
             total += 1;
             previous_was_globstar = component == "**";
+            unbounded |= previous_was_globstar;
         }
-        (total - optional).max(1)
+        (
+            (total - optional).max(1),
+            if unbounded { u32::MAX } else { total },
+        )
     }
 
     /// Appends an exclusion.
@@ -684,10 +915,24 @@ impl FilterInstance {
     /// excluded directory unless something below it is re-included, and where it
     /// does descend the state carried into [`step`](Self::step) keeps the subtree
     /// excluded without a rule saying so.
+    ///
+    /// Every exclusion enters the exclusion index, name rules included -- the
+    /// one place the two polarities are fed differently. A name rule is not
+    /// indexed as an inclusion because it cannot re-open a pruned subtree, but
+    /// `*.tmp` as an *exclusion* bites at any depth, so leaving it out would let
+    /// [`covers_subtree`](Self::covers_subtree) report a subtree as untouched by
+    /// a filter that excludes half of it.
     pub fn add_exclusion(&mut self, glob: &str) -> Result<(), FilterError> {
         let (glob, filename, ending_separator) = Self::compile(glob);
-        let min_depth = Self::min_depth(&glob, filename);
+        let (min_depth, depth_max) = Self::depth_range(&glob, filename);
         let literal = is_literal(&glob);
+        if filename {
+            self.exclude.insert_unanchored(self.lines.len(), depth_max);
+        } else {
+            let expand = !literal && glob.contains('{');
+            self.exclude
+                .insert(&glob, expand, self.lines.len(), depth_max);
+        }
         self.lines.push(FilterLine {
             glob,
             negated: false,
@@ -733,12 +978,17 @@ impl FilterInstance {
 
         let subtree = (!filename && !glob.ends_with('*')).then(|| format!("{glob}/**"));
 
+        let (min_depth, depth_max) = Self::depth_range(&glob, filename);
+        let literal = is_literal(&glob);
+        // A name rule is neither indexed nor given a companion, so it pays no scan.
+        let braced = !filename && glob.contains('{');
         if !filename {
-            self.reinclude.insert(&glob, self.lines.len());
+            self.reinclude
+                .insert(&glob, braced && !literal, self.lines.len(), depth_max);
         }
         self.lines.push(FilterLine {
-            min_depth: Self::min_depth(&glob, filename),
-            literal: is_literal(&glob),
+            min_depth,
+            literal,
             glob,
             negated: true,
             directory: ending_separator,
@@ -747,9 +997,11 @@ impl FilterInstance {
         });
 
         if let Some(subtree) = subtree {
-            self.reinclude.insert(&subtree, self.lines.len());
+            let (min_depth, depth_max) = Self::depth_range(&subtree, false);
+            self.reinclude
+                .insert(&subtree, braced, self.lines.len(), depth_max);
             self.lines.push(FilterLine {
-                min_depth: Self::min_depth(&subtree, false),
+                min_depth,
                 literal: false,
                 glob: subtree,
                 negated: true,
@@ -903,8 +1155,38 @@ impl FilterInstance {
     /// A walk stops descending here, a fold stops folding here, and
     /// [`excludes_subtree`](Self::excludes_subtree) reports it. `path` is the
     /// lowercase form `state` was produced for.
+    ///
+    /// The query depth is `0`, so every indexed inclusion clears the depth
+    /// bound however shallow its own rule. This side is deliberately unbounded
+    /// in depth: tightening it would prune walks that reach content today.
     fn settles_subtree(&self, state: FilterState, path: &str) -> bool {
-        state.excluded && !self.reinclude.below(path, state.decided_at)
+        state.excluded && !self.reinclude.below(path, state.decided_at, 0)
+    }
+
+    /// Whether `state` includes `path` and no rule can exclude anything below
+    /// it, so every descendant is included too. `depth` is how many components
+    /// `path` has, and `0` for the repository root.
+    ///
+    /// The exact dual of [`settles_subtree`](Self::settles_subtree), and for the
+    /// same reason: [`step`](Self::step) skips every line whose effect equals
+    /// the current state, so from an excluded directory only an inclusion can
+    /// change the verdict below, and from an included one only an exclusion can.
+    ///
+    /// Two filters that both cover a subtree agree on every path in it, whatever
+    /// else they say, so a walk comparing them can take the whole subtree
+    /// without descending.
+    ///
+    /// The floor is `0` rather than `state.decided_at` because `step` itself
+    /// floors at `0` whenever the parent is included: every line applies below
+    /// an included directory, exclusions authored before whatever re-inclusion
+    /// decided it included.
+    fn covers_subtree(&self, state: FilterState, path: &str, depth: u32) -> bool {
+        debug_assert_eq!(
+            depth,
+            query_depth(path),
+            "a depth that is not {path:?}'s own reports a subtree as covered that is not"
+        );
+        !state.excluded && !self.exclude.below(path, 0, depth)
     }
 
     /// One [`step`](Self::step) from `parent`, reduced to the verdict the caller
@@ -1020,6 +1302,30 @@ impl FilterStates {
 }
 
 impl Filter {
+    /// The same ignore rules with `view` in the view slot, and a fresh
+    /// [`AncestorMemo`].
+    ///
+    /// For an operation holding the filter an instance runs under that needs the
+    /// one it is moving to: both are asked the same questions about the same
+    /// tree, so both exist at once.
+    ///
+    /// The fresh memo is what this exists for. [`Filter`] is `Clone` with public
+    /// slots, so `let mut new = old.clone(); new.view = view;` compiles and
+    /// leaves the two sharing a memo that revalidates on the slots' line
+    /// *counts* alone -- two views of equal length would serve each other's
+    /// folded ancestor verdicts.
+    ///
+    /// The ignore slot carries over: it holds the rules [`load`] adds and no
+    /// file names, so dropping it would let staging take `.lore` and the merge
+    /// artifacts.
+    pub fn with_view(&self, view: FilterInstance) -> Self {
+        Self {
+            ignore: self.ignore.clone(),
+            view,
+            memo: AncestorMemo::default(),
+        }
+    }
+
     /// The exclusion verdict for `path` in both slots, given its parent's, plus
     /// why it is excluded if it is.
     ///
@@ -1383,6 +1689,41 @@ impl Filter {
             || (mode.contains(FilterMode::View) && self.view.excludes_subtree(path))
     }
 
+    /// Whether every path at or below `path` is included, for the slots in
+    /// `mode`, given the verdicts at `path` itself. `depth` is how many
+    /// components `path` has; the root is answered at depth `0` whatever a
+    /// caller counted for the path naming it.
+    ///
+    /// The threaded form, for a walk that holds the states: see
+    /// [`FilterInstance::covers_subtree`] for what the answer is worth. Covered
+    /// means covered by every slot in `mode`, since content has to clear both,
+    /// and a slot outside `mode` is not consulted and cannot object -- so an
+    /// empty mode covers everything.
+    ///
+    /// **An ignore slot built by [`load`] covers nothing.** It adds `.lore`,
+    /// `.urc`, the merge artifacts and the temporary extension as name rules,
+    /// which match at any depth and so reach below every path. A caller
+    /// comparing two views therefore asks with [`FilterMode::View`]: the two
+    /// share one ignore slot, which cannot make them disagree, and including
+    /// `Ignore` in the mode would answer `false` everywhere.
+    pub fn covers_subtree(
+        &self,
+        states: FilterStates,
+        path: &impl FilterPath,
+        depth: u32,
+        mode: FilterMode,
+    ) -> bool {
+        let (lowercase, depth) = if path.is_empty() || path.as_str() == "." {
+            ("", 0)
+        } else {
+            (path.as_lowercase_str(), depth)
+        };
+        (!mode.contains(FilterMode::Ignore)
+            || self.ignore.covers_subtree(states.ignore, lowercase, depth))
+            && (!mode.contains(FilterMode::View)
+                || self.view.covers_subtree(states.view, lowercase, depth))
+    }
+
     /// [`excludes_tree`](Self::excludes_tree), emitting a
     /// [`LoreEvent::FilterExclude`] when it hits.
     ///
@@ -1410,5 +1751,81 @@ impl Filter {
             }
             None => false,
         }
+    }
+}
+
+/// The arithmetic behind a [`RuleIndex`] answer, which nothing outside the
+/// module can reach. The behaviour it produces is asserted in `tests/filter.rs`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both bounds over every construct the compiler can hand the index.
+    ///
+    /// The upper bound is the one that has to be an over-estimate: it decides
+    /// whether a rule is dropped from an answer, and a bound that is too small
+    /// drops content with nothing downstream able to tell. It is checked beside
+    /// the lower one, since a pair that crossed would describe a rule able to
+    /// match at no depth at all.
+    ///
+    /// The compiled glob is asserted too, because the bounds read the compiled
+    /// text rather than the authored rule, and the interesting rows differ in
+    /// how `compile` treats them: a leading separator is what decides whether
+    /// `*` is a name rule or a path one, and `**/a/b` keeps a prefix that
+    /// `**/name` loses.
+    #[test]
+    fn the_depth_bounds_agree_on_every_glob_shape() {
+        // Authored rule, compiled glob, name rule, fewest, most.
+        let cases: &[(&str, &str, bool, u32, u32)] = &[
+            ("/Engine/Intermediate", "engine/intermediate", false, 2, 2),
+            ("/*", "*", false, 1, 1),
+            ("/Some/**/Path", "some/**/path", false, 2, u32::MAX),
+            ("*.tmp", "*.tmp", true, 1, u32::MAX),
+            ("Thumbs.db", "thumbs.db", true, 1, u32::MAX),
+            ("**/a/b", "**/a/b", false, 2, u32::MAX),
+            ("**/node_modules", "node_modules", true, 1, u32::MAX),
+            ("/engine/**", "engine/**", false, 2, u32::MAX),
+            ("**", "**", false, 1, u32::MAX),
+            // A brace group expands to no more components than its text, so
+            // counting the text stays an upper bound over both alternatives.
+            ("/a{b,c/d}", "a{b,c/d}", false, 2, 2),
+        ];
+
+        for (rule, glob, filename, min, max) in cases {
+            let (compiled, compiled_filename, _) = FilterInstance::compile(rule);
+            assert_eq!(
+                (compiled.as_str(), compiled_filename),
+                (*glob, *filename),
+                "{rule} compiled to something else"
+            );
+            assert_eq!(
+                FilterInstance::depth_range(glob, *filename),
+                (*min, *max),
+                "{rule} has different bounds"
+            );
+            assert!(*min <= *max, "{rule} can match at no depth at all");
+        }
+    }
+
+    /// A reach holding no rule matters to no query, whatever it is asked, and
+    /// line zero still matters to a floor of zero.
+    ///
+    /// The default is what every unvisited node carries and what a filter with
+    /// no rules of that polarity carries throughout, which is the commonest
+    /// filter there is. Line zero is the boundary the count encoding turns on:
+    /// one off and either no rule is ever consulted or an empty index answers
+    /// for a rule it does not hold.
+    #[test]
+    fn an_empty_reach_reaches_nothing() {
+        let empty = RuleReach::default();
+        for floor in [0, 1, u32::MAX] {
+            for depth in [0, 1, u32::MAX] {
+                assert!(!empty.reaches(floor, depth), "floor {floor}, depth {depth}");
+            }
+        }
+        assert!(
+            RuleReach::rule(0, 1).reaches(0, 0),
+            "the first line of a filter has to clear a floor of zero"
+        );
     }
 }

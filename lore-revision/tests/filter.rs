@@ -3,6 +3,10 @@
 #[cfg(test)]
 mod tests {
     use lore_revision::filter::FilterInstance;
+    use lore_revision::filter::FilterMode;
+    use lore_revision::filter::FilterState;
+    use lore_revision::filter::FilterStates;
+    use lore_revision::repository::TEMP_FILE_EXTENSION;
     use lore_revision::util::path::RelativePath;
 
     include!("helper.rs");
@@ -1290,6 +1294,455 @@ mod tests {
                 None => expected = Some(text),
             }
         }
+    }
+
+    /// `parse_filter` reads the rules a load of the same bytes reads, so a
+    /// caller that has the bytes already does not get a different filter for
+    /// having read them itself.
+    ///
+    /// The split exists so absent and empty can be told apart: `load_filter`
+    /// answers both with an empty filter, which is right where there is nothing
+    /// to exclude and wrong where the file is the record of what is in view.
+    #[test]
+    fn parse_filter_reads_what_a_load_reads() {
+        let dir = TempDir::new("lore-filter-parse-");
+        let file = dir.child("view");
+        test_file_write(&file, ENCODED_RULES.as_bytes());
+
+        let loaded = lore_revision::filter::load_filter(&file).expect("load");
+        let parsed = lore_revision::filter::parse_filter(
+            ENCODED_RULES.as_bytes(),
+            std::path::Path::new("view"),
+        )
+        .expect("parse");
+
+        assert_eq!(parsed.lines.len(), loaded.lines.len());
+        for probe in ENCODED_PROBES {
+            for is_directory in [false, true] {
+                assert_eq!(
+                    parsed.excludes(&probe_path(probe), is_directory),
+                    loaded.excludes(&probe_path(probe), is_directory),
+                    "parsing disagrees with loading on {probe} (directory: {is_directory})"
+                );
+            }
+        }
+
+        assert!(
+            lore_revision::filter::load_filter(dir.child("absent"))
+                .expect("an absent filter loads")
+                .lines
+                .is_empty(),
+            "an absent filter is still an empty one"
+        );
+    }
+
+    /// Paths the covering tests fold over: directories at several depths, files
+    /// under them, and a witness below a directory for every rule set in
+    /// [`COVER_RULES`] -- without one, a rule wrongly left out of the index
+    /// reports a subtree as covered and this list holds nothing to contradict
+    /// it.
+    const COVER_PATHS: &[&str] = &[
+        "engine",
+        "engine/content",
+        "engine/content/asset.uasset",
+        "engine/intermediate",
+        "engine/intermediate/build.obj",
+        "game",
+        "game/maps",
+        "game/maps/level.umap",
+        "game/node_modules",
+        "game/node_modules/package.json",
+        "game/thumbs.db",
+        "game/scratch.tmp",
+        "some",
+        "some/branch",
+        "some/branch/path",
+        "some/branch/path/leaf",
+        "thumbs.db",
+        // A brace alternative reaching through a separator, and a witness under
+        // each of its two expansions.
+        "alt",
+        "alt/b",
+        "alt/b/keep",
+        "alt/b/keep/one.txt",
+        "alt/c",
+        "alt/c/d",
+        "alt/c/d/keep",
+        "alt/c/d/keep/two.txt",
+    ];
+
+    /// Rule sets spanning the shapes that decide a covering answer: an open
+    /// re-inclusion, one with an exclusion nested under it, one with the
+    /// exclusion somewhere else entirely, a literal name rule, a suffix rule, a
+    /// `**` in the middle, and one of each at once.
+    const COVER_RULES: &[&[&str]] = &[
+        &["/*", "!/engine"],
+        &["/*", "!/engine", "/engine/intermediate"],
+        &["/*", "!/game", "/engine/intermediate"],
+        &["Thumbs.db"],
+        &["*.tmp"],
+        &["/some/**/path"],
+        &["/engine/content"],
+        &["**/node_modules"],
+        &["/*", "!/alt", "/alt/{b,c/d}/keep/*"],
+        &[
+            "/*",
+            "!/engine",
+            "!/game",
+            "/engine/intermediate",
+            "*.tmp",
+            "Thumbs.db",
+        ],
+    ];
+
+    /// A walk reaches what a braced inclusion re-includes, and no further.
+    ///
+    /// Each alternative is a separate path the rule names, and the index holds
+    /// every one of them. Left out, the index reports no inclusion below the
+    /// directory an alternative names, the walk prunes there, and the re-included
+    /// content is never reached. Recorded at the group instead, every excluded
+    /// directory in the repository looks as though it might hold something, which
+    /// is what the last assertion here pins.
+    #[test]
+    fn a_braced_inclusion_is_reachable_and_bounded() {
+        let mut filter = FilterInstance::default();
+        filter.add_exclusion("**").expect("exclude");
+        filter
+            .add_inclusion("{game,engine}/content/*")
+            .expect("include");
+
+        let descends = |directory: &str| {
+            let path = probe_path(directory);
+            let state = filter.child_exclusion_state(FilterState::ROOT, &path, true);
+            filter.should_descend(state, &path)
+        };
+
+        for named in ["game", "engine"] {
+            assert!(
+                descends(named),
+                "the walk prunes at {named}, so nothing the rule names is reached"
+            );
+        }
+        for kept in ["game/content/level.umap", "engine/content/asset.uasset"] {
+            assert!(
+                !filter.excludes(&probe_path(kept), false),
+                "{kept} is not re-included"
+            );
+        }
+        assert!(
+            !descends("elsewhere"),
+            "the walk descends where no alternative reaches"
+        );
+    }
+
+    /// A rule compared as text keeps its braces, and its subtree companion does
+    /// not.
+    ///
+    /// A glob carrying no `*?[]\\` is compared to the path rather than
+    /// evaluated, so its braces are part of the name it matches and enumerating
+    /// them would record paths it never names. The companion
+    /// [`FilterInstance::add_inclusion`] generates is evaluated as a glob
+    /// whatever the rule it carries was, so the same braces do alternate there
+    /// and the index has to enumerate them or the walk loses the subtree.
+    ///
+    /// The two together are why the filter re-includes `alt/b/x` without
+    /// re-including `alt/b`.
+    #[test]
+    fn a_literal_braced_rule_matches_its_own_text() {
+        let mut exclusion = FilterInstance::default();
+        exclusion.add_exclusion("/alt/{b,c}").expect("exclude");
+        assert!(exclusion.excludes(&probe_path("alt/{b,c}"), true));
+        for expansion in ["alt/b", "alt/c"] {
+            assert!(
+                !exclusion.excludes(&probe_path(expansion), true),
+                "{expansion} is excluded by a rule that matches text alone"
+            );
+        }
+
+        let mut inclusion = FilterInstance::default();
+        inclusion.add_exclusion("**").expect("exclude");
+        inclusion.add_inclusion("alt/{b,c}").expect("include");
+        let alt = probe_path("alt");
+        let state = inclusion.child_exclusion_state(FilterState::ROOT, &alt, true);
+        assert!(
+            inclusion.should_descend(state, &alt),
+            "the walk never reaches what the companion re-includes"
+        );
+        assert!(!inclusion.excludes(&probe_path("alt/{b,c}"), true));
+        assert!(!inclusion.excludes(&probe_path("alt/b/x"), false));
+        assert!(inclusion.excludes(&probe_path("alt/b"), true));
+    }
+
+    /// A filter holding `rules` in its view slot, built through the file they
+    /// would be authored in so the parser is exercised too.
+    fn view_filter(dir: &TempDir, name: &str, rules: &[&str]) -> lore_revision::filter::Filter {
+        let file = dir.child(name);
+        test_file_write(&file, rules.join("\n").as_bytes());
+        lore_revision::filter::load_view(&file).expect("load view")
+    }
+
+    /// Whether `filter` reports `directory` and everything under it as included.
+    fn covers(filter: &lore_revision::filter::Filter, directory: &str) -> bool {
+        let path = probe_path(directory);
+        let states = filter.exclusion_states(&path);
+        let depth = directory.split('/').count() as u32;
+        filter.covers_subtree(states, &path, depth, FilterMode::View)
+    }
+
+    /// `covers_subtree` may only call a directory covered when nothing below it
+    /// is excluded.
+    ///
+    /// That is the direction which has to hold: a walk comparing two filters
+    /// takes a subtree both of them cover without descending into it, so a
+    /// wrong "covered" drops every change inside it silently. The other
+    /// direction only costs traversal.
+    ///
+    /// Held against `FilterInstance::excludes`, which folds every ancestor on
+    /// every call and consults no index, the way the rest of these tests hold
+    /// the memoized answers against it.
+    #[test]
+    fn a_covered_subtree_holds_nothing_excluded() {
+        let dir = TempDir::new("lore-filter-covers-");
+        let mut covered = 0;
+        for (index, rules) in COVER_RULES.iter().enumerate() {
+            let filter = view_filter(&dir, &format!("view{index}"), rules);
+            for directory in COVER_PATHS {
+                if !covers(&filter, directory) {
+                    continue;
+                }
+                covered += 1;
+                for candidate in COVER_PATHS {
+                    let Some(rest) = candidate.strip_prefix(directory) else {
+                        continue;
+                    };
+                    if !rest.starts_with('/') {
+                        continue;
+                    }
+                    for is_directory in [false, true] {
+                        assert!(
+                            !filter.view.excludes(&probe_path(candidate), is_directory),
+                            "{rules:?} covers {directory} but excludes {candidate} (directory: {is_directory})"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            covered > 0,
+            "no rule set covered any directory, so the comparison asserted nothing"
+        );
+    }
+
+    /// The covering answer for each bound that produces it, named so a
+    /// regression says which one broke.
+    #[test]
+    fn covering_answers_each_bound_that_decides_it() {
+        let dir = TempDir::new("lore-filter-covers-bounds-");
+
+        // `*` is the only exclusion and it cannot reach past the first level,
+        // so the re-included subtree is covered whole.
+        assert!(covers(
+            &view_filter(&dir, "open", &["/*", "!/engine"]),
+            "engine"
+        ));
+
+        // The trie finds `engine/intermediate` below `engine`.
+        assert!(!covers(
+            &view_filter(&dir, "nested", &["/*", "!/engine", "/engine/intermediate"]),
+            "engine"
+        ));
+
+        // `*` keeps its own one-component bound whatever `engine/intermediate`
+        // needs: a single depth for the whole index would lend `*` the longer
+        // rule's reach and lose this prune everywhere.
+        assert!(covers(
+            &view_filter(
+                &dir,
+                "per-marker",
+                &["/*", "!/game", "/engine/intermediate"]
+            ),
+            "game"
+        ));
+
+        // A literal name rule is bounded by no prefix and no depth, so it can
+        // catch a file anywhere and nothing is covered. Recording it is the one
+        // place the two polarities are fed differently -- as an inclusion it is
+        // deliberately left out -- and leaving it out here would report a
+        // subtree holding `game/thumbs.db` as untouched.
+        assert!(!covers(&view_filter(&dir, "name", &["Thumbs.db"]), "game"));
+
+        // A `**` anywhere in a rule leaves its depth unbounded.
+        assert!(!covers(
+            &view_filter(&dir, "globstar", &["/some/**/path"]),
+            "some"
+        ));
+
+        // A brace alternative can hold a separator, so the group's text names no
+        // component and the trie cannot follow it. Each alternative is indexed
+        // in its own right: neither of the two the rule names is covered, and a
+        // sibling neither reaches is, which is the precision enumerating them
+        // buys over marking the group.
+        let braced = view_filter(&dir, "brace", &["/*", "!/alt", "/alt/{b,c/d}/keep/*"]);
+        assert!(
+            braced
+                .view
+                .excludes(&probe_path("alt/c/d/keep/two.txt"), false)
+        );
+        assert!(!covers(&braced, "alt/c"));
+        assert!(!covers(&braced, "alt/b"));
+        assert!(covers(&braced, "alt/untouched"));
+
+        // Nothing to exclude at all covers everything, the root included.
+        let open = view_filter(&dir, "empty", &[]);
+        assert!(covers(&open, "engine"));
+        assert!(open.covers_subtree(
+            FilterStates::ROOT,
+            &RelativePath::new(),
+            0,
+            FilterMode::View
+        ));
+    }
+
+    /// The root is not covered while anything at all is excluded, since
+    /// everything is below it.
+    ///
+    /// The one path with no components, and so the one whose depth a caller
+    /// counting components would get wrong.
+    #[test]
+    fn the_root_is_not_covered_while_anything_is_excluded() {
+        let dir = TempDir::new("lore-filter-covers-root-");
+        for rules in COVER_RULES {
+            let filter = view_filter(&dir, "view", rules);
+            assert!(
+                !filter.covers_subtree(
+                    FilterStates::ROOT,
+                    &RelativePath::new(),
+                    0,
+                    FilterMode::View
+                ),
+                "{rules:?} reports the whole repository as covered"
+            );
+        }
+    }
+
+    /// A slot outside the mode cannot object, so an empty mode covers
+    /// everything.
+    ///
+    /// What makes a walk that asks for no filtering -- the merge graft walk --
+    /// answer the question deliberately rather than by accident of which slots
+    /// happen to hold rules.
+    #[test]
+    fn an_unconsulted_slot_covers_everything() {
+        let dir = TempDir::new("lore-filter-covers-mode-");
+        let filter = view_filter(&dir, "view", &["/*", "!/engine", "/engine/intermediate"]);
+        let path = probe_path("engine");
+        let states = filter.exclusion_states(&path);
+        assert!(!filter.covers_subtree(states, &path, 1, FilterMode::View));
+        assert!(filter.covers_subtree(states, &path, 1, FilterMode::empty()));
+    }
+
+    /// An ignore filter covers nothing, so a caller comparing two views has to
+    /// ask with `View` alone.
+    ///
+    /// `load` adds `.lore`, `.urc`, the merge artifacts and the temporary
+    /// extension as name rules, and a name rule matches at any depth, so one
+    /// reaches below every path there is. Including `Ignore` in the mode would
+    /// answer `false` everywhere and silently cost a two-view walk every prune
+    /// it has.
+    #[test]
+    fn an_ignore_filter_covers_nothing() {
+        let dir = TempDir::new("lore-filter-covers-ignore-");
+        let ignore = dir.child("ignore");
+        test_file_write(&ignore, b"");
+        let view = dir.child("view");
+        test_file_write(&view, b"/*\n!/game\n");
+        let filter = lore_revision::filter::load(&ignore, &view).expect("load");
+
+        for directory in ["game", "game/maps"] {
+            let path = probe_path(directory);
+            let states = filter.exclusion_states(&path);
+            let depth = directory.split('/').count() as u32;
+            assert!(
+                filter.covers_subtree(states, &path, depth, FilterMode::View),
+                "the view covers {directory}"
+            );
+            for mode in [FilterMode::Ignore, FilterMode::Full] {
+                assert!(
+                    !filter.covers_subtree(states, &path, depth, mode),
+                    "{mode:?} reports {directory} as covered"
+                );
+            }
+        }
+    }
+
+    /// `with_view` must not let the new view read the old one's folded ancestor
+    /// verdicts.
+    ///
+    /// Clones share the memo and it revalidates on the slots' line counts
+    /// alone, so two views of equal length are the case that would go
+    /// unnoticed: the stale entry carries a `decided_at` naming a line in the
+    /// filter that is gone, and the replacement answers for a fold it never
+    /// made.
+    #[test]
+    fn with_view_does_not_inherit_folded_verdicts() {
+        let dir = TempDir::new("lore-filter-with-view-memo-");
+        let first = view_filter(&dir, "first", &["/*", "!/game"]);
+
+        let mut second = FilterInstance::default();
+        second.add_exclusion("/*").expect("exclude");
+        second.add_inclusion("/engine").expect("include");
+        assert_eq!(
+            second.lines.len(),
+            first.view.lines.len(),
+            "the two views have to be the same length to be the case this tests"
+        );
+
+        let probe = probe_path("game/level.umap");
+        assert!(
+            !first.excludes(&probe, false, FilterMode::View),
+            "the first view keeps game, so there is a folded verdict to inherit"
+        );
+
+        assert!(
+            first
+                .with_view(second)
+                .excludes(&probe, false, FilterMode::View),
+            "the replacement view excludes game, so the fold cannot have come from the first"
+        );
+    }
+
+    /// `with_view` carries the ignore slot over.
+    ///
+    /// Dropping it would stop excluding `.lore`, the merge artifacts and the
+    /// temporary extension that `load` adds to every ignore filter, and nothing
+    /// would report it until something staged them.
+    #[test]
+    fn with_view_keeps_the_ignore_rules() {
+        let dir = TempDir::new("lore-filter-with-view-ignore-");
+        let ignore = dir.child("ignore");
+        test_file_write(&ignore, b"/build\n");
+        let view = dir.child("view");
+        test_file_write(&view, b"/*\n!/game\n");
+        let filter = lore_revision::filter::load(&ignore, &view).expect("load");
+
+        let mut replacement = FilterInstance::default();
+        replacement.add_exclusion("/*").expect("exclude");
+        let swapped = filter.with_view(replacement);
+
+        for path in [".lore", ".urc", "build"] {
+            assert!(
+                swapped.excludes(&probe_path(path), true, FilterMode::Ignore),
+                "the ignore slot no longer excludes {path}"
+            );
+        }
+        assert!(
+            swapped.excludes(
+                &probe_path(&format!("game/asset{TEMP_FILE_EXTENSION}")),
+                false,
+                FilterMode::Ignore
+            ),
+            "the ignore slot no longer excludes the temporary extension"
+        );
     }
 
     /// The file `save` builds the new rules in, named as the implementation
