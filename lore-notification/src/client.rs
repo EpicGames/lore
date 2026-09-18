@@ -183,7 +183,7 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
 
         let stop = cancellation_token.clone();
         let client_ref = client;
-        let event_sender = execution_context().dispatcher.sender();
+        let event_sender = execution_context().dispatcher.keep_open();
         let task = lore_spawn_net!(async move {
             LoreEvent::NotificationSubscribed(LoreNotificationSubscribedEventData { repository })
                 .send();
