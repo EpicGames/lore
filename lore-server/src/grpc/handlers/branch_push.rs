@@ -595,6 +595,15 @@ async fn try_fast_forward_merge(
         );
         state_current.set_revision_number(revision_number);
 
+        // Match the client commit path — without this, incoming entries are unattributed.
+        lore_revision::commit::weave_history(repository.clone(), state_current.clone())
+            .await
+            .warn_map_err(|err| {
+                Status::internal(format!(
+                    "Failed to weave history for fast-forward merge: {err}"
+                ))
+            })?;
+
         // Copy metadata from the incoming revision and set merged-by to "server"
         let incoming_metadata_hash = incoming_state.metadata_hash();
         if !incoming_metadata_hash.is_zero() {
