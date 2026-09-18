@@ -1006,9 +1006,9 @@ fn a_forced_step_excludes_nothing_and_carries_no_verdict() {
 
 /// `save` writes back rules that load to the same filter, and leaves out the
 /// companions `add_inclusion` generates.
-#[test]
+#[tokio::test]
 #[allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
-fn saved_rules_reload_to_the_same_filter() {
+async fn saved_rules_reload_to_the_same_filter() {
     let authored = [
         "/Intermediate",
         "*.tmp",
@@ -1027,7 +1027,9 @@ fn saved_rules_reload_to_the_same_filter() {
 
     let dir = lore_base::test_util::TempDir::new("lore-filter-save-roundtrip-");
     let file = dir.child("filter");
-    lore_revision::filter::save(&original, &file).expect("save");
+    lore_revision::filter::save(&original, &file)
+        .await
+        .expect("save");
     let reloaded = lore_revision::filter::load_filter(&file).expect("load");
 
     assert_eq!(reloaded.lines.len(), original.lines.len());

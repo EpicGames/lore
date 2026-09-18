@@ -1119,7 +1119,7 @@ fn make_diff_content(bytes: &[u8]) -> DiffContent {
     if !bytes.is_empty() && !is_utf16_bom(bytes) && !infer_is_diffable_by_slice(bytes) {
         DiffContent::Binary
     } else {
-        DiffContent::Text(decode_text_for_display(bytes))
+        DiffContent::Text(decode_text_for_display(bytes).into_owned())
     }
 }
 

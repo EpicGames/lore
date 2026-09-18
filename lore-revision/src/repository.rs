@@ -2231,7 +2231,7 @@ pub async fn load_and_connect_with_token(
         (immutable_store, mutable_store as Arc<dyn MutableStore>)
     };
 
-    let filter = load_filter(path).unwrap_or_default();
+    let filter = load_filter(path)?;
 
     // Resolve the remote eagerly only when we need it for the mutable store upgrade.
     // Otherwise keep it pending so local-only commands never block on the connect.
@@ -2661,7 +2661,12 @@ pub async fn create_local(
     Ok(repository)
 }
 
-pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
+/// Loads the ignore and view filters for the repository rooted at `root_path`.
+///
+/// A filter file that cannot be understood fails the load rather than yielding
+/// an empty filter: an empty one excludes nothing, so the caller would go on to
+/// walk and stage everything the file meant to keep out.
+pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryError> {
     let mut ignore_path = root_path.join(DOT_LOREIGNORE);
 
     // Both formats use .loreignore as the primary ignore file; fall back to
@@ -2673,13 +2678,10 @@ pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
         }
     }
 
-    let view_path = get_dot_lore_path(root_path).ok()?.join(VIEW_FILTER);
-
-    if let Ok(filter) = filter::load(&ignore_path, &view_path) {
-        Some(Arc::new(filter))
-    } else {
-        None
-    }
+    let view_path = get_dot_lore_path(root_path)?.join(VIEW_FILTER);
+    let filter = filter::load(&ignore_path, &view_path)
+        .forward::<RepositoryError>("Failed to load repository filter")?;
+    Ok(Arc::new(filter))
 }
 
 fn branch_switch_create_recurse(

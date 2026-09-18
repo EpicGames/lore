@@ -8,6 +8,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 ### Fixes & Improvements
 
 - Fix a command carried out by the service being answered without part of its output. A relayed call returned its result while its events were still being delivered to the caller's callback, so `lore status` could report a repository with no staged changes. The events are now delivered before the call returns
+- Ignore and view filter files are read as UTF-8, and as UTF-16 of either byte order with a byte-order mark or, where the rules are mostly ASCII, without one. UTF-32, truncated UTF-16, and mark-less UTF-16 that cannot be detected are refused rather than read as UTF-8 into rules carrying NULs, so UTF-16 whose rules lie outside ASCII requires a mark
 
 ## v0.10.0 (Sep 17th 2026) [#1170]
 

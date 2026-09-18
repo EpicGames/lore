@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::BufRead;
-use std::io::BufReader;
-use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -17,6 +13,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::bitflagsops;
+use crate::errors::InvalidArguments;
 use crate::event::LoreEvent;
 use crate::interface::LoreString;
 use crate::lore_warn;
@@ -24,6 +21,7 @@ use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
 use crate::repository::MERGE_ARTIFACT_SUFFIXES;
 use crate::repository::TEMP_FILE_EXTENSION;
+use crate::util::encoding::decode_text_for_parsing;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
 
@@ -79,7 +77,9 @@ pub struct FilterLine {
 }
 
 #[error_set]
-pub enum FilterError {}
+pub enum FilterError {
+    InvalidArguments,
+}
 
 /// Where a walk has got to: the verdict for the directory it is standing in,
 /// and the line that produced it.
@@ -235,12 +235,27 @@ pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
     })
 }
 
+/// Reads the authored rules from a filter file, one per line.
+///
+/// A file that cannot be read is not an error: there is no filter, so nothing is
+/// excluded. A file that can be read but not understood is, and the whole file
+/// is refused rather than the offending line skipped — a filter missing a rule
+/// excludes less than the file asks for, and the caller has no way to tell that
+/// from a filter that matched everything it named.
+///
+/// The file is read whole because its encoding is a property of its leading
+/// bytes and a UTF-16 one has to be transcoded before it has lines at all;
+/// [`decode_text_for_parsing`] names the encodings accepted.
 pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError> {
+    let path = path.as_ref();
     let mut filter = FilterInstance::default();
-    if let Ok(file) = File::open(path) {
+    if let Ok(bytes) = std::fs::read(path) {
+        let text = decode_text_for_parsing(&bytes).map_err(|error| InvalidArguments {
+            reason: format!("{}: {}", path.display(), error.reason),
+        })?;
         let mut has_include = false;
         let mut has_exclude = false;
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
+        for line in text.lines() {
             let mut glob = line.trim();
             if glob.is_empty() || glob.starts_with('#') {
                 continue;
@@ -275,22 +290,34 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
     Ok(filter)
 }
 
-/// Writes the authored rules back out, in order.
+/// Writes the authored rules back out, in order, as UTF-8 with no byte-order
+/// mark whatever encoding they were read from.
 ///
 /// Reconstructed from the compiled lines: a name rule is written as it stands, a
 /// rooted single-component rule regains its leading separator, and a
 /// directory-only rule its trailing one. An authored `**/foo` comes back as
 /// `foo`, which gitignore defines as the same rule.
-pub fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::Result<()> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
+///
+/// A reader sees either the previous rules or the new ones, and a save that
+/// fails leaves the previous ones.
+///
+/// The whole file is built in memory, so it costs one write rather than one per
+/// rule, and the I/O driver's atomic whole-file write publishes it: a temporary
+/// sibling, synced to disk with its parent directory, renamed over the target.
+/// Opening the target itself would truncate it at the open, so a write that then
+/// failed part way, on a full filesystem for instance, would leave a prefix of
+/// the new rules or nothing at all. A filter short a rule excludes less than the
+/// file asked for and nothing downstream can tell, which is the same reason
+/// [`load_filter`] refuses a file it cannot decode whole.
+///
+/// The driver leaves the sibling behind on failure and gives its cleanup to the
+/// caller, so a failure removes it. Nothing reports it while it exists: it is
+/// named with [`TEMP_FILE_EXTENSION`], which the ignore filter excludes and the
+/// working-tree scanners skip.
+pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::Result<()> {
+    let path = path.as_ref();
     let mut out = String::new();
     for line in filter.lines.iter().filter(|line| !line.generated) {
-        out.clear();
         if line.negated {
             out.push('!');
         }
@@ -302,9 +329,34 @@ pub fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::Result<
             out.push('/');
         }
         out.push('\n');
-        file.write_all(out.as_bytes())?;
     }
-    Ok(())
+    let temp_path = temp_sibling(path);
+    let saved = lore_io::IoDriver::global()
+        .write_file_segments_atomic(
+            &temp_path,
+            path,
+            &lore_io::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+            vec![out.into_bytes()],
+        )
+        .await;
+
+    if saved.is_err() {
+        // The target is unchanged, so the sibling is all there is to clean up.
+        // Its own failure is not worth reporting over the one that got here.
+        let _ = lore_io::IoDriver::global().remove_file(&temp_path).await;
+    }
+    saved
+}
+
+/// The temporary file [`save`] builds the new contents of `path` in, beside it
+/// in the same directory so the rename onto it stays within one filesystem.
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(TEMP_FILE_EXTENSION);
+    PathBuf::from(temp)
 }
 
 /// How many components a non-empty relative path has.
