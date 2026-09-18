@@ -970,7 +970,7 @@ mod test {
     /// A prefix inside the caller's own repository needs no link-read
     /// verdict: the partition layer already admitted the request. An
     /// authorizer that cannot answer synchronously must not turn every
-    /// prefixed walk into NotFound.
+    /// prefixed walk into `NotFound`.
     #[tokio::test]
     async fn path_prefix_in_own_repository_needs_no_sync_link_verdict() {
         let repository = random::<RepositoryId>();
