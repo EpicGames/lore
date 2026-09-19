@@ -1104,6 +1104,10 @@ impl RepositoryContext {
     /// paths the filesystem, the filter and the modified-time keys answer for. A path within
     /// the mounted tree is derived from its node where one is called for, by
     /// [`State::node_path`](crate::state::State::node_path).
+    ///
+    /// The filter is carried over as the same handle, not rebuilt. A diff tells one view from two
+    /// by pointer identity on it, so a fresh handle holding the same rules would leave every diff
+    /// across the mount doing two-view work for a view that has not changed.
     pub async fn to_link_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
         let remote = if let Ok(remote) = remote {

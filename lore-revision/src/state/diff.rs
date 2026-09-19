@@ -132,7 +132,7 @@ impl DiffFlags {
     /// filters held separately report as differing even where their rules agree,
     /// and a walk then does work it could have skipped rather than skipping work
     /// it had to do.
-    pub fn between(from: &Arc<Filter>, to: &Arc<Filter>) -> Self {
+    fn between(from: &Arc<Filter>, to: &Arc<Filter>) -> Self {
         if Arc::ptr_eq(from, to) {
             Self::empty()
         } else {
@@ -148,22 +148,23 @@ impl DiffFlags {
 /// verdict was decided at, and one filter's line numbering says nothing about
 /// another's. `path` leaves the walk only where both sides exclude it, which is
 /// also the only case the exclusion is announced in.
+///
+/// [`DiffFlags`] are derived here rather than passed in. This is where the walk
+/// begins and where both sides' filters are in hand, so deriving them anywhere
+/// else would only be a second answer to the same question.
 pub async fn diff_subtree(
     from: NodeChangeState,
     to: NodeChangeState,
     path: RelativePath,
-    flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
     changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
-    let (from_states, to_states, excluded) = seed_sides(
-        &from.mapping.repository.filter,
-        &to.mapping.repository.filter,
-        &path,
-        flags,
-        filter_mode,
-    );
+    let from_filter = &from.mapping.repository.filter;
+    let to_filter = &to.mapping.repository.filter;
+    let flags = DiffFlags::between(from_filter, to_filter);
+    let (from_states, to_states, excluded) =
+        seed_sides(from_filter, to_filter, &path, flags, filter_mode);
     if excluded {
         lore_debug!("Excluded by filter: {}", path.as_str());
         return Ok(());
@@ -193,15 +194,13 @@ pub async fn diff_subtree(
 /// The verdicts a walk over `path` starts from, one per side, and whether the walk
 /// drops `path`.
 ///
-/// One filter held by both sides is asked once. The same rules put the same
-/// question about the same path answer the same way, so the second call would
-/// only repeat the first, and every caller that is not moving the view holds one
-/// filter.
+/// One filter held by both sides is asked once: the same rules put the same
+/// question about the same path answer the same way, and every caller that is not
+/// moving the view holds one filter.
 ///
-/// The walk drops `path` where both sides exclude it, and the to side announces
-/// that: it is asked last, and asked in the announcing form only where the from
-/// side has already excluded. One filter answering for both makes the two
-/// conditions one, so the single call announces for itself.
+/// `path` is dropped where both sides exclude it, and only there is the exclusion
+/// announced. The to side is asked last, and in the announcing form only once the
+/// from side has excluded, so the drop and the announcement are one condition.
 fn seed_sides(
     from_filter: &Arc<Filter>,
     to_filter: &Arc<Filter>,
@@ -209,13 +208,7 @@ fn seed_sides(
     flags: DiffFlags,
     mode: FilterMode,
 ) -> (FilterStates, FilterStates, bool) {
-    let two_views = !Arc::ptr_eq(from_filter, to_filter);
-    debug_assert_eq!(
-        two_views,
-        flags.contains(DiffFlags::TwoViews),
-        "flags derived from filters other than the ones the walk carries"
-    );
-
+    let two_views = flags.contains(DiffFlags::TwoViews);
     let from_seed = two_views.then(|| seed_states(from_filter, path, false, mode));
     let announce = from_seed.is_none_or(|(_, excluded)| excluded);
     let to_seed = seed_states(to_filter, path, announce, mode);
@@ -667,6 +660,40 @@ fn subtree_states(
         .0
 }
 
+/// Whether the to side holds nothing at or under `path`, with the states its children inherit
+/// where the walk goes on to use them.
+///
+/// The verdict reads `false` wherever the two sides cannot disagree, since under one filter the
+/// from side's verdict, taken before this node was paired, is the to side's too.
+///
+/// The filter is asked only where one of the two answers is read: a paired directory threads the
+/// states into the recursion below it whatever the flags say, and every other pairing reads the
+/// verdict alone, so is asked under [`DiffFlags::TwoViews`] alone. **Only a paired directory may
+/// read the states.** Unasked they are the parent's, and a caller reading them there would filter
+/// `path`'s children as though `path`'s own rules had never been stepped.
+///
+/// `is_file` is the to node's, and anything else is asked as a directory, a link included, because
+/// a link's content sits in a directory even though the node is not one. So the answer is the
+/// subtree's and not the node's, and for a link the two part: a directory-only rule naming a mount
+/// reaches what is under it without matching the mount itself.
+fn to_subtree_verdict(
+    filter: &Filter,
+    parent: FilterStates,
+    path: &RelativePath,
+    was_file: bool,
+    is_file: bool,
+    flags: DiffFlags,
+    mode: FilterMode,
+) -> (FilterStates, bool) {
+    let two_views = flags.contains(DiffFlags::TwoViews);
+    let paired_directory = !was_file && !is_file;
+    if !paired_directory && !two_views {
+        return (parent, false);
+    }
+    let (states, excluded) = filter.child_excludes_tree(parent, path, !is_file, mode);
+    (states, excluded && two_views)
+}
+
 /// Report the change between the two nodes the walk paired by name, and descend where both are
 /// directories.
 ///
@@ -795,6 +822,30 @@ async fn add_change_for_paired_nodes(
         }
         drop(to_name);
 
+        let (to_subtree_states, to_excludes_subtree) = to_subtree_verdict(
+            &to_nodes.repository.filter,
+            states.to,
+            &subpath,
+            was_file,
+            is_file,
+            flags,
+            filter_mode,
+        );
+        if to_excludes_subtree {
+            lore_trace!("Diff node {subpath} excluded on the to side, delete {from_path}");
+            add_change(
+                from,
+                to,
+                change::FileAction::Delete,
+                change::Flags::None,
+                changes,
+                filter_mode,
+                from_node_states,
+            )
+            .await?;
+            return Ok(());
+        }
+
         let action = if is_rename {
             change::FileAction::Move
         } else {
@@ -827,11 +878,7 @@ async fn add_change_for_paired_nodes(
                     from_node_states,
                     filter_mode,
                 ),
-                to: to_nodes
-                    .repository
-                    .filter
-                    .child_excludes_tree(states.to, &subpath, true, filter_mode)
-                    .0,
+                to: to_subtree_states,
             };
 
             if !mode_equal || is_rename {
@@ -971,15 +1018,14 @@ async fn add_change_for_paired_nodes(
             }
         } else {
             lore_trace!(
-                "Diff node {subpath} change from {} to {}, delete old and add new",
+                "Diff node {subpath} changed from {} to {}",
                 if was_file { "file" } else { "directory" },
                 if is_file { "file" } else { "directory" }
             );
-            let to_node_states = to_nodes
+            let (to_node_states, to_node_excluded) = to_nodes
                 .repository
                 .filter
-                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), filter_mode)
-                .0;
+                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), filter_mode);
             add_change(
                 from.clone(),
                 to.clone(),
@@ -990,16 +1036,18 @@ async fn add_change_for_paired_nodes(
                 from_node_states,
             )
             .await?;
-            add_change(
-                from,
-                to,
-                change::FileAction::Add,
-                change::Flags::None,
-                changes,
-                filter_mode,
-                to_node_states,
-            )
-            .await?;
+            if !to_node_excluded {
+                add_change(
+                    from,
+                    to,
+                    change::FileAction::Add,
+                    change::Flags::None,
+                    changes,
+                    filter_mode,
+                    to_node_states,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
@@ -1240,8 +1288,8 @@ pub async fn get_filtered_node_and_path(
         }))
 }
 
-/// The two decisions a walk takes before its first step, which it does not report:
-/// what it makes of its two filters, and what it seeds each side with.
+/// The decisions a walk takes and does not report: what it makes of its two filters,
+/// what it seeds each side with, and what it asks the to side about a paired node.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,5 +1371,131 @@ mod tests {
         let from = Arc::new(Filter::default());
         let to = Arc::new(Filter::default());
         assert_eq!(DiffFlags::between(&from, &to), DiffFlags::TwoViews);
+    }
+
+    /// A filter that excludes `path`, so a query against it is visible in what comes
+    /// back: states other than the parent's, and a verdict of `true`.
+    fn excluding(path: &str) -> Filter {
+        let mut filter = Filter::default();
+        filter
+            .view
+            .add_exclusion(&format!("/{path}"))
+            .expect("view exclusion");
+        filter
+    }
+
+    /// The to side is not asked about a paired file under one filter.
+    ///
+    /// Asserted by what comes back rather than by counting: the same filter answers
+    /// `true` once the flag is set, so the parent's states handed straight back is
+    /// the query not having happened.
+    #[test]
+    fn a_paired_file_under_one_filter_costs_no_to_side_query() {
+        let filter = excluding("x");
+        let path = RelativePath::new_from_initial_path("x").expect("valid path");
+        let verdict = |flags| {
+            to_subtree_verdict(
+                &filter,
+                FilterStates::ROOT,
+                &path,
+                true,
+                true,
+                flags,
+                FilterMode::Full,
+            )
+        };
+
+        assert_eq!(verdict(DiffFlags::empty()), (FilterStates::ROOT, false));
+        assert!(
+            verdict(DiffFlags::TwoViews).1,
+            "the filter must be one that answers true, or the case above proves nothing"
+        );
+    }
+
+    /// A paired directory needs the states below it whatever the flags say, so it is
+    /// asked either way -- and reports no exclusion under one filter, where the from
+    /// side's verdict already stands for both.
+    #[test]
+    fn a_paired_directory_is_asked_under_one_filter_and_reports_nothing() {
+        let filter = excluding("x");
+        let path = RelativePath::new_from_initial_path("x").expect("valid path");
+        let (states, excluded) = to_subtree_verdict(
+            &filter,
+            FilterStates::ROOT,
+            &path,
+            false,
+            false,
+            DiffFlags::empty(),
+            FilterMode::Full,
+        );
+
+        assert_ne!(states, FilterStates::ROOT, "the states must be stepped");
+        assert!(!excluded, "one filter cannot route the two sides apart");
+    }
+
+    /// A directory the to side excludes but re-includes under is still held there, so the
+    /// verdict is the subtree's and not the node's: deleting it would take the re-included
+    /// content with it.
+    #[test]
+    fn a_directory_re_including_below_itself_is_not_excluded() {
+        let path = RelativePath::new_from_initial_path("x").expect("valid path");
+        let excluded = |filter: &Filter| {
+            to_subtree_verdict(
+                filter,
+                FilterStates::ROOT,
+                &path,
+                false,
+                false,
+                DiffFlags::TwoViews,
+                FilterMode::Full,
+            )
+            .1
+        };
+        let mut re_including = excluding("x");
+        re_including
+            .view
+            .add_inclusion("/x/keep")
+            .expect("view inclusion");
+
+        assert!(
+            excluded(&excluding("x")),
+            "the rule alone must exclude the directory"
+        );
+        assert!(
+            !excluded(&re_including),
+            "a re-inclusion below must keep the directory"
+        );
+    }
+
+    /// `is_file` alone decides which of the two questions is put, and a directory-only rule
+    /// answers them differently.
+    ///
+    /// This is the shape a link arrives in: neither side of the pairing is a file, so the
+    /// subtree question is asked of it, and the rule reaches what a mount holds without
+    /// matching the mount. The node question, which the type-change branch puts, answers the
+    /// other way -- so neither call stands in for the other.
+    #[test]
+    fn a_directory_only_rule_parts_the_two_questions() {
+        let mut filter = Filter::default();
+        filter.view.add_exclusion("/x/").expect("view exclusion");
+        let path = stepped_path();
+        let excluded = |was_file, is_file| {
+            to_subtree_verdict(
+                &filter,
+                FilterStates::ROOT,
+                &path,
+                was_file,
+                is_file,
+                DiffFlags::TwoViews,
+                FilterMode::Full,
+            )
+            .1
+        };
+
+        assert!(excluded(false, false), "the subtree question must exclude");
+        assert!(
+            !excluded(true, true),
+            "the node question must not match what is no directory"
+        );
     }
 }
