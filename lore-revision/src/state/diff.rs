@@ -4,12 +4,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use bitflags::bitflags;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
 
 use crate::change;
 use crate::change::NodeChangeState;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::lore::Address;
@@ -44,14 +46,14 @@ use crate::util::path::RelativePath;
 pub struct GraftOracle {
     repository: Arc<RepositoryContext>,
     state_target: Arc<State>,
-    view: Arc<crate::filter::Filter>,
+    view: Arc<Filter>,
 }
 
 impl GraftOracle {
     pub fn new(
         repository: Arc<RepositoryContext>,
         state_target: Arc<State>,
-        view: Arc<crate::filter::Filter>,
+        view: Arc<Filter>,
     ) -> Self {
         Self {
             repository,
@@ -111,21 +113,57 @@ impl GraftOracle {
     }
 }
 
+bitflags! {
+    /// What holds of a walk's two sides, derived once and carried unchanged to
+    /// every step below.
+    #[repr(transparent)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct DiffFlags: u32 {
+        /// The sides filter through different filters, so neither side's verdict
+        /// answers for the other side.
+        const TwoViews = 0b1;
+    }
+}
+
+impl DiffFlags {
+    /// The flags for a walk whose sides filter through `from` and `to`.
+    ///
+    /// [`Self::TwoViews`] is pointer inequality, which over-approximates: two
+    /// filters held separately report as differing even where their rules agree,
+    /// and a walk then does work it could have skipped rather than skipping work
+    /// it had to do.
+    pub fn between(from: &Arc<Filter>, to: &Arc<Filter>) -> Self {
+        if Arc::ptr_eq(from, to) {
+            Self::empty()
+        } else {
+            Self::TwoViews
+        }
+    }
+}
+
+/// Emits the changes between the subtrees `from` and `to` name, both spelled from
+/// `path`, into `changes`.
+///
+/// Each side is seeded from its own filter: a [`FilterStates`] names the line its
+/// verdict was decided at, and one filter's line numbering says nothing about
+/// another's. `path` leaves the walk only where both sides exclude it, which is
+/// also the only case the exclusion is announced in.
 pub async fn diff_subtree(
     from: NodeChangeState,
     to: NodeChangeState,
     path: RelativePath,
-    flags: u32,
+    flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
     changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
-    let parent_states = to.mapping.repository.filter.parent_exclusion_states(&path);
-    let (states, excluded) =
-        to.mapping
-            .repository
-            .filter
-            .child_emit_excludes(parent_states, &path, true, filter_mode);
+    let (from_states, to_states, excluded) = seed_sides(
+        &from.mapping.repository.filter,
+        &to.mapping.repository.filter,
+        &path,
+        flags,
+        filter_mode,
+    );
     if excluded {
         lore_debug!("Excluded by filter: {}", path.as_str());
         return Ok(());
@@ -140,8 +178,8 @@ pub async fn diff_subtree(
                 to: path,
             },
             states: DiffStates {
-                from: states,
-                to: states,
+                from: from_states,
+                to: to_states,
             },
         },
         flags,
@@ -152,11 +190,66 @@ pub async fn diff_subtree(
     .await
 }
 
+/// The verdicts a walk over `path` starts from, one per side, and whether the walk
+/// drops `path`.
+///
+/// One filter held by both sides is asked once. The same rules put the same
+/// question about the same path answer the same way, so the second call would
+/// only repeat the first, and every caller that is not moving the view holds one
+/// filter.
+///
+/// The walk drops `path` where both sides exclude it, and the to side announces
+/// that: it is asked last, and asked in the announcing form only where the from
+/// side has already excluded. One filter answering for both makes the two
+/// conditions one, so the single call announces for itself.
+fn seed_sides(
+    from_filter: &Arc<Filter>,
+    to_filter: &Arc<Filter>,
+    path: &RelativePath,
+    flags: DiffFlags,
+    mode: FilterMode,
+) -> (FilterStates, FilterStates, bool) {
+    let two_views = !Arc::ptr_eq(from_filter, to_filter);
+    debug_assert_eq!(
+        two_views,
+        flags.contains(DiffFlags::TwoViews),
+        "flags derived from filters other than the ones the walk carries"
+    );
+
+    let from_seed = two_views.then(|| seed_states(from_filter, path, false, mode));
+    let announce = from_seed.is_none_or(|(_, excluded)| excluded);
+    let to_seed = seed_states(to_filter, path, announce, mode);
+    let (from_states, from_excluded) = from_seed.unwrap_or(to_seed);
+    (from_states, to_seed.0, from_excluded && to_seed.1)
+}
+
+/// The states a walk rooted at `path` threads into its children, and whether
+/// `filter` excludes `path` with everything below it. `path` is taken as a
+/// directory, which is what a walk rooted at one stands in.
+///
+/// `path`'s own ancestors are folded here, since a walk starting at it has none
+/// behind it.
+///
+/// `announce` emits the filter-exclude event where the verdict excludes.
+fn seed_states(
+    filter: &Filter,
+    path: &RelativePath,
+    announce: bool,
+    mode: FilterMode,
+) -> (FilterStates, bool) {
+    let parent = filter.parent_exclusion_states(path);
+    if announce {
+        filter.child_emit_excludes(parent, path, true, mode)
+    } else {
+        filter.child_excludes_tree(parent, path, true, mode)
+    }
+}
+
 fn recurse_diff_subtree_node(
     from: NodeChangeState,
     to: NodeChangeState,
     cursor: DiffCursor,
-    flags: u32,
+    flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
     changes: ChangeSender,
     filter_mode: FilterMode,
@@ -215,7 +308,7 @@ async fn diff_subtree_node(
     from: NodeChangeState,
     to: NodeChangeState,
     cursor: DiffCursor,
-    flags: u32,
+    flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
     changes: &ChangeSender,
     filter_mode: FilterMode,
@@ -267,7 +360,7 @@ async fn diff_subtree_node_walk(
     to: &NodeChangeState,
     paths: &DiffPaths,
     states: DiffStates,
-    flags: u32,
+    flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
     changes: &ChangeSender,
     filter_mode: FilterMode,
@@ -583,7 +676,7 @@ fn subtree_states(
 #[allow(clippy::too_many_arguments)]
 async fn add_change_for_paired_nodes(
     subtasks: &mut JoinSet<Result<(), StateError>>,
-    flags: u32,
+    flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
     context: DiffContext<'_>,
     to_named_node: &StateNamedNode,
@@ -1145,4 +1238,90 @@ pub async fn get_filtered_node_and_path(
                 Some((result, states))
             }
         }))
+}
+
+/// The two decisions a walk takes before its first step, which it does not report:
+/// what it makes of its two filters, and what it seeds each side with.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A filter that excludes `x` and re-includes under it, so a query against it steps
+    /// to a verdict no root state matches and still descends.
+    ///
+    /// Descending is what keeps it free of an event, and so of the execution context a
+    /// send reaches for and a unit test does not stand up.
+    fn stepping() -> Arc<Filter> {
+        let mut filter = Filter::default();
+        filter.view.add_exclusion("/x").expect("view exclusion");
+        filter
+            .view
+            .add_inclusion("/x/keep")
+            .expect("view inclusion");
+        Arc::new(filter)
+    }
+
+    fn stepped_path() -> RelativePath {
+        RelativePath::new_from_initial_path("x").expect("valid path")
+    }
+
+    #[test]
+    fn one_filter_answers_for_both_sides() {
+        let filter = stepping();
+        let path = stepped_path();
+
+        let (from_states, to_states, excluded) = seed_sides(
+            &filter,
+            &filter,
+            &path,
+            DiffFlags::empty(),
+            FilterMode::Full,
+        );
+
+        assert_eq!(
+            (from_states, excluded),
+            seed_states(&filter, &path, true, FilterMode::Full),
+            "one filter must seed both sides with the one answer it gives"
+        );
+        assert_eq!(from_states, to_states);
+    }
+
+    /// Two filters are asked separately, and the walk goes on unless both exclude.
+    #[test]
+    fn two_filters_seed_each_side_from_its_own() {
+        let from = stepping();
+        let to = Arc::new(Filter::default());
+        let path = stepped_path();
+
+        let (from_states, to_states, excluded) =
+            seed_sides(&from, &to, &path, DiffFlags::TwoViews, FilterMode::Full);
+
+        assert_ne!(
+            from_states, to_states,
+            "each side must carry the verdict of the filter it walks under"
+        );
+        assert_eq!(
+            to_states,
+            FilterStates::ROOT,
+            "a filter with no rules steps nowhere"
+        );
+        assert!(
+            !excluded,
+            "a path one side still holds must not leave the walk"
+        );
+    }
+
+    #[test]
+    fn one_filter_on_both_sides_is_not_two_views() {
+        let filter = Arc::new(Filter::default());
+        let shared = filter.clone();
+        assert_eq!(DiffFlags::between(&filter, &shared), DiffFlags::empty());
+    }
+
+    #[test]
+    fn two_filters_are_two_views_even_where_their_rules_agree() {
+        let from = Arc::new(Filter::default());
+        let to = Arc::new(Filter::default());
+        assert_eq!(DiffFlags::between(&from, &to), DiffFlags::TwoViews);
+    }
 }

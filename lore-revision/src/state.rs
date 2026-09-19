@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use bytes::Bytes;
+use diff::DiffFlags;
 pub use diff::GraftOracle;
 use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
@@ -5641,12 +5642,14 @@ pub async fn diff(
             state_to
         };
 
+        let flags = DiffFlags::between(&repository_from.filter, &repository_to.filter);
         let from =
             node_change_state(&repository_from, &state_from, from_link.node, path.clone()).await;
         let to = node_change_state(&repository_to, &state_to, to_link.node, path.clone()).await;
 
-        diff::diff_subtree(from, to, path, 0, graft, changes, filter_mode).await?;
+        diff::diff_subtree(from, to, path, flags, graft, changes, filter_mode).await?;
     } else {
+        let flags = DiffFlags::between(&repository_from.filter, &repository_to.filter);
         diff::diff_subtree(
             NodeChangeState {
                 mapping: NodeMapping {
@@ -5673,7 +5676,7 @@ pub async fn diff(
                 mode: 0,
             },
             RelativePath::new(),
-            0,
+            flags,
             graft,
             changes,
             filter_mode,
@@ -5727,8 +5730,12 @@ pub async fn diff_collect_subtree(
     path: RelativePath,
     filter_mode: FilterMode,
 ) -> Result<Vec<NodeChange>, StateError> {
+    let flags = DiffFlags::between(
+        &from.mapping.repository.filter,
+        &to.mapping.repository.filter,
+    );
     let mut changes = ChangeStream::spawn(async move |changes| {
-        diff::diff_subtree(from, to, path, 0, None, &changes, filter_mode).await
+        diff::diff_subtree(from, to, path, flags, None, &changes, filter_mode).await
     })
     .collect()
     .await?;
