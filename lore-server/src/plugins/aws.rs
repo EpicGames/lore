@@ -116,7 +116,7 @@ pub struct AwsImmutableStorePluginConfig {
     pub force_write: bool,
 
     /// Force path-style S3 addressing (required for S3-compatible stores behind
-    /// non-AWS hostnames like `MinIO` in Docker).
+    /// non-AWS hostnames like `RustFS` in Docker).
     #[serde(default)]
     pub s3_force_path_style: bool,
 }

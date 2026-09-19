@@ -71,7 +71,7 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --verbose
 
-  # Runs the integration tests against the MinIO, DynamoDB Local, and Consul
+  # Runs the integration tests against the RustFS, DynamoDB Local, and Consul
   # services that Docker Compose starts. Only the Linux runners provide Docker.
   # The tests connect to 127.0.0.1 on ports 9000, 9090, and 8500, which the
   # compose file maps.
@@ -99,13 +99,13 @@ jobs:
         with:
           key: integration
 
-      - name: Start backing services (MinIO, DynamoDB Local, Consul)
+      - name: Start backing services (RustFS, DynamoDB Local, Consul)
         run: docker compose --file lore-integration-tests/compose.yaml up --detach
 
       - name: Wait for services to be ready
         run: |
           for i in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9000/minio/health/ready \
+            if curl -sf http://127.0.0.1:9000/health \
                && curl -sf http://127.0.0.1:8500/v1/status/leader \
                && curl -s -o /dev/null http://127.0.0.1:9090; then
               echo "services ready"
