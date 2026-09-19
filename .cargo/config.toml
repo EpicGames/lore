@@ -110,6 +110,19 @@ rustflags = [
     "--cfg", "uuid_unstable"
 ]
 
+# No target-cpu pin yet — no specific x86_64 Linux instance family to target.
+# split-debuginfo=packed (not aarch64-linux's "off"): smaller default .so and
+# matches every other target; see ADR-00021.
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "--cfg", "tokio_unstable",
+    "-C", "force-unwind-tables=yes",
+    "-C", "force-frame-pointers=yes",
+    "-C", "split-debuginfo=packed",
+    # allows uuid IntoBytes/FromBytes unstable feature
+    "--cfg", "uuid_unstable"
+]
+
 # macOS: split-debuginfo=packed emits a separate .dSYM bundle (runs dsymutil);
 # the default "unpacked" leaves DWARF in the .o files and ships no .dSYM. Both
 # blocks repeat the [build] non-warning flags (see the note there).
