@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use bytes::Bytes;
+pub use diff::DiffWalkStats;
 pub use diff::GraftOracle;
 use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
@@ -5603,6 +5604,10 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
 /// — does **not** run the post-walk move-coalescing or path-sort fixup that
 /// the legacy `Vec`-returning version applied. Callers that want the
 /// historical buffered-and-coalesced shape use `diff_collect` instead.
+///
+/// Answers with what the walk did rather than what it found, for a caller
+/// measuring it; the changes are the `changes` channel's. `diff_collect`
+/// discards it.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff(
     repository_from: Arc<RepositoryContext>,
@@ -5613,7 +5618,7 @@ pub async fn diff(
     graft: Option<Arc<GraftOracle>>,
     changes: &ChangeSender,
     filter_mode: FilterMode,
-) -> Result<(), StateError> {
+) -> Result<DiffWalkStats, StateError> {
     if let Some(path) = path {
         let from_link = state_from
             .find_node_link(repository_from.clone(), path.as_str())
@@ -5645,7 +5650,7 @@ pub async fn diff(
             node_change_state(&repository_from, &state_from, from_link.node, path.clone()).await;
         let to = node_change_state(&repository_to, &state_to, to_link.node, path.clone()).await;
 
-        diff::diff_subtree(from, to, path, graft, changes, filter_mode).await?;
+        diff::diff_subtree(from, to, path, graft, changes, filter_mode).await
     } else {
         diff::diff_subtree(
             NodeChangeState {
@@ -5677,10 +5682,8 @@ pub async fn diff(
             changes,
             filter_mode,
         )
-        .await?;
+        .await
     }
-
-    Ok(())
 }
 
 /// The node `node_id` of `state` at `path`, as one side of a change, carrying the flags and

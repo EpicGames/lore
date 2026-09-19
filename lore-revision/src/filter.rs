@@ -388,7 +388,10 @@ fn component_count(path: &str) -> u32 {
 
 /// How deep a query about `path` stands, which bounds which rules can reach
 /// below it. The repository root arrives empty and names no component.
-fn query_depth(path: &str) -> u32 {
+///
+/// This is the `depth` [`Filter::covers_subtree`] is asked with. A walk that
+/// descends a component at a time counts instead, and pays nothing for it.
+pub(crate) fn query_depth(path: &str) -> u32 {
     if path.is_empty() {
         0
     } else {

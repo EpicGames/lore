@@ -3,10 +3,11 @@
 
 //! A diff whose two sides filter through different view filters.
 //!
-//! Two things are held here. Each side is seeded from its own filter, and the walk drops the path
-//! it is rooted at only where both sides exclude it. And a path one side holds while the other does
-//! not is routed by which side holds it: out of the to view it is deleted, into the to view it is
-//! added.
+//! Three things are held here. Each side is seeded from its own filter, and the walk drops the
+//! path it is rooted at only where both sides exclude it. A path one side holds while the other
+//! does not is routed by which side holds it: out of the to view it is deleted, into the to view
+//! it is added. And what the walk reports of itself says which directories it entered, which is
+//! the only place a subtree it skipped differs from one it walked and found unchanged.
 //!
 //! Every walk here is subpath-scoped, which is what lets the root itself be excluded. A whole-tree
 //! walk is rooted at the repository root, and no view excludes that.
@@ -21,20 +22,15 @@ mod tests {
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
-    use lore_revision::commit;
-    use lore_revision::commit::CommitOptions;
-    use lore_revision::file;
-    use lore_revision::filter::Filter;
+    use lore_revision::change::NodeChange;
+    use lore_revision::change::sort_by_path;
     use lore_revision::filter::FilterMode;
     use lore_revision::interface::ExecutionContext;
-    use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreGlobalArgs;
-    use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::stage::StageOptions;
     use lore_revision::state;
     use lore_revision::util::path::RelativePath;
 
@@ -72,12 +68,36 @@ mod tests {
     /// The view rule that excludes [`RENAMED`], the name [`MOVED`] arrives under.
     const EXCLUDE_RENAMED: &str = "/sub/renamed.txt";
 
+    /// The directory the sibling subtrees sit under, which the walks that measure what a walk
+    /// entered are rooted at.
+    const TREE: &str = "wide";
+    /// How many siblings [`TREE`] holds. Entering them all has to read differently from entering
+    /// the one a walk has a reason to, so more than a handful.
+    const SIBLINGS: u32 = 20;
+    /// The sibling whose content differs between the two revisions, so every walk enters it
+    /// whatever the views say.
+    const CHANGED: u32 = 3;
+    /// A sibling both revisions hold identically, so the views alone decide whether a walk
+    /// enters it.
+    const UNTOUCHED: u32 = 7;
+    /// The file each sibling holds beside [`DROPPED`], which a view can re-include below a
+    /// sibling it excludes.
+    const KEPT: &str = "keep.txt";
+    /// The file each sibling holds beside [`KEPT`], which no re-inclusion names.
+    const DROPPED: &str = "drop.txt";
+
+    /// The path of sibling `index` under [`TREE`].
+    fn sibling(index: u32) -> String {
+        format!("{TREE}/dir{index:02}")
+    }
+
     /// What the newer revision does beyond rewriting [`FILE`].
     #[derive(Clone, Copy)]
     enum Shape {
         Plain,
         Retype,
         Rename,
+        Wide,
     }
 
     /// A repository holding [`FILE`] in two revisions, over the stores its contexts are built on.
@@ -117,6 +137,15 @@ mod tests {
             Self::build(immutable_store, mutable_store, Shape::Rename).await
         }
 
+        /// [`Fixture::create`] beside [`SIBLINGS`] sibling directories under [`TREE`], of which
+        /// [`CHANGED`] alone differs between the two revisions.
+        async fn create_wide(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> Self {
+            Self::build(immutable_store, mutable_store, Shape::Wide).await
+        }
+
         async fn build(
             immutable_store: Arc<dyn lore_storage::ImmutableStore>,
             mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -140,8 +169,22 @@ mod tests {
                 Shape::Plain => {}
                 Shape::Retype => test_file_write(retyped.as_path(), b"was a file"),
                 Shape::Rename => test_file_write(moved.as_path(), b"carried across"),
+                Shape::Wide => {
+                    for index in 0..SIBLINGS {
+                        let directory = instance.path.join(sibling(index));
+                        std::fs::create_dir_all(&directory).expect("Create directory failed");
+                        test_file_write(
+                            directory.join(KEPT).as_path(),
+                            format!("kept {index}").as_bytes(),
+                        );
+                        test_file_write(
+                            directory.join(DROPPED).as_path(),
+                            format!("dropped {index}").as_bytes(),
+                        );
+                    }
+                }
             }
-            let older = commit_tree(&instance, "First").await;
+            let older = test_commit_tree(&instance, "First").await;
 
             test_file_write(file.as_path(), b"after");
             match shape {
@@ -158,8 +201,12 @@ mod tests {
                     std::fs::rename(&moved, instance.path.join(RENAMED))
                         .expect("Rename file failed");
                 }
+                Shape::Wide => test_file_write(
+                    instance.path.join(sibling(CHANGED)).join(DROPPED).as_path(),
+                    b"rewritten",
+                ),
             }
-            let newer = commit_tree(&instance, "Second").await;
+            let newer = test_commit_tree(&instance, "Second").await;
 
             Self {
                 instance,
@@ -170,32 +217,37 @@ mod tests {
             }
         }
 
-        /// A context over the repository whose view excludes `globs`.
-        ///
-        /// Each call mints its own [`Filter`], so two contexts from one fixture hold different
-        /// ones whether or not their rules agree.
+        /// A context over the repository whose view holds `globs`.
         fn view(&self, globs: &[&str]) -> Arc<RepositoryContext> {
-            let mut filter = Filter::default();
-            for glob in globs {
-                filter.view.add_exclusion(glob).expect("View exclusion");
-            }
-            Arc::new(RepositoryContext::new(
-                default_repository_creation_args(
-                    self.immutable_store.clone(),
-                    self.mutable_store.clone(),
-                )
-                .with_path(&self.instance.path)
-                .with_id(self.instance.repository.id)
-                .with_instance_id(self.instance.repository.instance_id)
-                .with_filter(Arc::new(filter)),
-            ))
+            test_view_context(
+                &self.instance,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                globs,
+            )
         }
 
-        /// What a walk over [`SUBDIRECTORY`] reports between the two revisions, as the action
-        /// letter against the path.
-        ///
-        /// The action is carried because the two sides route a path by which of them admits it,
-        /// and a path alone does not say which route it took.
+        /// A context whose ignore slot holds `ignore` and whose view is empty, as a repository
+        /// opened over a `.loreignore` and no view file holds one.
+        fn ignoring(&self, ignore: &[&str]) -> Arc<RepositoryContext> {
+            test_filter_context(
+                &self.instance,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                ignore,
+                &[],
+            )
+        }
+
+        /// A view that excludes sibling `index` and re-includes [`KEPT`] below it, so the
+        /// sibling holds something the view keeps and something it does not.
+        fn view_excluding_but_for_kept(&self, index: u32) -> Arc<RepositoryContext> {
+            let directory = sibling(index);
+            self.view(&[&format!("/{directory}"), &format!("!/{directory}/{KEPT}")])
+        }
+
+        /// What a walk over [`SUBDIRECTORY`] reports between the two revisions, read the way
+        /// every caller in the product reads it: coalesced and sorted.
         async fn changes(
             &self,
             from: Arc<RepositoryContext>,
@@ -211,15 +263,45 @@ mod tests {
             )
             .await
             .expect("Failed to diff the two revisions");
-            changes
-                .iter()
-                .map(|change| {
-                    (
-                        change.action.as_string_short().to_string(),
-                        change.path().as_str().to_string(),
-                    )
-                })
-                .collect()
+            reported(&changes)
+        }
+
+        /// What a walk over `path` emitted, and what it reported of itself.
+        ///
+        /// The changes are the walk's own, ahead of the move coalescing [`Fixture::changes`]
+        /// reads them through, and the summary is what `diff_collect` discards.
+        async fn walk(
+            &self,
+            from: Arc<RepositoryContext>,
+            to: Arc<RepositoryContext>,
+            path: &str,
+        ) -> (Vec<(String, String)>, state::DiffWalkStats) {
+            let older = self.older.clone();
+            let newer = self.newer.clone();
+            let path = RelativePath::new_from_initial_path(path).expect("Valid path");
+            let mut walk = state::ChangeStream::spawn(async move |changes| {
+                state::diff(
+                    from,
+                    older,
+                    to,
+                    newer,
+                    Some(path),
+                    None,
+                    &changes,
+                    FilterMode::Full,
+                )
+                .await
+            });
+            let mut collected = Vec::new();
+            while let Some(change) = walk.next().await {
+                collected.push(change);
+            }
+            let stats = walk
+                .finish()
+                .await
+                .expect("Failed to diff the two revisions");
+            sort_by_path(&mut collected);
+            (reported(&collected), stats)
         }
 
         /// [`Fixture::changes`] with the number of filter-exclude events the walk sent.
@@ -244,33 +326,20 @@ mod tests {
         }
     }
 
-    /// Stages and commits the whole working tree, answering the state of the revision it produced.
-    async fn commit_tree(fixture: &TestRepository, message: &str) -> Arc<state::State> {
-        file::stage::stage(
-            fixture.repository.clone(),
-            &fixture.write_token,
-            LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
-            StageOptions {
-                scan: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("Failed to stage the fixture");
-        commit::commit_boxed(
-            fixture.repository.clone(),
-            &fixture.write_token,
-            CommitOptions::new(message.to_string()),
-        )
-        .await
-        .expect("Commit failed");
-        let (revision, _branch) =
-            lore_revision::instance::load_current_anchor_boxed(&fixture.repository)
-                .await
-                .expect("Failed to load current anchor");
-        state::State::deserialize(fixture.repository.clone(), revision)
-            .await
-            .expect("Failed to deserialize the committed state")
+    /// The action letter against the path for each change.
+    ///
+    /// The action is carried because the two sides route a path by which of them admits it, and a
+    /// path alone does not say which route it took.
+    fn reported(changes: &[NodeChange]) -> Vec<(String, String)> {
+        changes
+            .iter()
+            .map(|change| {
+                (
+                    change.action.as_string_short().to_string(),
+                    change.path().as_str().to_string(),
+                )
+            })
+            .collect()
     }
 
     /// An execution that counts the filter-exclude events sent under it.
@@ -496,6 +565,307 @@ mod tests {
                 assert_eq!(
                     announced, 1,
                     "two sides asked is still one path dropped, so the to side announces alone"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The walk reports the directories it entered, which is the only place a subtree it skipped
+    /// differs from one it walked: both report the same changes.
+    #[tokio::test]
+    async fn a_walk_reports_the_directories_it_entered() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+                let repository = fixture.view(&[]);
+
+                let (changes, stats) = fixture.walk(repository.clone(), repository, TREE).await;
+
+                assert_eq!(
+                    changes,
+                    vec![("M".to_string(), format!("{}/{DROPPED}", sibling(CHANGED)))],
+                    "one file was rewritten between the revisions"
+                );
+                assert_eq!(
+                    stats.directories_entered.load(Ordering::Relaxed),
+                    2,
+                    "the root and the one sibling whose content differs, of {SIBLINGS}"
+                );
+                assert_eq!(
+                    stats.filter_queries.load(Ordering::Relaxed),
+                    u64::from(SIBLINGS) * 2 + 2,
+                    "each sibling costs the verdict admitting it and the subtree verdict for the \
+                     pair, the two files below the one entered cost the verdict admitting each, \
+                     and one filter asks no prune question"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A paired file costs one verdict under one view and two under two, which is the whole of
+    /// what the to-side verdict is gated for: a paired file is the commonest node a walk sees.
+    #[tokio::test]
+    async fn a_paired_file_costs_a_second_verdict_under_two_views() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+                let one_filter = fixture.view(&[]);
+                let files = sibling(CHANGED);
+
+                let (_, single) = fixture.walk(one_filter.clone(), one_filter, &files).await;
+                let (_, two) = fixture
+                    .walk(fixture.view(&[]), fixture.view(&[]), &files)
+                    .await;
+
+                assert_eq!(
+                    single.filter_queries.load(Ordering::Relaxed),
+                    2,
+                    "one filter answers for both sides, so each file costs the verdict admitting \
+                     it and nothing more"
+                );
+                assert_eq!(
+                    two.filter_queries.load(Ordering::Relaxed),
+                    4,
+                    "a second view is a second verdict per paired file"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Two views that cover a content-equal subtree agree about everything in it, so the walk
+    /// takes it whole -- the prune the whole design exists to keep.
+    #[tokio::test]
+    async fn views_that_cover_a_content_equal_subtree_do_not_enter_it() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+
+                let (changes, stats) = fixture
+                    .walk(
+                        fixture.view(&[EXCLUDE_SUBDIRECTORY]),
+                        fixture.view(&[EXCLUDE_SUBDIRECTORY]),
+                        TREE,
+                    )
+                    .await;
+
+                assert_eq!(
+                    changes,
+                    vec![("M".to_string(), format!("{}/{DROPPED}", sibling(CHANGED)))],
+                    "rules that reach nothing under the tree change nothing in it"
+                );
+                assert_eq!(
+                    stats.directories_entered.load(Ordering::Relaxed),
+                    2,
+                    "the root and the one sibling whose content differs, of {SIBLINGS}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A directory the to view excludes while re-including below it holds content on either side
+    /// of the rule, so the walk has to enter it and route each by the view holding it -- whether or
+    /// not its content
+    /// differs between the revisions.
+    ///
+    /// The two halves are the same assertion. Under content equality nothing but the views can
+    /// route the walk into the directory, which is what the prune has to account for; with the
+    /// content differing the walk would enter it anyway, so the half that passes on its own
+    /// proves nothing the other does not disprove.
+    #[tokio::test]
+    async fn a_re_inclusion_below_an_excluded_directory_is_reached() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+
+                for index in [CHANGED, UNTOUCHED] {
+                    let directory = sibling(index);
+                    let (changes, _) = fixture
+                        .walk(
+                            fixture.view(&[]),
+                            fixture.view_excluding_but_for_kept(index),
+                            TREE,
+                        )
+                        .await;
+
+                    assert!(
+                        changes.contains(&("D".to_string(), format!("{directory}/{DROPPED}"))),
+                        "{directory} holds a file the to view drops: {changes:?}"
+                    );
+                    assert!(
+                        !changes
+                            .iter()
+                            .any(|(_, path)| *path == format!("{directory}/{KEPT}")),
+                        "{directory} holds a re-included file that stays put: {changes:?}"
+                    );
+                    assert!(
+                        !changes.contains(&("D".to_string(), directory.clone())),
+                        "{directory} still holds the re-included file, so it stays: {changes:?}"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Two views that exclude one content-equal directory and re-include different files below it
+    /// disagree about everything else in it, so the walk enters it and routes each file by which
+    /// view holds it.
+    #[tokio::test]
+    async fn views_re_including_different_files_below_one_directory_diverge() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+                let directory = sibling(UNTOUCHED);
+                let excluded = format!("/{directory}");
+
+                let (changes, stats) = fixture
+                    .walk(
+                        fixture.view(&[&excluded, &format!("!/{directory}/{KEPT}")]),
+                        fixture.view(&[&excluded, &format!("!/{directory}/{DROPPED}")]),
+                        TREE,
+                    )
+                    .await;
+
+                assert_eq!(
+                    changes,
+                    vec![
+                        ("M".to_string(), format!("{}/{DROPPED}", sibling(CHANGED))),
+                        ("A".to_string(), format!("{directory}/{DROPPED}")),
+                        ("D".to_string(), format!("{directory}/{KEPT}")),
+                    ],
+                    "each file is routed by the view that holds it"
+                );
+                assert_eq!(
+                    stats.directories_entered.load(Ordering::Relaxed),
+                    3,
+                    "the root, the sibling whose content differs, and the one the views diverge in"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An ignore rule the two sides share cannot make them diverge, so it must not cost the prune.
+    ///
+    /// A repository opened for real holds name rules in its ignore slot, and a name rule reaches
+    /// below every path, so no subtree is ever coverable by that slot. A walk putting the question
+    /// to it as well as to the view would answer "the views diverge" under every directory there
+    /// is and walk the tree -- the one way this prune becomes a no-op in the product while every
+    /// other test still passes.
+    #[tokio::test]
+    async fn a_shared_ignore_rule_does_not_cost_the_prune() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+
+                let (_, stats) = fixture
+                    .walk(
+                        fixture.ignoring(&["*.tmp"]),
+                        fixture.ignoring(&["*.tmp"]),
+                        TREE,
+                    )
+                    .await;
+
+                assert_eq!(
+                    stats.directories_entered.load(Ordering::Relaxed),
+                    2,
+                    "an ignore rule both sides hold leaves every sibling coverable"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A view holding an exclusion that can match at any depth leaves the walk nothing to prune,
+    /// so it enters every sibling to find that nothing changed.
+    ///
+    /// The accepted characteristic, with the number behind it: such a rule belongs in
+    /// `.loreignore`, which both sides share and neither can diverge over.
+    #[tokio::test]
+    async fn an_unanchored_exclusion_costs_the_walk_every_prune() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+
+                let (changes, stats) = fixture
+                    .walk(fixture.view(&[]), fixture.view(&["*.tmp"]), TREE)
+                    .await;
+
+                assert_eq!(
+                    changes,
+                    vec![("M".to_string(), format!("{}/{DROPPED}", sibling(CHANGED)))],
+                    "the rule matches nothing here, so it changes nothing -- only what it cost \
+                     to find that out"
+                );
+                assert_eq!(
+                    stats.directories_entered.load(Ordering::Relaxed),
+                    u64::from(SIBLINGS) + 1,
+                    "a name rule reaches below every path, so no sibling is covered"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A directory the to view drops whole leaves without being entered: the verdict taken where
+    /// the walk pairs it answers for everything under it, and the delete fans out from there.
+    #[tokio::test]
+    async fn a_directory_the_to_view_drops_whole_is_not_entered() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+                let directory = sibling(UNTOUCHED);
+
+                let (changes, stats) = fixture
+                    .walk(
+                        fixture.view(&[]),
+                        fixture.view(&[&format!("/{directory}")]),
+                        TREE,
+                    )
+                    .await;
+
+                assert_eq!(
+                    changes,
+                    vec![
+                        ("M".to_string(), format!("{}/{DROPPED}", sibling(CHANGED))),
+                        ("D".to_string(), directory.clone()),
+                        ("D".to_string(), format!("{directory}/{DROPPED}")),
+                        ("D".to_string(), format!("{directory}/{KEPT}")),
+                    ],
+                    "the directory leaves with everything under it"
+                );
+                assert_eq!(
+                    stats.directories_entered.load(Ordering::Relaxed),
+                    2,
+                    "the root and the one sibling whose content differs, of {SIBLINGS}"
                 );
             }))
             .await
