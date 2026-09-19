@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let path_sep = MAIN_SEPARATOR;
 
-    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
 
     // Watch every source cbindgen reads, so the checked-in header cannot go stale: this crate's
     // own, and the crates `cbindgen.toml` names under `parse.include`, which define C-API types
@@ -43,10 +43,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // list input configuration files so that we run this script to update the c header
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR must be set");
     let header_gen = format!("{out_dir}{path_sep}lore.h");
     let source_gen = format!("{out_dir}{path_sep}lore.c");
-    let config = cbindgen::Config::from_file("cbindgen.toml").unwrap();
+    let config =
+        cbindgen::Config::from_file("cbindgen.toml").expect("Failed to read cbindgen.toml");
 
     // run cbindgen to generate `lore.h`
     match cbindgen::Builder::new()
@@ -101,8 +102,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .expect("Failed to create regex for associated-const macros");
     let contents = const_re
         .replace_all(contents.as_str(), |caps: &regex::Captures<'_>| {
-            let type_stem = caps.get(1).unwrap().as_str();
-            let const_name = caps.get(2).unwrap().as_str();
+            let type_stem = caps.get(1).expect("Failed to capture type stem").as_str();
+            let const_name = caps.get(2).expect("Failed to capture const name").as_str();
             format!("#define {}_{}", type_stem.to_uppercase(), const_name)
         })
         .to_string();
@@ -233,11 +234,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let header_target = format!("{profile_dir}{path_sep}lore.h");
     fs::copy(&header_gen, header_target).expect("Unable to write {header_target}");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos" {
+    if std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS must be set") == "macos" {
         let dylib_name = "liblore.dylib";
         println!("cargo:rustc-link-arg=-Wl,-install_name,@rpath/{dylib_name}");
     }
-    if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {
+    if std::env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS must be set") == "windows" {
         // Hack around EXE and DLL having the same file name for PDB file
         println!("cargo:rustc-link-arg-cdylib=/PDB:{profile_dir}\\lore.dll.pdb");
     }
