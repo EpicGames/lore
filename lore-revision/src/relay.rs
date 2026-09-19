@@ -1,5 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
 use bytes::Bytes;
 use lore_base::lore_spawn_core;
 use tokio::sync::Mutex;
@@ -33,11 +37,31 @@ use crate::util;
 /// has been consumed.
 type DispatchedEvent = (LoreEvent, Option<Bytes>);
 
+/// Keeps a dispatcher's channel open past `complete`, for a task that goes on
+/// sending after the command that started it has answered — a notification
+/// subscription. `drain` waits for the forwarder only while nothing holds one
+/// of these; dropping it lets the channel close once every sender is gone.
+pub struct KeepOpen {
+    _sender: UnboundedSender<DispatchedEvent>,
+    holders: Arc<AtomicUsize>,
+}
+
+impl Drop for KeepOpen {
+    fn drop(&mut self) {
+        self.holders.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct EventDispatcher {
     pub correlation_id: String,
     pub completed: CancellationToken,
     pub weak_sender: Option<WeakUnboundedSender<DispatchedEvent>>,
     pub strong_sender: Mutex<Option<UnboundedSender<DispatchedEvent>>>,
+    /// How many [`KeepOpen`] holds are live. Counted here rather than read off
+    /// the channel's strong count: a `send` upgrades the weak sender for as
+    /// long as the push takes, and that counted too, so a task logging while
+    /// `drain` looked made it return with events still queued.
+    holders: Arc<AtomicUsize>,
     /// The forwarder task, kept so `complete` can await the task itself rather
     /// than only the token it cancels. A runtime torn down under an in-flight
     /// call drops the task, which leaves the token uncancelled forever, but the
@@ -52,6 +76,7 @@ impl Default for EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
+            holders: Arc::new(AtomicUsize::new(0)),
             forwarder: Mutex::new(None),
         }
     }
@@ -93,6 +118,7 @@ impl EventDispatcher {
             completed,
             weak_sender: Some(weak_sender),
             strong_sender: Mutex::new(Some(sender)),
+            holders: Arc::new(AtomicUsize::new(0)),
             forwarder: Mutex::new(forwarder),
         }
     }
@@ -103,14 +129,27 @@ impl EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
+            holders: Arc::new(AtomicUsize::new(0)),
             forwarder: Mutex::new(None),
         }
     }
 
-    pub fn sender(&self) -> Option<UnboundedSender<DispatchedEvent>> {
+    fn sender(&self) -> Option<UnboundedSender<DispatchedEvent>> {
         self.weak_sender
             .as_ref()
             .and_then(|sender| sender.upgrade())
+    }
+
+    /// Keeps the channel open past `complete`, so that events sent afterwards
+    /// still reach the callback; `End` then follows the last hold rather than
+    /// `Complete`. `None` once the channel has closed.
+    pub fn keep_open(&self) -> Option<KeepOpen> {
+        let sender = self.sender()?;
+        self.holders.fetch_add(1, Ordering::AcqRel);
+        Some(KeepOpen {
+            _sender: sender,
+            holders: self.holders.clone(),
+        })
     }
 
     pub fn send(&self, event: LoreEvent) {
@@ -158,15 +197,10 @@ impl EventDispatcher {
         // if this is the only strong reference to the event channel
         drop(self.strong_sender.lock().await.take());
 
-        // If there are other strong references remaining it means the end event will come
-        // whenever that completes (such as an ongoing notification subscription)
-        if self
-            .weak_sender
-            .as_ref()
-            .map(|sender| sender.strong_count())
-            .unwrap_or_default()
-            == 0
-        {
+        // A hold means the end event will come whenever its holder is done
+        // (an ongoing notification subscription), so there is nothing to wait
+        // for here.
+        if self.holders.load(Ordering::Acquire) == 0 {
             // Await the forwarder task, not just the token it cancels on its way
             // out. The two finish together in the normal case, but a runtime torn
             // down under an in-flight call drops the task before it can cancel
@@ -270,5 +304,125 @@ mod complete_outcome_tests {
         assert_eq!(data.status, 13);
         assert_eq!(data.error.error_code, 13);
         assert_eq!(data.error.message.as_str(), "not found");
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use lore_base::lore_spawn;
+
+    use super::EventDispatcher;
+    use crate::event::LoreErrorDetail;
+    use crate::event::LoreEvent;
+    use crate::logging::LoreLogLevel;
+
+    /// A caller that reads what its callback collected once `complete` returns
+    /// must see everything sent ahead of `Complete`, however busy the other
+    /// tasks sharing the dispatcher are. A send in flight on another task used
+    /// to read as a subscription holding the channel open, so `drain` returned
+    /// without waiting and the CLI could print — or exit — before its events
+    /// arrived.
+    #[test]
+    fn complete_waits_for_delivery_while_another_task_is_sending() {
+        let delivered: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = delivered.clone();
+        let callback: crate::interface::LoreEventCallback =
+            Some(Box::new(move |event: &LoreEvent| {
+                // Lag behind the senders, so that the queue is never empty when
+                // `complete` looks.
+                std::thread::sleep(Duration::from_millis(1));
+                sink.lock().unwrap().push(event.clone());
+            }));
+        let dispatcher = Arc::new(EventDispatcher::new(callback));
+
+        // A task that logs while the command completes, the way a session
+        // release or a store flush does.
+        let done = Arc::new(AtomicBool::new(false));
+        let busy = {
+            let dispatcher = dispatcher.clone();
+            let done = done.clone();
+            lore_spawn!(async move {
+                while !done.load(Ordering::Relaxed) {
+                    dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
+                        LoreLogLevel::Trace,
+                        "busy".to_string(),
+                    )));
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+
+        for _ in 0..20 {
+            dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
+                LoreLogLevel::Info,
+                "before complete".to_string(),
+            )));
+        }
+        let status = lore_base::runtime::runtime().block_on(async {
+            let status = dispatcher.complete(LoreErrorDetail::default()).await;
+            done.store(true, Ordering::Relaxed);
+            let _ = busy.await;
+            status
+        });
+        assert_eq!(status, 0);
+
+        let delivered = delivered.lock().unwrap();
+        let complete_at = delivered
+            .iter()
+            .position(|event| matches!(event, LoreEvent::Complete(_)))
+            .expect("Complete must have been through the callback when complete returns");
+        let before = delivered[..complete_at]
+            .iter()
+            .filter(|event| {
+                matches!(event, LoreEvent::Log(log) if log.message.as_str() == "before complete")
+            })
+            .count();
+        assert_eq!(
+            before, 20,
+            "every event sent ahead of Complete arrives ahead of it"
+        );
+    }
+
+    /// A hold is what keeps `complete` from waiting: a subscription's events
+    /// come after the command has answered, and so does `End`.
+    #[test]
+    fn a_hold_lets_events_through_after_complete_and_ends_when_dropped() {
+        let delivered: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = delivered.clone();
+        let callback: crate::interface::LoreEventCallback =
+            Some(Box::new(move |event: &LoreEvent| {
+                sink.lock().unwrap().push(event.clone());
+            }));
+        let dispatcher = EventDispatcher::new(callback);
+        let hold = dispatcher.keep_open().expect("channel is open");
+
+        lore_base::runtime::runtime().block_on(async {
+            dispatcher.complete(LoreErrorDetail::default()).await;
+            dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
+                LoreLogLevel::Info,
+                "after complete".to_string(),
+            )));
+            drop(hold);
+            dispatcher.completed.cancelled().await;
+        });
+
+        let delivered = delivered.lock().unwrap();
+        let kinds: Vec<&str> = delivered
+            .iter()
+            .map(|event| match event {
+                LoreEvent::Complete(_) => "complete",
+                LoreEvent::Log(log) if log.message.as_str() == "after complete" => "after",
+                LoreEvent::End(_) => "end",
+                _ => "other",
+            })
+            .filter(|kind| *kind != "other")
+            .collect();
+        assert_eq!(kinds, ["complete", "after", "end"]);
     }
 }

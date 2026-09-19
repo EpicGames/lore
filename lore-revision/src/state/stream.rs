@@ -134,6 +134,16 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
         let ChangeStream { mut changes, walk } = self;
         while let Some(change) = changes.recv().await {
             if wanted(&change) {
+                // Stop the walk here, but wait for it to unwind: it holds the
+                // repository (and whatever else it captured) until its next
+                // emit sees the closed channel, and a caller that returns on
+                // this answer completes its command while that is still in
+                // flight. Its report is the closed channel, not a verdict, so
+                // it is dropped rather than forwarded.
+                drop(changes);
+                if let Some(walk) = walk {
+                    let _stopped = walk.await;
+                }
                 return Ok(true);
             }
         }
