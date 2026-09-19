@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::lore_spawn_core;
@@ -43,13 +41,25 @@ type DispatchedEvent = (LoreEvent, Option<Bytes>);
 /// of these; dropping it lets the channel close once every sender is gone.
 pub struct KeepOpen {
     _sender: UnboundedSender<DispatchedEvent>,
-    holders: Arc<AtomicUsize>,
+    holds: Arc<parking_lot::Mutex<Holds>>,
 }
 
 impl Drop for KeepOpen {
     fn drop(&mut self) {
-        self.holders.fetch_sub(1, Ordering::AcqRel);
+        self.holds.lock().count -= 1;
     }
+}
+
+/// The holds on a dispatcher's channel, and whether a drain has settled on waiting for that
+/// channel to close.
+///
+/// Both behind one lock, so taking a hold and settling on the wait are ordered against each
+/// other. A hold taken after a drain has settled would keep open the channel the drain is
+/// waiting to see closed, which for a subscription is until the subscription ends.
+#[derive(Default)]
+struct Holds {
+    count: usize,
+    settled: bool,
 }
 
 pub struct EventDispatcher {
@@ -57,11 +67,10 @@ pub struct EventDispatcher {
     pub completed: CancellationToken,
     pub weak_sender: Option<WeakUnboundedSender<DispatchedEvent>>,
     pub strong_sender: Mutex<Option<UnboundedSender<DispatchedEvent>>>,
-    /// How many [`KeepOpen`] holds are live. Counted here rather than read off
-    /// the channel's strong count: a `send` upgrades the weak sender for as
-    /// long as the push takes, and that counted too, so a task logging while
-    /// `drain` looked made it return with events still queued.
-    holders: Arc<AtomicUsize>,
+    /// The [`KeepOpen`] holds on the channel. Counted here rather than read off
+    /// the channel's strong count, which does not tell a hold apart from the
+    /// upgrade a `send` takes for the length of its push.
+    holds: Arc<parking_lot::Mutex<Holds>>,
     /// The forwarder task, kept so `complete` can await the task itself rather
     /// than only the token it cancels. A runtime torn down under an in-flight
     /// call drops the task, which leaves the token uncancelled forever, but the
@@ -76,7 +85,7 @@ impl Default for EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
-            holders: Arc::new(AtomicUsize::new(0)),
+            holds: Arc::default(),
             forwarder: Mutex::new(None),
         }
     }
@@ -118,7 +127,7 @@ impl EventDispatcher {
             completed,
             weak_sender: Some(weak_sender),
             strong_sender: Mutex::new(Some(sender)),
-            holders: Arc::new(AtomicUsize::new(0)),
+            holds: Arc::default(),
             forwarder: Mutex::new(forwarder),
         }
     }
@@ -129,7 +138,7 @@ impl EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
-            holders: Arc::new(AtomicUsize::new(0)),
+            holds: Arc::default(),
             forwarder: Mutex::new(None),
         }
     }
@@ -142,14 +151,31 @@ impl EventDispatcher {
 
     /// Keeps the channel open past `complete`, so that events sent afterwards
     /// still reach the callback; `End` then follows the last hold rather than
-    /// `Complete`. `None` once the channel has closed.
+    /// `Complete`. `None` once the channel has closed, and once
+    /// [`drain`](Self::drain) has settled on waiting for it to close, which a
+    /// hold granted afterwards would keep open.
     pub fn keep_open(&self) -> Option<KeepOpen> {
+        let mut holds = self.holds.lock();
+        if holds.settled {
+            return None;
+        }
         let sender = self.sender()?;
-        self.holders.fetch_add(1, Ordering::AcqRel);
+        holds.count += 1;
         Some(KeepOpen {
             _sender: sender,
-            holders: self.holders.clone(),
+            holds: self.holds.clone(),
         })
+    }
+
+    /// Settles whether a drain waits for the channel to close, which it does where nothing
+    /// holds the channel open.
+    ///
+    /// Decided under the lock a hold is taken under, so a hold cannot appear behind the
+    /// decision and keep open the channel the wait is for.
+    fn settle(&self) -> bool {
+        let mut holds = self.holds.lock();
+        holds.settled = holds.count == 0;
+        holds.settled
     }
 
     pub fn send(&self, event: LoreEvent) {
@@ -200,7 +226,7 @@ impl EventDispatcher {
         // A hold means the end event will come whenever its holder is done
         // (an ongoing notification subscription), so there is nothing to wait
         // for here.
-        if self.holders.load(Ordering::Acquire) == 0 {
+        if self.settle() {
             // Await the forwarder task, not just the token it cancels on its way
             // out. The two finish together in the normal case, but a runtime torn
             // down under an in-flight call drops the task before it can cancel
@@ -424,5 +450,38 @@ mod drain_tests {
             .filter(|kind| *kind != "other")
             .collect();
         assert_eq!(kinds, ["complete", "after", "end"]);
+    }
+
+    /// A drain that has settled on waiting refuses a hold, whatever the channel's senders say.
+    /// A `send` holds an upgraded sender for the length of its push, so a hold granted on the
+    /// strength of one alone would keep open the channel the drain is waiting to see closed.
+    #[test]
+    fn a_hold_is_refused_behind_a_settled_drain() {
+        let callback: crate::interface::LoreEventCallback = Some(Box::new(|_event: &LoreEvent| {}));
+        let dispatcher = Arc::new(EventDispatcher::new(callback));
+
+        lore_base::runtime::runtime().block_on(async {
+            // Stands in for the upgrade a `send` holds while it pushes: a sender the dispatcher
+            // does not own and no hold accounts for.
+            let in_flight = dispatcher.sender().expect("channel is open");
+
+            let draining = {
+                let dispatcher = dispatcher.clone();
+                lore_spawn!(async move { dispatcher.drain().await })
+            };
+
+            // The forwarder is held for the length of the join, so a drain that has it is one
+            // that has settled and is waiting.
+            while dispatcher.forwarder.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                dispatcher.keep_open().is_none(),
+                "a hold behind a settled drain keeps open the channel it waits on"
+            );
+
+            drop(in_flight);
+            draining.await.expect("the draining task");
+        });
     }
 }
