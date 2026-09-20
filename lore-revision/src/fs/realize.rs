@@ -69,8 +69,19 @@ use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::expand_path_ancestors;
 
+/// Carries the working tree from `state_current` to `state_target`.
+///
+/// Each context answers for the state beside it: one for a revision change, and two for a view
+/// change, where the tree holds what the current view materialized and is left holding what the
+/// target view does. Every write is the target context's, since that is the view the tree is left
+/// under.
+///
+/// A reset diffs the working tree against the target state instead. That walk asks the target
+/// context's view alone and reads the current state through the context beside it, so the pair
+/// carries one view however many are passed here.
 pub async fn realize_state(
-    repository: Arc<RepositoryContext>,
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
     state_current: Arc<State>,
     state_target: Arc<State>,
@@ -125,9 +136,9 @@ pub async fn realize_state(
             state_target.revision_number()
         );
         state::diff_collect(
-            repository.clone(),
+            repository_current.clone(),
             state_current.clone(),
-            repository.clone(),
+            repository_target.clone(),
             state_target.clone(),
             None, /* No subpath */
             options.filter_mode,
@@ -142,13 +153,13 @@ pub async fn realize_state(
         let mut changes = state::diff_filesystem_subtree(
             &operation,
             NodeMapping {
-                repository: repository.clone(),
+                repository: repository_target.clone(),
                 state: state_target.clone(),
                 path: RelativePath::new(),
                 node: ROOT_NODE,
             },
             NodeMapping {
-                repository: repository.clone(),
+                repository: repository_current.clone(),
                 state: state_current.clone(),
                 path: RelativePath::new(),
                 node: ROOT_NODE,
@@ -186,7 +197,7 @@ pub async fn realize_state(
         let tags: Vec<&str> = options.dependency_tags.iter().map(|s| s.as_str()).collect();
         let root_refs: Vec<&str> = options.root_files.iter().map(|s| s.as_str()).collect();
         let inclusion_set = dependency::resolve::resolve_dependency_file_set(
-            repository.clone(),
+            repository_target.clone(),
             state_target.clone(),
             &root_refs,
             &tags,
@@ -225,9 +236,9 @@ pub async fn realize_state(
         lore_info!("Verifying {} changes with local file system", changes.len());
         verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
             changes: changes.clone(),
-            repository_current: repository.clone(),
+            repository_current: repository_current.clone(),
             operation: operation.clone(),
-            current: NodeMapping::root(repository.clone(), state_current.clone()),
+            current: NodeMapping::root(repository_current.clone(), state_current.clone()),
             options: options.clone(),
         }))
         .await?
@@ -236,13 +247,19 @@ pub async fn realize_state(
     };
 
     realize_changes(
-        repository, operation, changes, None, dry_run, false, /* Not a merge */
+        repository_target,
+        operation,
+        changes,
+        None,
+        dry_run,
+        false, /* Not a merge */
         stats,
     )
     .await?;
 
     Ok(())
 }
+
 pub async fn verify_filesystem_for_changes(
     args: Arc<SyncVerifyArgs>,
 ) -> Result<Arc<Vec<NodeChange>>, SyncError> {
@@ -1611,6 +1628,23 @@ async fn remove_link_registry_entry(
     }
 }
 
+/// Whether the rename a move was realized by left the destination holding the content it should, so
+/// that writing it from the immutable store would replace it with the same bytes.
+///
+/// Two things have to hold. `renamed` reports a rename that completed, which is what says the source
+/// was there to be carried: a sparse working tree holds nothing at a source its view excludes, and a
+/// tree the move has already been applied to holds nothing at it either. And the two sides address
+/// the same content, since a move that rewrites the file carries the old bytes to the destination and
+/// the new ones are only in the store.
+///
+/// The rename answers the first for itself, so nothing here infers from a view whether the file was
+/// on disk. A view could not answer it: the source is materialized under the view the tree is carried
+/// *from* while realize holds the one it is carried *to*, and neither tells a source that was never
+/// materialized from one an earlier pass already carried away.
+fn rename_carried_the_content(change: &NodeChange, renamed: bool) -> bool {
+    renamed && change.from.address.hash == change.to.address.hash
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn realize_change_modify_add(
     tasks: &mut JoinSet<Result<(), SyncError>>,
@@ -1636,15 +1670,6 @@ async fn realize_change_modify_add(
     // it repositions a path an earlier in-view realize may have written.
     let write_to_disk = !view_filter.excludes_tree(path, node.is_directory(), FilterMode::View);
 
-    // A move is realized by renaming the file already on disk, which lets the
-    // content write be skipped when the content did not change. That only holds
-    // when the source was in view and so had a file to rename. A sparse working
-    // tree holds nothing at an excluded source, so the rename finds no file and
-    // the destination has to be written from the immutable store like any add.
-    let moved_from_in_view = change.move_source().is_some_and(|from_path| {
-        !view_filter.excludes_tree(from_path, node.is_directory(), FilterMode::View)
-    });
-
     lore_trace!(
         "{}{} {}",
         change.action.as_string_short(),
@@ -1657,23 +1682,25 @@ async fn realize_change_modify_add(
 
     let to_path = path.clone();
 
-    if !dry_run
+    let renamed = if !dry_run
         && change.action == change::FileAction::Move
         && let Some(from_path) = change.move_source()
     {
-        let from_path = from_path.clone();
-        if operation
-            .unify_case_rename(&from_path, &to_path)
+        let renamed = operation
+            .unify_case_rename(from_path, &to_path)
             .await
-            .is_err()
-        {
+            .is_ok();
+        if !renamed {
             lore_trace!("Failed renaming move node, fall back to deleting and recreating");
             operation
                 .remove_recursive(&to_path)
                 .await
                 .forward::<SyncError>("Failed to realize move/rename")?;
         }
-    }
+        renamed
+    } else {
+        false
+    };
 
     if (node.is_directory() || node.is_link()) && write_to_disk {
         if !dry_run
@@ -1731,20 +1758,18 @@ async fn realize_change_modify_add(
             .await
             .forward::<SyncError>("Failed to sync link")?;
         }
-    } else if node.is_file() && !dry_run && write_to_disk {
-        // For move changes where content didn't change, the rename already positioned the file correctly and the current branch's content should be preserved.
-        if change.action != change::FileAction::Move
-            || !moved_from_in_view
-            || change.from.address.hash != change.to.address.hash
-        {
-            lore_spawn!(tasks, {
-                let repository = repository.clone();
-                let operation = operation.clone();
-                let stats = stats.clone();
-                let change_path = change.path().clone();
-                async move { realize_file(repository, operation, &change_path, node, stats).await }
-            });
-        }
+    } else if node.is_file()
+        && !dry_run
+        && write_to_disk
+        && !rename_carried_the_content(&change, renamed)
+    {
+        lore_spawn!(tasks, {
+            let repository = repository.clone();
+            let operation = operation.clone();
+            let stats = stats.clone();
+            let change_path = change.path().clone();
+            async move { realize_file(repository, operation, &change_path, node, stats).await }
+        });
     }
 
     if let Some(state_stage) = state_stage.clone() {

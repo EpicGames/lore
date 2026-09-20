@@ -249,6 +249,17 @@ pub async fn test_commit_tree(
     )
     .await
     .expect("Failed to stage the fixture");
+    test_commit(instance, message).await
+}
+
+/// Commits what `instance` holds staged, answering the state of the revision that produced.
+///
+/// For a fixture that staged something narrower than the whole tree, such as a move.
+#[allow(dead_code)]
+pub async fn test_commit(
+    instance: &TestRepository,
+    message: &str,
+) -> std::sync::Arc<lore_revision::state::State> {
     lore_revision::commit::commit_boxed(
         instance.repository.clone(),
         &instance.write_token,

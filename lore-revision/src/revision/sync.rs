@@ -625,6 +625,7 @@ pub(crate) async fn sync(
     let state_synced = state_target.clone();
     let result = Box::pin(sync_realize(
         repository.clone(),
+        repository.clone(),
         state_current,
         state_target,
         options.clone(),
@@ -950,7 +951,11 @@ async fn shim_with_operation<T>(
 
 /// Realizes `state_target` over the working copy, returning the modified times of the files
 /// it wrote for the caller to store once the target revision is the current one.
+///
+/// `repository_current` is the context the working copy stands under, which is `repository` itself
+/// for a sync that carries the tree between revisions under one view.
 async fn sync_realize(
+    repository_current: Arc<RepositoryContext>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
@@ -959,6 +964,7 @@ async fn sync_realize(
     let (result, modified_times) =
         shim_with_operation(repository.file_system(), true, async |operation| {
             Box::pin(crate::fs::realize::realize_state(
+                repository_current,
                 repository,
                 operation,
                 state_current,
