@@ -8,13 +8,19 @@
 //! reports what the walk counted about itself beside the clock: the directories it stood in and
 //! the verdicts it asked a filter for.
 //!
-//! Three walks over one tree, so what separates them is the views and nothing else:
+//! Four walks over one tree, so what separates them is the views and nothing else:
 //!
 //! - **one view**, the content prune alone, which is every walk in the product today;
 //! - **two views diverging in one subtree**, where the walk has to enter that subtree and no
 //!   other;
+//! - **two views dropping one subtree**, where the walk enters no more than the first and the
+//!   delete fans out over what it dropped, naming it path by path;
 //! - **two views and an unanchored exclusion**, a rule that can match at any depth and so covers
 //!   nothing, leaving the walk to enter the tree whole.
+//!
+//! The third is the one a narrowing is made of, and the one place the hierarchy walk shows: it
+//! reports the directories the walk entered as the first does, and every path it emits is the
+//! hierarchy's.
 //!
 //! The counts are deterministic in the tree and the views, so they are asserted against each
 //! other here; the clock is reported. What the counts have to be for a given tree is asserted in
@@ -54,6 +60,9 @@ mod tests {
     /// The top-level directory the two views diverge in, which the walk must enter and which no
     /// content change gives it a reason to.
     const DIVERGED: u32 = 1;
+    /// The top-level directory the to view drops whole, which leaves the working tree path by path
+    /// without the walk entering it.
+    const DROPPED: u32 = 2;
     /// An exclusion that can match at any depth, so no subtree is ever covered.
     const UNANCHORED: &str = "*.tmp";
     /// How many times each walk is timed.
@@ -230,6 +239,14 @@ mod tests {
                         ],
                     )
                 };
+                let dropping = || {
+                    test_view_context(
+                        &instance,
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        &[&format!("/{}", top(DROPPED))],
+                    )
+                };
                 let unanchored = || {
                     test_view_context(
                         &instance,
@@ -249,10 +266,12 @@ mod tests {
                 )
                 .await;
                 let two_views = timed(|| (open(), diverging()), &older, &newer).await;
+                let dropped = timed(|| (open(), dropping()), &older, &newer).await;
                 let no_prune = timed(|| (open(), unanchored()), &older, &newer).await;
 
                 one_view.report("one view");
                 two_views.report("two views diverging in one subtree");
+                dropped.report("two views, one subtree dropped");
                 no_prune.report("two views, unanchored exclusion");
 
                 assert_eq!(
@@ -272,6 +291,18 @@ mod tests {
                 assert!(
                     two_views.entered() < no_prune.entered() / 2,
                     "diverging in one subtree must cost a subtree, not the tree"
+                );
+                assert_eq!(
+                    dropped.entered(),
+                    one_view.entered(),
+                    "the verdict taken where the walk pairs a dropped directory answers for \
+                     everything under it, so the delete fans out without the walk entering it"
+                );
+                assert_eq!(
+                    dropped.changes,
+                    one_view.changes + (1 + SUBDIRECTORIES + SUBDIRECTORIES * FILES) as usize,
+                    "a subtree the to view drops leaves path by path: the directory, its \
+                     subdirectories and every file in them"
                 );
             }))
             .await

@@ -9974,9 +9974,26 @@ bitflags! {
 }
 bitflagsops!(TreeFlags, u32);
 
+/// The side a delete hierarchy enumerates, which is the side its caller drew the filter verdict
+/// from.
+///
+/// `from` where the walk found the deletion between two trees, `to` where a stage recorded it and
+/// there is no from node at all. The tree and the verdict travel together: a verdict names lines
+/// by index into one filter, and the same indices read different rules in another.
+fn delete_hierarchy_side(from: NodeChangeState, to: &NodeChangeState) -> Option<NodeChangeState> {
+    if from.mapping.node.is_valid_or_root_node_id() {
+        Some(from)
+    } else if to.mapping.node.is_valid_or_root_node_id() {
+        Some(to.clone())
+    } else {
+        None
+    }
+}
+
 /// Recursively add delete changes for an entire directory hierarchy.
 ///
-/// `states` is the filter's verdict for the path being walked, which each child steps from.
+/// `states` is the filter's verdict for the path being walked, which each child steps from. It
+/// belongs to the filter [`delete_hierarchy_side`] answers with.
 async fn add_hierarchy_delete(
     from: NodeChangeState,
     to: NodeChangeState,
@@ -9984,47 +10001,35 @@ async fn add_hierarchy_delete(
     filter_mode: FilterMode,
     states: FilterStates,
 ) -> Result<(), StateError> {
-    // Try to get nodes from both states first
-    let from_node = if from.mapping.node.is_valid_or_root_node_id() {
-        from.mapping
-            .state
-            .node(from.mapping.repository.clone(), from.mapping.node)
-            .await
-            .ok()
-    } else {
-        None
-    };
-
-    let to_node = if to.mapping.node.is_valid_or_root_node_id() {
-        to.mapping
-            .state
-            .node(to.mapping.repository.clone(), to.mapping.node)
-            .await
-            .ok()
-    } else {
-        None
-    };
-
-    // Choose the state, "from" for normal deletions, "to" for merge deletions
-    let (iteration_state, node) = if let Some(from_node) = from_node {
-        (from, Some(from_node))
-    } else if let Some(to_node) = to_node {
-        (to.clone(), Some(to_node))
-    } else {
+    let Some(iteration_state) = delete_hierarchy_side(from, &to) else {
         return Ok(());
     };
 
-    // File nodes end recursion
-    if node.map(|n| n.is_file()).unwrap_or_default() {
+    let node = match iteration_state
+        .mapping
+        .state
+        .node(
+            iteration_state.mapping.repository.clone(),
+            iteration_state.mapping.node,
+        )
+        .await
+    {
+        Ok(node) => node,
+        Err(err) => {
+            lore_warn!(
+                "Skipping deletes below {}: node {} could not be read: {err}",
+                iteration_state.mapping.path,
+                iteration_state.mapping.node
+            );
+            return Ok(());
+        }
+    };
+
+    // A link holds children a delete does not name: the mount path stands for them
+    if node.is_file() || node.is_link() {
         return Ok(());
     }
 
-    // Link nodes don't recurse - don't show individual link files as deleted
-    if node.map(|n| n.is_link()).unwrap_or_default() {
-        return Ok(());
-    }
-
-    // Iterate children from whichever state has the node
     let mut children = StateNodeChildrenWithNameIterator::new(
         iteration_state.mapping.state.clone(),
         iteration_state.mapping.repository.clone(),
@@ -10039,7 +10044,6 @@ async fn add_hierarchy_delete(
             .push_into_buf(child_name)
             .freeze();
 
-        // Skip excluded paths
         let (child_states, excluded) = iteration_state
             .mapping
             .repository

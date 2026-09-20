@@ -56,6 +56,9 @@ mod tests {
     const EXCLUDE_STEADY: &str = "/sub/steady.txt";
     /// The view rule that excludes [`NESTED`] and everything under it.
     const EXCLUDE_NESTED: &str = "/sub/nested";
+    /// The view rule that re-includes [`NESTED_FILE`] below the directory [`EXCLUDE_NESTED`]
+    /// drops, so a view holding both materializes that file and nothing else under [`NESTED`].
+    const REINCLUDE_NESTED_FILE: &str = "!/sub/nested/deep.txt";
     /// A path that is a file in the older revision and a directory in the newer.
     const RETYPED: &str = "sub/retyped";
     const RETYPED_FILE: &str = "sub/retyped/inner.txt";
@@ -67,6 +70,16 @@ mod tests {
     const RENAMED: &str = "sub/renamed.txt";
     /// The view rule that excludes [`RENAMED`], the name [`MOVED`] arrives under.
     const EXCLUDE_RENAMED: &str = "/sub/renamed.txt";
+
+    /// A directory holding a different file in each revision, so which side a walk enumerates is
+    /// readable in what it names.
+    const RESHAPED: &str = "sub/reshaped";
+    /// The file [`RESHAPED`] holds in the older revision, and so the one on disk.
+    const HELD: &str = "sub/reshaped/held.txt";
+    /// The file [`RESHAPED`] holds in the newer revision, which no working tree ever stood on.
+    const ARRIVING: &str = "sub/reshaped/arriving.txt";
+    /// The view rule that excludes [`RESHAPED`] and everything under it.
+    const EXCLUDE_RESHAPED: &str = "/sub/reshaped";
 
     /// The directory the sibling subtrees sit under, which the walks that measure what a walk
     /// entered are rooted at.
@@ -97,6 +110,7 @@ mod tests {
         Plain,
         Retype,
         Rename,
+        Reshape,
         Wide,
     }
 
@@ -137,6 +151,15 @@ mod tests {
             Self::build(immutable_store, mutable_store, Shape::Rename).await
         }
 
+        /// [`Fixture::create`] where [`RESHAPED`] also holds [`HELD`] in the older revision and
+        /// [`ARRIVING`] in the newer.
+        async fn create_reshaping(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> Self {
+            Self::build(immutable_store, mutable_store, Shape::Reshape).await
+        }
+
         /// [`Fixture::create`] beside [`SIBLINGS`] sibling directories under [`TREE`], of which
         /// [`CHANGED`] alone differs between the two revisions.
         async fn create_wide(
@@ -165,10 +188,16 @@ mod tests {
             test_file_write(instance.path.join(STEADY).as_path(), b"steady");
             let retyped = instance.path.join(RETYPED);
             let moved = instance.path.join(MOVED);
+            let held = instance.path.join(HELD);
             match shape {
                 Shape::Plain => {}
                 Shape::Retype => test_file_write(retyped.as_path(), b"was a file"),
                 Shape::Rename => test_file_write(moved.as_path(), b"carried across"),
+                Shape::Reshape => {
+                    std::fs::create_dir_all(instance.path.join(RESHAPED))
+                        .expect("Create directory failed");
+                    test_file_write(held.as_path(), b"stood on disk");
+                }
                 Shape::Wide => {
                     for index in 0..SIBLINGS {
                         let directory = instance.path.join(sibling(index));
@@ -200,6 +229,13 @@ mod tests {
                 Shape::Rename => {
                     std::fs::rename(&moved, instance.path.join(RENAMED))
                         .expect("Rename file failed");
+                }
+                Shape::Reshape => {
+                    std::fs::remove_file(&held).expect("Remove file failed");
+                    test_file_write(
+                        instance.path.join(ARRIVING).as_path(),
+                        b"only in the target",
+                    );
                 }
                 Shape::Wide => test_file_write(
                     instance.path.join(sibling(CHANGED)).join(DROPPED).as_path(),
@@ -482,6 +518,72 @@ mod tests {
                         ("D".to_string(), NESTED_FILE.to_string()),
                     ],
                     "a directory the to view drops must take its contents with it"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A file the from view re-included below a directory it excluded leaves the tree when the to
+    /// view drops that directory whole.
+    ///
+    /// The verdict the delete fans out under names the line that decided it by index into the view
+    /// that produced it, and an excluded verdict is stepped from that line on. The two views hold
+    /// different lines at the same index: read against the to view the re-inclusion is not there to
+    /// be found, and the one file the working tree holds is never named.
+    #[tokio::test]
+    async fn a_re_included_file_leaves_with_the_directory_the_to_view_drops() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+
+                assert_eq!(
+                    fixture
+                        .changes(
+                            fixture.view(&[EXCLUDE_NESTED, REINCLUDE_NESTED_FILE]),
+                            fixture.view(&[EXCLUDE_NESTED]),
+                        )
+                        .await,
+                    vec![
+                        ("M".to_string(), FILE.to_string()),
+                        ("D".to_string(), NESTED.to_string()),
+                        ("D".to_string(), NESTED_FILE.to_string()),
+                    ],
+                    "the file the from view held below the directory must leave with it"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A directory leaving the view is emptied of what the from side holds, which is what stands on
+    /// disk, and not of what the newer revision would have put there.
+    ///
+    /// The delete fans out over one tree under one view, and both are the from side's: the to side
+    /// names a file no working tree ever stood on, and the to view excludes the subtree whole, so
+    /// asking it would name nothing at all.
+    #[tokio::test]
+    async fn a_directory_leaving_the_view_is_emptied_of_what_the_from_side_holds() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_reshaping(immutable_store, mutable_store).await;
+
+                assert_eq!(
+                    fixture
+                        .changes(fixture.view(&[]), fixture.view(&[EXCLUDE_RESHAPED]))
+                        .await,
+                    vec![
+                        ("M".to_string(), FILE.to_string()),
+                        ("D".to_string(), RESHAPED.to_string()),
+                        ("D".to_string(), HELD.to_string()),
+                    ],
+                    "the delete names the file the working tree holds, not the one arriving"
                 );
             }))
             .await
