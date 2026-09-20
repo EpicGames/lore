@@ -73,7 +73,11 @@ pub use lore_base::lore_spawn_blocking_nocontext;
 /// the diff, stage, realize and verify-filesystem walks.
 ///
 /// These tasks wait on the `lore-io` syscall pool rather than holding a core, so
-/// the bound keeps that pool fed while capping live per-task state. Overflow
-/// recurses inline rather than blocking on a permit, so any value >= 1 is
-/// correct.
+/// the bound keeps that pool fed while capping live per-task state. A walk that
+/// reaches the ceiling carries the work rather than waiting for a permit: the
+/// revision diff queues it for the task that found it, the filesystem diff and
+/// the local-size walk take it inline, and the walks bounded by the length of
+/// their own `JoinSet` wait on a task of theirs, which needs no permit to
+/// finish. So any value >= 1 is correct, and waiting for a permit instead would
+/// deadlock, since a task holds its own until the subtrees it spawned finish.
 pub const MAX_CONCURRENT_TREE_TASKS: usize = 1000;

@@ -1,16 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::change;
 use crate::change::NodeChangeState;
 use crate::filter::Filter;
@@ -147,8 +149,8 @@ impl DiffFlags {
 /// What a walk did to answer, for a caller measuring the walk rather than reading
 /// the changes it found.
 ///
-/// Every directory counts its own and folds in what the subtrees it spawned report,
-/// so no counter is shared between tasks.
+/// One count per task, which every directory that task walks adds to and which folds
+/// in what the subtrees it spawned report, so no counter is shared between tasks.
 #[derive(Default)]
 pub struct DiffWalkStats {
     /// Directories the walk stood in, the one it was rooted at included.
@@ -169,12 +171,9 @@ pub struct DiffWalkStats {
 }
 
 impl DiffWalkStats {
-    /// The stats of a directory the walk has entered and not yet looked inside.
-    fn entered() -> Self {
-        Self {
-            directories_entered: AtomicU64::new(1),
-            ..Default::default()
-        }
+    /// Records one directory the walk has entered.
+    fn entered(&self) {
+        self.directories_entered.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Records one verdict asked of a filter.
@@ -221,22 +220,24 @@ pub async fn diff_subtree(
     }
 
     let depth = query_depth(path.as_lowercase_str());
-    diff_subtree_node(
-        from,
-        to,
-        DiffCursor {
-            paths: DiffPaths {
-                from: path.clone(),
-                to: path,
-                depth,
+    diff_subtree_walk(
+        PendingSubtree {
+            from,
+            to,
+            cursor: DiffCursor {
+                paths: DiffPaths {
+                    from: path.clone(),
+                    to: path,
+                    depth,
+                },
+                states: DiffStates {
+                    from: from_states,
+                    to: to_states,
+                },
             },
-            states: DiffStates {
-                from: from_states,
-                to: to_states,
-            },
+            graft,
         },
         flags,
-        graft,
         changes,
         filter_mode,
     )
@@ -290,18 +291,161 @@ fn seed_states(
     }
 }
 
-fn recurse_diff_subtree_node(
+/// A paired directory a walk has still to descend into.
+///
+/// Held by the task that will walk it rather than walked from the frame that found it, which is
+/// what keeps a walk's stack the depth of one directory however deep the tree runs.
+struct PendingSubtree {
+    from: NodeChangeState,
+    to: NodeChangeState,
+    cursor: DiffCursor,
+    /// A linked repository merges through its own link, so a mount clears the oracle for
+    /// everything below it and each subtree carries the one that answers for it.
+    graft: Option<Arc<GraftOracle>>,
+}
+
+/// The subtree walks one task has in flight, each reporting what it counted.
+///
+/// Nothing else comes back: a subtree sends its changes on a clone of the caller's sender
+/// rather than collecting them for the directory above to pass on.
+type SubtreeTasks = JoinSet<Result<DiffWalkStats, StateError>>;
+
+/// The subtree walks one task has in flight and the ones it has still to walk itself.
+struct SubtreeWork {
+    tasks: SubtreeTasks,
+    /// Taken from the back, so what waits here is the depth-first frontier — a level's worth of
+    /// siblings per level standing open — rather than a whole level of the tree.
+    pending: Vec<PendingSubtree>,
+}
+
+/// Budget for subtree tasks live at once, spent by [`dispatch_subtree_diff`].
+///
+/// Process-wide rather than per-walk, because every task in a walk owns its own
+/// [`SubtreeTasks`]: a budget held by a walk would let concurrent walks each fan out as far as
+/// one walk may.
+static SUBTREE_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn subtree_task_semaphore() -> &'static Arc<Semaphore> {
+    SUBTREE_TASK_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_TREE_TASKS)))
+}
+
+/// Hands the paired subtree `cursor` stands at to a task while the budget allows, and to the
+/// walking task's own queue once it does not, then folds back whatever tasks have finished.
+///
+/// Queued rather than walked here, and rather than waiting for a permit. Walking it here would
+/// spend a frame per level, so a deep enough tree would exhaust the stack; waiting for a permit
+/// would deadlock, since a task holds its own until the subtrees it spawned finish. A queued
+/// subtree costs neither: the task that queued it walks it in the same loop it walks everything
+/// else, so a walk with no budget at all runs to the bottom of the tree in one task with no
+/// stack growth.
+fn dispatch_subtree_diff(
     from: NodeChangeState,
     to: NodeChangeState,
     cursor: DiffCursor,
     flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
-    changes: ChangeSender,
+    context: DiffContext<'_>,
+    work: &mut SubtreeWork,
+) -> Result<(), StateError> {
+    let DiffContext {
+        changes,
+        filter_mode,
+        stats,
+        ..
+    } = context;
+    let SubtreeWork { tasks, pending } = work;
+    let subtree = PendingSubtree {
+        from,
+        to,
+        cursor,
+        graft,
+    };
+    match subtree_task_semaphore().clone().try_acquire_owned() {
+        Ok(permit) => {
+            let changes = changes.clone();
+            lore_spawn!(tasks, async move {
+                let _permit = permit;
+                diff_subtree_walk(subtree, flags, &changes, filter_mode).await
+            });
+        }
+        Err(_) => pending.push(subtree),
+    }
+    while let Some(joined) = tasks.try_join_next() {
+        merge_subtree_task(joined, stats)?;
+    }
+    Ok(())
+}
+
+/// Walks `subtree` and everything below it that no task took, and answers with what all of that
+/// counted.
+///
+/// The walk is a loop rather than a recursion: a directory hands what it cannot spawn to
+/// [`SubtreeWork::pending`], and this takes them one at a time. So a task's stack holds one
+/// directory, its tasks are bounded by the budget, and what grows with the tree is a queue of
+/// change states.
+async fn diff_subtree_walk(
+    first: PendingSubtree,
+    flags: DiffFlags,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
-) -> Pin<Box<dyn Future<Output = Result<DiffWalkStats, StateError>> + Send>> {
-    Box::pin(async move {
-        diff_subtree_node(from, to, cursor, flags, graft, &changes, filter_mode).await
-    })
+) -> Result<DiffWalkStats, StateError> {
+    let stats = DiffWalkStats::default();
+    let mut work = SubtreeWork {
+        tasks: SubtreeTasks::new(),
+        pending: vec![first],
+    };
+
+    // Run the walk in a helper so any `?` early-out still hits the
+    // drain below — otherwise the JoinSet drops with subtree-diff
+    // tasks still running, leaking the Arc<RepositoryContext> clones.
+    let work_result = walk_pending_subtrees(&mut work, flags, changes, filter_mode, &stats).await;
+    let drain_result = lore_drain_tasks!(work.tasks, StateError::internal("Task failure"));
+    work_result?;
+    drain_result?;
+    Ok(stats)
+}
+
+/// Walks every queued subtree, and every subtree they queue, then joins the tasks they spawned.
+async fn walk_pending_subtrees(
+    work: &mut SubtreeWork,
+    flags: DiffFlags,
+    changes: &ChangeSender,
+    filter_mode: FilterMode,
+    stats: &DiffWalkStats,
+) -> Result<(), StateError> {
+    while let Some(subtree) = work.pending.pop() {
+        // Boxed for two reasons: it keeps one directory's state off the walk's own future,
+        // which every caller of `diff` holds and `clippy::large_futures` bounds, and it is
+        // what gives that future a size at all, since a directory dispatches walks and so
+        // names this one.
+        Box::pin(diff_subtree_node(
+            subtree,
+            flags,
+            changes,
+            filter_mode,
+            work,
+            stats,
+        ))
+        .await?;
+    }
+    while let Some(joined) = work.tasks.join_next().await {
+        merge_subtree_task(joined, stats)?;
+    }
+    Ok(())
+}
+
+/// Folds a joined subtree task's count into the walk that dispatched it.
+fn merge_subtree_task(
+    joined: Result<Result<DiffWalkStats, StateError>, JoinError>,
+    stats: &DiffWalkStats,
+) -> Result<(), StateError> {
+    stats.append(
+        joined
+            .internal("Task failure")
+            .map_err(StateError::from)
+            .flatten()?,
+    );
+    Ok(())
 }
 
 /// The path the walk stands at, one per side.
@@ -356,17 +500,23 @@ impl DiffCursor {
     }
 }
 
+/// Emits the changes between the two nodes `subtree` stands at, and queues in `work` what
+/// descending below them needs.
 async fn diff_subtree_node(
-    from: NodeChangeState,
-    to: NodeChangeState,
-    cursor: DiffCursor,
+    subtree: PendingSubtree,
     flags: DiffFlags,
-    graft: Option<Arc<GraftOracle>>,
     changes: &ChangeSender,
     filter_mode: FilterMode,
-) -> Result<DiffWalkStats, StateError> {
+    work: &mut SubtreeWork,
+    stats: &DiffWalkStats,
+) -> Result<(), StateError> {
+    let PendingSubtree {
+        from,
+        to,
+        mut cursor,
+        graft,
+    } = subtree;
     // If path is a file then treat this as a call for the parent with only one child.
-    let mut cursor = cursor;
     let (from_nodes, to_nodes, popped) =
         find_sorted_children(&mut cursor.paths, &from, &to).await?;
     if popped {
@@ -374,13 +524,8 @@ async fn diff_subtree_node(
     }
     let DiffCursor { paths, states } = cursor;
 
-    let stats = DiffWalkStats::entered();
-    let mut subtasks = JoinSet::new();
-
-    // Run the walk in a helper so any `?` early-out still hits the
-    // drain below — otherwise the JoinSet drops with subtree-diff
-    // tasks still running, leaking the Arc<RepositoryContext> clones.
-    let work_result = diff_subtree_node_walk(
+    stats.entered();
+    diff_subtree_node_walk(
         &from,
         &to,
         &paths,
@@ -391,18 +536,14 @@ async fn diff_subtree_node(
         filter_mode,
         &from_nodes,
         &to_nodes,
-        &mut subtasks,
-        &stats,
+        work,
+        stats,
     )
-    .await;
-    let drain_result = lore_drain_tasks!(subtasks, StateError::internal("Task failure"));
-    work_result?;
-    drain_result?;
-    Ok(stats)
+    .await
 }
 
-/// Walk paired/solo from/to children, spawning paired-node diffs into
-/// `subtasks` and emitting solo changes inline.
+/// Walk paired/solo from/to children, dispatching paired-node diffs through
+/// [`dispatch_subtree_diff`] and emitting solo changes as they are found.
 ///
 /// Each (case-normalized) name is in one of three buckets:
 /// 1. In `to_nodes` but not `from_nodes` → Added or Moved.
@@ -420,7 +561,7 @@ async fn diff_subtree_node_walk(
     filter_mode: FilterMode,
     from_nodes: &StateChildrenNodes,
     to_nodes: &StateChildrenNodes,
-    subtasks: &mut JoinSet<Result<DiffWalkStats, StateError>>,
+    work: &mut SubtreeWork,
     stats: &DiffWalkStats,
 ) -> Result<(), StateError> {
     let context = DiffContext {
@@ -470,7 +611,7 @@ async fn diff_subtree_node_walk(
             to_index += 1;
 
             add_change_for_paired_nodes(
-                subtasks,
+                work,
                 flags,
                 graft.clone(),
                 context,
@@ -485,15 +626,6 @@ async fn diff_subtree_node_walk(
 
     for to_index in to_index..to_nodes.children.len() {
         add_change_for_solo_to_node(context, from, to_index).await?;
-    }
-
-    while let Some(task_result) = subtasks.join_next().await {
-        stats.append(
-            task_result
-                .internal("Task failure")
-                .map_err(StateError::from)
-                .flatten()?,
-        );
     }
 
     Ok(())
@@ -781,7 +913,7 @@ fn views_diverge_below(
 /// itself, and is reported only for what else changed about it.
 #[allow(clippy::too_many_arguments)]
 async fn add_change_for_paired_nodes(
-    subtasks: &mut JoinSet<Result<DiffWalkStats, StateError>>,
+    work: &mut SubtreeWork,
     flags: DiffFlags,
     graft: Option<Arc<GraftOracle>>,
     context: DiffContext<'_>,
@@ -1038,29 +1170,23 @@ async fn add_change_for_paired_nodes(
                         .await?;
                     } else {
                         lore_debug!("Diff node {subpath} has linked changes, recurse diff");
-                        let from_path = from_path.clone();
-                        let task_changes = changes.clone();
-                        lore_spawn!(subtasks, async move {
-                            recurse_diff_subtree_node(
-                                from,
-                                to,
-                                DiffCursor {
-                                    paths: DiffPaths {
-                                        from: from_path,
-                                        to: subpath,
-                                        depth: child_depth,
-                                    },
-                                    states: child_states,
+                        dispatch_subtree_diff(
+                            from,
+                            to,
+                            DiffCursor {
+                                paths: DiffPaths {
+                                    from: from_path.clone(),
+                                    to: subpath,
+                                    depth: child_depth,
                                 },
-                                flags,
-                                // A linked repository merges through its own
-                                // link.
-                                None,
-                                task_changes,
-                                filter_mode,
-                            )
-                            .await
-                        });
+                                states: child_states,
+                            },
+                            flags,
+                            // A linked repository merges through its own link.
+                            None,
+                            context,
+                            work,
+                        )?;
                     }
                 } else {
                     // Source changed this directory and the target branch did
@@ -1090,27 +1216,22 @@ async fn add_change_for_paired_nodes(
                         lore_trace!(
                             "Diff node {subpath} directory hash change from {from_address} to {to_address}, recurse diff"
                         );
-                        let from_path = from_path.clone();
-                        let task_changes = changes.clone();
-                        lore_spawn!(subtasks, async move {
-                            recurse_diff_subtree_node(
-                                from,
-                                to,
-                                DiffCursor {
-                                    paths: DiffPaths {
-                                        from: from_path,
-                                        to: subpath,
-                                        depth: child_depth,
-                                    },
-                                    states: child_states,
+                        dispatch_subtree_diff(
+                            from,
+                            to,
+                            DiffCursor {
+                                paths: DiffPaths {
+                                    from: from_path.clone(),
+                                    to: subpath,
+                                    depth: child_depth,
                                 },
-                                flags,
-                                graft,
-                                task_changes,
-                                filter_mode,
-                            )
-                            .await
-                        });
+                                states: child_states,
+                            },
+                            flags,
+                            graft,
+                            context,
+                            work,
+                        )?;
                     }
                 }
             }
@@ -1389,10 +1510,14 @@ pub async fn get_filtered_node_and_path(
 }
 
 /// The decisions a walk takes and does not report: what it makes of its two filters,
-/// what it seeds each side with, and what it asks the to side about a paired node.
+/// what it seeds each side with, what it asks the to side about a paired node, and what it
+/// does with a subtree it has no budget left to walk in a task.
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::state::ChangeStream;
 
     /// A filter that excludes `x` and re-includes under it, so a query against it steps
     /// to a verdict no root state matches and still descends.
@@ -1602,5 +1727,204 @@ mod tests {
             !excluded(true, true),
             "the node question must not match what is no directory"
         );
+    }
+
+    /// How deep the fixture tree runs. Every level is a paired directory the walk dispatches, so
+    /// a walk with no budget left takes all of them from its own queue.
+    ///
+    /// Deep enough that walking them from the frames that found them would not fit a thread's
+    /// stack: a walk that recursed instead of queueing aborts the run here, at the 103,504 bytes
+    /// a level of that cost when it was measured, rather than passing quietly.
+    const DEPTH: u32 = 30;
+    /// Files in each directory of the fixture tree.
+    const FILES: u32 = 2;
+
+    /// The name of the directory at `level` of the chain.
+    fn directory_name(level: u32) -> String {
+        format!("d{level:02}")
+    }
+
+    /// The name of file `index` in a directory of the chain.
+    fn file_name(index: u32) -> String {
+        format!("f{index}.bin")
+    }
+
+    /// A file node addressing `content`, which is all the walk reads of a file: the content
+    /// itself is never fetched, so nothing stands behind the address but this.
+    fn file_node(content: &[u8]) -> Node {
+        Node {
+            flags: NodeFlags::File.bits(),
+            address: Address::zero_context_hash(crate::hash::hash_slice(content)),
+            size: content.len() as u64,
+            ..Default::default()
+        }
+    }
+
+    /// A state holding a chain of [`DEPTH`] directories with [`FILES`] files in each, the
+    /// deepest of them holding `content` and the rest holding nothing.
+    ///
+    /// Staged rather than committed, which is what makes every directory of it worth
+    /// descending: the nodes carry no computed address, so the walk pairs them on the staged
+    /// flag instead.
+    async fn chain_state(repository: &Arc<RepositoryContext>, content: &[u8]) -> Arc<State> {
+        let state = Arc::new(State::new());
+        let stage = async |path: RelativePath, node| {
+            crate::stage::stage_single_node(
+                repository.clone(),
+                state.clone(),
+                path,
+                node,
+                Arc::default(),
+                None,
+                FilterMode::empty(),
+            )
+            .await
+            .expect("a staged node");
+        };
+        let mut directory = RelativePath::new();
+        for level in 0..DEPTH {
+            directory = directory.push_into_buf(directory_name(level)).freeze();
+            stage(directory.clone(), Node::default()).await;
+            for file in 0..FILES {
+                let deepest = level + 1 == DEPTH && file + 1 == FILES;
+                stage(
+                    directory.push_into_buf(file_name(file)).freeze(),
+                    file_node(if deepest { content } else { b"" }),
+                )
+                .await;
+            }
+        }
+        state
+    }
+
+    /// The path of the one file [`chain_state`] addresses differently for a different
+    /// `content`, which is the deepest file of the chain.
+    fn deepest_file() -> String {
+        let mut path = (0..DEPTH).map(directory_name).collect::<Vec<_>>();
+        path.push(file_name(FILES - 1));
+        path.join("/")
+    }
+
+    /// A repository with no working tree, which is all a state-to-state walk needs.
+    async fn walk_repository() -> Arc<RepositoryContext> {
+        let (immutable_store, mutable_store, _execution) =
+            crate::fs::filesystem_provider::tests::test_store_create()
+                .await
+                .expect("test stores");
+        Arc::new(RepositoryContext::new(
+            crate::repository::test_helpers::default_repository_creation_args(
+                immutable_store,
+                mutable_store,
+            ),
+        ))
+    }
+
+    /// What a walk between the two states emitted, sorted, and how many directories it stood
+    /// in.
+    ///
+    /// Each change is its action letter, whether the walk measured the content as changed, and
+    /// its path. The letter alone does not carry the second: a paired file is reported `Keep`,
+    /// which reads as `M`, whether its content moved or only its staged flag did.
+    async fn walk(
+        repository: &Arc<RepositoryContext>,
+        from: &Arc<State>,
+        to: &Arc<State>,
+    ) -> (Vec<(String, bool, String)>, u64) {
+        let (repository_from, repository_to) = (repository.clone(), repository.clone());
+        let (from, to) = (from.clone(), to.clone());
+        let mut walk = ChangeStream::spawn(async move |changes| {
+            crate::state::diff(
+                repository_from,
+                from,
+                repository_to,
+                to,
+                None,
+                None,
+                &changes,
+                FilterMode::Full,
+            )
+            .await
+        });
+        let mut emitted = Vec::new();
+        while let Some(change) = walk.next().await {
+            emitted.push((
+                change.action.as_string_short().to_string(),
+                change.flags.contains(change::Flags::Modify),
+                change.path().as_str().to_string(),
+            ));
+        }
+        let stats = walk.finish().await.expect("a walk of the two states");
+        emitted.sort();
+        (emitted, stats.directories_entered.load(Ordering::Relaxed))
+    }
+
+    /// One semaphore for the process, so that what bounds one walk bounds every walk running
+    /// beside it. A budget minted per walk would let each of them fan out as far as one walk
+    /// may.
+    #[test]
+    fn the_fan_out_budget_is_one_semaphore() {
+        let first: *const Semaphore = Arc::as_ptr(subtree_task_semaphore());
+        let second: *const Semaphore = Arc::as_ptr(subtree_task_semaphore());
+        assert_eq!(first, second, "the budget must not be minted per caller");
+    }
+
+    /// A walk that cannot spawn takes every subtree from [`SubtreeWork::pending`] instead, and
+    /// reports the same changes over the same directories as a walk that spawns them all.
+    ///
+    /// No permit is free here, so the queue is the only way down: each of the [`DEPTH`]
+    /// directories below the root is queued by the directory above it and walked by the one task
+    /// the walk has. That every one of them was walked is what the count says, and the chain is
+    /// long enough that walking them from the frames that queued them would not fit a thread's
+    /// stack.
+    ///
+    /// The timeout is the point of the test as much as the equality is: a task holds its permit
+    /// until the subtrees it spawned finish, so a walk that waited for one would wait on a
+    /// descendant that cannot start, and would never end rather than fail.
+    #[tokio::test]
+    async fn a_walk_with_no_budget_left_walks_the_same_tree() {
+        let execution = crate::fs::filesystem_provider::tests::setup_test_execution();
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async {
+                let repository = walk_repository().await;
+                let from = chain_state(&repository, b"one").await;
+                let to = chain_state(&repository, b"two").await;
+
+                let spawned = walk(&repository, &from, &to).await;
+
+                let _budget = subtree_task_semaphore()
+                    .clone()
+                    .acquire_many_owned(MAX_CONCURRENT_TREE_TASKS as u32)
+                    .await
+                    .expect("the whole fan-out budget");
+                assert_eq!(
+                    subtree_task_semaphore().available_permits(),
+                    0,
+                    "the walk below must meet a budget that is actually spent"
+                );
+                let queued =
+                    tokio::time::timeout(Duration::from_secs(120), walk(&repository, &from, &to))
+                        .await
+                        .expect("a walk that never waits for a permit it cannot be given");
+
+                assert_eq!(
+                    spawned.1,
+                    u64::from(DEPTH) + 1,
+                    "the walk must stand in the root and every directory below it"
+                );
+                assert_eq!(
+                    queued.1, spawned.1,
+                    "every queued subtree must be walked, and counted by the task that walked it"
+                );
+                assert_eq!(
+                    queued.0, spawned.0,
+                    "a subtree taken from the queue must report what a task of its own would have"
+                );
+                assert!(
+                    spawned.0.contains(&("M".to_string(), true, deepest_file())),
+                    "the one file the two states address differently must be the one reported \
+                     with its content changed"
+                );
+            })
+            .await;
     }
 }
