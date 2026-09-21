@@ -122,7 +122,7 @@ Lore-native primitives. Use as written; define inline on first use.
 | `clone` | The act (`lore clone`) and the resulting repository instance. Lore-native — not a Git-ism. |
 | `fragment` | Lore's content-addressed unit of storage. |
 | `sync` | Lore's analog to Git's `pull`. |
-| `view filter` | Client-side glob-based path include/exclude applied at clone time (`lore clone --view`). Close to a P4 stream view, but per-instance rather than server-side. Closest Git analog: sparse-checkout. |
+| `view filter` | Client-side glob-based path include/exclude, user-defined per instance and changeable in place (`lore clone --view`, `lore sync --view`). Close to a P4 stream view, but per-instance rather than server-side. Closest Git analog: sparse-checkout. |
 | `layer` | A repository mounted at a path inside another repository, tracking current and staged revisions with revision-matching metadata. One of two Lore analogs to a Git submodule. |
 | `link` | A pinned reference to a path in another repository (`--pin <branch-or-revision>`). The other Lore analog to a Git submodule. |
 

@@ -3147,7 +3147,7 @@ pub async fn branch_switch(
         if global.force() {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
         } else {
-            state::rebase_staged_anchor(repository.clone(), branch_signature)
+            state::rebase_staged_anchor(repository.clone(), branch_signature, false)
                 .await
                 .forward::<RepositoryError>("Failed to rebase staged anchor")?;
         }

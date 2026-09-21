@@ -4,7 +4,7 @@ The `lore` command-line client drives every local and remote Lore operation: cre
 
 This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md); to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
 
-This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+1031`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
+This page is generated from `lore --markdown-help` (CLI `0.10.1-nightly+1183`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
 
 ```bash
 printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } )" > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
@@ -1179,6 +1179,7 @@ Synchronize to a given state of a repository
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
+* `--view <file>` — View filter file to leave the working files materialized under, changing which subset of the repository is on disk. Without it the instance keeps the view it holds
 
 
 
@@ -2558,6 +2559,7 @@ Synchronize to a repository state
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
+* `--view <file>` — View filter file to leave the working files materialized under, changing which subset of the repository is on disk. Without it the instance keeps the view it holds
 
 
 

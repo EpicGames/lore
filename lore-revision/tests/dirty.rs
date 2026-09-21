@@ -2391,6 +2391,7 @@ mod tests {
                     repository.clone(),
                     staged_revision,
                     current_revision,
+                    false,
                 )
                 .await
                 .expect("Rebase failed")
@@ -2482,6 +2483,7 @@ mod tests {
                     repository.clone(),
                     current_revision,
                     current_revision,
+                    false,
                 )
                 .await
                 .expect("Rebase failed");

@@ -4377,6 +4377,7 @@ impl State {
 pub async fn rebase_staged_anchor(
     repository: Arc<RepositoryContext>,
     new_current_signature: Hash,
+    force: bool,
 ) -> Result<(), StateError> {
     let Some(old_staged_signature) = crate::instance::load_staged_revision(&repository)
         .await
@@ -4396,6 +4397,7 @@ pub async fn rebase_staged_anchor(
         repository.clone(),
         old_staged_signature,
         new_current_signature,
+        force,
     )
     .await?
     else {
@@ -4413,10 +4415,19 @@ pub async fn rebase_staged_anchor(
 ///
 /// Returns the signature of the rebased state, leaving persistence to the
 /// caller, or `None` when nothing needs staging on top of the new current.
+///
+/// `force` carries forward dirty paths `repository`'s filter excludes, for a
+/// caller whose filter is the one those paths were recorded under. An operation
+/// that changes the view is not such a caller: its filter is the one the working
+/// tree is left materialized under, so a path it excludes names a file the tree
+/// no longer holds. A status asks the same filter and so reports nothing of a
+/// flag carried there, until the view widens again and it surfaces as a local
+/// change to a file nothing touched.
 pub async fn rebase_staged_state(
     repository: Arc<RepositoryContext>,
     old_staged_signature: Hash,
     new_current_signature: Hash,
+    force: bool,
 ) -> Result<Option<Hash>, StateError> {
     let old_staged_state = State::deserialize(repository.clone(), old_staged_signature).await?;
     let has_dirty = old_staged_state
@@ -4428,12 +4439,16 @@ pub async fn rebase_staged_state(
     }
 
     let mut dirty_paths: Vec<RelativePath> = Vec::new();
-    collect_dirty_paths(
+    collect_dirty_paths_inner(
         old_staged_state,
         repository.clone(),
         crate::node::ROOT_NODE,
-        RelativePathBuf::new(),
+        &mut RelativePathBuf::new(),
         &mut dirty_paths,
+        DirtyWalkOptions {
+            skip_staged: false,
+            force,
+        },
     )
     .await?;
 

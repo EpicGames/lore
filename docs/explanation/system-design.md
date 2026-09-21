@@ -1265,10 +1265,21 @@ user wants on disk. Paths outside the view are not materialized when a revision 
 switched, or restored; they exist in the repository's tree, but no bytes for them are written
 to the working directory.
 
-The view is local to a client. It is not part of the committed revision and does not travel
-with a clone. Two clients on the same revision can hold different views, materializing
-different subsets of the same tree. A change to the view triggers the storage subsystem to
-materialize (or de-materialize) paths to bring the instance into agreement.
+The view is defined locally by the user. It is a file of glob rules the user writes and points
+an instance at, supplied at clone time (`lore clone --view`) or left out for the whole tree.
+Nothing in the repository declares it and no deployment policy imposes one, so two clients on
+the same revision can hold different views and materialize different subsets of the same tree.
+It is not part of the committed revision and does not travel with a clone.
+
+A view is not fixed for the life of an instance either. The user can point an existing
+instance at a different view file at any later point (`lore sync --view <file>`), and the
+instance carries its working tree from the subset the old view materialized to the subset the
+new one does: paths entering the view are written from the store, paths leaving it are
+removed, and paths in both are left as they stand. This mints no revision and moves no branch;
+the revision the tree is materialized from has not moved, only which subset of it is on disk.
+Widening, narrowing, or re-shaping a view is therefore a local operation rather than a reason
+to re-clone. A change that would delete or overwrite a locally modified file is refused rather
+than carried out: the working tree is the only place that content exists.
 
 Views shape what the local cache is asked to hold, what the remote is asked to send, and what
 filesystem-level tools (search, indexing, build systems) see. They are useful well beyond the

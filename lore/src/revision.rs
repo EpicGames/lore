@@ -744,6 +744,10 @@ pub struct LoreRevisionSyncArgs {
     pub dependency_recursive: u8,
     /// Maximum dependency traversal depth; 0 means unlimited
     pub dependency_depth_limit: u32,
+    /// View filter file to leave the working files materialized under; empty to keep the view the
+    /// instance holds
+    #[serde(default)]
+    pub view: LoreString,
 }
 
 /// Synchronizes the working directory to a target revision, optionally merging divergent branches.
@@ -822,6 +826,16 @@ async fn sync_local(
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
+            let view = if args.view.length > 0 {
+                Some(
+                    lore_revision::util::path::make_absolute(args.view.as_str())
+                        .forward_with::<sync::SyncError, _>(|| {
+                            format!("Invalid path: {}", args.view)
+                        })?,
+                )
+            } else {
+                None
+            };
             let options = SyncOptions {
                 revision: args.revision.into(),
                 forward_changes: args.forward_changes != 0,
@@ -832,6 +846,7 @@ async fn sync_local(
                 dependency_tags,
                 dependency_recursive: args.dependency_recursive != 0,
                 dependency_depth_limit: args.dependency_depth_limit,
+                view,
             };
 
             sync::sync_boxed(repository, &token, options).await
@@ -1740,6 +1755,32 @@ mod tests {
         assert_eq!(args.revision.as_str(), "main@3");
         assert_eq!(args.message.as_str(), "pick");
         assert!(args.inherit_metadata.as_slice().is_empty());
+    }
+
+    #[test]
+    fn sync_args_old_payload_missing_view_uses_default() {
+        // Old IPC client payload with no view field. The new field must be
+        // `#[serde(default)]` so old clients keep working.
+        let full = LoreRevisionSyncArgs {
+            revision: "main@3".into(),
+            view: "views/engine.filter".into(),
+            ..Default::default()
+        };
+        let mut payload = serde_json::to_value(&full).expect("args must serialise");
+        payload
+            .as_object_mut()
+            .expect("args serialise to an object")
+            .remove("view")
+            .expect("the field must be present before it is removed");
+
+        let args: LoreRevisionSyncArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.revision.as_str(), "main@3");
+        assert!(
+            args.view.is_empty(),
+            "an omitted view keeps the view the instance holds"
+        );
     }
 
     #[test]

@@ -4961,6 +4961,9 @@ typedef struct lore_revision_sync_args_t {
   uint8_t dependency_recursive;
   // Maximum dependency traversal depth; 0 means unlimited
   uint32_t dependency_depth_limit;
+  // View filter file to leave the working files materialized under; empty to keep the view the
+  // instance holds
+  struct lore_string_t view;
 } lore_revision_sync_args_t;
 
 // Arguments for reverting the working directory to a specified revision.

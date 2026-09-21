@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -19,6 +20,8 @@ use crate::change::NodeChange;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
+use crate::filter;
+use crate::filter::FilterInstance;
 use crate::filter::FilterMode;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
@@ -229,6 +232,9 @@ pub struct SyncOptions {
     pub dependency_recursive: bool,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
+    /// View filter file the working tree is to be left materialized under. When absent the
+    /// instance keeps the view it holds.
+    pub view: Option<PathBuf>,
 }
 
 impl Default for SyncOptions {
@@ -243,15 +249,90 @@ impl Default for SyncOptions {
             dependency_tags: Vec::new(),
             dependency_recursive: false,
             dependency_depth_limit: 0,
+            view: None,
         }
     }
 }
 
+/// The view the working tree is to be left materialized under, parsed from the file naming it.
+///
+/// `None` keeps the view the instance holds, which is every sync that carries the tree between
+/// revisions alone.
+///
+/// A named file that cannot be read is refused rather than read as no rules at all, which is what
+/// [`filter::load_filter`] answers for an unreadable file and would mean the whole repository in
+/// view here.
+///
+/// The two options refused are the ones a view change cannot be carried alongside. A reset diffs
+/// the working tree against the target state, a walk that asks one view for both sides, and a
+/// dependency set is resolved against the target revision alone, so the changes it keeps are no
+/// longer the difference between two views.
+async fn sync_load_view(options: &SyncOptions) -> Result<Option<FilterInstance>, SyncError> {
+    let Some(path) = options.view.as_deref() else {
+        return Ok(None);
+    };
+    if options.reset {
+        return Err(InvalidArguments {
+            reason: "Unable to change the view of a sync that resets the working tree".into(),
+        }
+        .into());
+    }
+    if !options.root_files.is_empty() {
+        return Err(InvalidArguments {
+            reason: "Unable to change the view of a sync restricted to a dependency set".into(),
+        }
+        .into());
+    }
+
+    let bytes = lore_io::IoDriver::global()
+        .read_file_bytes(path)
+        .await
+        .internal_with(|| format!("Failed to read view filter {}", path.display()))?;
+    Ok(Some(
+        filter::parse_filter(&bytes, path).forward_with::<SyncError, _>(|| {
+            format!("Failed to parse view filter {}", path.display())
+        })?,
+    ))
+}
+
+/// Publishes the view the working tree now stands under, in the instance's own directory.
+///
+/// Written after the tree and the anchor, so an interrupted apply leaves the instance under the
+/// view it started from: the same change set is computed again on a re-run and carries the tree the
+/// rest of the way. Published first it would leave the instance naming a view the tree only partly
+/// holds, which nothing afterwards can tell from a finished apply.
+async fn sync_store_view(repository: &Arc<RepositoryContext>) -> Result<(), SyncError> {
+    let path = repository.dot_dir_path()?.join(repository::VIEW_FILTER);
+    filter::save(&repository.filter.view, &path)
+        .await
+        .internal_with(|| format!("Failed to write view filter {}", path.display()))?;
+    Ok(())
+}
+
+/// Carries the working tree to the revision, and the view, a sync resolves.
+///
+/// `repository` is the context the instance holds, and answers for what the working tree stands
+/// under. A view change adds the context it is left under — the same instance and stores, one
+/// filter with a different view slot — and the two are carried side by side from there: the tree is
+/// measured against the view that materialized it and written under the view it is left holding.
+/// Everything else here takes the target context, since that is the view the instance keeps once
+/// this returns.
 pub(crate) async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
+    let view = sync_load_view(&options).await?;
+    let view_change = view.is_some();
+    let repository_current = repository.clone();
+    let repository = match view {
+        Some(view) => Arc::new(repository.with_filter_and_remote(
+            Arc::new(repository.filter.with_view(view)),
+            repository.remote().await,
+        )),
+        None => repository,
+    };
+
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<SyncError>("Failed to deserialize current revision anchor")?;
@@ -543,7 +624,9 @@ pub(crate) async fn sync(
         .filter(|branch| !branch.is_zero())
         .is_some_and(|branch| branch != anchor_branch);
 
-    if revision == current_revision && !force && !options.reset && !moves_branch {
+    // A view change has work to do at a standing revision, which is the shape of it a user asks
+    // for most: the tree is materialized from the same revision through a different view.
+    if revision == current_revision && !force && !options.reset && !moves_branch && !view_change {
         return Ok(());
     }
 
@@ -578,6 +661,16 @@ pub(crate) async fn sync(
             .await
             .is_err()
         {
+            if view_change {
+                // The merge realizes its result under one view and leaves it staged, so the view
+                // change would have to be carried on top of a tree no revision holds.
+                return Err(InvalidArguments {
+                    reason: "Unable to change the view of a sync that merges a diverged branch"
+                        .into(),
+                }
+                .into());
+            }
+
             lore_info!("Remote and local branch have diverged, performing merge",);
             let merge_options = merge::MergeStartOptions {
                 message: String::new(),
@@ -624,7 +717,7 @@ pub(crate) async fn sync(
 
     let state_synced = state_target.clone();
     let result = Box::pin(sync_realize(
-        repository.clone(),
+        repository_current,
         repository.clone(),
         state_current,
         state_target,
@@ -688,9 +781,13 @@ pub(crate) async fn sync(
 
         modified_times.store(repository.clone()).await;
 
-        state::rebase_staged_anchor(repository.clone(), revision)
+        state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
             .await
             .forward::<SyncError>("Failed to rebase staged anchor")?;
+
+        if view_change {
+            sync_store_view(&repository).await?;
+        }
 
         // Set the local branch LATEST to match remote if we synced to that
         // If we synced to a local revision keep the branch LATEST to not lose
@@ -899,10 +996,15 @@ async fn sync_layers(
             Some(Hash::default())
         } else {
             Some(
-                state::rebase_staged_state(layer_repository, layer.staged, layer_revision)
-                    .await
-                    .forward::<SyncError>("Failed to rebase layer staged state")?
-                    .unwrap_or_default(),
+                state::rebase_staged_state(
+                    layer_repository,
+                    layer.staged,
+                    layer_revision,
+                    execution_context().globals().force(),
+                )
+                .await
+                .forward::<SyncError>("Failed to rebase layer staged state")?
+                .unwrap_or_default(),
             )
         };
 

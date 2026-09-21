@@ -2228,6 +2228,7 @@ class Lore:
         dependency_tags: list[str] | None = None,
         dependency_recursive: bool = False,
         dependency_depth_limit: int = 0,
+        view: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         root_file_args = []
@@ -2239,6 +2240,7 @@ class Lore:
         return self.run(
             ["sync"]
             + ([revision] if revision else [])
+            + (["--view", self._fix_path(view)] if view else [])
             + (["--forward-changes"] if forward_changes else [])
             + (["--reset"] if reset else [])
             + root_file_args

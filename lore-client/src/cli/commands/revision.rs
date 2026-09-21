@@ -221,6 +221,11 @@ pub struct RevisionSyncArgs {
     /// Maximum dependency traversal depth (0 means unlimited)
     #[clap(long, value_name = "depth", default_value = "0")]
     dependency_depth_limit: u32,
+
+    /// View filter file to leave the working files materialized under, changing which subset of
+    /// the repository is on disk. Without it the instance keeps the view it holds
+    #[clap(long, value_name = "file")]
+    view: Option<String>,
 }
 
 #[derive(Args)]
@@ -1496,6 +1501,7 @@ pub fn handle_revision_sync(globals: LoreGlobalArgs, args: &RevisionSyncArgs) ->
         ),
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
+        view: args.view.as_ref().into(),
     };
 
     let progress_bar = ProgressBar::new(0);
