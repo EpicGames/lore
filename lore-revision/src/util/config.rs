@@ -191,7 +191,7 @@ pub trait SaveableConfig: Serialize + for<'a> Deserialize<'a> + Default + Clone 
 
     fn file_location() -> Result<PathBuf, Self::ErrorType>;
 
-    async fn modify_on_load(self) -> Result<Self, Self::ErrorType> {
+    fn modify_on_load(self) -> Result<Self, Self::ErrorType> {
         Ok(self)
     }
 
@@ -202,7 +202,16 @@ pub trait SaveableConfig: Serialize + for<'a> Deserialize<'a> + Default + Clone 
         let config: Self = load(path)
             .await
             .forward::<Self::ErrorType>("Loading global config")?;
-        config.modify_on_load().await
+        config.modify_on_load()
+    }
+
+    fn load_blocking() -> Result<Self, Self::ErrorType> {
+        Self::load_from_path_blocking(&Self::file_location()?)
+    }
+    fn load_from_path_blocking(path: &Path) -> Result<Self, Self::ErrorType> {
+        let config: Self =
+            load_blocking(path).forward::<Self::ErrorType>("Loading global config")?;
+        config.modify_on_load()
     }
 
     async fn load_locked() -> Result<(Self, FSLock), Self::ErrorType> {
@@ -212,7 +221,7 @@ pub trait SaveableConfig: Serialize + for<'a> Deserialize<'a> + Default + Clone 
         let (config, lock) = load_with_lock::<Self>(path)
             .await
             .forward::<Self::ErrorType>("Loading global config")?;
-        Ok((config.modify_on_load().await?, lock))
+        Ok((config.modify_on_load()?, lock))
     }
 
     async fn save(&self, lock: FSLock) -> Result<(), Self::ErrorType> {

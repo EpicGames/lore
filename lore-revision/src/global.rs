@@ -148,20 +148,6 @@ impl GlobalConfig {
     pub fn use_service_automatically(&self) -> bool {
         self.service.use_automatically.unwrap_or(false)
     }
-
-    /// Synchronous twin of [`load`](SaveableConfig::load), for a caller that
-    /// reads the config before the runtime is doing anything else — deciding
-    /// how to size that runtime, for one.
-    ///
-    /// [`modify_on_load`](SaveableConfig::modify_on_load) is async and so does
-    /// not run here, which leaves the shared store URLs as they were written.
-    /// Only `[service]` is read this early, so this is inherent to
-    /// `GlobalConfig` rather than a method on the trait, where it would be an
-    /// invitation to read a field it had quietly not normalized.
-    pub fn load_blocking() -> Result<Self, GlobalConfigError> {
-        util::config::load_blocking(&Self::file_location()?)
-            .forward::<GlobalConfigError>("Loading global config")
-    }
 }
 
 impl SaveableConfig for GlobalConfig {
@@ -171,7 +157,7 @@ impl SaveableConfig for GlobalConfig {
         get_global_config_dir().map(|path| path.join(CONFIG))
     }
 
-    async fn modify_on_load(mut self) -> Result<Self, Self::ErrorType> {
+    fn modify_on_load(mut self) -> Result<Self, Self::ErrorType> {
         let old = std::mem::take(&mut self.default_shared_stores);
         for (key, value) in old {
             let normalized = normalize_remote_url(&key).to_owned();
