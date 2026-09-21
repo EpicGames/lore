@@ -81,6 +81,43 @@ pub trait StreamHandlerFactory: Send + Sync + 'static {
     }
 }
 
+/// Round trip boundaries in milliseconds, from same-region sub-millisecond up to a cross-region
+/// tail of two seconds.
+///
+/// Shared by the statistics either end of a connection reports, so that a distribution taken by
+/// the side that dialled can be read against the one taken by the side that accepted.
+pub(crate) const RTT_MS_BUCKETS: &[f64] = &[
+    1., 2., 5., 10., 20., 50., 100., 150., 200., 250., 300., 400., 500., 750., 1000., 1500., 2000.,
+];
+
+/// Congestion window boundaries in bytes, from roughly one packet through 128 MB in doubling
+/// steps. Shared for the same reason as [`RTT_MS_BUCKETS`].
+pub(crate) const CWND_BYTES_BUCKETS: &[f64] = &[
+    1_200.,
+    2_400.,
+    4_800.,
+    10_000.,
+    20_000.,
+    50_000.,
+    100_000.,
+    250_000.,
+    500_000.,
+    1_000_000.,
+    2_000_000.,
+    5_000_000.,
+    10_000_000.,
+    25_000_000.,
+    50_000_000.,
+    100_000_000.,
+    128_000_000.,
+];
+
+/// Names the QUIC service a metric describes.
+///
+/// Shared by everything recording one, so that the connection statistics and the request
+/// statistics stay joinable on it.
+pub(crate) const SERVICE_LABEL_KEY: &str = "quic_service_name";
+
 /// Sentinel rendered into a per-RPC span field when the value is not present.
 pub const NO_CONNECTION_ID: &str = "<no_connection_id>";
 pub const NO_REPOSITORY_ID: &str = "<no_repository_id>";

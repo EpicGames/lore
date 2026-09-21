@@ -297,12 +297,16 @@ async fn handle_conn(
         ));
     };
 
-    let _stats_guard =
-        track_connection_stats(service_name, &connection, connection_metrics_interval);
-
     let context = Arc::new(AttributeMap::default());
     context.insert(conn_span.clone());
     context.insert(ConnectionId(connection_id));
+
+    let _stats_guard = track_connection_stats(
+        service_name,
+        &connection,
+        context.clone(),
+        connection_metrics_interval,
+    );
 
     // Create the stream handler once per connection so per-connection state
     // (e.g. SessionMap in StorageServiceV4) is shared across all streams.

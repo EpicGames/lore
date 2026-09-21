@@ -9,19 +9,16 @@ use async_channel::Sender;
 use lore_base::lore_spawn_core;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
-use lore_telemetry::USER_AGENT_NONE;
 use lore_telemetry::create_operation_context_attribute;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Histogram;
-use opentelemetry_semantic_conventions::attribute::USER_AGENT_NAME;
 use tokio::select;
 use tracing::error;
 
 use crate::protocol::attribute_map::AttributeMap;
-use crate::protocol::client_identify::UserAgentValue;
 use crate::quic::QuicService;
+use crate::quic::SERVICE_LABEL_KEY;
 
-const SERVICE_LABEL_KEY: &str = "quic_service_name";
 const OPCODE_LABEL_KEY: &str = "opcode";
 const SUCCESS_LABEL_KEY: &str = "success";
 const HANDLER_ERROR_LABEL_KEY: &str = "handler_error";
@@ -204,7 +201,7 @@ where
         Self {
             service_label: KeyValue::new(SERVICE_LABEL_KEY, service.get_service_name_label()),
             handle_message_context: create_operation_context_attribute("handle_message"),
-            user_agent_label: user_agent_label(context),
+            user_agent_label: context.user_agent_label(),
             service,
         }
     }
@@ -291,7 +288,7 @@ where
 
     /// Rebuilds the labels subsequent events are recorded under.
     fn context_updated(&mut self, context: &AttributeMap) {
-        self.user_agent_label = user_agent_label(context);
+        self.user_agent_label = context.user_agent_label();
     }
 }
 
@@ -355,26 +352,21 @@ pub fn observe_connection<ServiceType>(
     });
 }
 
-fn user_agent_label(context: &AttributeMap) -> KeyValue {
-    let value = context
-        .get::<UserAgentValue>()
-        .map_or_else(|| USER_AGENT_NONE.clone(), |v| v.0.clone());
-
-    KeyValue::new(USER_AGENT_NAME, value)
-}
-
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
+    use lore_telemetry::USER_AGENT_NONE;
     use lore_transport::quic::QuicErrorStatus;
     use lore_transport::quic::QuicOpCode;
     use lore_transport::quic::QuicServiceError;
     use lore_transport::quic::command_header::CommandHeader;
     use opentelemetry::Value;
+    use opentelemetry_semantic_conventions::attribute::USER_AGENT_NAME;
     use tracing::Span;
 
     use super::*;
+    use crate::protocol::client_identify::UserAgentValue;
     use crate::quic::ProtocolErrorInfo;
 
     const TEST_SERVICE_LABEL: &str = "observer_test";

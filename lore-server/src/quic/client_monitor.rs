@@ -10,37 +10,12 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Gauge;
 use opentelemetry::metrics::Histogram;
 
+use crate::quic::CWND_BYTES_BUCKETS;
+use crate::quic::RTT_MS_BUCKETS;
+
 pub fn default_quic_client_monitor_interval_secs() -> u64 {
     10
 }
-
-// RTT histogram boundaries in milliseconds.
-// Sub-millisecond for same-region, up to 2s for cross-region tail / loss recovery.
-const RTT_MS_BUCKETS: &[f64] = &[
-    1., 2., 5., 10., 20., 50., 100., 150., 200., 250., 300., 400., 500., 750., 1000., 1500., 2000.,
-];
-
-// Congestion window boundaries in bytes.
-// From ~1 packet (1200B) through 128 MB in roughly doubling steps.
-const CWND_BYTES_BUCKETS: &[f64] = &[
-    1_200.,
-    2_400.,
-    4_800.,
-    10_000.,
-    20_000.,
-    50_000.,
-    100_000.,
-    250_000.,
-    500_000.,
-    1_000_000.,
-    2_000_000.,
-    5_000_000.,
-    10_000_000.,
-    25_000_000.,
-    50_000_000.,
-    100_000_000.,
-    128_000_000.,
-];
 
 struct ClientInstruments {
     /// Current smoothed `RTT` estimate from the congestion controller (ms).
