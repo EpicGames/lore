@@ -4200,30 +4200,16 @@ async fn merge_into_link(
     .await
     .forward::<MergeError>("preparing commit metadata")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
-    let rehash_result = commit::commit_files_and_rehash(
+    commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        RelativePath::new(),
-        ROOT_NODE,
         metadata.clone(),
-        std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
-        rehash_tracker.clone(),
-        modified_times.clone(),
-        commit::CommitStats::new(),
-        execution_context().globals().event_interval(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<MergeError>("rehashing commit")?;
-    modified_times.discard();
-    drain_result.forward::<MergeError>("draining rehash tracker")?;
+    .await
+    .forward::<MergeError>("rehashing commit")?
+    .discard();
 
     let state_new = state_staged;
     state_new.reset_merge_conflict_flags();
@@ -4561,30 +4547,16 @@ pub async fn merge_into(
     .await
     .forward::<MergeError>("preparing commit metadata")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
-    let rehash_result = commit::commit_files_and_rehash(
+    commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        RelativePath::new(),
-        ROOT_NODE,
         metadata.clone(),
-        std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
-        rehash_tracker.clone(),
-        modified_times.clone(),
-        commit::CommitStats::new(),
-        execution_context().globals().event_interval(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<MergeError>("rehashing commit")?;
-    modified_times.discard();
-    drain_result.forward::<MergeError>("draining rehash tracker")?;
+    .await
+    .forward::<MergeError>("rehashing commit")?
+    .discard();
     lore_debug!("Rehashed state");
 
     let state_new = state_staged;

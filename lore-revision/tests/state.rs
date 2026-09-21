@@ -2155,7 +2155,7 @@ mod is_file_modified_chunking_compat {
 
             let (address, _) = immutable::write_from_file(
                 repository.clone(),
-                path.as_path(),
+                &lore_storage::ContentSource::file(path.as_path()),
                 context,
                 lore_storage::WriteOptions::default().no_remote_write(),
             )

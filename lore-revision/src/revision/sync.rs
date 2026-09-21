@@ -1231,24 +1231,6 @@ pub async fn unlink_merge_artifacts(operation: &InstanceOperationImpl, path: &Re
     }
 }
 
-/// [`unlink_merge_artifacts`] for a caller holding no filesystem operation to remove the
-/// copies through.
-///
-/// A commit holds none: it names the files it fragments by absolute path throughout.
-pub async fn unlink_merge_artifacts_by_path(absolute_path: &Path) {
-    let Some(file_name) = absolute_path.file_name() else {
-        return;
-    };
-    let mut artifact = absolute_path.to_path_buf();
-    for suffix in MERGE_ARTIFACT_SUFFIXES {
-        let mut name = file_name.to_os_string();
-        name.push(suffix);
-        artifact.set_file_name(name);
-        lore_trace!("Delete merge artifact file {}", artifact.display());
-        let _ = crate::util::fs::unlink(artifact.as_path()).await;
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // Test fixtures writing the copies in a temporary directory.
 mod tests {

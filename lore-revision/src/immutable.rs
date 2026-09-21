@@ -465,17 +465,17 @@ pub async fn write_with_tracker(
 /// address stands for.
 pub async fn write_from_file(
     repository: Arc<RepositoryContext>,
-    path: &Path,
+    source: &lore_storage::ContentSource<'_>,
     context: Context,
     flags: WriteOptions,
 ) -> Result<(Address, u64), ImmutableError> {
-    write_from_file_with_tracker(repository, path, context, flags, None).await
+    write_from_file_with_tracker(repository, source, context, flags, None).await
 }
 
 /// Tracker-aware variant of [`write_from_file`].
 pub async fn write_from_file_with_tracker(
     repository: Arc<RepositoryContext>,
-    path: &Path,
+    source: &lore_storage::ContentSource<'_>,
     context: Context,
     flags: WriteOptions,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
@@ -488,7 +488,7 @@ pub async fn write_from_file_with_tracker(
     lore_storage::write_from_file(
         repository.immutable_store(),
         repository.id,
-        &lore_storage::ContentSource::file(path),
+        source,
         context,
         flags,
         session,

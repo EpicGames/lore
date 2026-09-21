@@ -139,8 +139,8 @@ pub(crate) async fn dirty_relative_paths(
 
 /// [`dirty_relative_paths`] against `operation`, which covers the parent's whole working tree
 /// and every layer mounted in it, so one call reads through one operation however many trees it
-/// marks.
-async fn dirty_relative_paths_in_operation(
+/// marks. For a caller that already holds one.
+pub(crate) async fn dirty_relative_paths_in_operation(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
