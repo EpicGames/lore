@@ -23,56 +23,91 @@ use tokio::task::JoinSet;
 // Instruments
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoreTaskLifecycleEvent {
     Started,
     Completed,
     Dropped,
 }
 
-pub type RuntimeTaskEventCallback =
-    Box<dyn Fn(LoreTaskLifecycleEvent, &LoreTaskSpawnLocation) + Send + Sync>;
-
-static RUNTIME_TASK_EVENTS: OnceLock<RuntimeTaskEventCallback> = OnceLock::new();
-
-pub fn set_task_lifecycle_callback(callback: RuntimeTaskEventCallback) -> bool {
-    let result = RUNTIME_TASK_EVENTS.set(callback);
-
-    result.is_ok()
-}
-
-pub struct LoreTaskSpawnLocation {
+/// What was true where a task was spawned, captured once as it is created.
+///
+/// Every event a task emits carries this same value, so an up/down counter keyed on these fields
+/// pairs a task's increment with its decrement. Re-resolving a field per event would not pair
+/// them: a task is created on its spawner's thread but polled and dropped on a worker's, under
+/// whatever context is ambient there — which for
+/// [`lore_spawn_net_nocontext!`](crate::lore_spawn_net_nocontext) is deliberately not the
+/// spawner's, so the two ends would count against different series.
+pub struct LoreTaskSpawn {
     pub file: &'static str,
     pub line: u32,
+    /// Labels the `LORE_CONTEXT` ambient where the task was spawned.
+    pub context_label: &'static str,
+}
+
+/// Observes the tasks spawned through the `lore_spawn*` macros.
+pub trait TaskLifecycleObserver: Send + Sync {
+    /// Labels the `LORE_CONTEXT` a task is being spawned under.
+    ///
+    /// Called once per task, on the spawning thread before the task reaches a runtime, so the
+    /// ambient context is still the spawning caller's. The label is stored on the task and handed
+    /// back to [`Self::on_event`] for every event it goes on to emit.
+    fn context_label(&self) -> &'static str;
+
+    /// Reports one event in a task's life, carrying the facts captured at its spawn.
+    fn on_event(&self, event: LoreTaskLifecycleEvent, spawn: &LoreTaskSpawn);
+}
+
+static RUNTIME_TASK_OBSERVER: OnceLock<Box<dyn TaskLifecycleObserver>> = OnceLock::new();
+
+/// Installs the process's task lifecycle observer, reporting whether it took.
+///
+/// Tasks already in flight stay unobserved rather than reporting only their end, so an observer
+/// counting tasks never sees a decrement whose increment it missed.
+pub fn set_task_lifecycle_observer(observer: Box<dyn TaskLifecycleObserver>) -> bool {
+    RUNTIME_TASK_OBSERVER.set(observer).is_ok()
+}
+
+fn report_task_event(spawn: Option<&LoreTaskSpawn>, event: LoreTaskLifecycleEvent) {
+    if let Some(spawn) = spawn
+        && let Some(observer) = RUNTIME_TASK_OBSERVER.get()
+    {
+        observer.on_event(event, spawn);
+    }
 }
 
 #[pin_project(PinnedDrop)]
 pub struct ObservedTask<F> {
     #[pin]
     inner: F,
-    location: LoreTaskSpawnLocation,
+    /// `None` when no observer was installed as the task was created, which keeps such a task
+    /// silent for its whole life rather than reporting an end with no matching start.
+    spawn: Option<LoreTaskSpawn>,
     ran_to_completion: bool,
 }
 
 impl<F> ObservedTask<F> {
-    /// Wraps a future with state events.
+    /// Wraps a future so its lifecycle reaches the installed [`TaskLifecycleObserver`].
     ///
-    /// If runtime callback has not been initialised yet, the wrapper is
-    /// inert
+    /// Inert if no observer has been installed yet.
     #[track_caller]
     pub fn new(inner: F) -> Self {
         let caller = ::std::panic::Location::caller();
-        let location = LoreTaskSpawnLocation {
-            file: caller.file(),
-            line: caller.line(),
-        };
 
-        if let Some(callback) = RUNTIME_TASK_EVENTS.get() {
-            callback(LoreTaskLifecycleEvent::Started, &location);
-        }
+        let spawn = RUNTIME_TASK_OBSERVER.get().map(|observer| {
+            let spawn = LoreTaskSpawn {
+                file: caller.file(),
+                line: caller.line(),
+                context_label: observer.context_label(),
+            };
+            observer.on_event(LoreTaskLifecycleEvent::Started, &spawn);
+
+            spawn
+        });
 
         Self {
             inner,
-            location,
+            spawn,
             ran_to_completion: false,
         }
     }
@@ -86,9 +121,7 @@ impl<F: Future> Future for ObservedTask<F> {
         let result = this.inner.poll(cx);
         if result.is_ready() {
             *this.ran_to_completion = true;
-            if let Some(callback) = RUNTIME_TASK_EVENTS.get() {
-                callback(LoreTaskLifecycleEvent::Completed, this.location);
-            }
+            report_task_event(this.spawn.as_ref(), LoreTaskLifecycleEvent::Completed);
         }
         result
     }
@@ -98,10 +131,8 @@ impl<F: Future> Future for ObservedTask<F> {
 impl<F> PinnedDrop for ObservedTask<F> {
     fn drop(self: Pin<&mut Self>) {
         let this = self.project();
-        if !*this.ran_to_completion
-            && let Some(callback) = RUNTIME_TASK_EVENTS.get()
-        {
-            callback(LoreTaskLifecycleEvent::Dropped, this.location);
+        if !*this.ran_to_completion {
+            report_task_event(this.spawn.as_ref(), LoreTaskLifecycleEvent::Dropped);
         }
     }
 }

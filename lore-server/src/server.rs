@@ -23,10 +23,11 @@ use clap::Parser;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
-use lore_base::runtime::LoreTaskSpawnLocation;
+use lore_base::runtime::LoreTaskSpawn;
+use lore_base::runtime::TaskLifecycleObserver;
 use lore_base::runtime::runtime;
 use lore_base::runtime::runtime_with_settings;
-use lore_base::runtime::set_task_lifecycle_callback;
+use lore_base::runtime::set_task_lifecycle_observer;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
@@ -53,6 +54,8 @@ use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::set_fallback_user_agent_product;
 use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::UpDownCounter;
 use opentelemetry_sdk::resource::ResourceDetector;
 use rustls::server::NoClientAuth;
 use tokio::runtime::Handle;
@@ -1610,48 +1613,56 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
     }
 }
 
-fn observe_task_lifecycles() {
-    let meter = lore_telemetry::meter("lore.runtime");
-    let spawned_tasks = meter
-        .u64_counter("lore.runtime.tasks.spawned.total")
-        .build();
-    let inflight_tasks = meter
-        .i64_up_down_counter("lore.runtime.tasks.running.total")
-        .build();
+/// Counts spawned and in-flight tasks, attributed to where each task was spawned.
+struct TaskLifecycleMetrics {
+    spawned_tasks: Counter<u64>,
+    inflight_tasks: UpDownCounter<i64>,
+}
 
-    let callback = move |event: LoreTaskLifecycleEvent, spawn_location: &LoreTaskSpawnLocation| {
-        let context_label = if let Some(context) = lore_revision::runtime::try_execution_context() {
-            if let Some(lore_state) = context
-                .caller_state()
-                .cloned()
-                .and_then(|any| ::std::sync::Arc::downcast::<ServerExecutionState>(any).ok())
-            {
-                lore_state.context_label
-            } else {
-                "<no server state>"
-            }
-        } else {
-            "<no context>"
+impl TaskLifecycleObserver for TaskLifecycleMetrics {
+    fn context_label(&self) -> &'static str {
+        let Some(context) = lore_revision::runtime::try_execution_context() else {
+            return "<no context>";
         };
 
+        context
+            .caller_state()
+            .cloned()
+            .and_then(|any| Arc::downcast::<ServerExecutionState>(any).ok())
+            .map_or("<no server state>", |state| state.context_label)
+    }
+
+    fn on_event(&self, event: LoreTaskLifecycleEvent, spawn: &LoreTaskSpawn) {
         let labels = [
-            KeyValue::new("context_label", context_label),
-            KeyValue::new("spawn_file", spawn_location.file),
-            KeyValue::new("spawn_line_number", spawn_location.line as i64),
+            KeyValue::new("context_label", spawn.context_label),
+            KeyValue::new("spawn_file", spawn.file),
+            KeyValue::new("spawn_line_number", spawn.line as i64),
         ];
 
         match event {
             LoreTaskLifecycleEvent::Started => {
-                spawned_tasks.add(1, &labels);
-                inflight_tasks.add(1, &labels);
+                self.spawned_tasks.add(1, &labels);
+                self.inflight_tasks.add(1, &labels);
             }
             LoreTaskLifecycleEvent::Completed | LoreTaskLifecycleEvent::Dropped => {
-                inflight_tasks.add(-1, &labels);
+                self.inflight_tasks.add(-1, &labels);
             }
         }
+    }
+}
+
+fn observe_task_lifecycles() {
+    let meter = lore_telemetry::meter("lore.runtime");
+    let observer = TaskLifecycleMetrics {
+        spawned_tasks: meter
+            .u64_counter("lore.runtime.tasks.spawned.total")
+            .build(),
+        inflight_tasks: meter
+            .i64_up_down_counter("lore.runtime.tasks.running.total")
+            .build(),
     };
 
-    if !set_task_lifecycle_callback(Box::new(callback)) {
+    if !set_task_lifecycle_observer(Box::new(observer)) {
         error!("Failed to set task events callback");
     }
 }
