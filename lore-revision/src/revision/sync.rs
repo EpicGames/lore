@@ -551,11 +551,12 @@ pub(crate) async fn sync(
             format!("Failed to deserialize state {current_revision}")
         })?;
 
-    let (layer_revisions, nearest_revision) = Box::pin(sync_load_layer_list(
+    let (layers, nearest_revision) = Box::pin(sync_load_layer_list(
         repository.clone(),
         target_branch,
         revision,
         state_current.clone(),
+        view_change || options.reset,
     ))
     .await?;
 
@@ -631,7 +632,7 @@ pub(crate) async fn sync(
     }
 
     if !force && !options.reset {
-        sync_reject_staged_layers(repository.clone(), &layer_revisions).await?;
+        sync_reject_staged_layers(&layers).await?;
     }
 
     if !state_current.revision().is_zero() && !force {
@@ -717,7 +718,7 @@ pub(crate) async fn sync(
 
     let state_synced = state_target.clone();
     let result = Box::pin(sync_realize(
-        repository_current,
+        repository_current.clone(),
         repository.clone(),
         state_current,
         state_target,
@@ -733,11 +734,12 @@ pub(crate) async fn sync(
     // Safe to handle error when cache task has finished
     let modified_times = result?;
 
-    if !layer_revisions.is_empty() {
+    if !layers.is_empty() {
         Box::pin(sync_layers(
+            repository_current,
             repository.clone(),
             token,
-            layer_revisions,
+            layers,
             options.clone(),
         ))
         .await?;
@@ -831,17 +833,35 @@ pub fn sync_boxed(
     Box::pin(sync(repository, token, options))
 }
 
+/// A layer this sync has work for.
+struct SyncLayer {
+    layer: Layer,
+    /// The layer's context under the view the sync leaves the working tree in, opened once and
+    /// carried: each one costs its own connection until UCS-19226 lands.
+    repository: Arc<RepositoryContext>,
+    /// The revision the layer is carried to, which is the one it holds where the view alone moved.
+    revision: Hash,
+}
+
+/// The layers this sync has work for, and the main repository revision layer matching resolved
+/// where it named one other than the revision the instance stands on.
+///
+/// A layer is unchanged where its revision does not move and the view does not either, and is left
+/// out. `carry_unmoved` keeps the ones at a standing revision, for a sync that has work for a mount
+/// regardless: a view change materializes the mount through a different view, and a reset measures
+/// it against the working tree rather than against another revision.
 async fn sync_load_layer_list(
     repository: Arc<RepositoryContext>,
     branch_id: BranchId,
     revision: Hash,
     state_current: Arc<State>,
-) -> Result<(Vec<(Layer, Hash)>, Option<Hash>), SyncError> {
-    let mut layer_revisions = vec![];
+    carry_unmoved: bool,
+) -> Result<(Vec<SyncLayer>, Option<Hash>), SyncError> {
+    let mut carried = vec![];
     let mut nearest_revision = None;
     if branch_id.is_zero() {
         // Detached sync - layers are handled separately by the caller
-        return Ok((layer_revisions, nearest_revision));
+        return Ok((carried, nearest_revision));
     }
     if let Ok(layers) = layer::list_with_context(repository.clone()).await {
         // Check which matching revision to sync to for each layer
@@ -850,14 +870,23 @@ async fn sync_load_layer_list(
         if !layers.is_empty() {
             lore_info!("Resolving layer revisions");
         }
-        for (layer, module) in layers.iter() {
+        for (layer, module) in layers {
             let Ok(layer_latest) = layer::latest_revision(module.clone(), branch_id).await else {
                 // No revision on this branch yet (e.g. newly created branch),
-                // skip layer sync - files stay at current state
+                // the layer stays at the revision it holds
                 lore_debug!(
-                    "Layer {} has no revision on branch, skipping",
-                    layer.repository
+                    "Layer {} has no revision on branch, staying at {}",
+                    layer.repository,
+                    layer.current
                 );
+                if carry_unmoved {
+                    let revision = layer.current;
+                    carried.push(SyncLayer {
+                        layer,
+                        repository: module,
+                        revision,
+                    });
+                }
                 continue;
             };
             let revision = nearest_revision.unwrap_or(revision);
@@ -891,35 +920,40 @@ async fn sync_load_layer_list(
             lore_debug!(
                 "Layer {layer:?} found revision {layer_revision} matching main revision {main_revision}"
             );
-            layer_revisions.push((layer.clone(), layer_revision));
+            if carry_unmoved || layer_revision != layer.current {
+                carried.push(SyncLayer {
+                    layer,
+                    repository: module,
+                    revision: layer_revision,
+                });
+            }
         }
     }
 
-    Ok((layer_revisions, nearest_revision))
+    Ok((carried, nearest_revision))
 }
 
 /// Reject a sync that would discard actually-staged content held by a layer.
 ///
 /// Layer staged pins live in the layer config, not the instance anchor that the
 /// check in [`sync`] reads, so a layer-only stage is invisible to it.
-async fn sync_reject_staged_layers(
-    repository: Arc<RepositoryContext>,
-    layer_revisions: &[(Layer, Hash)],
-) -> Result<(), SyncError> {
-    for (layer, layer_revision) in layer_revisions {
+///
+/// Every layer in `layers` has work in this sync, which is what [`sync_load_layer_list`] answers
+/// with, so a staged pin there is one the sync would discard.
+async fn sync_reject_staged_layers(layers: &[SyncLayer]) -> Result<(), SyncError> {
+    for SyncLayer {
+        layer, repository, ..
+    } in layers
+    {
         let Some(staged) = layer.staged_revision() else {
             continue;
         };
-        if *layer_revision == layer.current {
-            continue;
-        }
 
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-        let state_staged = state::State::deserialize(layer_repository.clone(), staged)
+        let state_staged = state::State::deserialize(repository.clone(), staged)
             .await
             .forward::<SyncError>("Failed to deserialize layer staged state")?;
         if state_staged
-            .node_has_staged_children(layer_repository, crate::node::ROOT_NODE)
+            .node_has_staged_children(repository.clone(), crate::node::ROOT_NODE)
             .await
             .forward::<SyncError>("Failed to check staged nodes")?
         {
@@ -936,33 +970,66 @@ async fn sync_reject_staged_layers(
     Ok(())
 }
 
+/// The read side of `layer_repository`, filtering through `filter`.
+///
+/// The same handle is answered where `layer_repository` already filters through `filter`: a diff
+/// tells one view from two by pointer identity on the filter, so a rebuilt handle would leave every
+/// mount doing two-view work for a view that has not moved.
+fn layer_context_under(
+    layer_repository: &Arc<RepositoryContext>,
+    filter: &Arc<filter::Filter>,
+) -> Arc<RepositoryContext> {
+    if Arc::ptr_eq(&layer_repository.filter, filter) {
+        return layer_repository.clone();
+    }
+    Arc::new(layer_repository.to_filter_context(filter.clone()))
+}
+
+/// Carries every layer in `layers` to its revision, and to the view `repository_target` holds.
+///
+/// `repository_current` is the context the working tree stands under, from which each mount's own
+/// from-side context is drawn.
 async fn sync_layers(
-    repository: Arc<RepositoryContext>,
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    layer_revisions: Vec<(Layer, Hash)>,
+    layers: Vec<SyncLayer>,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    for (layer, layer_revision) in layer_revisions {
+    let view_moved = !Arc::ptr_eq(&repository_current.filter, &repository_target.filter);
+    for SyncLayer {
+        layer,
+        repository: layer_repository_target,
+        revision: layer_revision,
+    } in layers
+    {
         lore_debug!("Synchronizing layer {layer:?}");
         let target_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
         let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
+        let layer_repository_current =
+            layer_context_under(&layer_repository_target, &repository_current.filter);
 
         // TODO(mjansson): Emit as events
-        lore_info!("Sync layer {} in {}", layer_repository.id, target_path);
+        lore_info!(
+            "Sync layer {} in {}",
+            layer_repository_target.id,
+            target_path
+        );
 
-        let layer_current = state::State::deserialize(layer_repository.clone(), layer.current)
-            .await
-            .forward_with::<SyncError, _>(|| {
-                format!("Failed to deserialize state {}", layer.current)
-            })?;
-        let layer_target = state::State::deserialize(layer_repository.clone(), layer_revision)
-            .await
-            .forward_with::<SyncError, _>(|| {
-                format!("Failed to deserialize state {layer_revision}")
-            })?;
+        let layer_current =
+            state::State::deserialize(layer_repository_target.clone(), layer.current)
+                .await
+                .forward_with::<SyncError, _>(|| {
+                    format!("Failed to deserialize state {}", layer.current)
+                })?;
+        let layer_target =
+            state::State::deserialize(layer_repository_target.clone(), layer_revision)
+                .await
+                .forward_with::<SyncError, _>(|| {
+                    format!("Failed to deserialize state {layer_revision}")
+                })?;
 
         lore_info!(
             "Current state         : {} revision {}",
@@ -977,7 +1044,8 @@ async fn sync_layers(
 
         // TODO(mjansson): Sync disjoint layers in parallel
         Box::pin(layer::sync(
-            layer_repository.clone(),
+            layer_repository_current,
+            layer_repository_target.clone(),
             layer_current,
             layer_target,
             target_path.clone(),
@@ -997,10 +1065,10 @@ async fn sync_layers(
         } else {
             Some(
                 state::rebase_staged_state(
-                    layer_repository,
+                    layer_repository_target,
                     layer.staged,
                     layer_revision,
-                    execution_context().globals().force(),
+                    execution_context().globals().force() && !view_moved,
                 )
                 .await
                 .forward::<SyncError>("Failed to rebase layer staged state")?
@@ -1009,7 +1077,7 @@ async fn sync_layers(
         };
 
         layer::store_layer_current(
-            repository.clone(),
+            repository_target.clone(),
             token,
             target_path.as_str(),
             layer.repository,

@@ -14,8 +14,13 @@ import os
 from dataclasses import dataclass
 
 import pytest
-from error_types import LocalModificationsError, LoreException
-from lore_parsers import parse_jsonl, parse_status_json
+from error_types import LocalModificationsError
+from lore_parsers import (
+    parse_complete_json,
+    parse_jsonl,
+    parse_layer_list_json,
+    parse_status_json,
+)
 from test_utils import to_posix
 
 from lore import Lore
@@ -46,6 +51,29 @@ EMPTIED_VIEW = ["/assets/drop/**"]
 REINCLUDING_VIEW = ["/*", "!/assets", "/assets/drop"]
 # No rules at all, which puts the whole repository in view.
 WIDE_VIEW = []
+
+# Where the link tests mount a second repository, the subtree of it they mount, and
+# what that subtree holds once mounted.
+LINK_MOUNT = "link"
+LINK_SOURCE = os.path.join("another", "path")
+LINK_KEPT = os.path.join("link", "keep.uasset")
+LINK_DROPPED = os.path.join("link", "drop", "one.uasset")
+# Excludes the mount whole, and excludes a subtree of it while keeping the rest.
+LINK_EXCLUDED_VIEW = ["/link"]
+LINK_NARROW_VIEW = ["/link/drop"]
+
+# Where the layer tests mount a second repository, and what it holds there.
+LAYER_MOUNT = "lay"
+LAYER_KEPT = os.path.join("lay", "keep.uasset")
+LAYER_DROPPED = os.path.join("lay", "drop", "one.uasset")
+# Excludes the mount whole, and excludes a subtree of it while keeping the rest.
+LAYER_EXCLUDED_VIEW = ["/lay"]
+LAYER_NARROW_VIEW = ["/lay/drop"]
+
+# The `lore_error_code_t` values a refused sync reports as the status of its
+# terminal complete event, from `lore-capi/lore.h`.
+INVALID_ARGUMENTS = 3
+INTERNAL = -1
 
 
 @dataclass(frozen=True)
@@ -102,6 +130,23 @@ def sync_view(instance: Lore, view: str, **kwargs) -> tuple[str, Realized]:
     """Syncs `instance` under `view`, answering the event output and what it did."""
     output = instance.sync(view=view, json=True, **kwargs)
     return output, Realized.from_events(output)
+
+
+def assert_sync_refused(instance: Lore, code: int, what: str, **options) -> None:
+    """Asserts a sync refuses `what` with `code` and carries none of the change.
+
+    The code is read off the terminal complete event rather than matched against
+    the text of the refusal: re-wording a message is not a change in behavior,
+    while a refusal answering a different code is one.
+    """
+    output = instance.sync(json=True, check=False, **options)
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") == code, (
+        f"{what} must be refused with status {code}, got: {output}"
+    )
+    assert Realized.from_events(output) == Realized(
+        files_written=0, bytes_written=0, files_deleted=0
+    ), f"{what} must carry none of the change, got: {output}"
 
 
 def reported_files(output: str) -> set[str]:
@@ -371,13 +416,16 @@ def test_sync_view_refuses_what_it_cannot_carry(new_lore_repo, scratch_dir):
     absent = os.path.join(os.path.dirname(narrow), "absent.txt")
 
     refusals = [
-        ("Unable to change the view of a sync that resets", {"reset": True}),
-        ("Unable to change the view of a sync restricted", {"root_files": [KEPT]}),
-        ("Failed to read view filter", {"view": absent}),
+        ("a sync that resets the working tree", INVALID_ARGUMENTS, {"reset": True}),
+        (
+            "a sync restricted to a dependency set",
+            INVALID_ARGUMENTS,
+            {"root_files": [KEPT]},
+        ),
+        ("a view file that cannot be read", INTERNAL, {"view": absent}),
     ]
-    for message, options in refusals:
-        with pytest.raises(LoreException, match=message):
-            instance.sync(**{"view": narrow} | options)
+    for what, code, options in refusals:
+        assert_sync_refused(instance, code, what, **{"view": narrow} | options)
 
     assert stored_view(instance) is None, "a refused sync publishes no view"
     assert instance.file_exists(DROPPED), "a refused sync carries nothing"
@@ -410,8 +458,12 @@ def test_sync_view_refuses_a_sync_that_would_merge(new_lore_repo, scratch_dir):
     instance.stage(scan=True)
     instance.commit("Aside from the remote", local=True)
 
-    with pytest.raises(LoreException, match="Unable to change the view of a sync"):
-        instance.sync(view=narrow)
+    assert_sync_refused(
+        instance,
+        INVALID_ARGUMENTS,
+        "a sync that merges a diverged branch",
+        view=narrow,
+    )
 
     assert stored_view(instance) is None, "a refused sync publishes no view"
     assert instance.file_exists(DROPPED), "a refused sync carries nothing"
@@ -471,3 +523,219 @@ def test_sync_view_applied_twice_changes_nothing(new_lore_repo, scratch_dir):
     assert materialized(instance) == once, "a re-applied view leaves the tree alone"
     assert stored_view(instance) == "assets/drop\n", "the view file is rewritten as is"
     assert_status_clean(instance, "the instance stays coherent with its view")
+
+
+def repository_with_layer(new_lore_repo) -> Lore:
+    """A pushed repository mounting a second one at `lay`, materialized whole.
+
+    The mount path and the path the layer repository spells its content with agree,
+    which is what `layer::sync` carries.
+    """
+    repo = committed_repository(new_lore_repo)
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    for path in [LAYER_KEPT, LAYER_DROPPED]:
+        layer_repo.make_dirs(os.path.dirname(path))
+        with layer_repo.open_file(path, "w+b") as output_file:
+            output_file.write(os.urandom(FILE_BYTES))
+    layer_repo.stage(scan=True)
+    layer_repo.commit()
+    layer_repo.push()
+    repo.layer_add(LAYER_MOUNT, layer_repo, LAYER_MOUNT + "/")
+    assert repo.file_exists(LAYER_KEPT) and repo.file_exists(LAYER_DROPPED), (
+        "setup: adding the layer materializes what it mounts"
+    )
+    return repo
+
+
+def layer_revision(instance: Lore) -> str:
+    """The revision the instance's one layer is pinned at."""
+    layers = parse_layer_list_json(instance.layer_list(json=True))
+    assert len(layers) == 1, f"expected the one configured layer, got {layers}"
+    return layers[0]["revision"]
+
+
+@pytest.mark.smoke
+def test_sync_view_carries_a_layer_mount_out_of_view_and_back(
+    new_lore_repo, scratch_dir
+):
+    """A mount leaves the view with the rest of the tree and is read back from the
+    layer repository's store when the view widens again.
+
+    The layer's pinned revision does not move either way: the mount is carried
+    because the view moved, which is the only thing a sync has to notice for it.
+    """
+    instance = repository_with_layer(new_lore_repo)
+    narrow = view_file(scratch_dir, "layer-narrow", LAYER_EXCLUDED_VIEW)
+    wide = view_file(scratch_dir, "layer-wide", WIDE_VIEW)
+    pinned = layer_revision(instance)
+    whole = materialized(instance)
+
+    sync_view(instance, narrow)
+
+    assert not instance.path_exists(LAYER_KEPT), "the mount's content leaves the view"
+    assert not instance.path_exists(LAYER_DROPPED), (
+        "the mount's content leaves the view, subtrees included"
+    )
+    assert instance.file_exists(KEPT), "the instance's own tree is left as it stands"
+    assert layer_revision(instance) == pinned, (
+        "the mount is carried to the view alone, at the revision the layer holds"
+    )
+    assert stored_view(instance) == "/lay\n", (
+        "the view the tree stands under is published as the instance's own: a rule of "
+        "one component keeps the leading separator that roots it"
+    )
+    assert_status_clean(instance, "a mount out of view is not a phantom delete")
+
+    sync_view(instance, wide)
+
+    assert materialized(instance) == whole, (
+        "a widening reads the mount back from the layer repository's store"
+    )
+    assert layer_revision(instance) == pinned, "the layer's pin is still where it was"
+
+
+@pytest.mark.smoke
+def test_sync_view_moves_the_view_below_a_layer_mount(new_lore_repo, scratch_dir):
+    """A view moving below the mount is applied inside it, leaving the rest of the
+    mount alone.
+
+    Nothing of the mount's content changes between the two sides, so this is the
+    shape a walk reading one view takes as matching and never descends into.
+    """
+    instance = repository_with_layer(new_lore_repo)
+    narrow = view_file(scratch_dir, "layer-subtree", LAYER_NARROW_VIEW)
+
+    sync_view(instance, narrow)
+
+    assert not instance.path_exists(LAYER_DROPPED), (
+        "the subtree the view drops leaves the mount"
+    )
+    assert instance.file_exists(LAYER_KEPT), "the rest of the mount stays"
+    assert_status_clean(instance, "a mount narrowed below is coherent with its view")
+
+
+@pytest.mark.smoke
+def test_sync_view_refused_while_a_layer_holds_staged_content(
+    new_lore_repo, scratch_dir
+):
+    """A view change that would delete a mount holding staged content is refused.
+
+    The pin lives in the layer set rather than in the instance anchor, so the
+    instance's own staged check answers nothing about it.
+    """
+    instance = repository_with_layer(new_lore_repo)
+    narrow = view_file(scratch_dir, "layer-narrow", LAYER_EXCLUDED_VIEW)
+    staged = os.path.join(LAYER_MOUNT, "staged.uasset")
+    instance.write_files({staged: b"staged through the mount"})
+    instance.stage(staged)
+
+    assert_sync_refused(
+        instance,
+        INVALID_ARGUMENTS,
+        "a view change deleting a mount that holds staged content",
+        view=narrow,
+    )
+
+    assert instance.file_exists(LAYER_KEPT) and instance.file_exists(staged), (
+        "the refusal leaves the mount and the staged work as they stand"
+    )
+    assert stored_view(instance) is None, (
+        "the instance is left under the view it started from"
+    )
+
+
+def repository_with_link(new_lore_repo) -> Lore:
+    """A pushed repository mounting a subtree of a second one at `link`.
+
+    A link is a node of the mounting repository's own revision, unlike a layer, so
+    the mount is committed and pushed and a clone carries it.
+    """
+    repo = committed_repository(new_lore_repo)
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+    for path in [
+        os.path.join(LINK_SOURCE, "keep.uasset"),
+        os.path.join(LINK_SOURCE, "drop", "one.uasset"),
+    ]:
+        link_repo.make_dirs(os.path.dirname(path))
+        with link_repo.open_file(path, "w+b") as output_file:
+            output_file.write(os.urandom(FILE_BYTES))
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    repo.make_dirs(LINK_MOUNT)
+    repo.link_add(LINK_MOUNT, link_repo.get_id(), to_posix(LINK_SOURCE))
+    repo.commit()
+    repo.push()
+    assert repo.file_exists(LINK_KEPT) and repo.file_exists(LINK_DROPPED), (
+        "setup: adding the link materializes the subtree it mounts"
+    )
+    return repo
+
+
+@pytest.mark.smoke
+def test_sync_view_moves_the_view_below_a_link_mount(new_lore_repo, scratch_dir):
+    """A view moving below a link mount is applied inside it, leaving the rest of
+    the mount alone.
+
+    The mount's content does not change between the two sides, so a walk reading one
+    view takes the whole subtree as matching and never descends into it. What makes
+    this reach the link at all is that the prune is asked before the mount is routed
+    as a link, and a link is neither file nor directory, so the pair takes the
+    paired-directory path with no special case.
+    """
+    repo = repository_with_link(new_lore_repo)
+    instance = repo.clone()
+    narrow = view_file(scratch_dir, "link-subtree", LINK_NARROW_VIEW)
+    wide = view_file(scratch_dir, "link-wide", WIDE_VIEW)
+    whole = materialized(instance)
+
+    _output, realized = sync_view(instance, narrow)
+
+    assert not instance.path_exists(LINK_DROPPED), (
+        "the subtree the view drops leaves the mount"
+    )
+    assert instance.file_exists(LINK_KEPT), "the rest of the mount stays"
+    assert realized == Realized(files_written=0, bytes_written=0, files_deleted=2), (
+        "the file and the directory holding it leave, and nothing else in the mount"
+    )
+    assert_status_clean(instance, "a mount narrowed below is coherent with its view")
+
+    sync_view(instance, wide)
+
+    assert materialized(instance) == whole, (
+        "a widening reads the subtree back from the linked repository's store"
+    )
+
+
+@pytest.mark.smoke
+def test_sync_view_carries_a_link_mount_out_of_view_and_back(
+    new_lore_repo, scratch_dir
+):
+    """A link mount leaving the view is removed whole, and read back when the view
+    widens again.
+
+    A mount is one node, so what leaves the view is the mount rather than each path
+    below it: the delete is emitted for the mount path alone and the removal below it
+    is recursive.
+    """
+    repo = repository_with_link(new_lore_repo)
+    instance = repo.clone()
+    narrow = view_file(scratch_dir, "link-narrow", LINK_EXCLUDED_VIEW)
+    wide = view_file(scratch_dir, "link-wide", WIDE_VIEW)
+    whole = materialized(instance)
+
+    _output, realized = sync_view(instance, narrow)
+
+    assert not instance.path_exists(LINK_MOUNT), "the mount leaves the working tree"
+    assert instance.file_exists(KEPT), "the instance's own tree is left as it stands"
+    assert realized == Realized(files_written=0, bytes_written=0, files_deleted=1), (
+        "one delete carries the mount away, rather than one per path below it"
+    )
+    assert stored_view(instance) == "/link\n", "the view is published"
+
+    sync_view(instance, wide)
+
+    assert materialized(instance) == whole, (
+        "a widening reads the mount back from the linked repository's store"
+    )

@@ -888,19 +888,25 @@ pub fn list_staged_boxed(
     Box::pin(list_staged(repository))
 }
 
+/// Carries the layer's mount to `state_target`, and to the view `repository_target` holds.
+///
+/// `repository_current` is the layer context the mount stands under, which is `repository_target`
+/// itself for a sync carrying the mount between revisions under one view.
 pub async fn sync(
-    repository: Arc<RepositoryContext>,
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     target_path: RelativePath,
     source_path: RelativePath,
     options: SyncOptions,
 ) -> Result<(), LayerError> {
-    let filesystem = repository.file_system();
+    let filesystem = repository_target.file_system();
     with_operation(filesystem, true, async |operation| {
         sync_in_operation(
             operation,
-            repository,
+            repository_current,
+            repository_target,
             state_current,
             state_target,
             target_path,
@@ -916,7 +922,8 @@ pub async fn sync(
 #[allow(clippy::too_many_arguments)]
 async fn sync_in_operation(
     operation: Arc<InstanceOperationImpl>,
-    repository: Arc<RepositoryContext>,
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     target_path: RelativePath,
@@ -924,9 +931,20 @@ async fn sync_in_operation(
     options: SyncOptions,
 ) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
-    let current =
-        drawn_subtree_state(&repository, &state_current, &source_path, &target_path).await;
-    let target = drawn_subtree_state(&repository, &state_target, &source_path, &target_path).await;
+    let current = drawn_subtree_state(
+        &repository_current,
+        &state_current,
+        &source_path,
+        &target_path,
+    )
+    .await;
+    let target = drawn_subtree_state(
+        &repository_target,
+        &state_target,
+        &source_path,
+        &target_path,
+    )
+    .await;
     let current_tree = NodeMapping {
         repository: current.mapping.repository.clone(),
         state: current.mapping.state.clone(),
@@ -988,10 +1006,10 @@ async fn sync_in_operation(
             changes.len()
         );
         sync::sync_verify_filesystem(
-            repository.clone(),
+            repository_target.clone(),
             Arc::new(sync::SyncVerifyArgs {
                 changes: changes.clone(),
-                repository_current: repository.clone(),
+                repository_current,
                 operation: operation.clone(),
                 current: current_tree,
                 options: options.clone(),
@@ -1004,7 +1022,7 @@ async fn sync_in_operation(
     };
 
     crate::fs::realize::realize_changes(
-        repository.clone(),
+        repository_target.clone(),
         operation.clone(),
         changes,
         None,

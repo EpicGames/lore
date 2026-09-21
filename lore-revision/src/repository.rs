@@ -1168,6 +1168,16 @@ impl RepositoryContext {
         }
     }
 
+    /// This context reading the same repository through `filter`, inheriting everything else as
+    /// the same handles, the connection state cell included.
+    ///
+    /// The write token travels, as it does through every other builder here. Writes deep in a read
+    /// path are gated on it and skip themselves without one — chiefly
+    /// [`state::file_modified_against_node`](crate::state::file_modified_against_node), which
+    /// records the modified time of a file a hash check just established as unmodified — so a
+    /// context without one leaves every later pass to pay the hash again. Sharing grants no
+    /// authority the caller does not already hold: the guard is the one `self` holds, and it is
+    /// released once every sibling drops.
     pub fn to_filter_context(&self, filter: Arc<Filter>) -> Self {
         RepositoryContext {
             link_read: self.link_read.clone(),
@@ -1182,7 +1192,7 @@ impl RepositoryContext {
             settings: self.settings.clone(),
             is_link: self.is_link,
             is_layer: self.is_layer,
-            write_token: None,
+            write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
             session_pool: Default::default(),
             lazy_session: Default::default(),
@@ -3412,6 +3422,7 @@ async fn layer_branch_switch(
             };
 
             if let Err(err) = Box::pin(layer::sync(
+                layer_repository.clone(),
                 layer_repository,
                 layer_current,
                 layer_target,

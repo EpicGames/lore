@@ -467,13 +467,10 @@ mod tests {
                     .view
                     .add_exclusion("engine/**")
                     .expect("view exclude");
-                // `to_filter_context` drops the write token. Re-attach a
-                // shared one, so the view-scoped merge can write anchors.
                 let view_repo = std::sync::Arc::new(
                     fixture
                         .repository
-                        .to_filter_context(std::sync::Arc::new(view_filter))
-                        .with_write_token(fixture.write_token.share()),
+                        .to_filter_context(std::sync::Arc::new(view_filter)),
                 );
 
                 let merged_rev = Box::pin(lore_revision::branch::merge::merge_start(
@@ -548,9 +545,6 @@ mod tests {
 
     /// Build a view filter that excludes `directory/` at every depth, and a
     /// repository context that applies it.
-    ///
-    /// `to_filter_context` drops the write token, so a shared one is re-attached
-    /// for the view-scoped merge to write anchors with.
     fn excluded_context(fixture: &DiffFixture, directory: &str) -> Arc<RepositoryContext> {
         let mut view_filter = lore_revision::filter::Filter::default();
         view_filter
@@ -561,12 +555,7 @@ mod tests {
             .view
             .add_exclusion(&format!("{directory}/**"))
             .expect("view exclude");
-        Arc::new(
-            fixture
-                .repository
-                .to_filter_context(Arc::new(view_filter))
-                .with_write_token(fixture.write_token.share()),
-        )
+        Arc::new(fixture.repository.to_filter_context(Arc::new(view_filter)))
     }
 
     fn engine_excluded_context(fixture: &DiffFixture) -> Arc<RepositoryContext> {
@@ -841,12 +830,8 @@ mod tests {
                     .view
                     .add_exclusion("*.bin")
                     .expect("view exclude");
-                let view_repo = Arc::new(
-                    fixture
-                        .repository
-                        .to_filter_context(Arc::new(view_filter))
-                        .with_write_token(fixture.write_token.share()),
-                );
+                let view_repo =
+                    Arc::new(fixture.repository.to_filter_context(Arc::new(view_filter)));
 
                 Box::pin(merge_main_under_view(
                     &view_repo,
