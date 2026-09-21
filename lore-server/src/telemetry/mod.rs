@@ -39,9 +39,21 @@ use tracing_opentelemetry::MetricsLayer;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::registry::Registry;
+
+/// Builds the log filter from `RUST_LOG`-style directives.
+///
+/// Defaults to warnings, so a server started without `RUST_LOG` reports the
+/// conditions an operator has to act on. An empty or unparsable set of
+/// directives leaves that default in force.
+fn log_filter(directives: &str) -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::WARN.into())
+        .parse_lossy(directives)
+}
 
 fn is_filtered_otel_name(name: &str) -> bool {
     matches!(
@@ -223,10 +235,44 @@ impl TelemetryInitializer {
     pub fn init(self) -> Result<TelemetryGuard, TelemetryError> {
         tracing_subscriber::registry()
             .with(self.layers)
-            .with(EnvFilter::from_default_env())
+            .with(log_filter(
+                &std::env::var(EnvFilter::DEFAULT_ENV).unwrap_or_default(),
+            ))
             .try_init()
             .internal("Failed to initialize tracing subscriber")?;
 
         Ok(self.guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn max_level(directives: &str) -> Option<LevelFilter> {
+        <EnvFilter as Layer<Registry>>::max_level_hint(&log_filter(directives))
+    }
+
+    /// A standalone server start sets no `RUST_LOG`, and an operator running
+    /// one wants to see the warnings it emits.
+    #[test]
+    fn no_directives_enable_warnings() {
+        assert_eq!(max_level(""), Some(LevelFilter::WARN));
+    }
+
+    #[test]
+    fn a_directive_overrides_the_default() {
+        assert_eq!(max_level("info"), Some(LevelFilter::INFO));
+    }
+
+    /// A large deployment cuts the output back down to errors alone.
+    #[test]
+    fn errors_only_remains_available() {
+        assert_eq!(max_level("error"), Some(LevelFilter::ERROR));
+    }
+
+    #[test]
+    fn an_unparsable_directive_leaves_the_default_in_force() {
+        assert_eq!(max_level("=!=not a directive=!="), Some(LevelFilter::WARN));
     }
 }

@@ -49,10 +49,13 @@ trace!(target = "lore_server::store", "detailed info");
 
 ### Configuration
 
-Control via the `RUST_LOG` environment variable:
+Control via the `RUST_LOG` environment variable. With `RUST_LOG` unset the server logs at `warn`
+and above, so a server started without configuration still reports the conditions an operator has
+to act on:
 
 ```bash
-RUST_LOG=info                               # Default level
+RUST_LOG=info                               # Above the default
+RUST_LOG=error                              # Below it, for a large deployment
 RUST_LOG=debug,lore_server::grpc=trace      # Module-specific
 ```
 

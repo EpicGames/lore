@@ -457,6 +457,28 @@ pub struct ServerSettings {
     pub runtime_shutdown_timeout_seconds: u16,
     #[serde(default)]
     pub user_agent: UserAgentSettings,
+    /// Disk space monitoring for the local store paths.
+    #[serde(default)]
+    pub local_store_monitor: LocalStoreMonitorSettings,
+}
+
+/// Periodic monitoring of the disk space available to the local store.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+pub struct LocalStoreMonitorSettings {
+    /// Seconds between checks. Zero turns monitoring off.
+    pub check_interval_seconds: u64,
+    /// Available space, in bytes, below which a warning is logged.
+    pub low_space_threshold_bytes: u64,
+}
+
+impl Default for LocalStoreMonitorSettings {
+    fn default() -> Self {
+        Self {
+            check_interval_seconds: 30,
+            low_space_threshold_bytes: 10 * 1024 * 1024 * 1024,
+        }
+    }
 }
 
 // For when this server acts as a client to another server's Internal port
@@ -691,6 +713,43 @@ mod tests {
     fn http_settings(extra_keys: &str) -> HttpSettings {
         toml::from_str(&format!("{MINIMAL_HTTP_SETTINGS}\n{extra_keys}\n"))
             .expect("[server.http] should deserialize")
+    }
+
+    const TEN_GIB: u64 = 10 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn local_store_monitor_checks_every_thirty_seconds_below_ten_gibibytes() {
+        let settings = LocalStoreMonitorSettings::default();
+
+        assert_eq!(settings.check_interval_seconds, 30);
+        assert_eq!(settings.low_space_threshold_bytes, TEN_GIB);
+    }
+
+    /// Existing config files carry no `[server.local_store_monitor]` table, so
+    /// an absent table has to leave the server running on the defaults.
+    #[test]
+    fn server_settings_default_the_local_store_monitor_table() {
+        let server: ServerSettings =
+            toml::from_str("").expect("[server] with no tables should deserialize");
+
+        assert_eq!(server.local_store_monitor.check_interval_seconds, 30);
+        assert_eq!(
+            server.local_store_monitor.low_space_threshold_bytes,
+            TEN_GIB
+        );
+    }
+
+    #[test]
+    fn local_store_monitor_keys_are_optional_one_by_one() {
+        let settings: LocalStoreMonitorSettings = toml::from_str(
+            r#"
+            check_interval_seconds = 5
+        "#,
+        )
+        .expect("[server.local_store_monitor] should deserialize");
+
+        assert_eq!(settings.check_interval_seconds, 5);
+        assert_eq!(settings.low_space_threshold_bytes, TEN_GIB);
     }
 
     /// A bare-string `jwt_issuer` and a one-entry list are the same

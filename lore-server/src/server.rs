@@ -107,8 +107,10 @@ use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
 use crate::settings::GrpcSettings;
 use crate::settings::HttpSettings;
+use crate::settings::ImmutableStoreSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
+use crate::settings::MutableStoreSettings;
 use crate::settings::NotificationSettings;
 use crate::settings::QuicSettings;
 use crate::settings::RemoteStoreSettings;
@@ -1027,34 +1029,203 @@ fn local_store() -> Option<Arc<dyn ImmutableStore>> {
 /// Directory under the system temporary directory where the server keeps
 /// zero-config artifacts (local stores and ephemeral certificates) when no
 /// explicit locations are configured.
+///
+/// `std::env::temp_dir` hands back `TMPDIR` as it stands, which an empty one
+/// makes a relative directory, so the result is resolved against the process
+/// working directory.
 fn local_data_dir() -> PathBuf {
-    std::env::temp_dir().join("lore-server")
+    let dir = std::env::temp_dir().join("lore-server");
+
+    std::path::absolute(&dir).unwrap_or(dir)
 }
 
-/// Resolve the configured local store path, falling back to a directory under
-/// the system temporary directory when none was provided.
+/// Whether the configuration names a local store path.
+fn is_path_configured(configured: &str) -> bool {
+    !configured.trim().is_empty()
+}
+
+/// Where the local store lives, falling back to a directory under the system
+/// temporary directory when the configuration names none.
 ///
-/// The resolved path is logged so operators can see where on-disk state lives.
-/// When no path was configured, the generated temporary path is logged as a
-/// prominent warning because that location is ephemeral and not persisted
-/// across reboots.
-fn resolve_local_store_path(configured: &str, store_label: &str) -> PathBuf {
-    if configured.trim().is_empty() {
-        let path = local_data_dir();
-        warn!(
-            store = store_label,
-            path = %path.display(),
-            "No local store path configured for the '{}' store; generated a path under the system \
-             temporary directory: {}. This data is EPHEMERAL and not persisted across reboots — \
-             configure an explicit path for production.",
-            store_label,
-            path.display(),
-        );
-        path
-    } else {
-        let path = PathBuf::from(configured);
-        info!(store = store_label, path = %path.display(), "Using configured local store path");
-        path
+/// A relative path is resolved against the process working directory, where the
+/// storage layer creates it. The `disallowed_methods` fence on
+/// `std::env::current_dir` guards library calls carrying a caller's directory;
+/// this is the server resolving its own configuration. Resolution is lexical,
+/// so the location is classified before the directory exists.
+fn local_store_path(configured: &str) -> PathBuf {
+    if !is_path_configured(configured) {
+        return local_data_dir();
+    }
+
+    let path = PathBuf::from(configured);
+
+    std::path::absolute(&path).unwrap_or(path)
+}
+
+/// A local store the configuration asks for.
+struct LocalStoreLocation {
+    /// Names the store in the log.
+    label: &'static str,
+    /// Where the store lands.
+    path: PathBuf,
+    /// Whether the configuration named the path.
+    configured: bool,
+    /// Whether the server writes at this path.
+    reaches_disk: bool,
+}
+
+/// Marks which immutable tiers are written at.
+///
+/// Every local tier is handed the store the first one creates, so a tier naming
+/// another path has nothing written at the path it names, and one naming the
+/// same path shares the store standing there.
+fn mark_shared_immutable_tiers(tiers: &mut [LocalStoreLocation]) {
+    let Some((created, shared)) = tiers.split_first_mut() else {
+        return;
+    };
+
+    for tier in shared {
+        tier.reaches_disk = tier.path == created.path;
+    }
+}
+
+/// Adds the local store `mode` names, if it names one.
+fn push_local_store(
+    stores: &mut Vec<LocalStoreLocation>,
+    label: &'static str,
+    mode: &str,
+    configured: Option<&str>,
+) {
+    if mode == store_mode::LOCAL
+        && let Some(configured) = configured
+    {
+        stores.push(LocalStoreLocation {
+            label,
+            path: local_store_path(configured),
+            configured: is_path_configured(configured),
+            reaches_disk: true,
+        });
+    }
+}
+
+/// Every local store the configuration asks for, in the order the server builds
+/// them.
+///
+/// The process holds one local immutable store, in `LOCAL_STORE`, which the
+/// first tier configured as local creates and every later local tier is handed;
+/// see [`mark_shared_immutable_tiers`]. Composite tiers are built in the order
+/// local, durable, replicas. The local mutable store is separate, at its own
+/// path.
+///
+/// A remote or replicated store writes to no local path, so a `[local]` block
+/// left in its configuration is not listed.
+fn local_store_locations(
+    immutable: &ImmutableStoreSettings,
+    mutable: &MutableStoreSettings,
+) -> Vec<LocalStoreLocation> {
+    let mut stores = Vec::new();
+
+    push_local_store(
+        &mut stores,
+        "immutable",
+        &immutable.mode,
+        immutable.local.as_ref().map(|local| local.path.as_str()),
+    );
+
+    if immutable.mode == store_mode::COMPOSITE
+        && let Some(composite) = immutable.composite.as_ref()
+    {
+        let tiers = std::iter::once(("immutable composite local", &composite.local))
+            .chain(
+                composite
+                    .durable
+                    .as_ref()
+                    .map(|tier| ("immutable composite durable", tier)),
+            )
+            .chain(
+                composite
+                    .replica
+                    .iter()
+                    .flatten()
+                    .map(|tier| ("immutable composite replica", tier)),
+            );
+
+        for (label, tier) in tiers {
+            push_local_store(
+                &mut stores,
+                label,
+                &tier.mode,
+                tier.local.as_ref().map(|local| local.path.as_str()),
+            );
+        }
+    }
+
+    mark_shared_immutable_tiers(&mut stores);
+
+    push_local_store(
+        &mut stores,
+        "mutable",
+        &mutable.mode,
+        mutable.local.as_ref().map(|local| local.path.as_str()),
+    );
+
+    stores
+}
+
+/// The store paths the disk space monitor watches.
+fn monitored_local_store_paths(stores: Vec<LocalStoreLocation>) -> Vec<PathBuf> {
+    stores
+        .into_iter()
+        .filter(|store| store.reaches_disk)
+        .map(|store| store.path)
+        .collect()
+}
+
+/// Reports where every local store lands.
+///
+/// A store nothing is written at draws that alone: where the path points says
+/// nothing an operator can act on. The remaining two conditions are independent,
+/// since either can hold without the other: a path the configuration does not
+/// name, and a path inside a system temporary directory.
+fn report_local_store_locations(stores: &[LocalStoreLocation]) {
+    for store in stores {
+        if !store.reaches_disk {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "The '{}' local store names {}, but every local immutable tier is handed the \
+                 store the first one creates, so nothing is written there. Remove the path, or \
+                 make this the first local tier.",
+                store.label,
+                store.path.display(),
+            );
+            continue;
+        }
+
+        if store.configured {
+            info!(store = store.label, path = %store.path.display(), "Using configured local store path");
+        } else {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "No local store path is configured for the '{}' store, so the server generated {}. \
+                 Configure an explicit path for production.",
+                store.label,
+                store.path.display(),
+            );
+        }
+
+        if crate::util::local_store_monitor::is_temporary_path(&store.path) {
+            warn!(
+                store = store.label,
+                path = %store.path.display(),
+                "The '{}' local store is at {}, inside a system temporary directory. This data is \
+                 EPHEMERAL and not persisted across reboots. Configure a persistent location for \
+                 production.",
+                store.label,
+                store.path.display(),
+            );
+        }
     }
 }
 
@@ -1124,7 +1295,7 @@ async fn create_local_store(
     flush_background: bool,
 ) -> Result<Arc<dyn ImmutableStore>> {
     let default_settings = lore_storage::local::immutable_store::ImmutableStoreSettings::default();
-    let store_path = resolve_local_store_path(&settings.path, "immutable");
+    let store_path = local_store_path(&settings.path);
 
     let options = ImmutableStoreCreateOptions {
         max_capacity: settings.max_capacity,
@@ -1189,7 +1360,7 @@ async fn configure_local_mutable_store(
 ) -> Result<Arc<dyn MutableStore>> {
     info!("Wiring up local mutable store");
 
-    let store_path = resolve_local_store_path(&settings.path, "mutable");
+    let store_path = local_store_path(&settings.path);
 
     Ok(lore_storage::local::mutable_store::create(
         Some(store_path.as_path()),
@@ -1781,6 +1952,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         plugin_registry.list_notification_plugins(),
     );
 
+    let local_stores = local_store_locations(&settings.immutable_store, &settings.mutable_store);
+    report_local_store_locations(&local_stores);
+
     #[cfg(feature = "seeding")]
     {
         let mode = &settings.immutable_store.mode;
@@ -1840,6 +2014,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let mutable_store =
         configure_mutable_store_via_plugin(&plugin_registry, &settings, immutable_store.clone())
             .await?;
+
+    crate::util::local_store_monitor::start_local_store_monitor(
+        monitored_local_store_paths(local_stores),
+        &settings.server.local_store_monitor,
+    );
 
     let lock_store = configure_lock_store_via_plugin(&plugin_registry, &settings)?;
 
@@ -2273,6 +2452,369 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    /// Covers where the local store ends up on disk, and whether that location
+    /// survives a reboot.
+    mod local_store_path_resolution {
+        use super::super::is_path_configured;
+        use super::super::local_data_dir;
+        use super::super::local_store_path;
+        use crate::util::local_store_monitor::is_temporary_path;
+
+        #[test]
+        fn a_path_counts_as_configured_only_when_it_names_something() {
+            assert!(is_path_configured("/srv/lore/store"));
+            assert!(!is_path_configured(""));
+            assert!(!is_path_configured("   "));
+        }
+
+        #[test]
+        fn an_unconfigured_path_falls_back_under_the_temp_dir() {
+            let path = local_store_path("");
+
+            assert_eq!(path, local_data_dir());
+            assert!(is_temporary_path(&path));
+        }
+
+        #[test]
+        fn a_blank_path_falls_back_under_the_temp_dir() {
+            assert_eq!(local_store_path("   "), local_data_dir());
+        }
+
+        /// Sourced from the temporary directory, which is absolute however the
+        /// platform spells one.
+        #[test]
+        fn a_configured_absolute_path_is_taken_as_given() {
+            let path = std::env::temp_dir().join("lore-configured-store");
+            let configured = path.to_str().expect("temporary directory path is UTF-8");
+
+            assert_eq!(local_store_path(configured), path);
+        }
+
+        /// The storage layer creates a relative path against the working
+        /// directory, so the reported location must match.
+        // The process directory is the assertion, not a carried one.
+        #[allow(clippy::disallowed_methods)]
+        #[test]
+        fn a_relative_path_is_resolved_against_the_working_directory() {
+            let current = std::env::current_dir().expect("working directory");
+
+            assert_eq!(local_store_path("store"), current.join("store"));
+        }
+
+        /// `./` is what the shipped `gha.toml` configures.
+        #[allow(clippy::disallowed_methods)]
+        #[test]
+        fn a_working_directory_path_resolves_to_the_working_directory() {
+            let current = std::env::current_dir().expect("working directory");
+
+            assert_eq!(local_store_path("./"), current);
+        }
+
+        /// Classification is lexical, so a first start decides as a later one
+        /// does.
+        #[test]
+        fn a_temporary_path_is_classified_before_it_exists() {
+            let path = std::env::temp_dir().join("lore-server-classified-before-it-exists");
+
+            assert!(!path.exists());
+            assert!(is_temporary_path(&path));
+        }
+
+        /// The shipped `local.toml` names a path under the temporary
+        /// directory, so being configured says nothing about surviving a
+        /// reboot.
+        #[test]
+        fn a_configured_temporary_path_is_configured_and_temporary() {
+            let path = std::env::temp_dir().join("lore-server");
+            let configured = path.to_str().expect("temporary directory path is UTF-8");
+
+            assert!(is_path_configured(configured));
+            assert!(is_temporary_path(&local_store_path(configured)));
+        }
+
+        #[test]
+        fn a_configured_persistent_path_is_neither() {
+            assert!(is_path_configured("/srv/lore/store"));
+            assert!(!is_temporary_path(&local_store_path("/srv/lore/store")));
+        }
+
+        /// Both conditions hold for the zero-configuration default.
+        #[test]
+        fn an_unconfigured_path_is_neither_configured_nor_persistent() {
+            assert!(!is_path_configured(""));
+            assert!(is_temporary_path(&local_store_path("")));
+        }
+    }
+
+    /// Covers which local stores are reported and given to the disk space
+    /// monitor.
+    mod local_stores {
+        use std::path::PathBuf;
+
+        use super::super::LocalStoreLocation;
+        use super::super::local_data_dir;
+        use super::super::local_store_locations;
+        use super::super::local_store_path;
+        use super::super::monitored_local_store_paths;
+        use crate::settings::ImmutableStoreSettings;
+        use crate::settings::MutableStoreSettings;
+
+        const LOCAL_IMMUTABLE: &str = r#"
+            mode = "local"
+            [local]
+            flush_delay_seconds = 10
+            path = "/tmp/lore-server"
+        "#;
+
+        const LOCAL_MUTABLE: &str = r#"
+            mode = "local"
+            [local]
+            flush_delay_seconds = 10
+            path = "/tmp/lore-server"
+        "#;
+
+        const REMOTE_MUTABLE: &str = r#"
+            mode = "remote"
+        "#;
+
+        const COMPOSITE_WITH_LOCAL_TIER: &str = r#"
+            mode = "composite"
+            [composite.local]
+            mode = "local"
+            [composite.local.local]
+            flush_delay_seconds = 10
+            path = "/tmp/lore-server"
+        "#;
+
+        const COMPOSITE_WITHOUT_LOCAL_TIER: &str = r#"
+            mode = "composite"
+            [composite.local]
+            mode = "local"
+        "#;
+
+        /// Only the first local tier reaches disk.
+        const COMPOSITE_WITH_EVERY_TIER_LOCAL: &str = r#"
+            mode = "composite"
+
+            [composite.local]
+            mode = "local"
+
+            [composite.local.local]
+            flush_delay_seconds = 10
+            path = "/var/lore/cache"
+
+            [composite.durable]
+            mode = "local"
+
+            [composite.durable.local]
+            flush_delay_seconds = 10
+            path = "/var/lore/durable"
+
+            [[composite.replica]]
+            mode = "local"
+
+            [composite.replica.local]
+            flush_delay_seconds = 10
+            path = "/var/lore/replica"
+        "#;
+
+        const UNCONFIGURED_IMMUTABLE: &str = r#"
+            mode = "local"
+            [local]
+            flush_delay_seconds = 10
+            path = ""
+        "#;
+
+        fn immutable(config: &'static str) -> ImmutableStoreSettings {
+            toml::from_str(config).expect("[immutable_store] should deserialize")
+        }
+
+        fn mutable(config: &'static str) -> MutableStoreSettings {
+            toml::from_str(config).expect("[mutable_store] should deserialize")
+        }
+
+        fn locations(
+            immutable_config: &'static str,
+            mutable_config: &'static str,
+        ) -> Vec<LocalStoreLocation> {
+            local_store_locations(&immutable(immutable_config), &mutable(mutable_config))
+        }
+
+        fn watched(immutable_config: &'static str, mutable_config: &'static str) -> Vec<PathBuf> {
+            monitored_local_store_paths(locations(immutable_config, mutable_config))
+        }
+
+        fn reaches_disk(stores: &[LocalStoreLocation]) -> Vec<bool> {
+            stores.iter().map(|store| store.reaches_disk).collect()
+        }
+
+        fn labels(stores: &[LocalStoreLocation]) -> Vec<&'static str> {
+            stores.iter().map(|store| store.label).collect()
+        }
+
+        #[test]
+        fn both_local_stores_are_watched() {
+            assert_eq!(
+                watched(LOCAL_IMMUTABLE, LOCAL_MUTABLE),
+                vec![local_store_path("/tmp/lore-server"); 2]
+            );
+        }
+
+        #[test]
+        fn each_store_is_named_by_what_it_is() {
+            assert_eq!(
+                labels(&locations(LOCAL_IMMUTABLE, LOCAL_MUTABLE)),
+                vec!["immutable", "mutable"]
+            );
+        }
+
+        /// A `[local]` block left in a remote deployment's config names a
+        /// directory the server never writes to.
+        #[test]
+        fn a_store_that_is_not_local_is_not_listed() {
+            let remote_immutable = r#"
+                mode = "remote"
+                [local]
+                flush_delay_seconds = 10
+                path = "/tmp/lore-server"
+            "#;
+
+            assert!(locations(remote_immutable, REMOTE_MUTABLE).is_empty());
+        }
+
+        #[test]
+        fn a_composite_local_tier_is_watched() {
+            assert_eq!(
+                watched(COMPOSITE_WITH_LOCAL_TIER, REMOTE_MUTABLE),
+                vec![local_store_path("/tmp/lore-server")]
+            );
+        }
+
+        /// A second local tier never gets a store at its own path.
+        #[test]
+        fn only_the_first_local_composite_tier_is_watched() {
+            assert_eq!(
+                watched(COMPOSITE_WITH_EVERY_TIER_LOCAL, REMOTE_MUTABLE),
+                vec![local_store_path("/var/lore/cache")]
+            );
+        }
+
+        /// The tiers that reach no disk are still listed, so the paths they
+        /// name can be reported as unused.
+        #[test]
+        fn every_local_composite_tier_is_listed() {
+            let stores = locations(COMPOSITE_WITH_EVERY_TIER_LOCAL, REMOTE_MUTABLE);
+
+            assert_eq!(
+                labels(&stores),
+                vec![
+                    "immutable composite local",
+                    "immutable composite durable",
+                    "immutable composite replica"
+                ]
+            );
+            assert_eq!(reaches_disk(&stores), vec![true, false, false]);
+        }
+
+        /// A later tier naming the first tier's path shares the store standing
+        /// there, so it is written at and must not be reported as unused.
+        #[test]
+        fn a_composite_tier_repeating_the_first_path_is_written_at() {
+            let tiers_share_a_path = r#"
+                mode = "composite"
+
+                [composite.local]
+                mode = "local"
+
+                [composite.local.local]
+                flush_delay_seconds = 10
+                path = "/var/lore/store"
+
+                [composite.durable]
+                mode = "local"
+
+                [composite.durable.local]
+                flush_delay_seconds = 10
+                path = "/var/lore/store"
+            "#;
+
+            let stores = locations(tiers_share_a_path, REMOTE_MUTABLE);
+
+            assert_eq!(reaches_disk(&stores), vec![true, true]);
+        }
+
+        /// The mutable store is its own store, not a tier handed the immutable
+        /// one.
+        #[test]
+        fn the_mutable_store_reaches_disk_beside_a_composite_tier() {
+            let stores = locations(COMPOSITE_WITH_LOCAL_TIER, LOCAL_MUTABLE);
+
+            assert_eq!(reaches_disk(&stores), vec![true, true]);
+        }
+
+        /// First in build order, not the cache tier by name.
+        #[test]
+        fn the_first_local_tier_is_watched_whichever_tier_that_is() {
+            let cache_is_remote = r#"
+                mode = "composite"
+
+                [composite.local]
+                mode = "remote"
+
+                [composite.durable]
+                mode = "local"
+
+                [composite.durable.local]
+                flush_delay_seconds = 10
+                path = "/var/lore/durable"
+            "#;
+
+            assert_eq!(
+                watched(cache_is_remote, REMOTE_MUTABLE),
+                vec![local_store_path("/var/lore/durable")]
+            );
+        }
+
+        #[test]
+        fn a_composite_store_with_no_local_tier_settings_is_not_listed() {
+            assert!(locations(COMPOSITE_WITHOUT_LOCAL_TIER, REMOTE_MUTABLE).is_empty());
+        }
+
+        #[test]
+        fn an_unconfigured_local_store_is_watched_where_it_falls_back_to() {
+            assert_eq!(
+                watched(UNCONFIGURED_IMMUTABLE, REMOTE_MUTABLE),
+                vec![local_data_dir()]
+            );
+        }
+
+        #[test]
+        fn an_unconfigured_local_store_is_recorded_as_unconfigured() {
+            let stores = locations(UNCONFIGURED_IMMUTABLE, REMOTE_MUTABLE);
+
+            assert_eq!(
+                stores
+                    .iter()
+                    .map(|store| store.configured)
+                    .collect::<Vec<_>>(),
+                vec![false]
+            );
+        }
+
+        #[test]
+        fn a_configured_local_store_is_recorded_as_configured() {
+            let stores = locations(LOCAL_IMMUTABLE, REMOTE_MUTABLE);
+
+            assert_eq!(
+                stores
+                    .iter()
+                    .map(|store| store.configured)
+                    .collect::<Vec<_>>(),
+                vec![true]
+            );
+        }
+    }
+
     /// Covers the `[server.http]` to `LoreHttpServerSettings` mapping, the one seam
     /// between config deserialization and the HTTP server's own settings.
     mod http_settings_mapping {

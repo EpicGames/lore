@@ -82,12 +82,25 @@ With no config files loaded, the server runs as a self-contained, single-node in
 
 ## Server and endpoint settings
 
-The `[server]` table and its sub-tables configure the network endpoints and graceful-shutdown behavior.
+The `[server]` table and its sub-tables configure the network endpoints, graceful-shutdown behavior, and the disk space check on the local stores.
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
+
+### Local store disk space
+
+`[server.local_store_monitor]` configures the periodic check of the disk space left to the local stores (see [Store settings](#store-settings)). Only stores the server writes at are watched, so a `[local]` block left in a remote deployment's configuration is ignored, as is a composite immutable tier that names a path other than the first local tier's — every local tier is handed the store the first one creates.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `check_interval_seconds` | `30` | Seconds between checks. `0` turns the check off. |
+| `low_space_threshold_bytes` | `10737418240` | Warn while free space on a volume holding a local store is below this (10 GiB). |
+
+The reading is taken per volume, not per store: stores sharing a filesystem are checked once and named together in a single warning. The first check runs at startup, so a server starting on a full volume says so immediately. A store path that matches no mounted filesystem is warned about once and goes unmonitored until a mount covers it again.
+
+At startup the server also reports where each local store lands, warning when the configuration names no path, when the path is inside a system temporary directory (see [Zero-config defaults](#zero-config-defaults)), and when a composite tier names a path nothing is written at.
 
 ### QUIC endpoints
 

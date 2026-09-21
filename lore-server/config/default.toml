@@ -20,6 +20,14 @@
 connection_close_timeout_seconds = 5
 runtime_shutdown_timeout_seconds = 25
 
+# Disk space available to the local store directories. Only stores the server
+# writes at are watched, and a volume holding several of them is checked once.
+[server.local_store_monitor]
+# Seconds between checks. 0 turns the check off.
+check_interval_seconds = 30
+# Warn while free space on a volume holding a local store is below this.
+low_space_threshold_bytes = 10_737_418_240  # 10 GiB
+
 # public facing server settings
 [server.quic]
 enabled = true

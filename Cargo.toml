@@ -127,7 +127,7 @@ serde_with = { version = "3.14.0", default-features = false, features = ["alloc"
 serial_test = { version = "3.2.0" }
 socket2 = "0.6.0"
 syn = "2.0.106"
-sysinfo = "0.37.0"
+sysinfo = { version = "0.37.0", features = ["linux-tmpfs"] }
 temp-env = "0.3.6"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = [

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 pub mod cert_metrics;
 pub mod core_hop;
+pub mod local_store_monitor;
 
 use lore_revision::interface::LoreGlobalArgs;
 
