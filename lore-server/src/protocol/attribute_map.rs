@@ -20,9 +20,18 @@ pub struct ConnectionId(pub usize);
 #[derive(Default)]
 pub struct AttributeMap {
     map: Arc<RwLock<AnyMap>>,
+    updated: tokio::sync::watch::Sender<()>,
 }
 
 impl AttributeMap {
+    /// Notified every time an attribute is inserted.
+    ///
+    /// The sender is held privately so that a notification means an insert happened, which is what
+    /// lets an observer treat one as "the attributes I derived from this have changed".
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+        self.updated.subscribe()
+    }
+
     pub fn insert<T: Send + Sync + 'static>(&self, val: T) {
         match self.map.write() {
             Ok(mut m) => {
@@ -30,8 +39,13 @@ impl AttributeMap {
             }
             Err(e) => {
                 warn!("Failed to get write lock when writing to attribute map: {e:?}");
+                return;
             }
         }
+
+        // Notified with the lock released: a subscriber reads the map as soon as it wakes, so
+        // notifying while still holding it invites the subscriber to block on this very insert.
+        let _ = self.updated.send(());
     }
 
     pub fn get<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {

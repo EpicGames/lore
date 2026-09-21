@@ -11,15 +11,9 @@ use bytes::Bytes;
 use lore_base::lore_spawn_core;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::runtime::execution_context;
-use lore_telemetry::InstrumentProvider;
-use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
-use lore_telemetry::create_operation_context_attribute;
-use lore_telemetry::drop_record::DropRecord;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
 use lore_transport::quic::command_header::CommandHeader;
-use opentelemetry::KeyValue;
-use opentelemetry::metrics::Histogram;
 use quinn::ClosedStream;
 use quinn::ReadError;
 use quinn::RecvStream;
@@ -31,6 +25,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tracing::Instrument;
 use tracing::debug;
+use tracing::error;
 use tracing::info;
 use tracing::info_span;
 use tracing::trace;
@@ -43,11 +38,14 @@ use crate::quic::QuicErrorStatus;
 use crate::quic::QuicService;
 use crate::quic::StreamDataHandler;
 use crate::quic::StreamHandlerError;
+use crate::quic::stream_observer::MessageFailure;
+use crate::quic::stream_observer::MessageHandling;
+use crate::quic::stream_observer::ServiceMetricEvent;
+use crate::quic::stream_observer::StreamMetricEvent;
+use crate::quic::stream_observer::StreamMetricSender;
+use crate::quic::stream_observer::observe_connection;
 
-const SERVICE_LABEL_KEY: &str = "quic_service_name";
-const OPCODE_LABEL_KEY: &str = "opcode";
-const HANDLER_ERROR_LABEL_KEY: &str = "handler_error";
-const HANDLER_ERROR_CLASSIFICATION_LABEL_KEY: &str = "error_classification";
+const METRIC_EVENTS_BUFFER: usize = 10_000;
 
 const PERMIT_TIMEOUT_LABEL_VALUE: &str = "PermitTimeout";
 /// Refused by the per-connection ceiling, before any wait for a stream permit.
@@ -115,14 +113,6 @@ pub struct AdmissionLimits {
     pub permit_timeout: Option<Duration>,
 }
 
-struct StreamHandlerInstrumentProvider;
-
-impl InstrumentProvider for StreamHandlerInstrumentProvider {
-    fn namespace(&self) -> &'static str {
-        "urc.quic.stream_handler"
-    }
-}
-
 pub struct StreamHandler<ServiceType>
 where
     ServiceType: QuicService,
@@ -142,9 +132,9 @@ where
     /// Clamped at construction to no more than [`StreamHandler::handler_duration_timeout`], so a
     /// short request deadline wins over the permit budget.
     permit_acquire_timeout: Duration,
-    latency_histogram: Histogram<f64>,
-    peak_pending_chunks_histogram: Histogram<u64>,
-    pending_chunk_stall_histogram: Histogram<u64>,
+
+    service_metrics: async_channel::Sender<ServiceMetricEvent>,
+    stream_metrics: async_channel::Sender<StreamMetricEvent>,
 }
 
 impl<ServiceType> StreamHandler<ServiceType>
@@ -156,22 +146,17 @@ where
         context: Arc<AttributeMap>,
         limits: AdmissionLimits,
     ) -> Self {
-        let provider = StreamHandlerInstrumentProvider;
-        let latency_histogram =
-            provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME);
-        let peak_pending_chunks_histogram = provider.length_histogram(
-            "stream.peak_pending_chunks",
-            vec![
-                1., 5., 10., 25., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 25_000.,
-                50_000., 100_000.,
-            ],
+        let (service_metrics, service_metrics_receiver) =
+            async_channel::bounded(METRIC_EVENTS_BUFFER);
+        let (stream_metrics, stream_metrics_receiver) =
+            async_channel::bounded(METRIC_EVENTS_BUFFER);
+        observe_connection(
+            service_metrics_receiver,
+            stream_metrics_receiver,
+            service.clone(),
+            context.clone(),
         );
-        let pending_chunk_stall_histogram = provider.length_histogram(
-            "stream.peak_pending_chunk_stall_duration",
-            vec![
-                1., 5., 10., 25., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000.,
-            ],
-        );
+
         let handler_duration_timeout = limits.handler_timeout.unwrap_or(DEFAULT_HANDLER_TIMEOUT);
         Self {
             service,
@@ -184,9 +169,8 @@ where
                 .permit_timeout
                 .unwrap_or(DEFAULT_PERMIT_ACQUIRE_TIMEOUT)
                 .min(handler_duration_timeout),
-            latency_histogram,
-            peak_pending_chunks_histogram,
-            pending_chunk_stall_histogram,
+            service_metrics,
+            stream_metrics,
         }
     }
 
@@ -243,25 +227,17 @@ where
             warn!(reason, error = %err, "Failed sending rejection response");
         }
 
-        self.latency_histogram.record(
-            waited.as_millis() as f64,
-            // QUIC is high throughput, and we want to keep memory allocations to a minimum.
-            // We specifically don't use get_labels from the Instrument Provider as that
-            // would involve multiple allocations to combine arrays of labels together
-            &[
-                KeyValue::new(SERVICE_LABEL_KEY, self.service.get_service_name_label()),
-                KeyValue::new(
-                    OPCODE_LABEL_KEY,
-                    self.service.command_to_metrics_label(header.cmd),
-                ),
-                KeyValue::new("success", false),
-                KeyValue::new(HANDLER_ERROR_LABEL_KEY, reason),
-                KeyValue::new(
-                    HANDLER_ERROR_CLASSIFICATION_LABEL_KEY,
-                    HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE,
-                ),
-            ],
-        );
+        let _ = self
+            .service_metrics
+            .try_send(ServiceMetricEvent::MessageHandling(MessageHandling {
+                elapsed: waited,
+                opcode: header.cmd,
+                error_info: Some(MessageFailure {
+                    classification: HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE,
+                    error_label: reason,
+                }),
+            }))
+            .inspect_err(|err| error!(?err, "failed to send service reject metric"));
     }
 
     /// Take a permit from `limiter`, waiting up to `permit_acquire_timeout` when none is free.
@@ -327,7 +303,7 @@ where
         };
 
         let context = self.context.clone();
-        let histogram = self.latency_histogram.clone();
+        let metrics_sender = self.service_metrics.clone();
         let service = self.service.clone();
         let request_span = service.build_request_span(&header, &message, &context);
         let fut = Box::pin(async move {
@@ -348,45 +324,17 @@ where
                 } => result
             };
 
-            let is_handler_successful;
-            let handler_error_label_value;
-            let error_classification_label;
-            if let Err(err) = &result {
-                is_handler_successful = false;
-                handler_error_label_value = err.message_handle_label;
-                error_classification_label = if err.is_internal_error {
-                    HANDLE_MESSAGE_INTERNAL_ERROR_LABEL_VALUE
-                } else {
-                    HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE
-                };
+            let error_info = if let Err(err) = &result {
+                Some(MessageFailure {
+                    classification: if err.is_internal_error {
+                        HANDLE_MESSAGE_INTERNAL_ERROR_LABEL_VALUE
+                    } else {
+                        HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE
+                    },
+                    error_label: err.message_handle_label,
+                })
             } else {
-                is_handler_successful = true;
-                handler_error_label_value = "";
-                error_classification_label = "";
-            }
-
-            // QUIC is high throughput, and we want to keep memory allocations to a minimum.
-            // We specifically don't use get_labels from the Instrument Provider as that
-            // would involve multiple allocations to combine arrays of labels together
-            let labels = [
-                KeyValue::new(SERVICE_LABEL_KEY, service.get_service_name_label()),
-                create_operation_context_attribute("handle_message"),
-                KeyValue::new(
-                    OPCODE_LABEL_KEY,
-                    service.command_to_metrics_label(header.cmd),
-                ),
-                KeyValue::new("success", is_handler_successful),
-                // keep error labels below this comment and exclude via count
-                KeyValue::new(
-                    HANDLER_ERROR_CLASSIFICATION_LABEL_KEY,
-                    error_classification_label,
-                ),
-                KeyValue::new(HANDLER_ERROR_LABEL_KEY, handler_error_label_value),
-            ];
-            let label_count = if is_handler_successful {
-                labels.len() - 2
-            } else {
-                labels.len()
+                None
             };
 
             let result = match result {
@@ -429,12 +377,16 @@ where
                 }
             }
 
-            // We can't use the `timed!` macro because we're just firing this off as a task without
-            // awaiting the result
-            histogram.record(elapsed.as_millis() as f64, &labels[..label_count]);
-
             drop(permit);
             drop(admission);
+
+            let _ = metrics_sender
+                .try_send(ServiceMetricEvent::MessageHandling(MessageHandling {
+                    elapsed,
+                    opcode: header.cmd,
+                    error_info,
+                }))
+                .inspect_err(|err| error!(?err, "failed to send service handle metric"));
         });
         // The transport-to-handler boundary: everything above this point runs on
         // net, and request processing must not. Pinned rather than `lore_spawn!`,
@@ -553,6 +505,9 @@ where
         send: SendStream,
     ) -> Result<(), StreamHandlerError> {
         debug!("Handling stream");
+
+        let mut stream_metrics = StreamMetricSender::new(self.stream_metrics.clone());
+
         let mut request = CommandHeader::default();
         let mut payload: Option<bytes::BytesMut> = None;
 
@@ -563,14 +518,6 @@ where
         let mut current_offset = 0u64;
         let mut next_chunk: Option<quinn::Chunk> = None;
         let mut pending_chunks = vec![];
-
-        let labels = [KeyValue::new(
-            SERVICE_LABEL_KEY,
-            self.service.get_service_name_label(),
-        )];
-        let mut peak_pending = DropRecord::new(self.peak_pending_chunks_histogram.clone(), &labels);
-        let mut max_pending: usize = 0;
-        let mut peak_stall = DropRecord::new(self.pending_chunk_stall_histogram.clone(), &labels);
         let mut stall_start = Instant::now();
 
         let send = Arc::new(Mutex::new(send));
@@ -711,10 +658,7 @@ where
                     stall_start = Instant::now();
                 }
                 pending_chunks.push(chunk);
-                if pending_chunks.len() > max_pending {
-                    peak_pending.add((pending_chunks.len() - max_pending) as u64);
-                    max_pending = pending_chunks.len();
-                }
+                stream_metrics.pending_chunks(pending_chunks.len());
             }
 
             for (ichunk, chunk) in pending_chunks.iter().enumerate() {
@@ -725,10 +669,7 @@ where
                     );
                     next_chunk = Some(pending_chunks.swap_remove(ichunk));
                     if pending_chunks.is_empty() {
-                        let stall_ms = stall_start.elapsed().as_millis() as u64;
-                        if stall_ms > peak_stall.get() {
-                            peak_stall.set(stall_ms);
-                        }
+                        stream_metrics.chunk_stall(stall_start.elapsed());
                     }
                     break;
                 }

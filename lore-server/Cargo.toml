@@ -9,6 +9,7 @@ autobins = false
 
 [dependencies]
 anyhow = { workspace = true }
+async-channel = { workspace = true }
 async-stream = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }

@@ -26,6 +26,7 @@ pub mod replication_store_service;
 pub mod storage_service;
 pub mod storage_service_v4;
 pub mod stream_handler;
+mod stream_observer;
 
 #[derive(Error, Debug)]
 pub enum StreamHandlerError {
