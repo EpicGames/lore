@@ -147,13 +147,12 @@ typedef enum lore_revision_resolve_target_t {
   LORE_REVISION_RESOLVE_TARGET_SIGNATURE = 3,
 } lore_revision_resolve_target_t;
 
-// Small discriminator enum for per-item terminal events in the
-// content-addressed storage API.
+// Small discriminator enum for the per-item terminal events of the revision-tree API.
 //
-// Narrower than the general library error code — events emitted per
-// put/get/copy/etc. item embed this code so a caller can branch on the
-// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-// detail.
+// Narrower than the general library error code: an event embeds this so a caller can branch on
+// the common cases cheaply, without reading a message. The cost is that it names only five
+// outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
+// [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
 //
 // The values are the error codes themselves, taken from the registry in
 // `lore_base::error`, so a code read from a per-item event means the same
@@ -2606,24 +2605,24 @@ typedef struct lore_storage_opened_event_data_t {
 } lore_storage_opened_event_data_t;
 
 // Terminal per-item event for `put`, `put_file`, `put_resolved` and
-// `put_file_resolved`. On success `error_code == None` and `address` is the
+// `put_file_resolved`. On success `error.error_code == 0` and `address` is the
 // computed content hash — for the resolved variants, the content the key now
-// resolves to; on failure `error_code` is populated and `address` is zero.
+// resolves to; on failure `error` is populated and `address` is zero.
 typedef struct lore_storage_put_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
   // The computed content address of the stored item.
   struct lore_address_t address;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
-  // Non-zero when the local store holds the content. Appended after the original three
-  // fields, so a consumer reading only those is unaffected — `serde(default)` lets an older
-  // payload that lacks the field deserialize, as events cross the IPC boundary.
+  struct lore_error_detail_t error;
+  // Non-zero when the local store holds the content. Trailing, so a payload that lacks it still
+  // decodes: the IPC wire format is non-self-describing, where only a missing trailing field is
+  // recoverable.
   uint8_t stored_local;
   // Non-zero when the content reached the remote, or was already durable there. A remote
-  // write that fails still reports `error_code = NONE` if the local write succeeded — this is
-  // how a caller tells the two apart. For fragmented content it is the intersection across
-  // every fragment, so it is set only when the whole tree is remote.
+  // write that fails still reports success if the local write succeeded — this is how a
+  // caller tells the two apart. For fragmented content it is the intersection across every
+  // fragment, so it is set only when the whole tree is remote.
   uint8_t stored_remote;
 } lore_storage_put_item_complete_event_data_t;
 
@@ -2673,14 +2672,13 @@ typedef struct lore_storage_get_item_complete_event_data_t {
   // The content address of the item.
   struct lore_address_t address;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_get_item_complete_event_data_t;
 
-// Terminal per-item event for `get_metadata`. On success `fragment` is
-// valid and `error_code == None`; on miss `error_code == ADDRESS_NOT_FOUND`.
-// Mirrors `LoreStorageGetItemCompleteEventData`'s shape minus the absence of
-// any preceding `GET_HEADER` / `GET_DATA` events — `get_metadata` carries no
-// payload bytes.
+// Terminal per-item event for `get_metadata`. On success `fragment` is valid and
+// `error.error_code == 0`; on miss `error` carries the address-not-found error. Mirrors
+// `LoreStorageGetItemCompleteEventData`'s shape minus the absence of any preceding
+// `GET_HEADER` / `GET_DATA` events — `get_metadata` carries no payload bytes.
 typedef struct lore_storage_get_metadata_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
@@ -2689,7 +2687,7 @@ typedef struct lore_storage_get_metadata_item_complete_event_data_t {
   // The metadata fragment for the item.
   struct lore_fragment_t fragment;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_get_metadata_item_complete_event_data_t;
 
 // Terminal per-item event for `copy`. `source_partition` /
@@ -2709,15 +2707,14 @@ typedef struct lore_storage_copy_item_complete_event_data_t {
   // The context of the item in the target.
   struct lore_context_t target_context;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_copy_item_complete_event_data_t;
 
 // Terminal per-item event for `obliterate`. `local_success` / `remote_success` report
 // whether the corresponding side completed without error. `local_skipped` / `remote_skipped`
 // report whether the corresponding side was suppressed up front by the handle's bound flags
 // (`globals.offline`/`local`/`remote`) — when a side is skipped, its `_success` flag is `0`
-// rather than a misleading `1`. `error_code` is populated if either side that DID run
-// failed.
+// rather than a misleading `1`. `error` is populated if either side that DID run failed.
 typedef struct lore_storage_obliterate_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
@@ -2732,7 +2729,7 @@ typedef struct lore_storage_obliterate_item_complete_event_data_t {
   // 1 when the remote side was skipped.
   uint8_t remote_skipped;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_obliterate_item_complete_event_data_t;
 
 // Terminal per-item event for `upload`. `already_durable` is 1 when the
@@ -2745,7 +2742,7 @@ typedef struct lore_storage_upload_item_complete_event_data_t {
   // 1 when the item was already durable and no upload was performed.
   uint8_t already_durable;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_upload_item_complete_event_data_t;
 
 // Delivered on successful `lore_revision_tree_load`. Carries the registry
@@ -3001,36 +2998,37 @@ typedef struct lore_revision_tree_info_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_info_event_data_t;
 
-// Terminal per-item event for `mutable_load`. On success `error_code == None` and `value` is
-// the loaded value hash (`Hash::default()` when the key holds a null/removed value); on miss
-// `error_code == ADDRESS_NOT_FOUND` and `value` is zero.
+// Terminal per-item event for `mutable_load`. On success `error.error_code == 0` and `value`
+// is the loaded value hash (`Hash::default()` when the key holds a null/removed value); on
+// miss `error` carries the miss the answering backend raised — `AddressNotFound` from a local
+// store, `NotFound` from a remote one — and `value` is zero.
 typedef struct lore_storage_mutable_load_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
   // The value stored for the key.
   struct lore_hash_t value;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_mutable_load_item_complete_event_data_t;
 
-// Terminal per-item event for `mutable_store`. `error_code == None` on a successful store.
+// Terminal per-item event for `mutable_store`. `error.error_code == 0` on a successful store.
 typedef struct lore_storage_mutable_store_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_mutable_store_item_complete_event_data_t;
 
 // Terminal per-item event for `mutable_compare_and_swap`. `previous` is the value the key held
 // before the swap (equal to the caller's `expected` when the swap took effect, otherwise the
-// actual current value). `error_code == None` on success.
+// actual current value). `error.error_code == 0` on success.
 typedef struct lore_storage_mutable_compare_and_swap_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
   // The value the key held before the swap.
   struct lore_hash_t previous;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_mutable_compare_and_swap_item_complete_event_data_t;
 
 // One `(key, value)` pair emitted by `mutable_list`, before the item's terminal event.
@@ -3044,12 +3042,12 @@ typedef struct lore_storage_mutable_list_entry_event_data_t {
 } lore_storage_mutable_list_entry_event_data_t;
 
 // Terminal per-item event for `mutable_list`, emitted after every `MUTABLE_LIST_ENTRY` for the
-// item. `error_code == None` once the listing completes.
+// item. `error.error_code == 0` once the listing completes.
 typedef struct lore_storage_mutable_list_item_complete_event_data_t {
   // Correlation id of the listing item.
   uint64_t id;
   // The outcome for the item.
-  enum lore_error_code_t error_code;
+  struct lore_error_detail_t error;
 } lore_storage_mutable_list_item_complete_event_data_t;
 
 // Data for the start of a store eviction pass.
@@ -5149,7 +5147,7 @@ typedef struct lore_storage_get_item_t {
   // selects `GET_DATA` delivery.
   //
   // The capacity is the limit: a range exceeding it fails the item with
-  // `LORE_ERROR_CODE_INVALID_ARGUMENTS` rather than truncating. `GET_HEADER` reports the whole
+  // `Oversized` rather than truncating. `GET_HEADER` reports the whole
   // content's size, which with `offset` and `length` gives the bytes written; no `GET_DATA`
   // follows, and `streaming` is ignored. The buffer holds unspecified bytes when the item fails.
   struct lore_bytes_mut_t data_out;
@@ -5197,7 +5195,7 @@ typedef struct lore_storage_get_resolved_item_t {
   // `GET_DATA` delivery.
   //
   // The capacity is the limit: content exceeding it fails the item with
-  // `LORE_ERROR_CODE_INVALID_ARGUMENTS` rather than truncating. `GET_HEADER` reports the content
+  // `Oversized` rather than truncating. `GET_HEADER` reports the content
   // size, no `GET_DATA` follows, and `streaming` is ignored. The buffer holds unspecified bytes
   // when the item fails.
   struct lore_bytes_mut_t data_out;

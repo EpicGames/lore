@@ -8,7 +8,7 @@
 //! backend: the default and `globals.local`/`globals.offline` act on the handle's local mutable
 //! store; `globals.remote` (or a remote-bound handle) acts on the remote store over the shared
 //! storage session. Each item resolves to one terminal
-//! `MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE` carrying `{id, previous, error_code}`; the swap took
+//! `MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE` carrying `{id, previous, error}`; the swap took
 //! effect when `previous == expected`.
 
 use std::sync::Arc;
@@ -20,12 +20,10 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::store::event::LoreStorageMutableCompareAndSwapItemCompleteEventData;
+use lore_storage::StorageError;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -34,6 +32,8 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
+use crate::storage::item_detail;
 use crate::storage::store::EffectiveFlags;
 use crate::storage::store::StoreInternal;
 
@@ -66,24 +66,6 @@ pub struct LoreStorageMutableCompareAndSwapArgs {
     pub items: LoreArray<LoreStorageMutableCompareAndSwapItem>,
 }
 
-#[error_set]
-enum MutableCompareAndSwapError {
-    InvalidArguments,
-}
-
-impl EventError for MutableCompareAndSwapError {
-    fn translated(&self) -> LoreError {
-        match self {
-            MutableCompareAndSwapError::InvalidArguments(_) => LoreError::InvalidArguments,
-            MutableCompareAndSwapError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Conditionally swap one or more mutable key values.
 pub async fn mutable_compare_and_swap(
     globals: LoreGlobalArgs,
@@ -109,11 +91,11 @@ async fn mutable_compare_and_swap_impl(
         async move |store, args| {
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), MutableCompareAndSwapError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
             if effective.no_local && store.remote.is_none() {
-                return Err(MutableCompareAndSwapError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason:
                         "remote mutable_compare_and_swap requires a handle opened with `remote_config`"
                             .into(),
@@ -138,24 +120,34 @@ async fn swap_item(
     item: &LoreStorageMutableCompareAndSwapItem,
     effective: EffectiveFlags,
     session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
+) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
-        return emit_complete(item, Hash::default(), LoreErrorCode::InvalidArguments);
+        return emit_complete(
+            item,
+            Hash::default(),
+            Err(invalid_item("item names the default partition")),
+        );
     }
 
     if effective.no_local {
         let Some(session) = session else {
-            return emit_complete(item, Hash::default(), LoreErrorCode::Internal);
+            return emit_complete(
+                item,
+                Hash::default(),
+                Err(StorageError::internal(
+                    "remote-only compare-and-swap with no session on the handle",
+                )),
+            );
         };
         match session
             .mutable_compare_and_swap(item.key, item.expected, item.value, item.key_type)
             .await
         {
-            Ok(previous) => emit_complete(item, previous, LoreErrorCode::None),
+            Ok(previous) => emit_complete(item, previous, Ok(())),
             Err(err) => emit_complete(
                 item,
                 Hash::default(),
-                crate::storage::protocol_error_to_code(&err),
+                Err(err).forward("swapping the mutable key on the remote"),
             ),
         }
     } else {
@@ -171,24 +163,23 @@ async fn swap_item(
             )
             .await
         {
-            Ok(previous) => emit_complete(item, previous, LoreErrorCode::None),
+            Ok(previous) => emit_complete(item, previous, Ok(())),
             Err(err) => emit_complete(
                 item,
                 Hash::default(),
-                crate::storage::store_error_to_code(&err),
+                Err(err).forward("swapping the mutable key"),
             ),
         }
     }
 }
 
-/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
-/// `return emit_complete(..)` directly.
+/// Emit the item's terminal event and return the outcome that was sent.
 fn emit_complete(
     item: &LoreStorageMutableCompareAndSwapItem,
     previous: Hash,
-    error_code: LoreErrorCode,
-) -> LoreErrorCode {
-    let previous = if error_code == LoreErrorCode::None {
+    result: Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let previous = if result.is_ok() {
         previous
     } else {
         Hash::default()
@@ -197,9 +188,9 @@ fn emit_complete(
         LoreStorageMutableCompareAndSwapItemCompleteEventData {
             id: item.id,
             previous,
-            error_code,
+            error: item_detail(&result),
         },
     )
     .send();
-    error_code
+    result
 }

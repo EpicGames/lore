@@ -5,6 +5,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ## Nightly
 
+### Breaking changes
+
+- C API: every storage `*_ITEM_COMPLETE` event replaces `error_code` with an `error` detail carrying the failure's own FFI code, message and trace, as `Complete` already did, and the call's `status` becomes the dominant item failure's code. Re-check any branch on a per-item code: a missing payload reports `PayloadNotFound` (81) rather than `AddressNotFound` (80), a buffer short of the content reports `Oversized` (118) rather than `InvalidArguments` (3), and most failures previously reported as `Internal` now report their own code. The structs grow and are no longer trivially copyable, so copy the detail's strings before the callback returns and rebuild against the new `lore.h`. The revision-tree per-item events are unchanged: they still carry `error_code` as a `lore_error_code_t`, so the five-value folding still applies to them, and moving them to a detail will need a second rebuild in a later release
+
 ### Fixes & Improvements
 
 - Fix a moved file being deleted when the change that moves it is realized over a working tree that already holds it, which is what re-running an interrupted `lore sync` does. The rename finds nothing at the source it was already carried from, and the recovery that follows removed the destination and then skipped rewriting it, because whether the content was in place was inferred from the view filter rather than read from the rename. It is now read from the rename, so a move whose source is not there is written from the store, and one the rename carried is left alone

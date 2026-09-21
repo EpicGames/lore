@@ -15,7 +15,7 @@
 //!   untouched. There is no zero-hash truncation as in `lore_storage_get_file`: a resolve that
 //!   finds nothing is a miss, not an address for empty content.
 //! - `offset` past the end of the content → `INVALID_ARGUMENTS`, with `path` left untouched.
-//! - file write failure → `INTERNAL`.
+//! - a file write failure reports its own error, `INTERNAL` where the filesystem gave no code.
 //!
 //! Ranges and temp-file staging behave as in `lore_storage_get_file`. Only the terminal
 //! `GET_ITEM_COMPLETE` is emitted, and its `address` is the *resolved* address, so a caller still
@@ -27,21 +27,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
-use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::read::read_resolved_into_file;
 use lore_transport::quic::storage_service::get_resolved_flags;
 use serde::Deserialize;
@@ -52,6 +48,9 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
+use crate::storage::item_detail;
+use crate::storage::offset_past_end;
 use crate::storage::store::StoreInternal;
 
 /// One `get_file_resolved` item — the mutable key to resolve and the file to write the content it
@@ -108,24 +107,6 @@ pub struct LoreStorageGetFileResolvedArgs {
     pub items: LoreArray<LoreStorageGetFileResolvedItem>,
 }
 
-#[error_set]
-enum GetFileResolvedError {
-    InvalidArguments,
-}
-
-impl EventError for GetFileResolvedError {
-    fn translated(&self) -> LoreError {
-        match self {
-            GetFileResolvedError::InvalidArguments(_) => LoreError::InvalidArguments,
-            GetFileResolvedError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Resolve one or more mutable keys and write the content they name to filesystem paths.
 pub async fn get_file_resolved(
     globals: LoreGlobalArgs,
@@ -151,7 +132,7 @@ async fn get_file_resolved_local(
         async move |store, args| {
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), GetFileResolvedError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
@@ -171,19 +152,18 @@ async fn get_file_resolved_item(
     item: &LoreStorageGetFileResolvedItem,
     effective: crate::storage::store::EffectiveFlags,
     session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
-    let (address, error_code) =
-        resolve_get_file_resolved_item(store, item, effective, session).await;
+) -> Result<(), StorageError> {
+    let (address, result) = resolve_get_file_resolved_item(store, item, effective, session).await;
     LoreEvent::StorageGetItemComplete(LoreStorageGetItemCompleteEventData {
         id: item.id,
         address,
-        error_code,
+        error: item_detail(&result),
     })
     .send();
-    error_code
+    result
 }
 
-/// Resolve and write one item. Reports the resolved address alongside the code, because unlike
+/// Resolve and write one item. Reports the resolved address alongside the outcome, because unlike
 /// `get_file` the address is an *output* here — the caller supplied a key, not a hash — and a
 /// failure has none to report.
 ///
@@ -195,16 +175,25 @@ async fn resolve_get_file_resolved_item(
     item: &LoreStorageGetFileResolvedItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> (Address, LoreErrorCode) {
+) -> (Address, Result<(), StorageError>) {
     if item.partition == Partition::default() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            Err(invalid_item("item names the default partition")),
+        );
     }
     if item.key == Hash::default() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            Err(invalid_item("item names the zero key")),
+        );
     }
     let path_str = item.path.as_str();
     if path_str.is_empty() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            Err(invalid_item("item has an empty path")),
+        );
     }
 
     let mut read_options = effective.read_options(remote_session.is_some());
@@ -227,19 +216,17 @@ async fn resolve_get_file_resolved_item(
     )
     .await
     {
-        Ok((_, fragment)) if item.offset > fragment.size_content => {
-            (Address::default(), LoreErrorCode::InvalidArguments)
-        }
+        Ok((_, fragment)) if item.offset > fragment.size_content => (
+            Address::default(),
+            Err(offset_past_end(item.offset, fragment.size_content)),
+        ),
         Ok((resolved, _)) => (
             Address {
                 hash: resolved,
                 context: item.context,
             },
-            LoreErrorCode::None,
+            Ok(()),
         ),
-        Err(err) => (
-            Address::default(),
-            crate::storage::storage_error_to_code(&err),
-        ),
+        Err(err) => (Address::default(), Err(err)),
     }
 }

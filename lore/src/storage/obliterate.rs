@@ -4,7 +4,7 @@
 //!
 //! Each item drives `ImmutableStore::obliterate` locally and, when the handle has a remote,
 //! the transport's `Admin::obliterate` in parallel. The two sides report independently into
-//! `local_success` / `remote_success` on `OBLITERATE_ITEM_COMPLETE`; `error_code` is set when
+//! `local_success` / `remote_success` on `OBLITERATE_ITEM_COMPLETE`; `error` is set when
 //! either side fails. With no remote configured, `remote_success=1` reflects "no remote was
 //! consulted, treat as no-op success".
 //!
@@ -14,18 +14,15 @@
 
 use std::sync::Arc;
 
-use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::store::event::LoreStorageObliterateItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::store_types::StoreObliterateStats;
 use lore_transport::ProtocolError;
 use serde::Deserialize;
@@ -36,6 +33,8 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
+use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One obliterate item — the `(partition, address)` to delete.
@@ -59,24 +58,6 @@ pub struct LoreStorageObliterateArgs {
     pub handle: LoreStore,
     /// Addresses to delete; each runs independently and emits its own `OBLITERATE_ITEM_COMPLETE`
     pub items: LoreArray<LoreStorageObliterateItem>,
-}
-
-#[error_set]
-enum ObliterateError {
-    InvalidArguments,
-}
-
-impl EventError for ObliterateError {
-    fn translated(&self) -> LoreError {
-        match self {
-            ObliterateError::InvalidArguments(_) => LoreError::InvalidArguments,
-            ObliterateError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Delete one or more `(partition, address)` entries.
@@ -104,7 +85,7 @@ async fn obliterate_local(
         async move |store, args| {
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), ObliterateError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
 
@@ -124,7 +105,17 @@ async fn obliterate_local(
 enum LegOutcome {
     Success,
     Skipped,
-    Failed(LoreErrorCode),
+    Failed(StorageError),
+}
+
+impl LegOutcome {
+    /// The error this leg failed with. A skipped leg reports none: it ran no work to fail.
+    fn failure(self) -> Option<StorageError> {
+        match self {
+            LegOutcome::Failed(err) => Some(err),
+            LegOutcome::Success | LegOutcome::Skipped => None,
+        }
+    }
 }
 
 /// Resolve one obliterate item. With no remote configured the remote side is reported as
@@ -138,13 +129,12 @@ async fn obliterate_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageObliterateItem,
     effective: crate::storage::store::EffectiveFlags,
-) -> LoreErrorCode {
+) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
         return emit_complete(
             item,
-            LegOutcome::Failed(LoreErrorCode::InvalidArguments),
+            LegOutcome::Failed(invalid_item("item names the default partition")),
             LegOutcome::Skipped,
-            LoreErrorCode::InvalidArguments,
         );
     }
 
@@ -154,16 +144,19 @@ async fn obliterate_item(
             return LegOutcome::Skipped;
         }
         let stats = Arc::new(StoreObliterateStats::default());
-        match store_for_local
+        let obliterated = store_for_local
             .immutable
             .clone()
             .obliterate(item.partition, item.address, stats)
-            .await
-        {
+            .await;
+        // Idempotent: an absent address is success.
+        let obliterated = match obliterated {
+            Err(err) if err.is_address_not_found() => Ok(()),
+            outcome => outcome,
+        };
+        match obliterated.forward::<StorageError>("obliterating the local payload") {
             Ok(()) => LegOutcome::Success,
-            // Idempotent: absent address is success.
-            Err(err) if err.is_address_not_found() => LegOutcome::Success,
-            Err(err) => LegOutcome::Failed(crate::storage::store_error_to_code(&err)),
+            Err(err) => LegOutcome::Failed(err),
         }
     };
 
@@ -179,47 +172,47 @@ async fn obliterate_item(
         let admin = match remote.admin(item.partition).await {
             Ok(admin) => admin,
             Err(err) => {
-                let storage_err = lore_storage::error::protocol_error_to_storage(err, item.address);
-                return LegOutcome::Failed(crate::storage::storage_error_to_code(&storage_err));
+                return LegOutcome::Failed(lore_storage::error::protocol_error_to_storage(
+                    err,
+                    item.address,
+                ));
             }
         };
         match admin.obliterate(item.address).await {
             Ok(()) | Err(ProtocolError::NotFound(_)) => LegOutcome::Success,
             Err(err) => {
                 let storage_err = lore_storage::error::protocol_error_to_storage(err, item.address);
+                // Idempotent: an absent address is success.
                 if storage_err.is_address_not_found() {
                     LegOutcome::Success
                 } else {
-                    LegOutcome::Failed(crate::storage::storage_error_to_code(&storage_err))
+                    LegOutcome::Failed(storage_err)
                 }
             }
         }
     };
 
     let (local_outcome, remote_outcome) = tokio::join!(local_fut, remote_fut);
-
-    // Local errors win on tie because they're usually the more actionable signal (disk full,
-    // lock contention) compared to typically-transient remote ones.
-    let error_code = match (&local_outcome, &remote_outcome) {
-        (LegOutcome::Failed(code), _) | (_, LegOutcome::Failed(code)) => *code,
-        _ => LoreErrorCode::None,
-    };
-    emit_complete(item, local_outcome, remote_outcome, error_code)
+    emit_complete(item, local_outcome, remote_outcome)
 }
 
-/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
-/// `return emit_complete(..)` directly.
+/// Emit the item's terminal event and return the outcome that was sent.
 fn emit_complete(
     item: &LoreStorageObliterateItem,
     local: LegOutcome,
     remote: LegOutcome,
-    error_code: LoreErrorCode,
-) -> LoreErrorCode {
+) -> Result<(), StorageError> {
     let local_success = u8::from(matches!(local, LegOutcome::Success));
     let local_skipped = u8::from(matches!(local, LegOutcome::Skipped));
     let remote_success = u8::from(matches!(remote, LegOutcome::Success));
     let remote_skipped = u8::from(matches!(remote, LegOutcome::Skipped));
-    let address = if error_code == LoreErrorCode::None {
+    // A local error wins over a remote one because it is usually the more actionable signal
+    // (disk full, lock contention) against a typically transient remote one.
+    let result = local
+        .failure()
+        .or_else(|| remote.failure())
+        .map_or(Ok(()), Err);
+    let address = if result.is_ok() {
         item.address
     } else {
         Address::default()
@@ -231,8 +224,8 @@ fn emit_complete(
         remote_success,
         local_skipped,
         remote_skipped,
-        error_code,
+        error: item_detail(&result),
     })
     .send();
-    error_code
+    result
 }

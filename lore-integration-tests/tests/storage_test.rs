@@ -15,7 +15,6 @@ mod imports {
     use lore_base::types::Hash;
     use lore_base::types::Partition;
     use lore_revision::event::LoreBytes;
-    use lore_revision::event::LoreErrorCode;
     use lore_storage::StoreError;
     use lore_storage::store_types::StoreMatch;
 }
@@ -414,15 +413,12 @@ mod open_tests {
 
         let events = sink.lock().unwrap().clone();
         let complete = events.iter().find_map(|e| match e {
-            LoreEvent::StoragePutItemComplete(data) => Some(*data),
+            LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
             _ => None,
         });
         let complete = complete.expect("expected PUT_ITEM_COMPLETE event");
         assert_eq!(complete.id, 42);
-        assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::None,
-        );
+        assert_eq!(complete.error.error_code, 0,);
         // Address hash matches the content hash; context is preserved.
         let expected_hash = lore_storage::hash::hash_slice(b"hello, storage put");
         assert_eq!(complete.address.hash, expected_hash);
@@ -476,15 +472,12 @@ mod open_tests {
         let complete = events
             .iter()
             .find_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .expect("expected PUT_ITEM_COMPLETE");
         assert_eq!(complete.id, 7);
-        assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(complete.error.error_code, 0);
         assert_eq!(complete.address.hash, Hash::default());
         assert_eq!(complete.address.context, context);
     }
@@ -554,7 +547,7 @@ mod open_tests {
         let completes: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .collect();
@@ -562,10 +555,10 @@ mod open_tests {
         let item_1 = completes.iter().find(|c| c.id == 1).unwrap();
         let item_2 = completes.iter().find(|c| c.id == 2).unwrap();
         assert_eq!(
-            item_1.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments,
+            item_1.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE,
         );
-        assert_eq!(item_2.error_code, lore_revision::event::LoreErrorCode::None,);
+        assert_eq!(item_2.error.error_code, 0,);
     }
 
     #[tokio::test]
@@ -647,14 +640,14 @@ mod open_tests {
         let complete = events
             .iter()
             .find_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .expect("expected PUT_ITEM_COMPLETE");
         assert_eq!(complete.id, 99);
         assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments,
+            complete.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE,
         );
     }
 
@@ -720,15 +713,15 @@ mod open_tests {
         let completes: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(data) => Some(*data),
+                LoreEvent::StoragePutItemComplete(data) => Some(data.clone()),
                 _ => None,
             })
             .collect();
         assert_eq!(completes.len(), 2, "every item must emit PUT_ITEM_COMPLETE");
         for c in &completes {
             assert_eq!(
-                c.error_code,
-                lore_revision::event::LoreErrorCode::InvalidArguments,
+                c.error.error_code,
+                lore_base::error::InvalidArguments::FFI_CODE,
             );
         }
     }
@@ -785,7 +778,10 @@ mod open_tests {
         ItemComplete {
             id: u64,
             address: lore_base::types::Address,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
+            /// The failing error's own message, empty on success. Captured so a test can assert
+            /// that a failing item is diagnosable from its event alone.
+            message: String,
         },
         Error,
         Complete(i32),
@@ -821,7 +817,8 @@ mod open_tests {
                 LoreEvent::StorageGetItemComplete(d) => GetCaptured::ItemComplete {
                     id: d.id,
                     address: d.address,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
+                    message: d.error.message.as_str().to_string(),
                 },
                 LoreEvent::Error(_) => GetCaptured::Error,
                 LoreEvent::Complete(d) => GetCaptured::Complete(d.status),
@@ -951,15 +948,13 @@ mod open_tests {
                     id,
                     error_code,
                     address,
+                    ..
                 } => Some((*id, *error_code, *address)),
                 _ => None,
             })
             .expect("expected GET_ITEM_COMPLETE");
         assert_eq!(complete.0, 5);
-        assert_eq!(
-            complete.1,
-            lore_revision::event::LoreErrorCode::InvalidArguments,
-        );
+        assert_eq!(complete.1, lore_base::error::InvalidArguments::FFI_CODE,);
         // Errored items carry zero address.
         assert_eq!(complete.2, Address::default());
     }
@@ -1026,10 +1021,7 @@ mod open_tests {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
         });
-        assert_eq!(
-            complete,
-            Some((12, lore_revision::event::LoreErrorCode::None)),
-        );
+        assert_eq!(complete, Some((12, 0)),);
     }
 
     #[tokio::test]
@@ -1072,7 +1064,7 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
 
         let events = sink.lock().unwrap().clone();
         // No HEADER or DATA must appear for the missed read.
@@ -1093,16 +1085,21 @@ mod open_tests {
                     id,
                     error_code,
                     address,
-                } => Some((*id, *error_code, *address)),
+                    message,
+                } => Some((*id, *error_code, *address, message.clone())),
                 _ => None,
             })
             .expect("expected GET_ITEM_COMPLETE");
         assert_eq!(complete.0, 77);
-        assert_eq!(
-            complete.1,
-            lore_revision::event::LoreErrorCode::AddressNotFound,
-        );
+        assert_eq!(complete.1, lore_base::error::AddressNotFound::FFI_CODE,);
         assert_eq!(complete.2, Address::default());
+        // The point of carrying a detail rather than a code: the item event alone says what
+        // failed, with no companion event and no server log to consult.
+        assert!(
+            !complete.3.is_empty(),
+            "a failing item must carry its error's message, got {:?}",
+            complete.3
+        );
     }
 
     #[tokio::test]
@@ -1227,10 +1224,11 @@ mod open_tests {
             id,
             error_code,
             address: c_addr,
+            ..
         } = &events[complete_ix]
         {
             assert_eq!(*id, 100);
-            assert_eq!(*error_code, lore_revision::event::LoreErrorCode::None);
+            assert_eq!(*error_code, 0);
             assert_eq!(*c_addr, address);
         }
     }
@@ -1301,7 +1299,7 @@ mod open_tests {
                 e,
                 GetCaptured::ItemComplete {
                     id: 200,
-                    error_code: lore_revision::event::LoreErrorCode::None,
+                    error_code: 0,
                     ..
                 }
             )),
@@ -1355,7 +1353,7 @@ mod open_tests {
                 e,
                 GetCaptured::ItemComplete {
                     id: 201,
-                    error_code: lore_revision::event::LoreErrorCode::InvalidArguments,
+                    error_code: lore_base::error::Oversized::FFI_CODE,
                     ..
                 }
             )),
@@ -1421,7 +1419,7 @@ mod open_tests {
                 e,
                 GetCaptured::ItemComplete {
                     id: 202,
-                    error_code: lore_revision::event::LoreErrorCode::None,
+                    error_code: 0,
                     ..
                 }
             )),
@@ -1542,7 +1540,7 @@ mod open_tests {
         let completes = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(d) => Some(*d),
+                LoreEvent::StoragePutItemComplete(d) => Some(d.clone()),
                 _ => None,
             })
             .collect();
@@ -1859,10 +1857,10 @@ mod open_tests {
         ];
         let (status, events) = get_items_capture(handle, items).await;
         // One item failed → call-level status is the internal code -1.
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
 
         // Per-item terminal events.
-        let collect_complete = |target_id: u64| -> Option<lore_revision::event::LoreErrorCode> {
+        let collect_complete = |target_id: u64| -> Option<i32> {
             events.iter().find_map(|e| match e {
                 GetCaptured::ItemComplete { id, error_code, .. } if *id == target_id => {
                     Some(*error_code)
@@ -1870,17 +1868,11 @@ mod open_tests {
                 _ => None,
             })
         };
-        assert_eq!(
-            collect_complete(1),
-            Some(lore_revision::event::LoreErrorCode::None),
-        );
-        assert_eq!(
-            collect_complete(2),
-            Some(lore_revision::event::LoreErrorCode::None),
-        );
+        assert_eq!(collect_complete(1), Some(0),);
+        assert_eq!(collect_complete(2), Some(0),);
         assert_eq!(
             collect_complete(3),
-            Some(lore_revision::event::LoreErrorCode::AddressNotFound),
+            Some(lore_base::error::AddressNotFound::FFI_CODE),
         );
 
         // Per-id ordering: per-id ordering HEADER → DATA → ITEM_COMPLETE
@@ -2069,11 +2061,9 @@ mod open_tests {
     }
 
     #[tokio::test]
-    async fn aggregate_call_error_uses_internal_when_only_address_not_found() {
-        // Without an InvalidArguments item, the call-level summary maps the
-        // dominant AddressNotFound aggregate to the internal error — the FFI
-        // surface has no AddressNotFound variant for batch ops. The enriched
-        // Complete carries the internal FFI code (-1).
+    async fn aggregate_call_error_reports_address_not_found_when_that_is_the_only_failure() {
+        // Without an InvalidArguments item, the dominant failure is AddressNotFound, and the
+        // call reports that error's own FFI code rather than collapsing it to internal.
         use lore_base::types::Address;
         use lore_base::types::Context;
         use lore_base::types::Hash;
@@ -2114,7 +2104,7 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
 
         let events = sink.lock().unwrap().clone();
         assert!(
@@ -2128,9 +2118,12 @@ mod open_tests {
                 _ => None,
             })
             .expect("expected Complete event");
-        // The aggregated AddressNotFound maps to the internal error, FFI code -1.
-        assert_eq!(complete.status, -1);
-        assert_eq!(complete.error.error_code, -1);
+        // The selected AddressNotFound carries its own FFI code through to the call.
+        assert_eq!(complete.status, lore_base::error::AddressNotFound::FFI_CODE);
+        assert_eq!(
+            complete.error.error_code,
+            lore_base::error::AddressNotFound::FFI_CODE
+        );
     }
 
     #[tokio::test]
@@ -2168,7 +2161,7 @@ mod open_tests {
         )
         .await;
         // Handle B never saw the write — read must miss.
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2176,10 +2169,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("expected GET_ITEM_COMPLETE");
-        assert_eq!(
-            complete,
-            (1, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
+        assert_eq!(complete, (1, lore_base::error::AddressNotFound::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -2348,7 +2338,7 @@ mod open_tests {
             id: u64,
             address: lore_base::types::Address,
             fragment: lore_base::types::Fragment,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
         },
         Error,
         CallComplete(i32),
@@ -2364,7 +2354,7 @@ mod open_tests {
                     id: d.id,
                     address: d.address,
                     fragment: d.fragment,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
                 },
                 LoreEvent::Error(_) => GetMetadataCaptured::Error,
                 LoreEvent::Complete(d) => GetMetadataCaptured::CallComplete(d.status),
@@ -2432,7 +2422,7 @@ mod open_tests {
             })
             .expect("GET_METADATA_ITEM_COMPLETE missing");
         assert_eq!(complete.0, 1);
-        assert_eq!(complete.1, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(complete.1, 0);
         assert_eq!(complete.2.size_content, payload.len() as u64);
         assert_eq!(complete.3, address);
     }
@@ -2465,7 +2455,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2473,10 +2463,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("GET_METADATA_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (7, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
+        assert_eq!(complete, (7, lore_base::error::AddressNotFound::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -2507,10 +2494,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("GET_METADATA_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (5, lore_revision::event::LoreErrorCode::InvalidArguments),
-        );
+        assert_eq!(complete, (5, lore_base::error::InvalidArguments::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -2542,7 +2526,7 @@ mod open_tests {
             remote_success: u8,
             local_skipped: u8,
             remote_skipped: u8,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
         },
         Error,
         CallComplete(i32),
@@ -2561,7 +2545,7 @@ mod open_tests {
                     remote_success: d.remote_success,
                     local_skipped: d.local_skipped,
                     remote_skipped: d.remote_skipped,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
                 },
                 LoreEvent::Error(_) => ObliterateCaptured::Error,
                 LoreEvent::Complete(d) => ObliterateCaptured::CallComplete(d.status),
@@ -2644,10 +2628,7 @@ mod open_tests {
             })
             .expect("OBLITERATE_ITEM_COMPLETE missing");
         // No remote_config: local leg ran (success=1), remote leg was skipped (skipped=1).
-        assert_eq!(
-            complete,
-            (1, 1, 0, 0, 1, lore_revision::event::LoreErrorCode::None),
-        );
+        assert_eq!(complete, (1, 1, 0, 0, 1, 0),);
 
         // Obliterated content matches nothing, through every path. The entry survives in the
         // index carrying its tombstone, but nothing describes it: `get_metadata` answers as it
@@ -2675,7 +2656,7 @@ mod open_tests {
             .expect("post-obliterate get_metadata event missing");
         assert_eq!(
             error_code,
-            lore_revision::event::LoreErrorCode::AddressNotFound,
+            lore_base::error::AddressNotFound::FFI_CODE,
             "an obliterated address must resolve to nothing, not to a tombstoned fragment",
         );
         assert_eq!(
@@ -2737,10 +2718,7 @@ mod open_tests {
             })
             .expect("OBLITERATE_ITEM_COMPLETE missing");
         // No remote_config: local-side absent-address is idempotent success; remote leg skipped.
-        assert_eq!(
-            complete,
-            (7, 1, 0, 0, 1, lore_revision::event::LoreErrorCode::None),
-        );
+        assert_eq!(complete, (7, 1, 0, 0, 1, 0),);
     }
 
     #[tokio::test]
@@ -2786,10 +2764,10 @@ mod open_tests {
                 _ => None,
             })
         };
-        assert_eq!(code_for(1), Some(lore_revision::event::LoreErrorCode::None));
+        assert_eq!(code_for(1), Some(0));
         assert_eq!(
             code_for(2),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments),
+            Some(lore_base::error::InvalidArguments::FFI_CODE),
         );
     }
 
@@ -2802,7 +2780,7 @@ mod open_tests {
             target_partition: lore_base::types::Partition,
             source_address: lore_base::types::Address,
             target_context: lore_base::types::Context,
-            error_code: lore_revision::event::LoreErrorCode,
+            error_code: i32,
         },
         Error,
         CallComplete(i32),
@@ -2820,7 +2798,7 @@ mod open_tests {
                     target_partition: d.target_partition,
                     source_address: d.source_address,
                     target_context: d.target_context,
-                    error_code: d.error_code,
+                    error_code: d.error.error_code,
                 },
                 LoreEvent::Error(_) => CopyCaptured::Error,
                 LoreEvent::Complete(d) => CopyCaptured::CallComplete(d.status),
@@ -2904,7 +2882,7 @@ mod open_tests {
             })
             .expect("COPY_ITEM_COMPLETE missing");
         assert_eq!(complete.0, 1);
-        assert_eq!(complete.1, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(complete.1, 0);
         assert_eq!(complete.2, source_partition);
         assert_eq!(complete.3, target_partition);
         assert_eq!(complete.4, address);
@@ -2968,7 +2946,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2976,10 +2954,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (7, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
+        assert_eq!(complete, (7, lore_base::error::AddressNotFound::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -3019,7 +2994,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE missing");
-        assert_eq!(complete, (1, lore_revision::event::LoreErrorCode::None),);
+        assert_eq!(complete, (1, 0),);
     }
 
     #[tokio::test]
@@ -3073,7 +3048,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE for id=11 missing");
-        assert_eq!(echoed_target.0, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(echoed_target.0, 0);
         assert_eq!(echoed_target.1, target_context);
 
         // Read against the destination tuple — must return the source's payload byte-for-byte.
@@ -3169,11 +3144,7 @@ mod open_tests {
         let mut succeeded: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for event in &events {
             if let CopyCaptured::Complete { id, error_code, .. } = event {
-                assert_eq!(
-                    *error_code,
-                    lore_revision::event::LoreErrorCode::None,
-                    "item {id} must succeed",
-                );
+                assert_eq!(*error_code, 0, "item {id} must succeed",);
                 succeeded.insert(*id);
             }
         }
@@ -3221,10 +3192,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("COPY_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (12, lore_revision::event::LoreErrorCode::InvalidArguments),
-        );
+        assert_eq!(complete, (12, lore_base::error::InvalidArguments::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -3254,10 +3222,7 @@ mod open_tests {
                 _ => None,
             })
             .expect("OBLITERATE_ITEM_COMPLETE missing");
-        assert_eq!(
-            complete,
-            (5, lore_revision::event::LoreErrorCode::InvalidArguments),
-        );
+        assert_eq!(complete, (5, lore_base::error::InvalidArguments::FFI_CODE),);
     }
 
     #[tokio::test]
@@ -3427,7 +3392,7 @@ mod open_tests {
             .collect()
     }
 
-    fn item_code(events: &[GetCaptured]) -> Option<lore_revision::event::LoreErrorCode> {
+    fn item_code(events: &[GetCaptured]) -> Option<i32> {
         events.iter().find_map(|e| match e {
             GetCaptured::ItemComplete { error_code, .. } => Some(*error_code),
             _ => None,
@@ -3500,10 +3465,7 @@ mod open_tests {
 
         assert_eq!(header_size(&events), Some(payload.len() as u64));
         assert_eq!(data_chunks(&events), vec![(40, payload[40..100].to_vec())]);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// A zeroed pair is the whole content, which is what keeps every caller written before
@@ -3588,10 +3550,7 @@ mod open_tests {
         assert_eq!(status, 0);
         assert_eq!(header_size(&events), Some(200));
         assert_eq!(data_chunks(&events), vec![(180, payload[180..].to_vec())]);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// Reading from where nothing is is a caller mistake. Clamping it to empty would be
@@ -3623,7 +3582,7 @@ mod open_tests {
             assert_ne!(status, 0, "streaming={streaming}");
             assert_eq!(
                 item_code(&events),
-                Some(lore_revision::event::LoreErrorCode::InvalidArguments),
+                Some(lore_base::error::InvalidArguments::FFI_CODE),
                 "streaming={streaming}",
             );
             assert!(
@@ -3660,10 +3619,7 @@ mod open_tests {
         assert_eq!(status, 0);
         assert_eq!(header_size(&events), Some(200));
         assert_eq!(data_chunks(&events), vec![(200, Vec::new())]);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// The zero hash answers an empty buffer whatever range was asked for: there is no content
@@ -3697,10 +3653,7 @@ mod open_tests {
         .await;
         assert_eq!(status, 0);
         assert_eq!(header_size(&events), Some(0));
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
     }
 
     /// Streaming a range out of multi-fragment content: chunks arrive in content order,
@@ -3734,10 +3687,7 @@ mod open_tests {
         )
         .await;
         assert_eq!(status, 0);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
 
         assert_eq!(header_size(&events), Some(len as u64));
 
@@ -3827,10 +3777,7 @@ mod open_tests {
         )
         .await;
         assert_eq!(status, 0);
-        assert_eq!(
-            item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::None)
-        );
+        assert_eq!(item_code(&events), Some(0));
 
         let on_disk = std::fs::read(&target).unwrap();
         assert_eq!(on_disk, payload[40..100]);
@@ -3899,7 +3846,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -3950,7 +3897,7 @@ mod open_tests {
         let completes = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(d) => Some(*d),
+                LoreEvent::StoragePutItemComplete(d) => Some(d.clone()),
                 _ => None,
             })
             .collect();
@@ -3999,7 +3946,7 @@ mod open_tests {
             .iter()
             .find(|c| c.id == 1)
             .expect("stored item complete missing");
-        assert_eq!(stored.error_code, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(stored.error.error_code, 0);
         assert_eq!(
             stored.address.hash,
             lore_storage::hash_slice(payload.as_slice()),
@@ -4009,8 +3956,8 @@ mod open_tests {
             .find(|c| c.id == 2)
             .expect("rejected item complete missing");
         assert_eq!(
-            rejected.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments,
+            rejected.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE,
         );
     }
 
@@ -4044,10 +3991,7 @@ mod open_tests {
         let (status, completes) = put_file_items(handle, vec![item]).await;
         assert_eq!(status, 0);
         let address = completes.iter().find(|c| c.id == 1).unwrap().address;
-        assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(completes[0].error.error_code, 0);
 
         let (g_status, events) = get_items_capture(
             handle,
@@ -4103,10 +4047,7 @@ mod open_tests {
         .await;
         assert_eq!(status, 0);
         let complete = completes.iter().find(|c| c.id == 9).unwrap();
-        assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(complete.error.error_code, 0);
         assert_eq!(complete.address.hash, Hash::default());
         assert_eq!(complete.address.context, context);
     }
@@ -4140,8 +4081,8 @@ mod open_tests {
         assert_ne!(status, 0);
         let complete = completes.iter().find(|c| c.id == 1).unwrap();
         assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            complete.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -4172,8 +4113,8 @@ mod open_tests {
         assert_ne!(status, 0);
         let complete = completes.iter().find(|c| c.id == 5).unwrap();
         assert_eq!(
-            complete.error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            complete.error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -4294,7 +4235,7 @@ mod open_tests {
         assert_eq!(std::fs::read(&second_path).unwrap(), second_payload);
 
         // Items resolve concurrently, so the events are correlated by id rather than by position.
-        let mut codes: Vec<(u64, lore_revision::event::LoreErrorCode)> = events
+        let mut codes: Vec<(u64, i32)> = events
             .iter()
             .filter_map(|e| match e {
                 GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
@@ -4302,14 +4243,7 @@ mod open_tests {
             })
             .collect();
         codes.sort_by_key(|(id, _)| *id);
-        assert_eq!(
-            codes,
-            vec![
-                (1, lore_revision::event::LoreErrorCode::None),
-                (2, lore_revision::event::LoreErrorCode::None),
-            ],
-            "one terminal event per item",
-        );
+        assert_eq!(codes, vec![(1, 0), (2, 0),], "one terminal event per item",);
     }
 
     #[tokio::test]
@@ -4358,10 +4292,7 @@ mod open_tests {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
         });
-        assert_eq!(
-            complete,
-            Some((1, lore_revision::event::LoreErrorCode::None)),
-        );
+        assert_eq!(complete, Some((1, 0)),);
     }
 
     #[tokio::test]
@@ -4433,14 +4364,14 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         let complete = events.iter().find_map(|e| match e {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
         });
         assert_eq!(
             complete,
-            Some((7, lore_revision::event::LoreErrorCode::AddressNotFound)),
+            Some((7, lore_base::error::AddressNotFound::FFI_CODE)),
         );
     }
 
@@ -4474,7 +4405,7 @@ mod open_tests {
         });
         assert_eq!(
             complete,
-            Some((5, lore_revision::event::LoreErrorCode::InvalidArguments)),
+            Some((5, lore_base::error::InvalidArguments::FFI_CODE)),
         );
     }
 
@@ -4512,7 +4443,7 @@ mod open_tests {
         let completes = events
             .iter()
             .filter_map(|e| match e {
-                LoreEvent::StoragePutItemComplete(d) => Some(*d),
+                LoreEvent::StoragePutItemComplete(d) => Some(d.clone()),
                 _ => None,
             })
             .collect();
@@ -4575,10 +4506,7 @@ mod open_tests {
         .await;
         assert_eq!(status, 0, "publishing the fixture file must succeed");
         assert_eq!(completes.len(), 1);
-        assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(completes[0].error.error_code, 0);
         completes[0].address
     }
 
@@ -4727,12 +4655,13 @@ mod open_tests {
                 id,
                 address,
                 error_code,
+                ..
             } => Some((*id, *address, *error_code)),
             _ => None,
         });
         assert_eq!(
             complete,
-            Some((2, published, lore_revision::event::LoreErrorCode::None)),
+            Some((2, published, 0)),
             "the terminal event must report the resolved address, so the caller learns the mapping"
         );
     }
@@ -4853,7 +4782,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
     }
 
@@ -4897,7 +4826,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -4943,7 +4872,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -4994,11 +4923,7 @@ mod open_tests {
             )
             .await;
             assert_eq!(status, 0, "{tag}");
-            assert_eq!(
-                item_code(&events),
-                Some(lore_revision::event::LoreErrorCode::None),
-                "{tag}"
-            );
+            assert_eq!(item_code(&events), Some(0), "{tag}");
             assert!(
                 std::fs::read(&target).unwrap().is_empty(),
                 "{tag}: an empty selection at the end of the content still writes the file"
@@ -5039,10 +4964,7 @@ mod open_tests {
         .await;
         assert_eq!(status, 0);
         assert_eq!(completes.len(), 1);
-        assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::None
-        );
+        assert_eq!(completes[0].error.error_code, 0);
         assert_eq!(
             completes[0].address.hash,
             Hash::default(),
@@ -5068,7 +4990,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::AddressNotFound)
+            Some(lore_base::error::AddressNotFound::FFI_CODE)
         );
         assert!(
             !target.exists(),
@@ -5100,10 +5022,10 @@ mod open_tests {
             ],
         )
         .await;
-        assert_eq!(status, -1);
+        assert_eq!(status, lore_base::error::AddressNotFound::FFI_CODE);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::AddressNotFound)
+            Some(lore_base::error::AddressNotFound::FFI_CODE)
         );
         assert_eq!(
             std::fs::read(&target).unwrap(),
@@ -5145,8 +5067,8 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(completes.len(), 1);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
 
         let (_target_guard, target) = temp_file_path("get-file-resolved-survives");
@@ -5207,8 +5129,8 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
 
         let (_target_guard, target) = temp_file_path("get-file-resolved-directory-survives");
@@ -5257,8 +5179,8 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -5290,8 +5212,8 @@ mod open_tests {
         .await;
         assert_ne!(status, 0);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
         assert!(
             started.elapsed() < std::time::Duration::from_secs(3),
@@ -5326,8 +5248,8 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(completes.len(), 1);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -5357,8 +5279,8 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(completes.len(), 1);
         assert_eq!(
-            completes[0].error_code,
-            lore_revision::event::LoreErrorCode::InvalidArguments
+            completes[0].error.error_code,
+            lore_base::error::InvalidArguments::FFI_CODE
         );
     }
 
@@ -5388,7 +5310,7 @@ mod open_tests {
         assert_ne!(status, 0);
         assert_eq!(
             item_code(&events),
-            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+            Some(lore_base::error::InvalidArguments::FFI_CODE)
         );
     }
 
@@ -5423,11 +5345,11 @@ mod open_tests {
         assert_eq!(completes.len(), 1);
         assert_eq!(
             (
-                completes[0].error_code,
+                completes[0].error.error_code,
                 completes[0].stored_local,
                 completes[0].stored_remote
             ),
-            (lore_revision::event::LoreErrorCode::None, 1, 0),
+            (0, 1, 0),
         );
     }
 
@@ -5870,10 +5792,7 @@ mod open_tests {
             drop(payload);
             (
                 "put",
-                status == 0
-                    && completes
-                        .iter()
-                        .all(|c| c.error_code == lore_revision::event::LoreErrorCode::None),
+                status == 0 && completes.iter().all(|c| c.error.error_code == 0),
             )
         });
 

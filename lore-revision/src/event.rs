@@ -477,13 +477,12 @@ impl<'de> serde::Deserialize<'de> for LoreBytesMut {
     }
 }
 
-/// Small discriminator enum for per-item terminal events in the
-/// content-addressed storage API.
+/// Small discriminator enum for the per-item terminal events of the revision-tree API.
 ///
-/// Narrower than the general library error code — events emitted per
-/// put/get/copy/etc. item embed this code so a caller can branch on the
-/// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-/// detail.
+/// Narrower than the general library error code: an event embeds this so a caller can branch on
+/// the common cases cheaply, without reading a message. The cost is that it names only five
+/// outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
+/// [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
 ///
 /// The values are the error codes themselves, taken from the registry in
 /// `lore_base::error`, so a code read from a per-item event means the same

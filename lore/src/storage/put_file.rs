@@ -18,19 +18,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use lore_base::error::InvalidArguments;
 use lore_base::types::Context;
 use lore_base::types::Partition;
-use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
-use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
-use lore_revision::store::event::LoreStoragePutItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::options::WriteOptions;
 use lore_storage::write::write_from_file;
 use serde::Deserialize;
@@ -42,6 +36,7 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::PutItemOutcome;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
 use crate::storage::store::StoreInternal;
 
 /// One `put_file` item — read the file at `path` and store it at
@@ -88,24 +83,6 @@ pub struct LoreStoragePutFileArgs {
     pub items: LoreArray<LoreStoragePutFileItem>,
 }
 
-#[error_set]
-enum PutFileError {
-    InvalidArguments,
-}
-
-impl EventError for PutFileError {
-    fn translated(&self) -> LoreError {
-        match self {
-            PutFileError::InvalidArguments(_) => LoreError::InvalidArguments,
-            PutFileError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Read one or more files into the content-addressed store.
 pub async fn put_file(
     globals: LoreGlobalArgs,
@@ -131,7 +108,7 @@ async fn put_file_local(
         async move |store, args| {
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), PutFileError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
@@ -154,31 +131,22 @@ async fn put_file_item(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutFileItem,
     session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
-    let outcome = resolve_put_file_item(store, item, session).await;
-    LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
-        id: item.id,
-        address: outcome.address,
-        error_code: outcome.error_code,
-        stored_local: u8::from(outcome.stored_local),
-        stored_remote: u8::from(outcome.stored_remote),
-    })
-    .send();
-    outcome.error_code
+) -> Result<(), StorageError> {
+    PutItemOutcome::emit(item.id, resolve_put_file_item(store, item, session).await)
 }
 
 async fn resolve_put_file_item(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutFileItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> PutItemOutcome {
+) -> Result<PutItemOutcome, StorageError> {
     if item.partition == Partition::default() {
-        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+        return Err(invalid_item("item names the default partition"));
     }
 
     let path_str = item.path.as_str();
     if path_str.is_empty() {
-        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+        return Err(invalid_item("item has an empty path"));
     }
     let mut write_options = WriteOptions::default();
     if item.fixed_size_chunk > 0 {
@@ -188,16 +156,15 @@ async fn resolve_put_file_item(
         write_options = write_options.with_local_cache_priority();
     }
 
-    PutItemOutcome::from_write(
-        write_from_file(
-            store.immutable.clone(),
-            item.partition,
-            &lore_storage::ContentSource::file(Path::new(path_str)),
-            item.context,
-            write_options,
-            remote_session,
-            lore_revision::immutable::counted_write_context(),
-        )
-        .await,
+    write_from_file(
+        store.immutable.clone(),
+        item.partition,
+        &lore_storage::ContentSource::file(Path::new(path_str)),
+        item.context,
+        write_options,
+        remote_session,
+        lore_revision::immutable::counted_write_context(),
     )
+    .await
+    .map(PutItemOutcome::from_write)
 }

@@ -5,7 +5,7 @@
 //! Listing acts on the handle's local mutable store only; a remote-targeted call
 //! (`globals.remote`, or a remote-bound handle) is rejected with `INVALID_ARGUMENTS`. Each found
 //! pair is emitted as a `MUTABLE_LIST_ENTRY` event `{id, key, value}`, followed by one terminal
-//! `MUTABLE_LIST_ITEM_COMPLETE` event `{id, error_code}` for the item. A default/zero partition
+//! `MUTABLE_LIST_ITEM_COMPLETE` event `{id, error}` for the item. A default/zero partition
 //! lists across every partition the caller can access.
 
 use std::sync::Arc;
@@ -17,13 +17,11 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::store::event::LoreStorageMutableListEntryEventData;
 use lore_revision::store::event::LoreStorageMutableListItemCompleteEventData;
+use lore_storage::StorageError;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -32,6 +30,7 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One `mutable_list` item — the `(partition, key_type)` to list.
@@ -55,24 +54,6 @@ pub struct LoreStorageMutableListArgs {
     pub handle: LoreStore,
     /// Listings to perform; each runs independently and emits its own entries and terminal event
     pub items: LoreArray<LoreStorageMutableListItem>,
-}
-
-#[error_set]
-enum MutableListError {
-    InvalidArguments,
-}
-
-impl EventError for MutableListError {
-    fn translated(&self) -> LoreError {
-        match self {
-            MutableListError::InvalidArguments(_) => LoreError::InvalidArguments,
-            MutableListError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// List one or more partitions' mutable key-value pairs.
@@ -100,13 +81,13 @@ async fn mutable_list_local(
         async move |store, args| {
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), MutableListError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
             // Listing has no remote wire protocol, so a remote-targeted list is rejected up front
             // rather than attempting a per-item remote call.
             if effective.no_local {
-                return Err(MutableListError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "mutable_list is only supported on the local store".into(),
                 }));
             }
@@ -121,7 +102,10 @@ async fn mutable_list_local(
 
 /// List one item's local mutable key-value pairs. Entries are emitted as they arrive, then a
 /// single terminal event closes the item. Remote listing is rejected before reaching here.
-async fn list_item(store: Arc<StoreInternal>, item: &LoreStorageMutableListItem) -> LoreErrorCode {
+async fn list_item(
+    store: Arc<StoreInternal>,
+    item: &LoreStorageMutableListItem,
+) -> Result<(), StorageError> {
     match store
         .mutable
         .clone()
@@ -133,9 +117,9 @@ async fn list_item(store: Arc<StoreInternal>, item: &LoreStorageMutableListItem)
             while let Some((key, value)) = receiver.recv().await {
                 emit_entry(item, key, value);
             }
-            emit_complete(item, LoreErrorCode::None)
+            emit_complete(item, Ok(()))
         }
-        Err(err) => emit_complete(item, crate::storage::store_error_to_code(&err)),
+        Err(err) => emit_complete(item, Err(err).forward("listing mutable keys")),
     }
 }
 
@@ -148,13 +132,15 @@ fn emit_entry(item: &LoreStorageMutableListItem, key: Hash, value: Hash) {
     .send();
 }
 
-/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
-/// `return emit_complete(..)` directly.
-fn emit_complete(item: &LoreStorageMutableListItem, error_code: LoreErrorCode) -> LoreErrorCode {
+/// Emit the item's terminal event and return the outcome that was sent.
+fn emit_complete(
+    item: &LoreStorageMutableListItem,
+    result: Result<(), StorageError>,
+) -> Result<(), StorageError> {
     LoreEvent::StorageMutableListItemComplete(LoreStorageMutableListItemCompleteEventData {
         id: item.id,
-        error_code,
+        error: item_detail(&result),
     })
     .send();
-    error_code
+    result
 }

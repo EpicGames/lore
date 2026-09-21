@@ -16,19 +16,17 @@
 
 use std::sync::Arc;
 
+use lore_base::error::AddressNotFound;
 use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
-use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::store::event::LoreStorageUploadItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::concurrency::acquire_fragment_memory_permit;
 use lore_storage::options::ReadOptions;
 use lore_storage::read::load_fragment;
@@ -42,6 +40,8 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
+use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One upload item — the `(partition, address)` of locally-stored content to push to remote.
@@ -65,24 +65,6 @@ pub struct LoreStorageUploadArgs {
     pub handle: LoreStore,
     /// Addresses to push to remote; each runs independently and emits its own `UPLOAD_ITEM_COMPLETE`
     pub items: LoreArray<LoreStorageUploadItem>,
-}
-
-#[error_set]
-enum UploadError {
-    InvalidArguments,
-}
-
-impl EventError for UploadError {
-    fn translated(&self) -> LoreError {
-        match self {
-            UploadError::InvalidArguments(_) => LoreError::InvalidArguments,
-            UploadError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Push one or more `(partition, address)` entries to the remote store.
@@ -109,13 +91,13 @@ async fn upload_local(
         upload,
         async move |store, args| {
             if store.remote.is_none() {
-                return Err(UploadError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "upload requires a handle opened with `remote_config`".into(),
                 }));
             }
             let effective = store.effective_flags(per_call)?;
             if effective.no_remote {
-                return Err(UploadError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "upload incompatible with `offline`/`local` flag set on handle or call"
                         .into(),
                 }));
@@ -123,7 +105,7 @@ async fn upload_local(
 
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), UploadError>(());
+                return Ok::<(), StorageError>(());
             }
 
             let mut reuse = crate::storage::store::SessionReuse::default();
@@ -142,12 +124,16 @@ async fn upload_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageUploadItem,
     session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
+) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
-        return emit_complete(item, 0, LoreErrorCode::InvalidArguments);
+        return emit_complete(
+            item,
+            0,
+            Err(invalid_item("item names the default partition")),
+        );
     }
     if item.address.hash == Hash::default() {
-        return emit_complete(item, 1, LoreErrorCode::None);
+        return emit_complete(item, 1, Ok(()));
     }
 
     // Anything weaker than `MatchFull` means the local entry is incomplete and must be
@@ -164,10 +150,14 @@ async fn upload_item(
     };
 
     if already_durable {
-        return emit_complete(item, 1, LoreErrorCode::None);
+        return emit_complete(item, 1, Ok(()));
     }
     if !has_local_payload {
-        return emit_complete(item, 0, LoreErrorCode::AddressNotFound);
+        return emit_complete(
+            item,
+            0,
+            Err(StorageError::from(AddressNotFound::from(item.address))),
+        );
     }
 
     // `no_remote()` is load-bearing: we must not pull from a third party to satisfy a
@@ -183,13 +173,13 @@ async fn upload_item(
     let (fragment, payload) = match load {
         Ok(pair) => pair,
         Err(err) => {
-            return emit_complete(item, 0, crate::storage::storage_error_to_code(&err));
+            return emit_complete(item, 0, Err(err));
         }
     };
 
     let permit = acquire_fragment_memory_permit(payload.len()).await;
 
-    match store_fragment(
+    let stored = store_fragment(
         store.immutable.clone(),
         item.partition,
         item.address,
@@ -201,20 +191,17 @@ async fn upload_item(
         permit,
     )
     .await
-    {
-        Ok(_) => emit_complete(item, 0, LoreErrorCode::None),
-        Err(err) => emit_complete(item, 0, crate::storage::storage_error_to_code(&err)),
-    }
+    .map(|_| ());
+    emit_complete(item, 0, stored)
 }
 
-/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
-/// `return emit_complete(..)` directly.
+/// Emit the item's terminal event and return the outcome that was sent.
 fn emit_complete(
     item: &LoreStorageUploadItem,
     already_durable: u8,
-    error_code: LoreErrorCode,
-) -> LoreErrorCode {
-    let address = if error_code == LoreErrorCode::None {
+    result: Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let address = if result.is_ok() {
         item.address
     } else {
         Address::default()
@@ -223,8 +210,8 @@ fn emit_complete(
         id: item.id,
         address,
         already_durable,
-        error_code,
+        error: item_detail(&result),
     })
     .send();
-    error_code
+    result
 }

@@ -11,9 +11,8 @@
 
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
-use lore_revision::event::EventError;
-use lore_revision::interface::LoreError;
 use lore_revision::lore::execution_context;
+use lore_storage::StorageError;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -30,21 +29,6 @@ use crate::storage::handle::LoreStore;
 pub struct LoreStorageFlushArgs {
     /// Open handle whose pending writes to flush
     pub handle: LoreStore,
-}
-
-#[error_set]
-enum FlushError {}
-
-impl EventError for FlushError {
-    fn translated(&self) -> LoreError {
-        match self {
-            FlushError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Flush pending writes through the handle's stores. Disk-backed stores
@@ -76,14 +60,14 @@ async fn flush_local(
                 .clone()
                 .flush(sync_data)
                 .await
-                .forward_any::<FlushError>("immutable store flush")?;
+                .forward_any::<StorageError>("immutable store flush")?;
             store
                 .mutable
                 .clone()
                 .flush(sync_data)
                 .await
-                .forward_any::<FlushError>("mutable store flush")?;
-            Ok::<(), FlushError>(())
+                .forward_any::<StorageError>("mutable store flush")?;
+            Ok::<(), StorageError>(())
         },
     )
     .await

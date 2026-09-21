@@ -7,10 +7,13 @@
 //! one or more `DATA` events for each item before the terminal. `open`
 //! emits a single `OPENED` event on success before `Complete`.
 //!
-//! All event-data structs here are `#[repr(C)]` PODs carrying the item's
+//! All event-data structs here are `#[repr(C)]` structs carrying the item's
 //! correlation `id`, the relevant addresses/partitions, and a
-//! [`LoreErrorCode`] discriminator. The companion `LORE_EVENT_ERROR` event
-//! (emitted alongside per-item failures) carries the human-readable detail.
+//! [`LoreErrorDetail`] holding the failing error's own code, message and trace.
+//!
+//! The detail owns heap data, so these structs are `Clone` rather than `Copy`,
+//! and the pointers it carries are valid only for the callback invocation that
+//! delivers the event.
 
 use lore_base::types::Address;
 use lore_base::types::Context;
@@ -21,7 +24,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::event::LoreBytes;
-use crate::event::LoreErrorCode;
+use crate::event::LoreErrorDetail;
 
 /// Delivered on successful `lore_storage_open`. Carries the handle id the
 /// caller must pass to subsequent ops against this store.
@@ -34,11 +37,11 @@ pub struct LoreStorageOpenedEventData {
 }
 
 /// Terminal per-item event for `put`, `put_file`, `put_resolved` and
-/// `put_file_resolved`. On success `error_code == None` and `address` is the
+/// `put_file_resolved`. On success `error.error_code == 0` and `address` is the
 /// computed content hash — for the resolved variants, the content the key now
-/// resolves to; on failure `error_code` is populated and `address` is zero.
+/// resolves to; on failure `error` is populated and `address` is zero.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStoragePutItemCompleteEventData {
     /// Correlation id of the item.
@@ -46,16 +49,16 @@ pub struct LoreStoragePutItemCompleteEventData {
     /// The computed content address of the stored item.
     pub address: Address,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
-    /// Non-zero when the local store holds the content. Appended after the original three
-    /// fields, so a consumer reading only those is unaffected — `serde(default)` lets an older
-    /// payload that lacks the field deserialize, as events cross the IPC boundary.
+    pub error: LoreErrorDetail,
+    /// Non-zero when the local store holds the content. Trailing, so a payload that lacks it still
+    /// decodes: the IPC wire format is non-self-describing, where only a missing trailing field is
+    /// recoverable.
     #[serde(default)]
     pub stored_local: u8,
     /// Non-zero when the content reached the remote, or was already durable there. A remote
-    /// write that fails still reports `error_code = NONE` if the local write succeeded — this is
-    /// how a caller tells the two apart. For fragmented content it is the intersection across
-    /// every fragment, so it is set only when the whole tree is remote.
+    /// write that fails still reports success if the local write succeeded — this is how a
+    /// caller tells the two apart. For fragmented content it is the intersection across every
+    /// fragment, so it is set only when the whole tree is remote.
     #[serde(default)]
     pub stored_remote: u8,
 }
@@ -96,7 +99,7 @@ pub struct LoreStorageGetDataEventData {
 /// filesystem. For the two resolved variants `address` is the address the key
 /// resolved to, so it is an output rather than an echo of the request.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageGetItemCompleteEventData {
     /// Correlation id of the item.
@@ -104,7 +107,7 @@ pub struct LoreStorageGetItemCompleteEventData {
     /// The content address of the item.
     pub address: Address,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
 /// Terminal per-item event for `copy`. `source_partition` /
@@ -113,7 +116,7 @@ pub struct LoreStorageGetItemCompleteEventData {
 /// destination tuple's context — the destination address is `(target_partition,
 /// source_address.hash, target_context)`.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageCopyItemCompleteEventData {
     /// Correlation id of the item.
@@ -127,17 +130,16 @@ pub struct LoreStorageCopyItemCompleteEventData {
     /// The context of the item in the target.
     pub target_context: Context,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
 /// Terminal per-item event for `obliterate`. `local_success` / `remote_success` report
 /// whether the corresponding side completed without error. `local_skipped` / `remote_skipped`
 /// report whether the corresponding side was suppressed up front by the handle's bound flags
 /// (`globals.offline`/`local`/`remote`) — when a side is skipped, its `_success` flag is `0`
-/// rather than a misleading `1`. `error_code` is populated if either side that DID run
-/// failed.
+/// rather than a misleading `1`. `error` is populated if either side that DID run failed.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageObliterateItemCompleteEventData {
     /// Correlation id of the item.
@@ -153,16 +155,15 @@ pub struct LoreStorageObliterateItemCompleteEventData {
     /// 1 when the remote side was skipped.
     pub remote_skipped: u8,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
-/// Terminal per-item event for `get_metadata`. On success `fragment` is
-/// valid and `error_code == None`; on miss `error_code == ADDRESS_NOT_FOUND`.
-/// Mirrors `LoreStorageGetItemCompleteEventData`'s shape minus the absence of
-/// any preceding `GET_HEADER` / `GET_DATA` events — `get_metadata` carries no
-/// payload bytes.
+/// Terminal per-item event for `get_metadata`. On success `fragment` is valid and
+/// `error.error_code == 0`; on miss `error` carries the address-not-found error. Mirrors
+/// `LoreStorageGetItemCompleteEventData`'s shape minus the absence of any preceding
+/// `GET_HEADER` / `GET_DATA` events — `get_metadata` carries no payload bytes.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageGetMetadataItemCompleteEventData {
     /// Correlation id of the item.
@@ -172,13 +173,13 @@ pub struct LoreStorageGetMetadataItemCompleteEventData {
     /// The metadata fragment for the item.
     pub fragment: Fragment,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
 /// Terminal per-item event for `upload`. `already_durable` is 1 when the
 /// item was already flagged durable and no upload was performed.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageUploadItemCompleteEventData {
     /// Correlation id of the item.
@@ -188,14 +189,15 @@ pub struct LoreStorageUploadItemCompleteEventData {
     /// 1 when the item was already durable and no upload was performed.
     pub already_durable: u8,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
-/// Terminal per-item event for `mutable_load`. On success `error_code == None` and `value` is
-/// the loaded value hash (`Hash::default()` when the key holds a null/removed value); on miss
-/// `error_code == ADDRESS_NOT_FOUND` and `value` is zero.
+/// Terminal per-item event for `mutable_load`. On success `error.error_code == 0` and `value`
+/// is the loaded value hash (`Hash::default()` when the key holds a null/removed value); on
+/// miss `error` carries the miss the answering backend raised — `AddressNotFound` from a local
+/// store, `NotFound` from a remote one — and `value` is zero.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableLoadItemCompleteEventData {
     /// Correlation id of the item.
@@ -203,25 +205,25 @@ pub struct LoreStorageMutableLoadItemCompleteEventData {
     /// The value stored for the key.
     pub value: Hash,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
-/// Terminal per-item event for `mutable_store`. `error_code == None` on a successful store.
+/// Terminal per-item event for `mutable_store`. `error.error_code == 0` on a successful store.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableStoreItemCompleteEventData {
     /// Correlation id of the item.
     pub id: u64,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
 /// Terminal per-item event for `mutable_compare_and_swap`. `previous` is the value the key held
 /// before the swap (equal to the caller's `expected` when the swap took effect, otherwise the
-/// actual current value). `error_code == None` on success.
+/// actual current value). `error.error_code == 0` on success.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableCompareAndSwapItemCompleteEventData {
     /// Correlation id of the item.
@@ -229,7 +231,7 @@ pub struct LoreStorageMutableCompareAndSwapItemCompleteEventData {
     /// The value the key held before the swap.
     pub previous: Hash,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }
 
 /// One `(key, value)` pair emitted by `mutable_list`, before the item's terminal event.
@@ -246,13 +248,13 @@ pub struct LoreStorageMutableListEntryEventData {
 }
 
 /// Terminal per-item event for `mutable_list`, emitted after every `MUTABLE_LIST_ENTRY` for the
-/// item. `error_code == None` once the listing completes.
+/// item. `error.error_code == 0` once the listing completes.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreStorageMutableListItemCompleteEventData {
     /// Correlation id of the listing item.
     pub id: u64,
     /// The outcome for the item.
-    pub error_code: LoreErrorCode,
+    pub error: LoreErrorDetail,
 }

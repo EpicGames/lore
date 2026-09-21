@@ -14,12 +14,10 @@ use lore_base::error::InvalidArguments;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
-use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorDetail;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
+use lore_storage::StorageError;
 
 use crate::call::setup_execution;
 use crate::interface::LoreEventCallback;
@@ -28,25 +26,6 @@ use crate::storage::store::OpGuard;
 use crate::storage::store::StoreInternal;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
-
-/// Errors emitted by the dispatch helper itself (not by the op impl).
-#[error_set]
-enum DispatchError {
-    InvalidArguments,
-}
-
-impl EventError for DispatchError {
-    fn translated(&self) -> LoreError {
-        match self {
-            DispatchError::InvalidArguments(_) => LoreError::InvalidArguments,
-            DispatchError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
 
 /// Run a storage-API op behind the in-flight counter protocol.
 ///
@@ -76,7 +55,7 @@ pub(crate) async fn storage_call<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arc<StoreInternal>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -86,7 +65,7 @@ where
     LORE_CONTEXT
         .scope(execution, async move {
             let Some(guard) = OpGuard::enter(store_handle) else {
-                let err = DispatchError::from(InvalidArguments {
+                let err = StorageError::from(InvalidArguments {
                     reason: "storage handle is unknown or has been closed".into(),
                 });
                 return execution_context()
@@ -143,7 +122,7 @@ mod tests {
             LoreStore::INVALID,
             (),
             "handle_miss_test",
-            |_store, _args: ()| async move { Ok::<_, DispatchError>(()) },
+            |_store, _args: ()| async move { Ok::<_, StorageError>(()) },
         )
         .await;
 
@@ -158,7 +137,7 @@ mod tests {
 
         // The status holds the handle-miss error's real error code and the detail
         // carries the same code and message.
-        let expected = DispatchError::from(InvalidArguments {
+        let expected = StorageError::from(InvalidArguments {
             reason: "storage handle is unknown or has been closed".into(),
         });
         let expected_code = expected.ffi_code();
@@ -188,7 +167,7 @@ mod tests {
             move |store_arc, _args: ()| async move {
                 invoked_clone.fetch_add(1, Ordering::AcqRel);
                 assert!(store_arc.in_flight.load(Ordering::Acquire) >= 1);
-                Ok::<_, DispatchError>(())
+                Ok::<_, StorageError>(())
             },
         )
         .await;
@@ -222,7 +201,7 @@ mod tests {
             (),
             "op_error_test",
             move |_store, _args: ()| async move {
-                Err::<(), _>(DispatchError::from(InvalidArguments {
+                Err::<(), _>(StorageError::from(InvalidArguments {
                     reason: "simulated op error".into(),
                 }))
             },
@@ -245,7 +224,7 @@ mod tests {
 
         // The status holds the op error's real error code and the detail carries
         // the same code and message.
-        let expected = DispatchError::from(InvalidArguments {
+        let expected = StorageError::from(InvalidArguments {
             reason: "simulated op error".into(),
         });
         let expected_code = expected.ffi_code();

@@ -28,7 +28,6 @@ mod storage_copy_on_write_tests {
     use lore_base::types::Partition;
     use lore_revision::environment::EnvironmentConfig;
     use lore_revision::event::LoreBytes;
-    use lore_revision::event::LoreErrorCode;
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEventCallback;
@@ -414,11 +413,13 @@ mod storage_copy_on_write_tests {
         remote_write: u8,
         chunk: u64,
     ) -> Address {
-        let captured: Arc<Mutex<Vec<(Address, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<(Address, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(data) = event {
-                sink.lock().unwrap().push((data.address, data.error_code));
+                sink.lock()
+                    .unwrap()
+                    .push((data.address, data.error.error_code));
             }
         }));
         let status = lore::storage::put::put(
@@ -444,7 +445,7 @@ mod storage_copy_on_write_tests {
         assert_eq!(status, 0, "put must succeed");
         let events = captured.lock().unwrap().clone();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, LoreErrorCode::None);
+        assert_eq!(events[0].1, 0);
         events[0].0
     }
 

@@ -7,7 +7,7 @@
 //! the handle's local mutable store; `globals.remote` (or a remote-bound handle) acts on the
 //! remote store over the shared storage session. Storing the null value (`Hash::default()`)
 //! removes the key. Each item resolves to one terminal `MUTABLE_STORE_ITEM_COMPLETE` carrying
-//! `{id, error_code}`.
+//! `{id, error}`.
 
 use std::sync::Arc;
 
@@ -18,12 +18,10 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::store::event::LoreStorageMutableStoreItemCompleteEventData;
+use lore_storage::StorageError;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -32,6 +30,8 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
+use crate::storage::item_detail;
 use crate::storage::store::EffectiveFlags;
 use crate::storage::store::StoreInternal;
 
@@ -62,24 +62,6 @@ pub struct LoreStorageMutableStoreArgs {
     pub items: LoreArray<LoreStorageMutableStoreItem>,
 }
 
-#[error_set]
-enum MutableStoreError {
-    InvalidArguments,
-}
-
-impl EventError for MutableStoreError {
-    fn translated(&self) -> LoreError {
-        match self {
-            MutableStoreError::InvalidArguments(_) => LoreError::InvalidArguments,
-            MutableStoreError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Write one or more mutable key-value pairs.
 pub async fn mutable_store(
     globals: LoreGlobalArgs,
@@ -105,11 +87,11 @@ async fn mutable_store_impl(
         async move |store, args| {
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), MutableStoreError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
             if effective.no_local && store.remote.is_none() {
-                return Err(MutableStoreError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "remote mutable_store requires a handle opened with `remote_config`"
                         .into(),
                 }));
@@ -133,42 +115,45 @@ async fn store_item(
     item: &LoreStorageMutableStoreItem,
     effective: EffectiveFlags,
     session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
+) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
-        return emit_complete(item, LoreErrorCode::InvalidArguments);
+        return emit_complete(item, Err(invalid_item("item names the default partition")));
     }
 
     if effective.no_local {
         let Some(session) = session else {
-            return emit_complete(item, LoreErrorCode::Internal);
+            return emit_complete(
+                item,
+                Err(StorageError::internal(
+                    "remote-only store with no session on the handle",
+                )),
+            );
         };
-        match session
+        let stored = session
             .mutable_store(item.key, item.value, item.key_type)
             .await
-        {
-            Ok(()) => emit_complete(item, LoreErrorCode::None),
-            Err(err) => emit_complete(item, crate::storage::protocol_error_to_code(&err)),
-        }
+            .forward("storing the mutable key on the remote");
+        emit_complete(item, stored)
     } else {
-        match store
+        let stored = store
             .mutable
             .clone()
             .store(item.partition, item.key, item.value, item.key_type)
             .await
-        {
-            Ok(()) => emit_complete(item, LoreErrorCode::None),
-            Err(err) => emit_complete(item, crate::storage::store_error_to_code(&err)),
-        }
+            .forward("storing the mutable key");
+        emit_complete(item, stored)
     }
 }
 
-/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
-/// `return emit_complete(..)` directly.
-fn emit_complete(item: &LoreStorageMutableStoreItem, error_code: LoreErrorCode) -> LoreErrorCode {
+/// Emit the item's terminal event and return the outcome that was sent.
+fn emit_complete(
+    item: &LoreStorageMutableStoreItem,
+    result: Result<(), StorageError>,
+) -> Result<(), StorageError> {
     LoreEvent::StorageMutableStoreItemComplete(LoreStorageMutableStoreItemCompleteEventData {
         id: item.id,
-        error_code,
+        error: item_detail(&result),
     })
     .send();
-    error_code
+    result
 }

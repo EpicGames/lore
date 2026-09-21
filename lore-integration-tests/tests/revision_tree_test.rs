@@ -3582,11 +3582,7 @@ mod interop_tests {
         let sink = stored.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(data) = event {
-                assert_eq!(
-                    data.error_code,
-                    LoreErrorCode::None,
-                    "storing the payload must succeed"
-                );
+                assert_eq!(data.error.error_code, 0, "storing the payload must succeed");
                 *sink.lock().unwrap() = Some(data.address);
             }
         }));
@@ -3622,7 +3618,7 @@ mod interop_tests {
     async fn get_bytes(store_handle_id: u64, partition: Partition, address: Address) -> Vec<u8> {
         let read: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = read.clone();
-        let outcome: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+        let outcome: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let outcome_sink = outcome.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
             LoreEvent::StorageGetData(data) => {
@@ -3634,7 +3630,7 @@ mod interop_tests {
                 }
             }
             LoreEvent::StorageGetItemComplete(data) => {
-                *outcome_sink.lock().unwrap() = Some(data.error_code);
+                *outcome_sink.lock().unwrap() = Some(data.error.error_code);
             }
             _ => {}
         }));
@@ -3657,7 +3653,7 @@ mod interop_tests {
         assert_eq!(status, 0, "reading {address:?} back must succeed");
         assert_eq!(
             *outcome.lock().unwrap(),
-            Some(LoreErrorCode::None),
+            Some(0),
             "the read of {address:?} must report success"
         );
         read.lock().unwrap().clone()

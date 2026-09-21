@@ -4,10 +4,10 @@
 //!
 //! Per-item behaviour:
 //! - `data.len == 0`: zero-hash short-circuit; no storage work, the terminal event carries
-//!   `address = (Hash::default(), item.context)` and `error_code = NONE`.
-//! - `data.len > 0 && data.ptr == NULL`: rejects with `error_code = INVALID_ARGUMENTS`; other
-//!   items run independently.
-//! - `partition == Partition::default()`: rejects with `error_code = INVALID_ARGUMENTS`.
+//!   `address = (Hash::default(), item.context)` and an empty error detail.
+//! - `data.len > 0 && data.ptr == NULL`: rejects with `InvalidArguments`; other items run
+//!   independently.
+//! - `partition == Partition::default()`: rejects with `InvalidArguments`.
 //! - Otherwise: `write_content` with `remote_session = None` and `WriteOptions` derived from the
 //!   item's `fixed_size_chunk`; the computed address is reported back in `PUT_ITEM_COMPLETE`.
 //!
@@ -16,21 +16,15 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
-use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreBytes;
-use lore_revision::event::LoreErrorCode;
-use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
-use lore_revision::store::event::LoreStoragePutItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::options::WriteOptions;
 use lore_storage::write::write_content;
 use serde::Deserialize;
@@ -42,6 +36,7 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::PutItemOutcome;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
 use crate::storage::store::StoreInternal;
 
 /// One put item — a buffer to hash and store at `(partition, context)`.
@@ -87,24 +82,6 @@ pub struct LoreStoragePutArgs {
     pub items: LoreArray<LoreStoragePutItem>,
 }
 
-#[error_set]
-enum PutError {
-    InvalidArguments,
-}
-
-impl EventError for PutError {
-    fn translated(&self) -> LoreError {
-        match self {
-            PutError::InvalidArguments(_) => LoreError::InvalidArguments,
-            PutError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Store one or more content-addressed buffers.
 pub async fn put(
     globals: LoreGlobalArgs,
@@ -131,7 +108,7 @@ async fn put_local(
             let items = args.items.as_slice();
 
             if items.is_empty() {
-                return Ok::<(), PutError>(());
+                return Ok::<(), StorageError>(());
             }
 
             let effective = store.effective_flags(per_call)?;
@@ -152,50 +129,41 @@ async fn put_local(
 }
 
 /// Execute one item. Always emits a single `PUT_ITEM_COMPLETE` event.
-/// Returns the per-item `LoreErrorCode` so the call-level aggregator can pick the dominant
-/// failure code; `LoreErrorCode::None` means success.
+/// Returns the item's own error so the call-level reduction can pick the dominant failure.
 async fn put_item(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutItem,
     session: Option<Arc<lore_transport::StorageSession>>,
-) -> LoreErrorCode {
-    let outcome = resolve_put_item(store, item, session).await;
-    LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
-        id: item.id,
-        address: outcome.address,
-        error_code: outcome.error_code,
-        stored_local: u8::from(outcome.stored_local),
-        stored_remote: u8::from(outcome.stored_remote),
-    })
-    .send();
-    outcome.error_code
+) -> Result<(), StorageError> {
+    PutItemOutcome::emit(item.id, resolve_put_item(store, item, session).await)
 }
 
 async fn resolve_put_item(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> PutItemOutcome {
+) -> Result<PutItemOutcome, StorageError> {
     if item.partition == Partition::default() {
-        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+        return Err(invalid_item("item names the default partition"));
     }
 
     if item.data.len == 0 {
         // Zero-hash short-circuit: succeeds without storing anything, so both placement flags
-        // stay clear even though `error_code` is `None`.
-        return PutItemOutcome {
+        // stay clear even though the item succeeded.
+        return Ok(PutItemOutcome {
             address: Address {
                 hash: Hash::default(),
                 context: item.context,
             },
-            error_code: LoreErrorCode::None,
             stored_local: false,
             stored_remote: false,
-        };
+        });
     }
 
     if item.data.ptr.is_null() {
-        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+        return Err(invalid_item(
+            "item declares a non-empty buffer behind a null pointer",
+        ));
     }
 
     // SAFETY:
@@ -217,17 +185,16 @@ async fn resolve_put_item(
         write_options = write_options.with_local_cache_priority();
     }
 
-    PutItemOutcome::from_write(
-        write_content(
-            store.immutable.clone(),
-            item.partition,
-            item.context,
-            bytes,
-            write_options,
-            remote_session,
-            lore_revision::immutable::counted_write_context(),
-            None,
-        )
-        .await,
+    write_content(
+        store.immutable.clone(),
+        item.partition,
+        item.context,
+        bytes,
+        write_options,
+        remote_session,
+        lore_revision::immutable::counted_write_context(),
+        None,
     )
+    .await
+    .map(PutItemOutcome::from_write)
 }

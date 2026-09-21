@@ -14,7 +14,6 @@ mod imports {
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
     use lore_base::types::Partition;
-    use lore_revision::event::LoreErrorCode;
 }
 
 #[cfg(test)]
@@ -39,7 +38,6 @@ mod mutable_local_tests {
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
     use lore_base::types::Partition;
-    use lore_revision::event::LoreErrorCode;
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEventCallback;
@@ -138,15 +136,15 @@ mod mutable_local_tests {
     async fn store_items(
         handle_id: u64,
         items: Vec<LoreStorageMutableStoreItem>,
-    ) -> (i32, Vec<(u64, LoreErrorCode)>) {
-        let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+    ) -> (i32, Vec<(u64, i32)>) {
+        let captured: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StorageMutableStoreItemComplete(data) = event {
                 captured_for_cb
                     .lock()
                     .unwrap()
-                    .push((data.id, data.error_code));
+                    .push((data.id, data.error.error_code));
             }
         }));
         let status = mutable_store::mutable_store(
@@ -176,23 +174,22 @@ mod mutable_local_tests {
         )
         .await;
         assert_eq!(status, 0, "store must succeed");
-        assert_eq!(completes, vec![(1, LoreErrorCode::None)]);
+        assert_eq!(completes, vec![(1, 0)]);
     }
 
     /// Run a load call and return `(status, per-item (id, value, error_code))`.
     async fn load_items(
         handle_id: u64,
         items: Vec<LoreStorageMutableLoadItem>,
-    ) -> (i32, Vec<(u64, Hash, LoreErrorCode)>) {
-        let captured: Arc<Mutex<Vec<(u64, Hash, LoreErrorCode)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+    ) -> (i32, Vec<(u64, Hash, i32)>) {
+        let captured: Arc<Mutex<Vec<(u64, Hash, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StorageMutableLoadItemComplete(data) = event {
                 captured_for_cb
                     .lock()
                     .unwrap()
-                    .push((data.id, data.value, data.error_code));
+                    .push((data.id, data.value, data.error.error_code));
             }
         }));
         let status = mutable_load::mutable_load(
@@ -209,7 +206,7 @@ mod mutable_local_tests {
     }
 
     /// Load a single key and return its `(value, error_code)`.
-    async fn load_one(handle_id: u64, partition: Partition, key: Hash) -> (Hash, LoreErrorCode) {
+    async fn load_one(handle_id: u64, partition: Partition, key: Hash) -> (Hash, i32) {
         let (_status, events) = load_items(
             handle_id,
             vec![LoreStorageMutableLoadItem {
@@ -228,16 +225,16 @@ mod mutable_local_tests {
     async fn cas_items(
         handle_id: u64,
         items: Vec<LoreStorageMutableCompareAndSwapItem>,
-    ) -> (i32, Vec<(u64, Hash, LoreErrorCode)>) {
-        let captured: Arc<Mutex<Vec<(u64, Hash, LoreErrorCode)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+    ) -> (i32, Vec<(u64, Hash, i32)>) {
+        let captured: Arc<Mutex<Vec<(u64, Hash, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StorageMutableCompareAndSwapItemComplete(data) = event {
-                captured_for_cb
-                    .lock()
-                    .unwrap()
-                    .push((data.id, data.previous, data.error_code));
+                captured_for_cb.lock().unwrap().push((
+                    data.id,
+                    data.previous,
+                    data.error.error_code,
+                ));
             }
         }));
         let status = mutable_compare_and_swap::mutable_compare_and_swap(
@@ -257,9 +254,9 @@ mod mutable_local_tests {
     async fn list_items(
         handle_id: u64,
         items: Vec<LoreStorageMutableListItem>,
-    ) -> (i32, Vec<(u64, Hash, Hash)>, Vec<(u64, LoreErrorCode)>) {
+    ) -> (i32, Vec<(u64, Hash, Hash)>, Vec<(u64, i32)>) {
         let entries: Arc<Mutex<Vec<(u64, Hash, Hash)>>> = Arc::new(Mutex::new(Vec::new()));
-        let completes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let completes: Arc<Mutex<Vec<(u64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let entries_for_cb = entries.clone();
         let completes_for_cb = completes.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
@@ -273,7 +270,7 @@ mod mutable_local_tests {
                 completes_for_cb
                     .lock()
                     .unwrap()
-                    .push((data.id, data.error_code));
+                    .push((data.id, data.error.error_code));
             }
             _ => {}
         }));
@@ -296,7 +293,7 @@ mod mutable_local_tests {
         handle_id: u64,
         partition: Partition,
         key_type: KeyType,
-    ) -> (i32, Vec<(Hash, Hash)>, Option<LoreErrorCode>) {
+    ) -> (i32, Vec<(Hash, Hash)>, Option<i32>) {
         let (status, entries, completes) = list_items(
             handle_id,
             vec![LoreStorageMutableListItem {
@@ -325,7 +322,7 @@ mod mutable_local_tests {
 
         store_one(handle_id, partition, key, value).await;
         let (loaded, code) = load_one(handle_id, partition, key).await;
-        assert_eq!(code, LoreErrorCode::None);
+        assert_eq!(code, 0);
         assert_eq!(loaded, value, "load must return the stored value");
     }
 
@@ -336,7 +333,7 @@ mod mutable_local_tests {
         let key = Hash::from([0x55u8; 32]);
 
         let (value, code) = load_one(handle_id, partition, key).await;
-        assert_eq!(code, LoreErrorCode::AddressNotFound);
+        assert_eq!(code, lore_base::error::AddressNotFound::FFI_CODE);
         // Errored loads carry a zero value.
         assert_eq!(value, Hash::default());
     }
@@ -349,16 +346,13 @@ mod mutable_local_tests {
         let value = Hash::from([0x88u8; 32]);
 
         store_one(handle_id, partition, key, value).await;
-        assert_eq!(
-            load_one(handle_id, partition, key).await.1,
-            LoreErrorCode::None
-        );
+        assert_eq!(load_one(handle_id, partition, key).await.1, 0);
 
         // Storing the null value removes the key.
         store_one(handle_id, partition, key, Hash::default()).await;
         assert_eq!(
             load_one(handle_id, partition, key).await.1,
-            LoreErrorCode::AddressNotFound,
+            lore_base::error::AddressNotFound::FFI_CODE,
             "key must be gone after storing the null value",
         );
     }
@@ -386,7 +380,7 @@ mod mutable_local_tests {
         assert_eq!(status, 0);
         assert_eq!(completes.len(), 1);
         let (_id, previous, code) = completes[0];
-        assert_eq!(code, LoreErrorCode::None);
+        assert_eq!(code, 0);
         // The swap took effect: previous (zero) equals the supplied expected (zero).
         assert_eq!(previous, Hash::default());
         assert_eq!(load_one(handle_id, partition, key).await.0, value);
@@ -416,7 +410,7 @@ mod mutable_local_tests {
         .await;
         assert_eq!(status, 0);
         let (_id, previous, code) = completes[0];
-        assert_eq!(code, LoreErrorCode::None);
+        assert_eq!(code, 0);
         // previous == expected → the swap took effect.
         assert_eq!(previous, current);
         assert_eq!(load_one(handle_id, partition, key).await.0, next);
@@ -447,7 +441,7 @@ mod mutable_local_tests {
         .await;
         assert_eq!(status, 0, "a no-op CAS is still a successful call");
         let (_id, previous, code) = completes[0];
-        assert_eq!(code, LoreErrorCode::None);
+        assert_eq!(code, 0);
         // previous != expected → no swap; previous reflects the actual current value.
         assert_eq!(previous, current);
         assert_eq!(
@@ -491,8 +485,12 @@ mod mutable_local_tests {
         assert_eq!(
             completes,
             vec![
-                (1, value, LoreErrorCode::None),
-                (2, Hash::default(), LoreErrorCode::AddressNotFound),
+                (1, value, 0),
+                (
+                    2,
+                    Hash::default(),
+                    lore_base::error::AddressNotFound::FFI_CODE
+                ),
             ],
         );
     }
@@ -532,13 +530,7 @@ mod mutable_local_tests {
         .await;
         assert_eq!(status, 0, "a no-op CAS is still a successful call");
         completes.sort_by_key(|(id, _, _)| *id);
-        assert_eq!(
-            completes,
-            vec![
-                (1, Hash::default(), LoreErrorCode::None),
-                (2, current, LoreErrorCode::None),
-            ],
-        );
+        assert_eq!(completes, vec![(1, Hash::default(), 0), (2, current, 0),],);
         assert_eq!(load_one(handle_id, partition, absent).await.0, next);
         assert_eq!(
             load_one(handle_id, partition, occupied).await.0,
@@ -593,10 +585,7 @@ mod mutable_local_tests {
             vec![(1, first_key, first_value), (2, second_key, second_value),],
             "each item lists only its own partition",
         );
-        assert_eq!(
-            completes,
-            vec![(1, LoreErrorCode::None), (2, LoreErrorCode::None)],
-        );
+        assert_eq!(completes, vec![(1, 0), (2, 0)],);
     }
 
     #[tokio::test]
@@ -619,7 +608,7 @@ mod mutable_local_tests {
 
         let (status, mut entries, complete) = list_one(handle_id, partition, KEY_TYPE).await;
         assert_eq!(status, 0);
-        assert_eq!(complete, Some(LoreErrorCode::None));
+        assert_eq!(complete, Some(0));
         entries.sort();
         let mut expected = pairs.clone();
         expected.sort();
@@ -667,7 +656,7 @@ mod mutable_local_tests {
         let (status, mut entries, complete) =
             list_one(handle_id, Partition::default(), KEY_TYPE).await;
         assert_eq!(status, 0);
-        assert_eq!(complete, Some(LoreErrorCode::None));
+        assert_eq!(complete, Some(0));
         entries.sort();
         let mut expected: Vec<(Hash, Hash)> =
             a_pairs.iter().chain(b_pairs.iter()).copied().collect();
@@ -681,7 +670,7 @@ mod mutable_local_tests {
         let (single_status, mut only_a, single_complete) =
             list_one(handle_id, part_a, KEY_TYPE).await;
         assert_eq!(single_status, 0);
-        assert_eq!(single_complete, Some(LoreErrorCode::None));
+        assert_eq!(single_complete, Some(0));
         only_a.sort();
         let mut a_sorted = a_pairs.clone();
         a_sorted.sort();
@@ -702,7 +691,7 @@ mod mutable_local_tests {
             entries.is_empty(),
             "no entries expected for an empty partition"
         );
-        assert_eq!(complete, Some(LoreErrorCode::None));
+        assert_eq!(complete, Some(0));
     }
 
     #[tokio::test]
@@ -722,7 +711,7 @@ mod mutable_local_tests {
             entries.is_empty(),
             "listing a different key_type must not surface the stored entry",
         );
-        assert_eq!(complete, Some(LoreErrorCode::None));
+        assert_eq!(complete, Some(0));
     }
 
     #[tokio::test]
@@ -730,7 +719,7 @@ mod mutable_local_tests {
         let handle_id = open_in_memory().await;
         let (value, code) =
             load_one(handle_id, Partition::default(), Hash::from([0x41u8; 32])).await;
-        assert_eq!(code, LoreErrorCode::InvalidArguments);
+        assert_eq!(code, lore_base::error::InvalidArguments::FFI_CODE);
         assert_eq!(value, Hash::default());
     }
 
@@ -749,7 +738,10 @@ mod mutable_local_tests {
         )
         .await;
         assert_eq!(status, lore_base::error::InvalidArguments::FFI_CODE);
-        assert_eq!(completes, vec![(1, LoreErrorCode::InvalidArguments)]);
+        assert_eq!(
+            completes,
+            vec![(1, lore_base::error::InvalidArguments::FFI_CODE)]
+        );
     }
 
     #[tokio::test]
@@ -829,10 +821,7 @@ mod mutable_local_tests {
         completes.sort_by_key(|(id, _)| *id);
         assert_eq!(
             completes,
-            vec![
-                (1, LoreErrorCode::None),
-                (2, LoreErrorCode::InvalidArguments),
-            ],
+            vec![(1, 0), (2, lore_base::error::InvalidArguments::FFI_CODE),],
         );
     }
 

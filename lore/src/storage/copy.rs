@@ -35,7 +35,7 @@
 
 use std::sync::Arc;
 
-use lore_base::error::InvalidArguments;
+use lore_base::error::AddressNotFound;
 use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Context;
@@ -43,13 +43,11 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
-use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
-use lore_revision::interface::LoreError;
 use lore_revision::lore_debug;
 use lore_revision::store::event::LoreStorageCopyItemCompleteEventData;
+use lore_storage::StorageError;
 use lore_storage::options::ReadOptions;
 use lore_storage::read::load_fragment;
 use lore_transport::ProtocolError;
@@ -62,6 +60,8 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
+use crate::storage::invalid_item;
+use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One copy item — relocate content from `(source_partition, source_address)` to
@@ -94,24 +94,6 @@ pub struct LoreStorageCopyArgs {
     pub items: LoreArray<LoreStorageCopyItem>,
 }
 
-#[error_set]
-enum CopyError {
-    InvalidArguments,
-}
-
-impl EventError for CopyError {
-    fn translated(&self) -> LoreError {
-        match self {
-            CopyError::InvalidArguments(_) => LoreError::InvalidArguments,
-            CopyError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Copy content between partitions for one or more items.
 pub async fn copy(
     globals: LoreGlobalArgs,
@@ -137,7 +119,7 @@ async fn copy_local(
         async move |store, args| {
             let items = args.items.as_slice();
             if items.is_empty() {
-                return Ok::<(), CopyError>(());
+                return Ok::<(), StorageError>(());
             }
             let effective = store.effective_flags(per_call)?;
 
@@ -168,7 +150,9 @@ async fn copy_local(
                     reuse.session_for(&store, item.target_partition, !effective.no_remote);
                 let outcome = copy_item(store, *item, effective, session).await;
                 local_mirror_errors += usize::from(outcome.local_mirror_failed);
-                crate::storage::build_call_error(&[outcome.code], total, "copy")
+                let mut outcomes = crate::storage::ItemOutcomes::default();
+                outcomes.push(outcome.result);
+                outcomes.into_call_result(total, "copy")
             } else {
                 let mut tasks: JoinSet<CopyOutcome> = JoinSet::new();
                 for item in items.iter().copied() {
@@ -179,13 +163,18 @@ async fn copy_local(
                         copy_item(store, item, effective, session).await
                     });
                 }
-                let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
-                while let Some(result) = tasks.join_next().await {
-                    let outcome = result.unwrap_or(CopyOutcome::failed(LoreErrorCode::Internal));
-                    codes.push(outcome.code);
+                let mut outcomes = crate::storage::ItemOutcomes::default();
+                while let Some(joined) = tasks.join_next().await {
+                    let outcome = joined.unwrap_or_else(|err| {
+                        CopyOutcome::settled(Err(StorageError::internal_with_context(
+                            err,
+                            "joining copy item task",
+                        )))
+                    });
+                    outcomes.push(outcome.result);
                     local_mirror_errors += usize::from(outcome.local_mirror_failed);
                 }
-                crate::storage::build_call_error(&codes, total, "copy")
+                outcomes.into_call_result(total, "copy")
             };
 
             if local_mirror_errors > 0 {
@@ -199,25 +188,19 @@ async fn copy_local(
     .await
 }
 
-/// Per-item outcome carried back to the call's batch-level aggregator. `code` is the item-level
-/// `LoreErrorCode` (`None` on success); `local_mirror_failed` is the swallowed local-copy
-/// failure after a successful remote round-trip — see `mirror_local_durable`.
+/// Per-item outcome carried back to the call's batch-level reduction. `result` is the item's own
+/// outcome; `local_mirror_failed` is the swallowed local-copy failure after a successful remote
+/// round-trip — see `mirror_local_durable`.
 struct CopyOutcome {
-    code: LoreErrorCode,
+    result: Result<(), StorageError>,
     local_mirror_failed: bool,
 }
 
 impl CopyOutcome {
-    fn ok() -> Self {
+    /// An item whose outcome is settled and whose terminal event has been emitted.
+    fn settled(result: Result<(), StorageError>) -> Self {
         Self {
-            code: LoreErrorCode::None,
-            local_mirror_failed: false,
-        }
-    }
-
-    fn failed(code: LoreErrorCode) -> Self {
-        Self {
-            code,
+            result,
             local_mirror_failed: false,
         }
     }
@@ -234,12 +217,18 @@ async fn copy_item(
     if item.source_partition == Partition::default()
         || item.target_partition == Partition::default()
     {
-        return CopyOutcome::failed(emit_complete(&item, LoreErrorCode::InvalidArguments));
+        return CopyOutcome::settled(emit_complete(
+            &item,
+            Err(invalid_item("item names the default partition")),
+        ));
     }
     if item.source_partition == item.target_partition
         && item.source_address.context == item.target_context
     {
-        return CopyOutcome::failed(emit_complete(&item, LoreErrorCode::InvalidArguments));
+        return CopyOutcome::settled(emit_complete(
+            &item,
+            Err(invalid_item("item copies a tuple onto itself")),
+        ));
     }
 
     let Some(session) = session else {
@@ -255,14 +244,11 @@ async fn copy_item(
             )
             .await
         {
-            Ok(()) => {
-                emit_complete(&item, LoreErrorCode::None);
-                return CopyOutcome::ok();
-            }
+            Ok(()) => return CopyOutcome::settled(emit_complete(&item, Ok(()))),
             Err(err) => {
-                return CopyOutcome::failed(emit_complete(
+                return CopyOutcome::settled(emit_complete(
                     &item,
-                    crate::storage::store_error_to_code(&err),
+                    Err(err).forward("copying within the local store"),
                 ));
             }
         }
@@ -279,13 +265,21 @@ async fn copy_item(
         Ok(()) => return mirror_local_durable(&store, item, effective).await,
         Err(ProtocolError::NotFound(_) | ProtocolError::NotAuthorized(_)) => {
             if effective.no_local {
-                return CopyOutcome::failed(emit_complete(&item, LoreErrorCode::AddressNotFound));
+                return CopyOutcome::settled(emit_complete(
+                    &item,
+                    Err(StorageError::from(AddressNotFound::from(
+                        item.source_address,
+                    ))),
+                ));
             }
         }
         Err(err) => {
-            return CopyOutcome::failed(emit_complete(
+            return CopyOutcome::settled(emit_complete(
                 &item,
-                crate::storage::protocol_error_to_code(&err),
+                Err(lore_storage::error::protocol_error_to_storage(
+                    err,
+                    item.source_address,
+                )),
             ));
         }
     }
@@ -301,23 +295,20 @@ async fn copy_item(
     .await;
     let (fragment, payload) = match load {
         Ok(pair) => pair,
-        Err(err) if err.is_address_not_found() || err.is_payload_not_found() => {
-            return CopyOutcome::failed(emit_complete(&item, LoreErrorCode::AddressNotFound));
-        }
         Err(err) => {
-            return CopyOutcome::failed(emit_complete(
-                &item,
-                crate::storage::storage_error_to_code(&err),
-            ));
+            return CopyOutcome::settled(emit_complete(&item, Err(err)));
         }
     };
     if let Err(err) = session
         .put(item.source_address, fragment, Some(payload))
         .await
     {
-        return CopyOutcome::failed(emit_complete(
+        return CopyOutcome::settled(emit_complete(
             &item,
-            crate::storage::protocol_error_to_code(&err),
+            Err(lore_storage::error::protocol_error_to_storage(
+                err,
+                item.source_address,
+            )),
         ));
     }
     mirror_local_durable(&store, item, effective).await
@@ -338,8 +329,7 @@ async fn mirror_local_durable(
     effective: crate::storage::store::EffectiveFlags,
 ) -> CopyOutcome {
     if effective.no_local {
-        emit_complete(&item, LoreErrorCode::None);
-        return CopyOutcome::ok();
+        return CopyOutcome::settled(emit_complete(&item, Ok(())));
     }
     let local_failed = store
         .immutable
@@ -353,17 +343,18 @@ async fn mirror_local_durable(
         )
         .await
         .is_err();
-    emit_complete(&item, LoreErrorCode::None);
     CopyOutcome {
-        code: LoreErrorCode::None,
+        result: emit_complete(&item, Ok(())),
         local_mirror_failed: local_failed,
     }
 }
 
-/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
-/// fold the emit into the return (e.g. `CopyOutcome::failed(emit_complete(..))`).
-fn emit_complete(item: &LoreStorageCopyItem, error_code: LoreErrorCode) -> LoreErrorCode {
-    let source_address = if error_code == LoreErrorCode::None {
+/// Emit the item's terminal event and return the outcome that was sent.
+fn emit_complete(
+    item: &LoreStorageCopyItem,
+    result: Result<(), StorageError>,
+) -> Result<(), StorageError> {
+    let source_address = if result.is_ok() {
         item.source_address
     } else {
         Address::default()
@@ -374,8 +365,8 @@ fn emit_complete(item: &LoreStorageCopyItem, error_code: LoreErrorCode) -> LoreE
         target_partition: item.target_partition,
         source_address,
         target_context: item.target_context,
-        error_code,
+        error: item_detail(&result),
     })
     .send();
-    error_code
+    result
 }

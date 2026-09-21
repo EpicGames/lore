@@ -25,9 +25,7 @@ use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::event::EventError;
 use lore_revision::event::LoreEvent;
-use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
@@ -35,6 +33,7 @@ use lore_revision::repository::get_dot_lore_path;
 use lore_revision::store::event::LoreStorageOpenedEventData;
 use lore_revision::util::path::make_absolute;
 use lore_storage::MutableStore;
+use lore_storage::StorageError;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::create as create_immutable;
@@ -156,24 +155,6 @@ fn build_create_options(
     }
 }
 
-#[error_set]
-enum OpenError {
-    InvalidArguments,
-}
-
-impl EventError for OpenError {
-    fn translated(&self) -> LoreError {
-        match self {
-            OpenError::InvalidArguments(_) => LoreError::InvalidArguments,
-            OpenError::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
-}
-
 /// Acquire a handle to a content-addressed store.
 ///
 /// On success the caller receives `LORE_EVENT_STORAGE_OPENED` carrying
@@ -201,7 +182,7 @@ async fn open_local(
         // Bound `remote=1` without a `remote_config` produces a silently-broken handle —
         // every read misses local then finds no remote. Reject up front.
         if bound_flags.remote && args.has_remote_config == 0 {
-            return Err(OpenError::from(InvalidArguments {
+            return Err(StorageError::from(InvalidArguments {
                 reason: "`globals.remote=1` requires `has_remote_config != 0`".into(),
             }));
         }
@@ -226,7 +207,7 @@ async fn open_local(
                     ImmutableStoreSettings::default(),
                 )
                 .await
-                .forward_any::<OpenError>("creating in-memory immutable store")?;
+                .forward_any::<StorageError>("creating in-memory immutable store")?;
                 lore_storage::maintenance::spawn_gc(&immutable, &create_options);
                 let mutable: Arc<dyn MutableStore> = Arc::new(
                     LocalMutableStore::new(
@@ -235,7 +216,7 @@ async fn open_local(
                         immutable.clone(),
                     )
                     .await
-                    .forward::<OpenError>("creating in-memory mutable store")?,
+                    .forward::<StorageError>("creating in-memory mutable store")?,
                 );
                 (immutable, mutable)
             }
@@ -244,7 +225,7 @@ async fn open_local(
                 // canonicalize failure so the dotpath check below surfaces the real error.
                 let absolute = make_absolute(path).unwrap_or_else(|_| PathBuf::from(path));
                 let dotpath = get_dot_lore_path(&absolute).map_err(|_err| {
-                    OpenError::from(InvalidArguments {
+                    StorageError::from(InvalidArguments {
                         reason: format!(
                             "unable to find .lore directory for repository at {}",
                             absolute.display(),
@@ -255,7 +236,7 @@ async fn open_local(
                 // `LocalImmutableStore` would create the directory tree, silently fabricating
                 // a fresh repo on any path.
                 if !dotpath.is_dir() {
-                    return Err(OpenError::from(InvalidArguments {
+                    return Err(StorageError::from(InvalidArguments {
                         reason: format!(
                             "no lore repository at {} (missing {})",
                             absolute.display(),
@@ -264,7 +245,7 @@ async fn open_local(
                     }));
                 }
                 let config = repository::load_repository_config(&absolute)
-                    .forward_any::<OpenError>("loading repository config")?;
+                    .forward_any::<StorageError>("loading repository config")?;
                 let immutable = repository::create_client_immutable_store(
                     &config,
                     &dotpath,
@@ -272,15 +253,15 @@ async fn open_local(
                     false,
                 )
                 .await
-                .forward_any::<OpenError>("opening immutable store")?;
+                .forward_any::<StorageError>("opening immutable store")?;
                 let mutable: Arc<dyn MutableStore> =
                     repository::create_client_mutable_store(&config, &dotpath, immutable.clone())
                         .await
-                        .forward_any::<OpenError>("opening mutable store")?;
+                        .forward_any::<StorageError>("opening mutable store")?;
                 (immutable, mutable)
             }
             _ => {
-                return Err(OpenError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "`repository_path` non-empty requires `in_memory == 0`; \
                              `repository_path` empty requires `in_memory == 1`"
                         .into(),
@@ -291,7 +272,7 @@ async fn open_local(
         let remote = if args.has_remote_config != 0 {
             let url = args.remote_config.remote_url.as_str();
             if url.is_empty() {
-                return Err(OpenError::from(InvalidArguments {
+                return Err(StorageError::from(InvalidArguments {
                     reason: "`remote_config.remote_url` must be non-empty when \
                              `has_remote_config != 0`"
                         .into(),
@@ -320,7 +301,7 @@ async fn open_local(
             handle_id: handle.handle_id,
         })
         .send();
-        Ok::<(), OpenError>(())
+        Ok::<(), StorageError>(())
     })
     .await
 }

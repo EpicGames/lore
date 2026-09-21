@@ -301,7 +301,7 @@ pub async fn no_repository_call<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,

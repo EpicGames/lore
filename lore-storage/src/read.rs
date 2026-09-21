@@ -656,10 +656,10 @@ async fn content_payload_for_buffer(
             Ok((fragment, PayloadRead::Returned(payload))) => {
                 return Ok(Some((fragment, Some(payload))));
             }
+            // Forwarded rather than rebuilt: rebuilding put the old error's whole `Display` in
+            // the new one's context, so the caller read "Oversized: Oversized: ...".
             Err(err) if err.is_oversized() => {
-                return Err(StorageError::from(crate::errors::Oversized {
-                    context: err.to_string(),
-                }));
+                return Err(err).forward("reading the content into the caller's buffer");
             }
             Err(err) => {
                 lore_base::lore_trace!(
