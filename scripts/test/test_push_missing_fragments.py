@@ -64,6 +64,7 @@ def missing_fragments_remote_url(
 
 
 @pytest.mark.smoke
+@pytest.mark.requires_instrumented_lore
 def test_push_missing_fragments(new_lore_repo, missing_fragments_remote_url):
     repo: Lore = new_lore_repo(remote_url=missing_fragments_remote_url)
     # Generate some files

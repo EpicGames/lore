@@ -36,6 +36,7 @@ addopts = "--dist loadgroup --tb=short -rsxX"
 markers = [
     "smoke: marks as smoke test",
     "slow: marks as a slow running test",
+    "requires_instrumented_lore: marks tests that need an instrumented build",
 ]
 # A test that hangs used to take the whole run with it. Nothing in this suite
 # bounds how long a lore command may take - the helper calls `subprocess.run`
