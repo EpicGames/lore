@@ -434,3 +434,80 @@ async fn revision_tree_metadata_set_batch_survives_the_wire() {
         }
     }
 }
+
+/// A sync routed through a service carries its view filter file over the wire.
+///
+/// `view` names the file the working tree is left materialized under, and a sync that reached the
+/// service without it is a sync of the revision alone: the same call, silently doing something
+/// else. The last field of the struct, which is where a hand-written encoder stops early.
+///
+/// The arrays are compared as slices rather than with the struct: a `LoreArray` is a pointer and a
+/// count, and its equality is the pointer's, so two arrays holding equal elements at different
+/// addresses are unequal.
+#[tokio::test]
+async fn revision_sync_args_survive_the_wire() {
+    use lore::revision::LoreRevisionSyncArgs;
+
+    let args = LoreRevisionSyncArgs {
+        revision: LoreString::from_str("main@7"),
+        forward_changes: 0,
+        reset: 1,
+        root_files: LoreArray::from_vec(vec![LoreString::from_str("engine/root.uasset")]),
+        dependency_tags: LoreArray::from_vec(vec![LoreString::from_str("editor")]),
+        dependency_recursive: 1,
+        dependency_depth_limit: 3,
+        view: LoreString::from_str("/tmp/a narrow view.txt"),
+    };
+
+    for (serialization, label) in [
+        (SerializationType::Json, "json"),
+        (SerializationType::Bincode, "bincode"),
+    ] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::RevisionSync(args.clone()),
+        };
+        let message_bytes = write_v1_message(message, serialization).unwrap();
+        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+            blocking_read_v1_message(&mut message_bytes.as_slice());
+        let processed = processed
+            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
+            .expect("a whole message must be present");
+
+        match processed.1.command {
+            LoreCommand::RevisionSync(read_back) => {
+                assert_eq!(
+                    read_back.view, args.view,
+                    "{label} must carry the view unchanged"
+                );
+                assert_eq!(read_back.revision, args.revision, "{label}");
+                assert_eq!(
+                    read_back.root_files.as_slice(),
+                    args.root_files.as_slice(),
+                    "{label}"
+                );
+                assert_eq!(
+                    read_back.dependency_tags.as_slice(),
+                    args.dependency_tags.as_slice(),
+                    "{label}"
+                );
+                assert_eq!(
+                    (
+                        read_back.forward_changes,
+                        read_back.reset,
+                        read_back.dependency_recursive,
+                        read_back.dependency_depth_limit,
+                    ),
+                    (
+                        args.forward_changes,
+                        args.reset,
+                        args.dependency_recursive,
+                        args.dependency_depth_limit,
+                    ),
+                    "{label} must carry every flag unchanged"
+                );
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}

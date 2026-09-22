@@ -12,10 +12,10 @@ Run as a script, this module is the driver a test invokes as a subprocess:
     python lore_ffi.py auth-user-info <library-path> <repository-path> [user-id...]
     python lore_ffi.py service-start <library-path>
     python lore_ffi.py service-stop <library-path>
+    python lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
 
-exiting with the call's FFI code. Tests go through
-`Lore.auth_user_info_capi()` and `Lore.service_capi()` rather than importing
-`LoreLibrary` directly:
+exiting with the call's FFI code. Tests go through `Lore`'s `*_capi` methods
+rather than importing `LoreLibrary` directly:
 loading the library into the pytest process would leak its global state
 (connection and authz caches, the tokio runtime, a panic hook) across every
 test sharing that xdist worker, let a panic in the library take the worker
@@ -138,6 +138,22 @@ class LoreServiceStopArgs(Structure):
     _fields_ = [("_unused", c_int)]
 
 
+class LoreRevisionSyncArgs(Structure):
+    """`lore_revision_sync_args_t`. `view` names the view filter file the
+    working tree is left materialized under, empty to keep the instance's own."""
+
+    _fields_ = [
+        ("revision", LoreString),
+        ("forward_changes", c_uint8),
+        ("reset", c_uint8),
+        ("root_files", LoreStringArray),
+        ("dependency_tags", LoreStringArray),
+        ("dependency_recursive", c_uint8),
+        ("dependency_depth_limit", c_uint32),
+        ("view", LoreString),
+    ]
+
+
 # Every struct above, paired with the header type it mirrors. A struct bound
 # here belongs in this list: it is what test_lore_ffi.py checks the mirrors
 # against, so a field added to the C API is reported as a named mismatch rather
@@ -150,6 +166,7 @@ MIRRORED_STRUCTS = [
     ("lore_auth_user_info_args_t", LoreAuthUserInfoArgs),
     ("lore_service_start_args_t", LoreServiceStartArgs),
     ("lore_service_stop_args_t", LoreServiceStopArgs),
+    ("lore_revision_sync_args_t", LoreRevisionSyncArgs),
 ]
 
 # One field per line, either a function pointer (`void (*func)(...)`) or a plain
@@ -206,6 +223,12 @@ class LoreLibrary:
             POINTER(LoreServiceStopArgs),
             LoreEventCallbackConfig,
         ]
+        self._lib.lore_revision_sync.restype = c_int32
+        self._lib.lore_revision_sync.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreRevisionSyncArgs),
+            LoreEventCallbackConfig,
+        ]
 
     def auth_user_info(self, repository_path: str, user_ids: list[str]) -> int:
         """Call `lore_auth_user_info` (the SDK's `authUserInfo`) without an
@@ -252,11 +275,36 @@ class LoreLibrary:
             LoreEventCallbackConfig(0, None),
         )
 
+    def revision_sync(self, repository_path: str, view: str) -> int:
+        """Call `lore_revision_sync` with `view` and nothing else set, returning
+        its FFI code.
+
+        The entry point an SDK consumer reaches a view change through. `view`
+        empty is the call every consumer that does not want one makes, and has
+        to leave the instance's own view standing.
+        """
+        # Encoded buffers must outlive the call; keep references on the stack.
+        path_bytes = repository_path.encode()
+        view_bytes = view.encode()
+
+        globals_args = LoreGlobalArgs()
+        globals_args.repository_path = LoreString(path_bytes, len(path_bytes))
+
+        args = LoreRevisionSyncArgs()
+        args.view = LoreString(view_bytes, len(view_bytes))
+
+        return self._lib.lore_revision_sync(
+            ctypes.byref(globals_args),
+            ctypes.byref(args),
+            LoreEventCallbackConfig(0, None),
+        )
+
 
 USAGE = """usage:
   lore_ffi.py auth-user-info <library-path> <repository-path> [user-id...]
   lore_ffi.py service-start <library-path>
-  lore_ffi.py service-stop <library-path>"""
+  lore_ffi.py service-stop <library-path>
+  lore_ffi.py revision-sync <library-path> <repository-path> <view-file>"""
 
 
 def main(argv: list[str]) -> int:
@@ -267,6 +315,8 @@ def main(argv: list[str]) -> int:
             return LoreLibrary(library_path).service_start()
         case ["service-stop", library_path]:
             return LoreLibrary(library_path).service_stop()
+        case ["revision-sync", library_path, repository_path, view]:
+            return LoreLibrary(library_path).revision_sync(repository_path, view)
         case _:
             print(USAGE, file=sys.stderr)
             return 2

@@ -36,10 +36,12 @@ import shutil
 import statistics
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import pytest
+from cleanup_util import remove_tree
 from lore_parsers import parse_jsonl
 
 from lore import Lore
@@ -217,9 +219,31 @@ class Summarized:
         )
 
 
-def interleaved(
-    rows: list[tuple[Lore, str, list[str]]], counts: Path
-) -> list[Summarized]:
+# What a row answers when a pass asks it for its work: the client arguments, and the
+# working tree to run them against, which is the instance's own where it is None.
+Command = Callable[[], tuple[list[str], str | None]]
+
+
+@dataclass
+class Row:
+    """One command a pass runs.
+
+    `command` answers the arguments and the working tree to run them against, and is
+    asked once per pass rather than held: a clone names a directory it is about to
+    create, which is a different one every pass.
+    """
+
+    instance: Lore
+    label: str
+    command: Command
+
+
+def against_its_own_tree(args: list[str]) -> Command:
+    """A command that is the same every pass, run against the instance's own tree."""
+    return lambda: (args, None)
+
+
+def interleaved(rows: list[Row], counts: Path) -> list[Summarized]:
     """Runs every row once per pass, answering what each cost across them.
 
     Interleaved rather than one row at a time, so a drift in the machine's state
@@ -227,10 +251,13 @@ def interleaved(
     instances as it found them, which is what makes a pass repeatable: a sync that
     carries nothing carries nothing again, and the view rows alternate.
     """
-    runs: dict[str, list[Measured]] = {label: [] for _instance, label, _args in rows}
+    runs: dict[str, list[Measured]] = {row.label: [] for row in rows}
     for _pass in range(PASSES):
-        for instance, label, args in rows:
-            runs[label].append(timed_lore(instance, label, args, None, counts))
+        for row in rows:
+            args, path = row.command()
+            runs[row.label].append(
+                timed_lore(row.instance, row.label, args, path, counts)
+            )
     return [
         Summarized(
             label=label,
@@ -243,9 +270,59 @@ def interleaved(
     ]
 
 
+def clone_targets(instance: Lore, scratch_dir) -> Callable[[], Path]:
+    """Hands out a clone directory, having removed every one handed out before it.
+
+    Shared by the clone rows rather than held one per row, and the removal and the
+    prune both happen before the pass is timed. A clone registers its instance, and
+    registering lists every instance the repository holds and reads each one's
+    metadata, so what a clone costs depends on how many stand. A row removing only
+    its own previous target leaves its sibling's standing: the first clone of the
+    first row runs with none of them and every clone after it with one, which makes
+    that row's first pass its cheapest for a reason that is not the command.
+    Removing both before either is timed leaves every clone the same instances to
+    register against.
+    """
+    handed_out: list[Path] = []
+
+    def fresh() -> Path:
+        for target in handed_out:
+            remove_tree(target, label="clone target")
+        handed_out.clear()
+        instance.run(["repository", "instance", "prune"], offline=True)
+        target = Path(scratch_dir("clone"))
+        target.mkdir(parents=True, exist_ok=True)
+        instance.created_paths.append(str(target))
+        handed_out.append(target)
+        return target
+
+    return fresh
+
+
+def into_a_fresh_directory(
+    fresh: Callable[[], Path], remote_path: str, view: str | None
+) -> Command:
+    """A clone, which names a directory it creates and so needs a new one per pass."""
+
+    def command() -> tuple[list[str], str | None]:
+        target = fresh()
+        arguments = ["repository", "clone", remote_path, str(target)]
+        if view:
+            arguments += ["--view", view]
+        return arguments, str(target)
+
+    return command
+
+
 @pytest.mark.slow
 def test_view_change_against_the_clone_it_replaces(new_lore_repo, scratch_dir):
-    """A narrowing, a widening, and the clones each would otherwise be."""
+    """A narrowing, a widening, and the clones each would otherwise be.
+
+    The rows are read against each other, so they are interleaved: what a view
+    change is worth is the gap between a sync row and the clone row producing the
+    same working tree, and a gap between two blocks of runs is the machine's as
+    much as it is the commands'.
+    """
     repo: Lore = new_lore_repo()
     write_tree(repo)
     repo.stage(scan=True)
@@ -257,34 +334,38 @@ def test_view_change_against_the_clone_it_replaces(new_lore_repo, scratch_dir):
 
     counts = Path(scratch_dir("allocations", create=True))
     instance = repo.clone()
-    # The re-applied view carries nothing, so what it costs is what a sync costs
-    # before any change is realized -- the baseline the other rows are read against.
-    syncs = [
-        ("sync --view (narrowing)", narrow),
-        ("sync --view (re-applied, carries nothing)", narrow),
-        ("sync --view (widening)", wide),
+    fresh_clone_target = clone_targets(instance, scratch_dir)
+    rows = [
+        # The re-applied view carries nothing, so what it costs is what a sync costs
+        # before any change is realized -- the baseline the other rows are read
+        # against. The three run in this order, which is what makes a pass repeatable.
+        (
+            "sync --view (narrowing)",
+            against_its_own_tree(["sync", "--view", narrow]),
+        ),
+        (
+            "sync --view (re-applied, carries nothing)",
+            against_its_own_tree(["sync", "--view", narrow]),
+        ),
+        ("sync --view (widening)", against_its_own_tree(["sync", "--view", wide])),
+        (
+            "clone --view (narrow)",
+            into_a_fresh_directory(fresh_clone_target, repo.remote_path, narrow),
+        ),
+        (
+            "clone (whole tree)",
+            into_a_fresh_directory(fresh_clone_target, repo.remote_path, None),
+        ),
     ]
-    measurements = [
-        timed_lore(instance, label, ["sync", "--view", view], instance.path, counts)
-        for label, view in syncs
-    ]
-
-    for label, view in [
-        ("clone --view (narrow)", narrow),
-        ("clone (whole tree)", None),
-    ]:
-        target = Path(scratch_dir("clone"))
-        target.mkdir(parents=True, exist_ok=True)
-        instance.created_paths.append(str(target))
-        arguments = ["repository", "clone", repo.remote_path, str(target)]
-        if view:
-            arguments += ["--view", view]
-        measurements.append(timed_lore(instance, label, arguments, str(target), counts))
+    measurements = interleaved(
+        [Row(instance, label, command) for label, command in rows], counts
+    )
 
     logger.info(
-        "View change over %d files in %d directories:\n%s",
+        "View change over %d files in %d directories, %d passes:\n%s",
         FILES,
         DIRECTORIES,
+        PASSES,
         "\n".join(str(measurement) for measurement in measurements),
     )
     print(json.dumps([asdict(measurement) for measurement in measurements], indent=2))
@@ -323,17 +404,19 @@ def test_layer_mount_view_change(new_lore_repo, scratch_dir):
     counts = Path(scratch_dir("allocations", create=True))
     instance = plain.clone()
     rows = [
-        (instance, "sync (no layer configured)", ["sync"]),
-        (repo, "sync (layer at a standing revision)", ["sync"]),
-        (
+        Row(instance, "sync (no layer configured)", against_its_own_tree(["sync"])),
+        Row(
+            repo, "sync (layer at a standing revision)", against_its_own_tree(["sync"])
+        ),
+        Row(
             repo,
             "sync --view (mount leaving the view)",
-            ["sync", "--view", views["mount-out"]],
+            against_its_own_tree(["sync", "--view", views["mount-out"]]),
         ),
-        (
+        Row(
             repo,
             "sync --view (mount entering the view)",
-            ["sync", "--view", views["wide"]],
+            against_its_own_tree(["sync", "--view", views["wide"]]),
         ),
     ]
     measurements = interleaved(rows, counts)

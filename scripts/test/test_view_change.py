@@ -739,3 +739,96 @@ def test_sync_view_carries_a_link_mount_out_of_view_and_back(
     assert materialized(instance) == whole, (
         "a widening reads the mount back from the linked repository's store"
     )
+
+
+@pytest.mark.smoke
+def test_sync_view_reads_a_view_file_whose_path_holds_spaces(
+    new_lore_repo, scratch_dir
+):
+    """The path named after `--view` reaches the operation whole.
+
+    It is a filesystem path from the user, so it holds whatever the filesystem
+    allows: a space is what a path arriving split rather than whole fails on
+    first, and the failure is a view file reported missing or one silently read
+    as empty, which materializes the whole repository.
+    """
+    repo = committed_repository(new_lore_repo)
+    instance = repo.clone()
+    spaced = view_file(scratch_dir, "a narrow view", NARROW_VIEW)
+    assert " " in os.path.basename(spaced), "the view file's path holds a space"
+
+    _output, realized = sync_view(instance, spaced)
+
+    assert not instance.path_exists(DROPPED_DIRECTORY), (
+        "the view named by a path holding spaces is the one applied"
+    )
+    assert realized == Realized(files_written=0, bytes_written=0, files_deleted=3), (
+        "the narrowing is carried whole, not partly"
+    )
+    assert_status_clean(instance, "the instance is coherent with the view it read")
+
+
+@pytest.mark.smoke
+def test_sync_view_through_the_c_api(new_lore_repo, scratch_dir, lore_library_path):
+    """A view change driven through `lore_revision_sync`, the entry point an SDK
+    consumer reaches it through.
+
+    The C struct is laid out by the caller, so the field order and widths are the
+    caller's to get right and the library reads them out of memory the caller
+    allocated. A sync asked for with no view leaves the instance's own standing,
+    which is every consumer that wants no view change.
+    """
+    repo = committed_repository(new_lore_repo)
+    instance = repo.clone()
+    narrow = view_file(scratch_dir, "capi-narrow", NARROW_VIEW)
+
+    assert instance.revision_sync_capi(lore_library_path, narrow) == 0, (
+        "a view change through the C API succeeds"
+    )
+    assert not instance.path_exists(DROPPED_DIRECTORY), (
+        "the view file named in the struct is the one applied"
+    )
+    assert stored_view(instance) == "assets/drop\n", "the view is published"
+    assert_status_clean(instance, "a C API view change leaves a coherent instance")
+
+    assert instance.revision_sync_capi(lore_library_path) == 0, (
+        "a sync naming no view succeeds"
+    )
+    assert stored_view(instance) == "assets/drop\n", (
+        "a sync naming no view leaves the view the instance holds standing"
+    )
+    assert not instance.path_exists(DROPPED_DIRECTORY), (
+        "and leaves the working tree the view materializes as it stands"
+    )
+
+
+@pytest.mark.smoke
+def test_sync_view_leaves_another_instance_over_the_same_store_alone(
+    new_lore_repo, scratch_dir
+):
+    """A view is the instance's, not the store's.
+
+    Two instances over one shared store hold one copy of the fragments and one
+    copy of the cache between them, and a view change reads and writes both. What
+    it must not reach is the other instance: its view file and its working tree
+    are its own, and a narrowing in one leaving the other narrowed would empty a
+    working tree nobody asked about.
+    """
+    repo = committed_repository(new_lore_repo)
+    repo.shared_store_create(repo.remote)
+    first = repo.clone(use_shared_store=True)
+    second = repo.clone(use_shared_store=True)
+    narrow = view_file(scratch_dir, "shared-narrow", NARROW_VIEW)
+    whole = materialized(second)
+
+    sync_view(first, narrow)
+
+    assert not first.path_exists(DROPPED_DIRECTORY), "the instance asked is narrowed"
+    assert stored_view(first) == "assets/drop\n", (
+        "and publishes the view it stands under"
+    )
+    assert stored_view(second) is None, "the other instance holds no view of its own"
+    assert materialized(second) == whole, (
+        "and its working tree is left as it stands, whole"
+    )
+    assert_status_clean(second, "the other instance is coherent with its own view")

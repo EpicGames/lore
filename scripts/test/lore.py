@@ -1708,36 +1708,26 @@ class Lore:
             **kwargs,
         )
 
-    def auth_user_info_capi(
-        self, library_path: str, user_ids: str | list[str] | None = None
-    ) -> int:
-        """Resolve user IDs through the public C API, returning the FFI code.
+    def _capi_driver(self, library_path: str, command: str, *args: str) -> int:
+        """Runs `lore_ffi.py` as a subprocess, returning the FFI code the call it
+        drives answered: 0 on success, the failing error's code otherwise.
 
-        `authUserInfo` has no CLI surface — the commands that resolve display
-        names discard failures — so this drives `liblore` directly, the same
-        entry point the SDK binds. The call runs in a subprocess so it reads
-        this repository's isolated auth and global directories, and so a crash
-        in the library fails this test rather than the whole pytest worker.
+        Out of process so the call reads this repository's isolated auth and
+        global directories, and so a crash in the library fails one test rather
+        than the pytest worker sharing it. Run from the repository, as `run()`
+        does: repository discovery falls back to the working directory, and the
+        checkout pytest runs from is itself a repository — inheriting that cwd
+        would let a bad repository path silently resolve somewhere else.
         """
-        if user_ids is None:
-            user_ids = []
-        elif isinstance(user_ids, str):
-            user_ids = [user_ids]
-
         command_args = [
             sys.executable,
             str(Path(__file__).with_name("lore_ffi.py")),
-            "auth-user-info",
+            command,
             library_path,
-            self.path,
-            *user_ids,
+            *args,
         ]
         command_string = " ".join(command_args)
         logger.info("Executing Lore C API driver: %s", command_string)
-        # Run from the repository, as `run()` does: repository discovery falls
-        # back to the working directory, and the checkout pytest runs from is
-        # itself a repository — inheriting that cwd would let a bad repository
-        # path silently resolve somewhere else.
         result = subprocess.run(
             command_args,
             capture_output=True,
@@ -1753,38 +1743,42 @@ class Lore:
         )
         return result.returncode
 
+    def auth_user_info_capi(
+        self, library_path: str, user_ids: str | list[str] | None = None
+    ) -> int:
+        """Resolve user IDs through the public C API, returning the FFI code.
+
+        `authUserInfo` has no CLI surface — the commands that resolve display
+        names discard failures — so this drives `liblore` directly, the same
+        entry point the SDK binds.
+        """
+        if user_ids is None:
+            user_ids = []
+        elif isinstance(user_ids, str):
+            user_ids = [user_ids]
+
+        return self._capi_driver(library_path, "auth-user-info", self.path, *user_ids)
+
     def service_capi(self, library_path: str, command: str) -> int:
         """Start or stop the service through the public C API, returning the FFI
         code. `command` is `service-start` or `service-stop`.
 
         The CLI's `service start`/`stop` wrap these, so a test driving the CLI
         covers the wrapper rather than the entry point an SDK consumer calls.
-        Run in a subprocess for the reasons `auth_user_info_capi` is: this
-        repository's isolated directories, and a crash failing one test rather
-        than the pytest worker. It matters twice over here — the library records
-        a service running in its own process, which no later test could undo.
+        Running out of process matters twice over here: the library records a
+        service running in its own process, which no later test could undo.
         """
-        command_args = [
-            sys.executable,
-            str(Path(__file__).with_name("lore_ffi.py")),
-            command,
-            library_path,
-        ]
-        logger.info("Executing Lore C API driver: %s", " ".join(command_args))
-        result = subprocess.run(
-            command_args,
-            capture_output=True,
-            text=True,
-            env=self._subprocess_env(),
-            cwd=self.path if os.path.isdir(self.path) else None,
-        )
-        logger.info(
-            "Lore C API driver (%s) exited %s, output:\n%s",
-            command,
-            result.returncode,
-            result.stdout + result.stderr,
-        )
-        return result.returncode
+        return self._capi_driver(library_path, command)
+
+    def revision_sync_capi(self, library_path: str, view: str = "") -> int:
+        """Sync through the public C API, returning the FFI code.
+
+        The CLI fills `lore_revision_sync_args_t` from its own flags, so driving
+        it covers the mapping rather than the struct. A consumer that lays the
+        struct out itself is the one the field order and widths have to be right
+        for, and the library reads them out of memory that consumer allocated.
+        """
+        return self._capi_driver(library_path, "revision-sync", self.path, view)
 
     def layer_add(
         self,

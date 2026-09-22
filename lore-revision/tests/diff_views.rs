@@ -22,7 +22,6 @@ mod tests {
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
-    use lore_revision::change::NodeChange;
     use lore_revision::change::sort_by_path;
     use lore_revision::filter::FilterMode;
     use lore_revision::interface::ExecutionContext;
@@ -299,7 +298,7 @@ mod tests {
             )
             .await
             .expect("Failed to diff the two revisions");
-            reported(&changes)
+            test_reported(&changes)
         }
 
         /// What a walk over `path` emitted, and what it reported of itself.
@@ -337,7 +336,7 @@ mod tests {
                 .await
                 .expect("Failed to diff the two revisions");
             sort_by_path(&mut collected);
-            (reported(&collected), stats)
+            (test_reported(&collected), stats)
         }
 
         /// [`Fixture::changes`] with the number of filter-exclude events the walk sent.
@@ -362,20 +361,14 @@ mod tests {
         }
     }
 
-    /// The action letter against the path for each change.
+    /// `changes` ordered by path and then by action.
     ///
-    /// The action is carried because the two sides route a path by which of them admits it, and a
-    /// path alone does not say which route it took.
-    fn reported(changes: &[NodeChange]) -> Vec<(String, String)> {
+    /// The walk's own order is `change::sort_by_path`, which sorts by path alone and unstably, so
+    /// two records standing at one path arrive in no defined order. Imposing one here is what makes
+    /// the pair a retype emits readable as a list.
+    fn by_path_and_action(mut changes: Vec<(String, String)>) -> Vec<(String, String)> {
+        changes.sort_by(|left, right| (&left.1, &left.0).cmp(&(&right.1, &right.0)));
         changes
-            .iter()
-            .map(|change| {
-                (
-                    change.action.as_string_short().to_string(),
-                    change.path().as_str().to_string(),
-                )
-            })
-            .collect()
     }
 
     /// An execution that counts the filter-exclude events sent under it.
@@ -584,6 +577,38 @@ mod tests {
                         ("D".to_string(), HELD.to_string()),
                     ],
                     "the delete names the file the working tree holds, not the one arriving"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A path that is a file in one revision and a directory in the next leaves the working tree
+    /// and arrives again: the file is deleted, the directory added at the same path, and what that
+    /// directory holds added below it.
+    ///
+    /// Both records stand at the one path, which no view moves, so this is what a retype costs
+    /// before any view has a say -- and the case the exclusion below narrows.
+    #[tokio::test]
+    async fn a_retype_is_deleted_and_added_at_the_one_path() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_retyping(immutable_store, mutable_store).await;
+                let repository = fixture.view(&[]);
+
+                assert_eq!(
+                    by_path_and_action(fixture.changes(repository.clone(), repository).await),
+                    vec![
+                        ("M".to_string(), FILE.to_string()),
+                        ("A".to_string(), RETYPED.to_string()),
+                        ("D".to_string(), RETYPED.to_string()),
+                        ("A".to_string(), RETYPED_FILE.to_string()),
+                    ],
+                    "a retyped path leaves as the file it was and arrives as the directory it \
+                     becomes, carrying what that directory holds"
                 );
             }))
             .await
