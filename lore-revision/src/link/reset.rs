@@ -5,6 +5,7 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use super::LinkError;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::link;
 use crate::link::LinkFlags;
@@ -154,11 +155,10 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .forward::<LinkError>("Failed to restore link registry entry")?;
 
-    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
-    lore_io::IoDriver::global()
-        .create_dir_all(absolute_path.as_path())
+    operation
+        .create_dir_all(&link_path)
         .await
-        .internal("recreating the link directory")?;
+        .forward::<LinkError>("Failed to recreate the link directory")?;
 
     link::realize_link_pin_change_in_operation(
         operation,

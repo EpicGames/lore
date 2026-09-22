@@ -9,6 +9,7 @@ use crate::branch;
 use crate::errors::InvalidPath;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -242,33 +243,6 @@ pub async fn add(
 
     let clone_path = link_path.clone();
 
-    // If a directory already exists, make sure it doesn't have any children
-    let link_path_exists = match lore_io::IoDriver::global()
-        .read_dir(clone_path.to_absolute_path(repository.require_path()?))
-        .await
-    {
-        Ok(mut entries) => {
-            if entries
-                .next()
-                .await
-                .transpose()
-                .internal("Failed to check link path")?
-                .is_some()
-            {
-                return Err(LinkError::internal(format!(
-                    "Link path already has children {clone_path}"
-                )));
-            }
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => {
-            return Err(LinkError::internal(format!(
-                "Failed to check link path: {error}"
-            )));
-        }
-    };
-
     // Resolve through any parent links so the link lands in the innermost
     // containing repository (empty chain for a plain top-level link).
     let chain = link::resolve_link_chain(
@@ -345,7 +319,6 @@ pub async fn add(
             chain.innermost.clone(),
             remainder_parent,
             &clone_path,
-            link_path_exists,
         )
         .await
     })
@@ -477,15 +450,50 @@ pub async fn add(
 /// Creates the directory the link mounts at and the one holding it, and stages the intermediate
 /// path against the innermost repository.
 ///
-/// One operation covers all three: the directory the link is placed in, the path staged against
-/// the innermost repository, and the mount directory itself are in the same filesystem.
+/// A mount point the filesystem already holds is taken only as an empty directory: a file, or a
+/// directory with children, is something the link would displace.
+///
+/// One operation covers all of it: the mount point, the directory the link is placed in, the path
+/// staged against the innermost repository, and the mount directory itself are in the same
+/// filesystem.
 async fn create_link_mount(
     operation: &Arc<InstanceOperationImpl>,
     innermost: NodeMapping,
     remainder_parent: RelativePathBuf,
     clone_path: &RelativePath,
-    link_path_exists: bool,
 ) -> Result<(), LinkError> {
+    let mount_info = operation
+        .file_info(clone_path)
+        .await
+        .forward_with::<LinkError, _>(|| format!("Failed to check link path {clone_path}"))?;
+    match mount_info {
+        FileInfo::NotExist => {}
+        FileInfo::Directory => {
+            let mut entries = operation
+                .read_directory(clone_path)
+                .await
+                .forward_with::<LinkError, _>(|| {
+                    format!("Failed to check link path {clone_path}")
+                })?;
+            if entries
+                .next()
+                .await
+                .transpose()
+                .forward_with::<LinkError, _>(|| format!("Failed to check link path {clone_path}"))?
+                .is_some()
+            {
+                return Err(LinkError::internal(format!(
+                    "Link path already has children {clone_path}"
+                )));
+            }
+        }
+        FileInfo::File { .. } => {
+            return Err(LinkError::internal(format!(
+                "Link path is a file {clone_path}"
+            )));
+        }
+    }
+
     let parent_path = clone_path.parent_path();
     if !operation
         .file_info(&parent_path)
@@ -519,7 +527,7 @@ async fn create_link_mount(
         .forward::<LinkError>("Failed staging the link node")?;
     }
 
-    if !link_path_exists {
+    if mount_info == FileInfo::NotExist {
         lore_debug!("Creating directory {clone_path}");
         operation
             .create_dir_all(clone_path)
