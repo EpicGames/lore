@@ -884,3 +884,409 @@ def test_sync_reports_a_file_it_cannot_read(new_lore_repo):
         )
     finally:
         os.chmod(clone_file_path, 0o644)
+
+
+@pytest.mark.smoke
+def test_sync_remote_explicit_revision(new_lore_repo):
+    """
+    Syncing to a revision named with --remote advances the local branch latest
+    to it, leaving the branch standing at the remote revision it was synced to
+    rather than behind it.
+    """
+    repo = new_lore_repo()
+
+    with repo.open_file("file1.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file1.txt")
+    repo.commit("Commit 1")
+    repo.push()
+
+    # Cloned ahead of the merge below, so the clone's branch latest stands behind the
+    # remote's rather than at it.
+    clone = repo.clone()
+    base_revision = clone.branch_info("main").local_latest
+
+    repo.branch_create("feature")
+    with repo.open_file("file2.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file2.txt")
+    repo.commit("Feature commit")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_merge_start("feature", message="Merge feature into main")
+    repo.push()
+
+    merge_revision = repo.branch_info("main").local_latest
+    assert merge_revision != base_revision
+
+    before = clone.branch_info("main")
+    assert before.local_latest == base_revision
+    assert before.remote_latest == merge_revision
+
+    clone.sync(merge_revision, remote=True)
+
+    after = clone.branch_info("main")
+    assert after.local_latest == merge_revision
+    assert after.local_latest == after.remote_latest
+
+
+def _two_pushed_revisions(repo):
+    with repo.open_file("file1.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file1.txt")
+    repo.commit("Commit 1")
+    repo.push()
+
+    base_revision = repo.branch_info("main").local_latest
+
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v2")
+    repo.stage("file1.txt")
+    repo.commit("Commit 2")
+    repo.push()
+
+    tip_revision = repo.branch_info("main").local_latest
+    assert tip_revision != base_revision
+    return base_revision, tip_revision
+
+
+@pytest.mark.smoke
+def test_sync_remote_historical_revision_keeps_latest(new_lore_repo):
+    """
+    Syncing back to a revision the branch latest already stands ahead of keeps that
+    latest: the revision is taken without the branch being recorded behind where it
+    already reached.
+    """
+    repo = new_lore_repo()
+    base_revision, tip_revision = _two_pushed_revisions(repo)
+
+    # Cloned at the tip, so the latest stands ahead of the revision synced to
+    # below and where the pointer ends up is visible.
+    clone = repo.clone()
+    assert clone.branch_info("main").local_latest == tip_revision
+
+    clone.sync(base_revision, remote=True)
+
+    after = clone.branch_info("main")
+    assert after.local_latest == tip_revision
+    assert after.remote_latest == tip_revision
+
+
+def _clone_with_unpushed_commit(repo, tip_revision):
+    clone = repo.clone()
+
+    # Committed and not pushed, which is what stands the branch divergent.
+    with clone.open_file("local.txt", "w+") as f:
+        f.write("local")
+    clone.stage("local.txt")
+    clone.commit("Local commit")
+
+    local_revision = clone.branch_info("main").local_latest
+    assert local_revision != tip_revision
+    return clone, local_revision
+
+
+@pytest.mark.smoke
+def test_sync_remote_historical_revision_keeps_divergent_latest(new_lore_repo):
+    """
+    A branch holding a revision the remote does not keeps its latest when syncing
+    back to an earlier remote revision, that revision staying reachable.
+    """
+    repo = new_lore_repo()
+    base_revision, tip_revision = _two_pushed_revisions(repo)
+    clone, local_revision = _clone_with_unpushed_commit(repo, tip_revision)
+
+    clone.sync(base_revision, remote=True)
+
+    assert clone.branch_info("main").local_latest == local_revision
+
+
+@pytest.mark.smoke
+def test_sync_remote_tip_keeps_divergent_latest(new_lore_repo):
+    """
+    A branch holding a revision the remote does not keeps its latest when syncing
+    to the remote's own tip: the revision is taken, and the branch is not recorded
+    as convergent on a tip that does not carry it.
+    """
+    repo = new_lore_repo()
+    _base_revision, tip_revision = _two_pushed_revisions(repo)
+    clone, local_revision = _clone_with_unpushed_commit(repo, tip_revision)
+
+    clone.sync(tip_revision, remote=True)
+
+    assert clone.branch_info("main").local_latest == local_revision
+
+    # Still divergent, so a sync given no revision stages a merge and leaves the latest
+    # on the unpushed revision. A branch recorded convergent would advance onto the tip
+    # instead, leaving that revision behind.
+    clone.sync()
+    assert clone.branch_info("main").local_latest == local_revision
+
+
+@pytest.mark.smoke
+def test_sync_layer_matched_revision_keeps_latest(new_lore_repo):
+    """
+    Where a layer carries the sync target back to the nearest main revision it matches,
+    the branch latest is read off that revision. It stands ahead of the matched one, so
+    it keeps where it is rather than being rewound onto it.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    # Both take the default commit message, which is what the layer matches on.
+    repo.write_commit_push(None, {"main.txt": b"v1"})
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(None, {"lay/data.txt": b"initial"})
+    repo.layer_add("lay", layer_repo, "lay/", metadata="message")
+
+    matched_revision = repo.branch_info("main").local_latest
+
+    # Main revisions the layer matches nothing of, so matching has to walk back.
+    for i in (2, 3):
+        with repo.open_file("main.txt", "wb") as f:
+            f.write(f"v{i}".encode())
+        repo.stage(scan=True)
+        repo.commit(f"no-match-{i}", non_interactive=True)
+    repo.push()
+
+    latest_revision = repo.branch_info("main").local_latest
+    assert latest_revision != matched_revision
+
+    # Pushed from elsewhere, so the revision asked for below stands ahead of the
+    # latest this instance holds and would advance it on its own.
+    other = repo.clone()
+    other.write_commit_push("no-match-4", {"main.txt": b"v4"})
+    requested_revision = other.branch_info("main").local_latest
+    assert requested_revision != latest_revision
+
+    repo.sync(requested_revision, search_nearest=True)
+
+    # The layer carried the target back, which is what puts the latest at risk.
+    assert repo.revision_info().signature == matched_revision
+
+    assert repo.branch_info("main").local_latest == latest_revision
+
+
+@pytest.mark.smoke
+def test_sync_revision_advances_latest_without_remote_flag(new_lore_repo):
+    """
+    Syncing to the remote's tip advances the branch latest without --remote being
+    given: a search of both the remote and the local history reads the remote too.
+    A sync under --local advances nothing, having no remote answer to stand on.
+    """
+    repo = new_lore_repo()
+    base_revision, tip_revision = _two_pushed_revisions(repo)
+
+    clone = repo.clone(revision=base_revision)
+    assert clone.branch_info("main").local_latest == base_revision
+
+    # Carries the working tree to the tip and leaves the latest behind, there being no
+    # remote answer to record it against.
+    clone.sync(tip_revision, local=True)
+    assert clone.branch_info("main").local_latest == base_revision
+
+    # The tree already stands at the revision, so the latest is all a sync has left to
+    # record. A dry run records nothing.
+    clone.sync(tip_revision, dry_run=True)
+    assert clone.branch_info("main").local_latest == base_revision
+
+    clone.sync(tip_revision)
+
+    after = clone.branch_info("main")
+    assert after.local_latest == tip_revision
+    assert after.local_latest == after.remote_latest
+
+
+@pytest.mark.smoke
+def test_sync_remote_tip_behind_latest_keeps_latest(new_lore_repo):
+    """
+    A remote carried back to an earlier revision leaves a tip numbered below the branch
+    latest. Syncing to that tip takes the revision without standing the latest back on
+    it, the revisions the branch already tracks staying tracked.
+    """
+    repo = new_lore_repo()
+
+    for i in (1, 2, 3):
+        with repo.open_file("file1.txt", "w+") as f:
+            f.write(f"v{i}")
+        repo.stage("file1.txt")
+        repo.commit(f"Commit {i}")
+    repo.push()
+
+    first_revision = repo.revision_info("main@1").signature
+    latest_revision = repo.branch_info("main").local_latest
+
+    # Cloned at the third revision, so the latest stands ahead of the tip left below.
+    clone = repo.clone()
+    assert clone.branch_info("main").local_latest == latest_revision
+
+    repo.branch_reset(first_revision)
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v2 again")
+    repo.stage("file1.txt")
+    repo.commit("Commit 2 again")
+    repo.push(force=True)
+
+    replacement_tip = repo.branch_info("main").local_latest
+    assert replacement_tip != latest_revision
+    assert repo.revision_info(replacement_tip).revision == "2"
+
+    clone.sync(replacement_tip, remote=True)
+
+    assert clone.branch_info("main").local_latest == latest_revision
+
+
+@pytest.mark.smoke
+def test_sync_remote_dropped_revision_keeps_latest(new_lore_repo):
+    """
+    A revision the remote no longer holds at its number does not become the branch
+    latest, however far ahead of that latest it is numbered. A whole hash is not
+    looked up, so only the remote's own answer says it still stands there.
+    """
+    repo = new_lore_repo()
+
+    with repo.open_file("file1.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file1.txt")
+    repo.commit("Commit 1")
+    repo.push()
+
+    base_revision = repo.branch_info("main").local_latest
+
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v2")
+    repo.stage("file1.txt")
+    repo.commit("Commit 2")
+    repo.push()
+
+    dropped_revision = repo.branch_info("main").local_latest
+    assert dropped_revision != base_revision
+
+    # Pinned behind the revision dropped below, so that revision is numbered ahead of
+    # the latest and would advance it were the remote still holding it.
+    clone = repo.clone(revision=base_revision)
+    assert clone.branch_info("main").local_latest == base_revision
+
+    # The remote branch is carried back and taken forward again, so what it holds at
+    # the dropped revision's number is a different revision.
+    repo.branch_reset(base_revision)
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v2 again")
+    repo.stage("file1.txt")
+    repo.commit("Commit 2 again")
+    repo.push(force=True)
+
+    replacement_revision = repo.branch_info("main").local_latest
+    assert replacement_revision != dropped_revision
+
+    clone.sync(dropped_revision, remote=True)
+
+    assert clone.branch_info("main").local_latest == base_revision
+
+
+# Revisions between the branch latest and the revision synced to, enough of them that a
+# decision scaling with the distance between the two would show it.
+_DEEP_HISTORY_REVISIONS = 1100
+
+
+@pytest.mark.slow
+def test_sync_remote_revision_deep_behind_tip_advances_latest(new_lore_repo):
+    """
+    A revision ahead of the branch latest advances it however far behind the remote's
+    tip it stands.
+    """
+    repo = new_lore_repo()
+
+    with repo.open_file("file1.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file1.txt")
+    repo.commit("Commit 1")
+    repo.push()
+
+    base_revision = repo.branch_info("main").local_latest
+
+    with repo.open_file("bulk.txt", "w+") as f:
+        f.write("rev 0\n")
+    repo.stage("bulk.txt", offline=True)
+    repo.commit("Bulk rev 0", offline=True)
+    second_revision = repo.revision_info().signature
+
+    for i in range(1, _DEEP_HISTORY_REVISIONS):
+        with repo.open_file("bulk.txt", "w+") as f:
+            f.write(f"rev {i}\n")
+        repo.stage("bulk.txt", offline=True)
+        repo.commit(f"Bulk rev {i}", offline=True)
+    repo.push()
+
+    tip_revision = repo.branch_info("main").local_latest
+    assert tip_revision not in (base_revision, second_revision)
+
+    # Pinned at the first revision, so the revision synced to below stands one ahead
+    # of the latest and the whole bulk history behind the remote's tip.
+    clone = repo.clone(revision=base_revision)
+    assert clone.branch_info("main").local_latest == base_revision
+
+    clone.sync(second_revision, remote=True)
+
+    after = clone.branch_info("main")
+    assert after.local_latest == second_revision
+    assert after.remote_latest == tip_revision
+
+
+@pytest.mark.smoke
+def test_sync_remote_revision_merged_from_divergence_keeps_latest(new_lore_repo):
+    """
+    A revision a merge carried onto the branch stands behind the latest, and shares its
+    number with the revision the remote holds at that number, the divergence the merge
+    resolved having numbered the two alike. The latest keeps where it is on either
+    count.
+    """
+    repo = new_lore_repo()
+
+    with repo.open_file("file1.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file1.txt")
+    repo.commit("Commit 1")
+    repo.push()
+
+    clone = repo.clone()
+
+    with repo.open_file("file1.txt", "w") as f:
+        f.write("v2")
+    repo.stage("file1.txt")
+    repo.commit("Commit 2")
+    repo.push()
+
+    # A commit on the same branch that the remote has moved past, so the sync
+    # below merges rather than advancing, and the merge carries this revision as
+    # a parent other than its first.
+    with clone.open_file("file2.txt", "w+") as f:
+        f.write("local")
+    clone.stage("file2.txt")
+    clone.commit("Divergent commit", local=True)
+    merged_revision = clone.branch_info("main").local_latest
+
+    clone.sync()
+    clone.push()
+
+    merge_revision = clone.branch_info("main").local_latest
+    assert merge_revision != merged_revision
+
+    # Reachable past the first parent alone, which is what a first-parent walk
+    # misses and this test exists for. A merge reports both its parents on one
+    # line, the first of them the one such a walk follows.
+    merge_parents = clone.revision_info(merge_revision).merge.split()
+    assert len(merge_parents) == 2
+    assert merge_parents[0] != merged_revision
+    assert merge_parents[1] == merged_revision
+
+    # Cloned at the merge, so the latest stands ahead of the revision synced to.
+    other = repo.clone()
+    assert other.branch_info("main").local_latest == merge_revision
+
+    other.sync(merged_revision, remote=True)
+
+    after = other.branch_info("main")
+    assert after.local_latest == merge_revision
+    assert after.remote_latest == merge_revision

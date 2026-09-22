@@ -28,6 +28,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - A change to a file's executable bit alone is now reported by `lore status --scan`, taken by `lore stage`, and recorded on the revision `lore commit` produces. A chmod moves neither the content, the size nor the modification time, which were all the comparison read, so the change was invisible from the moment it was made
 - `lore sync` and `lore branch merge` keep a locally changed executable bit on a file whose content they carry, rather than silently reverting it to the revision's. The bit stands as a local modification and blocks nothing; `--reset` and `--force` apply the revision's bit as before
 - Fix `lore stage` over a large tree failing with `grab_node_unused returned INVALID on a freshly-allocated block`. A freshly allocated block of node slots was published for every other thread to grab from before the thread that allocated it took its own, so under enough concurrency the block could be emptied out from under it. It takes its slot before it publishes the block
+- `lore sync <revision>` advances the branch latest to a revision standing ahead of the one the branch holds, the remote answering for it. It was left where it stood, so a sync to the remote's tip drew a `lore status` reporting the branch behind the remote and a second sync that did not see it was already there. A named revision moves the latest forward only, `--local` and `--dry-run` move it not at all, and a divergent branch keeps the one it has
 
 ## v0.10.0 (Sep 17th 2026) [#1170]
 

@@ -1497,17 +1497,6 @@ async fn resolve_revision_number(
     )
     .await?;
 
-    event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
-        repository: repository.id,
-        branch,
-        target: LoreRevisionResolveTarget::Number,
-        revision_number,
-        revision: Hash::default(),
-        remote: should_search_remote.into(),
-        local: should_search_local.into(),
-    })
-    .send();
-
     let mut revision = Hash::default();
 
     if should_search_remote
@@ -1697,6 +1686,16 @@ async fn resolve_revision(
                 .await?;
             }
             BranchTarget::Number(revision_number) => {
+                event::LoreEvent::RevisionResolve(LoreRevisionResolveEventData {
+                    repository: repository.id,
+                    branch,
+                    target: LoreRevisionResolveTarget::Number,
+                    revision_number,
+                    revision: Hash::default(),
+                    remote: should_search_remote.into(),
+                    local: should_search_local.into(),
+                })
+                .send();
                 revision = resolve_revision_number(
                     repository.clone(),
                     branch,
