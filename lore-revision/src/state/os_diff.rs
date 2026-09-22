@@ -51,7 +51,6 @@ use crate::state::ChangeSender;
 use crate::state::diff::get_filtered_node_and_path;
 use crate::state::diff::get_node_match;
 use crate::state::stream::emit;
-use crate::util;
 use crate::util::path::EntryPath;
 use crate::util::path::RelativePath;
 
@@ -96,11 +95,11 @@ async fn diff_filesystem_subtree_impl(
         .filesystem_path
         .to_absolute_path(ctx.from.repository.require_path()?);
 
-    match util::fs::list_path(absolute_path)
+    match crate::fs::os::list_path(absolute_path)
         .await
         .forward::<StateError>("Failed to list the path")?
     {
-        util::fs::PathListingResult::Directory { listing } => {
+        crate::fs::os::PathListingResult::Directory { listing } => {
             // A path-filtered scan can enter a directory present on disk but
             // absent from state_from (an untracked add). Create its dirty-add
             // node chain so adds discovered inside resolve their parent node.
@@ -118,7 +117,7 @@ async fn diff_filesystem_subtree_impl(
             }
             diff_filesystem_directory(ctx, listing, changes).await
         }
-        util::fs::PathListingResult::File { item } => {
+        crate::fs::os::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory
             // chain exists so the add resolves its parent node.
             if ctx.intent.marks_dirty()
@@ -131,7 +130,7 @@ async fn diff_filesystem_subtree_impl(
             }
             diff_filesystem_single_file(ctx, item, changes).await
         }
-        util::fs::PathListingResult::NotFound => {
+        crate::fs::os::PathListingResult::NotFound => {
             // Path doesn't exist on filesystem - everything in state is deleted
             diff_filesystem_missing(
                 ctx.from,
@@ -1186,8 +1185,8 @@ async fn diff_filesystem_directory_walk(
         .filesystem_path
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
     while let Some(entry) = file_listing.next().await {
-        let Some(item) =
-            util::fs::file_list_item(entry).forward::<StateError>("Unusable directory entry")?
+        let Some(item) = crate::fs::os::file_list_item(entry)
+            .forward::<StateError>("Unusable directory entry")?
         else {
             continue;
         };
@@ -2096,7 +2095,7 @@ fn diff_filesystem_subtree_merge_task(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_single_file(
     ctx: FilesystemDiffContext,
-    file_item: util::fs::FileListItem,
+    file_item: crate::fs::os::FileListItem,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();

@@ -139,8 +139,8 @@ impl FileInfo {
     }
 
     /// The mode to store on a node whose mode is `previous`, as
-    /// [`crate::util::fs::metadata_to_mode`] answers it for the metadata this was read
-    /// from.
+    /// [`crate::util::fs::mode_from_observed`] answers it for what was read off the
+    /// metadata this describes.
     pub fn mode(&self, previous: u16) -> u16 {
         crate::util::fs::mode_from_observed(self.is_file(), self.executable(), previous)
     }
@@ -1423,6 +1423,16 @@ pub mod tests {
     /// staged from the metadata itself would, since the two are the same walk before
     /// and after the file information became the currency between them. A directory
     /// states none of what a file stores, which is none of what a directory node takes.
+    /// The mode read straight off the metadata, which is the path [`FileInfo::mode`] has to
+    /// reproduce for a node staged either way to land the same one.
+    fn metadata_to_mode(metadata: &std::fs::Metadata, previous: u16) -> u16 {
+        crate::util::fs::mode_from_observed(
+            metadata.is_file(),
+            crate::util::fs::file_executable_observed(metadata),
+            previous,
+        )
+    }
+
     #[test]
     fn file_information_answers_what_the_metadata_helpers_answer() {
         let dir = lore_base::test_util::TempDir::new("lore-fs-provider-test-");
@@ -1438,7 +1448,7 @@ pub mod tests {
             assert_eq!(metadata.is_file(), info.is_file());
             for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
                 assert_eq!(
-                    crate::util::fs::metadata_to_mode(&metadata, previous),
+                    metadata_to_mode(&metadata, previous),
                     info.mode(previous),
                     "mode for {} from previous {previous}",
                     path.display()
@@ -1453,7 +1463,7 @@ pub mod tests {
         assert_eq!(FileInfo::Directory, directory);
         for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
             assert_eq!(
-                crate::util::fs::metadata_to_mode(&metadata, previous),
+                metadata_to_mode(&metadata, previous),
                 directory.mode(previous),
                 "mode for a directory from previous {previous}"
             );
