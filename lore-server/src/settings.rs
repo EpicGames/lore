@@ -20,6 +20,7 @@ use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
 use crate::authnz::repository_authorizer::select_repository_authorizer;
+use crate::authnz::repository_catalog::select_repository_catalog;
 use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
@@ -184,9 +185,11 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.as_deref());
-    // Run the authorizer selection at load, so a refused pairing bails here,
-    // before any initialization, instead of at server startup.
+    // Run the authorizer and catalog selection at load, so a refused pairing
+    // bails here, before any initialization, instead of at server startup.
     select_repository_authorizer(auth, auth_url)
+        .map_err(|err| config::ConfigError::Message(err.to_string()))?;
+    select_repository_catalog(auth, auth_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
     let Some(auth) = auth else {
         return Ok(());
@@ -289,9 +292,15 @@ pub struct AuthSettings {
     pub identity_claim: String,
     /// What the repository listing answers for an authenticated caller with
     /// no explicit grant. Gates listing of the IDs only, never grants
-    /// access to the contents.
+    /// access to the contents. Consulted by the `baseline` catalog only.
     #[serde(default)]
     pub baseline_access: BaselineAccess,
+    /// Which catalog answers the repository listing. Absent: `auth_service`
+    /// when `[environment.endpoint] auth_url` is set, `baseline` otherwise.
+    pub repository_catalog: Option<RepositoryCatalogMode>,
+    /// The `UrcAuthApi` endpoint the `auth_service` catalog asks. Absent:
+    /// `[environment.endpoint] auth_url`.
+    pub repository_catalog_url: Option<String>,
 }
 
 impl AuthSettings {
@@ -324,6 +333,17 @@ pub enum BaselineAccess {
     /// option is an explicit choice.
     #[default]
     Denied,
+}
+
+/// Which catalog answers the repository listing.
+#[derive(Copy, Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepositoryCatalogMode {
+    /// Answer per `baseline_access` from the server's own store.
+    Baseline,
+    /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
+    /// caller's token.
+    AuthService,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -809,6 +829,8 @@ mod tests {
             resource_wildcard = "urc-*"
             identity_claim = "preferred_username"
             baseline_access = "reachable"
+            repository_catalog = "auth_service"
+            repository_catalog_url = "https://catalog.example.com"
         "#,
         )
         .expect("[server.auth] with every authorization field should deserialize");
@@ -820,6 +842,14 @@ mod tests {
         assert_eq!(auth.resource_wildcard, "urc-*");
         assert_eq!(auth.identity_claim, "preferred_username");
         assert_eq!(auth.baseline_access, BaselineAccess::Reachable);
+        assert_eq!(
+            auth.repository_catalog,
+            Some(RepositoryCatalogMode::AuthService)
+        );
+        assert_eq!(
+            auth.repository_catalog_url.as_deref(),
+            Some("https://catalog.example.com")
+        );
     }
 
     /// A config setting none of the authorization fields gets the documented
@@ -842,6 +872,8 @@ mod tests {
         assert_eq!(auth.permission_claim, None);
         assert_eq!(auth.resource_claim, None);
         assert_eq!(auth.identity_claim, "sub");
+        assert_eq!(auth.repository_catalog, None);
+        assert_eq!(auth.repository_catalog_url, None);
     }
 
     /// Minimal loadable settings with the given `[server.auth]` keys, for the
@@ -995,6 +1027,27 @@ mod tests {
             .expect_err("auth_url with resource_claim must fail validation");
         assert!(error.to_string().contains("auth_url"), "{error}");
         assert!(error.to_string().contains("resource_claim"), "{error}");
+    }
+
+    /// `repository_catalog = "auth_service"` with no endpoint to ask is
+    /// refused at load, naming both settings that could supply one.
+    #[test]
+    fn auth_service_catalog_without_an_endpoint_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "https://issuer.example.com"
+            jwt_audience = ["lore-service"]
+            repository_catalog = "auth_service"
+        "#,
+        )
+        .expect("the incomplete pairing still parses");
+        let error = validate_auth_config(&settings)
+            .expect_err("auth_service without an endpoint must fail validation");
+        assert!(
+            error.to_string().contains("repository_catalog_url"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("auth_url"), "{error}");
     }
 
     /// Both keys absent means an empty policy, which resolves to the built-in set.

@@ -14,6 +14,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 - `lore sync --view <file>` changes the view filter an instance materializes its working files under, carrying the working tree to what the new view holds rather than re-cloning
 - `lore-server`: the disk space available to the local stores is checked on a timer and a warning is logged once it falls below a threshold. `[server.local_store_monitor]` carries `check_interval_seconds` (default 30) and `low_space_threshold_bytes` (default 10 GiB); an interval of 0 turns the check off. Every local store the server writes at is watched, the immutable store and the mutable store among them, and the reading is taken per volume: stores sharing a filesystem draw one warning naming them all, rather than one warning each. A server whose stores are not local is not checked
+- `lore-server`: `lore repository list` answers through a `RepositoryCatalog` implementation. The implementation is selected based on server configuration. A `UrcAuthApi` deployment asks `LookupUserPermissions` as before, a server with no `[server.auth]` lists everything it holds. A deployment authorizing from token claims uses a catalog implementation based `repository_catalog` and `repository_catalog_url` configuration.
 
 ### Fixes & Improvements
 

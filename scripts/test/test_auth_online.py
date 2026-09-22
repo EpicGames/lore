@@ -54,6 +54,7 @@ from mock_auth_server import (
     MockUser,
     check_user_permission_response,
     empty_response,
+    lookup_user_permissions_response,
     start_auth_session_response,
     tamper_token,
     user_token_response,
@@ -268,9 +269,9 @@ def script_partition_access(
         bearer=login_token,
         resource_id=resource_id,
     ).respond(user_token_response(user, authz_token))
-    mock.on(
-        "CheckUserPermission", bearer=login_token, resource_id=resource_id
-    ).respond(check_user_permission_response(resource_id, permissions))
+    mock.on("CheckUserPermission", bearer=login_token, resource_id=resource_id).respond(
+        check_user_permission_response(resource_id, permissions)
+    )
 
 
 def script_repository_lifecycle(mock: MockAuthServer, resource_id: str) -> None:
@@ -478,6 +479,39 @@ def test_granted_user_can_access_shared_repository(auth_env, make_actor, scratch
 
 
 @pytest.mark.smoke
+def test_repository_list_is_the_auth_services_answer(auth_env, make_actor):
+    """`lore repository list` on the legacy tier asks `LookupUserPermissions`
+    once, with the `urc` filter and no paging, and lists exactly the
+    partitions the answer names: a second repository the same user created
+    but the answer omits is not listed, and entries that are not partitions
+    are skipped."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "lister", USER1)
+
+    unlisted_id = uuid.uuid4().hex
+    script_repository_lifecycle(mock, f"urc-{unlisted_id}")
+    unlisted = owner.actor.make_repo(repo_id=unlisted_id)
+    unlisted.repository_create(repo_id=unlisted_id, identity=USER1.user_id)
+
+    mock.on("LookupUserPermissions", bearer=owner.login_token).respond(
+        lookup_user_permissions_response(
+            owner.resource_id, "urc-not-a-partition", "something-else"
+        )
+    )
+
+    listing = owner.repo.repository_list().splitlines()
+
+    assert f"{owner.repo.name} ({owner.repo.get_id()})" in listing
+    assert not any(unlisted.get_id() in line for line in listing), (
+        "a partition the auth service did not name must not be listed"
+    )
+    lookups = mock.requests_for("LookupUserPermissions")
+    assert len(lookups) == 1
+    assert lookups[0]["resource_filter"] == "urc"
+    assert lookups[0]["page_token"] == "", "the first page carries no token"
+
+
+@pytest.mark.smoke
 def test_each_user_owns_their_created_repositories(auth_env, make_actor):
     """USER2 creates repository C with an API-key login: the rebac
     registration carries USER2's credential, not USER1's."""
@@ -666,9 +700,7 @@ def subscribe_code(target: str, repo_id_hex: str, token: str) -> grpc.StatusCode
 
 
 @pytest.mark.smoke
-def test_every_partition_scoped_service_enforces_partition_access(
-    auth_env, make_actor
-):
+def test_every_partition_scoped_service_enforces_partition_access(auth_env, make_actor):
     """Every partition-scoped gRPC service sits behind the partition-access
     check: on each one, a verifiable token holding no grant for the partition
     answers PERMISSION_DENIED, the owner's granted token never does, and the
@@ -909,9 +941,7 @@ def provision_member(auth_env, make_actor, owner, label: str, permissions):
     login_api_key(seed, auth_env.remote_url, USER2_API_KEY)
     repo = seed.clone()
     repo.environment_vars.update(seed.environment_vars)
-    return SimpleNamespace(
-        repo=repo, login_token=login_token, authz_token=authz_token
-    )
+    return SimpleNamespace(repo=repo, login_token=login_token, authz_token=authz_token)
 
 
 def revoke(mock, member, resource_id: str) -> None:

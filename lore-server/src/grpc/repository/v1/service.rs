@@ -31,6 +31,7 @@ use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -57,6 +58,7 @@ impl InstrumentProvider for RepositoryServiceInstrumentProvider {
 pub struct LoreRepositoryV1Service {
     environment: EnvironmentConfig,
     authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -70,6 +72,7 @@ impl LoreRepositoryV1Service {
     pub fn new(
         environment: EnvironmentConfig,
         authorizer: Arc<dyn RepositoryAuthorizer>,
+        repository_catalog: Arc<dyn RepositoryCatalog>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
@@ -79,6 +82,7 @@ impl LoreRepositoryV1Service {
         Self {
             environment,
             authorizer,
+            repository_catalog,
             immutable_store,
             mutable_store,
             hook_dispatcher,
@@ -160,7 +164,8 @@ impl RepositoryService for LoreRepositoryV1Service {
     ) -> Result<Response<Self::RepositoryListStream>, Status> {
         repository_list::handler(
             request,
-            self.auth_url(),
+            self.repository_catalog.clone(),
+            self.rpc_timeout,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
         )

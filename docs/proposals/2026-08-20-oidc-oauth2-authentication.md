@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-09-11
+updated: 2026-09-21
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -311,8 +311,8 @@ The tokens themselves need three properties:
   unchanged.
 
 The permission and directory RPCs do not move. `CheckUserPermission` and `LookupUserPermissions`
-stay behind `RepositoryAuthorizer` and `RepositoryDirectory` (D7, D8), and `GetUserInfo` and
-`GetUserId` behind `UserDirectory` (D7).
+stay behind `RepositoryAuthorizer` and `RepositoryCatalog` (D7, D8), and `GetUserInfo` and
+`GetUserId` behind `UserCatalog` (D7).
 
 Both interfaces run side by side for the whole migration. The gRPC API keeps serving clients that
 have not moved, the standard endpoints serve the ones that have, and the gRPC API retires only
@@ -536,7 +536,7 @@ path's credentials intact. The setting retires with the legacy path in phase 5.
 | `RefreshAuthSession` | `refresh_token` grant. Fills in `Authentication::refresh_authentication`, which currently returns `NotSupported`. |
 | `GetUserInfo`, `GetUserId`, `GetProviderUserId` | Moves off the auth path entirely, see D7. `GetProviderUserId` maps an internal ID to the upstream provider's ID. With an external issuer the provider's `sub` *is* the ID, so it has no successor. |
 | `CheckUserPermission` | Stays as a `RepositoryAuthorizer` implementation rather than part of the standard set, see D8. |
-| `LookupUserPermissions` | A paginated search over a permission store, which no standard endpoint offers. Moves to the optional `RepositoryDirectory` trait, see D7. |
+| `LookupUserPermissions` | A paginated search over a permission store, which no standard endpoint offers. Moves to the optional `RepositoryCatalog` trait, see D7. |
 | `VerifyUser` | Asserts a user satisfies a named compliance requirement. No OAuth 2.0 equivalent, and no caller in this repository, so it gets no successor until one is needed. A deployment that needs it grants an action and checks it through `RepositoryAuthorizer`, the way `obliterate` works (D4, D8). |
 | `HealthCheck` | No successor needed. The provider's discovery document serves as the liveness probe. |
 | (new) | [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) revocation on `lore auth logout`. |
@@ -804,13 +804,13 @@ grant space, or to resolve an identifier that is not the bearer's. Both therefor
 authentication path onto optional traits with a degraded default, rather than being forced into a
 mechanism that cannot hold them.
 
-#### The user directory
+#### The user catalog
 
 `GetUserInfo` resolves a batch of user IDs to display names, and `GetUserId` resolves the reverse.
 OIDC has no equivalent, because `/userinfo` describes only the bearer. Nothing in the standard set
 replaces these.
 
-The design moves them off the `Authentication` trait onto a separate optional `UserDirectory`
+The design moves them off the `Authentication` trait onto a separate optional `UserCatalog`
 trait. The default implementation answers from the token's own `name` and `preferred_username`
 claims for the current user, and returns the raw ID for anyone else. The CLI already degrades to
 printing the ID when no name resolves
@@ -824,9 +824,9 @@ name (`created_by` and its siblings in
 be unmapped from a person without rewriting history.
 
 The directory lookup therefore stays a real dependency for any deployment that wants names, and
-OIDC does not supply one. Deployments with a directory can implement `UserDirectory` over it, SCIM
+OIDC does not supply one. Deployments with a directory can implement `UserCatalog` over it, SCIM
 2.0 being the nearest standard, but out of scope for this change. Deployments without a
-`UserDirectory` implementation show identifiers.
+`UserCatalog` implementation show identifiers.
 
 There is a third position for deployments that do not need the unmapping property: record a
 human-readable claim as the identity itself. Nothing in the protocol constrains what `created_by`
@@ -840,7 +840,7 @@ human-readable claim is an explicit opt-in with two costs: names become permanen
 claims other than `sub` are not guaranteed unique or immutable, so a rename forks a user's
 identity and a reused username collides with its previous holder.
 
-#### The repository directory
+#### The repository catalog
 
 `lore repo list` resolves "which partitions may I see" through `LookupUserPermissions`, in both
 the [v0](../../lore-server/src/grpc/handlers/repository_list.rs) and
@@ -851,7 +851,7 @@ filter: it is a search over a permission store, not a question about the caller'
 No token can answer it. A Tier 2 access token contains one partition, because Lorelib
 requests exactly one resource per exchange (D1), and `lore repo list` has no partition
 to exchange for in the first place, since discovering them is the point of the
-call. Enumeration therefore requires its own optional trait, `RepositoryDirectory`.
+call. Enumeration therefore requires its own optional trait, `RepositoryCatalog`.
 
 The default implementation answers from `baseline_access` (D8): `denied`, the default, lists
 none, and `reachable` lists every partition the server holds. The secure option is the default
@@ -859,6 +859,16 @@ so the disclosing one is an explicit choice. A server with no `[server.auth]` at
 listing everything it holds, as a local server does today. That setting exists for this trait
 alone and gates no access decision. A `UrcAuthApi` deployment gets an implementation that calls
 `LookupUserPermissions` and behaves exactly as today.
+
+The choice is not bound to the authorizer. `repository_catalog` in `[server.auth]` names the
+catalog (`baseline` or `auth_service`) and `repository_catalog_url` the endpoint the auth-service
+catalog asks; absent, the catalog follows `auth_url`, set meaning the auth service and unset the
+baseline. So a Tier 1 or Tier 2 deployment whose auth service accepts its tokens keeps the
+`LookupUserPermissions` catalog, and a `UrcAuthApi` deployment can list from the store instead.
+The catalog forwards the caller's own token, so the endpoint has to accept the tokens the server
+verifies. No client-side check is needed for that forwarding: the client's send-check (D5)
+already confines a token to servers under its `aud`, and the server it reaches holds the token
+in full either way.
 
 `reachable` enumerates through the path `lore repo list` already takes when no auth service is
 configured, `list_local` over `KeyType::RepositoryId`
@@ -911,11 +921,12 @@ that. So when `jwt_issuer` holds an https URL the server fetches
 `iss` against the same value. `[server.auth.jwk].endpoint` stays as the override for providers with
 non-standard discovery.
 
-`[server.auth]` therefore gains `permission_claim`, `baseline_access`, `resource_claim`,
-`resource_id_claim`, `resource_id_template`, `resource_wildcard` and `identity_claim` (D7, `sub`
-by default, compared wherever the server checks a recorded identity). `permission_claim` is
+`[server.auth]` therefore gains `permission_claim`, `baseline_access`, `repository_catalog`,
+`repository_catalog_url`, `resource_claim`, `resource_id_claim`, `resource_id_template`,
+`resource_wildcard` and `identity_claim` (D7, `sub` by default, compared wherever the server
+checks a recorded identity). `permission_claim` is
 exercised from phase 2 onwards, because it is what Tier 1 runs on. `baseline_access` steers only
-what the default `RepositoryDirectory` lists (D7), never an access decision. The other four only
+what the default `RepositoryCatalog` lists (D7), never an access decision. The other four only
 matter once a per-partition claim is in play, so phase 4 for a new deployment and immediately for
 a `UrcAuthApi` one. There is no service-account setting, because D4 turned that check into two
 ordinary actions.
@@ -1012,7 +1023,9 @@ in `[server.auth]` but touches listing only:
 | --- | --- |
 | `permission_claim` | Dotted path to the actions claim, for example `realm_access.roles` on Keycloak or `groups` on Dex. Claim values are action names. |
 | `resource_claim` | Present means Tier 2, and actions are scoped by the resource beside them. Absent means the `permission_claim` actions are global, which is Tier 1. |
-| `baseline_access` | What the default `RepositoryDirectory` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
+| `baseline_access` | What the default `RepositoryCatalog` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
+| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`, or `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`. Absent, `auth_service` when `auth_url` is set and `baseline` otherwise. |
+| `repository_catalog_url` | The endpoint the `auth_service` catalog asks, `auth_url` by default. It receives the caller's token, so it must accept the tokens this server verifies. |
 
 A deployment that configures `[server.auth]` but no `permission_claim` leaves every authenticated
 principal with ordinary access and no admin actions at all. That fails closed on every privileged
@@ -1142,12 +1155,12 @@ than requiring a claim for a partition that does not exist.
   client against an old server sees no `oidc_issuer` and uses the legacy path. An old client
   against a new server works as long as the server keeps its legacy `auth_url` advertised, which the
   migration phases require until the last phase. Two trait signatures change.
-- **What `lore repo list` shows** — A deployment with no `RepositoryDirectory` implementation lists
+- **What `lore repo list` shows** — A deployment with no `RepositoryCatalog` implementation lists
   every partition the server holds rather than the subset the caller was granted (D7). On Tier 1
   those are the same set. On Tier 2 they are not, so a deployment moving from `UrcAuthApi` to a
   stock provider sees the list widen unless it implements the enumeration trait. Operations on a listed
   partition still fail if the caller lacks the grant, so this changes what is visible, not what
-  is permitted. Limiting visibility requires a deployment-specific `RepositoryDirectory` implementation.
+  is permitted. Limiting visibility requires a deployment-specific `RepositoryCatalog` implementation.
   The default answers by enumerating the store, which D7 notes has to stay performant on the AWS
   backend.
 - **When an unauthorized gRPC request fails** — Today an unauthorized request is rejected in the
@@ -1332,7 +1345,7 @@ identifier and not a name, so an operator can unmap that identifier from a perso
 or an erasure request, without rewriting history. Resolving names through a directory at read time
 is what makes that possible, and D7 keeps it that way. The identity-claim option in D7 trades the
 property away deliberately: a deployment that records `preferred_username` into history chooses
-readability over erasability, and the default stays `sub`. The `UserDirectory` default answers
+readability over erasability, and the default stays `sub`. The `UserCatalog` default answers
 from the caller's own token rather than accumulating a local cache of other people's names.
 
 **Tokens stay out of logs.** The existing discipline holds: `set_sensitive` on the gRPC

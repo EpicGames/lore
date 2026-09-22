@@ -5,4 +5,5 @@ pub mod common;
 pub mod global_grants_authorizer;
 pub mod rebac;
 pub mod repository_authorizer;
+pub mod repository_catalog;
 pub mod resource_grants_authorizer;

@@ -153,6 +153,21 @@ def check_user_permission_response(resource_id: str, permissions) -> bytes:
     return encode_bytes_field(1, entry)
 
 
+def lookup_user_permissions_response(
+    *resource_ids: str, next_page_token: str = ""
+) -> bytes:
+    """A `LookupUserPermissions` answer granting `read` on each resource,
+    with a continuation token when the listing has another page."""
+    response = b""
+    for resource_id in resource_ids:
+        response += encode_bytes_field(
+            1, encode_string_field(1, resource_id) + encode_string_field(2, "read")
+        )
+    if next_page_token:
+        response += encode_string_field(2, next_page_token)
+    return response
+
+
 def user_info_response(*users: MockUser) -> bytes:
     """A `GetUserInfo` answer resolving the given users."""
     response = b""
@@ -196,7 +211,10 @@ _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
         "resource_id": (1, _STRINGS),
         "target_user": (2, _TARGET_USER),
     },
-    "LookupUserPermissions": {"resource_filter": (1, _STRING)},
+    "LookupUserPermissions": {
+        "resource_filter": (1, _STRING),
+        "page_token": (4, _STRING),
+    },
     "GetUserInfo": {"resource_id": (1, _STRING), "user_id": (2, _STRINGS)},
     "GetUserId": {"resource_id": (1, _STRING), "user_display_name": (2, _STRING)},
     "GetProviderUserId": {"user_id": (1, _STRING)},

@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::types::Context;
 use lore_proto::lore::repository::v1::RepositoryListRequest;
 use lore_proto::lore::repository::v1::RepositoryListResponse;
 use lore_revision::lore::RepositoryId;
@@ -15,7 +15,6 @@ use lore_revision::repository::RepositoryContext;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_stream::Stream;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 use tonic::Response;
@@ -24,12 +23,12 @@ use tracing::Instrument;
 use tracing::debug;
 
 use super::record::build_repository;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::grpc::FilterSlowDownExt;
-use crate::grpc::ServerResultExt;
-use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
-use crate::grpc::handlers::repository_list::lookup_authorized_repositories;
+use crate::grpc::get_verified_token;
 use crate::util::setup_execution;
 
 type ListStream =
@@ -37,23 +36,25 @@ type ListStream =
 
 /// `lore.repository.v1.RepositoryService.RepositoryList` handler.
 ///
-/// Streams `Repository` records the caller is authorised to see. When the
-/// environment configures an auth-service URL the server first asks the
-/// auth service for the caller's permitted repository ids; otherwise the
-/// server lists all locally-known repositories.
+/// Streams `Repository` records for the repositories the configured
+/// [`RepositoryCatalog`] lists for the caller.
 ///
 /// `RepositoryListRequest.creator`, when set, filters the stream to
 /// repositories whose `creator` exactly matches.
+///
+/// The response streams, so the RPC runs under no request timeout;
+/// `catalog_budget` bounds the catalog walk that precedes the stream.
 #[tracing::instrument(name = "RepositoryList::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryListRequest>,
-    auth_url: Option<String>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
+    catalog_budget: Duration,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<ListStream>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = extract_authorization_header(&request);
+    let token = get_verified_token(request.extensions()).map(|token| token.owned());
     let req = request.into_inner();
     let creator_filter = req.creator;
 
@@ -61,13 +62,10 @@ pub async fn handler(
 
     let candidate_ids = LORE_CONTEXT
         .scope(execution.clone(), async {
-            list_candidate_ids(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                auth_url,
-                authorization,
-            )
-            .await
+            let token = token.as_ref().map(VerifiedTokenOwned::as_token);
+            repository_catalog
+                .list_all(token.as_ref(), catalog_budget)
+                .await
         })
         .await?;
 
@@ -111,33 +109,6 @@ pub async fn handler(
 
     let recv_stream = ReceiverStream::from(rx);
     Ok(Response::new(Box::pin(recv_stream) as ListStream))
-}
-
-async fn list_candidate_ids(
-    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
-    mutable_store: Arc<dyn lore_storage::MutableStore>,
-    auth_url: Option<String>,
-    authorization: Option<String>,
-) -> Result<Vec<RepositoryId>, Status> {
-    if let Some(auth_url) = auth_url {
-        let ids = lookup_authorized_repositories(auth_url, authorization).await?;
-        Ok(ids.into_iter().map(RepositoryId::from).collect())
-    } else {
-        let repository = Arc::new(RepositoryContext::new_server_context(
-            immutable_store,
-            mutable_store,
-            Context::default().into(),
-        ));
-        let mut stream = repository::list_local(repository)
-            .await
-            .filter_slow_down()?
-            .warn_map_err(|err| Status::internal(format!("Failed to list repositories: {err}")))?;
-        let mut out = Vec::new();
-        while let Some(id) = stream.next().await {
-            out.push(id.into());
-        }
-        Ok(out)
-    }
 }
 
 /// Build one repository record. A repository whose metadata cannot be read is

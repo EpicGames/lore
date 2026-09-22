@@ -295,7 +295,7 @@ fn check_user_permission_request(
     )
 }
 
-fn bearer_header(token: Option<&VerifiedToken<'_>>) -> Option<String> {
+pub(super) fn bearer_header(token: Option<&VerifiedToken<'_>>) -> Option<String> {
     token.map(|token| format!("Bearer {}", token.raw))
 }
 

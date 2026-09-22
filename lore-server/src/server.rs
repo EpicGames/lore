@@ -71,6 +71,7 @@ use tracing::warn;
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -445,6 +446,7 @@ async fn launch_grpc_server(
     lock_store: Option<Arc<dyn LockStore>>,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     settings: Settings,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
@@ -526,7 +528,7 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier, repository_authorizer)?
+        .with_jwt_verifier(jwt_verifier, repository_authorizer, repository_catalog)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -2053,13 +2055,20 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
     // One shared authorizer, selected by the configuration (D8's four-way
     // flowchart), threaded into the gRPC, QUIC and HTTP servers.
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.clone());
     let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
         settings.server.auth.as_ref(),
-        settings
-            .environment
-            .as_ref()
-            .and_then(|environment| environment.endpoint.as_ref())
-            .and_then(|endpoint| endpoint.auth_url.clone()),
+        auth_url.clone(),
+    )?;
+    let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
+        settings.server.auth.as_ref(),
+        auth_url.as_deref(),
+        immutable_store.clone(),
+        mutable_store.clone(),
     )?;
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
@@ -2128,6 +2137,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let lock_store = lock_store.clone();
             let jwt_verifier = jwt_verifier.clone();
             let repository_authorizer = repository_authorizer.clone();
+            let repository_catalog = repository_catalog.clone();
             let settings = settings.clone();
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
@@ -2146,6 +2156,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 lock_store,
                 jwt_verifier,
                 repository_authorizer,
+                repository_catalog,
                 settings,
                 notification,
                 notification_service,
