@@ -156,15 +156,6 @@ impl InstanceOperation for OsOperation {
             .await
     }
 
-    async fn names_folding_to(
-        &self,
-        path: &RelativePath,
-        name: &str,
-    ) -> Result<Vec<String>, FsError> {
-        let path = self.absolute(path);
-        Ok(names_folding_to(path, name).await?)
-    }
-
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
         let path = self.absolute(path);
         Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
@@ -493,62 +484,6 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     }
 }
 
-/// Every spelling of `name` the directory `path` holds that folds to the same name, the
-/// exact one alone if it is there, and empty if no spelling is, which is the OS arm of
-/// [`InstanceOperation::names_folding_to`].
-///
-/// Reads the directory and compares every child, which is what answering for
-/// variations other than the one asked about takes. A caller that only needs to
-/// know whether the case it has is the one on disk should ask
-/// [`InstanceOperation::holds_name_exactly`] instead.
-pub async fn names_folding_to(
-    path: impl AsRef<Path>,
-    name: &str,
-) -> tokio::io::Result<Vec<String>> {
-    let path = path.as_ref();
-
-    let mut matches = vec![];
-    let match_name = name.to_lowercase();
-    let mut listing = lore_io::IoDriver::global().read_dir(path).await?;
-    while let Some(entry) = listing.next().await {
-        let entry_name = entry_name(entry?.file_name).map_err(tokio::io::Error::other)?;
-        if entry_name == name {
-            // Exact match
-            return Ok(vec![entry_name]);
-        }
-        let entry_lowercase_name = entry_name.to_lowercase();
-        if entry_lowercase_name == match_name {
-            matches.push(entry_name);
-        }
-    }
-
-    if !matches.is_empty() {
-        if matches.len() == 1 {
-            lore_debug!(
-                "Found case variations for file {name} in path {}: {}",
-                path.display(),
-                matches[0]
-            );
-        } else {
-            let mut message = format!(
-                "Found case variations for file {name} in path {}:",
-                path.display()
-            );
-            for entry in matches.iter() {
-                message.push_str(format!("\n  {entry}").as_str());
-            }
-            lore_debug!("{message}");
-        }
-        return Ok(matches);
-    }
-
-    lore_debug!(
-        "Found NO case variation for file {name} in path {}",
-        path.display()
-    );
-    Ok(vec![])
-}
-
 /// Helper function to rename files during name case unification handling. Will try to rename
 /// the "from" file/directory to "to" name. If the "to" name already exist in the file system
 /// it will try to handle it as follows:
@@ -841,26 +776,30 @@ mod tests {
     async fn names_answers_with_the_case_variation_it_was_given() {
         let dir = temp_dir();
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+        let operation = os_operation(dir.path()).await;
 
         assert_eq!(
-            names_folding_to(dir.path(), "Test.file")
+            operation
+                .names_folding_to(&relative(""), "Test.file")
                 .await
                 .expect("a name the filesystem holds must resolve"),
             vec!["Test.file".to_string()]
         );
     }
 
-    /// The reason the helper exists: a caller holding a name in one case needs the one the
-    /// filesystem kept. The directory is read and the names compared here rather than looked up,
-    /// so the case variation on disk is reported whether or not the filesystem would itself
-    /// have found the file under the one asked about.
+    /// The reason the member exists: a caller holding a name in one case needs the one the
+    /// filesystem kept. The directory is read and the names folded rather than looked up, so the
+    /// case variation on disk is reported whether or not the filesystem would itself have found
+    /// the file under the one asked about.
     #[tokio::test]
     async fn names_answers_with_the_stored_case_variation() {
         let dir = temp_dir();
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+        let operation = os_operation(dir.path()).await;
 
         assert_eq!(
-            names_folding_to(dir.path(), "test.FILE")
+            operation
+                .names_folding_to(&relative(""), "test.FILE")
                 .await
                 .expect("a case variation must resolve"),
             vec!["Test.file".to_string()]
@@ -871,9 +810,11 @@ mod tests {
     async fn names_reports_a_name_that_is_not_there_in_any_case() {
         let dir = temp_dir();
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+        let operation = os_operation(dir.path()).await;
 
         assert!(
-            names_folding_to(dir.path(), "other.file")
+            operation
+                .names_folding_to(&relative(""), "other.file")
                 .await
                 .expect("reading the directory must succeed")
                 .is_empty(),
@@ -888,9 +829,11 @@ mod tests {
     async fn names_does_not_answer_with_a_neighbouring_name() {
         let dir = temp_dir();
         std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+        let operation = os_operation(dir.path()).await;
 
         assert!(
-            names_folding_to(dir.path(), "Test.file.")
+            operation
+                .names_folding_to(&relative(""), "Test.file.")
                 .await
                 .expect("reading the directory must succeed")
                 .is_empty(),
@@ -898,9 +841,30 @@ mod tests {
         );
     }
 
-    /// Where variations can coexist, every one of them comes back — resolving that ambiguity is
-    /// the caller's to do — while an exact match answers for itself alone. Only a case-sensitive
-    /// filesystem can hold the two files this needs.
+    /// A link is not a spelling the repository holds, so it is not reported as one even where its
+    /// name is the only thing that folds to the one asked about.
+    #[tokio::test]
+    #[cfg(target_family = "unix")]
+    async fn names_leaves_out_a_link() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("target"), b"").expect("write target");
+        std::os::unix::fs::symlink(dir.path().join("target"), dir.path().join("Test.file"))
+            .expect("create link");
+        let operation = os_operation(dir.path()).await;
+
+        assert!(
+            operation
+                .names_folding_to(&relative(""), "test.file")
+                .await
+                .expect("reading the directory must succeed")
+                .is_empty(),
+            "a link must not be reported as a case variation"
+        );
+    }
+
+    /// Every variation comes back, the exact one among them: resolving the ambiguity is the
+    /// caller's to do, and one that has to tell a collision from a resolution needs to see both.
+    /// Only a case-sensitive filesystem can hold the two files this needs.
     #[tokio::test]
     async fn names_reports_every_case_variation_that_coexists() {
         let dir = temp_dir();
@@ -909,23 +873,19 @@ mod tests {
         }
         std::fs::write(dir.path().join("Test.file"), b"").expect("write Test.file");
         std::fs::write(dir.path().join("test.file"), b"").expect("write test.file");
+        let operation = os_operation(dir.path()).await;
 
-        let mut found = names_folding_to(dir.path(), "TEST.FILE")
-            .await
-            .expect("the variations must resolve");
-        found.sort();
-        assert_eq!(
-            found,
-            vec!["Test.file".to_string(), "test.file".to_string()],
-            "an ambiguous name must report every case variation, not pick one"
-        );
-
-        assert_eq!(
-            names_folding_to(dir.path(), "test.file")
+        for asked in ["TEST.FILE", "test.file"] {
+            let mut found = operation
+                .names_folding_to(&relative(""), asked)
                 .await
-                .expect("an exact name must resolve"),
-            vec!["test.file".to_string()],
-            "a case variation the filesystem holds answers for itself, ambiguity or not"
-        );
+                .expect("the variations must resolve");
+            found.sort();
+            assert_eq!(
+                found,
+                vec!["Test.file".to_string(), "test.file".to_string()],
+                "asking about {asked} must report every case variation, not pick one"
+            );
+        }
     }
 }

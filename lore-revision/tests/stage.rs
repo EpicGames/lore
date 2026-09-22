@@ -33,6 +33,25 @@ mod tests {
 
     include!("helper.rs");
 
+    /// The names the directory holds that fold to `name`, sorted, read straight off the
+    /// filesystem: what these tests assert staging left the working tree spelling things.
+    fn names_folding_to(directory: &std::path::Path, name: &str) -> Vec<String> {
+        let folded = name.to_lowercase();
+        let mut found: Vec<String> = std::fs::read_dir(directory)
+            .expect("read the directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|held| held.to_lowercase() == folded)
+            .collect();
+        found.sort();
+        found
+    }
+
     #[tokio::test]
     async fn stage_dry_run_no_persist() {
         let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
@@ -599,10 +618,7 @@ mod tests {
                 }
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::fs::os::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.File");
@@ -623,10 +639,7 @@ mod tests {
                 .expect("Case difference not resolved as expected");
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::fs::os::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.file");
@@ -750,10 +763,7 @@ mod tests {
                 }
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::fs::os::names_folding_to(path.as_path(), "testdir")
-                        .await
-                        .expect("Failed to get updated directory name");
+                let updated_name = names_folding_to(path.as_path(), "testdir");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "Testdir");
@@ -774,19 +784,12 @@ mod tests {
                 .expect("Case difference not resolved as expected");
 
                 // Verify the file system was updated
-                let updated_directory_name =
-                    lore_revision::fs::os::names_folding_to(path.as_path(), "testdir")
-                        .await
-                        .expect("Failed to get updated directory name");
+                let updated_directory_name = names_folding_to(path.as_path(), "testdir");
                 assert_eq!(updated_directory_name.len(), 1);
                 let updated_directory_name = updated_directory_name[0].clone();
                 assert_eq!(updated_directory_name, "testDir");
-                let updated_file_name = lore_revision::fs::os::names_folding_to(
-                    first_directory_path.as_path(),
-                    "test.file",
-                )
-                .await
-                .expect("Failed to get updated file name");
+                let updated_file_name =
+                    names_folding_to(first_directory_path.as_path(), "test.file");
                 assert_eq!(updated_file_name.len(), 1);
                 let updated_file_name = updated_file_name[0].clone();
                 assert_eq!(updated_file_name, "teST.file");
@@ -902,10 +905,7 @@ mod tests {
                 }
 
                 // Verify the file system was updated
-                let updated_name =
-                    lore_revision::fs::os::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.File");
@@ -926,10 +926,7 @@ mod tests {
                 .expect("Case difference not resolved as expected");
 
                 // Verify the file system was maintained
-                let updated_name =
-                    lore_revision::fs::os::names_folding_to(path.as_path(), "Test.file")
-                        .await
-                        .expect("Failed to get updated file name");
+                let updated_name = names_folding_to(path.as_path(), "Test.file");
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.File");
@@ -1100,17 +1097,20 @@ mod tests {
                         }
                     }
                 }
-                let names = lore_revision::fs::os::names_folding_to(path.as_path(), "assets")
-                    .await
-                    .expect("the directory must still be there");
-                assert_eq!(names, vec!["Assets".to_string()]);
-                assert!(
-                    lore_revision::util::fs::filesystem_names_all_exist(
-                        &path.as_path().join("Assets"),
-                        &["first.file", "second.file"]
-                    )
-                    .await,
-                    "both files must still be there, under the directory the tree names"
+                assert_eq!(
+                    vec!["Assets".to_string()],
+                    names_folding_to(path.as_path(), "assets")
+                );
+                let held = path.as_path().join("Assets");
+                assert_eq!(
+                    vec!["first.file".to_string()],
+                    names_folding_to(&held, "first.file"),
+                    "the first file must still be there, under the directory the tree names"
+                );
+                assert_eq!(
+                    vec!["second.file".to_string()],
+                    names_folding_to(&held, "second.file"),
+                    "the second file must still be there, under the directory the tree names"
                 );
 
                 // And the tree holds one directory, not one per case variation that

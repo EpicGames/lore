@@ -1924,6 +1924,27 @@ fn record_staged_file(node: &mut Node, info: &FileInfo) {
     node.size = info.size();
 }
 
+/// Whether `directory` holds both the spelling the tree carries and the one the file system
+/// showed, which a case-sensitive file system can hold side by side as separate entries.
+///
+/// The two fold together, the node having been claimed by that fold, so one listing answers for
+/// both. Read rather than taken from the parent's listing: staging a sibling renames entries in
+/// this directory, so an earlier snapshot answers a stale question. A directory that cannot be
+/// read is one that cannot be unified either, and reads as holding neither.
+async fn holds_both_spellings(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    tracked: &str,
+    observed: &str,
+) -> bool {
+    let held = operation
+        .names_folding_to(directory, observed)
+        .await
+        .unwrap_or_default();
+    held.iter().any(|spelling| spelling == tracked)
+        && held.iter().any(|spelling| spelling == observed)
+}
+
 /// Stage the child `name` of `base` from the file information the caller already holds.
 ///
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
@@ -2249,22 +2270,9 @@ pub(crate) async fn stage_node_from_metadata(
                     node_name
                 );
 
-                // On case-sensitive file systems the old-cased path may still exist alongside
-                // the new one (e.g. both "Assets" and "assets" as separate directories).
-                // If so, unify the file system by merging the old into the new so that the
-                // stage picks up contents from both.
-                // Re-read rather than reused from the parent's listing: staging a sibling renames
-                // entries in this directory, so an earlier snapshot answers a stale question.
                 let old_path = relative_path.join(&node_name);
                 let new_path = relative_path.join(&name);
-                if util::fs::filesystem_names_all_exist(
-                    relative_path
-                        .to_absolute_path(repository.require_path()?)
-                        .as_path(),
-                    &[node_name.as_str(), name.as_str()],
-                )
-                .await
-                {
+                if holds_both_spellings(operation, &relative_path, &node_name, &name).await {
                     lore_debug!(
                         "Case rename: old path {old_path} still exists alongside {new_path}, unifying file system"
                     );

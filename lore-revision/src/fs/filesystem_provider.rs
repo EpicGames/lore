@@ -22,6 +22,7 @@ use crate::filter::FilterStates;
 use crate::fs::os::OsDirectoryListing;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::filesystem::SwfsOperation;
+use crate::hash::hash_string;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore_trace;
@@ -444,17 +445,38 @@ pub trait InstanceOperation: Send + Sync {
     /// [`names_folding_to`](Self::names_folding_to) answers.
     fn holds_name_exactly(&self, path: &RelativePath) -> impl Future<Output = Option<bool>> + Send;
 
-    /// Every spelling of `name` the directory at `path` holds that folds to the same name:
-    /// the exact one alone where it is there, and empty where no spelling is.
+    /// Every spelling of `name` the directory at `path` holds that folds to the same name, and
+    /// empty where no spelling is.
     ///
     /// Reads the directory, which is what answering for a spelling other than the one asked
     /// about takes. A caller that only needs to know whether its own spelling is the one on
     /// disk asks [`holds_name_exactly`](Self::holds_name_exactly).
+    ///
+    /// Names are claimed by the fold [`read_directory`](Self::read_directory) already carries,
+    /// which is the same digest a node's children are matched on: a spelling this reports is one
+    /// the tree would resolve to the same node. A link is not among them, a listing holding no
+    /// entry for one.
+    ///
+    /// Derived from [`read_directory`](Self::read_directory). A provider that can answer without
+    /// reading the directory overrides this.
     fn names_folding_to(
         &self,
         path: &RelativePath,
         name: &str,
-    ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
+    ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send {
+        async move {
+            let folded = hash_string(name);
+            let mut listing = self.read_directory(path).await?;
+            let mut matches = Vec::new();
+            while let Some(entry) = listing.next().await {
+                let entry = entry?;
+                if entry.name_hash == folded {
+                    matches.push(entry.name);
+                }
+            }
+            Ok(matches)
+        }
+    }
 
     /// The children of the directory at `path`, described as the repository tracks them.
     ///

@@ -141,50 +141,6 @@ pub fn file_executable_observed(metadata: &Metadata) -> Option<bool> {
     Some(file_is_executable(metadata))
 }
 
-/// Whether every one of `names` is present in `parent`, compared exactly rather than by the
-/// filesystem's own rules — `Path::exists` is case-insensitive on Windows and macOS, which is
-/// the distinction a caller resolving a case collision is asking about.
-///
-/// One listing answers for all of them, and it stops as soon as they are all accounted for: a
-/// caller asking about several names in a directory is asking one question about it. Asking
-/// about no names is answered without reading anything.
-///
-/// Matches are tracked in a bitmask, so at most 64 names can be asked about at once.
-pub async fn filesystem_names_all_exist(parent: &Path, names: &[&str]) -> bool {
-    assert!(
-        names.len() <= u64::BITS as usize,
-        "filesystem_names_all_exist takes at most {} names",
-        u64::BITS
-    );
-    if names.is_empty() {
-        return true;
-    }
-
-    let Ok(mut listing) = lore_io::IoDriver::global().read_dir(parent).await else {
-        return false;
-    };
-    let wanted = if names.len() == u64::BITS as usize {
-        u64::MAX
-    } else {
-        (1u64 << names.len()) - 1
-    };
-    let mut found = 0u64;
-    while let Some(entry) = listing.next().await {
-        let Ok(entry) = entry else {
-            continue;
-        };
-        for (index, name) in names.iter().enumerate() {
-            if entry.file_name == *name {
-                found |= 1u64 << index;
-            }
-        }
-        if found == wanted {
-            return true;
-        }
-    }
-    false
-}
-
 /// The case each directory prefix is held in on disk, resolved once for the
 /// paths that share them.
 ///
@@ -195,8 +151,9 @@ pub async fn filesystem_names_all_exist(parent: &Path, names: &[&str]) -> bool {
 ///
 /// Keys are relative to the base path they were resolved against, and only that
 /// one - a map built for the repository root says nothing about a path under a
-/// layer or a link mount. A prefix whose case is ambiguous or that is not
-/// there is left out, so paths under it resolve as they would have without this.
+/// layer or a link mount. A prefix [`spelling_to_take`] cannot settle, or that is
+/// not there, is left out, so paths under it resolve as they would have without
+/// this.
 #[derive(Default)]
 pub struct ResolvedPrefixes {
     prefixes: std::collections::HashMap<String, String>,
@@ -315,18 +272,15 @@ pub(crate) async fn resolve_prefixes(
                     .rfind('/')
                     .map_or(path.as_str(), |separator| &path[separator + 1..]);
                 let candidate = candidate_path(directory.as_str(), name);
-                if candidate_is_held(&operation, &candidate).await == Some(true) {
+                if operation.holds_name_exactly(&candidate).await == Some(true) {
                     let resolved = join_relative(&variation, name);
                     return Some((path, resolved));
                 }
-                // One variation is an answer; several are the ambiguity
-                // `filesystem_path` forks on, and are left for it to find as it
-                // always did. A platform that would not say arrives here too,
-                // and the read settles it.
-                if let Ok(names) = names_folding_to_in_operation(&operation, &directory, name).await
-                    && let [single] = names.as_slice()
+                // A platform that would not say arrives here too, and the read settles it.
+                if let Ok(names) = operation.names_folding_to(&directory, name).await
+                    && let Some(spelling) = spelling_to_take(&names, name)
                 {
-                    let resolved = join_relative(&variation, single);
+                    let resolved = join_relative(&variation, spelling);
                     return Some((path, resolved));
                 }
                 None
@@ -363,21 +317,24 @@ fn candidate_path(parent: &str, name: &str) -> RelativePath {
     RelativePath::new_from_clean_parts(parent, name)
 }
 
-/// [`InstanceOperation::holds_name_exactly`] for a candidate the resolver built.
-async fn candidate_is_held(
-    operation: &InstanceOperationImpl,
-    candidate: &RelativePath,
-) -> Option<bool> {
-    operation.holds_name_exactly(candidate).await
-}
-
-/// [`InstanceOperation::names_folding_to`] for a directory the resolver built.
-async fn names_folding_to_in_operation(
-    operation: &InstanceOperationImpl,
-    directory: &RelativePath,
-    name: &str,
-) -> Result<Vec<String>, crate::fs::filesystem_provider::FsError> {
-    operation.names_folding_to(directory, name).await
+/// The spelling to take from the ones the directory holds: the one asked for where it is among
+/// them, and the sole variation otherwise.
+///
+/// Several variations with none of them the spelling asked for is the ambiguity
+/// [`filesystem_path`] forks on, and is no answer here.
+///
+/// The spelling asked for is among them only where the platform declined the lookup that would
+/// have settled it — macOS for every name, Windows past its path limit. A platform that answers
+/// reports a name it holds as held, so a resolver reaching here has already been told the
+/// spelling is not there.
+fn spelling_to_take<'a>(held: &'a [String], name: &str) -> Option<&'a str> {
+    if let Some(exact) = held.iter().find(|spelling| *spelling == name) {
+        return Some(exact);
+    }
+    match held {
+        [single] => Some(single.as_str()),
+        _ => None,
+    }
 }
 
 // TODO(mjansson): We could pass around a hashmap cache of directory to file list mappings
@@ -449,14 +406,16 @@ pub async fn filesystem_path_and_info(
         // and that costs one lookup to establish. Only where it is not, or where
         // the platform will not say, does the directory get read, and a name
         // allocated for what it says.
-        if candidate_is_held(operation, &candidate_path(found_path.as_str(), name)).await
+        if operation
+            .holds_name_exactly(&candidate_path(found_path.as_str(), name))
+            .await
             == Some(true)
         {
             found_path.push(name);
             continue;
         }
         let directory = candidate_path(found_path.as_str(), "");
-        let Ok(fs_names) = names_folding_to_in_operation(operation, &directory, name).await else {
+        let Ok(fs_names) = operation.names_folding_to(&directory, name).await else {
             return Err(tokio::io::Error::other(
                 "Failed to read the directory for case variations",
             ));
@@ -467,60 +426,60 @@ pub async fn filesystem_path_and_info(
                 "Matching file not found",
             ));
         }
-        if fs_names.len() > 1 {
-            if remain_path.is_empty() {
-                lore_debug!("Found ambiguous path case variations for {find_path}");
-                return Err(tokio::io::Error::other(
-                    "Ambiguous case variations for path {find_path}",
-                ));
-            }
-
-            // Find the match in either or many of the potential variations
-            let mut found_variation = false;
-            for entry in fs_names.iter() {
-                let next_full_path = directory.join(entry);
-
-                lore_debug!(
-                    "Fork case variation check for {remain_path} in {}",
-                    next_full_path
-                );
-                if let Ok(sub_path) =
-                    filesystem_path_fork(operation, next_full_path.as_str(), &remain_path).await
-                {
-                    if found_variation {
-                        lore_debug!("Found ambiguous path case variations for {find_path}");
-                        return Err(tokio::io::Error::other(
-                            "Ambiguous case variations found for path {find_path}",
-                        ));
-                    }
-
-                    found_path.push(entry);
-                    found_path.push(sub_path.as_str());
-
-                    lore_debug!(
-                        "Fork found case variation {sub_path} for {remain_path} in {}",
-                        next_full_path
-                    );
-                    found_variation = true;
-                } else {
-                    lore_debug!(
-                        "Fork found NO case variation for {remain_path} in {}",
-                        next_full_path
-                    );
-                }
-            }
-
-            if !found_variation {
-                return Err(tokio::io::Error::new(
-                    tokio::io::ErrorKind::NotFound,
-                    "Matching file not found",
-                ));
-            }
-
-            break;
+        if let Some(spelling) = spelling_to_take(&fs_names, name) {
+            found_path.push(spelling);
+            continue;
+        }
+        if remain_path.is_empty() {
+            lore_debug!("Found ambiguous path case variations for {find_path}");
+            return Err(tokio::io::Error::other(
+                "Ambiguous case variations for path {find_path}",
+            ));
         }
 
-        found_path.push(fs_names[0].as_str());
+        // Find the match in either or many of the potential variations
+        let mut found_variation = false;
+        for entry in fs_names.iter() {
+            let next_full_path = directory.join(entry);
+
+            lore_debug!(
+                "Fork case variation check for {remain_path} in {}",
+                next_full_path
+            );
+            if let Ok(sub_path) =
+                filesystem_path_fork(operation, next_full_path.as_str(), &remain_path).await
+            {
+                if found_variation {
+                    lore_debug!("Found ambiguous path case variations for {find_path}");
+                    return Err(tokio::io::Error::other(
+                        "Ambiguous case variations found for path {find_path}",
+                    ));
+                }
+
+                found_path.push(entry);
+                found_path.push(sub_path.as_str());
+
+                lore_debug!(
+                    "Fork found case variation {sub_path} for {remain_path} in {}",
+                    next_full_path
+                );
+                found_variation = true;
+            } else {
+                lore_debug!(
+                    "Fork found NO case variation for {remain_path} in {}",
+                    next_full_path
+                );
+            }
+        }
+
+        if !found_variation {
+            return Err(tokio::io::Error::new(
+                tokio::io::ErrorKind::NotFound,
+                "Matching file not found",
+            ));
+        }
+
+        break;
     }
 
     let mut found = found_path.freeze();
@@ -883,35 +842,30 @@ mod tests {
         .expect("beginning an operation over the OS filesystem")
     }
 
-    /// Asking about no names is satisfied by any directory, including an empty one — the check
-    /// is over the names given, and there are none to be missing.
-    #[tokio::test]
-    async fn all_names_exist_is_true_for_no_names() {
-        let dir = temp_dir();
-        assert!(filesystem_names_all_exist(dir.path(), &[]).await);
+    #[test]
+    fn a_sole_variation_is_the_spelling_to_take() {
+        let held = vec!["Assets".to_string()];
+        assert_eq!(Some("Assets"), spelling_to_take(&held, "assets"));
     }
 
-    #[tokio::test]
-    async fn all_names_exist_requires_every_name() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("one"), b"").expect("write one");
-        std::fs::write(dir.path().join("two"), b"").expect("write two");
-
-        assert!(filesystem_names_all_exist(dir.path(), &["one", "two"]).await);
-        assert!(!filesystem_names_all_exist(dir.path(), &["one", "three"]).await);
-        assert!(!filesystem_names_all_exist(dir.path(), &["three"]).await);
+    /// The spelling asked for wins over its neighbours, which is what keeps a collision between
+    /// two variations from reading as an ambiguity for a caller that named one of them.
+    #[test]
+    fn the_spelling_asked_for_wins_over_a_coexisting_variation() {
+        let held = vec!["Assets".to_string(), "assets".to_string()];
+        assert_eq!(Some("assets"), spelling_to_take(&held, "assets"));
     }
 
-    /// The comparison is exact, which is the whole reason this exists rather than `Path::exists`:
-    /// on a case-insensitive filesystem that would answer for a name that is not the one asked
-    /// about.
-    #[tokio::test]
-    async fn all_names_exist_compares_exactly() {
-        let dir = temp_dir();
-        std::fs::write(dir.path().join("Assets"), b"").expect("write Assets");
+    /// Several variations, none of them the one asked for, is the ambiguity the caller forks on.
+    #[test]
+    fn coexisting_variations_the_caller_did_not_name_are_no_answer() {
+        let held = vec!["Assets".to_string(), "ASSETS".to_string()];
+        assert_eq!(None, spelling_to_take(&held, "assets"));
+    }
 
-        assert!(filesystem_names_all_exist(dir.path(), &["Assets"]).await);
-        assert!(!filesystem_names_all_exist(dir.path(), &["assets"]).await);
+    #[test]
+    fn a_directory_holding_no_spelling_is_no_answer() {
+        assert_eq!(None, spelling_to_take(&[], "assets"));
     }
 
     fn depth_paths(paths: &[&str]) -> Vec<DepthPath> {
@@ -932,6 +886,30 @@ mod tests {
         let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
         std::fs::remove_file(&probe).expect("remove probe");
         insensitive
+    }
+
+    /// A variation held beside the spelling asked for does not disturb resolving it. Where the
+    /// platform settles the lookup this never reads the directory; where it declines,
+    /// [`spelling_to_take`] answers the same. Only a case-sensitive filesystem can hold the two
+    /// directories this needs.
+    #[tokio::test]
+    async fn path_resolves_a_leaf_whose_case_variation_coexists() {
+        let dir = temp_dir();
+        if case_insensitive(dir.path()) {
+            return;
+        }
+        let operation = os_operation(dir.path()).await;
+        std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+        std::fs::create_dir(dir.path().join("assets")).expect("create variation");
+
+        let asked: RelativePath = std::str::FromStr::from_str("assets").expect("relative path");
+        assert_eq!(
+            "assets",
+            filesystem_path(&operation, "", &asked, None)
+                .await
+                .expect("the spelling asked for must settle the directory")
+                .as_str()
+        );
     }
 
     /// The path already in the case the filesystem holds it in - the case
@@ -1191,12 +1169,6 @@ mod tests {
                 "{asked} must resolve the same with the map as without it"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn all_names_exist_is_false_for_an_unreadable_directory() {
-        let dir = temp_dir();
-        assert!(!filesystem_names_all_exist(&dir.path().join("absent"), &["any"]).await);
     }
 
     const EXEC: u16 = NodeFileMode::Executable.bits();

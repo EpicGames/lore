@@ -178,10 +178,6 @@ impl InstanceOperation for SwfsOperation {
         self.os.holds_name_exactly(path).await
     }
 
-    fake_with_os!(names_folding_to, Vec<String>,
-        _path: &RelativePath,
-        name: &str);
-
     fake_with_os!(read_directory, DirectoryListing, _path: &RelativePath,);
 
     fake_with_os!(write_node, FileInfo,
