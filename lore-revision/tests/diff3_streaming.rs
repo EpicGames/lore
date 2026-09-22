@@ -585,6 +585,78 @@ mod tests {
         .expect("merge_start failed")
     }
 
+    /// A chmod is a modification of the executable bit and nothing else, which the content a
+    /// merge brings in answers nothing about. The merge writes the content and leaves the bit,
+    /// so the change the user made stands rather than being reverted by the write.
+    ///
+    /// The merge realizes every change it verified rather than the ones the working copy still
+    /// needs, so what the verify settles on a change has to reach the realize that follows it.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_merge_keeps_a_local_executable_bit_over_incoming_content() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const SCRIPT: &str = "script.sh";
+        const FIRST: &[u8] = b"#!/bin/sh\necho first\n";
+        const SECOND: &[u8] = b"#!/bin/sh\necho second\n";
+        const FEATURE: &str = "feature.txt";
+
+        let execution = offline_execution().await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+
+                fixture.write_file(SCRIPT, FIRST);
+                let base_revision = fixture.stage_and_commit("base").await;
+                let main_branch = fixture.main_branch_id;
+
+                // The feature branch leaves the script alone, so the merge below carries main's
+                // rewrite of it whole.
+                let feature_branch = fixture.create_branch("feature").await;
+                fixture.write_file(FEATURE, b"feature\n");
+                let feature_rev = fixture.stage_and_commit("feature change").await;
+
+                fixture.switch_to(main_branch, base_revision).await;
+                fixture.delete_file(FEATURE);
+                fixture.write_file(SCRIPT, SECOND);
+                fixture.stage_and_commit("main rewrites the script").await;
+
+                fixture.switch_to(feature_branch, feature_rev).await;
+                fixture.write_file(SCRIPT, FIRST);
+                fixture.write_file(FEATURE, b"feature\n");
+
+                let script = fixture.repo_path.join(SCRIPT);
+                std::fs::set_permissions(script.as_path(), std::fs::Permissions::from_mode(0o755))
+                    .expect("Failed to set the executable bit");
+
+                merge_main_under_view(
+                    &fixture.repository,
+                    &fixture,
+                    main_branch,
+                    "merge main into feature",
+                )
+                .await;
+
+                assert_eq!(
+                    std::fs::read(script.as_path()).expect("The merged file must be readable"),
+                    SECOND,
+                    "the merge has to carry the content the incoming revision holds"
+                );
+                assert_ne!(
+                    std::fs::metadata(script.as_path())
+                        .expect("The merged file must be readable")
+                        .permissions()
+                        .mode()
+                        & 0o111,
+                    0,
+                    "the bit the user set has to survive the write the merge makes"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// Paths where the merged feature branch still differs from main, under a
     /// full-tree diff. Empty means the two agree everywhere.
     async fn paths_divergent_from_main(

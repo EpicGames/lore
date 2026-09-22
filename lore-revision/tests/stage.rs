@@ -10,6 +10,7 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
+    use lore_base::types::Hash;
     use lore_revision::branch;
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
@@ -2093,14 +2094,32 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// The mode a node records is the one its file carries on disk, which the walk reads
-    /// through `FileInfo` rather than from the metadata directly.
+    /// The mode `signature`'s state records for `script.sh`.
+    #[cfg(target_family = "unix")]
+    async fn script_mode(repository: Arc<RepositoryContext>, signature: Hash) -> u16 {
+        let state = state::State::deserialize(repository.clone(), signature)
+            .await
+            .expect("Failed to deserialize the state");
+        let link = state
+            .find_node_link(repository.clone(), "script.sh")
+            .await
+            .expect("The state must hold the file");
+        state
+            .node(repository, link.node)
+            .await
+            .expect("The node must read back")
+            .mode
+    }
+
+    /// The mode a revision records is the one its file carried on disk, which the commit
+    /// reads from the file it fragments. Only the executable bit is tracked, and a change to
+    /// it alone is a modification the revision carries.
     ///
-    /// Only the executable bit is tracked. An already-staged node is left alone, so the
-    /// revision is committed between the two stages for the second to reach the mode.
+    /// An already-staged node is left alone, so the revision is committed between the two
+    /// stages for the second to reach the mode.
     #[cfg(target_family = "unix")]
     #[tokio::test]
-    async fn staging_a_file_records_the_executable_bit_it_carries() {
+    async fn the_executable_bit_a_file_carries_reaches_the_revision() {
         use std::os::unix::fs::PermissionsExt;
 
         let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
@@ -2126,13 +2145,15 @@ mod tests {
                 .expect("Failed to initialize repository");
 
                 let file_path = path.as_path().join("script.sh");
-                let stage_all = async |mode: u32, contents: &[u8]| {
-                    test_file_write(file_path.as_path(), contents);
+                test_file_write(file_path.as_path(), b"#!/bin/sh\necho unchanged");
+                let set_mode = |mode: u32| {
                     std::fs::set_permissions(
                         file_path.as_path(),
                         std::fs::Permissions::from_mode(mode),
                     )
                     .expect("Failed to set test file mode");
+                };
+                let stage_all = async || {
                     let signature = file::stage::stage(
                         repository.clone(),
                         &write_token,
@@ -2147,48 +2168,60 @@ mod tests {
                     )
                     .await
                     .expect("Failed to stage the test file");
-                    let staged = state::State::deserialize(repository.clone(), signature)
+                    script_mode(repository.clone(), signature).await
+                };
+                let commit_all = async || {
+                    let signature = commit::commit_boxed(
+                        repository.clone(),
+                        &write_token,
+                        CommitOptions {
+                            message: String::new(),
+                            link_messages: std::collections::HashMap::new(),
+                            link: None,
+                            layer_messages: std::collections::HashMap::new(),
+                            layer: None,
+                        },
+                    )
+                    .await
+                    .expect("Failed to commit the test file");
+                    let state = state::State::deserialize(repository.clone(), signature)
                         .await
-                        .expect("Failed to deserialize the staged state");
-                    let link = staged
+                        .expect("Failed to deserialize the committed state");
+                    let link = state
                         .find_node_link(repository.clone(), "script.sh")
                         .await
-                        .expect("The staged state must hold the file");
-                    staged
-                        .node(repository.clone(), link.node)
-                        .await
-                        .expect("The staged node must read back")
-                        .mode
+                        .expect("The committed state must hold the file");
+                    assert!(
+                        state
+                            .node_delta(repository.clone(), link.node)
+                            .await
+                            .expect("The delta must read back")
+                            .is_some(),
+                        "the revision must name the file among the nodes it changed"
+                    );
+                    script_mode(repository.clone(), signature).await
                 };
 
                 let executable = node::NodeFileMode::Executable.bits();
 
-                let mode = stage_all(0o755, b"#!/bin/sh\necho one").await;
+                set_mode(0o755);
                 assert_eq!(
                     executable,
-                    mode & executable,
-                    "an executable file must record the bit"
+                    stage_all().await & executable,
+                    "a staged add must record the bit the file carries"
+                );
+                assert_eq!(
+                    executable,
+                    commit_all().await & executable,
+                    "the revision must record the bit"
                 );
 
-                commit::commit_boxed(
-                    repository.clone(),
-                    &write_token,
-                    CommitOptions {
-                        message: String::new(),
-                        link_messages: std::collections::HashMap::new(),
-                        link: None,
-                        layer_messages: std::collections::HashMap::new(),
-                        layer: None,
-                    },
-                )
-                .await
-                .expect("Failed to commit the executable file");
-
-                let mode = stage_all(0o644, b"#!/bin/sh\necho two and three").await;
+                set_mode(0o644);
+                stage_all().await;
                 assert_eq!(
                     0,
-                    mode & executable,
-                    "a file that lost the bit must record its loss"
+                    commit_all().await & executable,
+                    "the revision must record the loss of the bit"
                 );
             }))
             .await

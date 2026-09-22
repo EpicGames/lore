@@ -3,6 +3,7 @@
 import logging
 import os
 import shutil
+import stat
 import sys
 import time
 
@@ -148,9 +149,15 @@ def test_sync(new_lore_repo):
 
     # Verify files contents, mode and last modified timestamp
 
-    clone.compare_file(repo, text_file)
-    clone.compare_file(repo, unicode_file)
-    clone.compare_file(repo, added_file)
+    assert clone.compare_file(repo, text_file)
+    assert clone.compare_file(repo, unicode_file)
+    assert clone.compare_file(repo, added_file)
+
+    if sys.platform != "win32":
+        synced_mode = os.stat(os.path.join(repo.path, text_file)).st_mode
+        assert synced_mode & stat.S_IXUSR, (
+            f"the mode change must reach the synced repository: {synced_mode:o}"
+        )
 
     assert not repo.path_exists(long_path_first_dir), (
         "Directory not deleted as expected in source repo: " + long_path_first_dir

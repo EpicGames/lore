@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import stat
+import sys
 
 import pytest
 from test_utils import posix_join, to_posix
@@ -1010,4 +1012,48 @@ def test_status_check_dirty_rehashes_same_size(new_lore_repo):
     after = _status_files_by_path(repo)
     assert set(after) == {"modified.bin"}, (
         f"reverted file must remain cleared on a later status, got {sorted(after)}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_status_scan_reports_a_mode_only_change(new_lore_repo):
+    """The executable bit is part of what a file is, so a chmod alone is a
+    modification. It moves neither the size nor the modification time of the
+    file, so the scan has to compare the bit to see it, staging has to take it,
+    and the revision has to carry it to a fresh clone.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("script.sh", "w+b") as output_file:
+        output_file.write(b"#!/bin/sh\necho unchanged\n")
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    os.chmod(os.path.join(repo.path, "script.sh"), 0o755)
+
+    scanned = _status_files_by_path(repo, scan=True)
+    assert set(scanned) == {"script.sh"}, (
+        f"a chmod with no content change must be reported, got {sorted(scanned)}"
+    )
+    assert scanned["script.sh"]["action"] == "keep"
+
+    repo.stage(scan=True)
+    staged = _status_files_by_path(repo)
+    assert set(staged) == {"script.sh"}, (
+        f"the staged mode change must still be reported, got {sorted(staged)}"
+    )
+
+    repo.commit()
+    repo.push()
+
+    assert not _status_files_by_path(repo, scan=True), (
+        "the committed mode must leave nothing to report"
+    )
+
+    clone = repo.clone()
+    cloned_mode = os.stat(os.path.join(clone.path, "script.sh")).st_mode
+    assert cloned_mode & stat.S_IXUSR, (
+        f"the revision must carry the executable bit to a clone: {cloned_mode:o}"
     )

@@ -925,8 +925,8 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// A staged modification records the size and mode the file was measured with, which is
-    /// what a commit reads to realize it.
+    /// A staged modification records the size the file was measured with. The mode is left to
+    /// the commit, which is what compares it against the one the revision holds.
     #[tokio::test]
     async fn a_staged_modification_records_what_the_file_carries() {
         let (immutable_store, mutable_store, execution) =
@@ -968,6 +968,71 @@ mod tests {
                     grown.len() as u64,
                     node.size,
                     "the node must record the size the file was measured with"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The executable bit is part of what a file is, so a change to it alone is a
+    /// modification even where every byte of the content stands. A chmod moves neither the
+    /// size nor the modification time, so the bit is what the walk has to compare.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_mode_change_alone_is_a_modification() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+
+                let script = fixture.path.join("script.sh");
+                test_file_write(&script, b"#!/bin/sh\necho unchanged");
+                commit_fixture(&fixture).await;
+
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                    .expect("Failed to set the executable bit");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let marked = test_scan_with_intent(
+                    repository.clone(),
+                    staged,
+                    current,
+                    FilesystemDiffIntent::MarkDirty,
+                )
+                .await;
+                assert!(
+                    marked
+                        .iter()
+                        .any(|change| change.path().as_str() == "script.sh"),
+                    "a marking walk must report the file the chmod changed, reported {:?}",
+                    marked.iter().map(|c| c.path().as_str()).collect::<Vec<_>>()
+                );
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let node_id = staged
+                    .find_node_link(repository.clone(), "script.sh")
+                    .await
+                    .expect("the tree must hold the committed file")
+                    .node;
+                test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                let flags = staged_flags(&repository, &staged, node_id).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedModify),
+                    "a mode change must be settled as a modification, flags {flags:?}"
                 );
             }))
             .await

@@ -85,6 +85,10 @@ bitflags! {
         const Staged = 0b10000000;
         // Change is dirty (filesystem modification detected)
         const Dirty = 0b100000000;
+        // The working file carries an executable bit no revision gave it, which realizing the
+        // change keeps: the content is written and the bit left as a local modification. Set by
+        // the verify, so a reset or a forced sync carries the bit the node names instead.
+        const LocalMode = 0b1000000000;
     }
 }
 bitflagsops!(Flags, u16);
@@ -96,6 +100,10 @@ impl Flags {
 
     pub fn is_dirty(&self) -> bool {
         self.contains(Flags::Dirty)
+    }
+
+    pub fn is_local_mode(&self) -> bool {
+        self.contains(Flags::LocalMode)
     }
 
     pub fn is_merge(&self) -> bool {

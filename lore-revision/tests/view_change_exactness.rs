@@ -574,9 +574,8 @@ mod tests {
         modified: Vec<String>,
         added: Vec<String>,
         deleted: Vec<String>,
-        /// The files the second revision marks executable, which it also rewrites: a chmod on its
-        /// own changes no content, size or modified time, and the scan that stages a tree measures
-        /// those, so the revision would carry no trace of it.
+        /// The files the second revision marks executable, leaving their content as it stands:
+        /// the executable bit is a modification in its own right.
         executable: Vec<String>,
         /// The directories the second revision does not hold, removed once what they held is.
         emptied: Vec<String>,
@@ -635,10 +634,7 @@ mod tests {
                 match rng.random_range(0..10u32) {
                     0 | 1 => modified.push(path.clone()),
                     2 => deleted.push(path.clone()),
-                    3 => {
-                        modified.push(path.clone());
-                        executable.push(path.clone());
-                    }
+                    3 => executable.push(path.clone()),
                     _ => {}
                 }
             }
@@ -746,8 +742,7 @@ mod tests {
     /// Asserts that the second revision records the mode changes the tree asks for.
     ///
     /// Without this the mode half of every comparison below could be comparing one value with
-    /// itself and say so nowhere: the bit reaches a revision only because the file carrying it is
-    /// rewritten as well.
+    /// itself and say so nowhere.
     #[cfg(unix)]
     async fn mode_changes_are_recorded(fixture: &Fixture, tree: &Tree, seed: u64) {
         if tree.executable.is_empty() {

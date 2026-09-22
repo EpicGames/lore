@@ -1912,6 +1912,18 @@ impl StagedChild {
     }
 }
 
+/// Record on `node` what a staged file carries: it is a file, it holds no children, and it is
+/// the size the walk measured.
+///
+/// The mode is not recorded. A commit reads the file's mode and compares it with the node's to
+/// see whether the revision has to carry a change to it, so a mode recorded here would be
+/// compared against itself and a change to the executable bit alone would be lost.
+fn record_staged_file(node: &mut Node, info: &FileInfo) {
+    node.flags |= NodeFlags::File;
+    node.child = 0;
+    node.size = info.size();
+}
+
 /// Stage the child `name` of `base` from the file information the caller already holds.
 ///
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
@@ -2326,26 +2338,24 @@ pub(crate) async fn stage_node_from_metadata(
             } else {
                 let node_path = relative_path.join(name.as_str());
 
-                file_modified_against_node(
-                    repository.clone(),
-                    &node,
-                    info.mtime(),
-                    info.size(),
-                    &node_path,
-                    !node.is_staged(),
-                    operation,
-                    &lore_storage::ContentHashes::default(),
-                )
-                .await
-                .forward::<StageError>("Failed to determine if file is modified")?
-                .is_modified()
+                info.mode_differs_from(node.mode)
+                    || file_modified_against_node(
+                        repository.clone(),
+                        &node,
+                        info.mtime(),
+                        info.size(),
+                        &node_path,
+                        !node.is_staged(),
+                        operation,
+                        &lore_storage::ContentHashes::default(),
+                    )
+                    .await
+                    .forward::<StageError>("Failed to determine if file is modified")?
+                    .is_modified()
             };
 
             if stage_file_node {
-                node.flags |= NodeFlags::File;
-                node.child = 0;
-                node.mode = info.mode(node.mode);
-                node.size = info.size();
+                record_staged_file(&mut node, &info);
                 maybe_content_modified = true;
             } else if was_dirty_add {
                 maybe_content_modified = true;

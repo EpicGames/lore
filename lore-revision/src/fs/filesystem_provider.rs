@@ -144,6 +144,15 @@ impl FileInfo {
     pub fn mode(&self, previous: u16) -> u16 {
         crate::util::fs::mode_from_observed(self.is_file(), self.executable(), previous)
     }
+
+    /// Whether this carries a different mode from `previous`, which is a modification of the
+    /// file in its own right.
+    ///
+    /// A platform with no executable bit to read answers no, since `previous` is then what
+    /// [`Self::mode`] stores.
+    pub fn mode_differs_from(&self, previous: u16) -> bool {
+        crate::util::fs::mode_changed(previous, self.mode(previous))
+    }
 }
 
 /// One child of a directory listing.
@@ -265,6 +274,9 @@ pub struct FilesystemDiffContext {
 pub struct FileDifferenceFromNode {
     /// Whether the file content differs from the node.
     pub modified: bool,
+    /// Whether the file carries a different mode from the node, which is a modification of the
+    /// file in its own right and one the content answers nothing about.
+    pub mode_differs: bool,
 }
 
 /// The node a file was measured against, and whether the current revision is what holds it.
@@ -1419,10 +1431,6 @@ pub mod tests {
         assert_eq!(0, info.mtime());
     }
 
-    /// A node staged from a `FileInfo` has to land the size, time and mode a node
-    /// staged from the metadata itself would, since the two are the same walk before
-    /// and after the file information became the currency between them. A directory
-    /// states none of what a file stores, which is none of what a directory node takes.
     /// The mode read straight off the metadata, which is the path [`FileInfo::mode`] has to
     /// reproduce for a node staged either way to land the same one.
     fn metadata_to_mode(metadata: &std::fs::Metadata, previous: u16) -> u16 {
@@ -1433,6 +1441,10 @@ pub mod tests {
         )
     }
 
+    /// A node staged from a `FileInfo` has to land the size, time and mode a node
+    /// staged from the metadata itself would, since the two are the same walk before
+    /// and after the file information became the currency between them. A directory
+    /// states none of what a file stores, which is none of what a directory node takes.
     #[test]
     fn file_information_answers_what_the_metadata_helpers_answer() {
         let dir = lore_base::test_util::TempDir::new("lore-fs-provider-test-");

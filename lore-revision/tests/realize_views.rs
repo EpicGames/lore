@@ -231,6 +231,33 @@ mod tests {
         fn working_file(&self, path: &str) -> Option<Vec<u8>> {
             std::fs::read(self.instance.path.join(path)).ok()
         }
+
+        /// Marks the working file at `path` executable behind the repository's back, which is what a
+        /// user running `chmod +x` leaves: a bit no revision gave the file.
+        #[cfg(target_family = "unix")]
+        fn make_working_executable(&self, path: &str) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let file = self.instance.path.join(path);
+            let mut permissions = std::fs::metadata(&file)
+                .expect("The working file must be readable")
+                .permissions();
+            permissions.set_mode(permissions.mode() | 0o111);
+            std::fs::set_permissions(&file, permissions).expect("Failed to set the executable bit");
+        }
+
+        /// Whether the working file at `path` carries the executable bit.
+        #[cfg(target_family = "unix")]
+        fn working_executable(&self, path: &str) -> bool {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::metadata(self.instance.path.join(path))
+                .expect("The working file must be readable")
+                .permissions()
+                .mode()
+                & 0o111
+                != 0
+        }
     }
 
     /// A file the target view drops leaves the working tree, which is what the current view's
@@ -363,6 +390,83 @@ mod tests {
                         bytes: REWRITTEN.len() as u64
                     },
                     "a move whose content changed is written whatever the rename did"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A bit the user set at the source is the working tree's own, and the rename carries it to the
+    /// destination along with the file. Nothing may then apply the mode the revision holds over it.
+    ///
+    /// The verify has to measure the source to see the bit at all: the destination holds nothing
+    /// until the rename has run, so a measurement taken there answers nothing about the mode.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_move_keeps_a_local_executable_bit_the_rename_carries() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let repository = fixture.view(&[]);
+                fixture.make_working_executable(MOVED);
+
+                let written = fixture.realize(repository.clone(), repository).await;
+
+                assert_eq!(
+                    fixture.working_file(RENAMED).as_deref(),
+                    Some(CONTENT),
+                    "the rename carries the content to the destination"
+                );
+                assert!(
+                    fixture.working_executable(RENAMED),
+                    "the bit the user set at the source stands at the destination"
+                );
+                assert_eq!(
+                    written,
+                    Written { files: 0, bytes: 0 },
+                    "a bit of its own is no reason for a move to write the content"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The same where the move rewrites the file, which the rename cannot carry: the content is
+    /// written from the store, and writing a node applies the mode it holds. The bit is read off the
+    /// file the rename moved and written with the content rather than reverted to the revision's.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn a_move_that_rewrites_the_file_keeps_a_local_executable_bit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_rewriting(immutable_store, mutable_store).await;
+                let repository = fixture.view(&[]);
+                fixture.make_working_executable(MOVED);
+
+                let written = fixture.realize(repository.clone(), repository).await;
+
+                assert_eq!(
+                    fixture.working_file(RENAMED).as_deref(),
+                    Some(REWRITTEN),
+                    "the destination holds what the newer revision holds"
+                );
+                assert!(
+                    fixture.working_executable(RENAMED),
+                    "the bit the user set survives the write the rewritten content takes"
+                );
+                assert_eq!(
+                    written,
+                    Written {
+                        files: 1,
+                        bytes: REWRITTEN.len() as u64
+                    },
+                    "the content still comes from the store"
                 );
             }))
             .await

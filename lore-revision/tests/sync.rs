@@ -26,6 +26,142 @@ mod tests {
 
     include!("helper.rs");
 
+    /// The file the executable bit test carries across two revisions.
+    const SCRIPT: &str = "script.sh";
+    const FIRST: &[u8] = b"#!/bin/sh\necho first";
+    const SECOND: &[u8] = b"#!/bin/sh\necho second";
+
+    /// Syncs `instance` to `revision`, discarding local modifications where `reset` asks it to.
+    #[cfg(target_family = "unix")]
+    async fn sync_to(instance: &TestRepository, revision: lore_base::types::Hash, reset: bool) {
+        sync::sync_boxed(
+            instance.repository.clone(),
+            &instance.write_token,
+            SyncOptions {
+                revision: Some(revision.to_string()),
+                reset,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to sync to the revision");
+    }
+
+    /// A repository whose second revision rewrites [`SCRIPT`], answered beside the working tree
+    /// standing on the first revision with the file marked executable by hand.
+    #[cfg(target_family = "unix")]
+    async fn a_chmodded_working_tree(
+        immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    ) -> (TestRepository, lore_base::types::Hash) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let instance = test_repository_create(
+            immutable_store,
+            mutable_store,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+        )
+        .await;
+        let script = instance.path.join(SCRIPT);
+
+        test_file_write(script.as_path(), FIRST);
+        let first = test_commit_tree(&instance, "First").await.revision();
+        test_file_write(script.as_path(), SECOND);
+        let second = test_commit_tree(&instance, "Second").await.revision();
+
+        sync_to(&instance, first, false).await;
+        std::fs::set_permissions(script.as_path(), std::fs::Permissions::from_mode(0o755))
+            .expect("Failed to set the executable bit");
+
+        (instance, second)
+    }
+
+    /// Whether the working file at `path` carries the executable bit.
+    #[cfg(target_family = "unix")]
+    fn working_executable(path: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path)
+            .expect("The working file must be readable")
+            .permissions()
+            .mode()
+            & 0o111
+            != 0
+    }
+
+    /// A chmod is a modification of the executable bit and nothing else, which the content an
+    /// incoming revision carries answers nothing about. A sync to that revision writes the content
+    /// and leaves the bit, so the change the user made stands as a local modification against the
+    /// revision the tree lands on rather than being reverted by the write.
+    #[cfg(target_family = "unix")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sync_writes_new_content_and_keeps_a_local_executable_bit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let (instance, second) =
+                    a_chmodded_working_tree(immutable_store, mutable_store).await;
+                let script = instance.path.join(SCRIPT);
+
+                sync_to(&instance, second, false).await;
+
+                assert_eq!(
+                    fs::read(script.as_path()).expect("The synced file must be readable"),
+                    SECOND,
+                    "the sync has to carry the content the revision it lands on holds"
+                );
+                assert!(
+                    working_executable(script.as_path()),
+                    "the bit the user set has to survive the write"
+                );
+
+                let (current, staged) = test_anchor_states(&instance.repository).await;
+                let scanned =
+                    test_reported(&test_scan(instance.repository.clone(), staged, current).await);
+                assert!(
+                    scanned.contains(&("M".to_string(), SCRIPT.to_string())),
+                    "the bit has to stand as a local modification against the revision synced \
+                     to, reported {scanned:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset discards local modifications, which the executable bit is one of: the file is left
+    /// holding the mode its revision names.
+    #[cfg(target_family = "unix")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_discards_a_local_executable_bit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let (instance, second) =
+                    a_chmodded_working_tree(immutable_store, mutable_store).await;
+                let script = instance.path.join(SCRIPT);
+
+                sync_to(&instance, second, true).await;
+
+                assert_eq!(
+                    fs::read(script.as_path()).expect("The synced file must be readable"),
+                    SECOND,
+                    "a reset carries the content the revision it lands on holds"
+                );
+                assert!(
+                    !working_executable(script.as_path()),
+                    "a reset leaves the mode the revision names, the local bit with it"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_explicit_revision() {
         let (_immutable_store, _mutable_store, execution) =
