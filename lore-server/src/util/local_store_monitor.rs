@@ -520,8 +520,7 @@ mod tests {
         std::fs::create_dir(&inside).expect("create directory");
 
         let through_parent = inside.join("..").join("inside").join("store");
-        let settled = inside
-            .canonicalize()
+        let settled = real_location(&inside)
             .expect("resolve directory")
             .join("store");
 
@@ -686,12 +685,13 @@ mod tests {
 
     /// A directory that exists, so `resolved_location` settles the store paths
     /// under a mount point the test names, whatever the platform spells one.
+    ///
+    /// Read through [`real_location`], which is how the check spells a path it
+    /// resolves: `canonicalize` alone answers a verbatim path on Windows, and a
+    /// mount point spelled that way matches none of the stores under it.
     fn mount_root(prefix: &str) -> (lore_base::test_util::TempDir, PathBuf) {
         let dir = lore_base::test_util::TempDir::new(prefix);
-        let root = dir
-            .path()
-            .canonicalize()
-            .expect("resolve temporary directory");
+        let root = real_location(dir.path()).expect("resolve temporary directory");
 
         (dir, root)
     }

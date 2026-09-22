@@ -37,6 +37,16 @@ def _logged(path: Path) -> str:
     return json.dumps(str(path))[1:-1]
 
 
+def _names(path: Path, line: str) -> bool:
+    """Whether `line` names `path`, whichever way the log spells a separator.
+
+    A text log carries the path as it stands and a JSON log escapes the Windows
+    separator, so either spelling counts. Reading one form alone passes on a
+    platform whose separator needs no escaping and fails on Windows.
+    """
+    return str(path) in line or _logged(path) in line
+
+
 def _wait_for_log_lines(log_path: Path, matches, timeout: float = 30.0):
     """Poll the server log until `matches` selects at least one line."""
     deadline = time.monotonic() + timeout
@@ -109,7 +119,7 @@ class TestLocalStoreWarnings:
         """The store path is named at warning level, with RUST_LOG unset."""
         found = _wait_for_log_lines(
             server_log_path,
-            lambda line: "WARN" in line and _logged(store_directory) in line,
+            lambda line: "WARN" in line and _names(store_directory, line),
         )
 
         assert found, (
@@ -124,7 +134,9 @@ class TestLocalStoreWarnings:
         """
         found = _wait_for_log_lines(
             server_log_path,
-            lambda line: "WARN" in line and "no local store path is configured" in line.lower(),
+            lambda line: (
+                "WARN" in line and "no local store path is configured" in line.lower()
+            ),
             timeout=2.0,
         )
 
@@ -142,9 +154,11 @@ class TestLocalStoreWarnings:
         """
         found = _wait_for_log_lines(
             server_log_path,
-            lambda line: "WARN" in line
-            and "mount_point" in line
-            and str(UNREACHABLE_THRESHOLD_BYTES) in line,
+            lambda line: (
+                "WARN" in line
+                and "mount_point" in line
+                and str(UNREACHABLE_THRESHOLD_BYTES) in line
+            ),
         )
 
         assert found, (
@@ -214,7 +228,7 @@ class TestUnconfiguredLocalStore:
         generated = temp_root / "lore-server"
         found = _wait_for_log_lines(
             server_log_path,
-            lambda line: "WARN" in line and _logged(generated) in line,
+            lambda line: "WARN" in line and _names(generated, line),
         )
 
         assert len(found) >= 2, (
