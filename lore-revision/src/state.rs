@@ -2179,11 +2179,13 @@ impl State {
             }
 
             let (idx, block) = self.allocate_fresh_block()?;
-            return self.try_grab_in(&block, idx).ok_or_else(|| {
+            let node_id = self.try_grab_in(&block, idx).ok_or_else(|| {
                 StateError::internal(
                     "grab_node_unused returned INVALID on a freshly-allocated block",
                 )
-            });
+            })?;
+            self.push_unused_block_list(idx, &block);
+            return Ok(node_id);
         }
     }
 
@@ -2292,12 +2294,15 @@ impl State {
         Some((block_index, block))
     }
 
-    /// Allocate a fresh `NodeBlock`, push it onto the runtime's block vector
-    /// and splice it at the head of the unused chain. Errors only when the
-    /// per-tree block limit is reached. The returned block is guaranteed to
-    /// have at least one free slot — a newly-zeroed block has
-    /// `node_count == 0`, well below `BLOCK_NODE_COUNT` — so the caller's
-    /// grab is structurally guaranteed to succeed.
+    /// Allocate a fresh `NodeBlock` and push it onto the runtime's block vector, leaving it
+    /// out of the unused chain. Errors only when the per-tree block limit is reached.
+    ///
+    /// Staying out of the chain is what makes the caller's grab certain to succeed: a
+    /// newly-zeroed block has `node_count == 0`, well below `BLOCK_NODE_COUNT`, and the chain
+    /// is the only way another grabber reaches a block, so while the caller holds the
+    /// allocation permit nothing else can take a slot from this one. The caller splices it in
+    /// with [`Self::push_unused_block_list`] once it has taken its own, as the recycling path
+    /// does.
     fn allocate_fresh_block(&self) -> Result<(usize, Arc<NodeBlock>), StateError> {
         let mut runtime = self.runtime.write();
         let block_index = runtime.block.len();
@@ -2313,18 +2318,13 @@ impl State {
         }
         runtime.block.push(Arc::downgrade(&block));
 
-        let prior_head = if let Some(tree) = runtime.tree.as_mut() {
-            let prior = tree.block_unused_first;
+        if let Some(tree) = runtime.tree.as_mut() {
             tree.block_count = 1 + block_index as u32;
-            tree.block_unused_first = block_index as u32;
             tree.flags |= TreeFlags::Dirty;
-            prior
-        } else {
-            INVALID_BLOCK
-        };
+        }
         {
             let mut block_writer = block.write();
-            block_writer.node_block().block_unused_next = prior_head;
+            block_writer.node_block().block_unused_next = INVALID_BLOCK;
             block_writer.mark_dirty();
         }
         drop(runtime);

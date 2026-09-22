@@ -26,6 +26,8 @@ mod tests {
     const READS_PER_TASK: usize = 10_000;
     const TREE_INSTALL_TASKS: usize = 16;
     const TREE_INSTALL_ROUNDS: usize = 64;
+    /// Enough to cross several block boundaries, a block holding [`BLOCK_NODE_COUNT`] slots.
+    const ALLOCATED_NODES: usize = 4 * BLOCK_NODE_COUNT;
 
     /// Regression test for the `node_add` publish-before-init race.
     ///
@@ -165,6 +167,91 @@ mod tests {
                         .await
                         .expect("every concurrently-added sibling must be findable");
                 }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Regression test for the node allocator draining a block it had just allocated.
+    ///
+    /// The fresh block was spliced at the head of the unused chain before the task that
+    /// allocated it took its own slot, so every other grabber could reach it first and empty
+    /// it, and the allocation then failed with `grab_node_unused returned INVALID on a
+    /// freshly-allocated block`. It grabs before it splices, so the block it allocated is
+    /// still its own.
+    ///
+    /// Adds more nodes at once than a block holds, so the grabs that can drain one are in
+    /// flight while the next is allocated, and every add has to come back with a slot of its
+    /// own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn node_add_parallel_across_block_boundaries_hands_out_distinct_slots() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state = Arc::new(State::new());
+                let start = Arc::new(tokio::sync::Barrier::new(ALLOCATED_NODES));
+                let mut adders: JoinSet<NodeID> = JoinSet::new();
+                for index in 0..ALLOCATED_NODES {
+                    let repo = repository.clone();
+                    let state = state.clone();
+                    let start = start.clone();
+                    lore_spawn!(adders, async move {
+                        let name = format!("node-{index:05}");
+                        start.wait().await;
+                        state
+                            .node_add(
+                                repo,
+                                ROOT_NODE,
+                                Node {
+                                    name_hash: hash_string(&name),
+                                    ..Default::default()
+                                },
+                                &name,
+                            )
+                            .await
+                            .expect("every concurrent add must be given a slot")
+                    });
+                }
+
+                let mut slots = std::collections::BTreeSet::new();
+                while let Some(joined) = adders.join_next().await {
+                    slots.insert(joined.expect("adder task panicked"));
+                }
+                assert_eq!(
+                    ALLOCATED_NODES,
+                    slots.len(),
+                    "no two concurrent adds may be given the same slot"
+                );
+                assert!(
+                    state.block_count() >= ALLOCATED_NODES / BLOCK_NODE_COUNT,
+                    "the adds must have crossed several block boundaries, blocks {}",
+                    state.block_count()
+                );
             }))
             .await
             .expect("Test task failed");

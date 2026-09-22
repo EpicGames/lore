@@ -26,6 +26,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Fix the wrong files being removed when a directory leaves the working tree. Where the directory's node could not be read, the removal was decided from the incoming revision's tree and filter rather than the ones the working tree was materialized under, so it could name files that were never on disk and leave behind files that were
 - A change to a file's executable bit alone is now reported by `lore status --scan`, taken by `lore stage`, and recorded on the revision `lore commit` produces. A chmod moves neither the content, the size nor the modification time, which were all the comparison read, so the change was invisible from the moment it was made
 - `lore sync` and `lore branch merge` keep a locally changed executable bit on a file whose content they carry, rather than silently reverting it to the revision's. The bit stands as a local modification and blocks nothing; `--reset` and `--force` apply the revision's bit as before
+- Fix `lore stage` over a large tree failing with `grab_node_unused returned INVALID on a freshly-allocated block`. A freshly allocated block of node slots was published for every other thread to grab from before the thread that allocated it took its own, so under enough concurrency the block could be emptied out from under it. It takes its slot before it publishes the block
 
 ## v0.10.0 (Sep 17th 2026) [#1170]
 
