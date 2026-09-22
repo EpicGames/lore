@@ -23,7 +23,6 @@ mod tests {
     use lore_revision::filter::FilterMode;
     use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
     use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
-    use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
@@ -69,7 +68,7 @@ mod tests {
         .await
         .expect("Failed to diff filesystem");
         operation
-            .finalize(false)
+            .finalize()
             .await
             .expect("Failed to finish filesystem operation");
         changes

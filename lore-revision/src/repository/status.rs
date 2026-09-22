@@ -1335,7 +1335,6 @@ async fn report_tree_diffs(
     with_operation_if(
         repository.file_system(),
         plan.reads_working_tree(),
-        false, /* Reads the working tree, writes only the staged tree */
         async |operation| {
             if plan.compare_staged {
                 let diff = StagedDiff {

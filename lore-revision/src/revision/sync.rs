@@ -1104,15 +1104,11 @@ fn discard_modified_times<T>((result, modified_times): (T, RecordedModifiedTimes
 /// The times are only true once the revision the operation realized is the current one, so a
 /// caller that advances the current revision stores them and every other caller discards
 /// them.
-///
-/// `changes_made` reports whether the callback leaves the working copy changed, which a dry run
-/// does not: it reports the writes it would have made and leaves nothing of them behind.
 async fn shim_with_operation<T>(
     filesystem: Arc<dyn FilesystemProvider>,
-    changes_made: bool,
     callback: impl AsyncFnOnce(Arc<InstanceOperationImpl>) -> T,
 ) -> Result<(T, RecordedModifiedTimes), FsError> {
-    with_operation(filesystem, changes_made, async |operation| {
+    with_operation(filesystem, async |operation| {
         let result = callback(operation.clone()).await;
         Ok((result, operation.take_modified_times()))
     })
@@ -1132,7 +1128,7 @@ async fn sync_realize(
     options: SyncOptions,
 ) -> Result<RecordedModifiedTimes, SyncError> {
     let (result, modified_times) =
-        shim_with_operation(repository.file_system(), true, async |operation| {
+        shim_with_operation(repository.file_system(), async |operation| {
             Box::pin(crate::fs::realize::realize_state(
                 repository_current,
                 repository,
@@ -1216,7 +1212,7 @@ pub async fn realize_changes(
     is_merge: bool,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), !dry_run, async |operation| {
+    shim_with_operation(repository.file_system(), async |operation| {
         crate::fs::realize::realize_changes(
             repository,
             operation,
@@ -1244,7 +1240,7 @@ pub async fn realize_conflicts(
     stats: Arc<SyncRealizeStats>,
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), !dry_run, async |operation| {
+    shim_with_operation(repository.file_system(), async |operation| {
         crate::fs::realize::realize_conflicts(
             repository,
             operation,

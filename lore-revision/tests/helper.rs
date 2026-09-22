@@ -351,7 +351,8 @@ pub async fn test_scan_path_with_intent(
     .collect()
     .await
     .expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
@@ -395,7 +396,8 @@ pub async fn test_scan_streaming(
         changes.push(change);
     }
     stream.finish().await.expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes

@@ -89,7 +89,7 @@ pub(crate) async fn update(
     // TODO(vri): Verify filesystem in any case for local modifications
     // Tree roots at the innermost node; filesystem path is the full link path.
     if state_current.revision() != state_staged.revision() {
-        let changed = with_operation(repository.file_system(), false, async |operation| {
+        let changed = with_operation(repository.file_system(), async |operation| {
             let linked_changes = state::diff_filesystem_subtree(
                 &operation,
                 NodeMapping {

@@ -477,7 +477,7 @@ pub async fn add(
     let target_states = layer_repository.filter.mount_states(&target_path);
     // The target directory and the files cloned under it are in the same filesystem, so one
     // operation covers both.
-    with_operation(layer_repository.file_system(), true, async |operation| {
+    with_operation(layer_repository.file_system(), async |operation| {
         operation
             .create_dir_all(&target_path)
             .await
@@ -631,7 +631,7 @@ pub async fn remove(
 
     let force = execution_context().globals().force();
     // The walk reads the same files the removal then deletes, so one operation covers both.
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         walk_layer_subtree(
             &operation,
             layer_repository.clone(),
@@ -902,7 +902,7 @@ pub async fn sync(
     options: SyncOptions,
 ) -> Result<(), LayerError> {
     let filesystem = repository_target.file_system();
-    with_operation(filesystem, true, async |operation| {
+    with_operation(filesystem, async |operation| {
         sync_in_operation(
             operation,
             repository_current,

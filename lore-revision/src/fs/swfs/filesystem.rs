@@ -77,6 +77,18 @@ pub struct SwfsOperation {
     os: OsOperation,
 }
 
+impl SwfsOperation {
+    /// Thaws the frozen filesystem, clearing the write cache where the operation wrote.
+    pub(crate) async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
+        let token = SwfsExecutionToken {};
+        self.mount
+            .thaw(token, changes_made)
+            .await
+            .internal("Thawing SWFS file system")?;
+        Ok(())
+    }
+}
+
 macro_rules! fake_with_os {
     ($fn_name:ident, $result_ty:ty, $($arg_name:ident: $arg_ty:ty),* $(,)?) => {
         async fn $fn_name(&self, $($arg_name: $arg_ty),*) -> Result<$result_ty, FsError> {
@@ -127,15 +139,6 @@ impl InstanceOperation for SwfsOperation {
             .await
             .internal("Failed to cache file contents")?;
         Ok((Fragment::default(), None))
-    }
-
-    async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
-        let token = SwfsExecutionToken {};
-        self.mount
-            .thaw(token, changes_made)
-            .await
-            .internal("Thawing SWFS file system")?;
-        Ok(())
     }
 
     fn changes_from_filesystem_to_state(

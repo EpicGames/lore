@@ -2312,7 +2312,7 @@ pub async fn apply_diff(
 
     // One operation covers the whole diff: every path it verifies and realizes is in the
     // same filesystem, and one opened per change would freeze and thaw it once per file.
-    let (changes, conflicts) = with_operation(repository.file_system(), true, async |operation| {
+    let (changes, conflicts) = with_operation(repository.file_system(), async |operation| {
         verify_diff_against_filesystem(
             &operation,
             &repository,
@@ -3036,7 +3036,7 @@ pub async fn merge_abort(
     let dry_run = execution_context().globals().dry_run();
     // One operation covers the abort: the merge artifacts it removes and the changes it
     // reverts are in the same working tree.
-    let modified_times = with_operation(repository.file_system(), true, async |operation| {
+    let modified_times = with_operation(repository.file_system(), async |operation| {
         if !dry_run {
             for change in changes.iter() {
                 sync::unlink_merge_artifacts(&operation, change.path()).await;
@@ -3217,7 +3217,7 @@ pub async fn apply_restart_diff(
         let conflicts = Arc::new(conflicts);
 
         // One operation covers the restart, as it covers a whole diff application.
-        with_operation(repository.file_system(), true, async |operation| {
+        with_operation(repository.file_system(), async |operation| {
             restart_reset_conflicts(&operation, &repository, &conflicts, dry_run).await?;
             realize_diff_over_filesystem(RealizeDiff {
                 operation: &operation,
@@ -3841,7 +3841,7 @@ pub async fn merge_resolve(
     // One operation covers every path: resolving reads the working copy to tell a conflict
     // still marked up from one settled. Nothing is written: the resolution is recorded in the
     // staged state.
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         resolve_paths(
             &operation,
             &repository,

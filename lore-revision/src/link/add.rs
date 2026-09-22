@@ -339,7 +339,7 @@ pub async fn add(
     let mut remainder_parent = remainder_path.clone();
     remainder_parent.pop();
 
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         create_link_mount(
             &operation,
             chain.innermost.clone(),
@@ -412,7 +412,7 @@ pub async fn add(
 
     let stats = Arc::new(CloneStats::default());
     let clone_states = link.filter.mount_states(&clone_path);
-    with_operation(link.file_system(), true, async |operation| {
+    with_operation(link.file_system(), async |operation| {
         let clone_ctx = CloneContext {
             repository: link.clone(),
             state: link_state,

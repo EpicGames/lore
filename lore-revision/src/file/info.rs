@@ -192,48 +192,44 @@ pub async fn info(
         .await
         .forward::<InfoError>("Failed deserializing revision state")?;
 
-    with_operation(
-        repository.file_system(),
-        false, /* Reads the working tree and leaves it alone */
-        async |operation| {
-            let mut tasks = JoinSet::new();
-            for path in paths.iter() {
-                lore_debug!("Info path: {path}");
+    with_operation(repository.file_system(), async |operation| {
+        let mut tasks = JoinSet::new();
+        for path in paths.iter() {
+            lore_debug!("Info path: {path}");
 
-                let operation = operation.clone();
-                let repository = repository.clone();
-                let state = state.clone();
-                let path = path.clone();
+            let operation = operation.clone();
+            let repository = repository.clone();
+            let state = state.clone();
+            let path = path.clone();
 
-                lore_spawn!(tasks, async move {
-                    info_path(
-                        operation,
-                        repository,
-                        state,
-                        path,
-                        options.local,
-                        options.filtered,
-                    )
-                    .await
-                });
-            }
+            lore_spawn!(tasks, async move {
+                info_path(
+                    operation,
+                    repository,
+                    state,
+                    path,
+                    options.local,
+                    options.filtered,
+                )
+                .await
+            });
+        }
 
-            let mut failure: Option<InfoError> = None;
-            while let Some(result) = tasks.join_next().await {
-                let inner = result
-                    .internal("Internal task failure")
-                    .map_err(InfoError::from)
-                    .flatten();
-                failure = failure.or(inner.err());
-            }
+        let mut failure: Option<InfoError> = None;
+        while let Some(result) = tasks.join_next().await {
+            let inner = result
+                .internal("Internal task failure")
+                .map_err(InfoError::from)
+                .flatten();
+            failure = failure.or(inner.err());
+        }
 
-            if let Some(err) = failure {
-                return Err(err);
-            }
+        if let Some(err) = failure {
+            return Err(err);
+        }
 
-            Ok(())
-        },
-    )
+        Ok(())
+    })
     .await
 }
 

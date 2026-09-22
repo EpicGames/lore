@@ -2561,7 +2561,7 @@ pub(crate) async fn stage_from_parent_revision(
     paths: LoreArray<LoreString>,
     merge_parent: MergeParent,
 ) -> Result<(), StageError> {
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         stage_from_parent_revision_in_operation(
             operation,
             repository.clone(),

@@ -23,7 +23,6 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_revision::fs::filesystem_provider::FilesystemProvider;
-    use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreGlobalArgs;
@@ -218,7 +217,8 @@ mod tests {
                     ))
                     .await
                     .expect("Failed to realize the newer revision");
-                    InstanceOperation::finalize(operation.as_ref(), true)
+                    operation
+                        .finalize()
                         .await
                         .expect("Failed to finish filesystem operation");
                     recording.dispatcher.drain().await;

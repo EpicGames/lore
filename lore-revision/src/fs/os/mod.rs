@@ -348,11 +348,6 @@ impl InstanceOperation for OsOperation {
             .await
             .unwrap_or(false))
     }
-
-    async fn finalize(&self, _success: bool) -> Result<(), FsError> {
-        // No-op for OS filesystem
-        Ok(())
-    }
 }
 
 /// Represents a single filesystem item.

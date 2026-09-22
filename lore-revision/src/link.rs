@@ -1109,7 +1109,7 @@ pub async fn restore_link_paths_from_state(
         return Ok(());
     }
 
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         for link_relative in paths {
             let mount_path = link_path.join(link_relative.as_str());
             sync::unlink_merge_artifacts(&operation, &mount_path).await;
@@ -1324,7 +1324,7 @@ pub async fn realize_link_pin_change(
 ) -> Result<(), LinkError> {
     let diff = link_pin_diff(&link_context, link_path, old_sig, new_sig, linked_node).await?;
 
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         realize_link_pin_diff(&operation, repository, link_context, new_sig, diff).await
     })
     .await

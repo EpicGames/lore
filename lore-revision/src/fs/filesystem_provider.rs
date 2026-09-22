@@ -324,11 +324,11 @@ pub trait FilesystemProvider: Send + Sync + 'static {
 /// Runs `work` inside one filesystem operation, finalizing it whether or not the work
 /// succeeded so a failure never leaves a filesystem frozen.
 ///
-/// `changes_made` reports whether the work wrote to the filesystem. The work's error is
-/// reported ahead of a finalize failure, being the one that explains the run.
+/// The finalize is told what the work wrote, which the operation records as each write is
+/// asked for. The work's error is reported ahead of a finalize failure, being the one that
+/// explains the run.
 pub async fn with_operation<T, E, F>(
     filesystem: Arc<dyn FilesystemProvider>,
-    changes_made: bool,
     work: F,
 ) -> Result<T, E>
 where
@@ -341,7 +341,7 @@ where
         .forward_any::<E>("Failed to start filesystem operation")?;
     let result = work(operation.clone()).await;
     let finalized = operation
-        .finalize(changes_made)
+        .finalize()
         .await
         .forward_any::<E>("Failed to finish filesystem operation");
     let value = result?;
@@ -357,7 +357,6 @@ where
 pub async fn with_operation_if<T, E, F>(
     filesystem: Arc<dyn FilesystemProvider>,
     needed: bool,
-    changes_made: bool,
     work: F,
 ) -> Result<T, E>
 where
@@ -368,10 +367,7 @@ where
         return work(None).await;
     }
 
-    with_operation(filesystem, changes_made, async |operation| {
-        work(Some(operation)).await
-    })
-    .await
+    with_operation(filesystem, async |operation| work(Some(operation)).await).await
 }
 
 /// Creates `path` and any missing ancestor, for a directory no file written below it creates on
@@ -592,20 +588,6 @@ pub trait InstanceOperation: Send + Sync {
         &self,
         path: &RelativePath,
     ) -> impl Future<Output = Result<bool, FsError>> + Send;
-
-    /// Finalize the operation.
-    ///
-    /// # Parameters
-    ///
-    /// - `changes_made`: Reports whether changes were made to the file system during the operation.
-    ///
-    /// On SWFS this clears the cache to enable those writes.
-    ///
-    /// # Implementation notes
-    ///
-    /// - **`OsOperation`**: No-op (returns immediately).
-    /// - **`SWFS`**: Thaws the filesystem, optionally clears the write cache based on `changes_made`.
-    fn finalize(&self, changes_made: bool) -> impl Future<Output = Result<(), FsError>> + Send;
 }
 
 /// Implements `InstanceOperation` by wrapping all other types implementing it and forwarding method
@@ -621,6 +603,7 @@ pub enum StaticDispatchInstanceOperation {
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
     finalized: AtomicBool,
+    changed: AtomicBool,
     modified_times: RecordedModifiedTimes,
 }
 
@@ -629,6 +612,7 @@ impl InstanceOperationImpl {
         Self {
             dispatch,
             finalized: AtomicBool::new(false),
+            changed: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
         }
     }
@@ -654,6 +638,34 @@ impl InstanceOperationImpl {
     /// thawing a filesystem another caller still holds.
     fn claim_finalize(&self) -> bool {
         !self.finalized.swap(true, Ordering::AcqRel)
+    }
+
+    /// Collects that the operation was asked to write, which is what [`Self::finalize`] reports.
+    ///
+    /// Recorded for the call rather than for its outcome: a write that failed part of the way
+    /// through leaves the same stale cache behind as one that succeeded.
+    fn record_change(&self) {
+        self.changed.store(true, Ordering::Release);
+    }
+
+    /// Finishes the operation, reporting to the provider behind it whether the work wrote.
+    ///
+    /// # Implementation notes
+    ///
+    /// - **`OsOperation`**: Nothing to finish, the writes having gone to the filesystem the
+    ///   reads come from.
+    /// - **`SWFS`**: Thaws the filesystem, clearing the write cache where writes were made.
+    pub async fn finalize(&self) -> Result<(), FsError> {
+        if !self.claim_finalize() {
+            return Err(FsError::internal("Operation already finalized"));
+        }
+        let changes_made = self.changed.load(Ordering::Acquire);
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made),
+            StaticDispatchInstanceOperation::Os(_this) => Ok(()),
+            StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
+        }
     }
 }
 
@@ -757,6 +769,7 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -770,15 +783,17 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.create_dir_all(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.create_dir_all(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.create_dir_all(path).await,
         }
     }
 
     async fn create_file(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -792,6 +807,7 @@ impl InstanceOperation for InstanceOperationImpl {
         from: &RelativePath,
         to: &RelativePath,
     ) -> Result<(), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -801,6 +817,7 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -810,6 +827,7 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -824,6 +842,7 @@ impl InstanceOperation for InstanceOperationImpl {
         node: &Node,
         path: &RelativePath,
     ) -> Result<FileInfo, FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -842,6 +861,7 @@ impl InstanceOperation for InstanceOperationImpl {
         node: &Node,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -861,6 +881,7 @@ impl InstanceOperation for InstanceOperationImpl {
         source_path: &RelativePath,
         destination_path: &RelativePath,
     ) -> Result<(), FsError> {
+        self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -881,6 +902,9 @@ impl InstanceOperation for InstanceOperationImpl {
         result: &RelativePath,
         mode: MergeTextMode<'_>,
     ) -> Result<bool, FsError> {
+        if matches!(mode, MergeTextMode::Write(_)) {
+            self.record_change();
+        }
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -901,18 +925,6 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_diffable(path).await,
-        }
-    }
-
-    async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
-        if !self.claim_finalize() {
-            return Err(FsError::internal("Operation already finalized"));
-        }
-        match &self.dispatch {
-            #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made).await,
-            StaticDispatchInstanceOperation::Os(this) => this.finalize(changes_made).await,
-            StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
         }
     }
 }
@@ -966,6 +978,7 @@ pub mod tests {
         pub names_folding_count: Arc<AtomicUsize>,
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
+        write_fails: bool,
         holds_paths: bool,
     }
 
@@ -978,6 +991,14 @@ pub mod tests {
         pub fn failing_finalize() -> TestFilesystemProvider {
             Self {
                 finalize_fails: true,
+                ..Self::new()
+            }
+        }
+
+        /// A provider whose operations report every write they are asked for as failed.
+        pub fn failing_writes() -> TestFilesystemProvider {
+            Self {
+                write_fails: true,
                 ..Self::new()
             }
         }
@@ -1033,22 +1054,35 @@ pub mod tests {
                     names_folding_count: self.names_folding_count.clone(),
                     finalize_events: self.finalize_events.clone(),
                     finalize_fails: self.finalize_fails,
+                    write_fails: self.write_fails,
                     holds_paths: self.holds_paths,
                 }),
             )))
         }
     }
 
+    /// Answers the reads and the directory create these tests make, and records each finalize.
+    /// Every other member panics.
     pub struct TestOperation {
         file_info_count: Arc<AtomicUsize>,
         holds_name_count: Arc<AtomicUsize>,
         names_folding_count: Arc<AtomicUsize>,
         finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
+        write_fails: bool,
         holds_paths: bool,
     }
 
     impl TestOperation {
+        /// Records the finalize and the writes it was told the operation made.
+        pub(super) fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
+            self.finalize_events.lock().push(changes_made);
+            if self.finalize_fails {
+                return Err(FsError::internal("Finalize failed"));
+            }
+            Ok(())
+        }
+
         /// What the provider was told to hold, which for the default is a path the filesystem
         /// does not hold.
         fn held(&self) -> FileInfo {
@@ -1065,16 +1099,6 @@ pub mod tests {
     }
 
     impl InstanceOperation for TestOperation {
-        /// Members beyond finalizing, the walk and the name lookups are unimplemented, which will
-        /// fail any test that calls them.
-        async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
-            self.finalize_events.lock().push(changes_made);
-            if self.finalize_fails {
-                return Err(FsError::internal("Finalize failed"));
-            }
-            Ok(())
-        }
-
         /// Reports a working tree holding exactly what the state does, which is what a walk over a
         /// tree with nothing to reconcile answers.
         fn changes_from_filesystem_to_state(
@@ -1144,8 +1168,12 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
+        /// Succeeds without a tree behind it, or fails where the provider was told writes fail.
         async fn create_dir_all(&self, _path: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
+            if self.write_fails {
+                return Err(FsError::internal("Write failed"));
+            }
+            Ok(())
         }
 
         async fn create_file(&self, _path: &RelativePath) -> Result<(), FsError> {
@@ -1235,10 +1263,10 @@ pub mod tests {
         );
         assert_eq!(Vec::<bool>::new(), *(filesystem.finalize_events.lock()));
 
-        operation.finalize(true).await.expect("Finalize failed");
+        operation.finalize().await.expect("Finalize failed");
 
         assert_eq!(1, filesystem.begins());
-        assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+        assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
     }
 
     #[tokio::test]
@@ -1247,7 +1275,7 @@ pub mod tests {
         let repository = test_repository(filesystem.clone()).await;
 
         let handed: Option<()> =
-            with_operation_if(repository.file_system(), false, false, async |operation| {
+            with_operation_if(repository.file_system(), false, async |operation| {
                 Ok::<_, FsError>(operation.map(|_| ()))
             })
             .await
@@ -1270,7 +1298,7 @@ pub mod tests {
         let repository = test_repository(filesystem.clone()).await;
 
         let handed: Option<()> =
-            with_operation_if(repository.file_system(), true, false, async |operation| {
+            with_operation_if(repository.file_system(), true, async |operation| {
                 Ok::<_, FsError>(operation.map(|_| ()))
             })
             .await
@@ -1290,7 +1318,7 @@ pub mod tests {
         let repository = test_repository(filesystem.clone()).await;
 
         let result: Result<(), FsError> =
-            with_operation_if(repository.file_system(), true, false, async |_operation| {
+            with_operation_if(repository.file_system(), true, async |_operation| {
                 Err(FsError::internal("Work failed"))
             })
             .await;
@@ -1309,7 +1337,7 @@ pub mod tests {
         let repository = test_repository(filesystem.clone()).await;
 
         let result: Result<(), FsError> =
-            with_operation(repository.file_system(), false, async |_operation| {
+            with_operation(repository.file_system(), async |_operation| {
                 Err(FsError::internal("Work failed"))
             })
             .await;
@@ -1327,7 +1355,7 @@ pub mod tests {
         let filesystem = Arc::new(TestFilesystemProvider::new());
         let repository = test_repository(filesystem.clone()).await;
 
-        let value: u32 = with_operation(repository.file_system(), true, async |_operation| {
+        let value: u32 = with_operation(repository.file_system(), async |_operation| {
             Ok::<_, FsError>(7)
         })
         .await
@@ -1335,6 +1363,59 @@ pub mod tests {
 
         assert_eq!(7, value);
         assert_eq!(1, filesystem.begins());
+        assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_wrote_finalizes_as_changed() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        with_operation(repository.file_system(), async |operation| {
+            operation.create_dir_all(&relative("written")).await
+        })
+        .await
+        .expect("The work succeeded");
+
+        assert_eq!(
+            vec![true],
+            *(filesystem.finalize_events.lock()),
+            "A write the operation performed was not reported to the finalize"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_only_read_finalizes_as_unchanged() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        with_operation(repository.file_system(), async |operation| {
+            operation.file_info(&relative("read")).await.map(|_| ())
+        })
+        .await
+        .expect("The work succeeded");
+
+        assert_eq!(
+            vec![false],
+            *(filesystem.finalize_events.lock()),
+            "A read was reported to the finalize as a write"
+        );
+    }
+
+    /// A write that failed leaves the same stale cache behind as one that succeeded, so what
+    /// the operation was asked for is what it reports.
+    #[tokio::test]
+    async fn an_operation_whose_write_failed_finalizes_as_changed() {
+        let filesystem = Arc::new(TestFilesystemProvider::failing_writes());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let result: Result<(), FsError> =
+            with_operation(repository.file_system(), async |operation| {
+                operation.create_dir_all(&relative("written")).await
+            })
+            .await;
+
+        result.expect_err("The write failed");
         assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
     }
 
@@ -1344,7 +1425,7 @@ pub mod tests {
         let repository = test_repository(filesystem.clone()).await;
 
         let result: Result<(), FsError> =
-            with_operation(repository.file_system(), false, async |_operation| Ok(())).await;
+            with_operation(repository.file_system(), async |_operation| Ok(())).await;
 
         result.expect_err("A finalize failure should be reported");
     }
@@ -1355,7 +1436,7 @@ pub mod tests {
         let repository = test_repository(filesystem.clone()).await;
 
         let result: Result<(), FsError> =
-            with_operation(repository.file_system(), false, async |_operation| {
+            with_operation(repository.file_system(), async |_operation| {
                 Err(FsError::internal("Work failed"))
             })
             .await;
@@ -1708,14 +1789,14 @@ pub mod tests {
         let repository = test_repository(filesystem.clone()).await;
 
         let operation = repository.file_system().begin_operation().await.unwrap();
-        operation.finalize(true).await.expect("Finalize failed");
+        operation.finalize().await.expect("Finalize failed");
         operation
-            .finalize(true)
+            .finalize()
             .await
             .expect_err("A second finalize should be refused");
 
         assert_eq!(
-            vec![true],
+            vec![false],
             *(filesystem.finalize_events.lock()),
             "The refused finalize reached the filesystem"
         );

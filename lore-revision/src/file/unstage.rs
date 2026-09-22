@@ -302,7 +302,7 @@ async fn unstage_parent(
     let link_tracker = LinkTracker::new();
     let is_merge_or_cherry_pick_or_revert = state_staged.is_merge_or_cherry_pick_or_revert();
 
-    let mut clear = with_operation(repository.file_system(), true, async |operation| {
+    let mut clear = with_operation(repository.file_system(), async |operation| {
         unstage_each_path(UnstagePaths {
             operation: &operation,
             repository: &repository,
@@ -437,7 +437,7 @@ async fn unstage_from_layer(
     let discard = Arc::new(DashMap::<RepositoryId, Vec<u32>>::new());
     let link_tracker = LinkTracker::new();
 
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         for remain in remains {
             Box::pin(unstage_path(
                 operation.clone(),

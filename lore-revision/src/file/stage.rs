@@ -628,7 +628,7 @@ pub async fn stage(
 
     // One filesystem operation covers the whole stage: a layer or link at a subpath
     // is a subtree of the same filesystem and takes the operation its parent holds.
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         let walk = StageWalk {
             prefixes: resolve_shared_prefixes(&operation, &repository, &shared_ancestors, options)
                 .await?,
@@ -1125,7 +1125,7 @@ pub async fn stage_merge(
     let stats = Arc::new(StageStats::default());
     // One operation covers every path: one per path would freeze a filesystem per path.
     // Nothing is written: the conflict is recorded in the staged state.
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         stage_merge_paths(
             &operation,
             &repository,
@@ -1245,7 +1245,7 @@ pub async fn stage_move(
     let mut parent_options = options;
     parent_options.no_children = true;
 
-    let parent_node_link = with_operation(repository.file_system(), true, async |operation| {
+    let parent_node_link = with_operation(repository.file_system(), async |operation| {
         let to_info = operation
             .file_info(&to_path)
             .await

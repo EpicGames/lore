@@ -1230,7 +1230,7 @@ pub async fn clone(
     let _ = repository.flush(call.sync_data()).await;
 
     let operation_result = operation
-        .finalize(true)
+        .finalize()
         .await
         .forward::<CloneError>("Finishing operation");
 

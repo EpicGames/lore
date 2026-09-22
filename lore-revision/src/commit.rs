@@ -537,7 +537,7 @@ pub fn commit_boxed(
 /// Wraps [`commit_with_metadata_in_operation`] in the one filesystem operation the whole call
 /// reads the working tree through, for the parent and for every link and layer mounted in it.
 ///
-/// Finalized as having changed the filesystem: a commit resolving a staged merge conflict
+/// The working tree is written to only where a commit resolves a staged merge conflict, which
 /// removes the copies that merge left beside the file.
 pub(crate) async fn commit_with_metadata(
     repository: Arc<RepositoryContext>,
@@ -547,7 +547,7 @@ pub(crate) async fn commit_with_metadata(
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
 ) -> Result<Hash, CommitError> {
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         Box::pin(commit_with_metadata_in_operation(
             &operation, repository, token, options, keys, values, formats,
         ))
@@ -1875,7 +1875,7 @@ pub(crate) async fn rehash_tree_in_operation(
 ) -> Result<Arc<RecordedModifiedTimes>, CommitError> {
     let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
     let modified_times = Arc::new(RecordedModifiedTimes::default());
-    let rehashed = with_operation(repository.file_system(), true, async |operation| {
+    let rehashed = with_operation(repository.file_system(), async |operation| {
         commit_files_and_rehash(
             operation,
             repository.clone(),

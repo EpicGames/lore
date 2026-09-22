@@ -131,7 +131,7 @@ pub(crate) async fn dirty_relative_paths(
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         dirty_relative_paths_in_operation(&operation, repository, paths).await
     })
     .await
@@ -319,7 +319,7 @@ pub(crate) async fn dirty_relative_paths_in(
     state_staged: Arc<State>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         dirty_relative_paths_in_masked(
             &operation,
             repository,

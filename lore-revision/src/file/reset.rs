@@ -569,7 +569,7 @@ pub async fn reset(
     let modified_times = Arc::new(crate::state::RecordedModifiedTimes::default());
     // One operation covers the whole reset: it resolves the case each path is held in and
     // writes every file, and one opened per file would freeze a filesystem per file.
-    let result = with_operation(repository.file_system(), true, async |operation| {
+    let result = with_operation(repository.file_system(), async |operation| {
         let producer_operation = operation.clone();
         let walked = run_reset_pipeline(operation.clone(), stats.clone(), |file_tx| async move {
             reset_walk_each_path(ResetWalk {
@@ -753,7 +753,7 @@ pub async fn reset_to_last_merged(
 
     let modified_times = Arc::new(crate::state::RecordedModifiedTimes::default());
     // One operation covers the whole reset, as it does for a reset to a named revision.
-    let result = with_operation(repository.file_system(), true, async |operation| {
+    let result = with_operation(repository.file_system(), async |operation| {
         let producer_operation = operation.clone();
         let walked = run_reset_pipeline(operation.clone(), stats.clone(), |file_tx| async move {
             reset_walk_each_path(ResetWalk {

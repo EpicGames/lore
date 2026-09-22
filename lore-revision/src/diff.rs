@@ -135,7 +135,7 @@ pub async fn diff_filesystem_paths(
     paths: Option<Vec<RelativePath>>,
 ) -> Result<Vec<NodeChange>, DiffError> {
     let filesystem = repository.file_system();
-    with_operation(filesystem, false, async |operation| {
+    with_operation(filesystem, async |operation| {
         diff_filesystem_paths_in(operation, repository, state_from, state_current, paths).await
     })
     .await

@@ -90,7 +90,7 @@ pub(crate) async fn remove(
 
     // One operation covers the removal: the working tree read to find local changes is the one
     // the mount is then deleted from.
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         if !execution_context().globals().force() {
             verify_no_local_changes_under_link(
                 &operation,
