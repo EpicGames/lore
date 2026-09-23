@@ -59,12 +59,14 @@ unsafe impl Send for LoreBinary {}
 unsafe impl Sync for LoreBinary {}
 
 impl LoreBinary {
+    /// A NULL pointer is empty whatever the length field says, as for
+    /// [`LoreString::is_empty`].
     pub fn is_empty(&self) -> bool {
-        self.length == 0
+        self.payload.is_null() || self.length == 0
     }
 
     pub fn len(&self) -> usize {
-        self.length
+        if self.is_empty() { 0 } else { self.length }
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -77,8 +79,10 @@ impl LoreBinary {
         }
     }
 
-    /// Build an owning `LoreBinary` from raw bytes, copied into a freshly
-    /// allocated buffer that `Drop` frees with the matching layout.
+    /// Build an owning `LoreBinary` from raw bytes. Non-empty bytes are copied
+    /// into a freshly allocated buffer that `Drop` frees with the matching
+    /// layout. Empty bytes allocate nothing and answer the NULL pointer of
+    /// length 0 the type documents.
     pub fn from_bytes(source: &[u8]) -> Self {
         if source.is_empty() {
             return Self::default();
@@ -203,12 +207,16 @@ impl std::fmt::Debug for LoreString {
 }
 
 impl LoreString {
+    /// A NULL pointer is empty whatever the length field says. The library
+    /// answers NULL for every empty string it emits, so a caller can hand one
+    /// back in an argument struct beside a length it filled in itself, and the
+    /// pointer alone says whether there are bytes to read.
     pub fn is_empty(&self) -> bool {
-        self.length == 0
+        self.string.is_null() || self.length == 0
     }
 
     pub fn len(&self) -> usize {
-        self.length
+        if self.is_empty() { 0 } else { self.length }
     }
 
     /// The text as `&str`, assuming it is valid UTF-8.
@@ -245,10 +253,14 @@ impl LoreString {
         Self::from_str(source.as_str())
     }
 
-    /// Build an owning `LoreString` from raw bytes, copied into a freshly
-    /// allocated NUL-terminated buffer. The bytes need not be valid UTF-8;
-    /// `Drop` frees the buffer with the matching layout.
+    /// Build an owning `LoreString` from raw bytes. Non-empty bytes are copied
+    /// into a freshly allocated NUL-terminated buffer that `Drop` frees with the
+    /// matching layout. Empty bytes allocate nothing and answer the NULL pointer
+    /// of length 0 the type documents. The bytes need not be valid UTF-8.
     pub fn from_bytes(source: &[u8]) -> Self {
+        if source.is_empty() {
+            return Self::default();
+        }
         unsafe {
             let length = source.len();
             let layout = std::alloc::Layout::from_size_align_unchecked(length + 1, 1);
@@ -289,25 +301,11 @@ impl Default for LoreString {
 }
 
 impl Clone for LoreString {
-    /// Copies the raw bytes, like [`Self::clone_from`]. Cloning must not read
-    /// the text as `&str`: every call clones its arguments before anything has
-    /// checked them, so this runs on whatever the caller passed in.
+    /// Copies the raw bytes. Cloning must not read the text as `&str`: every
+    /// call clones its arguments before anything has checked them, so this runs
+    /// on whatever the caller passed in.
     fn clone(&self) -> Self {
         Self::from_bytes(self.as_bytes())
-    }
-
-    fn clone_from(&mut self, source: &Self) {
-        self.free();
-
-        unsafe {
-            let length = source.len();
-            let layout = std::alloc::Layout::from_size_align_unchecked(length + 1, 1);
-            let buffer = std::alloc::alloc(layout);
-            std::ptr::copy_nonoverlapping(source.string.cast::<u8>(), buffer, length);
-            *buffer.add(length) = 0;
-            self.string = buffer as *const std::os::raw::c_char;
-            self.length = length;
-        }
     }
 }
 
@@ -1918,6 +1916,48 @@ mod tests {
         let mut assigned = LoreString::from_str("replaced");
         assigned.clone_from(&value);
         assert_eq!(assigned.as_bytes(), &[b'a', 0xff, 0xfe, b'b']);
+    }
+
+    /// The type documents an empty string as a NULL pointer with length 0, so
+    /// every way of building one has to answer that, or the same value reaches
+    /// a C caller in more than one shape.
+    #[test]
+    fn lore_string_empty_is_a_null_pointer_of_zero_length() {
+        let mut assigned = LoreString::from_str("replaced");
+        assigned.clone_from(&LoreString::default());
+
+        for empty in [
+            LoreString::default(),
+            LoreString::from_bytes(&[]),
+            LoreString::from_str(""),
+            LoreString::from(String::new()),
+            LoreString::from_str("").clone(),
+            assigned,
+        ] {
+            assert!(empty.string.is_null());
+            assert_eq!(empty.len(), 0);
+            assert_eq!(empty.as_str(), "");
+            assert_eq!(empty, LoreString::default());
+        }
+    }
+
+    /// Now that the library hands a C consumer a NULL pointer for every empty
+    /// string, one comes back in an argument struct with a length the caller
+    /// filled in from its own bookkeeping. The pointer decides whether there is
+    /// text to read, so reading such a string answers empty instead of
+    /// dereferencing NULL.
+    #[test]
+    fn lore_string_null_pointer_is_empty_whatever_the_length_claims() {
+        let claimed = LoreString {
+            string: std::ptr::null(),
+            length: 7,
+        };
+
+        assert!(claimed.is_empty());
+        assert_eq!(claimed.len(), 0);
+        assert_eq!(claimed.as_bytes(), b"");
+        assert_eq!(claimed.as_str(), "");
+        assert!(claimed.validate_text().is_ok());
     }
 
     #[test]

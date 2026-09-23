@@ -29,13 +29,14 @@ header = '''// LORE C API
 //
 // Strings
 //
-// A string the library produces is a NUL-terminated buffer. A string carried
-// inside an event is valid only while the callback runs; copy its bytes to keep
-// them after the callback returns. A string the caller passes in must be valid
-// UTF-8: the library checks every string an operation carries before it starts
-// the call, and fails the whole call with error code 3 (invalid arguments)
-// naming the offending field if any of them is not. The library copies the
-// bytes, so the caller may free the string once the call returns. See
+// A non-empty string the library produces is a NUL-terminated buffer. An empty
+// one is a NULL pointer with length 0, so read length before the pointer. A
+// string carried inside an event is valid only while the callback runs; copy its
+// bytes to keep them after the callback returns. A string the caller passes in
+// must be valid UTF-8: the library checks every string an operation carries
+// before it starts the call, and fails the whole call with error code 3 (invalid
+// arguments) naming the offending field if any of them is not. The library copies
+// the bytes, so the caller may free the string once the call returns. See
 // lore_string_t for the layout of the type.
 //
 // Argument lifetime
