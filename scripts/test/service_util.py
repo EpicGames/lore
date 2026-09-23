@@ -20,17 +20,17 @@ SERVICE_UNAVAILABLE = 32
 def name_service_executable(
     env: dict[str, str], lore_executable_path: str
 ) -> dict[str, str]:
-    """Names the executable under test as the service, where relaying is on.
+    """Names the executable under test as the service.
 
-    Relaying requires both the setting and a named executable, so a test that
-    sets only `LORE_USE_SERVICE` would quietly run its commands locally instead.
-    Applied here rather than in each test so that no test can leave it out.
+    `service start` needs an executable to spawn, and commands relaying to a
+    service need an executable to start one when none is running. Setting it
+    here rather than in each test ensures no test can leave it out, and that
+    the service serving a test is always the build being tested rather than
+    whichever Lore is installed on the machine running the suite.
 
-    Naming the build under test is what a test wants regardless: the service
-    serving it is then the build being tested, not whichever Lore is installed
-    on the machine running the suite. A test that names one itself keeps it.
+    A test that names one itself keeps it.
     """
-    if env.get("LORE_USE_SERVICE") and not env.get("LORE_SERVICE_EXECUTABLE"):
+    if not env.get("LORE_SERVICE_EXECUTABLE"):
         env["LORE_SERVICE_EXECUTABLE"] = lore_executable_path
     return env
 
@@ -51,14 +51,9 @@ LORE_SERVICE_LISTENING_MESSAGE = "Lore service listening"
 LORE_NO_SERVICE_MESSAGE = "No Lore service is running"
 # `lore service start` prints this once a service is reachable.
 LORE_SERVICE_RUNNING_MESSAGE = "Lore service is running"
-# Printed by the `service` setters when the two settings relaying needs are left
-# in a state that will not relay.
-LORE_NO_SERVICE_EXECUTABLE_MESSAGE = "No service executable is named"
-
-
-# Names the directory the suite stands in for the machine's Lore settings with,
-# so that a test can tell it apart from a developer's own.
-MACHINE_SETTINGS_PREFIX = "lore_machine_settings_"
+# Printed by the `service` setters when relaying is on but no executable is set.
+# Commands can use a running service, but cannot start one without an executable.
+LORE_NO_SERVICE_EXECUTABLE_MESSAGE = "No service executable is set"
 
 
 def service_supported():
@@ -74,10 +69,6 @@ def stop_lore_service(lore_executable_path: str, global_dir_name: str) -> str:
     """
     env = os.environ.copy()
     env["LORE_GLOBAL_PATH"] = global_dir_name
-    # Alongside the global config, as the `Lore` wrapper does for its own
-    # commands. Assigned rather than defaulted, for the same reason it is there:
-    # `env` starts from the ambient environment, so a `LORE_AUTH_PATH` already
-    # exported would win and this would read that credential store.
     env["LORE_AUTH_PATH"] = global_dir_name
     stop = subprocess.run(
         [lore_executable_path, "service", "stop"],

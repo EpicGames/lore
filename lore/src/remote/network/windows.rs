@@ -20,7 +20,6 @@ use windows_sys::Win32::Storage::FileSystem::GetTempPathW;
 use crate::remote::network::UdsAcceptError;
 use crate::remote::network::UdsConnectionError;
 use crate::remote::network::UdsListenerError;
-use crate::remote::service_socket_name;
 
 const LISTENER_BACKLOG: i32 = 10;
 
@@ -85,11 +84,11 @@ pub struct UdsListener {
 }
 
 impl UdsListener {
-    pub fn new() -> Result<UdsListener, UdsListenerError> {
-        let wide_file_name = uds_sock_path();
+    pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
+        let wide_file_name = uds_sock_path(name);
         // Ahead of the delete, so an address that cannot be built does not first
         // remove the socket a running service is listening on.
-        let addr: SOCKADDR_UN = uds_sockaddr().map_err(UdsListenerError::internal)?;
+        let addr: SOCKADDR_UN = uds_sockaddr(name).map_err(UdsListenerError::internal)?;
 
         // Safety: Necessary to call windows APIs, only const pointers are passed to windows
         unsafe {
@@ -182,7 +181,7 @@ impl UdsStream {
         self.stream.try_clone().map(|stream| Self { stream })
     }
 
-    pub fn connect() -> Result<UdsStream, UdsConnectionError> {
+    pub fn connect(name: &str) -> Result<UdsStream, UdsConnectionError> {
         if !wsa_startup() {
             // Safety: Necessary to call windows API
             return Err(UdsConnectionError::internal(format!(
@@ -195,7 +194,7 @@ impl UdsStream {
         // no service is how both the start and the stop loops make progress, so
         // the failure below is taken hundreds of times per wait.
         let sock = OwnedSocket::new().map_err(UdsConnectionError::internal)?;
-        let addr: SOCKADDR_UN = uds_sockaddr().map_err(UdsConnectionError::internal)?;
+        let addr: SOCKADDR_UN = uds_sockaddr(name).map_err(UdsConnectionError::internal)?;
 
         // Safety: Needed to call windows API. Only const pointers are passed to windows.
         unsafe {
@@ -236,7 +235,7 @@ fn wsa_startup() -> bool {
     })
 }
 
-fn uds_sock_path() -> Vec<u16> {
+fn uds_sock_path(socket_name: &str) -> Vec<u16> {
     let mut path = Vec::new();
     // Safety: Necessary to call windows APIs. The buffer length required by windows is allocated in
     // buffer passed mutably to windows
@@ -248,7 +247,7 @@ fn uds_sock_path() -> Vec<u16> {
     }
     // Append the file name, taking into account the null terminator.
     path.resize(path.len() - 1, 0);
-    path.extend(service_socket_name().encode_utf16());
+    path.extend(socket_name.encode_utf16());
     // Reinsert the null terminator.
     path.push(0);
     path
@@ -266,8 +265,8 @@ const SUN_PATH_CAPACITY: usize = 108;
 /// a caller can arrive at by configuration. Reported rather than truncated: a
 /// truncated path names a different socket, which would silently divide callers
 /// between two services.
-fn uds_sockaddr() -> Result<SOCKADDR_UN, String> {
-    let path_string = String::from_utf16(&uds_sock_path())
+fn uds_sockaddr(name: &str) -> Result<SOCKADDR_UN, String> {
+    let path_string = String::from_utf16(&uds_sock_path(name))
         .map_err(|_err| "the socket path is not valid text".to_string())?;
     sockaddr_for_path(path_string.trim_end_matches('\0'))
 }

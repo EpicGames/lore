@@ -44,16 +44,12 @@ def test_killed_sync_leaves_blocking_orphan(new_lore_repo):
     repo.write_commit_push("rev2", {"X.bin": b"b" * (40 * _MB)})
 
     # Start a sync toward rev2. Kill it as soon as X.bin changes from its rev1 size.
-    env = os.environ.copy()
-    env.update(clone.environment_vars)
-    env["LORE_GLOBAL_PATH"] = clone.global_dir
-    env.setdefault("LORE_AUTH_PATH", clone.global_dir)
     proc = subprocess.Popen(
         [clone.lore_executable_path, "--repository", clone.path, "sync"],
         cwd=clone.path,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        env=env,
+        env=clone.sandboxed_env(),
     )
     deadline = time.time() + 60
     while time.time() < deadline:

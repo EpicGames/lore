@@ -3,7 +3,6 @@
 //! The service process a call is served by: connecting to the one that runs,
 //! starting one when none does, and stopping the one that runs in this process.
 use std::ffi::OsString;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
@@ -29,6 +28,7 @@ use tokio::time::Instant;
 
 use crate::remote::network::UdsStream;
 use crate::remote::network::uds_supported;
+use crate::remote::service_socket_name;
 
 #[error_set]
 pub enum ServiceProcessError {
@@ -58,12 +58,8 @@ fn unavailable(reason: impl Into<String>) -> ServiceProcessError {
     .into()
 }
 
-/// Name of the executable that carries the service, without the platform's
-/// executable suffix.
-const SERVICE_EXECUTABLE_NAME: &str = "lore";
-
-/// Names the executable to start the service with for one call, overriding the
-/// one named in the global config.
+/// Environment variable that sets the executable to start the service with,
+/// overriding the one in the global config.
 const SERVICE_EXECUTABLE_VAR: &str = "LORE_SERVICE_EXECUTABLE";
 
 /// Where the global config names an executable, for messages that ask a reader
@@ -99,102 +95,48 @@ const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// stopping normally.
 const STOP_RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// File name of the executable that carries the service on this platform.
-fn service_executable_name() -> String {
-    format!("{SERVICE_EXECUTABLE_NAME}{}", std::env::consts::EXE_SUFFIX)
+/// The executable from the environment variable, trimmed, with a blank value read as unset so
+/// that clearing the field removes it.
+fn executable_from_environment(from_env: Option<OsString>) -> Option<OsString> {
+    from_env.filter(|value| !value.to_string_lossy().trim().is_empty())
 }
 
-/// Whether `path` names the executable that carries the service.
-///
-/// The whole file name is compared rather than the stem. A stem comparison also
-/// accepts `lore.plugin` and `lore.sh`, so an embedding program with a name like
-/// that would be relaunched as the service instead of the client beside it being
-/// found — starting the wrong program, and leaving no service able to start.
-///
-/// Case is ignored only where the platform's own paths ignore it. On Unix `LORE`
-/// names a different file from `lore`, so matching it there would resolve a path
-/// to a program that is not the client, or to nothing at all.
-fn is_service_executable(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| {
-        let name = name.as_encoded_bytes();
-        let expected = service_executable_name();
-        if cfg!(target_family = "windows") {
-            name.eq_ignore_ascii_case(expected.as_bytes())
-        } else {
-            name == expected.as_bytes()
-        }
-    })
+/// The executable from the config, trimmed, with a blank value read as unset so
+/// that clearing the field removes it.
+fn executable_from_config(from_config: Option<&str>) -> Option<&str> {
+    from_config.map(str::trim).filter(|value| !value.is_empty())
 }
 
-/// The executable named for one call, with a value of nothing but space read as
-/// unset.
+/// The executable to start the service with, from the environment variable or
+/// the global config.
 ///
-/// Left to stand, such a value would be started as a path made of spaces and
-/// fail with an error about a file nobody named. A set value is otherwise passed
-/// through as it came: a path is not required to be text this can trim.
-fn named_executable(named: Option<OsString>) -> Option<OsString> {
-    named.filter(|value| !value.to_string_lossy().trim().is_empty())
-}
-
-/// The executable the config pins, trimmed, with a blank value read as unset so
-/// that clearing the field stops pinning one.
-fn pinned_executable(pinned: Option<&str>) -> Option<&str> {
-    pinned.map(str::trim).filter(|value| !value.is_empty())
-}
-
-/// The executable to start the service with, from the one named for this call,
-/// the one the global config pins, and the running program's own path.
-///
-/// The order is what makes the choice deliberate. Clients of different versions
-/// share a machine, and without a pin the version that serves them is decided by
-/// whichever client happened to start a service first. The config names that
-/// version once; the environment overrides it for a single call, for a build
-/// under test or a one-off. Only with neither set does this fall back to the
-/// running program, which is the Lore client itself in the ordinary case. A
-/// caller that links the library runs its own program, which must not be started
-/// a second time, so the client shipped beside it is used instead.
-///
-/// That fallback serves a command that asks for a service outright, which is a
-/// deliberate act by whoever ran it. Relaying automatically requires a name — see
-/// [`service_executable_is_named`].
+/// This ensures that clients of different versions sharing a machine have a predictable service
+/// version.
 fn resolve_service_executable(
-    named: Option<OsString>,
-    pinned: Option<&str>,
-    running: std::io::Result<PathBuf>,
+    from_env: Option<OsString>,
+    from_config: Option<&str>,
 ) -> Result<PathBuf, ServiceProcessError> {
-    if let Some(named) = named_executable(named) {
-        return Ok(PathBuf::from(named));
+    if let Some(executable) = executable_from_environment(from_env) {
+        return Ok(PathBuf::from(executable));
     }
 
-    if let Some(pinned) = pinned_executable(pinned) {
-        return Ok(PathBuf::from(pinned));
-    }
-
-    let running = running.internal("reading the running program's path")?;
-    if is_service_executable(&running) {
-        return Ok(running);
-    }
-
-    let beside = running.with_file_name(service_executable_name());
-    if beside.is_file() {
-        return Ok(beside);
+    if let Some(executable) = executable_from_config(from_config) {
+        return Ok(PathBuf::from(executable));
     }
 
     Err(unavailable(format!(
-        "no {} to start one with beside {}; name one under \
-         {SERVICE_EXECUTABLE_SETTING} in the global config, or in {SERVICE_EXECUTABLE_VAR}",
-        service_executable_name(),
-        running.display()
+        "no service executable set; set one under \
+         {SERVICE_EXECUTABLE_SETTING} in the global config, or in {SERVICE_EXECUTABLE_VAR}"
     )))
 }
 
-/// The executable to start the service with, reading the config that pins one.
+/// The executable to start the service with, reading the one set in the config.
 ///
-/// A config that cannot be read leaves the pin unknown rather than failing the
-/// call. Most callers have none set, and the remaining rules still resolve an
-/// executable, so a config Lore cannot read is reported and stepped over.
+/// A config that cannot be read leaves the executable unknown rather than failing
+/// the call. Most callers have none set, so a config Lore cannot read is reported
+/// and stepped over.
 pub async fn service_executable() -> Result<PathBuf, ServiceProcessError> {
-    let pinned = match GlobalConfig::load().await {
+    let from_config = match GlobalConfig::load().await {
         Ok(config) => config.service_executable().map(str::to_string),
         Err(error) => {
             lore_warn!(
@@ -206,13 +148,12 @@ pub async fn service_executable() -> Result<PathBuf, ServiceProcessError> {
 
     resolve_service_executable(
         std::env::var_os(SERVICE_EXECUTABLE_VAR),
-        pinned.as_deref(),
-        std::env::current_exe(),
+        from_config.as_deref(),
     )
 }
 
-/// Turns relaying on or off for one command, overriding the setting in the
-/// global config.
+/// Environment variable that turns relaying on or off, overriding the setting
+/// in the global config.
 const USE_SERVICE_VAR: &str = "LORE_USE_SERVICE";
 
 /// Where the global config turns relaying on, for messages naming it.
@@ -235,96 +176,58 @@ fn reads_as_off(value: &str) -> bool {
     )
 }
 
-/// Whether relaying is asked for, from the value named for this command and the
-/// setting in the config.
+/// Whether relaying is asked for, from the environment variable for this command
+/// and the setting in the config.
 ///
 /// A blank value reads as unset and defers to the config, matching how a blank
-/// `[service] executable` defers to the rules below it.
-fn relaying_is_asked_for(named: Option<OsString>, configured: bool) -> bool {
-    if let Some(named) = named {
-        let named = named.to_string_lossy();
-        if !named.trim().is_empty() {
-            return !reads_as_off(&named);
+/// `[service] executable` defers to the config.
+fn relaying_is_asked_for(from_env: Option<OsString>, from_config: bool) -> bool {
+    if let Some(from_env) = from_env {
+        let from_env = from_env.to_string_lossy();
+        if !from_env.trim().is_empty() {
+            return !reads_as_off(&from_env);
         }
     }
-    configured
+    from_config
 }
 
-/// Whether an executable is named for the service, in either of the two places
-/// that can name one.
-///
-/// This is required before calls relay automatically, and turning relaying on is
-/// not enough on its own. With no name the executable resolves from the running
-/// program, so the version serving a machine would be whichever program relayed
-/// first — an editor's bundled plugin as readily as the client someone installed,
-/// and thereafter every client on the machine is served by that one. Naming it
-/// makes the version serving a machine something chosen and readable rather than
-/// an accident of ordering.
-///
-/// A command that asks for a service outright still needs no name: `lore service
-/// start` is a deliberate act by whoever ran it, and resolves through the whole
-/// chain in [`resolve_service_executable`].
-fn service_executable_is_named(named: Option<OsString>, pinned: Option<&str>) -> bool {
-    named_executable(named).is_some() || pinned_executable(pinned).is_some()
-}
-
-/// Whether calls are relayed to the service, which requires both that relaying is
-/// asked for and that an executable is named for it.
-///
-/// Relaying asked for with no executable named is reported rather than passed
-/// over, since the setting has been turned on and is not taking effect, and
-/// nothing else about the command would say so.
-fn use_service(named: Option<OsString>, configured: bool, executable_is_named: bool) -> bool {
-    if !relaying_is_asked_for(named, configured) {
-        return false;
-    }
-
-    if !executable_is_named {
-        // Reaches a log file rather than a terminal: this decision is made before
-        // the call has an execution context to dispatch a message through. The
-        // report a reader can act on comes from the setters instead — see
-        // [`report_settings_that_will_not_relay`].
-        lore_warn!(
-            "{USE_SERVICE_SETTING} is on with no service executable named, so this \
-             call runs here rather than on the service"
-        );
-        return false;
-    }
-
-    true
-}
-
-/// Reports a pair of settings that will not relay, for a caller that has just
+/// Reports settings that may not relay as expected, for a caller that has just
 /// written one of them.
 ///
-/// Relaying needs both, and either one alone says nothing about the other, so
-/// turning the setting on and finding nothing changed would otherwise be silent.
-///
-/// Judged on the config alone. `LORE_SERVICE_EXECUTABLE` names an executable for
-/// one command, which is not the same as the machine having one configured.
-pub(crate) fn report_settings_that_will_not_relay(config: &GlobalConfig) {
-    if config.use_service_automatically() && config.service_executable().is_none() {
-        lore_warn!(
-            "No service executable is named, so commands will keep running in the \
-             process that runs them. Name the build to serve this machine with \
-             `lore service set-executable <path>`, or under \
-             {SERVICE_EXECUTABLE_SETTING} in the global config."
-        );
+/// Relaying can use a service that is already running, but starting one when
+/// none is running requires an executable. A user turning relaying on without
+/// setting an executable may not realize commands will fail if no service is
+/// running.
+pub(crate) fn report_settings_update_that_will_not_relay(config: &GlobalConfig) {
+    if !config.use_service_automatically() {
+        return;
     }
+
+    let exec_from_env = std::env::var_os(SERVICE_EXECUTABLE_VAR);
+    let exec_from_config = config.service_executable();
+    if resolve_service_executable(exec_from_env, exec_from_config).is_ok() {
+        return;
+    }
+
+    lore_warn!(
+        "No service executable is set. Commands will use a service that is \
+         already running, but will fail if none is running. To let commands \
+         start a service when needed, set an executable with \
+         `lore service set-executable <path>`, or under \
+         {SERVICE_EXECUTABLE_SETTING} in the global config."
+    );
 }
 
 /// The config values the relaying decision reads, so the two loaders below agree
 /// on what they take from a config they could not read.
 struct ServiceSettings {
     relaying_on: bool,
-    executable: Option<String>,
 }
 
 impl ServiceSettings {
     fn from(config: &GlobalConfig) -> Self {
         Self {
             relaying_on: config.use_service_automatically(),
-            executable: config.service_executable().map(str::to_string),
         }
     }
 
@@ -333,21 +236,16 @@ impl ServiceSettings {
     /// than failing the call.
     fn unreadable(error: &impl std::fmt::Display) -> Self {
         lore_warn!("Could not read {USE_SERVICE_SETTING} from the global config: {error}");
-        Self {
-            relaying_on: false,
-            executable: None,
-        }
+        Self { relaying_on: false }
     }
 
-    fn decide(&self) -> bool {
-        use_service(
-            std::env::var_os(USE_SERVICE_VAR),
-            self.relaying_on,
-            service_executable_is_named(
-                std::env::var_os(SERVICE_EXECUTABLE_VAR),
-                self.executable.as_deref(),
-            ),
-        )
+    /// Whether calls are relayed to the service, which is when relaying is asked for.
+    ///
+    /// An executable is not required here: a service already running can be used
+    /// without one. Only starting a service when none is running requires an
+    /// executable, and that check happens in [`connect_or_spawn_service`].
+    fn decide_use_service(&self) -> bool {
+        relaying_is_asked_for(std::env::var_os(USE_SERVICE_VAR), self.relaying_on)
     }
 }
 
@@ -387,7 +285,7 @@ pub(crate) async fn service_in_use() -> bool {
         Err(error) => ServiceSettings::unreadable(&error),
     };
 
-    let decided = settings.decide();
+    let decided = settings.decide_use_service();
     *SERVICE_IN_USE.write() = Some(decided);
     decided
 }
@@ -413,7 +311,7 @@ pub(crate) fn service_in_use_blocking() -> bool {
         Err(error) => ServiceSettings::unreadable(&error),
     };
 
-    let decided = settings.decide();
+    let decided = settings.decide_use_service();
     *SERVICE_IN_USE.write() = Some(decided);
     decided
 }
@@ -586,9 +484,10 @@ fn spawn_service(executable: PathBuf) -> Result<Child, ServiceProcessError> {
 /// `None` rather than logged. Only a failure to make the attempt at all is an
 /// error.
 async fn connect_attempt() -> Result<Option<UdsStream>, ServiceProcessError> {
-    let connection = lore_base::lore_spawn_blocking!(|| UdsStream::connect().ok())
-        .await
-        .internal("joining the service connect task")?;
+    let connection =
+        lore_base::lore_spawn_blocking!(|| UdsStream::connect(service_socket_name()).ok())
+            .await
+            .internal("joining the service connect task")?;
     Ok(connection)
 }
 
@@ -754,42 +653,10 @@ pub(crate) fn request_service_stop() -> bool {
 mod tests {
     use super::*;
 
-    /// A directory of this test module's own, named after the test using it.
-    fn test_directory(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("lore-service-process-{name}"));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("the test directory must be creatable");
-        path
-    }
-
     #[test]
-    fn the_client_starts_the_service_with_itself() {
-        let client = Path::new("/opt/lore/bin").join(service_executable_name());
-
-        let resolved = resolve_service_executable(None, None, Ok(client.clone()))
-            .expect("the client resolves an executable");
-
-        assert_eq!(resolved, client);
-    }
-
-    #[test]
-    fn a_program_that_links_the_library_starts_the_client_beside_it() {
-        let directory = test_directory("client-beside-the-program");
-        let client = directory.join(service_executable_name());
-        std::fs::write(&client, b"").expect("the client stand-in must be writable");
-
-        let resolved = resolve_service_executable(None, None, Ok(directory.join("editor")))
-            .expect("a program with a client beside it resolves that client");
-
-        assert_eq!(resolved, client);
-    }
-
-    #[test]
-    fn a_program_with_no_client_beside_it_is_told_to_name_one() {
-        let directory = test_directory("no-client-beside-the-program");
-
-        let error = resolve_service_executable(None, None, Ok(directory.join("editor")))
-            .expect_err("a program with no client beside it cannot start the service");
+    fn no_executable_set_reports_both_places_to_set_one() {
+        let error =
+            resolve_service_executable(None, None).expect_err("no executable set must fail");
 
         assert!(
             error.to_string().contains(SERVICE_EXECUTABLE_SETTING)
@@ -799,33 +666,30 @@ mod tests {
     }
 
     #[test]
-    fn the_pinned_executable_is_used_ahead_of_the_running_client() {
-        // The running program is a client and could serve, but the config names
-        // the version that does, so a machine with several installed agrees on
-        // one rather than on whichever started first.
-        let pinned = "/opt/lore/1.9/bin/lore";
-        let running = Path::new("/opt/lore/1.2/bin").join(service_executable_name());
+    fn the_executable_from_config_resolves() {
+        let from_config = "/opt/lore/1.9/bin/lore";
 
-        let resolved = resolve_service_executable(None, Some(pinned), Ok(running))
-            .expect("the pinned executable resolves");
+        let resolved = resolve_service_executable(None, Some(from_config))
+            .expect("the executable from config resolves");
 
-        assert_eq!(resolved, PathBuf::from(pinned));
+        assert_eq!(resolved, PathBuf::from(from_config));
     }
 
-    /// A pin of nothing but space would otherwise be started as a path made of
-    /// spaces, which fails with an error about a file no one named.
+    /// A config value of nothing but space would otherwise be started as a path
+    /// made of spaces, which fails with an error about a file no one set.
     #[test]
-    fn a_pin_of_only_space_falls_back_to_the_running_client() {
-        let client = Path::new("/opt/lore/bin").join(service_executable_name());
+    fn a_config_value_of_only_space_is_treated_as_unset() {
+        let error = resolve_service_executable(None, Some("   "))
+            .expect_err("a blank config value must fail");
 
-        let resolved = resolve_service_executable(None, Some("   "), Ok(client.clone()))
-            .expect("a blank pin resolves the running client");
-
-        assert_eq!(resolved, client);
+        assert!(
+            error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
+            "the failure must name where one can be set: {error}"
+        );
     }
 
     #[test]
-    fn a_named_value_that_reads_as_off_turns_relaying_off() {
+    fn an_environment_value_that_reads_as_off_turns_relaying_off() {
         // The obvious way to disable something must not enable it.
         for off in ["0", "false", "no", "off", "OFF", "False", " 0 "] {
             assert!(
@@ -836,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn a_named_value_that_reads_as_on_turns_relaying_on() {
+    fn an_environment_value_that_reads_as_on_turns_relaying_on() {
         for on in ["1", "true", "yes", "on", "anything"] {
             assert!(
                 relaying_is_asked_for(Some(OsString::from(on)), false),
@@ -846,182 +710,71 @@ mod tests {
     }
 
     #[test]
-    fn no_named_value_leaves_the_config_to_decide() {
+    fn no_environment_value_leaves_the_config_to_decide() {
         assert!(
             relaying_is_asked_for(None, true),
             "the config turns relaying on"
         );
         assert!(!relaying_is_asked_for(None, false), "and off");
-        // Blank reads as unset, as a blank pin does.
+        // Blank reads as unset, as a blank config value does.
         assert!(relaying_is_asked_for(Some(OsString::from("   ")), true));
         assert!(!relaying_is_asked_for(Some(OsString::new()), false));
     }
 
-    /// Turning relaying on is not enough on its own. Without a named executable
-    /// the version serving a machine would be whichever program relayed first, so
-    /// an editor's bundled plugin could take a machine's service for itself.
     #[test]
-    fn relaying_turned_on_without_a_named_executable_stays_off() {
+    fn an_empty_config_value_is_treated_as_unset() {
+        let error = resolve_service_executable(None, Some(""))
+            .expect_err("an empty config value must fail");
+
         assert!(
-            !use_service(None, true, false),
-            "the config turning relaying on must not relay with no executable named"
-        );
-        assert!(
-            !use_service(Some(OsString::from("1")), false, false),
-            "and nor must the environment turning it on"
+            error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
+            "the failure must name where one can be set: {error}"
         );
     }
 
     #[test]
-    fn relaying_turned_on_with_a_named_executable_relays() {
-        assert!(use_service(None, true, true));
-        assert!(use_service(Some(OsString::from("1")), false, true));
-    }
-
-    /// The executable alone asks for nothing. Naming one says which build would
-    /// serve the machine, not that anything should be relayed to it.
-    #[test]
-    fn a_named_executable_alone_does_not_turn_relaying_on() {
-        assert!(!use_service(None, false, true));
-        assert!(
-            !use_service(Some(OsString::from("off")), true, true),
-            "a named value that reads as off still wins over both"
-        );
-    }
-
-    #[test]
-    fn an_executable_named_in_either_place_counts_as_named() {
-        assert!(service_executable_is_named(
-            Some(OsString::from("/opt/lore/bin/lore")),
-            None
-        ));
-        assert!(service_executable_is_named(
-            None,
-            Some("/opt/lore/bin/lore")
-        ));
-        assert!(!service_executable_is_named(None, None));
-    }
-
-    /// Blank counts as unset for this the same way it does when resolving the
-    /// executable, or relaying would turn on for a name that resolves to nothing.
-    #[test]
-    fn a_blank_executable_does_not_count_as_named() {
-        assert!(!service_executable_is_named(
-            Some(OsString::from("   ")),
-            Some("  ")
-        ));
-        assert!(!service_executable_is_named(
-            Some(OsString::new()),
-            Some("")
-        ));
-    }
-
-    #[test]
-    fn an_empty_pin_falls_back_to_the_running_client() {
-        let client = Path::new("/opt/lore/bin").join(service_executable_name());
-
-        let resolved = resolve_service_executable(None, Some(""), Ok(client.clone()))
-            .expect("an empty pin resolves the running client");
-
-        assert_eq!(resolved, client);
-    }
-
-    #[test]
-    fn the_named_executable_overrides_the_pin() {
-        // One call, one build under test, without editing what the machine pins.
-        let named = PathBuf::from("/home/dev/lore/target/debug/lore");
+    fn the_executable_from_environment_overrides_the_config() {
+        // One call, one build under test, without editing what the machine configures.
+        let from_env = PathBuf::from("/home/dev/lore/target/debug/lore");
 
         let resolved = resolve_service_executable(
-            Some(named.clone().into_os_string()),
+            Some(from_env.clone().into_os_string()),
             Some("/opt/lore/1.9/bin/lore"),
-            Ok(PathBuf::from("/opt/lore/1.2/bin/lore")),
         )
-        .expect("the named executable resolves");
+        .expect("the executable from environment resolves");
 
-        assert_eq!(resolved, named);
+        assert_eq!(resolved, from_env);
     }
 
     #[test]
-    fn the_named_executable_is_used_as_it_stands() {
-        let named = PathBuf::from("/opt/tools/lore-for-the-service");
+    fn the_executable_from_environment_is_used_as_it_stands() {
+        let from_env = PathBuf::from("/opt/tools/lore-for-the-service");
 
-        let resolved = resolve_service_executable(
-            Some(named.clone().into_os_string()),
-            None,
-            Ok(PathBuf::from("/opt/editor/editor")),
-        )
-        .expect("the named executable resolves");
+        let resolved = resolve_service_executable(Some(from_env.clone().into_os_string()), None)
+            .expect("the executable from environment resolves");
 
-        assert_eq!(resolved, named);
+        assert_eq!(resolved, from_env);
     }
 
     #[test]
-    fn an_empty_name_falls_back_to_the_running_program() {
-        let client = Path::new("/opt/lore/bin").join(service_executable_name());
+    fn an_empty_environment_value_falls_back_to_the_config() {
+        let from_config = "/opt/lore/bin/lore";
 
-        let resolved = resolve_service_executable(Some(OsString::new()), None, Ok(client.clone()))
-            .expect("an empty name resolves the running client");
+        let resolved = resolve_service_executable(Some(OsString::new()), Some(from_config))
+            .expect("an empty environment value falls back to the config");
 
-        assert_eq!(resolved, client);
+        assert_eq!(resolved, PathBuf::from(from_config));
     }
 
     #[test]
-    fn a_program_whose_name_only_contains_the_client_name_is_not_the_client() {
-        let directory = test_directory("client-name-inside-another-name");
-
-        let error = resolve_service_executable(None, None, Ok(directory.join("lore-server")))
-            .expect_err("a name the client's name is only part of is not the client");
+    fn an_empty_environment_value_with_no_config_fails() {
+        let error = resolve_service_executable(Some(OsString::new()), None)
+            .expect_err("an empty environment value with no config must fail");
 
         assert!(
-            error.to_string().contains(SERVICE_EXECUTABLE_SETTING)
-                && error.to_string().contains(SERVICE_EXECUTABLE_VAR),
-            "the failure must name both places one can be set: {error}"
+            error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
+            "the failure must name where one can be set: {error}"
         );
-    }
-
-    /// A stem comparison accepts every one of these, since each has the stem
-    /// `lore`. Accepting one relaunches the embedding program as the service:
-    /// the wrong program starts, and no service ever binds the socket.
-    #[test]
-    fn a_program_that_shares_the_client_name_before_an_extension_is_not_the_client() {
-        for name in ["lore.plugin", "lore.sh", "lore.dll", "lore.so"] {
-            // Skip the name that is the client on this platform, which `.exe`
-            // makes `lore.dll` on none of them but keeps the loop honest.
-            if name == service_executable_name() {
-                continue;
-            }
-
-            let program = test_directory("client-name-before-an-extension").join(name);
-            assert!(
-                !is_service_executable(&program),
-                "{name} must not read as the client"
-            );
-
-            resolve_service_executable(None, None, Ok(program))
-                .expect_err("a program that is not the client must not be started as the service");
-        }
-    }
-
-    /// Unix paths are case sensitive, so `LORE` there names a different file —
-    /// resolving it would start something that is not the client, or nothing.
-    #[cfg(target_family = "unix")]
-    #[test]
-    fn a_differently_cased_name_is_not_the_client_on_unix() {
-        assert!(!is_service_executable(Path::new("/opt/lore/bin/LORE")));
-    }
-
-    /// Windows paths ignore case, so `LORE.EXE` there is the same file.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn a_differently_cased_name_is_the_client_on_windows() {
-        assert!(is_service_executable(Path::new("C:\\lore\\bin\\LORE.EXE")));
-    }
-
-    #[test]
-    fn the_client_reads_as_the_client() {
-        assert!(is_service_executable(
-            &Path::new("/opt/lore/bin").join(service_executable_name())
-        ));
     }
 
     #[tokio::test]

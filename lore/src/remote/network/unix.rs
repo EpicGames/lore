@@ -11,7 +11,6 @@ use lore_error_set::prelude::*;
 use crate::remote::network::UdsAcceptError;
 use crate::remote::network::UdsConnectionError;
 use crate::remote::network::UdsListenerError;
-use crate::remote::service_socket_name;
 
 pub fn uds_supported() -> bool {
     true
@@ -36,8 +35,8 @@ fn uds_sock_dir() -> PathBuf {
     base.join(format!("lore-{uid}"))
 }
 
-fn uds_sock_path() -> PathBuf {
-    uds_sock_dir().join(service_socket_name())
+fn uds_sock_path(name: &str) -> PathBuf {
+    uds_sock_dir().join(name)
 }
 
 pub struct UdsListener {
@@ -46,14 +45,14 @@ pub struct UdsListener {
 }
 
 impl UdsListener {
-    pub fn new() -> Result<UdsListener, UdsListenerError> {
+    pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
         let dir = uds_sock_dir();
         fs::create_dir_all(&dir)
             .internal_with(|| format!("creating socket directory {}", dir.display()))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .internal_with(|| format!("restricting socket directory {}", dir.display()))?;
 
-        let path = dir.join(service_socket_name());
+        let path = dir.join(name);
 
         if path.exists() {
             if UnixStream::connect(&path).is_ok() {
@@ -103,8 +102,8 @@ impl UdsStream {
         self.stream.try_clone().map(|stream| Self { stream })
     }
 
-    pub fn connect() -> Result<UdsStream, UdsConnectionError> {
-        let path = uds_sock_path();
+    pub fn connect(name: &str) -> Result<UdsStream, UdsConnectionError> {
+        let path = uds_sock_path(name);
         let stream = UnixStream::connect(&path)
             .internal_with(|| format!("connecting to {}", path.display()))?;
         Ok(Self { stream })

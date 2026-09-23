@@ -31,7 +31,7 @@ BURSTS = 8
 
 @pytest.mark.regression
 def test_a_burst_of_relayed_commands_keeps_the_staged_state(
-    new_lore_repo, no_lore_service
+    new_lore_repo, stops_background_services
 ):
     """Every command in a burst reports the staged state the repository holds."""
     for burst in range(BURSTS):

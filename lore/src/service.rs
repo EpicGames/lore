@@ -22,7 +22,7 @@ use crate::remote::service_process::collect_exited_services;
 use crate::remote::service_process::connect_or_spawn_service;
 use crate::remote::service_process::connect_to_running_service;
 use crate::remote::service_process::forget_whether_service_is_in_use;
-use crate::remote::service_process::report_settings_that_will_not_relay;
+use crate::remote::service_process::report_settings_update_that_will_not_relay;
 use crate::remote::service_process::request_service_stop;
 use crate::remote::service_process::service_runs_in_this_process;
 use crate::remote::service_process::wait_until_no_service_is_listening;
@@ -190,7 +190,8 @@ async fn stop_local(
 /// Arguments for naming the executable the Lore service runs from.
 pub struct LoreServiceSetExecutableArgs {
     /// Path of the executable to start as the service. Empty clears the setting,
-    /// which returns to resolving one from the running program.
+    /// which prevents auto-starting the service but can still can connect to an
+    /// already running service.
     pub executable: LoreString,
 }
 
@@ -244,7 +245,7 @@ async fn set_executable_local(
             }
             // Clearing the executable is one of the two ways to end up with a pair
             // that does not relay.
-            report_settings_that_will_not_relay(&config);
+            report_settings_update_that_will_not_relay(&config);
 
             config
                 .save(lock)
@@ -327,7 +328,7 @@ async fn set_use_automatically_local(
             }
             // Reported after the line above rather than instead of it: the setting
             // was stored, and this says what it will and will not do on its own.
-            report_settings_that_will_not_relay(&config);
+            report_settings_update_that_will_not_relay(&config);
             Ok(())
         };
     no_repository_call(globals, callback, args, set_use_automatically, command).await

@@ -220,25 +220,21 @@ mod tests {
         );
     }
 
-    /// Both settings are stored, and both are read back by the decision the
-    /// dispatch makes. Written through the API rather than into the file, since
-    /// what an embedder can set is the point.
+    /// The `use_automatically` setting alone turns relaying on. An executable is
+    /// only needed to start a service when none is running; a running service can
+    /// be used without one configured.
     #[test]
     #[serial]
-    fn both_settings_together_turn_relaying_on() {
-        let _settings = machine_settings("service-api-both-settings-");
+    fn use_automatically_alone_turns_relaying_on() {
+        let _settings = machine_settings("service-api-use-automatically-");
 
         lore::runtime().block_on(async {
             assert_eq!(set_use_automatically(true).await, 0);
             assert!(
-                !lore::will_use_service(),
-                "the setting alone must not relay: the executable is unnamed, so \
-                 the version serving the machine would be whichever program \
-                 relayed first"
+                lore::will_use_service(),
+                "the setting alone must relay: a running service can be used \
+                 without an executable configured"
             );
-
-            assert_eq!(set_executable("/opt/lore/1.9/bin/lore").await, 0);
-            assert!(lore::will_use_service(), "with both named, calls relay");
         });
     }
 
@@ -255,24 +251,24 @@ mod tests {
         });
     }
 
-    /// Clearing the executable turns relaying off again, and the setter forgets
-    /// the decision this process already made so that the change takes effect
-    /// without it being restarted.
+    /// Clearing the executable does not turn relaying off. An executable is only
+    /// needed to start a service; relaying stays on so that a running service can
+    /// still be used.
     #[test]
     #[serial]
-    fn clearing_the_executable_turns_relaying_off_within_the_process() {
+    fn clearing_the_executable_does_not_turn_relaying_off() {
         let _settings = machine_settings("service-api-clear-executable-");
 
         lore::runtime().block_on(async {
             assert_eq!(set_use_automatically(true).await, 0);
             assert_eq!(set_executable("/opt/lore/1.9/bin/lore").await, 0);
-            assert!(lore::will_use_service(), "both are named");
+            assert!(lore::will_use_service(), "relaying is on");
 
             assert_eq!(set_executable("").await, 0);
             assert!(
-                !lore::will_use_service(),
-                "clearing the executable must take effect in this process, not \
-                 only in the next one"
+                lore::will_use_service(),
+                "clearing the executable must not turn relaying off: a running \
+                 service can still be used without an executable configured"
             );
         });
     }

@@ -29,7 +29,7 @@ def test_no_swfs_clone_outside_service(new_lore_repo):
     reason="swfs is generally not available; test fails randomly under parallel execution"
 )
 @pytest.mark.smoke
-def test_swfs_creates_external_dot_lore(new_lore_repo, background_lore_service):
+def test_swfs_creates_external_dot_lore(new_lore_repo, background_lore_service, global_dir_name):
     repo: Lore = new_lore_repo(
         create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
     )
@@ -39,7 +39,7 @@ def test_swfs_creates_external_dot_lore(new_lore_repo, background_lore_service):
     instance_id = get_instance_id(repo.repository_info())
     assert instance_id is not None
     external_dot_lore = os.path.join(
-        repo.global_dir, "data", "external", instance_id, ".lore"
+        global_dir_name, "data", "external", instance_id, ".lore"
     )
 
     # Expect the external .lore directory to have been created rather than a local one.

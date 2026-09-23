@@ -26,6 +26,7 @@ use lore::remote::network::uds_supported;
 use lore::remote::service_process::ServiceStopRequest;
 use lore::remote::service_process::register_service_process;
 use lore::remote::service_process::service_executable;
+use lore::remote::service_socket_name;
 use lore::service::initialization::initialize_service;
 use lore::service::service_main::ServiceMainError;
 use tokio::sync::mpsc;
@@ -102,8 +103,8 @@ pub async fn service_main(
         .await
         .forward::<ServiceMainError>("Failed initializing service")?;
 
-    let listener: UdsListener =
-        UdsListener::new().forward::<ServiceMainError>("Failed to start listener socket")?;
+    let listener: UdsListener = UdsListener::new(service_socket_name())
+        .forward::<ServiceMainError>("Failed to start listener socket")?;
     println!("{LISTENING_MESSAGE}");
     report_build_that_is_not_the_configured_one().await;
 
@@ -152,7 +153,7 @@ pub async fn service_main(
 
     println!("Shutting down Lore service");
     shutting_down.store(true, Ordering::SeqCst);
-    if let Err(error) = UdsStream::connect() {
+    if let Err(error) = UdsStream::connect(service_socket_name()) {
         eprintln!("Failed to wake the accept loop: {error}");
     }
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)

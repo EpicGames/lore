@@ -5689,7 +5689,8 @@ typedef struct lore_service_stop_args_t {
 // Arguments for naming the executable the Lore service runs from.
 typedef struct lore_service_set_executable_args_t {
   // Path of the executable to start as the service. Empty clears the setting,
-  // which returns to resolving one from the running program.
+  // which prevents auto-starting the service but can still can connect to an
+  // already running service.
   struct lore_string_t executable;
 } lore_service_set_executable_args_t;
 

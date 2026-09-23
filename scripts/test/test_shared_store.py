@@ -1271,7 +1271,7 @@ def test_update_path_after_move(new_lore_repo, scratch_dir):
         lore_executable_path=repo_b.lore_executable_path,
         path=new_path,
         name=repo_b.name,
-        global_dir=repo_b.global_dir,
+        base_env=repo_b.base_env,
         create_repo=False,
     )
 

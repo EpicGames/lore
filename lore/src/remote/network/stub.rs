@@ -11,7 +11,7 @@ pub fn uds_supported() -> bool {
 pub struct UdsListener {}
 
 impl UdsListener {
-    pub fn new() -> Result<UdsListener, UdsListenerError> {
+    pub fn new(_name: &str) -> Result<UdsListener, UdsListenerError> {
         panic!("Networking not supported on this OS")
     }
 
@@ -39,7 +39,7 @@ impl UdsStream {
         panic!("Networking not supported on this OS")
     }
 
-    pub fn connect() -> Result<UdsStream, UdsConnectionError> {
+    pub fn connect(_name: &str) -> Result<UdsStream, UdsConnectionError> {
         panic!("Networking not supported on this OS")
     }
 }
