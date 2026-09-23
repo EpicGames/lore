@@ -537,12 +537,28 @@ pub struct WantsHttp2Config {
     admin_svc: LoreAdminService,
 }
 
+/// The two server-side bounds a partition-scoped RPC answers to. They stay
+/// separate because neither can stand in for the other: the authorization
+/// bound covers one online call this server makes and nothing else, while
+/// stretching it over the handler would also span tonic's decode of the
+/// request body and so expire on a client that is slow to finish sending.
+#[derive(Clone, Copy, Debug)]
+pub struct GrpcTimeouts {
+    /// What a handler allows itself for the work it owns. Kept below the load
+    /// balancer's timeout so a stuck request is observed here rather than as
+    /// a 504 at the balancer.
+    pub request_handler: Duration,
+    /// What the partition-access check ahead of a handler allows for reaching
+    /// the authorizer.
+    pub authorization: Duration,
+}
+
 impl GrpcServerBuilder<WantsHttp2Config> {
     pub fn with_http2_config(
         self,
         http2_keep_alive_interval: Option<Duration>,
         http2_keep_alive_timeout: Option<Duration>,
-        request_handler_timeout: Duration,
+        timeouts: GrpcTimeouts,
         service_settings: GrpcPublicServicesSettings,
         user_agent_filter: Arc<UserAgentFilter>,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
@@ -561,7 +577,8 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             admin_svc: self.0.admin_svc,
             http2_keep_alive_interval,
             http2_keep_alive_timeout,
-            request_handler_timeout,
+            request_handler_timeout: timeouts.request_handler,
+            authorization_timeout: timeouts.authorization,
             service_settings,
             user_agent_filter,
             forwarded_requests,
@@ -584,6 +601,7 @@ pub struct MaybeJwtVerifier {
     http2_keep_alive_interval: Option<Duration>,
     http2_keep_alive_timeout: Option<Duration>,
     request_handler_timeout: Duration,
+    authorization_timeout: Duration,
     service_settings: GrpcPublicServicesSettings,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
@@ -617,15 +635,20 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
     /// check inside the handler (e.g. notification subscribe, lock action
     /// checks). The middleware sees the request body only as a binary stream,
     /// so we cannot easily action on any body values.
+    ///
+    /// `authorization_timeout` bounds that access check alone, not the
+    /// service behind it: the body is decoded inside the wrapped service, so
+    /// a bound reaching that far would charge a client's send time to the
+    /// server. Handlers time out their own work.
     fn partition_scoped<S>(
         service: S,
         jwt_interceptor: &JWTInterceptor,
         authorizer: &Arc<dyn RepositoryAuthorizer>,
-        request_timeout: Duration,
+        authorization_timeout: Duration,
     ) -> tonic::service::interceptor::InterceptedService<PartitionAccessService<S>, JWTInterceptor>
     {
         tonic::service::interceptor::InterceptedService::new(
-            PartitionAccessLayer::new(authorizer.clone(), request_timeout).layer(service),
+            PartitionAccessLayer::new(authorizer.clone(), authorization_timeout).layer(service),
             jwt_interceptor.clone(),
         )
     }
@@ -637,6 +660,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         repository_catalog: Arc<dyn RepositoryCatalog>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
         let rpc_timeout = self.0.request_handler_timeout;
+        let authorization_timeout = self.0.authorization_timeout;
         let services = &self.0.service_settings;
         let mut registered = Vec::new();
         let mut check_enabled = |settings: &dyn GrpcServiceSettings, name: &'static str| {
@@ -776,13 +800,13 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                     StorageServiceServer::new(storage_svc.clone()),
                     &jwt_interceptor,
                     &repository_authorizer,
-                    rpc_timeout,
+                    authorization_timeout,
                 ))
                 .add_service(Self::partition_scoped(
                     storage_service_v1_server::StorageServiceServer::new(storage_svc),
                     &jwt_interceptor,
                     &repository_authorizer,
-                    rpc_timeout,
+                    authorization_timeout,
                 ));
         }
         if check_enabled(&services.revision_service, "revision_service") {
@@ -791,13 +815,13 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                     RevisionServiceServer::new(revision_svc),
                     &jwt_interceptor,
                     &repository_authorizer,
-                    rpc_timeout,
+                    authorization_timeout,
                 ))
                 .add_service(Self::partition_scoped(
                     revision_v1_server::RevisionServiceServer::new(revision_v1_svc),
                     &jwt_interceptor,
                     &repository_authorizer,
-                    rpc_timeout,
+                    authorization_timeout,
                 ));
         }
         if check_enabled(&services.thin_client_service, "thin_client_service") {
@@ -805,7 +829,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 thin_client_v1_server::ThinClientServiceServer::new(thin_client_v1_svc),
                 &jwt_interceptor,
                 &repository_authorizer,
-                rpc_timeout,
+                authorization_timeout,
             ));
         }
         if check_enabled(&services.repository_service, "repository_service") {
@@ -836,7 +860,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 lock_service,
                 &jwt_interceptor,
                 &repository_authorizer,
-                rpc_timeout,
+                authorization_timeout,
             ));
         }
         if let Some(notification_service) = notification_service

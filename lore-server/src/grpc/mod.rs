@@ -54,6 +54,7 @@ pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
 pub use server::GrpcServerBuilder;
 pub use server::GrpcServiceSettings;
+pub use server::GrpcTimeouts;
 pub use storage_service::LoreStorageService;
 pub use thinclient::LoreThinClientV1Service;
 use tokio::sync::mpsc::Sender;
@@ -446,6 +447,14 @@ pub fn hook_error_to_status(error: HookError) -> Status {
 
 pub fn no_repository_access_status() -> Status {
     Status::permission_denied("Unauthorized")
+}
+
+/// What an authorization check answers with when its own bound elapses,
+/// wherever that check is made. A server condition rather than a denial, and
+/// worded apart from a handler timeout so that which of the two elapsed stays
+/// legible in logs and metrics.
+pub fn authorization_timeout_status() -> Status {
+    Status::cancelled("Authorization timeout exceeded")
 }
 
 pub fn timeout_grpc<T>(

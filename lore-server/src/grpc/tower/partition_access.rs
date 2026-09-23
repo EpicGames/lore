@@ -21,10 +21,10 @@ use tower::Service;
 use crate::authnz::repository_authorizer::Grants;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_repository;
 use crate::grpc::get_verified_token;
 use crate::grpc::no_repository_access_status;
-use crate::grpc::timeout_grpc;
 
 /// Enforces partition access for every RPC at the service level, so no
 /// handler can forget the check.
@@ -63,25 +63,29 @@ use crate::grpc::timeout_grpc;
 /// and this keeps the three entry points agreeing that an allow-all verdict
 /// opens a no-auth server's partitions without elevating anonymous callers
 /// to its privileged actions.
+///
+/// The layer bounds its own authorization stage and nothing else. The inner
+/// service is entered unbounded, because tonic decodes the request body
+/// inside it: a bound spanning that decode expires on a client that is slow
+/// to finish sending and attributes the stall to the server, under a status
+/// that counts as a server error. Each handler behind this layer times out
+/// the work it owns, which is the bound that keeps a request below the load
+/// balancer's ceiling.
 #[derive(Clone)]
 pub struct PartitionAccessLayer {
     authorizer: Arc<dyn RepositoryAuthorizer>,
-    /// The request's whole server-side budget, the same request-handler
-    /// timeout the handlers behind this layer enforce themselves. The
-    /// authorization stage consumes from it and the handler stage is bounded
-    /// by the remainder, so the two do not stack: a request never holds the
-    /// server longer than one budget, which is what keeps it below the load
-    /// balancer's timeout. Without the authorization-stage bound a stalled
-    /// online authorizer would park every partition-scoped RPC until the
-    /// client gives up.
-    request_timeout: Duration,
+    /// Ceiling on the authorization stage alone — the one online call this
+    /// layer may make. Sized for reaching the authorizer, not for a whole
+    /// request, so a stalled online authorizer cannot park every
+    /// partition-scoped RPC until the client gives up.
+    authorization_timeout: Duration,
 }
 
 impl PartitionAccessLayer {
-    pub fn new(authorizer: Arc<dyn RepositoryAuthorizer>, request_timeout: Duration) -> Self {
+    pub fn new(authorizer: Arc<dyn RepositoryAuthorizer>, authorization_timeout: Duration) -> Self {
         Self {
             authorizer,
-            request_timeout,
+            authorization_timeout,
         }
     }
 }
@@ -93,7 +97,7 @@ impl<S> Layer<S> for PartitionAccessLayer {
         PartitionAccessService {
             inner,
             authorizer: self.authorizer.clone(),
-            request_timeout: self.request_timeout,
+            authorization_timeout: self.authorization_timeout,
         }
     }
 }
@@ -102,7 +106,7 @@ impl<S> Layer<S> for PartitionAccessLayer {
 pub struct PartitionAccessService<S> {
     inner: S,
     authorizer: Arc<dyn RepositoryAuthorizer>,
-    request_timeout: Duration,
+    authorization_timeout: Duration,
 }
 
 /// The authorization stage's verdict on one request.
@@ -140,7 +144,7 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let authorizer = self.authorizer.clone();
-        let request_timeout = self.request_timeout;
+        let authorization_timeout = self.authorization_timeout;
 
         Box::pin(async move {
             let mut request = request;
@@ -150,21 +154,19 @@ where
                 Err(status) => return Ok(status.into_http()),
             };
 
-            let stage_started = std::time::Instant::now();
             // Authorization denials are flattened to `Denied` inside the
-            // timed stage, so the only error escaping it is the timeout's
-            // own status. Only the extensions are borrowed into the stage,
-            // not the request, so the future stays `Send` for any body type.
+            // timed stage, so elapsing is the only thing the stage reports
+            // besides a verdict. Only the extensions are borrowed into the
+            // stage, not the request, so the future stays `Send` for any
+            // body type.
             let access = {
                 let extensions = request.extensions();
-                timeout_grpc(request_timeout, async move {
+                tokio::time::timeout(authorization_timeout, async move {
                     let token = get_verified_token(extensions);
-                    Ok(
-                        match authorizer.granted_access(token.as_ref(), repository).await {
-                            Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
-                            Err(_denied) => Access::Denied,
-                        },
-                    )
+                    match authorizer.granted_access(token.as_ref(), repository).await {
+                        Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
+                        Err(_denied) => Access::Denied,
+                    }
                 })
                 .await
             };
@@ -179,26 +181,16 @@ where
                             grants,
                         });
                     }
-                    // The handler stage gets what the authorization stage
-                    // left of the budget, so the two stages share one
-                    // request timeout instead of stacking two. Handlers
-                    // keep their own equal bound; this one only fires
-                    // earlier by however long authorization took.
-                    let remaining = request_timeout.saturating_sub(stage_started.elapsed());
-                    match tokio::time::timeout(remaining, inner.call(request)).await {
-                        Ok(response) => response,
-                        Err(_elapsed) => {
-                            Ok(Status::cancelled("Request handler timeout exceeded").into_http())
-                        }
-                    }
+                    // Entered unbounded: the decode of the request body
+                    // happens in here, and time a client spends sending is
+                    // not the server's to time out. The handler bounds the
+                    // work it owns once it has the body.
+                    inner.call(request).await
                 }
                 // Flattened to one uniform status, so an unauthorized caller
                 // learns nothing from the reason.
                 Ok(Access::Denied) => Ok(no_repository_access_status().into_http()),
-                // The stage timed out: a server condition, answered with the
-                // same status a handler timeout produces rather than masked
-                // as a denial.
-                Err(status) => Ok(status.into_http()),
+                Err(_elapsed) => Ok(authorization_timeout_status().into_http()),
             }
         })
     }
@@ -219,6 +211,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
+    use http::HeaderValue;
     use lore_base::types::Context as LoreContext;
     use tonic::Code;
     use tonic::metadata::MetadataValue;
@@ -604,10 +597,10 @@ mod tests {
     }
 
     /// A stalled authorizer cannot park the request: the authorization stage
-    /// runs under the same request-handler timeout as the handlers, and a
-    /// timeout answers with the handler timeout's own status, not a denial.
+    /// is bounded on its own, and elapsing answers with a server status
+    /// naming that stage rather than a denial.
     #[tokio::test]
-    async fn a_stalled_authorizer_times_out_with_the_handler_status() {
+    async fn a_stalled_authorizer_times_out_with_the_authorization_status() {
         struct StalledAuthorizer;
 
         #[async_trait]
@@ -642,16 +635,16 @@ mod tests {
 
         let status = status_of(&response);
         assert_eq!(status.code(), Code::Cancelled);
-        assert_eq!(status.message(), "Request handler timeout exceeded");
+        assert_eq!(status.message(), "Authorization timeout exceeded");
         assert!(inner.0.lock().unwrap().is_empty());
     }
 
-    /// The authorization stage and the handler stage share one request
-    /// budget: time the authorizer consumes is deducted from what the
-    /// handler may use, so a slow authorizer plus a slow handler cannot
-    /// hold the server for two budgets.
+    /// The authorization timeout bounds the authorization stage only. An
+    /// inner service that outlasts it still answers for itself, so neither
+    /// the receipt of a request body nor the handler's own work is charged
+    /// to the authorization budget.
     #[tokio::test]
-    async fn the_two_stages_share_one_request_budget() {
+    async fn the_authorization_timeout_does_not_bound_the_inner_service() {
         struct SlowAuthorizer(Duration);
 
         #[async_trait]
@@ -675,11 +668,13 @@ mod tests {
             }
         }
 
-        /// A handler that never answers, standing in for a stalled one.
+        /// Answers only after a delay, standing in for a request still
+        /// arriving and a handler still working. Marks its response so the
+        /// test can tell it apart from one the layer synthesized.
         #[derive(Clone)]
-        struct PendingInner;
+        struct SlowInner(Duration);
 
-        impl Service<Request<()>> for PendingInner {
+        impl Service<Request<()>> for SlowInner {
             type Response = Response<()>;
             type Error = Infallible;
             type Future = Pin<Box<dyn Future<Output = Result<Response<()>, Infallible>> + Send>>;
@@ -689,28 +684,36 @@ mod tests {
             }
 
             fn call(&mut self, _request: Request<()>) -> Self::Future {
-                Box::pin(std::future::pending())
+                let delay = self.0;
+                Box::pin(async move {
+                    tokio::time::sleep(delay).await;
+                    let mut response = Response::new(());
+                    response
+                        .headers_mut()
+                        .insert("x-inner-answered", HeaderValue::from_static("yes"));
+                    Ok(response)
+                })
             }
         }
 
-        let budget = Duration::from_millis(100);
-        let mut service =
-            PartitionAccessLayer::new(Arc::new(SlowAuthorizer(Duration::from_millis(60))), budget)
-                .layer(PendingInner);
+        let authorization_timeout = Duration::from_millis(100);
+        let mut service = PartitionAccessLayer::new(
+            Arc::new(SlowAuthorizer(Duration::from_millis(60))),
+            authorization_timeout,
+        )
+        .layer(SlowInner(authorization_timeout * 3));
 
-        let started = std::time::Instant::now();
         let response = service
             .call(request(Some(repository()), true))
             .await
             .unwrap();
 
-        assert_eq!(status_of(&response).code(), Code::Cancelled);
-        // One budget covers both stages; well under two would already prove
-        // no stacking, and the bound is loose only for scheduler slack.
-        assert!(
-            started.elapsed() < budget * 2,
-            "elapsed {:?} must stay within one shared budget",
-            started.elapsed()
+        assert_eq!(
+            response
+                .headers()
+                .get("x-inner-answered")
+                .map(HeaderValue::as_bytes),
+            Some(b"yes".as_slice()),
         );
     }
 

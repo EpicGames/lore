@@ -360,6 +360,12 @@ pub struct GrpcSettings {
     /// Keep below the ALB timeout to ensure we gracefully observe stuck requests
     /// rather than clients receive a 504 response from the ALB
     pub request_handler_timeout_seconds: u64,
+    /// Ceiling on the partition-access authorization check that precedes a
+    /// handler, covering the online authorizer call it may make. Sized for
+    /// reaching the authorizer rather than for a whole request, so it is well
+    /// below `request_handler_timeout_seconds`.
+    #[serde(default = "default_authorization_timeout_seconds")]
+    pub authorization_timeout_seconds: u64,
     /// Require client certificates (mTLS): `true` demands a full mTLS triple,
     /// `false` accepts unverified clients.
     #[serde(default = "default_verify_client_certs")]
@@ -368,6 +374,10 @@ pub struct GrpcSettings {
 
 fn default_verify_client_certs() -> bool {
     true
+}
+
+pub(crate) fn default_authorization_timeout_seconds() -> u64 {
+    10
 }
 
 #[derive(Clone, Debug, Deserialize)]

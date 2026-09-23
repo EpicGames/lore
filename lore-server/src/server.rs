@@ -74,6 +74,7 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
+use crate::grpc::GrpcTimeouts;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::forwarded_requests::GrpcForwardedRequests;
 use crate::grpc::notification_service::NotificationService;
@@ -118,6 +119,7 @@ use crate::settings::RemoteStoreSettings;
 use crate::settings::ReplicatedStoreSettings;
 use crate::settings::ReplicationMode;
 use crate::settings::Settings;
+use crate::settings::default_authorization_timeout_seconds;
 use crate::store::replica_factory::ReplicationStoreTargetFactory;
 use crate::store::replicated_store::ReplicatedStore;
 use crate::store::resolve_plugin_config_with_fallback;
@@ -523,7 +525,10 @@ async fn launch_grpc_server(
             grpc_settings
                 .http2_keepalive_timeout_seconds
                 .map(Duration::from_secs),
-            Duration::from_secs(grpc_settings.request_handler_timeout_seconds),
+            GrpcTimeouts {
+                request_handler: Duration::from_secs(grpc_settings.request_handler_timeout_seconds),
+                authorization: Duration::from_secs(grpc_settings.authorization_timeout_seconds),
+            },
             service_settings,
             user_agent_filter,
             forwarded_requests,
@@ -2092,16 +2097,20 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     });
 
     if !is_maintenance {
-        // The subscribe authorization check runs under the same handler
-        // timeout as the gRPC endpoint the service registers on. Without a
-        // gRPC endpoint the service is unreachable and the fallback (the
-        // config default) is moot.
+        // Subscribe authorizes from the request body, so its check is made in
+        // the handler rather than by the partition-access layer. It is the
+        // same kind of check either way, so it answers to the same
+        // authorization budget as that layer rather than to the longer
+        // request-handler budget. Without a gRPC endpoint the service is
+        // unreachable and the fallback is moot.
         let notification_authorization_timeout = Duration::from_secs(
             settings
                 .server
                 .grpc
                 .as_ref()
-                .map_or(50, |grpc| grpc.request_handler_timeout_seconds),
+                .map_or_else(default_authorization_timeout_seconds, |grpc| {
+                    grpc.authorization_timeout_seconds
+                }),
         );
         let (notification, notification_service) = configure_notification(
             &mut endpoints,

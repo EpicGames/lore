@@ -21,17 +21,22 @@ use tracing::debug;
 use tracing::instrument;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::no_repository_access_status;
-use crate::grpc::timeout_grpc;
 
 #[derive(Clone)]
 pub struct NotificationService {
     sender: Arc<crate::notification::local::NotificationSender>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
-    /// Bound on the subscribe authorization check, the request-handler
-    /// timeout: a stalled online authorizer must not park subscribers.
+    /// Bound on the subscribe authorization check alone, so a stalled online
+    /// authorizer cannot park subscribers. This is the authorization budget
+    /// every public gRPC access check answers to, not the longer
+    /// request-handler budget: the check is one online call, and sizing it
+    /// for a whole request is what lets a stalled authorizer hold a
+    /// subscriber for the length of a request instead of the length of a
+    /// permission question.
     authorization_timeout: Duration,
 }
 
@@ -72,17 +77,17 @@ impl lore_notification::NotificationService for NotificationService {
         // Checked against the partition in the request *body*. The
         // default authorization middleware validates access using the
         // request metadata fields. The services passing a repository
-        // in the body need custom verification logic. Denials are flattened
-        // inside the timed check, so the only error escaping `timeout_grpc`
-        // is the timeout's own status.
-        let permitted = timeout_grpc(self.authorization_timeout, async {
-            Ok(self
-                .authorizer
+        // in the body need custom verification logic. A denial is folded
+        // into the boolean inside the bound, so elapsing is the only other
+        // thing the check reports.
+        let permitted = tokio::time::timeout(self.authorization_timeout, async {
+            self.authorizer
                 .check_repository_access(get_verified_token(&extensions).as_ref(), repository, None)
                 .await
-                .is_ok())
+                .is_ok()
         })
-        .await?;
+        .await
+        .map_err(|_elapsed| authorization_timeout_status())?;
         if !permitted {
             return Err(no_repository_access_status());
         }
@@ -187,6 +192,48 @@ mod tests {
 
         assert_eq!(denied.code(), Code::PermissionDenied);
         assert_eq!(*authorizer.asked.lock().unwrap(), vec![body_partition]);
+    }
+
+    /// A stalled authorizer cannot park a subscriber: the check elapses under
+    /// its own bound, and answers with the authorization timeout's status
+    /// rather than a denial or the handler timeout's.
+    #[tokio::test]
+    async fn a_stalled_authorizer_times_out_the_subscribe_check() {
+        struct StalledAuthorizer;
+
+        #[async_trait]
+        impl RepositoryAuthorizer for StalledAuthorizer {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                _repository_id: RepositoryId,
+                _action: Option<&str>,
+            ) -> Result<(), Status> {
+                std::future::pending().await
+            }
+        }
+
+        let service = NotificationService::new(
+            Arc::new(crate::notification::local::NotificationSender::default()),
+            Arc::new(StalledAuthorizer),
+            Duration::from_millis(50),
+        );
+
+        let mut request = Request::new(SubscribeRequest {
+            repository: Context::from(repository(1)).into(),
+        });
+        request
+            .extensions_mut()
+            .insert(AuthorizationToken::default());
+        request.extensions_mut().insert(RawToken("raw.jwt".into()));
+
+        let status = match service.subscribe(request).await {
+            Err(status) => status,
+            Ok(_) => panic!("a stalled authorization check must not admit a subscriber"),
+        };
+
+        assert_eq!(status.code(), Code::Cancelled);
+        assert_eq!(status.message(), authorization_timeout_status().message());
     }
 
     /// A no-auth configuration selects `AllowAllRepositoryAuthorizer`, under

@@ -73,6 +73,8 @@ enabled = true
 host = "0.0.0.0"
 port = 41337
 request_handler_timeout_seconds = 50
+# Bounds the partition-access check ahead of a handler, not the handler itself.
+authorization_timeout_seconds = 10
 
 [server.grpc_public_services.lock_service.general]
 max_encoding_message_size = 16777216
