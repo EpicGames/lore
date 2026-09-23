@@ -29,6 +29,7 @@ use crate::immutable;
 use crate::immutable::ImmutableError;
 use crate::immutable::ReadBoxFromImmutable;
 use crate::interface::LoreNodeStagedAction;
+use crate::interface::LoreNodeType;
 use crate::lore::Address;
 use crate::lore::CloneHeapAlloc;
 use crate::lore::Hash;
@@ -209,6 +210,16 @@ bitflagsops!(NodeFlags, u16);
 impl NodeFlags {
     pub fn is_directory(&self) -> bool {
         !(self.contains(NodeFlags::File) || self.contains(NodeFlags::Link))
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        if self.contains(NodeFlags::File) {
+            LoreNodeType::File
+        } else if self.contains(NodeFlags::Link) {
+            LoreNodeType::Link
+        } else {
+            LoreNodeType::Directory
+        }
     }
 }
 
@@ -452,6 +463,10 @@ impl Node {
     /// Check if the node is a directory
     pub fn is_directory(&self) -> bool {
         !self.is_file() && !self.is_link()
+    }
+
+    pub fn node_type(&self) -> LoreNodeType {
+        NodeFlags::from_bits_retain(self.flags).node_type()
     }
 
     /// Check if node is marked as discarded
@@ -2312,6 +2327,23 @@ mod tests {
         assert_eq!(
             node.action_bits(),
             NodeFlags::StagedMove.bits() & NodeFlags::ActionBits.bits()
+        );
+    }
+
+    #[test]
+    fn node_type_reads_the_kind_bits_and_ignores_the_rest() {
+        assert_eq!(Node::default().node_type(), LoreNodeType::Directory);
+        assert_eq!(
+            node_with_flags(NodeFlags::File.bits()).node_type(),
+            LoreNodeType::File
+        );
+        assert_eq!(
+            node_with_flags(NodeFlags::Link.bits() | NodeFlags::StagedAdd.bits()).node_type(),
+            LoreNodeType::Link
+        );
+        assert_eq!(
+            node_with_flags(NodeFlags::DirtyModify.bits()).node_type(),
+            LoreNodeType::Directory
         );
     }
 }

@@ -1905,6 +1905,18 @@ struct FileToCommit {
     relative_path: RelativePath,
 }
 
+/// A commit walk clears the flags of every node it freezes, so a conflict has to be refused before
+/// the record of it is gone.
+fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError> {
+    if node.is_staged_merge_unresolved() {
+        return Err(Conflict {
+            path: path.to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_directory(
     operation: Arc<InstanceOperationImpl>,
@@ -1977,6 +1989,14 @@ async fn commit_directory(
 
         debug_assert!(node.is_directory());
         lore_trace!("Committing directory node {node_id} child {child_node_id}");
+
+        // A file is refused in `commit_file`, which also reads its markers from disk.
+        if !child_node.is_file()
+            && let Err(err) = reject_unresolved_conflict(&child_node, relative_path.as_str())
+        {
+            walk_failure = Some(err);
+            break;
+        }
 
         if child_node.is_staged_delete() {
             if child_node.is_directory() {
@@ -2541,13 +2561,7 @@ async fn commit_file(
     debug_assert!(node.is_file());
 
     if node.is_staged_merge_conflict() {
-        // Check if it's resolved on the node level before going to disk
-        if !node.is_staged_merge_resolved() {
-            return Err(Conflict {
-                path: relative_path.as_str().to_string(),
-            }
-            .into());
-        }
+        reject_unresolved_conflict(&node, relative_path.as_str())?;
         // Check if file has conflict markers remaining
         if infer::infer_is_conflicted(&operation.content_source(&relative_path))
             .await
@@ -4308,6 +4322,16 @@ async fn freeze_directory(
             continue;
         }
         updated = true;
+
+        // No working tree holds this one, so a conflict on any node has nowhere to be resolved and
+        // no markers to read.
+        if child_node.is_staged_merge_unresolved() {
+            let path = state
+                .node_path(repository.clone(), child_node_id)
+                .await
+                .unwrap_or_default();
+            reject_unresolved_conflict(&child_node, &path)?;
+        }
 
         if child_node.is_staged_delete() {
             if child_node.is_directory() {

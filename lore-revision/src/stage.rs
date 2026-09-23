@@ -758,11 +758,7 @@ pub(crate) async fn stage_single_node(
                 existing_node.flags
             );
 
-            let existing_flags = NodeFlags::from_bits_retain(existing_node.flags);
-
-            if node_flags.bitand(NodeFlags::File | NodeFlags::Link)
-                == existing_flags.bitand(NodeFlags::File | NodeFlags::Link)
-            {
+            if node_flags.node_type() == existing_node.node_type() {
                 // Update the existing node
                 let block_dirtied = {
                     let mut block_writer = block.write();

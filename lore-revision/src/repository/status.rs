@@ -43,7 +43,6 @@ use crate::lore_debug;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
 use crate::metadata::Metadata;
-use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
@@ -192,13 +191,7 @@ impl LoreRepositoryStatusFileEventData {
         } else {
             change.from.flags
         };
-        let node_type = if node_type.contains(NodeFlags::File) {
-            LoreNodeType::File
-        } else if node_type.contains(NodeFlags::Link) {
-            LoreNodeType::Link
-        } else {
-            LoreNodeType::Directory
-        };
+        let node_type = node_type.node_type();
         LoreRepositoryStatusFileEventData {
             path: LoreString::from(change.path()),
             size,

@@ -6,6 +6,7 @@ use lore_error_set::prelude::*;
 
 use crate::bitflagsops;
 use crate::fs::filesystem_provider::FileInfo;
+use crate::interface::LoreNodeType;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore::RepositoryId;
@@ -404,6 +405,17 @@ pub async fn is_conflict(
     }
     // Both are files and hashes match
     Ok(false)
+}
+
+/// The subtree moves between repositories along with a mount replaced between a directory and a
+/// link, so a change the other side of a merge made below it does not stand on its own.
+pub fn is_link_replacement(change: &NodeChange) -> bool {
+    if !change.from.mapping.node.is_valid_node_id() || !change.to.mapping.node.is_valid_node_id() {
+        return false;
+    }
+    let from_type = change.from.flags.node_type();
+    let to_type = change.to.flags.node_type();
+    from_type != to_type && (from_type == LoreNodeType::Link || to_type == LoreNodeType::Link)
 }
 
 pub fn sort_by_path(changes: &mut [NodeChange]) {

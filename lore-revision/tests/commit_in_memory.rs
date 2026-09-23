@@ -1159,4 +1159,70 @@ mod tests {
             .await
             .expect("Task failed");
     }
+
+    /// A memory-based handle has no working tree, so a conflict on any kind of node has no file to
+    /// resolve and no markers to read. The freeze clears the flags of everything it walks, so an
+    /// unresolved one has to be refused rather than published as settled.
+    #[tokio::test]
+    async fn commit_in_memory_revision_rejects_an_unresolved_conflict() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+
+                let linked = Node {
+                    flags: NodeFlags::Link.bits(),
+                    mode: 0o755,
+                    name_hash: hash_string("node"),
+                    child: 7,
+                    address: Address {
+                        hash: Hash::from_u64(0xabcd),
+                        context: Context::from(uuid::Uuid::now_v7()),
+                    },
+                    ..Default::default()
+                };
+
+                for conflicted in [file("node"), directory("node"), linked] {
+                    let branch = branch_id();
+                    let state = Arc::new(State::new());
+                    let node_id =
+                        add(&state, repository.clone(), ROOT_NODE, conflicted, "node").await;
+                    state
+                        .node_mark_staged(
+                            repository.clone(),
+                            node_id,
+                            NodeFlags::StagedMergeConflict,
+                            NodeFlags::NoFlags,
+                        )
+                        .await
+                        .expect("marking the conflict must succeed");
+
+                    let failure = commit_in_memory_revision(
+                        repository.clone(),
+                        &token(),
+                        state,
+                        metadata_on(branch),
+                        Hash::default(),
+                        branch,
+                    )
+                    .await
+                    .expect_err("an unresolved conflict must not reach a revision");
+
+                    assert!(
+                        failure.error.is_conflict(),
+                        "Expected Conflict, got {failure}"
+                    );
+                    assert!(
+                        branch::load_latest(repository.clone(), branch)
+                            .await
+                            .unwrap_or_default()
+                            .is_zero(),
+                        "the branch must hold no revision"
+                    );
+                }
+            }))
+            .await
+            .expect("Task failed");
+    }
 }

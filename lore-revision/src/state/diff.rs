@@ -19,6 +19,7 @@ use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::query_depth;
+use crate::interface::LoreNodeType;
 use crate::lore::Address;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
@@ -962,6 +963,7 @@ async fn add_change_for_paired_nodes(
     let is_staged = to_node.is_staged();
     let is_staged_delete = to_node.is_staged_delete();
     let is_staged_merge = to_node.is_staged_merge();
+    let is_staged_merge_conflict = to_node.is_staged_merge_conflict();
     let is_dirty = to_node.is_dirty();
     let is_dirty_delete = to_node.is_dirty_delete();
 
@@ -1005,8 +1007,12 @@ async fn add_change_for_paired_nodes(
         )
         .await?;
     } else {
-        let was_file = from_node.is_file();
-        let is_file = to_node.is_file();
+        let from_type = from_node.node_type();
+        let to_type = to_node.node_type();
+        // A directory and a link both hold a subtree, but one of each at a path
+        // is a type change: the subtree moved between repositories.
+        let both_files = from_type == to_type && to_type == LoreNodeType::File;
+        let same_type = from_type == to_type;
 
         let to_name = match to_nodes
             .state
@@ -1037,8 +1043,8 @@ async fn add_change_for_paired_nodes(
             &to_nodes.repository.filter,
             states.to,
             &subpath,
-            was_file,
-            is_file,
+            from_type == LoreNodeType::File,
+            to_type == LoreNodeType::File,
             flags,
             filter_mode,
             stats,
@@ -1064,7 +1070,7 @@ async fn add_change_for_paired_nodes(
             change::FileAction::Keep
         };
 
-        if was_file && is_file {
+        if both_files {
             if is_modify || is_staged || is_staged_merge || is_dirty || is_rename {
                 lore_trace!(
                     "Diff node {subpath} file modified {from_address} size {from_size} to {to_address} size {to_size}, mode {from_mode} to {to_mode} - {action:?}"
@@ -1080,7 +1086,7 @@ async fn add_change_for_paired_nodes(
                 )
                 .await?;
             }
-        } else if !was_file && !is_file {
+        } else if same_type {
             let child_states = DiffStates {
                 from: subtree_states(
                     from_nodes,
@@ -1095,7 +1101,11 @@ async fn add_change_for_paired_nodes(
             };
             let child_depth = paths.depth + 1;
 
-            if !mode_equal || is_rename {
+            // A conflict on a directory node is at the path itself, and the
+            // walk below it reports nothing that carries it.
+            let conflicted_directory =
+                is_staged_merge_conflict && to_type == LoreNodeType::Directory;
+            if !mode_equal || is_rename || conflicted_directory {
                 lore_trace!(
                     "Diff node {subpath} directory mode change from {from_mode} to {to_mode}, {action:?}|modify"
                 );
@@ -1236,11 +1246,7 @@ async fn add_change_for_paired_nodes(
                 }
             }
         } else {
-            lore_trace!(
-                "Diff node {subpath} changed from {} to {}",
-                if was_file { "file" } else { "directory" },
-                if is_file { "file" } else { "directory" }
-            );
+            lore_trace!("Diff node {subpath} changed from {from_type:?} to {to_type:?}");
             stats.queried();
             let (to_node_states, to_node_excluded) = to_nodes
                 .repository
