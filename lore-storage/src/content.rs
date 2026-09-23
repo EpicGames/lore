@@ -96,12 +96,12 @@ impl<'a> ContentSource<'a> {
             })
     }
 
-    /// The whole content at once, naming it rather than opening it, for a comparison that
-    /// settles without a handle. A caller holding one reads through
-    /// [`ContentHandle::read_all`] instead of naming the content twice.
+    /// The whole content at once, naming it rather than opening it, which reads it in one
+    /// dispatch. A caller already holding a handle reads through [`ContentHandle::read_all`]
+    /// instead of naming the content twice.
     ///
     /// The caller budgets for holding the content resident.
-    pub(crate) async fn read_all(&self) -> Result<Bytes, StorageError> {
+    pub async fn read_all(&self) -> Result<Bytes, StorageError> {
         let path = self.host_path();
         lore_io::IoDriver::global()
             .read_file_bytes(path)

@@ -13,6 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use lore_base::error::InvalidPath;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
@@ -31,8 +32,6 @@ use super::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::hash::hash_string;
 use crate::immutable;
 use crate::lore_debug;
-use crate::merge::MergeTextMode;
-use crate::merge::merge3_text_by_path;
 use crate::node::Node;
 use crate::node::NodeFileMode;
 use crate::repository::RepositoryContext;
@@ -237,10 +236,10 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
-    async fn create_file(&self, path: &RelativePath) -> Result<(), FsError> {
+    async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
         let path = self.absolute(path);
         lore_io::IoDriver::global()
-            .write_file_bytes(path, bytes::Bytes::new(), false)
+            .write_file_bytes(path, contents, false)
             .await?;
         Ok(())
     }
@@ -274,16 +273,7 @@ impl InstanceOperation for OsOperation {
             lore_io::IoDriver::global().create_dir_all(parent).await?;
         }
 
-        if node.size > 0 {
-            let options = immutable::read_options_from_repository(&repository);
-            immutable::read_into_file(repository, node.address, &path, None, options)
-                .await
-                .forward_any::<FsError>("Failed to read file")?;
-        } else {
-            lore_io::IoDriver::global()
-                .write_file_bytes(&path, bytes::Bytes::new(), false)
-                .await?;
-        }
+        write_node_content(repository, node, &path).await?;
 
         let written = lore_io::IoDriver::global().metadata(&path).await?;
         let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
@@ -299,12 +289,8 @@ impl InstanceOperation for OsOperation {
         node: &Node,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
-        let options = immutable::read_options_from_repository(&repository);
         let path = self.absolute(path);
-        let (fragment, metadata) =
-            immutable::read_into_file(repository, node.address, &path, None, options)
-                .await
-                .forward_any::<FsError>("Failed to read file")?;
+        let (fragment, metadata) = write_node_content(repository, node, &path).await?;
         Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
@@ -317,23 +303,6 @@ impl InstanceOperation for OsOperation {
             .copy(self.absolute(source_path), self.absolute(destination_path))
             .await?;
         Ok(())
-    }
-
-    async fn merge3_text_by_path(
-        &self,
-        base: &RelativePath,
-        mine: &RelativePath,
-        theirs: &RelativePath,
-        result: &RelativePath,
-        mode: MergeTextMode<'_>,
-    ) -> Result<bool, FsError> {
-        Ok(merge3_text_by_path(&self.filesystem_root, base, mine, theirs, result, mode).await?)
-    }
-
-    async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
-        Ok(crate::infer::infer_is_diffable(&self.content_source(path))
-            .await
-            .unwrap_or(false))
     }
 }
 
@@ -478,6 +447,22 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
         // Symlink or other special file type
         Ok(PathListingResult::NotFound)
     }
+}
+
+/// Puts the content `node` addresses at `path`, with the fragment it came from and what the write
+/// left there where the write reported it.
+///
+/// A node addressing nothing -- the zero hash every empty file carries -- leaves an empty file:
+/// the store answers for it without being read, there being no content to find.
+async fn write_node_content(
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    path: &Path,
+) -> Result<(Fragment, Option<std::fs::Metadata>), FsError> {
+    let options = immutable::read_options_from_repository(&repository);
+    immutable::read_into_file(repository, node.address, path, None, options)
+        .await
+        .forward_any::<FsError>("Failed to read file")
 }
 
 /// Carries the file at `from_path` to `to_path` without a rename, which is what a move between two
@@ -944,6 +929,44 @@ mod tests {
             std::fs::read(dir.path().join("to")).expect("read destination")
         );
         assert!(!dir.path().join("from").exists(), "the source must be gone");
+    }
+
+    /// Text is diffable and an opaque format is not, read through the content the operation names
+    /// at the path.
+    #[tokio::test]
+    async fn infer_is_diffable_reads_the_content_at_the_path() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("text"), b"one\ntwo\n").expect("write text");
+        std::fs::write(dir.path().join("opaque"), b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
+            .expect("write opaque");
+        let operation = os_operation(dir.path()).await;
+
+        assert!(
+            operation
+                .infer_is_diffable(&relative("text"))
+                .await
+                .expect("reading the content must succeed")
+        );
+        assert!(
+            !operation
+                .infer_is_diffable(&relative("opaque"))
+                .await
+                .expect("reading the content must succeed")
+        );
+    }
+
+    /// Content that is not there is not diffable, there being nothing to diff.
+    #[tokio::test]
+    async fn infer_is_diffable_reports_content_that_is_not_there() {
+        let dir = temp_dir();
+        let operation = os_operation(dir.path()).await;
+
+        assert!(
+            !operation
+                .infer_is_diffable(&relative("absent"))
+                .await
+                .expect("an unreadable path is an answer, not a failure")
+        );
     }
 
     /// A move between two filesystems is no rename, so the content is copied and the source

@@ -12,6 +12,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
@@ -19,6 +20,7 @@ mod tests {
     use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::node::Node;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::util::path::RelativePath;
@@ -202,19 +204,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn instance_operation_create_file() {
+    async fn instance_operation_write_file() {
         run_fs_test(|_repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("new_file.txt").unwrap();
             operation
-                .create_file(&rel_path)
+                .write_file(&rel_path, Bytes::new())
                 .await
-                .expect("create_file should succeed");
+                .expect("write_file should succeed");
 
             let absolute_file = path.join("new_file.txt");
-            assert!(
-                absolute_file.exists(),
-                "File should exist after create_file"
-            );
+            assert!(absolute_file.exists(), "File should exist after write_file");
             assert!(
                 absolute_file.metadata().unwrap().is_file(),
                 "Created path should be a file"
@@ -225,6 +224,41 @@ mod tests {
                 .await
                 .expect("file_info should succeed");
             assert_eq!(info.size(), 0, "Created file should be empty");
+
+            operation
+                .write_file(&rel_path, Bytes::from_static(b"contents"))
+                .await
+                .expect("write_file should succeed");
+            assert_eq!(
+                b"contents".to_vec(),
+                std::fs::read(&absolute_file).expect("read the written file"),
+                "The file should hold what was written over it"
+            );
+        })
+        .await;
+    }
+
+    /// A node of no size addresses no stored content, so the provider leaves an empty file rather
+    /// than asking the store for one, and reports what it wrote.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn instance_operation_materializes_an_empty_node() {
+        run_fs_test(|repository, operation, path| async move {
+            let rel_path = RelativePath::new_from_initial_path("empty.txt").unwrap();
+
+            let (fragment, info) = operation
+                .set_file_to_immutable_store_contents(repository, &Node::default(), &rel_path)
+                .await
+                .expect("an empty node should materialize");
+
+            assert_eq!(0, fragment.size_content, "nothing should be transferred");
+            assert_eq!(
+                Some(0),
+                info.map(|info| info.size()),
+                "the write should report the file it left"
+            );
+            let absolute_file = path.join("empty.txt");
+            assert!(absolute_file.is_file(), "an empty file should be there");
+            assert_eq!(0, absolute_file.metadata().unwrap().len());
         })
         .await;
     }

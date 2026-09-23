@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use lore_base::error::InvalidArguments;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
@@ -26,7 +27,6 @@ use crate::hash::hash_string;
 use crate::lore::Address;
 use crate::lore::Context;
 use crate::lore_trace;
-use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
@@ -544,8 +544,22 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
-    /// Create an empty file.
-    fn create_file(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
+    /// Writes `contents` to `path` in the file system the operation was opened on, replacing what
+    /// is there. Empty contents leave an empty file.
+    ///
+    /// Raw bytes the caller holds, written as they are: the merged text a text conflict resolves
+    /// to, and the empty base a merge leaves beside a file where the revision holds none. The
+    /// path may well be one the revision tracks; the bytes are not, coming from the caller rather
+    /// than from a node.
+    ///
+    /// Content a node addresses is written by [`write_node`](Self::write_node) or
+    /// [`set_file_to_immutable_store_contents`](Self::set_file_to_immutable_store_contents),
+    /// which take it from the immutable store rather than from the caller.
+    fn write_file(
+        &self,
+        path: &RelativePath,
+        contents: Bytes,
+    ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Moves what the file system holds at `from` to `to`, unifying the two where `to` is
     /// occupied rather than refusing: a file takes the place of the file there, and a directory
@@ -587,7 +601,15 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
-    /// Sets the file at `path` to be the contents of `Node`.
+    /// Sets the file at `path` to the content `node` addresses, reporting the fragment it came
+    /// from and what the file looks like where the write reported it.
+    ///
+    /// A node of no size addresses no stored content and leaves an empty file, the store holding
+    /// nothing to read it from. A caller materializing a tree asks here for every node and does
+    /// not sort the empty ones out itself.
+    ///
+    /// The file information is `None` where the write did not report it, which a caller needing
+    /// it answers with [`file_info`](Self::file_info).
     fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
@@ -603,21 +625,23 @@ pub trait InstanceOperation: Send + Sync {
         destination_path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
-    /// Merge 3 files that exist on the file system.
-    fn merge3_text_by_path(
-        &self,
-        base: &RelativePath,
-        mine: &RelativePath,
-        theirs: &RelativePath,
-        result: &RelativePath,
-        mode: MergeTextMode<'_>,
-    ) -> impl Future<Output = Result<bool, FsError>> + Send;
-
-    /// Load the contents of `path` to see if it can be diffed or must only be opaquely compared.
+    /// Whether the content at `path` can be diffed, or must only be compared opaquely.
+    ///
+    /// Reads the head of the content, which is what telling text from an opaque format takes.
+    /// Content that cannot be read is not diffable, there being nothing to diff.
+    ///
+    /// Derived from [`content_source`](Self::content_source). A provider that answers without
+    /// reading overrides this.
     fn infer_is_diffable(
         &self,
         path: &RelativePath,
-    ) -> impl Future<Output = Result<bool, FsError>> + Send;
+    ) -> impl Future<Output = Result<bool, FsError>> + Send {
+        async move {
+            Ok(crate::infer::infer_is_diffable(&self.content_source(path))
+                .await
+                .unwrap_or(false))
+        }
+    }
 }
 
 /// Implements `InstanceOperation` by wrapping all other types implementing it and forwarding method
@@ -822,13 +846,13 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn create_file(&self, path: &RelativePath) -> Result<(), FsError> {
+    async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
         self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => this.create_file(path).await,
-            StaticDispatchInstanceOperation::Swfs(this) => this.create_file(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.write_file(path, contents).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.write_file(path, contents).await,
         }
     }
 
@@ -920,31 +944,6 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn merge3_text_by_path(
-        &self,
-        base: &RelativePath,
-        mine: &RelativePath,
-        theirs: &RelativePath,
-        result: &RelativePath,
-        mode: MergeTextMode<'_>,
-    ) -> Result<bool, FsError> {
-        if matches!(mode, MergeTextMode::Write(_)) {
-            self.record_change();
-        }
-        match &self.dispatch {
-            #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => {
-                this.merge3_text_by_path(base, mine, theirs, result, mode)
-                    .await
-            }
-            StaticDispatchInstanceOperation::Swfs(this) => {
-                this.merge3_text_by_path(base, mine, theirs, result, mode)
-                    .await
-            }
-        }
-    }
-
     async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
             #[cfg(test)]
@@ -966,6 +965,7 @@ pub mod tests {
     use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
+    use bytes::Bytes;
     use lore_base::types::Fragment;
     use parking_lot::Mutex;
 
@@ -985,7 +985,6 @@ pub mod tests {
     use crate::fs::filesystem_provider::with_operation_if;
     use crate::lore::Address;
     use crate::lore::RepositoryId;
-    use crate::merge::MergeTextMode;
     use crate::node::Node;
     use crate::repository::RepositoryContext;
     use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
@@ -1202,7 +1201,7 @@ pub mod tests {
             Ok(())
         }
 
-        async fn create_file(&self, _path: &RelativePath) -> Result<(), FsError> {
+        async fn write_file(&self, _path: &RelativePath, _contents: Bytes) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
@@ -1241,17 +1240,6 @@ pub mod tests {
             _source_path: &RelativePath,
             _destination_path: &RelativePath,
         ) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
-        async fn merge3_text_by_path(
-            &self,
-            _base: &RelativePath,
-            _mine: &RelativePath,
-            _theirs: &RelativePath,
-            _result: &RelativePath,
-            _mode: MergeTextMode<'_>,
-        ) -> Result<bool, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::WrapInternal;
@@ -21,7 +22,6 @@ use crate::fs::os::OsOperation;
 use crate::fs::swfs::api_interface::SwfsInterface;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
 use crate::immutable;
-use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
@@ -119,9 +119,7 @@ impl InstanceOperation for SwfsOperation {
         Ok(())
     }
 
-    async fn create_file(&self, _path: &RelativePath) -> Result<(), FsError> {
-        Ok(())
-    }
+    fake_with_os!(write_file, (), path: &RelativePath, contents: Bytes);
 
     async fn remove_recursive(&self, _path: &RelativePath) -> Result<(), FsError> {
         Ok(())
@@ -163,16 +161,6 @@ impl InstanceOperation for SwfsOperation {
         _source_path: &RelativePath,
         _destination_path: &RelativePath,
     );
-
-    fake_with_os!(merge3_text_by_path, bool,
-        _base: &RelativePath,
-        _mine: &RelativePath,
-        _theirs: &RelativePath,
-        _result: &RelativePath,
-        _mode: MergeTextMode<'_>,
-    );
-
-    fake_with_os!(infer_is_diffable, bool, _path: &RelativePath,);
 
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         self.os.holds_name_exactly(path).await

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
@@ -2255,7 +2256,7 @@ async fn realize_file_merge(
                         .await?;
                     } else {
                         lore_trace!("Change from has no valid from node, empty base file");
-                        let _ = operation.create_file(&base_path).await;
+                        let _ = operation.write_file(&base_path, Bytes::new()).await;
                     }
 
                     // Realize the "mine" file as the current file
@@ -2275,15 +2276,15 @@ async fn realize_file_merge(
                             .ok_or_else(|| SyncError::from(WriteRequired))?;
                         crate::merge::MergeTextMode::Write(write_token)
                     };
-                    let merged = match operation
-                        .merge3_text_by_path(
-                            &base_path,
-                            &mine_path,
-                            &theirs_path,
-                            &change_to_path,
-                            mode,
-                        )
-                        .await
+                    let merged = match crate::merge::merge3_text_in_operation(
+                        &operation,
+                        &base_path,
+                        &mine_path,
+                        &theirs_path,
+                        &change_to_path,
+                        mode,
+                    )
+                    .await
                     {
                         Err(err) => {
                             // Could not merge, maybe file from binary to text, fall back to

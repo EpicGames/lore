@@ -1851,28 +1851,14 @@ async fn clone_file(
         // path captures it on the open write handle; on that path we skip the
         // post-write stat entirely. Multi-fragment and zero-size paths
         // still need a separate metadata query.
-        let captured_file_info = if node.size > 0 {
-            let (fragment, file_info) = operation
-                .set_file_to_immutable_store_contents(repository.clone(), &node, &repository_path)
-                .await
-                .forward_with::<CloneError, _>(|| {
-                    format!("Failed to clone file {repository_path}")
-                })?;
-            stats
-                .complete
-                .bytes_transferred
-                .fetch_add(fragment.size_content, Ordering::Relaxed);
-            file_info
-        } else {
-            // Zero sized file, just create
-            operation
-                .create_file(&repository_path)
-                .await
-                .forward_with::<CloneError, _>(|| {
-                    format!("Failed to clone file {repository_path}")
-                })?;
-            None
-        };
+        let (fragment, captured_file_info) = operation
+            .set_file_to_immutable_store_contents(repository.clone(), &node, &repository_path)
+            .await
+            .forward_with::<CloneError, _>(|| format!("Failed to clone file {repository_path}"))?;
+        stats
+            .complete
+            .bytes_transferred
+            .fetch_add(fragment.size_content, Ordering::Relaxed);
 
         let file_info = if let Some(file_info) = captured_file_info {
             file_info
