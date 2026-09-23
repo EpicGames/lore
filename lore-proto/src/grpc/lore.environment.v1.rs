@@ -23,6 +23,10 @@ pub struct Endpoint {
     /// Notification service endpoint.
     #[prost(string, tag = "6")]
     pub notification_url: ::prost::alloc::string::String,
+    /// User directory endpoint: resolves user IDs to display names and back.
+    /// Falls back to `auth_url` if empty.
+    #[prost(string, tag = "7")]
+    pub user_url: ::prost::alloc::string::String,
 }
 impl ::prost::Name for Endpoint {
     const NAME: &'static str = "Endpoint";

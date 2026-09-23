@@ -310,9 +310,10 @@ The tokens themselves need three properties:
   the `root_domains` claim (D5). An audience that already carries a domain suffix keeps working
   unchanged.
 
-The permission and directory RPCs do not move. `CheckUserPermission` and `LookupUserPermissions`
-stay behind `RepositoryAuthorizer` and `RepositoryCatalog` (D7, D8), and `GetUserInfo` and
-`GetUserId` behind `UserCatalog` (D7).
+The permission and directory RPCs do not move onto the OIDC endpoints. `CheckUserPermission`
+and `LookupUserPermissions` stay behind `RepositoryAuthorizer` and `RepositoryCatalog` (D7, D8),
+and `GetUserInfo` and `GetUserId` behind `UserService` (D7). The three directory RPCs are
+extracted out of `UrcAuthApi` into a gRPC API of their own, `lore.user.v1.UserService`.
 
 Both interfaces run side by side for the whole migration. The gRPC API keeps serving clients that
 have not moved, the standard endpoints serve the ones that have, and the gRPC API retires only
@@ -465,6 +466,7 @@ an operator advertises rather than what the server enforces. The enforcement set
 | `scope_template` | How to name a partition as a scope value instead, for example `partition:{id}`. For providers that reject `resource` or never see it on the exchange grant. |
 | `token_exchange_issuer` | The [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) endpoint to exchange against, whether that is the provider itself or a separate token service. |
 | `identity_claim` | The claim clients record as the user identity, `sub` by default (D7). Advertised so every client records the same form. |
+| `user_url` | The user directory clients resolve names at, `auth_url` by default (D7). Independent of the auth path, so an OIDC deployment can advertise a directory without a legacy auth service. |
 
 The list of hosts a token may be sent to is deliberately *not* advertised here: it comes from the
 issuer-signed token, because the environment response is served by the same party a stolen token
@@ -804,13 +806,13 @@ grant space, or to resolve an identifier that is not the bearer's. Both therefor
 authentication path onto optional traits with a degraded default, rather than being forced into a
 mechanism that cannot hold them.
 
-#### The user catalog
+#### The user service
 
 `GetUserInfo` resolves a batch of user IDs to display names, and `GetUserId` resolves the reverse.
 OIDC has no equivalent, because `/userinfo` describes only the bearer. Nothing in the standard set
 replaces these.
 
-The design moves them off the `Authentication` trait onto a separate optional `UserCatalog`
+The design moves them off the `Authentication` trait onto a separate optional `UserService`
 trait. The default implementation answers from the token's own `name` and `preferred_username`
 claims for the current user, and returns the raw ID for anyone else. The CLI already degrades to
 printing the ID when no name resolves
@@ -824,9 +826,20 @@ name (`created_by` and its siblings in
 be unmapped from a person without rewriting history.
 
 The directory lookup therefore stays a real dependency for any deployment that wants names, and
-OIDC does not supply one. Deployments with a directory can implement `UserCatalog` over it, SCIM
+OIDC does not supply one. Deployments with a directory can implement `UserService` over it, SCIM
 2.0 being the nearest standard, but out of scope for this change. Deployments without a
-`UserCatalog` implementation show identifiers.
+`UserService` implementation show identifiers.
+
+The lookup runs on the client and bypasses the Lore server, which keeps personal information out
+of it. So the directory is discovered like the auth service: the server advertises
+`user_url` on the endpoint, `auth_url` when absent, and the client selects the
+`UserService` implementation from that URL. The directory's host must be under a domain that is
+found in one of the token's `aud` names.
+
+The directory operations outlive the auth service, so they get a gRPC API of their own:
+`lore.user.v1.UserService`, carrying `GetUserInfo`, `GetUserId` and `LookupUserPermissions` with
+their messages copied field for field from `auth_api.proto`. The copy is wire-identical for
+simple migration.
 
 There is a third position for deployments that do not need the unmapping property: record a
 human-readable claim as the identity itself. Nothing in the protocol constrains what `created_by`
@@ -1345,7 +1358,7 @@ identifier and not a name, so an operator can unmap that identifier from a perso
 or an erasure request, without rewriting history. Resolving names through a directory at read time
 is what makes that possible, and D7 keeps it that way. The identity-claim option in D7 trades the
 property away deliberately: a deployment that records `preferred_username` into history chooses
-readability over erasability, and the default stays `sub`. The `UserCatalog` default answers
+readability over erasability, and the default stays `sub`. The `UserService` default answers
 from the caller's own token rather than accumulating a local cache of other people's names.
 
 **Tokens stay out of logs.** The existing discipline holds: `set_sensitive` on the gRPC

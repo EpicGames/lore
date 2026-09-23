@@ -24,7 +24,10 @@ pub fn token_fingerprint(token: &str) -> String {
 }
 
 pub fn domain_from_url_or_url(url: &Url) -> String {
-    url.domain().unwrap_or(url.as_str()).to_string()
+    url.domain()
+        .or_else(|| url.host_str())
+        .unwrap_or(url.as_str())
+        .to_string()
 }
 
 pub fn domain_from_url_str_or_url(remote_url: &str) -> Result<String, ParseError> {
@@ -64,5 +67,16 @@ mod tests {
     #[test]
     fn no_token_has_no_fingerprint() {
         assert!(token_fingerprint("").is_empty());
+    }
+
+    #[test]
+    fn an_ip_literal_host_is_the_domain_under_every_scheme() {
+        assert_eq!(get_domain_or_empty("http://127.0.0.1:54300"), "127.0.0.1");
+        assert_eq!(get_domain_or_empty("lore://127.0.0.1:54303/"), "127.0.0.1");
+        assert_eq!(get_domain_or_empty("http://[::1]:1"), "[::1]");
+        assert_eq!(
+            get_domain_or_empty("https://auth.example.com/path"),
+            "auth.example.com"
+        );
     }
 }

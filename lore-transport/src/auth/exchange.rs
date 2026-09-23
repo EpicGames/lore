@@ -870,7 +870,6 @@ mod tests {
         use crate::types::AuthSession;
         use crate::types::AuthenticationToken;
         use crate::types::AuthorizationToken;
-        use crate::types::ResolvedUser;
 
         /// `sub` alice, `aud` example.com, expiring in 2033.
         const AUTHN_ONE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
@@ -964,32 +963,6 @@ mod tests {
             ) -> Result<AuthorizationToken, ProtocolError> {
                 Err(ProtocolError::internal(
                     "the stub only serves repository exchanges",
-                ))
-            }
-
-            async fn get_user_info(
-                &self,
-                _auth_url: &str,
-                _authz_token: &str,
-                _repository: RepositoryId,
-                _user_ids: &[String],
-                _correlation_id: &str,
-            ) -> Result<Vec<ResolvedUser>, ProtocolError> {
-                Err(ProtocolError::internal(
-                    "the stub only serves authorization exchanges",
-                ))
-            }
-
-            async fn get_user_id(
-                &self,
-                _auth_url: &str,
-                _authz_token: &str,
-                _repository: RepositoryId,
-                _display_name: &str,
-                _correlation_id: &str,
-            ) -> Result<Option<ResolvedUser>, ProtocolError> {
-                Err(ProtocolError::internal(
-                    "the stub only serves authorization exchanges",
                 ))
             }
         }

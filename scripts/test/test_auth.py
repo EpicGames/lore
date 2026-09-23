@@ -46,30 +46,27 @@ def test_auth_info_not_supported_without_auth_endpoint(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_auth_user_info_not_supported_without_auth_endpoint(
+def test_auth_user_info_answers_from_the_token_only_service_without_auth_endpoint(
     new_lore_repo, lore_library_path
 ):
-    """`authUserInfo` (remote user-info resolution) must fail with
-    `NotSupported` against the authless test server, not `NotAuthenticated`:
-    the real failure is that the server has no auth endpoint at all, and
-    replacing it with `NotAuthenticated` sends consumers chasing login state
-    that cannot exist.
+    """`authUserInfo` (remote user-info resolution) succeeds against the
+    authless test server. With no auth service and no directory advertised
+    there is nothing to exchange a token with and nothing to ask, so the
+    token-only service answers: every ID is its own display name. Failing
+    here, with `NotSupported` or worse `NotAuthenticated`, would send SDK
+    consumers chasing login state that cannot exist on this server.
 
-    No CLI command surfaces this call's errors (the CLI only uses it to
-    decorate output with display names and deliberately ignores failures), so
-    the test calls the public C API — the surface the SDK's `authUserInfo`
-    binding is built on — and asserts on the returned FFI code."""
+    No CLI command surfaces this call's result directly (the CLI only uses it
+    to decorate output with display names), so the test calls the public C
+    API — the surface the SDK's `authUserInfo` binding is built on — and
+    asserts on the returned FFI code."""
 
     repo: Lore = new_lore_repo()
 
     result = repo.auth_user_info_capi(lore_library_path, "some-other-user")
 
-    assert result != 0, "resolving a user against an authless server must fail"
-    assert result != NOT_AUTHENTICATED, (
-        "the authless failure must not be masked as NotAuthenticated"
-    )
-    assert result == NOT_SUPPORTED, (
-        f"expected NotSupported ({NOT_SUPPORTED}), got FFI code {result}"
+    assert result == 0, (
+        f"the token-only service answers an authless server; got FFI code {result}"
     )
 
 

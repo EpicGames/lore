@@ -4060,7 +4060,7 @@ typedef struct lore_global_args_t {
   uint64_t event_interval_ms;
 } lore_global_args_t;
 
-// Arguments for resolving user IDs to display names via the remote auth service.
+// Arguments for resolving user IDs to display names via the remote user service.
 typedef struct lore_auth_user_info_args_t {
   // User IDs to resolve; empty resolves the current user locally
   struct lore_string_array_t user_ids;

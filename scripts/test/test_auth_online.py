@@ -57,6 +57,7 @@ from mock_auth_server import (
     lookup_user_permissions_response,
     start_auth_session_response,
     tamper_token,
+    user_info_response,
     user_token_response,
 )
 from thin_client import revision_tree
@@ -476,6 +477,28 @@ def test_granted_user_can_access_shared_repository(auth_env, make_actor, scratch
     viewer.clone(path=str(clone_path))
 
     assert (clone_path / "shared.txt").read_text() == "shared content"
+
+
+@pytest.mark.smoke
+def test_user_names_come_from_the_auth_service_without_a_separate_directory(
+    auth_env, make_actor, lore_library_path
+):
+    """A server advertising no `user_url` keeps its auth service as
+    the user directory: another user's name is a `GetUserInfo` call there,
+    carrying the partition-scoped token the CLI exchanged for it."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "owner", USER1)
+    mock.on(
+        "GetUserInfo", bearer=owner.authz_token, resource_id=owner.resource_id
+    ).respond(user_info_response(USER2))
+
+    result = owner.repo.auth_user_info_capi(lore_library_path, USER2.user_id)
+
+    assert result == 0, (
+        f"resolving through the auth service failed with FFI code {result}"
+    )
+    assert mock.calls["GetUserInfo"] == 1
+    assert list(mock.requests_for("GetUserInfo")[0]["user_id"]) == [USER2.user_id]
 
 
 @pytest.mark.smoke

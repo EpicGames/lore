@@ -893,6 +893,11 @@ impl Connection {
         self.auth_url.as_str()
     }
 
+    /// The user directory advertised by the server.
+    pub fn user_url(&self) -> &str {
+        self.environment.user_url(&self.auth_url)
+    }
+
     pub fn identity(&self) -> &str {
         self.identity.as_str()
     }

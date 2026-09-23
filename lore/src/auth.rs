@@ -71,7 +71,7 @@ impl EventError for AuthStoreError {
     }
 }
 
-/// Arguments for resolving user IDs to display names via the remote auth service.
+/// Arguments for resolving user IDs to display names via the remote user service.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
 #[handler(resolve_user_info_local)]
@@ -80,9 +80,9 @@ pub struct LoreAuthUserInfoArgs {
     pub user_ids: LoreArray<LoreString>,
 }
 
-/// Resolves user IDs to display names using the remote authentication service.
+/// Resolves user IDs to display names using the remote user service.
 ///
-/// Requires an authenticated connection. Queries the authentication service to
+/// Requires an authenticated connection. Queries the remote user service to
 /// resolve the provided user IDs to their display names.
 ///
 /// When `user_ids` is empty, falls back to [`local_user_info`] to return the
@@ -642,7 +642,7 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// exchange when no valid cached token exists.
 ///
 /// For remote resolution of user IDs with proper authorization, use
-/// [`resolve_user_info`] which queries the remote authentication service.
+/// [`resolve_user_info`] which queries the remote user service.
 ///
 /// # Events
 ///

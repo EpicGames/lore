@@ -89,6 +89,21 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
 
+### Advertised endpoints
+
+`[environment.endpoint]` defines the external service endpoints advertised for the client.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
+| `user_url` | `auth_url` | The user directory that clients use to resolve user IDs to display names, and back. If not set, uses `auth_url` as the user service. If both are unset, falls back to an offline resolver that returns user IDs as names. |
+
+```toml
+[environment.endpoint]
+auth_url = "ucs-auth://auth.example.com"
+user_url = "ucs-auth://directory.example.com"
+```
+
 ### Local store disk space
 
 `[server.local_store_monitor]` configures the periodic check of the disk space left to the local stores (see [Store settings](#store-settings)). Only stores the server writes at are watched, so a `[local]` block left in a remote deployment's configuration is ignored, as is a composite immutable tier that names a path other than the first local tier's — every local tier is handed the store the first one creates.

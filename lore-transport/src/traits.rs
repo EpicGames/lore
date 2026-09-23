@@ -445,21 +445,26 @@ pub trait Authentication: Send + Sync {
         resource_id: &str,
         correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError>;
+}
 
+/// Client-side directory lookup between user IDs and display names.
+#[async_trait]
+pub trait UserService: Send + Sync {
     /// Resolves user IDs to display names.
     async fn get_user_info(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         user_ids: &[String],
         correlation_id: &str,
     ) -> Result<Vec<ResolvedUser>, ProtocolError>;
 
-    /// Resolves a display name back to a user ID.
+    /// Resolves a display name back to a user ID. `None` when the service
+    /// does not recognize the user.
     async fn get_user_id(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         display_name: &str,

@@ -4,8 +4,8 @@
 ///
 /// These tests verify the `Authentication` trait's error handling patterns
 /// that the orchestration layer depends on for identity probing and
-/// authorization exchange. They use `MockAuthentication` registered in the
-/// global authentication registry.
+/// authorization exchange, and the `UserService` lookup beside it. They use
+/// `TestAuthentication` registered in the global scheme registries.
 ///
 /// The original `AuthExchange` trait tests (identity selection, domain
 /// filtering) operated on an in-memory mock of the token store. Those
@@ -26,7 +26,9 @@ mod tests {
     use lore_transport::AuthorizationToken;
     use lore_transport::ProtocolError;
     use lore_transport::ResolvedUser;
+    use lore_transport::UserService;
     use lore_transport::auth::authentication;
+    use lore_transport::auth::user_service;
 
     struct TestAuthentication {
         exchange_result:
@@ -124,10 +126,13 @@ mod tests {
         ) -> Result<AuthorizationToken, ProtocolError> {
             (self.exchange_result)(RepositoryId::default())
         }
+    }
 
+    #[async_trait]
+    impl UserService for TestAuthentication {
         async fn get_user_info(
             &self,
-            _auth_url: &str,
+            _user_url: &str,
             _authz_token: &str,
             _repository: RepositoryId,
             user_ids: &[String],
@@ -144,7 +149,7 @@ mod tests {
 
         async fn get_user_id(
             &self,
-            _auth_url: &str,
+            _user_url: &str,
             _authz_token: &str,
             _repository: RepositoryId,
             display_name: &str,
@@ -250,10 +255,10 @@ mod tests {
     #[tokio::test]
     async fn get_user_info_returns_resolved_users() {
         let scheme = "test-userinfo";
-        authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
+        user_service::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
 
-        let auth = authentication::find(&format!("{scheme}://auth.test.com")).unwrap();
-        let users = auth
+        let service = user_service::find(&format!("{scheme}://auth.test.com"));
+        let users = service
             .get_user_info(
                 &format!("{scheme}://auth.test.com"),
                 "authz-tok",
@@ -271,10 +276,10 @@ mod tests {
     #[tokio::test]
     async fn get_user_id_returns_resolved_user() {
         let scheme = "test-userid";
-        authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
+        user_service::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
 
-        let auth = authentication::find(&format!("{scheme}://auth.test.com")).unwrap();
-        let user = auth
+        let service = user_service::find(&format!("{scheme}://auth.test.com"));
+        let user = service
             .get_user_id(
                 &format!("{scheme}://auth.test.com"),
                 "authz-tok",
@@ -286,6 +291,43 @@ mod tests {
             .unwrap();
         assert!(user.is_some());
         assert_eq!(user.unwrap().user_id, "id-for-Alice");
+    }
+
+    /// An authentication registered without a user service still resolves users:
+    /// the user's own name is resolved from the token, the other user names
+    /// are resolved as their IDs.
+    #[tokio::test]
+    async fn authentication_without_a_user_service_falls_back_to_the_token() {
+        /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
+        const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+        let scheme = "test-authn-only";
+        authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
+
+        let auth_url = format!("{scheme}://auth.test.com");
+        let users = user_service::find(&auth_url)
+            .get_user_info(
+                &auth_url,
+                ALICE_TOKEN,
+                RepositoryId::default(),
+                &["alice".into(), "bob".into()],
+                "corr",
+            )
+            .await
+            .unwrap();
+        let names: Vec<&str> = users.iter().map(|u| u.user_name.as_str()).collect();
+        assert_eq!(names, ["Alice", "bob"]);
+
+        let bob = user_service::find(&auth_url)
+            .get_user_id(
+                &auth_url,
+                ALICE_TOKEN,
+                RepositoryId::default(),
+                "bob",
+                "corr",
+            )
+            .await
+            .unwrap();
+        assert!(bob.is_none(), "the token names nobody but its bearer");
     }
 
     #[tokio::test]

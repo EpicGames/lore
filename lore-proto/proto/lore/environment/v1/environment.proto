@@ -31,6 +31,9 @@ message Endpoint {
   string lock_url = 5;
   // Notification service endpoint.
   string notification_url = 6;
+  // User directory endpoint: resolves user IDs to display names and back.
+  // Falls back to `auth_url` if empty.
+  string user_url = 7;
 }
 
 // Compression algorithm to use when storing payloads.

@@ -14,7 +14,15 @@ use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
 use crate::error::ProtocolError;
 use crate::grpc::CorrelationInterceptor;
 use crate::traits::Authentication;
+use crate::traits::UserService;
 use crate::types::*;
+
+/// The auth URL schemes [`UcsAuthentication`] is registered under, for
+/// authentication and the user service alike. `https` is the transition
+/// fallback. `http` serves local test auth services; The implementation only
+/// honours plaintext for loopback hosts and upgrades any other http URL to
+/// https (see [`grpc_endpoint`]).
+pub const SCHEMES: [&str; 3] = ["ucs-auth", "https", "http"];
 
 /// Whether `auth_url` is a plain-http URL naming a loopback host. Does
 /// not accept username and password in URL, but just accepts plain
@@ -98,10 +106,10 @@ fn set_auth_header<T>(request: &mut tonic::Request<T>, token: &str) -> Result<()
     Ok(())
 }
 
-/// Authentication implementation using UCS Auth API gRPC service.
+/// Authentication and user service over the UCS Auth API gRPC service.
 ///
-/// Registered under the `ucs-auth` scheme (and `https` during transition).
-/// All `lore_proto::auth` imports are confined to this module.
+/// Registered under [`SCHEMES`] in both registries. All `lore_proto::auth`
+/// imports are confined to this module.
 ///
 /// The `correlation_id` parameter on trait methods is not used directly --
 /// correlation IDs are injected into gRPC requests by `CorrelationInterceptor`,
@@ -259,16 +267,19 @@ impl Authentication for UcsAuthentication {
             acceptable_root_domains: Vec::new(),
         })
     }
+}
 
+#[async_trait]
+impl UserService for UcsAuthentication {
     async fn get_user_info(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         user_ids: &[String],
         _correlation_id: &str,
     ) -> Result<Vec<ResolvedUser>, ProtocolError> {
-        let mut client = connect_client(auth_url).await?;
+        let mut client = connect_client(user_url).await?;
 
         let mut request = tonic::Request::new(GetUserInfoRequest {
             resource_id: resource_id(repository),
@@ -294,13 +305,13 @@ impl Authentication for UcsAuthentication {
 
     async fn get_user_id(
         &self,
-        auth_url: &str,
+        user_url: &str,
         authz_token: &str,
         repository: RepositoryId,
         display_name: &str,
         _correlation_id: &str,
     ) -> Result<Option<ResolvedUser>, ProtocolError> {
-        let mut client = connect_client(auth_url).await?;
+        let mut client = connect_client(user_url).await?;
 
         let mut request = tonic::Request::new(GetUserIdRequest {
             resource_id: resource_id(repository),

@@ -50,6 +50,11 @@ impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig 
                 } else {
                     None
                 },
+                user_url: if !endpoint.user_url.is_empty() {
+                    Some(endpoint.user_url.clone())
+                } else {
+                    None
+                },
             }),
             config: value.config.map(|config| EnvironmentServerConfig {
                 max_query_batch: if config.max_query_batch > 0 {

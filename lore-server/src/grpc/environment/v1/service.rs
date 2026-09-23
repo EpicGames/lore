@@ -21,6 +21,7 @@ fn endpoint_to_proto(endpoint: &Option<lore_transport::Endpoint>) -> Option<Endp
         revision_url: endpoint.revision_url.clone().unwrap_or_default(),
         lock_url: endpoint.lock_url.clone().unwrap_or_default(),
         notification_url: endpoint.notification_url.clone().unwrap_or_default(),
+        user_url: endpoint.user_url.clone().unwrap_or_default(),
     })
 }
 

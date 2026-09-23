@@ -74,6 +74,15 @@ impl EnvironmentConfig {
             fallback,
         )
     }
+
+    /// User directory endpoint: resolves user IDs to display names and back.
+    /// Falls back to `auth_url` if empty.
+    pub fn user_url<'a>(&'a self, fallback: &'a str) -> &'a str {
+        service_url_or(
+            self.endpoint.as_ref().and_then(|e| e.user_url.as_deref()),
+            fallback,
+        )
+    }
 }
 
 fn service_url_or<'a>(override_url: Option<&'a str>, fallback: &'a str) -> &'a str {
@@ -92,6 +101,9 @@ pub struct Endpoint {
     pub revision_url: Option<String>,
     pub lock_url: Option<String>,
     pub notification_url: Option<String>,
+    /// User directory endpoint: resolves user IDs to display names and back.
+    /// Falls back to `auth_url` if empty.
+    pub user_url: Option<String>,
 }
 
 /// A compression mode as it arrives from a server, held as the number it was sent as: the codec
@@ -329,5 +341,30 @@ mod tests {
         assert_eq!(env.revision_url(FALLBACK), FALLBACK);
         assert_eq!(env.repository_url(FALLBACK), FALLBACK);
         assert_eq!(env.notification_url(FALLBACK), FALLBACK);
+    }
+
+    /// Uses `auth_url` as fallback user directory, unless
+    /// `user_url` is defined
+    #[test]
+    fn user_url_follows_the_auth_url_until_advertised() {
+        const AUTH_URL: &str = "ucs-auth://auth.example.com";
+
+        assert_eq!(env_with(Endpoint::default()).user_url(AUTH_URL), AUTH_URL);
+        assert_eq!(
+            env_with(Endpoint {
+                user_url: Some(String::new()),
+                ..Default::default()
+            })
+            .user_url(AUTH_URL),
+            AUTH_URL
+        );
+        assert_eq!(
+            env_with(Endpoint {
+                user_url: Some("ucs-auth://directory.example.com".into()),
+                ..Default::default()
+            })
+            .user_url(AUTH_URL),
+            "ucs-auth://directory.example.com"
+        );
     }
 }
