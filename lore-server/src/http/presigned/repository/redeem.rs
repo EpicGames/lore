@@ -203,7 +203,9 @@ mod tests {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
+    use axum::http::Method;
     use axum::http::StatusCode;
+    use axum::http::header::ALLOW;
     use axum::http::header::CONTENT_TYPE;
     use axum_test::TestServer;
     use lore_base::runtime::LORE_CONTEXT;
@@ -458,7 +460,48 @@ mod tests {
                     "Failed to deserialize query string: missing field `token`"
                 );
             })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn head_is_rejected_without_redeeming_content() {
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let server = build_test_server(immutable_store, mutable_store, presign_config());
+
+        let response = server
+            .method(
+                Method::HEAD,
+                "/v1/presigned/not-a-repository/not-an-address",
+            )
             .await;
+
+        assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(response.headers().get(ALLOW).unwrap(), "GET");
+    }
+
+    #[tokio::test]
+    async fn non_get_methods_advertise_get_only() {
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let server = build_test_server(immutable_store, mutable_store, presign_config());
+
+        for method in [
+            Method::OPTIONS,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::TRACE,
+            Method::CONNECT,
+        ] {
+            let response = server
+                .method(method, "/v1/presigned/not-a-repository/not-an-address")
+                .await;
+
+            assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.headers().get(ALLOW).unwrap(), "GET");
+        }
     }
 
     #[tokio::test]
