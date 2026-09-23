@@ -148,7 +148,7 @@ impl InstanceOperation for SwfsOperation {
         self.os.changes_from_filesystem_to_state(diff)
     }
 
-    fake_with_os!(unify_case_rename, (),
+    fake_with_os!(rename, (),
         _from: &RelativePath,
         _to: &RelativePath,
     );

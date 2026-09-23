@@ -245,13 +245,9 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
-    async fn unify_case_rename(
-        &self,
-        from: &RelativePath,
-        to: &RelativePath,
-    ) -> Result<(), FsError> {
+    async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
         let (from, to) = (self.absolute(from), self.absolute(to));
-        unify_name_case_rename(&from, &to).await?;
+        rename_unifying(&from, &to).await?;
         Ok(())
     }
 
@@ -484,15 +480,31 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     }
 }
 
-/// Helper function to rename files during name case unification handling. Will try to rename
-/// the "from" file/directory to "to" name. If the "to" name already exist in the file system
-/// it will try to handle it as follows:
-/// - if the "from"/"to" is a file it will overwrite the "to" file with the "from" file, then remove
-///   the "from" file
-/// - if the "from"/"to" is a directory it will recurse and call `unify_name_case_rename` on each
-///   child item in the "from" directory to move it to the "to" directory, applying the same
-///   rules to each subitem (replacing files, recursing directories).
-pub fn unify_name_case_rename<'a>(
+/// Carries the file at `from_path` to `to_path` without a rename, which is what a move between two
+/// filesystems takes: no rename crosses one.
+async fn copy_and_unlink(from_path: &Path, to_path: &Path) -> std::io::Result<()> {
+    let driver = lore_io::IoDriver::global();
+    lore_debug!(
+        "Copying {} -> {}, no rename carries it",
+        from_path.display(),
+        to_path.display()
+    );
+    driver.copy(from_path, to_path).await?;
+    driver.remove_file(from_path).await?;
+    Ok(())
+}
+
+/// The OS arm of [`InstanceOperation::rename`]: moves what the file system holds at `from_path` to
+/// `to_path`, by rename where one lands and by hand where none does.
+///
+/// A file goes to `to_path` whether or not a file is there, one that is there being removed first.
+/// A directory hands each child over under these same rules, a child whose name the destination
+/// also holds recursing again, before it goes; a destination that is not there is created to take
+/// them. A `from_path` and `to_path` of different kinds are refused, there being no move that
+/// leaves one of them.
+///
+/// Boxed because it recurses.
+fn rename_unifying<'a>(
     from_path: &'a Path,
     to_path: &'a Path,
 ) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
@@ -509,9 +521,15 @@ pub fn unify_name_case_rename<'a>(
         }
 
         let from_metadata = driver.metadata(from_path).await?;
-        let to_metadata = driver.metadata(to_path).await?;
+        let to_metadata = match driver.metadata(to_path).await {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err),
+        };
 
-        if from_metadata.is_dir() != to_metadata.is_dir() {
+        if let Some(to_metadata) = &to_metadata
+            && from_metadata.is_dir() != to_metadata.is_dir()
+        {
             return Err(tokio::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "Unable to rename, file/directory mismatch",
@@ -519,27 +537,17 @@ pub fn unify_name_case_rename<'a>(
         }
 
         if from_metadata.is_file() {
-            lore_debug!(
-                "Failed rename {} -> {}, replacing",
-                from_path.display(),
-                to_path.display()
-            );
-            driver.remove_file(to_path).await?;
-            if let Err(err) = driver.rename(from_path, to_path).await {
-                lore_debug!(
-                    "Failed rename {} -> {}, try copy and delete: {err}",
-                    from_path.display(),
-                    to_path.display(),
-                );
-                driver.copy(from_path, to_path).await?;
-                driver.remove_file(from_path).await?;
+            if to_metadata.is_some() {
+                driver.remove_file(to_path).await?;
+                if driver.rename(from_path, to_path).await.is_ok() {
+                    return Ok(());
+                }
             }
+            copy_and_unlink(from_path, to_path).await?;
         } else {
-            lore_debug!(
-                "Failed rename {} -> {}, try recursive directory unification",
-                from_path.display(),
-                to_path.display()
-            );
+            if to_metadata.is_none() {
+                driver.create_dir_all(to_path).await?;
+            }
             // The listing is drained before the directory goes, so nothing is still walking it.
             let names = {
                 let mut listing = driver.read_dir(from_path).await?;
@@ -552,7 +560,7 @@ pub fn unify_name_case_rename<'a>(
             for name in names {
                 let from_path = from_path.join(&name);
                 let to_path = to_path.join(&name);
-                unify_name_case_rename(&from_path, &to_path).await?;
+                rename_unifying(&from_path, &to_path).await?;
             }
             driver.remove_dir_all(from_path).await?;
         }
@@ -594,6 +602,35 @@ mod tests {
         let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
         std::fs::remove_file(&probe).expect("remove probe");
         insensitive
+    }
+
+    /// An empty directory of its own on a filesystem other than the one holding `beside`, or
+    /// `None` where the machine offers no second one. `/dev/shm` is the tmpfs a Linux system
+    /// mounts apart from the one temporary directories come from.
+    ///
+    /// Named per call, the tests sharing a process and running at the same time, and per process,
+    /// a previous run having left one behind where it failed. The caller removes it: it lies
+    /// outside the temporary directory that would have.
+    #[cfg(target_os = "linux")]
+    fn second_filesystem_directory(beside: &Path) -> Option<PathBuf> {
+        use std::os::unix::fs::MetadataExt;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        static TAKEN: AtomicUsize = AtomicUsize::new(0);
+
+        let shm = Path::new("/dev/shm");
+        if std::fs::metadata(shm).ok()?.dev() == std::fs::metadata(beside).ok()?.dev() {
+            return None;
+        }
+        let directory = shm.join(format!(
+            "lore-fs-os-test-{}-{}",
+            std::process::id(),
+            TAKEN.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir(&directory).ok()?;
+        Some(directory)
     }
 
     /// What the lookup answers where the platform has one, and `None` where it
@@ -887,5 +924,141 @@ mod tests {
                 "asking about {asked} must report every case variation, not pick one"
             );
         }
+    }
+
+    /// A file lands on the name even where the name is taken, replacing what was there.
+    #[tokio::test]
+    async fn rename_replaces_the_file_at_the_destination() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("from"), b"carried").expect("write source");
+        std::fs::write(dir.path().join("to"), b"replaced").expect("write destination");
+        let operation = os_operation(dir.path()).await;
+
+        operation
+            .rename(&relative("from"), &relative("to"))
+            .await
+            .expect("the move must land");
+
+        assert_eq!(
+            b"carried".to_vec(),
+            std::fs::read(dir.path().join("to")).expect("read destination")
+        );
+        assert!(!dir.path().join("from").exists(), "the source must be gone");
+    }
+
+    /// A move between two filesystems is no rename, so the content is copied and the source
+    /// unlinked, whether or not the destination is already taken. The source is reached through a
+    /// link, the two paths an operation names lying under one root.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn rename_carries_a_file_across_filesystems() {
+        for occupied in [false, true] {
+            let dir = temp_dir();
+            let Some(elsewhere) = second_filesystem_directory(dir.path()) else {
+                return;
+            };
+            std::os::unix::fs::symlink(&elsewhere, dir.path().join("elsewhere")).expect("link");
+            std::fs::write(elsewhere.join("from"), b"carried").expect("write source");
+            if occupied {
+                std::fs::write(dir.path().join("to"), b"replaced").expect("write destination");
+            }
+            let operation = os_operation(dir.path()).await;
+
+            let moved = operation
+                .rename(&relative("elsewhere/from"), &relative("to"))
+                .await;
+
+            let landed = std::fs::read(dir.path().join("to")).ok();
+            let source_left = elsewhere.join("from").exists();
+            let _ = std::fs::remove_dir_all(&elsewhere);
+
+            moved.expect("the move must land");
+            assert_eq!(
+                Some(b"carried".to_vec()),
+                landed,
+                "the destination must hold the source, occupied {occupied}"
+            );
+            assert!(!source_left, "the source must be gone, occupied {occupied}");
+        }
+    }
+
+    /// A directory crosses a filesystem the same way, its children carried one at a time into a
+    /// destination created to take them.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn rename_carries_a_directory_across_filesystems() {
+        let dir = temp_dir();
+        let Some(elsewhere) = second_filesystem_directory(dir.path()) else {
+            return;
+        };
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("elsewhere")).expect("link");
+        std::fs::create_dir_all(elsewhere.join("from").join("nested")).expect("create source");
+        std::fs::write(
+            elsewhere.join("from").join("nested").join("leaf"),
+            b"carried",
+        )
+        .expect("write nested child");
+        let operation = os_operation(dir.path()).await;
+
+        let moved = operation
+            .rename(&relative("elsewhere/from"), &relative("to"))
+            .await;
+
+        let landed = std::fs::read(dir.path().join("to").join("nested").join("leaf")).ok();
+        let source_left = elsewhere.join("from").exists();
+        let _ = std::fs::remove_dir_all(&elsewhere);
+
+        moved.expect("the move must land");
+        assert_eq!(Some(b"carried".to_vec()), landed);
+        assert!(!source_left, "the source must be gone");
+    }
+
+    /// A directory whose name is taken hands its children over one at a time, leaving what the
+    /// destination already held beside them, and a child whose name is taken too is merged under
+    /// the same rules rather than refused.
+    #[tokio::test]
+    async fn rename_merges_a_directory_into_the_one_at_the_destination() {
+        let dir = temp_dir();
+        let from = dir.path().join("from");
+        let to = dir.path().join("to");
+        std::fs::create_dir_all(from.join("shared")).expect("create source");
+        std::fs::create_dir_all(to.join("shared")).expect("create destination");
+        std::fs::write(from.join("carried"), b"").expect("write child");
+        std::fs::write(to.join("held"), b"").expect("write held child");
+        std::fs::write(from.join("shared").join("nested"), b"").expect("write nested child");
+        std::fs::write(to.join("shared").join("kept"), b"").expect("write nested held child");
+        let operation = os_operation(dir.path()).await;
+
+        operation
+            .rename(&relative("from"), &relative("to"))
+            .await
+            .expect("the merge must land");
+
+        assert!(to.join("carried").exists());
+        assert!(to.join("held").exists());
+        assert!(to.join("shared").join("nested").exists());
+        assert!(to.join("shared").join("kept").exists());
+        assert!(!from.exists(), "the source must be gone");
+    }
+
+    /// A file and a directory are not two spellings of one thing, so there is no move that leaves
+    /// one of them.
+    #[tokio::test]
+    async fn rename_refuses_a_destination_of_another_kind() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("from"), b"").expect("write source");
+        std::fs::create_dir(dir.path().join("to")).expect("create destination");
+        let operation = os_operation(dir.path()).await;
+
+        operation
+            .rename(&relative("from"), &relative("to"))
+            .await
+            .expect_err("a file must not land on a directory");
+
+        assert!(dir.path().join("from").is_file(), "the source must survive");
+        assert!(
+            dir.path().join("to").is_dir(),
+            "the destination must survive"
+        );
     }
 }

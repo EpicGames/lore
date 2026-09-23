@@ -1801,10 +1801,7 @@ async fn realize_change_modify_add(
         && change.action == change::FileAction::Move
         && let Some(from_path) = change.move_source()
     {
-        let renamed = operation
-            .unify_case_rename(from_path, &to_path)
-            .await
-            .is_ok();
+        let renamed = operation.rename(from_path, &to_path).await.is_ok();
         if !renamed {
             lore_trace!("Failed renaming move node, fall back to deleting and recreating");
             operation

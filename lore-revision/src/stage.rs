@@ -1212,7 +1212,7 @@ async fn resolve_case_variant_collisions(
                     let from_path = relative_path.clone().push_and_freeze(&entry.name);
                     let to_path = relative_path.clone().push_and_freeze(winner_name);
                     lore_debug!("Case variant collision: unifying {from_path} into {to_path}");
-                    let _ = operation.unify_case_rename(&from_path, &to_path).await;
+                    let _ = operation.rename(&from_path, &to_path).await;
                 }
             }
         }
@@ -2254,14 +2254,11 @@ pub(crate) async fn stage_node_from_metadata(
                 name = node_name;
                 let to_path = relative_path.join(&name);
 
-                operation
-                    .unify_case_rename(&from_path, &to_path)
-                    .await
-                    .map_err(|e| {
-                        StageError::internal(format!(
-                            "Unable to rename file system path {from_path} to {to_path}: {e}"
-                        ))
-                    })?;
+                operation.rename(&from_path, &to_path).await.map_err(|e| {
+                    StageError::internal(format!(
+                        "Unable to rename file system path {from_path} to {to_path}: {e}"
+                    ))
+                })?;
             }
             StageCaseChange::Rename => {
                 // Stage a rename operation, updating the repository to match the file system
@@ -2276,14 +2273,11 @@ pub(crate) async fn stage_node_from_metadata(
                     lore_debug!(
                         "Case rename: old path {old_path} still exists alongside {new_path}, unifying file system"
                     );
-                    operation
-                        .unify_case_rename(&old_path, &new_path)
-                        .await
-                        .map_err(|e| {
-                            StageError::internal(format!(
-                                "Unable to rename file system path {old_path} to {new_path}: {e}"
-                            ))
-                        })?;
+                    operation.rename(&old_path, &new_path).await.map_err(|e| {
+                        StageError::internal(format!(
+                            "Unable to rename file system path {old_path} to {new_path}: {e}"
+                        ))
+                    })?;
                 }
 
                 // Set updated node name

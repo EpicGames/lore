@@ -547,9 +547,17 @@ pub trait InstanceOperation: Send + Sync {
     /// Create an empty file.
     fn create_file(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
-    /// Changes the casing of a file from `from` to `to` based on various OS and command argument
-    /// settings. `to` must be identical to `from` other than case differences.
-    fn unify_case_rename(
+    /// Moves what the file system holds at `from` to `to`, unifying the two where `to` is
+    /// occupied rather than refusing: a file takes the place of the file there, and a directory
+    /// hands each of its children over under these same rules before it goes.
+    ///
+    /// A `from` and `to` of different kinds, one a file and one a directory, is refused, there
+    /// being no move that leaves one of them.
+    ///
+    /// A case change is a move like any other, `from` and `to` differing only in spelling. It is
+    /// what the unification is for: a file system holding both spellings side by side leaves two
+    /// entries to merge rather than one to rename.
+    fn rename(
         &self,
         from: &RelativePath,
         to: &RelativePath,
@@ -824,17 +832,13 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn unify_case_rename(
-        &self,
-        from: &RelativePath,
-        to: &RelativePath,
-    ) -> Result<(), FsError> {
+    async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
         self.record_change();
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => this.unify_case_rename(from, to).await,
-            StaticDispatchInstanceOperation::Swfs(this) => this.unify_case_rename(from, to).await,
+            StaticDispatchInstanceOperation::Os(this) => this.rename(from, to).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.rename(from, to).await,
         }
     }
 
@@ -1202,11 +1206,7 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn unify_case_rename(
-            &self,
-            _from: &RelativePath,
-            _to: &RelativePath,
-        ) -> Result<(), FsError> {
+        async fn rename(&self, _from: &RelativePath, _to: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 

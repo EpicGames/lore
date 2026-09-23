@@ -1967,7 +1967,7 @@ async fn reset_file_realize(
                 .send();
 
                 operation
-                    .unify_case_rename(&relative_path, &to_path)
+                    .rename(&relative_path, &to_path)
                     .await
                     .forward::<ResetError>("Failed renaming file")?;
             } else {
