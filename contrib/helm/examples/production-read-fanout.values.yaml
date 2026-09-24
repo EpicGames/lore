@@ -1,0 +1,75 @@
+# Example: LARGE local-disk deployment tuned for high clone/pull throughput.
+#
+# Architecture: one durable data pod + a big caching handler tier, with the public
+# Service fanning client traffic ACROSS the handlers (servePublic=true) so reads
+# scale horizontally over the cache tier. Handlers sit on fast node-local NVMe and
+# are spread across nodes; the data pod holds the authoritative store on durable disk.
+#
+# IMPORTANT caveat: servePublic=true sends clients to handler pods, which serve
+# content clone/pull from their local cache. A handler CANNOT serve `repository list`
+# / `branch list` from its remote mutable store today — run those management
+# operations against the data pod directly, or keep servePublic=false until the
+# server supports remote list. Choose this profile when clone/pull throughput is the
+# priority and you accept that trade-off.
+
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+topology:
+  mode: tiered
+
+handler:
+  replicas: 8
+  servePublic: true            # fan client reads across the handler cache tier
+  persistence:
+    type: hostPath             # fast node-local NVMe for the cache
+    hostPath:
+      path: /mnt/nvme/lore-handler
+      type: DirectoryOrCreate
+
+data:
+  persistence:
+    type: pvc                  # authoritative store stays on durable, high-IOPS disk
+    size: 4Ti
+    storageClass: io2
+
+# Production compute — size to your workload.
+resources:
+  requests: { cpu: "8", memory: 32Gi }
+  limits:   { cpu: "8", memory: 32Gi }
+
+# Pin to NVMe-equipped nodes and spread pods across hosts for availability.
+nodeSelector:
+  lore.epicgames.com/local-nvme: "true"
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: lore
+
+# Stable, verified public endpoint.
+service:
+  type: LoadBalancer
+  # A LoadBalancer must carry UDP (QUIC 41337) as well as TCP 41337/41339, or
+  # clone/push break. These annotations provision an AWS NLB with a combined
+  # TCP+UDP listener — adapt for your cloud/LB. A default (often TCP-only) LB
+  # will not work.
+  loadBalancerClass: service.k8s.aws/nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: "true"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+
+tls:
+  mode: certManager   # requires cert-manager installed in the cluster
+  issuerName: <your-ca-clusterissuer>
+  extraSANs: ["lore.example.com"]
+
+auth:
+  enabled: true
+  jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
+  audience: ["lore"]

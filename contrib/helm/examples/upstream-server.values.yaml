@@ -1,0 +1,42 @@
+# Example: run a local caching handler tier in front of an EXTERNAL upstream lore
+# server (instead of this release's own data pod).
+#
+# Use this to stand up a fast local edge/cache near clients while the authoritative
+# store lives elsewhere — another cluster, region, or a central deployment. The
+# handlers serve cached content locally and forward durable/mutable operations to
+# the upstream URL.
+#
+# Deploy: helm install lore-edge . -f examples/upstream-server.values.yaml
+
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+topology:
+  mode: tiered
+
+handler:
+  replicas: 3
+  # Point the cache tier at the central/authoritative lore server. When set, the
+  # handlers forward to this URL instead of this release's data pod.
+  upstreamURL: "lore://lore.central.example.com:41337"
+  # With upstreamURL set, the public Service routes to the handlers only. Clients
+  # cannot get `repository list` / `branch list` from a handler's remote mutable
+  # store, so run management operations against the upstream server directly.
+  persistence:
+    # Cache tier — use the fastest local storage class available.
+    size: 500Gi
+    storageClass: ""   # set to a fast local/NVMe class if your cluster has one
+
+# The data pod still deploys (it is always part of tiered mode) but is unused when
+# handlers target an external upstream. Keep its footprint small here.
+data:
+  persistence:
+    enabled: true
+    size: 10Gi
+
+service:
+  type: LoadBalancer
+
+tls:
+  mode: certManager   # requires cert-manager installed in the cluster

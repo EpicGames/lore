@@ -1,0 +1,31 @@
+# Cross-cluster replication on port 41340 (mutual TLS). Data tier only.
+# Provide a Secret with tls.crt / tls.key / ca.crt, and list the peer endpoints.
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+replication:
+  enabled: true
+  tls:
+    secretName: lore-replication-tls   # keys: tls.crt, tls.key, ca.crt
+  # Publish 41340 on a routable address. Without this the port lives only on the
+  # headless Service, which has no external address, so peers in other clusters
+  # cannot reach it.
+  service:
+    enabled: true
+    type: LoadBalancer
+    # An AWS NLB must serve TCP and UDP on the same port number.
+    loadBalancerClass: service.k8s.aws/nlb
+    annotations:
+      service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+      service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: "true"
+    # Replication grants blanket access to every storage partition — keep this
+    # reachable only from your peer networks.
+    loadBalancerSourceRanges:
+      - 10.0.0.0/8
+  topology:
+    provider: fixed
+    fixed:
+      # Point at the OTHER clusters' replication Service addresses.
+      peers:
+        - { address: lore-replication.dc2.example, port: 41340, locality: OtherRegion }

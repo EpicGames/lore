@@ -1,0 +1,52 @@
+# Example: tiered lore server (default topology) with LOCAL filesystem storage.
+# One durable data pod plus a 2-replica caching handler tier, all on PVCs.
+# Deploy: helm install lore . -f examples/local-storage.values.yaml
+
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+# tiered is the chart default; shown here for clarity.
+topology:
+  mode: tiered
+
+# Data pod durable store on a PVC. Both immutable (fragments) and mutable (branch
+# pointers) stores live here; the lock store is in-memory. Grow as repo data grows.
+#
+# Production sizing: lore needs low-latency, high-throughput disk. This example
+# overrides the data PVC with an io2-backed StorageClass — create one referencing
+# EBS io2 with provisioned IOPS. io2/NVMe are AWS-specific overrides; the chart
+# default uses the cluster default storageClass (no AWS assumption). Direct-attached
+# NVMe instance storage is recommended over EBS whenever possible.
+data:
+  persistence:
+    enabled: true
+    size: 3Ti
+    storageClass: io2
+
+# Handler cache tier uses chart defaults (cluster default storageClass).
+# handler:
+#   replicas: 2
+#   persistence:
+#     size: 100Gi
+
+# LoadBalancer is required for QUIC/UDP clone (Ingress cannot carry UDP).
+service:
+  type: LoadBalancer
+  # A LoadBalancer must carry UDP (QUIC 41337) as well as TCP 41337/41339, or
+  # clone/push break. These annotations provision an AWS NLB with a combined
+  # TCP+UDP listener — adapt for your cloud/LB. A default (often TCP-only) LB
+  # will not work.
+  loadBalancerClass: service.k8s.aws/nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: "true"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+
+# cert-manager issues a stable self-signed cert. Clients clone with lore:// (skip
+# verify); add tls.extraSANs + use lores:// for verified TLS.
+tls:
+  mode: certManager   # requires cert-manager installed in the cluster
+
+# Open server (no auth). Set enabled: true + jwksEndpoint to require JWT.
+auth:
+  enabled: false

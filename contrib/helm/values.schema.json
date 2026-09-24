@@ -1,0 +1,611 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "lore Helm chart values",
+  "description": "Configuration for the loreserver (Lore revision control server) Helm chart.",
+  "type": "object",
+  "required": ["image", "service", "tls", "topology", "data", "handler"],
+  "properties": {
+    "topology": {
+      "type": "object",
+      "description": "How the deployment is structured.",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["tiered", "single"],
+          "description": "tiered (default): one durable DATA pod plus a caching HANDLER tier. single: one self-contained data pod, no handlers (use for a one-node install or a remote backend like S3 + DynamoDB)."
+        }
+      }
+    },
+    "data": {
+      "type": "object",
+      "description": "The authoritative durable store (Pod C).",
+      "required": ["persistence"],
+      "properties": {
+        "persistence": {
+          "type": "object",
+          "description": "How /data (the immutable + mutable store) is backed for the data tier.",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["pvc", "hostPath", "emptyDir"],
+              "description": "Volume source for /data. pvc (default): a durable PersistentVolumeClaim — RECOMMENDED for the authoritative store. hostPath: a directory on the node's disk (node-local NVMe); WARNING: does not follow a rescheduled pod, risking loss of the authoritative store. emptyDir: ephemeral, lost on restart (throwaway/testing, or when the real store is an external backend)."
+            },
+            "enabled": {
+              "type": "boolean",
+              "description": "Legacy flag. false is equivalent to type=emptyDir (kept for backward compatibility; prefer setting type)."
+            },
+            "size": {
+              "type": "string",
+              "description": "PVC size (a Kubernetes quantity, e.g. 500Gi). type=pvc only. A real server's local store will likely need much more."
+            },
+            "storageClass": {
+              "type": "string",
+              "description": "StorageClass for the PVC (type=pvc). Empty string uses the cluster default (no AWS assumption); point at a local-volume class for node-local NVMe."
+            },
+            "accessMode": {
+              "type": "string",
+              "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany", "ReadWriteOncePod"],
+              "description": "PVC access mode (type=pvc). Each pod gets its own volume, so ReadWriteOnce is correct."
+            },
+            "hostPath": {
+              "type": "object",
+              "description": "Host directory for /data when type=hostPath. Pin the pod to nodes that have this path via nodeSelector/affinity.",
+              "properties": {
+                "path": { "type": "string", "description": "Absolute directory on the node (e.g. a mounted NVMe path)." },
+                "type": { "type": "string", "description": "Kubernetes HostPathType, e.g. DirectoryOrCreate, Directory." }
+              }
+            },
+            "emptyDir": {
+              "type": "object",
+              "description": "emptyDir options when type=emptyDir.",
+              "properties": {
+                "medium": { "type": "string", "description": "\"\" (node disk) or \"Memory\" (tmpfs)." },
+                "sizeLimit": { "type": "string", "description": "Optional size limit (e.g. 200Gi); \"\" = none." }
+              }
+            }
+          }
+        },
+        "store": {
+          "$ref": "#/definitions/storeGc",
+          "description": "Garbage collection for the authoritative local store at /data. OFF by default, and off means unbounded growth until the volume no longer fits the store. Enabling it on this tier deletes content no other pod holds — only do so when the store is deliberately a cache."
+        }
+      }
+    },
+    "handler": {
+      "type": "object",
+      "description": "The caching replica tier (Pods A/B). Only used when topology.mode=tiered.",
+      "required": ["replicas", "persistence"],
+      "properties": {
+        "replicas": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of handler (caching) pods."
+        },
+        "servePublic": {
+          "type": "boolean",
+          "description": "When false (default), the public Service routes only to the data pod. Set true to add handlers to the public rotation for read fan-out (only safe once the server can serve list from a remote store)."
+        },
+        "upstreamURL": {
+          "type": "string",
+          "description": "lore:// URL the handlers use for the durable/mutable store. Empty (default) auto-targets this release's data pod. Set to front an external/upstream lore server; the public Service then routes to the handlers only and servePublic is ignored."
+        },
+        "persistence": {
+          "type": "object",
+          "description": "How the handler cache at /data is backed (one per handler pod).",
+          "properties": {
+            "type": {
+              "type": "string",
+              "enum": ["pvc", "hostPath", "emptyDir"],
+              "description": "Volume source for the cache. pvc (default): a PVC per pod. hostPath: a directory on the node's disk — ideal for direct-attached local NVMe since the cache is disposable; pin pods to NVMe nodes via nodeSelector/affinity. emptyDir: node-local scratch, cleared on restart."
+            },
+            "size": {
+              "type": "string",
+              "description": "Cache PVC size (a Kubernetes quantity, e.g. 500Gi). type=pvc only. Handler disk serves hot IO; prefer a fast/local class."
+            },
+            "storageClass": {
+              "type": "string",
+              "description": "StorageClass for the cache PVC (type=pvc). Empty string uses the cluster default; point at a local-volume class for node-local NVMe."
+            },
+            "accessMode": {
+              "type": "string",
+              "enum": ["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany", "ReadWriteOncePod"],
+              "description": "Cache PVC access mode (type=pvc). Each pod gets its own volume, so ReadWriteOnce is correct."
+            },
+            "hostPath": {
+              "type": "object",
+              "description": "Host directory for the cache when type=hostPath.",
+              "properties": {
+                "path": { "type": "string", "description": "Absolute directory on the node (e.g. a mounted NVMe path)." },
+                "type": { "type": "string", "description": "Kubernetes HostPathType, e.g. DirectoryOrCreate." }
+              }
+            },
+            "emptyDir": {
+              "type": "object",
+              "description": "emptyDir options when type=emptyDir.",
+              "properties": {
+                "medium": { "type": "string", "description": "\"\" (node disk) or \"Memory\" (tmpfs)." },
+                "sizeLimit": { "type": "string", "description": "Optional size limit; \"\" = none." }
+              }
+            }
+          }
+        },
+        "store": {
+          "$ref": "#/definitions/storeGc",
+          "description": "Garbage collection for this tier's local cache at /data. OFF by default. Safe to enable: an evicted fragment is re-fetched from the durable store on the data pod rather than lost."
+        }
+      }
+    },
+    "nameOverride": {
+      "type": "string",
+      "description": "Override the chart name used in object names and labels."
+    },
+    "fullnameOverride": {
+      "type": "string",
+      "description": "Override the full name of the objects the chart creates, including the Service — and so the in-cluster DNS name clients dial. Otherwise derived from the release name."
+    },
+    "image": {
+      "description": "The loreserver container image. Preferred form is an object with repository (required) plus tag or digest; a bare string (repository:tag, or with a @sha256 digest) is still accepted for compatibility. An empty tag falls back to the chart's appVersion, and digest takes precedence over tag.",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        {
+          "type": "object",
+          "required": ["repository"],
+          "properties": {
+            "repository": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Image repository, e.g. ghcr.io/epicgames/lore/loreserver."
+            },
+            "tag": {
+              "type": "string",
+              "description": "Image tag. Empty = the chart's appVersion."
+            },
+            "digest": {
+              "type": "string",
+              "description": "Image digest, e.g. sha256:... . Wins over tag when set."
+            }
+          }
+        }
+      ]
+    },
+    "imagePullPolicy": {
+      "type": "string",
+      "enum": ["Always", "IfNotPresent", "Never"],
+      "description": "Image pull policy for the loreserver container."
+    },
+    "imagePullSecrets": {
+      "type": "array",
+      "description": "References to Secrets used to pull the image from a private registry.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "Name of an existing image pull Secret." }
+        }
+      }
+    },
+    "extraEnv": {
+      "type": "array",
+      "description": "Additional environment variables for the loreserver container (both tiers). Standard Kubernetes EnvVar objects (name + value or valueFrom).",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "envFrom": {
+      "type": "array",
+      "description": "Populate environment from ConfigMaps/Secrets (standard Kubernetes envFrom entries: configMapRef / secretRef).",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "service": {
+      "type": "object",
+      "description": "How loreserver is exposed.",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["LoadBalancer", "ClusterIP", "NodePort"],
+          "description": "Service type. Default NodePort (works on any cluster with no cloud LB; QUIC/UDP is exposed on a node port). LoadBalancer gives a stable external address (needs a UDP-capable LB). ClusterIP is in-cluster only."
+        },
+        "nodePorts": {
+          "type": "object",
+          "description": "Optional pinned NodePorts (30000-32767) when type=NodePort. Empty string lets Kubernetes assign them.",
+          "properties": {
+            "quic": { "type": ["string", "integer"], "description": "UDP/QUIC node port (client data path)." },
+            "grpc": { "type": ["string", "integer"], "description": "TCP/gRPC node port." },
+            "http": { "type": ["string", "integer"], "description": "TCP/HTTP node port (/health_check)." }
+          }
+        },
+        "loadBalancerClass": {
+          "type": "string",
+          "description": "Optional loadBalancerClass, e.g. service.k8s.aws/nlb to force an AWS NLB (needed for UDP/QUIC)."
+        },
+        "tags": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Supplemental key/value tags applied to the AWS load balancer via the aws-load-balancer-additional-resource-tags annotation, e.g. ownership or cost-allocation tags your organisation requires."
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra annotations for the LoadBalancer Service (e.g. NLB scheme, target type, health-check settings)."
+        },
+        "quicPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "UDP/QUIC port — the client data path (clone/push/pull)."
+        },
+        "grpcPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "TCP/gRPC port — admin and revision API. Shares the port number with QUIC on a different protocol."
+        },
+        "httpPort": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "TCP/HTTP port — /health_check and presigned URLs."
+        },
+        "externalTrafficPolicy": {
+          "type": "string",
+          "enum": ["Local", "Cluster"],
+          "description": "Service externalTrafficPolicy. Applied to LoadBalancer/NodePort services."
+        }
+      }
+    },
+    "tls": {
+      "type": "object",
+      "description": "TLS/SSL for the server's QUIC endpoint. QUIC always encrypts — there is no plaintext mode — so transport is TLS-encrypted in every mode. 'mode' controls where the certificate comes from and therefore whether clients can verify it (lores://) or must skip verification (lore://).",
+      "required": ["mode"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["ephemeral", "certManager", "secret", "selfSigned"],
+          "description": "Certificate source (enumerated):\n- ephemeral (default): the SERVER generates a self-signed cert at startup. No cert-manager, no Secret, nothing mounted. Untrusted and regenerated on every restart — clients use lore:// (skip verify). Best for trials / dev.\n- selfSigned: the CHART generates a stable self-signed cert (sprig) stored in a Secret and preserved across upgrades. No cert-manager. Still untrusted by clients (lore://) unless they trust it out of band.\n- certManager: cert-manager issues the cert (the ONLY mode that requires cert-manager installed). With a real CA Issuer (tls.issuerName) and tls.extraSANs, clients can use the verifying lores:// scheme.\n- secret: bring your own existing TLS Secret (tls.existingSecret). Use lores:// if the cert is trusted and its SANs match the address."
+        },
+        "grpcTls": { "type": "boolean", "description": "Also serve gRPC (TCP 41337) over TLS with the same cert. Required for the lores:// scheme; makes the gRPC listener TLS-only so plaintext lore:// clients stop working. Cannot be used with tls.mode=ephemeral; the install fails if you try." },
+        "extraSANs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Extra Subject Alternative Names (external IP / DNS) baked into a chart-managed cert (selfSigned/certManager) so clients can verify with lores://. IPv4 literals are added as IP SANs; everything else as DNS SANs. Ignored in ephemeral mode."
+        },
+        "existingSecret": {
+          "type": "string",
+          "description": "Name of an existing kubernetes.io/tls Secret to mount. Used (and required) only when mode=secret."
+        },
+        "certKey": {
+          "type": "string",
+          "description": "Key within the TLS Secret holding the certificate (default tls.crt). Applies to mode=secret; also the key name the chart writes for selfSigned/certManager."
+        },
+        "keyKey": {
+          "type": "string",
+          "description": "Key within the TLS Secret holding the private key (default tls.key). Applies to mode=secret; also the key name the chart writes for selfSigned/certManager."
+        },
+        "issuerName": {
+          "type": "string",
+          "description": "cert-manager Issuer/ClusterIssuer name (mode=certManager). Empty string makes the chart create a self-signed Issuer (produces an untrusted cert — still lore://). Point it at a real CA Issuer to get a trusted cert usable with lores://."
+        },
+        "duration": {
+          "type": "string",
+          "description": "Validity duration for a chart-managed certificate, a Go duration (e.g. 87600h = 10 years). Applies to selfSigned/certManager; ignored for ephemeral (server-controlled) and secret (external)."
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "description": "Client authentication. Lore is not an identity provider: when enabled it validates bearer JWTs against an external IdP's JWKS endpoint and authorizes per repository from the token's resource claims. Disabled by default, which leaves the server open.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable JWT authentication. When false the server runs open — any client that can reach it can read and write every repository."
+        },
+        "jwksEndpoint": {
+          "type": "string",
+          "description": "URL of the IdP's JWKS (public signing keys). Required when enabled=true. Maps to [server.auth.jwk].endpoint."
+        },
+        "issuer": {
+          "type": "string",
+          "description": "Optional. If set, the JWT 'iss' claim must equal this. Maps to server.auth.jwt_issuer."
+        },
+        "audience": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Optional. If non-empty, the JWT 'aud' claim must contain one of these. Maps to server.auth.jwt_audience."
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "description": "Compute requests and limits for the loreserver container. Starter defaults — increase substantially for production.",
+      "properties": {
+        "requests": {
+          "type": "object",
+          "description": "Minimum guaranteed compute resources.",
+          "properties": {
+            "cpu": { "type": ["string", "number"], "description": "CPU request (e.g. \"2\")." },
+            "memory": { "type": "string", "description": "Memory request (e.g. 8Gi)." }
+          }
+        },
+        "limits": {
+          "type": "object",
+          "description": "Maximum compute resources.",
+          "properties": {
+            "cpu": { "type": ["string", "number"], "description": "CPU limit (e.g. \"2\")." },
+            "memory": { "type": "string", "description": "Memory limit (e.g. 8Gi)." }
+          }
+        }
+      }
+    },
+    "persistentVolumeClaimRetentionPolicy": {
+      "type": "object",
+      "description": "Optional StatefulSet PVC retention policy. Empty object leaves the cluster default (Retain).",
+      "properties": {
+        "whenDeleted": {
+          "type": "string",
+          "enum": ["Retain", "Delete"],
+          "description": "What happens to PVCs when the StatefulSet is deleted."
+        },
+        "whenScaled": {
+          "type": "string",
+          "enum": ["Retain", "Delete"],
+          "description": "What happens to PVCs when the StatefulSet is scaled down."
+        }
+      }
+    },
+    "podSecurityContext": {
+      "type": "object",
+      "description": "Pod-level security context (runAsNonRoot, fsGroup, seccompProfile, etc.). Applied to the StatefulSet pod template.",
+      "additionalProperties": true
+    },
+    "securityContext": {
+      "type": "object",
+      "description": "Container-level security context (allowPrivilegeEscalation, readOnlyRootFilesystem, dropped capabilities, etc.).",
+      "additionalProperties": true
+    },
+    "serviceAccount": {
+      "type": "object",
+      "description": "ServiceAccount used by the pod.",
+      "properties": {
+        "create": {
+          "type": "boolean",
+          "description": "Create a ServiceAccount. When false, an existing one named by 'name' (or 'default') is used."
+        },
+        "automountToken": {
+          "type": "boolean",
+          "description": "Mount the ServiceAccount token into the pods. Default false; loreserver does not call the Kubernetes API. EKS IRSA still works. Set true only if something you add to the pod needs API access."
+        },
+        "name": {
+          "type": "string",
+          "description": "ServiceAccount name. Empty string defaults to the chart fullname (when create=true) or 'default'."
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Annotations added to the ServiceAccount (e.g. IRSA role ARN)."
+        }
+      }
+    },
+    "podAnnotations": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Extra annotations added to the pod template."
+    },
+    "nodeSelector": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Node selector constraining pod scheduling (e.g. kubernetes.io/arch: arm64)."
+    },
+    "tolerations": {
+      "type": "array",
+      "description": "Pod tolerations for tainted nodes.",
+      "items": { "type": "object", "additionalProperties": true }
+    },
+    "affinity": {
+      "type": "object",
+      "description": "Pod affinity/anti-affinity rules.",
+      "additionalProperties": true
+    },
+    "priorityClassName": {
+      "type": "string",
+      "description": "PriorityClass for the pods. Empty = cluster default. Must already exist in the cluster."
+    },
+    "startupProbe": {
+      "type": "object",
+      "description": "Startup probe (HTTP GET /health_check). Allows the server time to start before liveness/readiness apply.",
+      "properties": {
+        "failureThreshold": { "type": "integer", "minimum": 1, "description": "Consecutive failures allowed during startup before the pod is killed." },
+        "periodSeconds": { "type": "integer", "minimum": 1, "description": "Seconds between startup probe attempts." }
+      }
+    },
+    "livenessProbe": {
+      "type": "object",
+      "description": "Liveness probe (HTTP GET /health_check). Restarts the pod when it fails repeatedly.",
+      "properties": {
+        "failureThreshold": { "type": "integer", "minimum": 1, "description": "Consecutive failures before the pod is restarted." },
+        "periodSeconds": { "type": "integer", "minimum": 1, "description": "Seconds between liveness probe attempts." },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "description": "Probe timeout in seconds." }
+      }
+    },
+    "readinessProbe": {
+      "type": "object",
+      "description": "Readiness probe (HTTP GET /health_check). Removes the pod from Service endpoints when unhealthy.",
+      "properties": {
+        "failureThreshold": { "type": "integer", "minimum": 1, "description": "Consecutive failures before the pod is marked not ready." },
+        "periodSeconds": { "type": "integer", "minimum": 1, "description": "Seconds between readiness probe attempts." },
+        "timeoutSeconds": { "type": "integer", "minimum": 1, "description": "Probe timeout in seconds." }
+      }
+    },
+    "terminationGracePeriodSeconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Seconds the kubelet waits after SIGTERM before SIGKILL. Must cover the preStop hook plus the server's own shutdown."
+    },
+    "lifecycle": {
+      "type": "object",
+      "description": "Container lifecycle hooks (a standard Kubernetes Lifecycle object). Defaults to a preStop sleep so Service endpoint removal lands before shutdown starts. Set to null to remove it; {} does not work, because Helm coalesces an empty map against the default.",
+      "additionalProperties": true
+    },
+    "replication": {
+      "type": "object",
+      "description": "Internal server-to-server replication endpoints (port 41340: quic_internal UDP + grpc_internal TCP) for cross-cluster peers/read replicas. Off by default; requires mutual TLS and loreserver >= v0.8.4. Only the data tier runs these.",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Expose and configure the 41340 replication endpoints." },
+        "port": { "type": "integer", "description": "Replication port (default 41340)." },
+        "verifyClientCerts": { "type": "boolean", "description": "Require mutual TLS. When true, a full cert chain (tls.secretName) is required or the endpoint won't start." },
+        "service": {
+          "type": "object",
+          "description": "Dedicated Service publishing port 41340 (quic_internal UDP + replication gRPC/TCP) on a routable address so peers in OTHER clusters can reach it. The headless Service has no external address. Off by default; requires replication.enabled.",
+          "properties": {
+            "enabled": { "type": "boolean", "description": "Render the replication Service." },
+            "type": { "type": "string", "enum": ["LoadBalancer", "NodePort", "ClusterIP"], "description": "Service type for the replication endpoint." },
+            "annotations": {
+              "type": "object",
+              "additionalProperties": { "type": "string" },
+              "description": "Annotations on the replication Service (e.g. an internal-only LB scheme)."
+            },
+            "loadBalancerClass": { "type": "string", "description": "loadBalancerClass when type=LoadBalancer; must carry TCP+UDP on one port." },
+            "loadBalancerSourceRanges": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "CIDRs allowed to reach 41340. Empty = unrestricted."
+            },
+            "externalTrafficPolicy": { "type": "string", "enum": ["Cluster", "Local"], "description": "externalTrafficPolicy for LoadBalancer/NodePort." },
+            "nodePorts": {
+              "type": "object",
+              "description": "Pinned NodePorts when type=NodePort (30000-32767); empty = auto-assign.",
+              "properties": {
+                "quic": { "type": ["string", "integer"], "description": "UDP NodePort for quic_internal." },
+                "grpc": { "type": ["string", "integer"], "description": "TCP NodePort for replication gRPC." }
+              }
+            }
+          }
+        },
+        "tls": {
+          "type": "object",
+          "description": "Secret holding the replication server cert, key, and CA chain (mounted at /etc/lore/replication-tls).",
+          "properties": {
+            "secretName": { "type": "string", "description": "Secret name (empty = no cert mounted)." },
+            "certKey": { "type": "string", "description": "Secret key for the server cert." },
+            "keyKey": { "type": "string", "description": "Secret key for the private key." },
+            "caKey": { "type": "string", "description": "Secret key for the CA chain (cert_chain)." }
+          }
+        },
+        "topology": {
+          "type": "object",
+          "description": "Peer discovery for replication.",
+          "properties": {
+            "provider": { "type": "string", "enum": ["none", "fixed", "consul"], "description": "none (single-node), fixed (static peer list), or consul (needs the consul plugin in the image)." },
+            "fixed": {
+              "type": "object",
+              "properties": {
+                "peers": {
+                  "type": "array",
+                  "description": "Static peers. Each: { address, port, locality: SameRegion|OtherRegion }.",
+                  "items": { "type": "object", "additionalProperties": true }
+                }
+              }
+            },
+            "consul": { "type": "object", "additionalProperties": true, "description": "[plugins.consul] key/values." }
+          }
+        }
+      }
+    },
+    "presignedUrl": {
+      "type": "object",
+      "description": "Presigned-URL feature on the HTTP endpoint. Off by default. The HMAC key is a Secret injected as an env var (LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY), never written to the ConfigMap.",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "Emit the presigned-URL TTL settings and wire the HMAC key env." },
+        "hmacKeySecret": {
+          "type": "object",
+          "description": "Secret reference for the hex HMAC key (>= 32 bytes; openssl rand -hex 32).",
+          "properties": {
+            "name": { "type": "string", "description": "Secret name." },
+            "key": { "type": "string", "description": "Key within the Secret." }
+          }
+        },
+        "minTtlSeconds": { "type": "integer", "description": "Minimum presigned-URL lifetime." },
+        "defaultTtlSeconds": { "type": "integer", "description": "Default presigned-URL lifetime." },
+        "maxTtlSeconds": { "type": "integer", "description": "Maximum presigned-URL lifetime." }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "description": "Observability. Lore exports over OTLP/gRPC (no Prometheus scrape endpoint). Export is enabled only when telemetry.exporter.endpoint is set.",
+      "properties": {
+        "exporter": {
+          "type": "object",
+          "description": "OTLP exporter. When endpoint is set, all three fields are emitted (they have no server-side individual defaults).",
+          "properties": {
+            "endpoint": { "type": "string", "description": "OTLP collector endpoint (e.g. http://otel-collector.observability.svc.cluster.local:4317). Empty = no export." },
+            "queueSize": { "type": "integer", "description": "Export queue size." },
+            "timeoutMs": { "type": "integer", "description": "Export timeout in milliseconds." }
+          }
+        },
+        "logger": {
+          "type": "object",
+          "properties": {
+            "enableOtlp": { "type": "boolean", "description": "Forward logs over OTLP (only when exporter.endpoint is set)." },
+            "format": { "type": "string", "enum": ["ansi", "json", "text"], "description": "Log format." },
+            "output": { "type": "string", "description": "Log output: stdout or stderr (file output via config.extra)." }
+          }
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "exportIntervalMillis": { "type": "integer", "description": "Metric export interval (ms)." },
+            "sampleIntervalMillis": { "type": "integer", "description": "Metric sample interval (ms)." }
+          }
+        },
+        "traces": {
+          "type": "object",
+          "properties": {
+            "sampleRate": { "type": "number", "minimum": 0, "maximum": 1, "description": "Trace sample rate [0,1]." },
+            "sampleRateLowTier": { "type": "number", "minimum": 0, "maximum": 1, "description": "Low-tier trace sample rate [0,1]." },
+            "serviceName": { "type": "string", "description": "Optional service name in traces." }
+          }
+        },
+        "additionalLabels": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Extra key/value labels on all exported telemetry."
+        }
+      }
+    },
+    "config": {
+      "type": "object",
+      "description": "Server configuration escape hatch.",
+      "properties": {
+        "extra": {
+          "type": "string",
+          "description": "Raw TOML appended to the server's local.toml as a last config layer. It can only open NEW tables: it is emitted after every table the chart writes, so repeating one of those headers here is a TOML duplicate-key error rather than an extension of it. Store caps in particular must go through data.store / handler.store."
+        }
+      }
+    }
+  },
+  "definitions": {
+    "storeGc": {
+      "type": "object",
+      "description": "Caps that drive the local immutable store's background compactor and evictor. Every field defaults to off, and the server reads an absent cap as 0, which disables the corresponding task entirely.",
+      "properties": {
+        "maxSize": {
+          "type": ["string", "integer"],
+          "description": "Total payload bytes above which the compactor drops least-recently-accessed payloads (down to 70% of this) and reclaims their pack files. Accepts a Kubernetes quantity such as \"200Gi\" or a plain byte count; fractional quantities like 1.5Gi are rejected. \"\" disables it. This is the knob that bounds disk usage."
+        },
+        "maxCapacity": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cap on the number of stored fragments, enforced by the evictor (oldest access first). The server floors this at 1048576, so smaller non-zero values have no effect. 0 disables it."
+        },
+        "compactionDelaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Interval between compactor passes over maxSize. 0 leaves the server's own default of 86400 (once a day), which is far too slow for a store that fills in hours — set this whenever maxSize is set."
+        },
+        "evictionDelaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Interval between evictor passes over maxCapacity. 0 leaves the server's default of 10 seconds."
+        }
+      }
+    }
+  }
+}

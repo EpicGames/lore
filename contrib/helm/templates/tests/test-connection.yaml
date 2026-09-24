@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "lore.fullname" . }}-test-connection
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": test
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  # Pod Security `restricted` rejects a pod that leaves any of these unset.
+  #
+  # runAsUser is not optional: this image declares `USER curl_user`, a name rather
+  # than a UID, which the kubelet cannot resolve to decide whether it is root, so
+  # runAsNonRoot alone fails every start with "image has non-numeric user
+  # (curl_user), cannot verify user is non-root". 100 is curl_user's UID here.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 100
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: curl
+      image: curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      command:
+        - sh
+        - -c
+        - |
+          # set -e, or a failed curl still exits 0 and the test passes.
+          set -e
+          curl -sf http://{{ include "lore.fullname" . }}:{{ .Values.service.httpPort }}/health_check
+          {{- if eq .Values.topology.mode "tiered" }}
+          {{- $handlerFullname := include "lore.handlerFullname" . }}
+          # Port 41339 is the container port. A headless Service does not remap ports.
+          curl -sf http://{{ $handlerFullname }}-0.{{ $handlerFullname }}-headless.{{ .Release.Namespace }}.svc.cluster.local:41339/health_check
+          {{- end }}
+          echo "Health check passed"

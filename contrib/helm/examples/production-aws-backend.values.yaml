@@ -1,0 +1,86 @@
+# Example: PRODUCTION deployment on the AWS S3 + DynamoDB backend.
+#
+# Architecture: the store is EXTERNAL and redundant — content in S3 (multi-AZ),
+# metadata/locks in DynamoDB — so the server pod is stateless. Use this when you
+# want durable, redundant storage instead of a single local disk.
+#
+# Prerequisites (see examples/aws-s3-dynamodb.values.yaml for backend detail):
+#   - an IRSA role granting S3 + DynamoDB access (serviceAccount.annotations below)
+#   - the S3 bucket and DynamoDB tables provisioned out of band, with the key
+#     schemas and indexes in contrib/aws/storage.tf
+#
+# NOTE: the chart runs ONE server pod (topology: single). Redundancy here is in the
+# storage layer, not the pod count — horizontal/multi-writer server scaling is a
+# lore feature not yet exposed by this chart.
+
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+topology:
+  mode: single                # external backend; no in-cluster cache tier
+
+data:
+  persistence:
+    enabled: false            # store lives in S3 + DynamoDB, not on a PVC
+
+# IRSA — the IAM role granting S3 + DynamoDB access.
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account-id>:role/lore-server
+
+# Production compute — size to your workload.
+resources:
+  requests: { cpu: "8", memory: 32Gi }
+  limits:   { cpu: "8", memory: 32Gi }
+
+# Stable, verified public endpoint.
+service:
+  type: LoadBalancer
+  # A LoadBalancer must carry UDP (QUIC 41337) as well as TCP 41337/41339, or
+  # clone/push break. Provision a UDP-capable LB (AWS NLB shown) — a default
+  # (often TCP-only) LB will not work.
+  loadBalancerClass: service.k8s.aws/nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: "true"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+  # tags: {Owner: ..., CostCenter: ...}  # if your organisation requires LB tags
+
+tls:
+  mode: certManager   # requires cert-manager installed in the cluster
+  issuerName: <your-ca-clusterissuer>    # a real CA issuer, for verified lores://
+  extraSANs: ["lore.example.com"]
+  grpcTls: true                          # lores:// needs this; clients must use lores://
+
+auth:
+  enabled: true
+  jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
+  issuer: "https://auth.example.com/"
+  audience: ["lore"]
+
+# Point every store at the AWS plugin. Adjust bucket/table names and region to your
+# resources. Each store has its own [plugins.aws.<store>] section.
+config:
+  extra: |
+    [immutable_store]
+    mode = "aws"
+    [mutable_store]
+    mode = "aws"
+    [lock_store]
+    mode = "aws"
+
+    [plugins.aws.immutable_store]
+    s3_bucket = "lore-fragments"
+    s3_region = "<region>"
+    dynamodb_fragments_table = "lore-fragments"
+    dynamodb_fragment_state_table = "lore-fragment-state"
+    dynamodb_region = "<region>"
+
+    [plugins.aws.mutable_store]
+    dynamodb_table = "lore-mutable"
+    dynamodb_region = "<region>"
+
+    [plugins.aws.lock_store]
+    dynamodb_table = "lore-locks"
+    dynamodb_region = "<region>"

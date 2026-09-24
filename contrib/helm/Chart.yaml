@@ -1,0 +1,19 @@
+apiVersion: v2
+name: lore
+description: Lore revision control server - tiered (data + caching handler) deployment
+type: application
+version: 0.3.1
+# Tracks the default image tag in values.yaml. This feeds app.kubernetes.io/version on every
+# rendered object, so "latest" here labels every deployment permanently unversioned.
+appVersion: "0.9.0"
+home: https://github.com/EpicGames/lore
+icon: https://raw.githubusercontent.com/EpicGames/lore/main/docs/assets/icons/Lore_Icon_Black_V1.svg
+sources:
+  - https://github.com/EpicGames/lore
+keywords:
+  - lore
+  - version-control
+  - scm
+maintainers:
+  - name: Lore maintainers
+    url: https://github.com/EpicGames/lore/blob/main/MAINTAINERS.md

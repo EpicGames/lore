@@ -1,0 +1,13 @@
+# Enable presigned URLs. HMAC key comes from a Secret, never the chart.
+# First: kubectl create secret generic lore-presign --from-literal=hmac=$(openssl rand -hex 32)
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+presignedUrl:
+  enabled: true
+  hmacKeySecret:
+    name: lore-presign
+    key: hmac
+  defaultTtlSeconds: 3600
+  maxTtlSeconds: 86400

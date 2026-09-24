@@ -1,0 +1,187 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lore.fullname" . }}
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+  {{- if or .Values.service.annotations .Values.service.tags }}
+  annotations:
+    {{- with .Values.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if .Values.service.tags }}
+    service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags: {{ $pairs := list }}{{- range $k, $v := .Values.service.tags }}{{ $pairs = append $pairs (printf "%s=%s" $k $v) }}{{- end }}{{ join "," $pairs | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  {{- if or (eq .Values.service.type "LoadBalancer") (eq .Values.service.type "NodePort") }}
+  externalTrafficPolicy: {{ .Values.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- if and (eq .Values.service.type "LoadBalancer") .Values.service.loadBalancerClass }}
+  loadBalancerClass: {{ .Values.service.loadBalancerClass }}
+  {{- end }}
+  selector:
+    {{- if and (eq .Values.topology.mode "tiered") .Values.handler.upstreamURL }}
+    # External upstream: the handlers front another lore server, and this release's
+    # data pod is unused, so client traffic goes to the handlers only.
+    {{- include "lore.handlerSelectorLabels" . | nindent 4 }}
+    {{- else if and (eq .Values.topology.mode "tiered") (not .Values.handler.servePublic) }}
+    # Default tiered routing: client traffic goes only to the data pod (C). It is
+    # the authoritative store and supports every operation including repository/
+    # branch `list`. A handler serves `list` from a remote mutable store, which
+    # cannot enumerate the catalog, so routing clients to a handler makes `list`
+    # fail intermittently. The headless Services below still select per-tier for
+    # in-cluster access.
+    {{- include "lore.dataSelectorLabels" . | nindent 4 }}
+    {{- else }}
+    # Public fan-out (handler.servePublic=true) or single mode: select all pods of
+    # this release by the base labels (no component), so both the data and handler
+    # tiers receive public traffic.
+    {{- include "lore.selectorLabels" . | nindent 4 }}
+    {{- end }}
+  ports:
+    - name: quic
+      port: {{ .Values.service.quicPort }}
+      targetPort: quic
+      protocol: UDP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePorts.quic }}
+      nodePort: {{ .Values.service.nodePorts.quic }}
+      {{- end }}
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePorts.grpc }}
+      nodePort: {{ .Values.service.nodePorts.grpc }}
+      {{- end }}
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePorts.http }}
+      nodePort: {{ .Values.service.nodePorts.http }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lore.fullname" . }}-headless
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Publish pod DNS before pods are Ready so a handler can resolve the data pod's
+  # address at startup (its remote mutable/durable stores point at the data pod).
+  # Without this the lookup can fail at boot with "Name or service not known".
+  publishNotReadyAddresses: true
+  selector:
+    {{- if eq .Values.topology.mode "tiered" }}
+    {{- include "lore.dataSelectorLabels" . | nindent 4 }}
+    {{- else }}
+    {{- include "lore.selectorLabels" . | nindent 4 }}
+    {{- end }}
+  ports:
+    - name: quic
+      port: {{ .Values.service.quicPort }}
+      targetPort: quic
+      protocol: UDP
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.replication.enabled }}
+    - name: repl-quic
+      port: {{ .Values.replication.port }}
+      targetPort: {{ .Values.replication.port }}
+      protocol: UDP
+    - name: repl-grpc
+      port: {{ .Values.replication.port }}
+      targetPort: {{ .Values.replication.port }}
+      protocol: TCP
+    {{- end }}
+{{- if and .Values.replication.enabled .Values.replication.service.enabled }}
+---
+# Replication Service: publishes port 41340 (quic_internal UDP + replication
+# gRPC/TCP) on a routable address so peers in OTHER clusters can reach it. The
+# headless Service above also carries 41340, but a headless Service has no
+# external address, so it only serves in-cluster peers.
+#
+# Selects the data tier only — handlers are caches and do not replicate.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lore.fullname" . }}-replication
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+  {{- with .Values.replication.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.replication.service.type }}
+  {{- if or (eq .Values.replication.service.type "LoadBalancer") (eq .Values.replication.service.type "NodePort") }}
+  externalTrafficPolicy: {{ .Values.replication.service.externalTrafficPolicy }}
+  {{- end }}
+  {{- if eq .Values.replication.service.type "LoadBalancer" }}
+  {{- with .Values.replication.service.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with .Values.replication.service.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  selector:
+    {{- if eq .Values.topology.mode "tiered" }}
+    {{- include "lore.dataSelectorLabels" . | nindent 4 }}
+    {{- else }}
+    {{- include "lore.selectorLabels" . | nindent 4 }}
+    {{- end }}
+  ports:
+    - name: repl-quic
+      port: {{ .Values.replication.port }}
+      targetPort: {{ .Values.replication.port }}
+      protocol: UDP
+      {{- if and (eq .Values.replication.service.type "NodePort") .Values.replication.service.nodePorts.quic }}
+      nodePort: {{ .Values.replication.service.nodePorts.quic }}
+      {{- end }}
+    - name: repl-grpc
+      port: {{ .Values.replication.port }}
+      targetPort: {{ .Values.replication.port }}
+      protocol: TCP
+      {{- if and (eq .Values.replication.service.type "NodePort") .Values.replication.service.nodePorts.grpc }}
+      nodePort: {{ .Values.replication.service.nodePorts.grpc }}
+      {{- end }}
+{{- end }}
+{{- if eq .Values.topology.mode "tiered" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lore.handlerFullname" . }}-headless
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "lore.handlerSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: quic
+      port: {{ .Values.service.quicPort }}
+      targetPort: quic
+      protocol: UDP
+    - name: grpc
+      port: {{ .Values.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+{{- end }}

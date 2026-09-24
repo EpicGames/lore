@@ -1,0 +1,425 @@
+# topology: how the deployment is structured.
+#
+#   tiered (default): a 3-node split. One DATA pod (Pod C) is the authoritative,
+#     durable store (local immutable + local mutable on its PVC, 1 replica). Two
+#     HANDLER pods (A/B) are caching replicas: a local immutable cache backed by a
+#     durable tier on the data pod, with their mutable store on the data pod. The
+#     public Service routes to the data pod by default (see handler.servePublic).
+#
+#   single: a single self-contained data pod and NO handler pods. Use this for a
+#     simple one-node install, or for a remote backend (e.g. AWS S3 + DynamoDB)
+#     where the store is external and the in-cluster cache tier does not apply.
+topology:
+  mode: tiered
+
+# handler: the caching replica tier (Pods A/B). Only used when topology.mode=tiered.
+handler:
+  # replicas: number of handler (caching) pods.
+  replicas: 2
+  # servePublic: when false (default), the public Service routes only to the data
+  # pod (C). The data pod is the authoritative store and supports every operation
+  # including repository/branch `list`, which a handler cannot serve from a remote
+  # mutable store. Set true to add the handler pods to the public rotation for read
+  # fan-out (only safe once the server can serve `list` from a remote store).
+  servePublic: false
+  # upstreamURL: lore:// URL the handlers use for the durable/mutable store.
+  # Empty (default) auto-targets this release's data pod (data-0 over the headless
+  # Service). Set this to front an external/upstream lore server with a local cache
+  # tier — see examples/upstream-server.values.yaml. When set, the public Service
+  # routes to the handlers only (servePublic is ignored), since the local data pod
+  # is then unused.
+  upstreamURL: ""
+  # persistence: where the handler cache at /data lives.
+  persistence:
+    # type: how /data is backed.
+    #   pvc      (default) one PersistentVolumeClaim per handler pod.
+    #   hostPath a directory on the node's own disk — use this for direct-attached
+    #            local NVMe. The pod must land on a node that has that disk; pin it
+    #            with nodeSelector/affinity below. The cache is disposable, so a
+    #            node-local volume is a good fit here (it just re-warms on a move).
+    #   emptyDir node-local scratch that lives with the pod (cleared on restart).
+    type: pvc
+    # type=pvc fields:
+    # Handler disk serves hot/temp IO and should be the fastest available. Default
+    # matches the data tier (500Gi); size to your cache working set. Lore is very
+    # IO-sensitive here — prefer a fast local/NVMe storage class.
+    size: 500Gi
+    storageClass: ""  # "" = cluster default (no AWS assumption). Point at a local-volume class for node-local NVMe.
+    accessMode: ReadWriteOnce
+    # type=hostPath fields (a raw directory on the node, e.g. a mounted NVMe):
+    hostPath:
+      path: ""   # required when type=hostPath, e.g. /mnt/nvme/lore-handler; no default
+      type: DirectoryOrCreate   # HostPathType: DirectoryOrCreate | Directory | ...
+    # type=emptyDir fields:
+    emptyDir:
+      medium: ""       # "" (node disk) or "Memory" (tmpfs)
+      sizeLimit: ""    # e.g. 200Gi; "" = no limit
+  # store: as data.store below, but safe to enable — this tier is a cache in
+  # front of the durable store, so an evicted fragment is re-fetched, not lost.
+  store:
+    maxSize: ""
+    maxCapacity: 0
+    compactionDelaySeconds: 0
+    evictionDelaySeconds: 0
+
+# data: the authoritative durable store (Pod C).
+data:
+  # persistence: where the authoritative store at /data lives.
+  persistence:
+    # type: how /data is backed.
+    #   pvc      (default) a durable PersistentVolumeClaim. RECOMMENDED for the data
+    #            tier — this is the single authoritative store, so it must survive
+    #            pod/node moves.
+    #   hostPath a directory on the node's disk. WARNING: node-local storage does
+    #            NOT follow the pod if it reschedules — using it on the data tier
+    #            risks losing the authoritative store. Only use if you pin the pod
+    #            to one node and accept that risk.
+    #   emptyDir ephemeral; data is LOST on restart. Only for throwaway/testing, or
+    #            when the real store is an external backend (S3 + DynamoDB).
+    type: pvc
+    # enabled: legacy flag. false is equivalent to type=emptyDir (kept for
+    # backward compatibility; prefer setting type).
+    enabled: true
+    # type=pvc fields:
+    # default starting size. Production deployments should set this much higher — a
+    # real lore server's local store grows large.
+    size: 500Gi
+    # Lore needs very performant disk for any production deployment. Use a storage
+    # class with low latency and high throughput (e.g. EBS io2 with provisioned
+    # IOPS). Direct-attached NVMe instance storage is recommended whenever possible.
+    storageClass: ""  # "" = cluster default (no AWS assumption)
+    accessMode: ReadWriteOnce
+    # type=hostPath fields:
+    hostPath:
+      path: ""   # required when type=hostPath, e.g. /mnt/nvme/lore-data; no default
+      type: DirectoryOrCreate
+    # type=emptyDir fields:
+    emptyDir:
+      medium: ""
+      sizeLimit: ""
+  # store: garbage collection for the local store at /data. See the README's
+  # "Bounding the store".
+  #
+  # Off means unbounded, not "use a default": the server reads an absent cap as 0
+  # and never starts the task. Off is still right for this tier, which holds the
+  # only authoritative copy — enable it only where the store is deliberately a
+  # cache, and note that aged-out content fails to read, it does not read slowly.
+  store:
+    maxSize: ""                 # payload bytes, k8s quantity ("200Gi"). Bounds disk.
+    maxCapacity: 0              # fragment count. Server floors it at 1048576.
+    compactionDelaySeconds: 0   # maxSize pass. Set whenever maxSize is; server default 86400.
+    evictionDelaySeconds: 0     # maxCapacity pass. Server default 10.
+
+# nameOverride / fullnameOverride: name the objects the chart creates. Otherwise
+# names follow the release name, collapsing the chart name only when the release
+# name already contains it (`lore` -> `lore`, `buildcache` -> `buildcache-lore`).
+# The Service name is the DNS name clients dial, so pin it when it must be fixed.
+nameOverride: ""
+fullnameOverride: ""
+
+# image: the loreserver image. Empty tag = the chart's appVersion; digest wins
+# over tag. A bare string (image: repo:tag) still works, but prefer these fields.
+#
+# The default is public (no pull secret) and linux/amd64 only, so it emulates on
+# arm64. On Graviton3+ use the -graviton tag; it SIGILLs on anything older,
+# Apple Silicon and Ampere included.
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""
+  digest: ""
+imagePullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# extraEnv: additional environment variables added to the loreserver container on
+# both tiers. Use for LORE__* config overrides (e.g. a presigned-URL HMAC key from
+# a Secret). Standard Kubernetes EnvVar entries.
+#   extraEnv:
+#     - name: LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY
+#       valueFrom: { secretKeyRef: { name: lore-presign, key: hmac } }
+extraEnv: []
+# envFrom: populate env from ConfigMaps/Secrets (standard Kubernetes envFrom entries).
+#   envFrom:
+#     - secretRef: { name: lore-extra-config }
+envFrom: []
+
+# service: how loreserver is exposed.
+#
+# type defaults to NodePort so the chart installs and is reachable on ANY cluster
+# with no cloud load balancer. QUIC is UDP; NodePort exposes it on every node at a
+# high port (see the post-install notes for the exact port + connect command).
+# Switch to LoadBalancer explicitly for a stable external address (needs a
+# UDP-capable LB, e.g. an AWS NLB via loadBalancerClass).
+service:
+  type: NodePort   # NodePort | LoadBalancer | ClusterIP
+  # nodePorts: optionally pin the assigned NodePorts (30000–32767). Leave empty to
+  # let Kubernetes assign them; the install notes print whatever is assigned.
+  nodePorts:
+    quic: ""   # UDP — the client data path (clone/push/pull)
+    grpc: ""   # TCP — admin/revision API (shares the QUIC port number)
+    http: ""   # TCP — /health_check
+  loadBalancerClass: ""  # e.g. service.k8s.aws/nlb to force an AWS NLB (type=LoadBalancer)
+  # tags: supplemental key/value tags applied to the AWS load balancer via the
+  # aws-load-balancer-additional-resource-tags annotation, e.g. ownership or
+  # cost-allocation tags your organisation requires. Provide these in a custom
+  # values file (do not hardcode here).
+  tags: {}
+  annotations: {}
+  # SERVICE-side only: the container listens where the image's default.toml says
+  # and Service ports forward by name, so these change the address clients dial,
+  # not what the server binds. Use config.extra to move the listeners.
+  #
+  # quicPort and grpcPort MUST be equal or the render fails — the server serves
+  # both on one port, so a client URL carries a single port number for both, and
+  # the AWS TCP_UDP listener annotation needs one number for both.
+  quicPort: 41337
+  grpcPort: 41337
+  httpPort: 41339
+  externalTrafficPolicy: Local
+
+# replication: the internal server-to-server replication endpoints (port 41340,
+# quic_internal UDP + grpc_internal TCP) for cross-cluster / multi-region peers
+# and read replicas. OFF by default. Both endpoints require MUTUAL TLS, so a Secret
+# with the server cert/key + CA chain must be provided; the endpoints won't start
+# with verifyClientCerts=true and no cert chain. Only the data tier runs these
+# (handlers are caches). This exposes + configures the endpoints; wiring an actual
+# peer mesh (certs + reachable peer addresses) is left to the operator.
+#
+# REQUIRES loreserver >= v0.8.4, which renamed this endpoint's config table from
+# [server.replication] to [server.grpc_internal]. On an older server the table is
+# silently ignored and the gRPC endpoint never starts (the QUIC half still comes up).
+replication:
+  enabled: false
+  port: 41340
+  verifyClientCerts: true   # mutual TLS; requires the cert chain below
+  # service: publish port 41340 on its own Service so peers OUTSIDE this cluster
+  # can reach it. Without this, 41340 is only on the headless Service, which has
+  # no external address — so cross-cluster peers cannot connect and you must
+  # provide your own plumbing. Off by default; replication.enabled must also be
+  # true. This is an INTERNAL trust boundary: the endpoint grants blanket access
+  # to every storage partition, so keep verifyClientCerts=true and restrict it to
+  # peer networks (loadBalancerSourceRanges / an internal-only LB annotation).
+  service:
+    enabled: false
+    type: LoadBalancer          # LoadBalancer | NodePort | ClusterIP
+    annotations: {}             # e.g. service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    loadBalancerClass: ""       # e.g. service.k8s.aws/nlb (needs TCP+UDP on one port)
+    loadBalancerSourceRanges: []  # CIDRs allowed to reach 41340; empty = no restriction
+    externalTrafficPolicy: Local
+    # nodePorts: pin the assigned NodePorts (30000–32767) when type=NodePort.
+    nodePorts:
+      quic: ""   # UDP — quic_internal
+      grpc: ""   # TCP — replication gRPC
+  tls:
+    secretName: ""          # Secret with the cert, key, and CA chain (keys below)
+    certKey: tls.crt
+    keyKey: tls.key
+    caKey: ca.crt
+  topology:
+    provider: none          # none | fixed | consul
+    fixed:
+      # peers: [{ address: lore-0.other-cluster.example, port: 41340, locality: OtherRegion }]
+      peers: []
+    consul: {}              # [plugins.consul] key/values (needs the consul plugin in the image)
+
+# tls: certificate configuration. QUIC always encrypts (there is no plaintext
+# QUIC), so "insecure" means an untrusted self-signed cert that clients reach with
+# the lore:// scheme (skip verify), vs lores:// for a verified cert.
+#
+# mode:
+#   ephemeral   (default) the SERVER generates a self-signed cert at startup.
+#               Zero setup: no cert-manager, no Secret, nothing to mount. The cert
+#               is regenerated on every restart and untrusted — clients use lore://.
+#               Best for trying it out and internal/dev use.
+#   selfSigned  the CHART generates a stable self-signed cert (sprig), stored in a
+#               Secret and preserved across upgrades. No cert-manager. Use when you
+#               want a cert that survives restarts without cert-manager.
+#   certManager use cert-manager to issue the cert (the ONLY mode that requires
+#               cert-manager installed). Use for a managed/renewable cert.
+#   secret      bring your own existing TLS Secret (tls.existingSecret).
+tls:
+  mode: ephemeral
+  # grpcTls: also serve the gRPC listener (TCP 41337) over TLS, using the same cert
+  # as QUIC. This is what the lores:// scheme needs — lores:// talks https:// to the
+  # gRPC endpoint, so with grpcTls=false it fails with a transport error no matter
+  # which tls.mode is set.
+  #
+  # The server's gRPC listener is EITHER plaintext OR TLS, not both, so this is a
+  # hard switch:
+  #   false (default) gRPC is plaintext h2c. Clients use lore:// (QUIC is still
+  #                   encrypted; only certificate verification is skipped).
+  #   true            gRPC is TLS. Clients MUST use lores:// and must trust the
+  #                   cert — lore:// stops working. Only useful with a cert clients
+  #                   actually trust (mode=certManager with a real CA Issuer, or
+  #                   mode=secret), plus tls.extraSANs covering the address clients
+  #                   dial. See the README "Verified TLS (lores://)" section.
+  #
+  # Cannot be used with tls.mode=ephemeral. The install fails if you try.
+  grpcTls: false
+  extraSANs: []          # SANs (external IP/DNS) for a chart-managed cert so clients can verify via lores:// (selfSigned/certManager). Ignored for ephemeral.
+  existingSecret: ""     # name of an existing kubernetes.io/tls Secret; required when mode=secret
+  certKey: tls.crt       # key in the Secret holding the cert (mode=secret; also the key name written for selfSigned/certManager)
+  keyKey: tls.key        # key in the Secret holding the private key
+  issuerName: ""         # cert-manager Issuer/ClusterIssuer (mode=certManager). "" = chart makes a self-signed Issuer (untrusted); set a real CA Issuer for a trusted lores:// cert
+  duration: 87600h       # 10y, for chart-managed cert (selfSigned/certManager)
+
+# auth: client authentication.
+#
+# Lore is not an identity provider. When enabled, the server validates bearer
+# JWTs against an external IdP's JWKS endpoint (any OIDC-style issuer) and
+# authorizes each request per repository from the token's resource claims.
+# Clients obtain a token with `lore login` against your IdP.
+#
+# Default below = DISABLED: the server runs open and any client that can reach
+# it can read and write every repository. Enable auth for any shared deployment.
+auth:
+  enabled: false
+  # jwksEndpoint: URL of the IdP's JWKS (its public signing keys). Required when
+  # enabled=true. Maps to [server.auth.jwk].endpoint.
+  jwksEndpoint: ""
+  # issuer: if set, the JWT `iss` claim must equal this. Maps to server.auth.jwt_issuer.
+  issuer: ""
+  # audience: if set, the JWT `aud` claim must contain one of these. Maps to
+  # server.auth.jwt_audience.
+  audience: []
+
+# Example — authenticate against a fictitious JWT IdP at auth.example.com.
+# Copy this into a values override (do not uncomment here) and adjust:
+#
+# auth:
+#   enabled: true
+#   jwksEndpoint: "https://auth.example.com/.well-known/jwks.json"
+#   issuer: "https://auth.example.com/"
+#   audience: ["lore"]
+#
+# Tokens must carry Lore resource claims to authorize repositories:
+#   resources: [{ resource_id: "urc-<repositoryId>", permission: ["read","write"] }]
+# Use resource_id "urc-*" to grant access to every repository. Clients then run:
+#   lore login lores://<server>:41337     # obtain a token from your IdP
+#   lore clone lores://<server>:41337/myrepo
+
+# resources: compute requests and limits.
+# These are starter defaults — increase substantially for production use.
+resources:
+  requests:
+    cpu: "2"       # starter default; increase for production
+    memory: 8Gi    # starter default; increase for production
+  limits:
+    cpu: "2"       # starter default; increase for production
+    memory: 8Gi    # starter default; increase for production
+
+# persistentVolumeClaimRetentionPolicy: optional StatefulSet PVC retention policy
+persistentVolumeClaimRetentionPolicy: {}
+
+# podSecurityContext: pod-level security settings
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# securityContext: container-level security settings
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# serviceAccount: Kubernetes ServiceAccount for the pod
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountToken: false
+
+podAnnotations: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# priorityClassName: must already exist in the cluster. "" = cluster default.
+priorityClassName: ""
+
+# terminationGracePeriodSeconds: the SIGTERM-to-SIGKILL window. Must cover the
+# preStop hook below plus the server's own shutdown.
+terminationGracePeriodSeconds: 45
+
+# lifecycle: standard Kubernetes Lifecycle object; `null` removes the hooks.
+# `{}` does NOT — Helm coalesces an empty map against this default, which puts
+# the preStop hook back.
+#
+# Pod termination and endpoint removal are concurrent, so without the preStop
+# delay the server can stop accepting while kube-proxy — or a slower external LB
+# — still sends traffic, which clients see as resets mid-rollout. `sleep` comes
+# from the image; another base may need a different command, or the native
+# `preStop: {sleep: {seconds: 5}}` on Kubernetes 1.30+.
+lifecycle:
+  preStop:
+    exec:
+      command: ["/bin/sleep", "5"]
+
+# startupProbe: allows up to 150s (30 * 5s) for the server to start
+startupProbe:
+  failureThreshold: 30
+  periodSeconds: 5
+
+# livenessProbe: restarts the pod only if it stops accepting TCP connections
+# (a cheap process-alive check). Store health is intentionally NOT checked here —
+# that lives on readinessProbe — so a store/dependency blip doesn't cycle the pod.
+livenessProbe:
+  failureThreshold: 6
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+# readinessProbe: removes pod from Service endpoints if the store is unhealthy
+# (HTTP /health_check, which probes the store on the data tier).
+readinessProbe:
+  failureThreshold: 3
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+# presignedUrl: the server's presigned-URL feature (HTTP endpoint). Off by default.
+# The HMAC key is a SECRET (hex, >= 32 bytes; generate with `openssl rand -hex 32`)
+# and is injected from a Kubernetes Secret as an env var — it is never written to the
+# ConfigMap. The server starts with the feature disabled until the key is provided.
+presignedUrl:
+  enabled: false
+  hmacKeySecret:
+    name: ""   # name of a Secret holding the hex HMAC key
+    key: ""    # key within that Secret
+  minTtlSeconds: 1
+  defaultTtlSeconds: 3600
+  maxTtlSeconds: 86400
+
+# telemetry: observability. Lore exports logs/metrics/traces over OTLP/gRPC — it does
+# NOT serve a Prometheus /metrics endpoint, so there is nothing to scrape. Export is
+# OFF until you set exporter.endpoint (an OTLP collector). When unset, nothing here is
+# emitted and the server uses its built-in defaults.
+telemetry:
+  exporter:
+    endpoint: ""       # e.g. http://otel-collector.observability.svc.cluster.local:4317 — set this to enable OTLP export
+    queueSize: 2048
+    timeoutMs: 5000
+  logger:
+    enableOtlp: false  # also forward logs over OTLP (only takes effect when exporter.endpoint set)
+    format: json       # ansi | json | text
+    output: stdout     # stdout | stderr  (file output: use config.extra)
+  metrics:
+    exportIntervalMillis: 30000
+    sampleIntervalMillis: 10000
+  traces:
+    sampleRate: 0.05
+    sampleRateLowTier: 0.001
+    serviceName: ""    # optional; identifies this service in traces
+  additionalLabels: {}  # extra key/value labels on all exported telemetry
+
+# config.extra: raw TOML appended to local.toml as a last-layer escape hatch.
+# It is appended AFTER every block the chart renders, so it must START WITH ITS OWN
+# TABLE HEADER (e.g. `[feature]`). A bare `key = value` at the top of this string
+# attaches to whatever table the chart happened to render last and is silently
+# ignored. It also cannot re-open a table the chart already emitted (duplicate TOML
+# tables are a parse error) — use extraEnv with LORE__* overrides for those keys.
+config:
+  extra: ""

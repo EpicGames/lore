@@ -1,0 +1,20 @@
+# Ship logs/metrics/traces to an OTLP collector (OTLP/gRPC push — no /metrics scrape).
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+telemetry:
+  exporter:
+    endpoint: http://otel-collector.observability.svc.cluster.local:4317
+  logger:
+    enableOtlp: true
+  traces:
+    sampleRate: 0.1
+    serviceName: lore
+  additionalLabels:
+    env: prod
+
+# arbitrary server env (e.g. LORE__ config overrides)
+extraEnv:
+  - name: LORE__SERVER__HTTP__REQUEST_TIMEOUT_SECONDS
+    value: "600"

@@ -1,0 +1,52 @@
+# Example: put the fast handler/cache tier on direct-attached node-local NVMe
+# (hostPath), while keeping the authoritative data tier on a durable PVC.
+#
+# This matches the intended hardware split: handlers absorb hot IO on the fastest
+# local disk (disposable — it just re-warms if a pod moves), and the single
+# authoritative store stays on durable network storage so it survives reschedules.
+#
+# Pin the handler pods to nodes that actually have the NVMe mounted at the path
+# below (label your NVMe nodes and set nodeSelector). hostPath does NOT schedule-
+# guard by itself.
+#
+# TWO PRECONDITIONS, both decided by the cluster rather than by this file:
+#
+# 1. The node must expose its NVMe as a mounted directory. Where it instead backs
+#    kubelet's ephemeral storage (Karpenter instanceStorePolicy=RAID0,
+#    Bottlerocket, most EKS instance-store setups) there is no host path to
+#    mount, and type=emptyDir lands on the NVMe unconfigured.
+#
+# 2. The namespace must not enforce Pod Security `restricted`. fsGroup does not
+#    apply to hostPath, so the chart needs a root init container to fix ownership
+#    of the kubelet-created directory, which `restricted` rejects.
+#
+# Deploy: helm install lore . -f examples/local-nvme.values.yaml
+
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+topology:
+  mode: tiered
+
+handler:
+  replicas: 3
+  persistence:
+    type: hostPath
+    hostPath:
+      path: /mnt/nvme/lore-handler   # the node's mounted NVMe directory
+      type: DirectoryOrCreate
+
+data:
+  persistence:
+    type: pvc            # keep the authoritative store durable
+    size: 500Gi
+    storageClass: ""     # your durable class (e.g. an EBS io2 class)
+
+# Pin pods to nodes that have the local NVMe. (nodeSelector currently applies to
+# both tiers; label your NVMe nodes accordingly.)
+nodeSelector:
+  lore.epicgames.com/local-nvme: "true"
+
+service:
+  type: NodePort

@@ -1,0 +1,205 @@
+{{- /*
+DATA StatefulSet (Pod C): the authoritative, durable store.
+
+Always rendered. In tiered mode it is the durable backend behind the handler
+tier. In single mode it is the lone self-contained lore pod (no handlers).
+
+Name is unchanged from the original single StatefulSet so the existing
+data-<fullname>-0 PVC is preserved across upgrades.
+*/}}
+{{- $configKey := ternary "data.toml" "local.toml" (eq .Values.topology.mode "tiered") }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "lore.fullname" . }}
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+    app.kubernetes.io/component: data
+spec:
+  replicas: 1
+  updateStrategy:
+    type: RollingUpdate
+  serviceName: {{ include "lore.fullname" . }}-headless
+  selector:
+    matchLabels:
+      {{- include "lore.dataSelectorLabels" . | nindent 6 }}
+  {{- with .Values.persistentVolumeClaimRetentionPolicy }}
+  persistentVolumeClaimRetentionPolicy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "lore.dataSelectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "lore.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountToken | default false }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "lore.initContainers" (dict "ctx" . "p" .Values.data.persistence "name" "data") | nindent 6 }}
+      containers:
+        - name: loreserver
+          image: {{ include "lore.image" . | quote }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            # The root filesystem is read-only, so the lore credential/token store
+            # cannot write its default base path ($HOME/.config on /). Point it at the
+            # writable /tmp emptyDir and use the file-based store (no OS keyring exists
+            # in-container). Credentials here are transient cache, so emptyDir is fine.
+            - name: LORE_AUTH_PATH
+              value: /tmp/lore-auth
+            - name: LORE_AUTH_STORE
+              value: fallback
+            - name: LORE_CONFIG_PATH
+              value: /etc/lore/config
+            {{- if include "lore.needsCaBundle" . }}
+            # tls.grpcTls: trust the chart-managed cert (public roots + that cert)
+            # so the handler -> data lores:// hop verifies. See lore.caBundleInit.
+            - name: SSL_CERT_FILE
+              value: /etc/lore/ca/bundle.crt
+            {{- end }}
+            {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
+            {{- if and .Values.presignedUrl.enabled .Values.presignedUrl.hmacKeySecret.name }}
+            - name: LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.presignedUrl.hmacKeySecret.name }}
+                  key: {{ .Values.presignedUrl.hmacKeySecret.key }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: quic
+              containerPort: 41337
+              protocol: UDP
+            - name: grpc
+              containerPort: 41337
+              protocol: TCP
+            - name: http
+              containerPort: 41339
+              protocol: TCP
+            {{- if .Values.replication.enabled }}
+            - name: repl-quic
+              containerPort: {{ .Values.replication.port }}
+              protocol: UDP
+            - name: repl-grpc
+              containerPort: {{ .Values.replication.port }}
+              protocol: TCP
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health_check
+              port: http
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+          livenessProbe:
+            # Cheap process-alive check (TCP connect). The deeper store /health_check
+            # runs on readinessProbe only, so a store/dependency blip removes the pod
+            # from Service endpoints instead of restarting the container.
+            tcpSocket:
+              port: http
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /health_check
+              port: http
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.lifecycle }}
+          lifecycle:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/lore/config
+              readOnly: true
+            {{- if ne .Values.tls.mode "ephemeral" }}
+            - name: certs
+              mountPath: /etc/lore/certs
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.replication.enabled .Values.replication.tls.secretName }}
+            - name: replication-tls
+              mountPath: /etc/lore/replication-tls
+              readOnly: true
+            {{- end }}
+            {{- if include "lore.needsCaBundle" . }}
+            - name: ca-bundle
+              mountPath: /etc/lore/ca
+              readOnly: true
+            {{- end }}
+            - name: tmp
+              mountPath: /tmp
+            - name: data
+              mountPath: /data
+              {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+              subPathExpr: $(POD_NAME)
+              {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "lore.fullname" . }}-config
+            # Mount this workload's config key as local.toml.
+            items:
+              - key: {{ $configKey }}
+                path: local.toml
+        {{- if ne .Values.tls.mode "ephemeral" }}
+        - name: certs
+          secret:
+            secretName: {{ include "lore.tlsSecretName" . }}
+        {{- end }}
+        {{- if and .Values.replication.enabled .Values.replication.tls.secretName }}
+        - name: replication-tls
+          secret:
+            secretName: {{ .Values.replication.tls.secretName }}
+        {{- end }}
+        {{- if include "lore.needsCaBundle" . }}
+        - name: ca-bundle
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- include "lore.storagePodVolume" (dict "p" .Values.data.persistence "name" "data") | nindent 8 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- include "lore.storageClaimTemplate" (dict "p" .Values.data.persistence "name" "data") | nindent 2 }}

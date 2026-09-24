@@ -1,0 +1,33 @@
+{{- if eq .Values.topology.mode "tiered" }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "lore.handlerFullname" . }}
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+    app.kubernetes.io/component: handler
+spec:
+  # maxUnavailable: 1 keeps at least one handler serving during a node drain while
+  # still allowing maintenance. The single-replica data pod has no PDB on purpose:
+  # a minAvailable budget there would block drains, and maxUnavailable: 1 would be
+  # a no-op guarantee.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "lore.handlerSelectorLabels" . | nindent 6 }}
+{{- else }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "lore.fullname" . }}
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+spec:
+  # maxUnavailable: 1 intentionally allows node drains on this single-replica deployment.
+  # Using minAvailable: 1 instead would block cluster maintenance (drain) because there is
+  # no second replica to satisfy the budget — the pod could never be evicted.
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "lore.selectorLabels" . | nindent 6 }}
+{{- end }}

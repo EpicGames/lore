@@ -1,0 +1,139 @@
+{{- if eq .Values.tls.mode "certManager" }}
+{{- if not .Values.tls.issuerName }}
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "lore.fullname" . }}-selfsigned
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+{{- end }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "lore.fullname" . }}-tls
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "lore.fullname" . }}-tls
+  duration: {{ .Values.tls.duration }}
+  issuerRef:
+    {{- if .Values.tls.issuerName }}
+    name: {{ .Values.tls.issuerName }}
+    kind: Issuer
+    {{- else }}
+    name: {{ include "lore.fullname" . }}-selfsigned
+    kind: Issuer
+    {{- end }}
+  dnsNames:
+    - {{ include "lore.fullname" . }}
+    - {{ printf "%s.%s.svc" (include "lore.fullname" .) .Release.Namespace }}
+    - {{ printf "%s.%s.svc.cluster.local" (include "lore.fullname" .) .Release.Namespace }}
+    # Data headless Service + the data pod's stable DNS, so handler->data QUIC TLS validates.
+    - {{ printf "%s-headless" (include "lore.fullname" .) }}
+    - {{ printf "%s-headless.%s.svc" (include "lore.fullname" .) .Release.Namespace }}
+    - {{ printf "%s-0.%s-headless.%s.svc.cluster.local" (include "lore.fullname" .) (include "lore.fullname" .) .Release.Namespace }}
+    {{- if eq .Values.topology.mode "tiered" }}
+    # Handler headless Service names (in-cluster access to the cache tier).
+    - {{ printf "%s-headless" (include "lore.handlerFullname" .) }}
+    - {{ printf "%s-headless.%s.svc" (include "lore.handlerFullname" .) .Release.Namespace }}
+    - {{ printf "%s-headless.%s.svc.cluster.local" (include "lore.handlerFullname" .) .Release.Namespace }}
+    {{- end }}
+    - localhost
+    {{- range .Values.tls.extraSANs }}
+    {{- if not (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" .) }}
+    - {{ . }}
+    {{- end }}
+    {{- end }}
+  {{- $ipSANs := list }}
+  {{- range .Values.tls.extraSANs }}
+  {{- if regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$" . }}
+  {{- $ipSANs = append $ipSANs . }}
+  {{- end }}
+  {{- end }}
+  {{- if $ipSANs }}
+  ipAddresses:
+    {{- range $ipSANs }}
+    - {{ . }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+
+{{- if eq .Values.tls.mode "selfSigned" }}
+{{- $fullname := include "lore.fullname" . }}
+{{- /*
+  Check tls.duration here, above the existing-secret branch, so a dry run and a
+  real upgrade agree.
+
+  genSelfSignedCert counts in whole days, but tls.duration is a Go duration. Take
+  whole hours only and reject anything smaller, rather than dropping it quietly.
+*/}}
+{{- $durationRaw := .Values.tls.duration | default "" | toString }}
+{{- if not (regexMatch "^[0-9]+h([0-9]+m)?([0-9]+s)?$" $durationRaw) }}
+{{- fail (printf "tls.duration %q is not usable for tls.mode=selfSigned: it must be whole hours, e.g. \"87600h\" (10y) or \"2160h0m0s\". Sub-hour units (\"4320m\", \"1.5h\", \"100ms\") are rejected here because sprig's genSelfSignedCert only takes whole days; tls.mode=certManager accepts any Go duration." $durationRaw) }}
+{{- end }}
+{{- $durMinutes := atoi (trimSuffix "m" (regexFind "[0-9]+m" $durationRaw | default "0m")) }}
+{{- $durSeconds := atoi (trimSuffix "s" (regexFind "[0-9]+s" $durationRaw | default "0s")) }}
+{{- if or (gt $durMinutes 0) (gt $durSeconds 0) }}
+{{- fail (printf "tls.duration %q has a non-zero minute/second component, which tls.mode=selfSigned cannot represent (it rounds to whole days). Express it in whole hours instead." $durationRaw) }}
+{{- end }}
+{{- $hoursDigits := trimSuffix "h" (regexFind "^[0-9]+h" $durationRaw) }}
+{{- /* Drop leading zeros, so a padded value like "000087600h" is not read as too long. */}}
+{{- $hoursDigits = regexReplaceAll "^0+" $hoursDigits "" }}
+{{- if eq $hoursDigits "" }}{{- $hoursDigits = "0" }}{{- end }}
+{{- /*
+  Cap the value before doing any maths on it. A very long number overflows atoi,
+  and anything past ~292 years overflows the cert itself and comes back already
+  expired. Both fail quietly. 2562024h is the largest value that still works.
+*/}}
+{{- if gt (len $hoursDigits) 8 }}
+{{- fail (printf "tls.duration %q is out of range for tls.mode=selfSigned: the maximum is 2562024h (~292 years, the limit of the nanosecond duration sprig uses). Use 87600h for 10 years." $durationRaw) }}
+{{- end }}
+{{- $durationHours := atoi $hoursDigits }}
+{{- if gt $durationHours 2562024 }}
+{{- fail (printf "tls.duration %q is out of range for tls.mode=selfSigned: the maximum is 2562024h (~292 years, the limit of the nanosecond duration sprig uses). Use 87600h for 10 years." $durationRaw) }}
+{{- end }}
+{{- /* Round up, minimum one day, so a short value never makes an already-expired cert. */}}
+{{- $durationDays := max 1 (div (add $durationHours 23) 24) | int }}
+{{- $existingSecret := lookup "v1" "Secret" .Release.Namespace (printf "%s-tls" $fullname) }}
+{{- if $existingSecret }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $fullname }}-tls
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ index $existingSecret.data "tls.crt" }}
+  tls.key: {{ index $existingSecret.data "tls.key" }}
+{{- else }}
+{{- $altNames := list $fullname (printf "%s.%s.svc" $fullname .Release.Namespace) (printf "%s.%s.svc.cluster.local" $fullname .Release.Namespace) "localhost" }}
+{{- $altNames = append $altNames (printf "%s-headless" $fullname) }}
+{{- $altNames = append $altNames (printf "%s-headless.%s.svc" $fullname .Release.Namespace) }}
+{{- $altNames = append $altNames (printf "%s-0.%s-headless.%s.svc.cluster.local" $fullname $fullname .Release.Namespace) }}
+{{- if eq .Values.topology.mode "tiered" }}
+{{- $handlerFullname := include "lore.handlerFullname" . }}
+{{- $altNames = append $altNames (printf "%s-headless" $handlerFullname) }}
+{{- $altNames = append $altNames (printf "%s-headless.%s.svc" $handlerFullname .Release.Namespace) }}
+{{- $altNames = append $altNames (printf "%s-headless.%s.svc.cluster.local" $handlerFullname .Release.Namespace) }}
+{{- end }}
+{{- $altNames = concat $altNames .Values.tls.extraSANs }}
+{{- $cert := genSelfSignedCert $fullname nil $altNames $durationDays }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $fullname }}-tls
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $cert.Cert | b64enc }}
+  tls.key: {{ $cert.Key | b64enc }}
+{{- end }}
+{{- end }}

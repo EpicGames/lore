@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+# Placeholder for contrib/helm's validation. The real workflow — lint, render
+# every example, then install into kind and run `helm test` — lands through a
+# GitHub PR, so it is tested on GitHub's runners before it gates anything.
+# Manual dispatch only until then, so it never reports a check it did not run.
+
+name: Validate Helm Chart
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Helm chart validation is not implemented yet."

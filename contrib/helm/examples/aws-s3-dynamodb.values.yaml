@@ -1,0 +1,102 @@
+# Example: lore server backed by AWS S3 (immutable fragments) + DynamoDB (mutable
+# store and locks) instead of local disk.
+#
+# The stock loreserver image DOES include the aws plugin — at startup it logs
+# `Registered plugins - immutable stores: ["aws"], mutable stores: ["aws"],
+# lock stores: ["aws"]`. No custom build is required.
+#
+# PREREQUISITES
+#   1. The S3 bucket and the FOUR DynamoDB tables provisioned out-of-band (e.g.
+#      Terraform). lore does NOT create them — it exits with
+#      "DynamoDB table not found: <name>". The key schemas are listed below; they
+#      are not guessable, and a wrong schema fails at runtime with a DynamoDB
+#      ValidationException that clients see as "Store overloaded, slow down".
+#   2. IRSA: an IAM role (set via serviceAccount.annotations below) granting the pod
+#      S3 read/write on the bucket and DynamoDB read/write on the tables and the
+#      locks table's indexes — including dynamodb:TransactWriteItems, which the lock
+#      store uses. contrib/aws/iam.tf has the exact policy.
+#   3. Use topology.mode=single here. The tiered (default) topology is a
+#      primary/cache model for the LOCAL backend (the data pod owns the mutable
+#      store, handlers cache local content). With the AWS backend the mutable store
+#      and locks already live in shared DynamoDB, so the in-cluster cache tier does
+#      not apply — this example configures the storage backend only, on one pod.
+#
+# DYNAMODB TABLES — create them exactly as contrib/aws/storage.tf does. Every table
+# key is binary (B), and the locks table needs its three global secondary indexes.
+# examples/localstack-aws-backend.values.yaml has the same tables as aws CLI
+# commands.
+#
+#   fragments table       partition: hash (B)                sort: repository_context (B)
+#   fragment-state table  partition: hash (B)                (no sort key)
+#   mutable table         partition: repository_id (B)       sort: key (B)
+#   locks table           partition: hash (B)                sort: repositoryBranch (B)
+#                         + indexes owner-repo-branch, repo-branch, repo-branch-description
+
+image:
+  repository: ghcr.io/epicgames/lore/loreserver
+  tag: ""  # empty = the chart's appVersion
+
+# Single pod, no handler tier — the store is remote (S3 + DynamoDB).
+topology:
+  mode: single
+
+# No local PVC — fragments are in S3, metadata/locks in DynamoDB. The chart still
+# mounts an (unused) emptyDir at /data when persistence is disabled. Verified: the
+# pod can be deleted and every repository survives, because no state is local.
+data:
+  persistence:
+    enabled: false
+
+# IRSA — attach the IAM role that grants S3 + DynamoDB access.
+serviceAccount:
+  create: true
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<account-id>:role/lore-server
+
+service:
+  type: LoadBalancer
+  # A LoadBalancer must carry UDP (QUIC 41337) as well as TCP 41337/41339, or
+  # clone/push break. Provision a UDP-capable LB (AWS NLB shown) — a default
+  # (often TCP-only) LB will not work.
+  loadBalancerClass: service.k8s.aws/nlb
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: "true"
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+
+tls:
+  mode: certManager   # requires cert-manager installed in the cluster
+
+# The chart's ConfigMap sets the local-store paths by default; setting mode="aws"
+# below overrides them (the local sub-config is then ignored). config.extra is raw
+# TOML appended as the final config layer, so it must start with a table header.
+# Adjust bucket/table names to match the resources you provisioned.
+#
+# On real AWS, leave the endpoint keys out — the SDK resolves them from the region.
+# To point at an S3/DynamoDB emulator instead, add s3_endpoint_url /
+# dynamodb_endpoint_url plus s3_force_path_style = true; see
+# examples/localstack-aws-backend.values.yaml.
+config:
+  extra: |
+    [immutable_store]
+    mode = "aws"
+
+    [mutable_store]
+    mode = "aws"
+
+    [lock_store]
+    mode = "aws"
+
+    [plugins.aws.immutable_store]
+    s3_bucket = "lore-fragments"
+    s3_region = "<region>"
+    dynamodb_fragments_table = "lore-fragments"
+    dynamodb_fragment_state_table = "lore-fragment-state"
+    dynamodb_region = "<region>"
+
+    [plugins.aws.mutable_store]
+    dynamodb_table = "lore-mutable"
+    dynamodb_region = "<region>"
+
+    [plugins.aws.lock_store]
+    dynamodb_table = "lore-locks"
+    dynamodb_region = "<region>"

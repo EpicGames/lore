@@ -1,0 +1,215 @@
+{{- if and .Values.tls.grpcTls (eq .Values.tls.mode "ephemeral") -}}
+{{- fail "tls.grpcTls=true does nothing when tls.mode=ephemeral, because the server makes that cert itself and the chart cannot point gRPC at it. Use selfSigned, certManager, or secret." -}}
+{{- end -}}
+{{- if ne (int .Values.service.quicPort) (int .Values.service.grpcPort) -}}
+{{- fail (printf "service.quicPort (%v) and service.grpcPort (%v) must be equal. The server serves QUIC and gRPC on one port, so a client URL carries a single port number for both, and the AWS TCP_UDP listener annotation needs one number for both. Splitting them leaves the gRPC half of that URL pointing at a port the Service does not publish over TCP." .Values.service.quicPort .Values.service.grpcPort) -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "lore.fullname" . }}-config
+  labels:
+    {{- include "lore.labels" . | nindent 4 }}
+data:
+{{- if eq .Values.topology.mode "tiered" }}
+  {{- /*
+    Tiered (data + caching-handler model).
+
+    data.toml -> the DATA pod (C). Authoritative self-contained store: local
+    immutable + local mutable on /data. Serves reads, writes, and list.
+
+    handler.toml -> the HANDLER pods (A/B). Caching replicas: a local immutable
+    cache backed by a remote durable tier on the data pod, and a mutable store on
+    the data pod. Reads hit the local cache, then fall through to C (which holds
+    the full authoritative copy). Writes go through to C and are cached locally.
+
+    Each StatefulSet mounts its single key as local.toml at /etc/lore/config.
+  */}}
+  {{- $fullname := include "lore.fullname" . }}
+  {{- $headless := printf "%s-headless" $fullname }}
+  {{- $ns := .Release.Namespace }}
+  {{- /*
+    Scheme for the handler -> data hop. When tls.grpcTls is on, the data pod's gRPC
+    listener is TLS-only, so the handlers must dial lores:// or their remote mutable
+    store cannot connect. The chart-managed cert covers the data pod's headless DNS
+    name (see certificate.yaml), so verification succeeds.
+  */}}
+  {{- $upstreamScheme := ternary "lores" "lore" (eq (include "lore.grpcTlsActive" .) "true") }}
+  {{- /*
+    Port 41337 is the CONTAINER port, hard-coded to match the containerPort in both
+    StatefulSets. This is a per-pod record of a headless Service, so it resolves
+    straight to the pod IP and no Service port remapping happens — service.quicPort
+    would be the wrong number the moment anyone changed it.
+  */}}
+  {{- $primary := printf "%s://%s-0.%s.%s.svc.cluster.local:41337" $upstreamScheme $fullname $headless $ns }}
+  data.toml: |-
+    {{- if .Values.auth.enabled }}
+    {{- if or .Values.auth.issuer .Values.auth.audience }}
+    [server.auth]
+    {{- if .Values.auth.issuer }}
+    jwt_issuer = {{ .Values.auth.issuer | quote }}
+    {{- end }}
+    {{- if .Values.auth.audience }}
+    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
+    {{- end }}
+    {{- end }}
+
+    [server.auth.jwk]
+    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- end }}
+
+    {{- if ne .Values.tls.mode "ephemeral" }}
+    [server.quic.certificate]
+    cert_file = "/etc/lore/certs/{{ .Values.tls.certKey }}"
+    pkey_file = "/etc/lore/certs/{{ .Values.tls.keyKey }}"
+    {{- if .Values.tls.grpcTls }}
+
+    # tls.grpcTls=true: serve gRPC over TLS as well, so clients can use lores://.
+    # This makes the gRPC listener TLS-only — plaintext lore:// clients can no
+    # longer connect.
+    [server.grpc.certificate]
+    cert_file = "/etc/lore/certs/{{ .Values.tls.certKey }}"
+    pkey_file = "/etc/lore/certs/{{ .Values.tls.keyKey }}"
+    {{- end }}
+    {{- end }}
+
+    # Data pod (C): authoritative local store.
+    [immutable_store.local]
+    path = "/data"
+    {{- with (include "lore.storeGcToml" .Values.data.store) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+
+    [mutable_store.local]
+    path = "/data"
+
+    {{- /*
+      Bare-key tables first, then every block that opens tables of its own. See
+      the TOML ORDERING INVARIANT on lore.serverHttpToml.
+    */}}
+    {{- include "lore.serverHttpToml" (dict "ctx" $ "storeHealthCheck" true) | nindent 4 }}
+    {{- if .Values.replication.enabled }}
+    {{- include "lore.replicationToml" $ | nindent 4 }}
+    {{- end }}
+    {{- if .Values.telemetry.exporter.endpoint }}
+    {{- include "lore.telemetryToml" $ | nindent 4 }}
+    {{- end }}
+    {{- if .Values.config.extra }}
+    {{- .Values.config.extra | nindent 4 }}
+    {{- end }}
+  handler.toml: |-
+    {{- if .Values.auth.enabled }}
+    {{- if or .Values.auth.issuer .Values.auth.audience }}
+    [server.auth]
+    {{- if .Values.auth.issuer }}
+    jwt_issuer = {{ .Values.auth.issuer | quote }}
+    {{- end }}
+    {{- if .Values.auth.audience }}
+    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
+    {{- end }}
+    {{- end }}
+
+    [server.auth.jwk]
+    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- end }}
+
+    {{- if ne .Values.tls.mode "ephemeral" }}
+    [server.quic.certificate]
+    cert_file = "/etc/lore/certs/{{ .Values.tls.certKey }}"
+    pkey_file = "/etc/lore/certs/{{ .Values.tls.keyKey }}"
+    {{- if .Values.tls.grpcTls }}
+
+    # tls.grpcTls=true: serve gRPC over TLS as well, so clients can use lores://.
+    # This makes the gRPC listener TLS-only — plaintext lore:// clients can no
+    # longer connect.
+    [server.grpc.certificate]
+    cert_file = "/etc/lore/certs/{{ .Values.tls.certKey }}"
+    pkey_file = "/etc/lore/certs/{{ .Values.tls.keyKey }}"
+    {{- end }}
+    {{- end }}
+
+    # Handler pod (A/B): local cache + durable tier and mutable store on the data pod.
+    [immutable_store]
+    mode = "composite"
+
+    [immutable_store.composite.local]
+    mode = "local"
+
+    [immutable_store.composite.local.local]
+    path = "/data"
+    flush_delay_seconds = 10
+    {{- with (include "lore.storeGcToml" .Values.handler.store) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+
+    [immutable_store.composite.durable]
+    mode = "remote"
+
+    [immutable_store.composite.durable.remote]
+    remote_url = {{ .Values.handler.upstreamURL | default $primary | quote }}
+
+    [mutable_store]
+    mode = "remote"
+
+    [mutable_store.remote]
+    remote_url = {{ .Values.handler.upstreamURL | default $primary | quote }}
+
+    {{- include "lore.serverHttpToml" (dict "ctx" $ "storeHealthCheck" false) | nindent 4 }}
+    {{- if .Values.telemetry.exporter.endpoint }}
+    {{- include "lore.telemetryToml" $ | nindent 4 }}
+    {{- end }}
+    {{- if .Values.config.extra }}
+    {{- .Values.config.extra | nindent 4 }}
+    {{- end }}
+{{- else }}
+  local.toml: |-
+    {{- if .Values.auth.enabled }}
+    {{- if or .Values.auth.issuer .Values.auth.audience }}
+    [server.auth]
+    {{- if .Values.auth.issuer }}
+    jwt_issuer = {{ .Values.auth.issuer | quote }}
+    {{- end }}
+    {{- if .Values.auth.audience }}
+    jwt_audience = [{{ range $idx, $aud := .Values.auth.audience }}{{ if $idx }}, {{ end }}{{ $aud | quote }}{{ end }}]
+    {{- end }}
+    {{- end }}
+
+    [server.auth.jwk]
+    endpoint = {{ .Values.auth.jwksEndpoint | quote }}
+    {{- end }}
+
+    {{- if ne .Values.tls.mode "ephemeral" }}
+    [server.quic.certificate]
+    cert_file = "/etc/lore/certs/{{ .Values.tls.certKey }}"
+    pkey_file = "/etc/lore/certs/{{ .Values.tls.keyKey }}"
+    {{- if .Values.tls.grpcTls }}
+
+    # tls.grpcTls=true: serve gRPC over TLS as well, so clients can use lores://.
+    # This makes the gRPC listener TLS-only — plaintext lore:// clients can no
+    # longer connect.
+    [server.grpc.certificate]
+    cert_file = "/etc/lore/certs/{{ .Values.tls.certKey }}"
+    pkey_file = "/etc/lore/certs/{{ .Values.tls.keyKey }}"
+    {{- end }}
+    {{- end }}
+
+    [immutable_store.local]
+    path = "/data"
+    {{- with (include "lore.storeGcToml" .Values.data.store) }}
+    {{- . | nindent 4 }}
+    {{- end }}
+
+    [mutable_store.local]
+    path = "/data"
+
+    {{- include "lore.serverHttpToml" (dict "ctx" $ "storeHealthCheck" true) | nindent 4 }}
+    {{- if .Values.replication.enabled }}
+    {{- include "lore.replicationToml" $ | nindent 4 }}
+    {{- end }}
+    {{- if .Values.telemetry.exporter.endpoint }}
+    {{- include "lore.telemetryToml" $ | nindent 4 }}
+    {{- end }}
+    {{- if .Values.config.extra }}
+    {{- .Values.config.extra | nindent 4 }}
+    {{- end }}
+{{- end }}
