@@ -168,6 +168,17 @@ fn main() -> Result<()> {
             &["./proto"],
         )?;
 
+    // lore.user.v1 — user directory, a wire-compatible copy of the UrcAuthApi
+    // directory RPCs. Self-contained — declares its own messages
+    let mut config = tonic_prost_build::Config::new();
+    config.enable_type_names();
+    config.bytes(["."]);
+
+    tonic_prost_build::configure()
+        .out_dir(&output_dir)
+        .protoc_arg("--experimental_allow_proto3_optional")
+        .compile_with_config(config, &["./proto/lore/user/v1/user.proto"], &["./proto"])?;
+
     let mut config = tonic_prost_build::Config::new();
     // Use Bytes for buffers instead of Vec
     config.bytes(["."]);

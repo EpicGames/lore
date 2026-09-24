@@ -13,6 +13,7 @@ const V1_PROTO_FILES: &[&str] = &[
     "proto/lore/revision/v1/revision.proto",
     "proto/lore/thin_client/v1/model.proto",
     "proto/lore/thin_client/v1/thin_client.proto",
+    "proto/lore/user/v1/user.proto",
 ];
 
 fn read_v1(rel: &str) -> String {
