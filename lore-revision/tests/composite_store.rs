@@ -2281,6 +2281,7 @@ mod tests {
         use lore_base::types::Partition;
         use lore_revision::fragment::generate_random;
         use lore_revision::lore::RepositoryId;
+        use lore_revision::store::composite::CompositeStore;
         use lore_revision::store::composite::CompositeStoreBuilder;
         use lore_storage::ImmutableStore;
         use lore_storage::StoreError;
@@ -2297,6 +2298,7 @@ mod tests {
             get_delay: Duration,
             get_result: RwLock<Result<StoreGetData, StoreError>>,
             get_count: AtomicU32,
+            get_metadata_count: AtomicU32,
         }
 
         impl DelayStore {
@@ -2310,6 +2312,7 @@ mod tests {
                         payload: Some(payload),
                     })),
                     get_count: AtomicU32::new(0),
+                    get_metadata_count: AtomicU32::new(0),
                 }
             }
 
@@ -2318,11 +2321,16 @@ mod tests {
                     get_delay: delay,
                     get_result: RwLock::new(Err(error)),
                     get_count: AtomicU32::new(0),
+                    get_metadata_count: AtomicU32::new(0),
                 }
             }
 
             fn get_count(&self) -> u32 {
                 self.get_count.load(Ordering::SeqCst)
+            }
+
+            fn get_metadata_count(&self) -> u32 {
+                self.get_metadata_count.load(Ordering::SeqCst)
             }
         }
 
@@ -2334,13 +2342,23 @@ mod tests {
 
         #[async_trait]
         impl ImmutableStore for DelayStore {
+            /// Answers from the same configured result as `get`, minus the payload, so a metadata
+            /// lookup and a full read of the same address agree on whether it is there.
             async fn get_metadata(
                 self: Arc<Self>,
-                partition: Partition,
-                address: Address,
+                _partition: Partition,
+                _address: Address,
             ) -> Result<StoreGetData, StoreError> {
-                let _ = (partition, address);
-                Ok(StoreGetData::default())
+                self.get_metadata_count.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(self.get_delay).await;
+                self.get_result
+                    .read()
+                    .await
+                    .clone()
+                    .map(|data| StoreGetData {
+                        payload: None,
+                        ..data
+                    })
             }
 
             async fn is_available(self: Arc<Self>, _timeout: Duration) -> bool {
@@ -2448,106 +2466,258 @@ mod tests {
             })
         }
 
-        #[tokio::test]
-        async fn success_propagated_to_listeners() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution.clone(), async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
+        /// Long enough that every task in a batch reaches the inflight map before the first
+        /// fan-out resolves, so what the assertions see is genuine contention.
+        const FAN_OUT_DELAY: Duration = Duration::from_millis(200);
 
-                    let durable = Arc::new(DelayStore::succeeding(
-                        fragment,
-                        payload.clone(),
-                        Duration::from_millis(200),
-                    ));
+        const NUM_CONCURRENT: usize = 5;
 
-                    let composite = Arc::new(
-                        CompositeStoreBuilder::default()
-                            .with_local("local".to_string(), create_empty_local().await)
-                            .expect("local should work")
-                            .with_durable("durable".to_string(), durable.clone())
-                            .expect("durable should work")
-                            .build()
-                            .expect("build should work"),
-                    );
-
-                    let num_concurrent = 5;
-                    let mut handles = Vec::with_capacity(num_concurrent);
-                    for _ in 0..num_concurrent {
-                        let store = composite.clone();
-                        handles.push(lore_spawn!(
-                            async move { store.get(repository, address).await }
-                        ));
-                    }
-
-                    for handle in handles {
-                        let (got_fragment, got_payload) = handle
-                            .await
-                            .expect("task panicked")
-                            .and_then(StoreGetData::into_payload)
-                            .expect("get failed");
-                        assert_eq!(got_fragment.size_payload, fragment.size_payload);
-                        assert_eq!(got_payload, payload);
-                    }
-
-                    assert_eq!(
-                        durable.get_count(),
-                        1,
-                        "inflight dedup should collapse concurrent gets into a single durable get"
-                    );
-                })
-                .await;
+        async fn composite_over(durable: Arc<DelayStore>) -> Arc<CompositeStore> {
+            Arc::new(
+                CompositeStoreBuilder::default()
+                    .with_local("local".to_string(), create_empty_local().await)
+                    .expect("local should work")
+                    .with_durable("durable".to_string(), durable)
+                    .expect("durable should work")
+                    .build()
+                    .expect("build should work"),
+            )
         }
 
-        #[tokio::test]
-        async fn failure_propagated_to_listeners() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution.clone(), async move {
-                    let repository: Partition = random::<RepositoryId>();
-                    let address = random::<Address>();
+        mod get {
+            use super::*;
 
-                    let durable = Arc::new(DelayStore::failing(
-                        StoreError::from(lore_storage::AddressNotFound::from(address)),
-                        Duration::from_millis(200),
-                    ));
+            #[tokio::test]
+            async fn success_propagated_to_listeners() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
 
-                    let composite = Arc::new(
-                        CompositeStoreBuilder::default()
-                            .with_local("local".to_string(), create_empty_local().await)
-                            .expect("local should work")
-                            .with_durable("durable".to_string(), durable.clone())
-                            .expect("durable should work")
-                            .build()
-                            .expect("build should work"),
-                    );
+                        let durable = Arc::new(DelayStore::succeeding(
+                            fragment,
+                            payload.clone(),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
 
-                    let num_concurrent = 5;
-                    let mut handles = Vec::with_capacity(num_concurrent);
-                    for _ in 0..num_concurrent {
-                        let store = composite.clone();
-                        handles.push(lore_spawn!(async move {
-                            store.get(repository, address).await
-                        }));
-                    }
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(
+                                async move { store.get(repository, address).await }
+                            ));
+                        }
 
-                    for handle in handles {
-                        let result = handle.await.expect("task panicked");
-                        assert!(result.is_err(), "get should have failed");
-                        assert!(
-                            result.unwrap_err().is_address_not_found(),
-                            "should be AddressNotFound"
+                        for handle in handles {
+                            let (got_fragment, got_payload) = handle
+                                .await
+                                .expect("task panicked")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get failed");
+                            assert_eq!(got_fragment.size_payload, fragment.size_payload);
+                            assert_eq!(got_payload, payload);
+                        }
+
+                        assert_eq!(
+                            durable.get_count(),
+                            1,
+                            "inflight dedup should collapse concurrent gets into a single durable get"
                         );
-                    }
+                    })
+                    .await;
+            }
 
-                    assert_eq!(
-                        durable.get_count(),
-                        1,
-                        "inflight dedup should collapse concurrent gets into a single durable get even on failure"
-                    );
-                })
-                .await;
+            #[tokio::test]
+            async fn failure_propagated_to_listeners() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let repository: Partition = random::<RepositoryId>();
+                        let address = random::<Address>();
+
+                        let durable = Arc::new(DelayStore::failing(
+                            StoreError::from(lore_storage::AddressNotFound::from(address)),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let error = handle
+                                .await
+                                .expect("task panicked")
+                                .expect_err("get should have failed");
+                            assert!(error.is_address_not_found(), "should be AddressNotFound");
+                        }
+
+                        assert_eq!(
+                            durable.get_count(),
+                            1,
+                            "inflight dedup should collapse concurrent gets into a single durable get even on failure"
+                        );
+                    })
+                    .await;
+            }
+        }
+
+        mod get_metadata {
+            use super::*;
+
+            #[tokio::test]
+            async fn success_propagated_to_listeners() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable =
+                            Arc::new(DelayStore::succeeding(fragment, payload, FAN_OUT_DELAY));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let data = handle
+                                .await
+                                .expect("task panicked")
+                                .expect("get_metadata failed");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchFull);
+                            assert_eq!(data.fragment.size_payload, fragment.size_payload);
+                            assert_eq!(
+                                data.payload, None,
+                                "a metadata answer carries no payload to copy to its listeners"
+                            );
+                        }
+
+                        assert_eq!(
+                            durable.get_metadata_count(),
+                            1,
+                            "inflight dedup should collapse concurrent get_metadata calls into a single durable lookup"
+                        );
+                    })
+                    .await;
+            }
+
+            /// A durable store that cannot answer leaves the composite with nothing better than
+            /// the empty starting result, and that is what every listener is handed.
+            #[tokio::test]
+            async fn durable_error_answers_every_listener_with_no_match() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let repository: Partition = random::<RepositoryId>();
+                        let address = random::<Address>();
+
+                        let durable = Arc::new(DelayStore::failing(
+                            StoreError::from(lore_storage::AddressNotFound::from(address)),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let data = handle
+                                .await
+                                .expect("task panicked")
+                                .expect("get_metadata reports a miss rather than failing");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchNone);
+                        }
+
+                        assert_eq!(
+                            durable.get_metadata_count(),
+                            1,
+                            "inflight dedup should collapse concurrent get_metadata calls into a single durable lookup even on failure"
+                        );
+                    })
+                    .await;
+            }
+
+            /// The inflight slot is keyed by partition and address, so unrelated lookups running
+            /// at the same time must not be served one another's answer.
+            #[tokio::test]
+            async fn distinct_addresses_each_fan_out() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, first_address, payload) = generate_random();
+                        let (_, second_address, _) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable =
+                            Arc::new(DelayStore::succeeding(fragment, payload, FAN_OUT_DELAY));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(2);
+                        for address in [first_address, second_address] {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let data = handle
+                                .await
+                                .expect("task panicked")
+                                .expect("get_metadata failed");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchFull);
+                        }
+
+                        assert_eq!(durable.get_metadata_count(), 2);
+                    })
+                    .await;
+            }
+
+            /// The slot is released once the fan-out it covers has broadcast, so a later caller
+            /// starts a fresh one instead of subscribing to a channel nothing will send on.
+            #[tokio::test]
+            async fn slot_released_once_the_fan_out_completes() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable =
+                            Arc::new(DelayStore::succeeding(fragment, payload, Duration::ZERO));
+                        let composite = composite_over(durable.clone()).await;
+
+                        for _ in 0..2 {
+                            let data = composite
+                                .clone()
+                                .get_metadata(repository, address)
+                                .await
+                                .expect("get_metadata failed");
+                            assert_eq!(data.match_made, lore_storage::StoreMatch::MatchFull);
+                        }
+
+                        assert_eq!(durable.get_metadata_count(), 2);
+                    })
+                    .await;
+            }
         }
     }
 
