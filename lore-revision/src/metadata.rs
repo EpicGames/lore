@@ -8,16 +8,20 @@ pub mod list;
 pub mod repository;
 pub mod set;
 
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_error_set::prelude::*;
+use lore_storage::ContentSource;
 use zerocopy::IntoBytes;
 
 use crate::errors::*;
 use crate::event::EventError;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
 use crate::interface::LoreError;
 use crate::lore::Address;
@@ -25,6 +29,9 @@ use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
 use crate::repository::RepositoryContext;
+use crate::util::path::RelativePath;
+use crate::util::path::is_path_inside_repository;
+use crate::util::path::make_absolute;
 
 /// Maximum serialized metadata blob size. Metadata is loaded fully into memory
 /// at deserialize time; callers needing to attach larger data should store it
@@ -146,6 +153,60 @@ pub const RESERVED_ERASE: [&str; 4] = [
     RESTORED_FROM,
     FAST_FORWARD_MERGE,
 ];
+
+/// The address the file a user named as a binary metadata value was stored at.
+///
+/// A path inside the repository is read through an operation on it, so a virtual filesystem
+/// answers for it, and the store reads it under that operation. One outside is read from the host
+/// filesystem: a value is free to name a file the user never put in a repository at all. Only a
+/// relative path needs a working tree to resolve against, so an absolute one is read from a
+/// context holding none -- a server, an in-memory handle -- rather than refused.
+///
+/// Streamed from where it sits rather than read whole, so what a value may name is bounded by the
+/// store and not by memory. Written under a zero context, so content that several revisions or
+/// files name keeps one entry.
+pub(crate) async fn store_binary_payload<E>(
+    repository: &Arc<RepositoryContext>,
+    value: &[u8],
+) -> Result<Address, E>
+where
+    E: ErrorSet + From<InvalidArguments>,
+{
+    let user_path = String::from_utf8_lossy(value);
+
+    let store = async |source: ContentSource<'static>| {
+        immutable::write_from_file(
+            repository.clone(),
+            &source,
+            Context::default(),
+            immutable::write_options_from_repository(repository.clone()),
+        )
+        .await
+        .map(|(address, _size)| address)
+        .forward_any::<E>("Failed to store the binary metadata payload")
+    };
+
+    let repository_path = if Path::new(user_path.as_ref()).is_absolute() {
+        repository.path()
+    } else {
+        Some(repository.require_path()?)
+    };
+
+    if let Some(repository_path) =
+        repository_path.filter(|root| is_path_inside_repository(root, &user_path))
+    {
+        let path = RelativePath::new_from_user_path(repository_path, &user_path)
+            .forward_any::<E>("Failed to resolve the binary metadata path")?;
+        return with_operation(repository.file_system(), async |operation| {
+            store(operation.content_source(&path)).await
+        })
+        .await;
+    }
+
+    let outside =
+        make_absolute(&user_path).forward_any::<E>("Failed to resolve the binary metadata path")?;
+    store(ContentSource::owned_file(outside)).await
+}
 
 /// Which of a source revision's keys a merge or cherry-pick carries onto the
 /// revision it creates, so the result reads as the integrated sum of the work

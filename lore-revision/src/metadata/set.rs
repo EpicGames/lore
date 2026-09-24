@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
@@ -28,11 +26,11 @@ use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event;
-use crate::immutable;
-use crate::lore::Context;
+use crate::lore::Address;
 use crate::lore::Hash;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
+use crate::metadata::store_binary_payload;
 use crate::node;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
@@ -128,45 +126,8 @@ pub(crate) async fn set_revision(
         let value = values[i];
         let format = formats[i];
 
-        let is_binary = format == MetadataType::Binary;
-        if is_binary {
-            // Read metadata from disk
-            let payload = {
-                let input_path = {
-                    let user_path = String::from_utf8_lossy(value).to_string();
-                    let given_path = PathBuf::from(&user_path);
-                    if given_path.is_absolute() {
-                        given_path
-                    } else {
-                        let repository_path = repository.require_path()?;
-                        let relative_path =
-                            RelativePath::new_from_user_path(repository_path, &user_path)
-                                .forward::<SetError>("Invalid path")?;
-                        relative_path.to_absolute_path(repository_path)
-                    }
-                };
-
-                lore_io::IoDriver::global()
-                    .read_file_bytes(input_path)
-                    .await
-                    .internal("Invalid path")?
-            };
-
-            // When storing binary data, put it in the immutable store
-            // Use a zero context to avoid creating extra entries if multiple
-            // revisions use the same metadata blob
-            let address = {
-                immutable::write(
-                    repository.clone(),
-                    Context::default(),
-                    Bytes::from_owner(payload),
-                    immutable::write_options_from_repository(repository.clone()),
-                )
-                .await
-                .forward::<SetError>("Failed to write payload")?
-            };
-
-            // When storing binary data, put its address in the metadata
+        if format == MetadataType::Binary {
+            let address = store_binary_payload::<SetError>(&repository, value).await?;
             metadata
                 .set(key, address.as_bytes(), MetadataType::Address)
                 .forward::<SetError>("Failed to set metadata")?;
@@ -267,57 +228,9 @@ async fn set_file_task(
         };
 
         for index in 0..keys.len() {
-            let key = &keys[index];
-            let value = &values[index];
-            let format = formats[index];
-
-            let is_binary = format == MetadataType::Binary;
-            if is_binary {
-                // Read metadata from disk
-                let payload = {
-                    let input_path = {
-                        let user_path = String::from_utf8_lossy(value).to_string();
-                        let given_path = PathBuf::from(&user_path);
-                        if given_path.is_absolute() {
-                            given_path
-                        } else {
-                            let repository_path = repository.require_path()?;
-                            let relative_path =
-                                RelativePath::new_from_user_path(repository_path, &user_path)
-                                    .forward::<SetError>("Invalid path")?;
-                            relative_path.to_absolute_path(repository_path)
-                        }
-                    };
-
-                    lore_io::IoDriver::global()
-                        .read_file_bytes(input_path)
-                        .await
-                        .internal("Invalid path")?
-                };
-
-                // When storing binary data, put it in the immutable store
-                // Use a zero context to avoid creating extra entries if multiple
-                // files use the same metadata blob
-                let address = {
-                    immutable::write(
-                        repository.clone(),
-                        Context::default(),
-                        Bytes::from_owner(payload),
-                        immutable::write_options_from_repository(repository.clone()),
-                    )
-                    .await
-                    .forward::<SetError>("Failed to write payload")?
-                };
-
-                // When storing binary data, put its address in the metadata
-                metadata
-                    .set(key, address.as_bytes(), MetadataType::Address)
-                    .forward::<SetError>("Failed to set metadata")?;
-            } else {
-                metadata
-                    .set(key, value, format)
-                    .forward::<SetError>("Failed to set metadata")?;
-            }
+            metadata
+                .set(&keys[index], &values[index], formats[index])
+                .forward::<SetError>("Failed to set metadata")?;
         }
 
         let metadata_hash_updated = metadata
@@ -357,6 +270,33 @@ async fn set_file_task(
     }
 
     Ok(())
+}
+
+/// The address each binary value's payload was stored at, `None` where the value stands for
+/// itself, and empty where none of them is binary.
+///
+/// A binary value names a file, and the same file whatever path it is set on, so its payload is
+/// stored once here rather than once per path. Storing it here also keeps the read out of the
+/// per-path tasks: a filesystem holds one operation at a time, and those tasks run concurrently.
+async fn binary_payload_addresses(
+    repository: &Arc<RepositoryContext>,
+    values: &[&[u8]],
+    formats: &[MetadataType],
+) -> Result<Vec<Option<Address>>, SetError> {
+    if !formats.contains(&MetadataType::Binary) {
+        return Ok(Vec::new());
+    }
+
+    let mut addresses = Vec::with_capacity(formats.len());
+    for (index, format) in formats.iter().enumerate() {
+        addresses.push(match format {
+            MetadataType::Binary => {
+                Some(store_binary_payload::<SetError>(repository, values[index]).await?)
+            }
+            _ => None,
+        });
+    }
+    Ok(addresses)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -406,6 +346,8 @@ pub async fn set_file(
         .await
         .forward_any::<SetError>("Failed to deserialize state")?;
 
+    let addresses = binary_payload_addresses(&repository, values, formats).await?;
+
     let events = paths.len() == 1; // Only if a single path is given.
 
     const MAX_TASK_COUNT: usize = 1000;
@@ -419,13 +361,19 @@ pub async fn set_file(
         let repository = repository.clone();
         let state = state.clone();
         let path = (*path).to_string();
-        let formats = formats[offset..offset + count].to_vec();
+        let mut formats = formats[offset..offset + count].to_vec();
 
         let mut keys_vec = vec![];
         let mut values_vec = vec![];
         for i in 0..count {
             keys_vec.push(keys[offset + i].to_vec());
-            values_vec.push(values[offset + i].to_vec());
+            match addresses.get(offset + i).and_then(Option::as_ref) {
+                Some(address) => {
+                    values_vec.push(address.as_bytes().to_vec());
+                    formats[i] = MetadataType::Address;
+                }
+                None => values_vec.push(values[offset + i].to_vec()),
+            }
         }
 
         lore_spawn!(tasks, {

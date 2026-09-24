@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_error_set::prelude::*;
 
 use crate::branch;
@@ -35,8 +33,8 @@ use crate::lore::Context;
 use crate::lore::Hash;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
+use crate::metadata::store_binary_payload;
 use crate::repository::RepositoryContext;
-use crate::util::path::RelativePath;
 
 /// Keys that cannot be modified or removed via the branch metadata API.
 pub const READ_ONLY_KEYS: &[&str] = &[
@@ -334,33 +332,7 @@ pub(crate) async fn set(
         let format = formats[i];
 
         if format == MetadataType::Binary {
-            let payload = {
-                let user_path = String::from_utf8_lossy(value).to_string();
-                let given_path = PathBuf::from(&user_path);
-                let input_path = if given_path.is_absolute() {
-                    given_path
-                } else {
-                    let repo_path = repo.require_path()?;
-                    let relative_path =
-                        RelativePath::new_from_user_path(repo_path, &user_path)
-                            .forward::<BranchMetadataError>("resolving binary metadata path")?;
-                    relative_path.to_absolute_path(repo_path)
-                };
-
-                lore_io::IoDriver::global()
-                    .read_file_bytes(input_path)
-                    .await
-                    .internal("reading binary metadata file")?
-            };
-
-            let address = immutable::write(
-                repo.clone(),
-                Context::default(),
-                Bytes::from_owner(payload),
-                immutable::write_options_from_repository(repo.clone()),
-            )
-            .await
-            .forward::<BranchMetadataError>("writing binary metadata to immutable store")?;
+            let address = store_binary_payload::<BranchMetadataError>(&repo, value).await?;
 
             metadata
                 .set_address(

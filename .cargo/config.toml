@@ -28,7 +28,6 @@ rustflags = [
     "-Wclippy::flat_map_option",
     "-Wclippy::float_cmp_const",
     "-Wclippy::fn_params_excessive_bools",
-    "-Wclippy::from_iter_instead_of_collect",
     "-Wclippy::implicit_clone",
     "-Wclippy::imprecise_flops",
     "-Wclippy::inefficient_to_string",
