@@ -578,7 +578,7 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
 
 
 
@@ -592,7 +592,7 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
+Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
 
 **Usage:** `lore repository instance prune`
 

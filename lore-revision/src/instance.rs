@@ -829,7 +829,32 @@ fn names_unreachable_volume(_error: &io::Error) -> bool {
 /// The instance file is looked up through
 /// [`crate::repository::get_dot_lore_path`], so a legacy `.urc` directory and
 /// an SWFS mount whose `.lore` lives outside the path are both resolved.
+///
+/// Outside the service no mount manager resolves an SWFS instance, whose path
+/// is absent or an empty mount point while it is not mounted. An SWFS instance
+/// cannot be removed by hand, so its external `.lore` in the global data
+/// directory is evidence it still exists, and outweighs a missing path or
+/// checkout.
 pub async fn instance_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
+    let staleness = path_staleness(path, instance_id).await;
+    // SWFS instances will seem stale, so if the result would be stale AND there is an external
+    // config AND that config is an SWFS instance, then override the result.
+    if matches!(
+        staleness,
+        InstanceStaleness::PathMissing | InstanceStaleness::CheckoutMissing
+    ) && let Ok(external) = crate::global::external_dir::external_lore_dir(instance_id)
+        && external_dot_lore_names_swfs(&external).await
+    {
+        InstanceStaleness::Active
+    } else {
+        staleness
+    }
+}
+
+/// Classify the registration of `instance_id` at `path` by what the path
+/// holds, as [`instance_staleness`] does before consulting external `.lore`
+/// directories.
+async fn path_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
     if path.is_empty() {
         return InstanceStaleness::Active;
     }
@@ -859,6 +884,18 @@ pub async fn instance_staleness(path: &str, instance_id: InstanceId) -> Instance
         Err(err) if is_absent(&err) => InstanceStaleness::CheckoutMissing,
         Err(_) => InstanceStaleness::Active,
     }
+}
+
+/// Whether the external `.lore` directory at `dot_lore` holds the config of an
+/// SWFS-backed instance. An absent config names none; one that is present but
+/// cannot be read or parsed is not evidence against an SWFS instance, so it
+/// counts as one.
+async fn external_dot_lore_names_swfs(dot_lore: &Path) -> bool {
+    crate::util::config::load::<crate::repository::RepositoryConfig>(
+        dot_lore.join(crate::repository::CONFIG),
+    )
+    .await
+    .map_or(true, |config| config.is_swfs())
 }
 
 /// The branch (ID and name) and revision an instance has checked out, read
@@ -987,7 +1024,8 @@ pub async fn instance_list(repository: Arc<RepositoryContext>) -> Result<(), Ins
 
 /// Prune stale instances: those whose path no longer exists, those whose path
 /// now holds a repository with a different current instance, and those whose
-/// path holds no checkout at all.
+/// path holds no checkout at all. An SWFS instance with an external `.lore` is
+/// kept whether or not it is mounted; see [`instance_staleness`].
 /// Emits a `RepositoryInstance` event for each pruned instance.
 pub async fn instance_prune(repository: Arc<RepositoryContext>) -> Result<u32, InstanceError> {
     if repository.try_write_token().is_none() {
@@ -1023,6 +1061,8 @@ impl fmt::Debug for InstanceId {
 }
 
 #[cfg(test)]
+// Fixtures write external `.lore` configs directly; what these test is how staleness reads them.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::repository::SALT_LORE;
@@ -1079,6 +1119,65 @@ mod tests {
         let mut restored = InstanceId::default();
         restored.as_mut_bytes().copy_from_slice(&bytes);
         assert_eq!(id, restored);
+    }
+
+    /// The minimal config of an SWFS-backed instance.
+    const SWFS_CONFIG: &[u8] = b"[vfs]\nvfs_type = \"Swfs\"\n";
+
+    fn external_dot_lore(config: Option<&[u8]>) -> lore_base::test_util::TempDir {
+        let dir = lore_base::test_util::TempDir::new("lore-instance-external-");
+        if let Some(config) = config {
+            std::fs::write(dir.path().join(crate::repository::CONFIG), config)
+                .expect("write config");
+        }
+        dir
+    }
+
+    #[tokio::test]
+    async fn an_swfs_config_names_swfs() {
+        let dir = external_dot_lore(Some(SWFS_CONFIG));
+        assert!(external_dot_lore_names_swfs(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn a_config_without_swfs_does_not_name_swfs() {
+        for config in [
+            &b"[vfs]\nvfs_type = \"None\"\n"[..],
+            b"remote_url = \"lore://host\"\n",
+        ] {
+            let dir = external_dot_lore(Some(config));
+            assert!(
+                !external_dot_lore_names_swfs(dir.path()).await,
+                "{}",
+                String::from_utf8_lossy(config)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_config_does_not_name_swfs() {
+        let dir = external_dot_lore(None);
+        assert!(!external_dot_lore_names_swfs(dir.path()).await);
+        assert!(
+            !external_dot_lore_names_swfs(&dir.path().join("absent")).await,
+            "a missing external directory holds no config"
+        );
+    }
+
+    /// Only positive evidence makes a registration stale, so a config that is
+    /// there but cannot be understood counts as an SWFS instance.
+    #[tokio::test]
+    async fn an_unparseable_config_names_swfs() {
+        let dir = external_dot_lore(Some(b"this is not toml = = ="));
+        assert!(external_dot_lore_names_swfs(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_config_names_swfs() {
+        let dir = external_dot_lore(None);
+        std::fs::create_dir(dir.path().join(crate::repository::CONFIG))
+            .expect("occupy the config path");
+        assert!(external_dot_lore_names_swfs(dir.path()).await);
     }
 
     #[test]

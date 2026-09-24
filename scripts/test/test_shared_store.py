@@ -21,6 +21,7 @@ from lore_parsers import (
     SpecificSharedStoreInfo,
     parse_jsonl,
 )
+from test_repository_info import get_instance_id
 from test_utils import to_posix
 
 from lore import Lore
@@ -1221,6 +1222,70 @@ def test_instance_prune_nothing_to_prune(new_lore_repo):
     output = repo.run(["repository", "instance", "prune"], json=True)
     pruned = parse_jsonl(output, "repositoryInstance")
     assert len(pruned) == 0, f"Expected no pruned instances, got {len(pruned)}"
+
+
+SWFS_CONFIG = '[vfs]\nvfs_type = "Swfs"\n'
+NON_SWFS_CONFIG = '[vfs]\nvfs_type = "None"\n'
+
+
+def plant_external_instance(global_dir_name: str, repo: Lore, config: str):
+    """Write the external `.lore` directory the Lore service keeps for an SWFS
+    instance, so `repo` stands in for an SWFS instance that isn't mounted. SWFS
+    is not available to smoke tests, so they cannot create a real one."""
+    instance_id = get_instance_id(repo.repository_info())
+    assert instance_id is not None
+    external_dot_lore = os.path.join(
+        global_dir_name, "data", "external", instance_id, ".lore"
+    )
+    os.makedirs(external_dot_lore)
+    with open(os.path.join(external_dot_lore, "config.toml"), "w") as f:
+        f.write(config)
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("leave_mount_point", [False, True])
+def test_instance_prune_keeps_unmounted_swfs_instance(
+    new_lore_repo, global_dir_name, leave_mount_point
+):
+    """Without the service, an SWFS instance's path is absent or an empty mount
+    point. Its external `.lore` shows the instance still exists, so prune keeps
+    it and list reports it as live, with its anchors intact."""
+    repo_a, repo_b = create_shared_instances(new_lore_repo)
+    plant_external_instance(global_dir_name, repo_b, SWFS_CONFIG)
+
+    shutil.rmtree(repo_b.path)
+    if leave_mount_point:
+        os.makedirs(repo_b.path)
+
+    output = repo_a.run(["repository", "instance", "prune"], json=True)
+    pruned = parse_jsonl(output, "repositoryInstance")
+    assert len(pruned) == 0, f"Expected no pruned instances, got {pruned}"
+
+    output = repo_a.run(["repository", "instance", "list"], json=True)
+    instances = parse_jsonl(output, "repositoryInstance")
+    by_path = {to_posix(i["path"]): i for i in instances}
+    assert to_posix(repo_b.path) in by_path
+    swfs_instance = by_path[to_posix(repo_b.path)]
+    assert swfs_instance["stale"] == 0
+    assert swfs_instance["branchName"] == "main"
+    assert swfs_instance["revision"] != "0" * 64
+
+
+@pytest.mark.smoke
+def test_instance_prune_removes_instance_with_non_swfs_external_dir(
+    new_lore_repo, global_dir_name
+):
+    """An external `.lore` whose config is not SWFS is no evidence the instance
+    still exists, so a missing path is pruned as usual."""
+    repo_a, repo_b = create_shared_instances(new_lore_repo)
+    plant_external_instance(global_dir_name, repo_b, NON_SWFS_CONFIG)
+
+    shutil.rmtree(repo_b.path)
+
+    output = repo_a.run(["repository", "instance", "prune"], json=True)
+    pruned = parse_jsonl(output, "repositoryInstance")
+    assert len(pruned) == 1, f"Expected 1 pruned instance, got {pruned}"
+    assert to_posix(pruned[0]["path"]) == to_posix(repo_b.path)
 
 
 @pytest.mark.smoke

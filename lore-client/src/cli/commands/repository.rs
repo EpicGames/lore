@@ -405,7 +405,9 @@ pub struct RepositoryInstanceArgs {
 pub enum RepositoryInstanceCommands {
     /// List all registered instances for this repository
     List,
-    /// Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
+    /// Remove stale instance entries: paths that no longer exist, paths that hold no revision, and
+    /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
+    /// in the global data directory, even when it is not mounted.
     Prune,
 }
 
