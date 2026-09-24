@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package lore.user.v1;
+
+// User directory. Clients call this service to resolve user names/ids and
+// user partition lists.
+service UserService {
+  // Resolve user IDs to users. IDs the directory does not know are omitted
+  // from the answer rather than reported as errors.
+  rpc UserGet(UserGetRequest) returns (UserGetResponse);
+  // Find the users whose username or display name equals a given name.
+  rpc UserFind(UserFindRequest) returns (UserFindResponse);
+  // Stream the partitions the bearer holds permissions on, one per message,
+  // with the permissions held on each. The Lore server drives
+  // `RepositoryList` from this.
+  rpc PartitionList(PartitionListRequest) returns (stream PartitionListResponse);
+}
+
+// A user as the directory knows them.
+message User {
+  // The durable user identifier, the value Lore records as a repository's
+  // `creator`, a revision's author or a lock's `owner`.
+  string id = 1;
+  // The name shown for the user.
+  string display_name = 2;
+  // The login name, unique among the directory's users. In OIDC tokens
+  // this is `preferred_username`. Empty when the directory has none.
+  string username = 3;
+}
+
+// Request to resolve user IDs within a partition.
+message UserGetRequest {
+  // The partition the caller is working in, so a directory that
+  // scopes user visibility by partition can restrict its answer.
+  // A directory that does not scope by partition ignores it.
+  bytes partition = 1;
+  // The user IDs to resolve.
+  repeated string id = 2;
+}
+
+// Response carrying the users known by the directory.
+message UserGetResponse {
+  // One entry per requested ID the directory knows, each carrying its `id`,
+  // so the order carries no meaning. Unknown IDs are absent.
+  repeated User user = 1;
+}
+
+// Request to find users by name within a partition.
+message UserFindRequest {
+  // The partition the caller is working in. See `UserGetRequest`.
+  bytes partition = 1;
+  // Which field the name is matched against, exactly.
+  oneof query {
+    // `User.username`. Unique, so at most one user matches.
+    string username = 2;
+    // `User.display_name`. Not unique, so several users may match.
+    string display_name = 3;
+  }
+}
+
+// Response carrying every user the query matched.
+message UserFindResponse {
+  // The matching users. Empty when none matches.
+  repeated User user = 1;
+}
+
+// Request to stream the caller's partitions. The caller ID is read from
+// the token.
+message PartitionListRequest {}
+
+// One-per-stream-message response carrying a single partition the bearer
+// holds permissions on.
+message PartitionListResponse {
+  // The partition id.
+  bytes partition = 1;
+  // The permission names the bearer holds on the partition.
+  repeated string permission = 2;
+}
