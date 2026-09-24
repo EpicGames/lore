@@ -13,6 +13,9 @@ use crate::diff;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
 use crate::immutable::read_options_from_repository;
 use crate::infer::infer_is_diffable_by_slice;
@@ -126,6 +129,27 @@ pub struct DiffOptions {
     pub ignore_whitespace_inline: bool,
 }
 
+/// What a diff reads one side from: a revision, or the working tree through an operation.
+///
+/// Only the target of a diff against the working tree reads from the tree, so an operation is
+/// opened for the output of such a diff alone and not around the whole of it: calculating the
+/// changes against the filesystem opens one of its own, and a filesystem holds one at a time.
+#[derive(Clone, Copy)]
+enum DiffSide<'a> {
+    Revision(&'a Arc<State>),
+    Working(&'a Arc<InstanceOperationImpl>),
+}
+
+impl<'a> DiffSide<'a> {
+    /// The revision the side reads from, and `None` for the working tree, which names none.
+    fn revision(self) -> Option<&'a Arc<State>> {
+        match self {
+            DiffSide::Revision(state) => Some(state),
+            DiffSide::Working(_) => None,
+        }
+    }
+}
+
 pub async fn diff(
     repository: Arc<RepositoryContext>,
     source_revision: Option<String>,
@@ -193,6 +217,8 @@ pub async fn diff(
         None
     };
 
+    require_working_tree_target(&repository, state_target.as_ref())?;
+
     if diff3 {
         Box::pin(file_diff3(
             repository,
@@ -207,6 +233,21 @@ pub async fn diff(
     } else {
         file_diff2(repository, state_source, state_target, paths, options).await
     }
+}
+
+/// Refuses a diff against the working tree from a context holding no path to one.
+///
+/// The target side of such a diff is read from the tree. A context without a path -- a server or
+/// in-memory handle -- carries a filesystem rooted at the empty path, which resolves against the
+/// process working directory rather than against any tree a revision describes.
+fn require_working_tree_target(
+    repository: &RepositoryContext,
+    state_target: Option<&Arc<State>>,
+) -> Result<(), DiffError> {
+    if state_target.is_none() {
+        repository.require_path()?;
+    }
+    Ok(())
 }
 
 async fn file_diff2(
@@ -257,15 +298,27 @@ async fn file_diff2(
         changes
     };
 
-    emit_unified_diffs(
-        repository,
-        &state_source,
-        &state_target,
-        &changes,
-        &[],
-        options,
-    )
-    .await
+    let emit = async |target: DiffSide<'_>| {
+        emit_unified_diffs(
+            repository.clone(),
+            &state_source,
+            target,
+            &changes,
+            &[],
+            options,
+        )
+        .await
+    };
+
+    match state_target {
+        Some(state_target) => emit(DiffSide::Revision(&state_target)).await,
+        None => {
+            with_operation(repository.file_system(), async |operation| {
+                emit(DiffSide::Working(&operation)).await
+            })
+            .await
+        }
+    }
 }
 
 async fn coalesce_staged_moves(
@@ -374,29 +427,39 @@ async fn file_diff3(
         .await
         .forward::<DiffError>("Failed deserializing revision state")?;
 
-    emit_diff3_changes(
-        repository.clone(),
-        &state_source,
-        &state_target,
-        &state_base,
-        &diff_result.changes,
-        &paths,
-        options,
-    )
-    .await?;
+    let emit = async |target: DiffSide<'_>| {
+        emit_diff3_changes(
+            repository.clone(),
+            &state_source,
+            target,
+            &state_base,
+            &diff_result.changes,
+            &paths,
+            options,
+        )
+        .await?;
 
-    emit_diff3_conflicts(
-        repository.clone(),
-        &state_source,
-        &state_target,
-        &state_base,
-        &diff_result.conflicts,
-        &paths,
-        options,
-    )
-    .await?;
+        emit_diff3_conflicts(
+            repository.clone(),
+            &state_source,
+            target,
+            &state_base,
+            &diff_result.conflicts,
+            &paths,
+            options,
+        )
+        .await
+    };
 
-    Ok(())
+    match state_target {
+        Some(state_target) => emit(DiffSide::Revision(&state_target)).await,
+        None => {
+            with_operation(repository.file_system(), async |operation| {
+                emit(DiffSide::Working(&operation)).await
+            })
+            .await
+        }
+    }
 }
 
 /// Emit diffs for non-conflicting changes in diff3 mode.
@@ -406,7 +469,7 @@ async fn file_diff3(
 async fn emit_diff3_changes(
     repository: Arc<RepositoryContext>,
     state_source: &Arc<State>,
-    state_target: &Option<Arc<State>>,
+    target: DiffSide<'_>,
     state_base: &Arc<State>,
     changes: &[NodeChange],
     paths: &[RelativePath],
@@ -421,8 +484,8 @@ async fn emit_diff3_changes(
             }
             emit_move_diff(
                 repository.clone(),
-                state_base,
-                state_target,
+                DiffSide::Revision(state_base),
+                target,
                 from_path,
                 change.path(),
                 options,
@@ -443,19 +506,24 @@ async fn emit_diff3_changes(
         }
 
         let base_content = if is_from_file {
-            diff_read_file(repository.clone(), Some(state_base.clone()), change.path()).await?
+            diff_read_file(
+                repository.clone(),
+                DiffSide::Revision(state_base),
+                change.path(),
+            )
+            .await?
         } else {
             DiffContent::empty()
         };
         let target_content = if is_to_file {
-            diff_read_file(repository.clone(), state_target.clone(), change.path()).await?
+            diff_read_file(repository.clone(), target, change.path()).await?
         } else {
             DiffContent::empty()
         };
         // Baseline content: try-read since NodeChange flags don't cover the baseline state
         let source_content = match diff_read_file(
             repository.clone(),
-            Some(state_source.clone()),
+            DiffSide::Revision(state_source),
             change.path(),
         )
         .await
@@ -481,24 +549,12 @@ async fn emit_diff3_changes(
             continue;
         }
 
-        let target_label = if let Some(state_target) = state_target.as_ref() {
-            format!(
-                "{}@{}",
-                change.path().as_str(),
-                state_target.revision_number()
-            )
-        } else {
-            change.path().as_str().to_string()
-        };
+        let target_label = diff_label(change.path(), target);
 
         if base_content.text() == source_content.text() {
             // Only the target branch modified this file
             let from_label = if is_from_file {
-                format!(
-                    "{}@{}",
-                    change.path().as_str(),
-                    state_base.revision_number()
-                )
+                diff_label(change.path(), DiffSide::Revision(state_base))
             } else {
                 "/dev/null".to_string()
             };
@@ -563,7 +619,7 @@ async fn emit_diff3_changes(
 async fn emit_diff3_conflicts(
     repository: Arc<RepositoryContext>,
     state_source: &Arc<State>,
-    state_target: &Option<Arc<State>>,
+    target: DiffSide<'_>,
     state_base: &Arc<State>,
     conflicts: &[(NodeChange, NodeChange)],
     paths: &[RelativePath],
@@ -590,7 +646,7 @@ async fn emit_diff3_conflicts(
         let base = if base_has_file {
             diff_read_file(
                 repository.clone(),
-                Some(state_base.clone()),
+                DiffSide::Revision(state_base),
                 source_change.path(),
             )
             .await?
@@ -600,42 +656,36 @@ async fn emit_diff3_conflicts(
         let source = if source_has_file {
             diff_read_file(
                 repository.clone(),
-                Some(state_source.clone()),
+                DiffSide::Revision(state_source),
                 source_change.path(),
             )
             .await?
         } else {
             DiffContent::empty()
         };
-        let target = if target_has_file {
-            diff_read_file(
-                repository.clone(),
-                state_target.clone(),
-                source_change.path(),
-            )
-            .await?
+        let target_content = if target_has_file {
+            diff_read_file(repository.clone(), target, source_change.path()).await?
         } else {
             DiffContent::empty()
         };
 
         // Binary content: emit a marker instead of three-way merging bytes.
-        if base.is_binary() || source.is_binary() || target.is_binary() {
+        if base.is_binary() || source.is_binary() || target_content.is_binary() {
             emit_binary_diff(source_change.path(), LoreFileAction::Keep);
             continue;
         }
 
         let source_label = format!("source@{}", state_source.revision_number());
-        let target_label = if let Some(state_target) = state_target.as_ref() {
-            format!("target@{}", state_target.revision_number())
-        } else {
-            "target".to_string()
+        let target_label = match target.revision() {
+            Some(state_target) => format!("target@{}", state_target.revision_number()),
+            None => "target".to_string(),
         };
 
         // mine = CLI --source, theirs = CLI --target
         match merge3_text(
             base.text(),
             source.text(),
-            target.text(),
+            target_content.text(),
             Some(&format!("base@{}", state_base.revision_number())),
             Some(&source_label),
             Some(&target_label),
@@ -670,7 +720,7 @@ async fn emit_diff3_conflicts(
 async fn emit_unified_diffs(
     repository: Arc<RepositoryContext>,
     state_source: &Arc<State>,
-    state_target: &Option<Arc<State>>,
+    target: DiffSide<'_>,
     changes: &[NodeChange],
     paths: &[RelativePath],
     options: DiffOptions,
@@ -684,8 +734,8 @@ async fn emit_unified_diffs(
             }
             emit_move_diff(
                 repository.clone(),
-                state_source,
-                state_target,
+                DiffSide::Revision(state_source),
+                target,
                 from_path,
                 change.path(),
                 options,
@@ -695,14 +745,13 @@ async fn emit_unified_diffs(
         }
 
         let is_from_file = change.from.flags.contains(NodeFlags::File);
-        let is_to_file = if state_target.is_some() {
-            change.to.flags.contains(NodeFlags::File)
-        } else {
-            let check_absolute_path = change.path().to_absolute_path(repository.require_path()?);
-            lore_io::IoDriver::global()
-                .metadata(check_absolute_path)
+        let is_to_file = match target {
+            DiffSide::Revision(_) => change.to.flags.contains(NodeFlags::File),
+            DiffSide::Working(operation) => operation
+                .file_info(change.path())
                 .await
-                .is_ok_and(|m| m.is_file())
+                .forward::<DiffError>("Failed to query the working file")?
+                .is_file(),
         };
 
         if !is_from_file && !is_to_file {
@@ -725,27 +774,23 @@ async fn emit_unified_diffs(
             continue;
         };
 
-        let source_label = diff_label(change.path(), Some(state_source));
-        let target_label = diff_label(change.path(), state_target.as_ref());
-
         if action == LoreFileAction::Keep {
             let source = diff_read_file(
                 repository.clone(),
-                Some(state_source.clone()),
+                DiffSide::Revision(state_source),
                 change.path(),
             )
             .await?;
-            let target =
-                diff_read_file(repository.clone(), state_target.clone(), change.path()).await?;
-            if source.is_binary() || target.is_binary() {
+            let target_content = diff_read_file(repository.clone(), target, change.path()).await?;
+            if source.is_binary() || target_content.is_binary() {
                 emit_binary_diff(change.path(), action);
                 continue;
             }
             emit_diff_event(
                 source.text(),
-                target.text(),
-                &source_label,
-                &target_label,
+                target_content.text(),
+                &diff_label(change.path(), DiffSide::Revision(state_source)),
+                &diff_label(change.path(), target),
                 change.path(),
                 action,
                 options,
@@ -753,7 +798,7 @@ async fn emit_unified_diffs(
         } else if action == LoreFileAction::Delete {
             let source = diff_read_file(
                 repository.clone(),
-                Some(state_source.clone()),
+                DiffSide::Revision(state_source),
                 change.path(),
             )
             .await?;
@@ -764,22 +809,21 @@ async fn emit_unified_diffs(
             emit_diff_event(
                 source.text(),
                 "",
-                &source_label,
+                &diff_label(change.path(), DiffSide::Revision(state_source)),
                 "/dev/null",
                 change.path(),
                 action,
                 options,
             );
         } else if action == LoreFileAction::Add {
-            let target =
-                diff_read_file(repository.clone(), state_target.clone(), change.path()).await?;
-            if target.is_binary() {
+            let target_content = diff_read_file(repository.clone(), target, change.path()).await?;
+            if target_content.is_binary() {
                 emit_binary_diff(change.path(), action);
                 continue;
             }
             emit_diff_event(
                 "",
-                target.text(),
+                target_content.text(),
                 "/dev/null",
                 change.path().as_str(),
                 change.path(),
@@ -792,8 +836,8 @@ async fn emit_unified_diffs(
     Ok(())
 }
 
-fn diff_label(path: &RelativePath, state: Option<&Arc<State>>) -> String {
-    match state {
+fn diff_label(path: &RelativePath, side: DiffSide<'_>) -> String {
+    match side.revision() {
         Some(state) => format!("{}@{}", path.as_str(), state.revision_number()),
         None => path.as_str().to_string(),
     }
@@ -890,14 +934,14 @@ fn build_unified_patch(
 
 async fn emit_move_diff(
     repository: Arc<RepositoryContext>,
-    state_source: &Arc<State>,
-    state_target: &Option<Arc<State>>,
+    source: DiffSide<'_>,
+    target: DiffSide<'_>,
     from_path: &RelativePath,
     to_path: &RelativePath,
     options: DiffOptions,
 ) -> Result<(), DiffError> {
-    let source = diff_read_file(repository.clone(), Some(state_source.clone()), from_path).await?;
-    let target = diff_read_file(repository.clone(), state_target.clone(), to_path).await?;
+    let source_content = diff_read_file(repository.clone(), source, from_path).await?;
+    let target_content = diff_read_file(repository.clone(), target, to_path).await?;
 
     let header = format!(
         "move from {}\nmove to {}\n",
@@ -905,18 +949,18 @@ async fn emit_move_diff(
         to_path.as_str()
     );
 
-    let patch = if source.is_binary() || target.is_binary() {
-        if source.text() != target.text() {
+    let patch = if source_content.is_binary() || target_content.is_binary() {
+        if source_content.text() != target_content.text() {
             format!("{header}Binary files differ\n")
         } else {
             header
         }
     } else {
-        let from_label = diff_label(from_path, Some(state_source));
-        let to_label = diff_label(to_path, state_target.as_ref());
+        let from_label = diff_label(from_path, source);
+        let to_label = diff_label(to_path, target);
         match build_unified_patch(
-            source.text(),
-            target.text(),
+            source_content.text(),
+            target_content.text(),
             &from_label,
             &to_label,
             options,
@@ -1125,16 +1169,19 @@ fn make_diff_content(bytes: &[u8]) -> DiffContent {
 
 async fn diff_read_file(
     repository: Arc<RepositoryContext>,
-    state: Option<Arc<State>>,
+    side: DiffSide<'_>,
     relative_path: &RelativePath,
 ) -> Result<DiffContent, DiffError> {
-    let Some(state) = state else {
-        let path = relative_path.to_absolute_path(repository.require_path()?);
-        let content = lore_io::IoDriver::global()
-            .read_file_bytes(path.as_path())
-            .await
-            .internal_with(|| format!("Failed reading file for diff: {}", path.display()))?;
-        return Ok(make_diff_content(&content));
+    let state = match side {
+        DiffSide::Revision(state) => state,
+        DiffSide::Working(operation) => {
+            let content = operation
+                .content_source(relative_path)
+                .read_all()
+                .await
+                .forward_any::<DiffError>("Failed reading file for diff")?;
+            return Ok(make_diff_content(&content));
+        }
     };
 
     let node_link = state
@@ -1153,7 +1200,7 @@ async fn diff_read_file(
             .forward::<DiffError>("Failed deserializing revision state")?;
         (repository, state)
     } else {
-        (repository, state)
+        (repository, state.clone())
     };
 
     let Ok(node) = state.node(repository.clone(), node_link.node).await else {
