@@ -12,6 +12,8 @@ use lore_base::lore_spawn_net;
 use lore_proto::rpc::replication_service_client::ReplicationServiceClient;
 use lore_revision::cluster::peer::Locality;
 use lore_revision::cluster::peer::PeerInfo;
+use lore_revision::store::composite::METRICS_REPLICA_TYPE_LABEL;
+use lore_revision::store::composite::ReplicaType;
 use lore_revision::store::composite::ReplicationTarget;
 use lore_revision::store::composite::replica_factory::ReplicaFactory;
 use lore_revision::store::composite::replica_factory::ReplicaTargets;
@@ -145,6 +147,7 @@ impl ReplicationStoreTargetFactory {
     async fn make_quic_target(
         &self,
         peer_info: &PeerInfo,
+        replica_type: ReplicaType,
     ) -> Result<ReplicationTarget, Box<dyn Error + Send + Sync>> {
         let scheme = if self.quic_certs.client.is_some() {
             "quics"
@@ -208,7 +211,10 @@ impl ReplicationStoreTargetFactory {
             container_config,
             smallvec![
                 KeyValue::new(METRICS_PEER_ID_LABEL, peer_info.metric_id.clone()),
-                KeyValue::new(METRICS_PEER_LOCALITY_LABEL, peer_info.locality.as_str())
+                KeyValue::new(METRICS_PEER_LOCALITY_LABEL, peer_info.locality.as_str()),
+                // A peer serving both roles is two targets holding a connection each. Without
+                // this they record under one series and the two connections' statistics merge.
+                KeyValue::new(METRICS_REPLICA_TYPE_LABEL, replica_type.as_str()),
             ],
         )
         .await?;
@@ -245,14 +251,14 @@ impl ReplicaFactory for ReplicationStoreTargetFactory {
             if self.use_grpc_write_replication && peer_info.locality == Locality::SameRegion {
                 Some(self.make_grpc_write_target(peer_info).await?)
             } else {
-                Some(self.make_quic_target(peer_info).await?)
+                Some(self.make_quic_target(peer_info, ReplicaType::Write).await?)
             }
         } else {
             None
         };
 
         let read = if appropriate_for_read && self.read_replicas_enabled {
-            Some(self.make_quic_target(peer_info).await?)
+            Some(self.make_quic_target(peer_info, ReplicaType::Read).await?)
         } else {
             None
         };

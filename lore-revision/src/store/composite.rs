@@ -54,7 +54,26 @@ use crate::store::query_one;
 use crate::util::inflight::InflightOutput;
 use crate::util::inflight::RequestRole;
 
-const METRICS_REPLICA_TYPE_LABEL: &str = "replica_type";
+pub const METRICS_REPLICA_TYPE_LABEL: &str = "replica_type";
+
+/// Which of the two replica lists a target belongs to.
+///
+/// A peer serving both roles is held as two targets with a connection each, so anything recorded
+/// per connection carries this to keep the two apart.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReplicaType {
+    Read,
+    Write,
+}
+
+impl ReplicaType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReplicaType::Read => "read",
+            ReplicaType::Write => "write",
+        }
+    }
+}
 
 type InflightGetsKey = (Partition, Address);
 
@@ -617,11 +636,17 @@ impl CompositeStore {
         }
         self.instruments.gauge_num_replicas.record(
             self.write_replicas.read().await.len() as u64,
-            &[KeyValue::new(METRICS_REPLICA_TYPE_LABEL, "write")],
+            &[KeyValue::new(
+                METRICS_REPLICA_TYPE_LABEL,
+                ReplicaType::Write.as_str(),
+            )],
         );
         self.instruments.gauge_num_replicas.record(
             self.read_replicas.read().await.len() as u64,
-            &[KeyValue::new(METRICS_REPLICA_TYPE_LABEL, "read")],
+            &[KeyValue::new(
+                METRICS_REPLICA_TYPE_LABEL,
+                ReplicaType::Read.as_str(),
+            )],
         );
 
         refresh_result
