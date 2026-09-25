@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -11,6 +12,10 @@ use serde::Serialize;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::set_file_to_node;
+use crate::fs::filesystem_provider::with_operation;
 use crate::immutable;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -24,6 +29,7 @@ use crate::state;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::is_path_inside_repository;
+use crate::util::path::repository_relative_path;
 
 /// Data for the event emitted when file content is written to a destination.
 #[repr(C)]
@@ -128,6 +134,59 @@ fn check_destination_access(
     Ok(())
 }
 
+/// Where `output` names, and the path the working tree holds it at where it holds it at all.
+///
+/// A destination the tree holds is written through an operation on it, so a virtual filesystem
+/// answers for it. One outside the root, or under the dot directory, is written to the host
+/// filesystem as named.
+fn write_destination(
+    repository_path: &Path,
+    output: &str,
+) -> Result<(PathBuf, Option<RelativePath>), WriteError> {
+    let destination = if Path::new(output).is_absolute() {
+        PathBuf::from(output)
+    } else {
+        crate::util::path::make_absolute(output).map_err(|_err| InvalidPath {
+            path: output.to_string(),
+        })?
+    };
+    Ok((
+        destination,
+        repository_relative_path(repository_path, output),
+    ))
+}
+
+/// Refuses a destination a write must not replace.
+///
+/// A directory is never one. A file already there is one only under `--force`, so a write never
+/// silently replaces content the user named only the destination of.
+fn require_free_destination(held: FileInfo, destination: &Path) -> Result<(), WriteError> {
+    let occupied = match held {
+        FileInfo::NotExist => false,
+        FileInfo::Directory => true,
+        FileInfo::File { .. } => !execution_context().globals().force(),
+    };
+    if occupied {
+        return Err(InvalidPath {
+            path: destination.display().to_string(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// What the host filesystem holds at `destination`, for a destination no operation covers.
+async fn host_file_info(destination: &Path) -> Result<FileInfo, WriteError> {
+    match lore_io::IoDriver::global().metadata(destination).await {
+        Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
+        Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
+        Err(err) => Err(WriteError::internal_with_context(
+            err,
+            "checking output destination",
+        )),
+    }
+}
+
 pub(crate) async fn write_file(
     repository: Arc<RepositoryContext>,
     token: Option<&RepositoryWriteToken>,
@@ -163,45 +222,7 @@ pub(crate) async fn write_file(
             .unwrap_or(current_revision)
     };
 
-    let destination = {
-        let mut absolute_path = Path::new(&output).to_path_buf();
-        if !absolute_path.is_absolute() {
-            let Ok(resolved) = crate::util::path::make_absolute(&output) else {
-                return Err(InvalidPath {
-                    path: output.clone(),
-                }
-                .into());
-            };
-
-            absolute_path = resolved;
-        }
-        absolute_path
-    };
-
-    match lore_io::IoDriver::global().metadata(&destination).await {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                return Err(InvalidPath {
-                    path: destination.display().to_string(),
-                }
-                .into());
-            }
-            if metadata.is_file() && !execution_context().globals().force() {
-                return Err(InvalidPath {
-                    path: destination.display().to_string(),
-                }
-                .into());
-            }
-        }
-        Err(err) => {
-            if err.kind() != tokio::io::ErrorKind::NotFound {
-                return Err(WriteError::internal_with_context(
-                    err,
-                    "checking output destination",
-                ));
-            }
-        }
-    }
+    let (destination, tracked) = write_destination(repository.require_path()?, output.as_str())?;
 
     let state = state::State::deserialize(repository.clone(), signature)
         .await
@@ -238,8 +259,23 @@ pub(crate) async fn write_file(
         .into());
     }
 
-    let written_metadata = if node.size > 0 {
-        immutable::read_into_file(
+    if let Some(tracked) = &tracked {
+        with_operation(repository.file_system(), async |operation| {
+            require_free_destination(
+                operation
+                    .file_info(tracked)
+                    .await
+                    .forward_any::<WriteError>("Failed to check the output destination")?,
+                &destination,
+            )?;
+            set_file_to_node::<WriteError>(&operation, repository.clone(), &node, tracked)
+                .await
+                .map(|_written| ())
+        })
+        .await?;
+    } else {
+        require_free_destination(host_file_info(&destination).await?, &destination)?;
+        let written_metadata = immutable::read_into_file(
             repository.clone(),
             node.address,
             destination.as_path(),
@@ -248,31 +284,24 @@ pub(crate) async fn write_file(
         )
         .await
         .forward::<WriteError>("Failed to write file")?
-        .1
-    } else {
-        // Zero sized file, just create
-        Some(
-            lore_io::IoDriver::global()
-                .write_file_bytes(destination.as_path(), bytes::Bytes::new(), false)
+        .1;
+
+        // Taken from the write where it captured one on the open handle. The multi-fragment
+        // path surfaces none, since the handle travels through the defragment pipeline, so
+        // that case is the one that still asks.
+        let metadata = match written_metadata {
+            Some(metadata) => metadata,
+            None => lore_io::IoDriver::global()
+                .metadata(destination.as_path())
                 .await
                 .internal("Failed to write file")?,
-        )
-    };
+        };
 
-    // Taken from the write where it captured one on the open handle. The multi-fragment path
-    // surfaces none, since the handle travels through the defragment pipeline, so that case is
-    // the one that still asks.
-    let metadata = match written_metadata {
-        Some(metadata) => metadata,
-        None => lore_io::IoDriver::global()
-            .metadata(destination.as_path())
-            .await
-            .internal("Failed to write file")?,
-    };
-
-    let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-    if node_executable != util::fs::file_is_executable(&metadata) {
-        util::fs::metadata_set_executable(destination.as_path(), &metadata, node_executable).await;
+        let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+        if node_executable != util::fs::file_is_executable(&metadata) {
+            util::fs::metadata_set_executable(destination.as_path(), &metadata, node_executable)
+                .await;
+        }
     }
 
     event::LoreEvent::FileWrite(LoreFileWriteEventData {
@@ -309,55 +338,36 @@ pub async fn write_address(
         })
     })?;
 
-    let destination = {
-        let mut absolute_path = Path::new(&output).to_path_buf();
-        if !absolute_path.is_absolute() {
-            let Ok(resolved) = crate::util::path::make_absolute(&output) else {
-                return Err(InvalidPath {
-                    path: output.clone(),
-                }
-                .into());
-            };
+    let (destination, tracked) = write_destination(repository.require_path()?, output.as_str())?;
 
-            absolute_path = resolved;
-        }
-        absolute_path
-    };
-
-    match lore_io::IoDriver::global().metadata(&destination).await {
-        Ok(metadata) => {
-            if metadata.is_dir() {
-                return Err(InvalidPath {
-                    path: destination.display().to_string(),
-                }
-                .into());
-            }
-            if metadata.is_file() && !execution_context().globals().force() {
-                return Err(InvalidPath {
-                    path: destination.display().to_string(),
-                }
-                .into());
-            }
-        }
-        Err(err) => {
-            if err.kind() != tokio::io::ErrorKind::NotFound {
-                return Err(WriteError::internal_with_context(
-                    err,
-                    "checking output destination",
-                ));
-            }
-        }
+    if let Some(tracked) = &tracked {
+        with_operation::<_, WriteError, _>(repository.file_system(), async |operation| {
+            require_free_destination(
+                operation
+                    .file_info(tracked)
+                    .await
+                    .forward_any::<WriteError>("Failed to check the output destination")?,
+                &destination,
+            )?;
+            operation
+                .set_file_to_immutable_store_contents(repository.clone(), address_value, tracked)
+                .await
+                .forward_any::<WriteError>("Failed to write file")?;
+            Ok(())
+        })
+        .await?;
+    } else {
+        require_free_destination(host_file_info(&destination).await?, &destination)?;
+        immutable::read_into_file(
+            repository.clone(),
+            address_value,
+            destination.as_path(),
+            None,
+            immutable::read_options_from_repository(&repository),
+        )
+        .await
+        .forward::<WriteError>("Failed to write file")?;
     }
-
-    let _ = immutable::read_into_file(
-        repository.clone(),
-        address_value,
-        destination.as_path(),
-        None,
-        immutable::read_options_from_repository(&repository),
-    )
-    .await
-    .forward::<WriteError>("Failed to write file")?;
 
     event::LoreEvent::FileWrite(LoreFileWriteEventData {
         path: destination.into(),

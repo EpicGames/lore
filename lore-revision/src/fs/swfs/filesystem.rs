@@ -128,12 +128,11 @@ impl InstanceOperation for SwfsOperation {
     async fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
-        node: &Node,
+        address: Address,
         _path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
-        let mut buffer = vec![0; node.size as usize];
         let options = immutable::read_options_from_repository(&repository);
-        immutable::read_into(repository, node.address, None, &mut buffer, options)
+        immutable::read(repository, address, None, options)
             .await
             .internal("Failed to cache file contents")?;
         Ok((Fragment::default(), None))

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use crate::errors::InvalidPath;
+use crate::repository::DOT_LORE;
+use crate::repository::DOT_URC;
 
 #[error_set]
 pub enum PathError {
@@ -74,6 +76,24 @@ pub fn is_path_inside_repository(repository_path: &Path, candidate: &str) -> boo
         RelativePath::new_from_user_path(repository_path, candidate),
         Err(PathError::InvalidPath(_)),
     )
+}
+
+/// Where the working tree holds `candidate`, and `None` where it holds it nowhere: outside the
+/// root, or under the dot directory, which holds the repository's own state rather than content
+/// it tracks.
+///
+/// The dot directory is matched on the fold the root is, so a spelling in any case names it, as
+/// it does on a filesystem that folds case. A path that cannot be resolved is held nowhere
+/// either. A caller dispatching on this reaches such a path directly, which asks nothing of the
+/// repository.
+pub fn repository_relative_path(repository_path: &Path, candidate: &str) -> Option<RelativePath> {
+    let path = RelativePath::new_from_user_path(repository_path, candidate).ok()?;
+    let head = path
+        .as_lowercase_str()
+        .split('/')
+        .next()
+        .unwrap_or_default();
+    (head != DOT_LORE && head != DOT_URC).then_some(path)
 }
 
 /// Number of path components in a repository-relative path.
@@ -1658,6 +1678,52 @@ mod tests {
         fn case_insensitive() {
             // new_from_user_path lowercases both sides before comparing.
             assert!(is_path_inside_repository(Path::new("/A/B"), "/a/b/x.txt",));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    mod repository_relative_path {
+        use std::path::Path;
+
+        use super::super::repository_relative_path;
+
+        fn held(candidate: &str) -> Option<String> {
+            repository_relative_path(Path::new("/a/b"), candidate).map(|path| path.to_string())
+        }
+
+        #[test]
+        fn a_path_under_the_root_is_held_relative_to_it() {
+            assert_eq!(held("/a/b/c/x.txt").as_deref(), Some("c/x.txt"));
+        }
+
+        #[test]
+        fn a_path_outside_the_root_is_held_nowhere() {
+            assert_eq!(held("/a/c/x.txt"), None);
+            assert_eq!(held("/a/b/../../tmp/x.txt"), None);
+        }
+
+        #[test]
+        fn the_dot_directory_is_held_nowhere() {
+            assert_eq!(held("/a/b/.lore"), None);
+            assert_eq!(held("/a/b/.lore/config"), None);
+            assert_eq!(held("/a/b/.urc/config"), None);
+        }
+
+        /// The root is matched whatever case it is named in, so the dot directory is too: on a
+        /// filesystem that folds case, `.LORE` is the directory `.lore` names.
+        #[test]
+        fn the_dot_directory_is_held_nowhere_in_any_case() {
+            assert_eq!(held("/a/b/.LORE/config"), None);
+            assert_eq!(held("/a/b/.Lore"), None);
+            assert_eq!(held("/a/b/.URC/config"), None);
+        }
+
+        /// Only the dot directory itself is the repository's own state: a name that merely begins
+        /// with it, or one of that name further down, is content the tree tracks.
+        #[test]
+        fn a_name_that_is_not_the_dot_directory_is_held() {
+            assert_eq!(held("/a/b/.lorebak/x").as_deref(), Some(".lorebak/x"));
+            assert_eq!(held("/a/b/sub/.lore/x").as_deref(), Some("sub/.lore/x"));
         }
     }
 

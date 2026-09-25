@@ -15,12 +15,12 @@ mod tests {
     use bytes::Bytes;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
+    use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_revision::branch;
     use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
     use lore_revision::lore::RepositoryId;
-    use lore_revision::node::Node;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::util::path::RelativePath;
@@ -238,17 +238,17 @@ mod tests {
         .await;
     }
 
-    /// A node of no size addresses no stored content, so the provider leaves an empty file rather
+    /// The zero address names no stored content, so the provider leaves an empty file rather
     /// than asking the store for one, and reports what it wrote.
     #[tokio::test(flavor = "multi_thread")]
-    async fn instance_operation_materializes_an_empty_node() {
+    async fn instance_operation_materializes_the_zero_address() {
         run_fs_test(|repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("empty.txt").unwrap();
 
             let (fragment, info) = operation
-                .set_file_to_immutable_store_contents(repository, &Node::default(), &rel_path)
+                .set_file_to_immutable_store_contents(repository, Address::default(), &rel_path)
                 .await
-                .expect("an empty node should materialize");
+                .expect("the zero address should materialize an empty file");
 
             assert_eq!(0, fragment.size_content, "nothing should be transferred");
             assert_eq!(

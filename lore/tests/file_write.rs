@@ -150,4 +150,44 @@ mod tests {
             "Inside-repo write content mismatch"
         );
     }
+
+    /// An empty file addresses no stored content, and is written out as an empty file whether
+    /// the destination lies inside the repository or outside it.
+    #[tokio::test]
+    async fn write_empty_file_inside_and_outside_repo() {
+        let repo_dir = TempDir::new("lore-file-write-empty-repo-");
+        let out_dir = TempDir::new("lore-file-write-empty-out-");
+        let repository_path = repo_dir.path().to_path_buf();
+
+        let globals = LoreGlobalArgs {
+            repository_path: repository_path.as_path().into(),
+            offline: 1,
+            identity: "test-user".into(),
+            ..Default::default()
+        };
+
+        let file_path = setup_committed_file(&globals, &repository_path, &[]).await;
+
+        for output_path in [
+            repository_path.join("empty.out"),
+            out_dir.path().join("empty.out"),
+        ] {
+            let args = LoreFileWriteArgs {
+                address: LoreString::default(),
+                path: file_path.as_path().into(),
+                revision: LoreString::default(),
+                output: output_path.as_path().into(),
+            };
+            let result = lore::file::write(globals.clone(), args, None).await;
+            assert_eq!(result, 0, "Failed to write {}", output_path.display());
+
+            let written = std::fs::read(&output_path).expect("Unable to read the written file");
+            assert!(
+                written.is_empty(),
+                "{} should be empty, holds {} bytes",
+                output_path.display(),
+                written.len()
+            );
+        }
+    }
 }

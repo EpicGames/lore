@@ -273,7 +273,7 @@ impl InstanceOperation for OsOperation {
             lore_io::IoDriver::global().create_dir_all(parent).await?;
         }
 
-        write_node_content(repository, node, &path).await?;
+        write_addressed_content(repository, node.address, &path).await?;
 
         let written = lore_io::IoDriver::global().metadata(&path).await?;
         let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
@@ -286,11 +286,11 @@ impl InstanceOperation for OsOperation {
     async fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
-        node: &Node,
+        address: Address,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         let path = self.absolute(path);
-        let (fragment, metadata) = write_node_content(repository, node, &path).await?;
+        let (fragment, metadata) = write_addressed_content(repository, address, &path).await?;
         Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
@@ -449,18 +449,18 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     }
 }
 
-/// Puts the content `node` addresses at `path`, with the fragment it came from and what the write
+/// Puts the content `address` names at `path`, with the fragment it came from and what the write
 /// left there where the write reported it.
 ///
-/// A node addressing nothing -- the zero hash every empty file carries -- leaves an empty file:
-/// the store answers for it without being read, there being no content to find.
-async fn write_node_content(
+/// The zero hash every empty file carries addresses nothing and leaves an empty file: the store
+/// answers for it without being read, there being no content to find.
+async fn write_addressed_content(
     repository: Arc<RepositoryContext>,
-    node: &Node,
+    address: Address,
     path: &Path,
 ) -> Result<(Fragment, Option<std::fs::Metadata>), FsError> {
     let options = immutable::read_options_from_repository(&repository);
-    immutable::read_into_file(repository, node.address, path, None, options)
+    immutable::read_into_file(repository, address, path, None, options)
         .await
         .forward_any::<FsError>("Failed to read file")
 }

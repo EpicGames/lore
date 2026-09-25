@@ -392,6 +392,59 @@ where
     Ok(())
 }
 
+/// Sets the executable bit at `path` to what `node` holds, where `file_info` reports a bit to
+/// compare against. A platform that reports none leaves the file alone.
+pub async fn match_node_executable<E>(
+    operation: &InstanceOperationImpl,
+    path: &RelativePath,
+    node: &Node,
+    file_info: &FileInfo,
+) -> Result<(), E>
+where
+    E: ErrorSet,
+{
+    let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+    if file_info
+        .executable()
+        .is_some_and(|observed| observed != node_executable)
+    {
+        operation
+            .make_executable(path, node_executable)
+            .await
+            .forward_any_with::<E, _>(|| format!("Failed to set the executable bit of {path}"))?;
+    }
+    Ok(())
+}
+
+/// Sets the file at `path` to what `node` holds, its content and then its executable bit, and
+/// reports the fragment the content came from and the file as the content write left it.
+///
+/// The write reports the file where it captured one on its open handle, and the file is looked
+/// up where it did not.
+pub async fn set_file_to_node<E>(
+    operation: &InstanceOperationImpl,
+    repository: Arc<RepositoryContext>,
+    node: &Node,
+    path: &RelativePath,
+) -> Result<(Fragment, FileInfo), E>
+where
+    E: ErrorSet,
+{
+    let (fragment, written) = operation
+        .set_file_to_immutable_store_contents(repository, node.address, path)
+        .await
+        .forward_any_with::<E, _>(|| format!("Failed to write file {path}"))?;
+    let file_info = match written {
+        Some(file_info) => file_info,
+        None => operation
+            .file_info(path)
+            .await
+            .forward_any_with::<E, _>(|| format!("Failed to read the file written at {path}"))?,
+    };
+    match_node_executable::<E>(operation, path, node, &file_info).await?;
+    Ok((fragment, file_info))
+}
+
 /// Instance operation trait - performs file operations within a context.
 ///
 /// Operations are performed against a consistent snapshot (for SWFS) or directly
@@ -601,19 +654,22 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
-    /// Sets the file at `path` to the content `node` addresses, reporting the fragment it came
+    /// Sets the file at `path` to the content `address` names, reporting the fragment it came
     /// from and what the file looks like where the write reported it.
     ///
-    /// A node of no size addresses no stored content and leaves an empty file, the store holding
+    /// The zero hash addresses no stored content and leaves an empty file, the store holding
     /// nothing to read it from. A caller materializing a tree asks here for every node and does
     /// not sort the empty ones out itself.
+    ///
+    /// Named by address rather than by node, so a caller holding an address alone -- one writing
+    /// out content no revision describes -- reaches the same write.
     ///
     /// The file information is `None` where the write did not report it, which a caller needing
     /// it answers with [`file_info`](Self::file_info).
     fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
-        node: &Node,
+        address: Address,
         path: &RelativePath,
     ) -> impl Future<Output = Result<(Fragment, Option<FileInfo>), FsError>> + Send;
 
@@ -908,7 +964,7 @@ impl InstanceOperation for InstanceOperationImpl {
     async fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
-        node: &Node,
+        address: Address,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         self.record_change();
@@ -916,11 +972,11 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.set_file_to_immutable_store_contents(repository, node, path)
+                this.set_file_to_immutable_store_contents(repository, address, path)
                     .await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
-                this.set_file_to_immutable_store_contents(repository, node, path)
+                this.set_file_to_immutable_store_contents(repository, address, path)
                     .await
             }
         }
@@ -1229,7 +1285,7 @@ pub mod tests {
         async fn set_file_to_immutable_store_contents(
             &self,
             _repository: Arc<RepositoryContext>,
-            _node: &Node,
+            _address: Address,
             _path: &RelativePath,
         ) -> Result<(Fragment, Option<FileInfo>), FsError> {
             panic!("Test operation unimplemented except finalize")
