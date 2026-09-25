@@ -364,40 +364,24 @@ fn evaluate_resources_claim(
 
 /// Answer an access question from a `CheckUserPermission` response.
 ///
-/// `action: None` checks whether the token contains the resource at all.
-/// `action: Some(str)` checks whether the token contains a given resource
-/// with the named action.
+/// `action: None` checks whether an allowed entry contains the resource at all.
+/// `action: Some` also checks whether the entry grants the named action.
 fn evaluate_check_user_permission(
     response: &CheckUserPermissionResponse,
     resource_id: &str,
     action: Option<&str>,
 ) -> Result<(), Status> {
-    match action {
-        None => {
-            if response
-                .allowed_resource_permission
-                .first()
-                .ok_or(Status::internal("No permissions for resource"))?
-                .resource_id
-                == resource_id
-            {
-                Ok(())
-            } else {
-                Err(Status::internal("Unexpected resource_id"))
-            }
-        }
-        Some(action) => {
-            let permitted = response
-                .allowed_resource_permission
-                .iter()
-                .filter(|entry| entry.resource_id == resource_id)
-                .any(|entry| entry.permission.iter().any(|granted| granted == action));
-            if permitted {
-                Ok(())
-            } else {
-                Err(Status::permission_denied("Action not permitted"))
-            }
-        }
+    let permitted = response
+        .allowed_resource_permission
+        .iter()
+        .filter(|entry| entry.resource_id == resource_id)
+        .any(|entry| {
+            action.is_none_or(|action| entry.permission.iter().any(|granted| granted == action))
+        });
+    if permitted {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Not permitted for resource"))
     }
 }
 
@@ -1086,7 +1070,8 @@ mod tests {
         let err =
             evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
-        evaluate_check_user_permission(&response, "urc-abc", None).unwrap_err();
+        let err = evaluate_check_user_permission(&response, "urc-abc", None).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[test]
@@ -1095,7 +1080,20 @@ mod tests {
         let err =
             evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
-        evaluate_check_user_permission(&response, "urc-abc", None).unwrap_err();
+        let err = evaluate_check_user_permission(&response, "urc-abc", None).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn plain_access_finds_the_resource_past_the_first_entry() {
+        let response = response(vec![
+            entry("urc-other", &["obliterate"]),
+            entry("urc-abc", &[]),
+        ]);
+        evaluate_check_user_permission(&response, "urc-abc", None).unwrap();
+        let err =
+            evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     /// `[server.auth]` settings with the mandatory pair present and `extra`

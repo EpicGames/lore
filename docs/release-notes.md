@@ -41,6 +41,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Fix a moved file being left behind at the path it came from where the move crosses a mount boundary inside the working tree. No rename carries a file between filesystems, and the recovery read a destination that was not there yet as a failure of its own, so the file was written at its new path from the store and the old one never removed. A move no rename can carry now copies the content and removes the source, and a directory is carried a child at a time
 - Fix a branch that replaced a committed folder with a link being invisible to a merge, which silently deleted the link and dropped its content. A directory paired with a link is the type change it is: `lore branch diff` reports the replacement, and a merge that changed anything below the mount conflicts at the mount
 - Changes to configuring the Lore service: The service executable field can be left unset if the service was started with lore service run separately. There is no longer a fallback that attempts to use the current binary as the service binary.
+- `lore-server`: permission checks are refused with `PERMISSION_DENIED` when access is checked against the grpc auth service, rather than `INTERNAL`
 
 ## v0.10.0 (Sep 17th 2026) [#1170]
 
