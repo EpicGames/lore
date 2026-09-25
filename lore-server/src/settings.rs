@@ -204,6 +204,23 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
             "server.auth.jwt_audience must not be empty".to_string(),
         ));
     }
+    if let Some(accepted) = auth.jwt_typ.as_ref() {
+        if accepted.is_empty() {
+            return Err(config::ConfigError::Message(
+                "server.auth.jwt_typ must name at least one type. Omit it to skip the check."
+                    .to_string(),
+            ));
+        }
+        if accepted
+            .iter()
+            .any(|typ| typ.is_empty() || typ.chars().any(char::is_whitespace))
+        {
+            return Err(config::ConfigError::Message(
+                "server.auth.jwt_typ entries must be media types: not empty, no whitespace"
+                    .to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -270,6 +287,14 @@ pub struct AuthSettings {
     /// configuration error.
     #[serde_as(as = "serde_with::OneOrMany<_, serde_with::formats::PreferMany>")]
     pub jwt_issuer: Vec<String>,
+    /// The accepted `typ` header values, as a bare string or a list. Absent,
+    /// the header is not checked, which every token the legacy auth service
+    /// issues needs. `"at+jwt"` is the RFC 9068 §4 rule. Values compare as
+    /// media types: case-insensitively, and with or without the
+    /// `application/` prefix.
+    #[serde_as(as = "Option<serde_with::OneOrMany<_, serde_with::formats::PreferMany>>")]
+    #[serde(default)]
+    pub jwt_typ: Option<Vec<String>>,
     /// Dotted path of the JWT claim carrying the caller's allowed actions.
     pub permission_claim: Option<String>,
     /// Dotted path of the claim carrying per-repository resource grants.
@@ -884,6 +909,91 @@ mod tests {
         assert_eq!(auth.identity_claim, "sub");
         assert_eq!(auth.repository_catalog, None);
         assert_eq!(auth.repository_catalog_url, None);
+        assert_eq!(auth.jwt_typ, None);
+    }
+
+    /// The RFC 9068 rule is one bare string; a provider with its own
+    /// convention lists what it emits.
+    #[test]
+    fn jwt_typ_accepts_a_bare_string_and_a_list() {
+        let bare: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore-service"]
+            jwt_typ = "at+jwt"
+        "#,
+        )
+        .expect("[server.auth] with a bare-string jwt_typ should deserialize");
+        let list: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore-service"]
+            jwt_typ = ["at+jwt", "JWT"]
+        "#,
+        )
+        .expect("[server.auth] with a jwt_typ list should deserialize");
+
+        assert_eq!(bare.jwt_typ, Some(vec!["at+jwt".to_string()]));
+        assert_eq!(
+            list.jwt_typ,
+            Some(vec!["at+jwt".to_string(), "JWT".to_string()])
+        );
+    }
+
+    /// An empty `jwt_typ` would refuse every token; leaving the key out is
+    /// how the check is skipped.
+    #[test]
+    fn auth_with_empty_jwt_typ_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore-service"]
+            jwt_typ = []
+        "#,
+        )
+        .expect("an empty jwt_typ list still parses");
+        let error = validate_auth_config(&settings)
+            .expect_err("[server.auth] with an empty jwt_typ must fail validation");
+        assert!(
+            error.to_string().contains("jwt_typ"),
+            "the error must name the setting: {error}"
+        );
+    }
+
+    /// A blank or whitespace-carrying entry beside a valid one is refused
+    /// too: it is no media type, and the verifier compares the header
+    /// exactly, so such an entry could only ever match a malformed header.
+    #[test]
+    fn auth_with_a_blank_jwt_typ_entry_fails_validation() {
+        for entry in ["\"\"", "\"  \"", "\"at+jwt \"", "\" at+jwt\""] {
+            let settings = settings_with_auth_keys(&format!(
+                r#"
+                jwt_issuer = "https://auth.example.com"
+                jwt_audience = ["lore-service"]
+                jwt_typ = ["at+jwt", {entry}]
+            "#
+            ))
+            .expect("a blank jwt_typ entry still parses");
+            let error = validate_auth_config(&settings)
+                .expect_err("[server.auth] with a blank jwt_typ entry must fail validation");
+            assert!(
+                error.to_string().contains("jwt_typ"),
+                "the error must name the setting: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_with_a_jwt_typ_list_passes_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore-service"]
+            jwt_typ = ["at+jwt", "JWT"]
+        "#,
+        )
+        .expect("a jwt_typ list must parse");
+        validate_auth_config(&settings).expect("a jwt_typ list must validate");
     }
 
     /// Minimal loadable settings with the given `[server.auth]` keys, for the

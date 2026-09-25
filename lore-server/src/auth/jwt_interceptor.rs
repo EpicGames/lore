@@ -157,6 +157,7 @@ mod tests {
             jwk_service: Arc::new(CachedJWKService),
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
+            jwt_typ: None,
             identity_claim: identity_claim.to_string(),
         }))
     }

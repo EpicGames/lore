@@ -320,6 +320,7 @@ mod test {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }
         }

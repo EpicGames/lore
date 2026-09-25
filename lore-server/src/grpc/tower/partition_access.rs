@@ -775,6 +775,7 @@ mod tests {
                 jwk_service: Arc::new(CachedJWKService),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }));
             let inner = Inner::default();

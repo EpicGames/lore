@@ -207,6 +207,8 @@ pub enum JwtVerifierError {
     ValidationFailed(#[from] jsonwebtoken::errors::Error),
     #[error("JWT carries no non-empty string at the identity claim `{claim}`")]
     IdentityClaimMissing { claim: String },
+    #[error("JWT header `typ` is absent or not an accepted type")]
+    TypNotAccepted,
 }
 
 #[derive(Clone)]
@@ -216,9 +218,22 @@ pub struct JwtVerifier {
     /// cutover, one otherwise (see [`AuthSettings::jwt_issuer`](crate::settings::AuthSettings)).
     pub jwt_issuer: Option<Vec<String>>,
     pub jwt_audience: Option<Vec<String>>,
+    /// Accepted `typ` header values.
+    /// `None` skips the check (see [`AuthSettings::jwt_typ`](crate::settings::AuthSettings)).
+    pub jwt_typ: Option<Vec<String>>,
     /// Dotted path of the claim recorded and compared as the caller's
     /// identity (see [`AuthSettings::identity_claim`](crate::settings::AuthSettings)).
     pub identity_claim: String,
+}
+
+/// The comparison form of a `typ` header value. RFC 7515 §4.1.9 makes the
+/// value a media type, so it is case-insensitive and may omit the
+/// `application/` prefix: `at+jwt`, `application/at+jwt` and `AT+JWT` are
+/// all the same type. Nothing else is forgiven: surrounding whitespace is
+/// not part of a media type, so ` at+jwt ` is not `at+jwt`.
+fn normalize_typ(typ: &str) -> String {
+    let typ = typ.to_ascii_lowercase();
+    typ.strip_prefix("application/").unwrap_or(&typ).to_string()
 }
 
 /// Whether a verification failure could be the signing key's fault rather than the token's.
@@ -243,6 +258,7 @@ impl JwtVerifier {
     /// signed with the new material fails until the process restarts.
     pub async fn verify_token(&self, token: &str) -> Result<AuthorizationToken, JwtVerifierError> {
         let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
+        self.check_typ(&header)?;
         let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
 
         let (key, alg) = self
@@ -283,6 +299,7 @@ impl JwtVerifier {
         token: &str,
     ) -> Result<Option<AuthorizationToken>, JwtVerifierError> {
         let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
+        self.check_typ(&header)?;
         let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
 
         let Some((key, alg)) = self.jwk_service.get_cached_key(&kid) else {
@@ -330,6 +347,23 @@ impl JwtVerifier {
         let mut claims = token_data.claims;
         claims.identity = self.resolve_identity(&claims)?;
         Ok(claims)
+    }
+
+    fn check_typ(&self, header: &jsonwebtoken::Header) -> Result<(), JwtVerifierError> {
+        let Some(accepted) = self.jwt_typ.as_ref() else {
+            return Ok(());
+        };
+        let presented = header.typ.as_deref().map(normalize_typ);
+        let is_accepted = presented.is_some_and(|presented| {
+            accepted
+                .iter()
+                .any(|accepted| normalize_typ(accepted) == presented)
+        });
+        if is_accepted {
+            return Ok(());
+        }
+        warn!("Rejecting token: the `typ` header is absent or not an accepted type");
+        Err(JwtVerifierError::TypNotAccepted)
     }
 
     /// `None` when the configured claim is `sub`, which `user_id` holds.
@@ -730,6 +764,7 @@ mod tests {
                 jwk_service: service,
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }
         }
@@ -868,6 +903,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }
         }
@@ -943,6 +979,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
@@ -1077,6 +1114,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
@@ -1117,6 +1155,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
@@ -1154,6 +1193,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["urc.example.com".to_string(), "Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
             let (original_authz_token, encoded_authz_token) =
@@ -1178,6 +1218,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: Some(issuers),
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             }
         }
@@ -1248,6 +1289,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
@@ -1291,6 +1333,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(common_audience.clone()),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
@@ -1317,6 +1360,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
@@ -1345,6 +1389,7 @@ mod tests {
                 jwk_service: Arc::new(service),
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["skein".to_string()]),
+                jwt_typ: None,
                 identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
             };
 
@@ -1374,6 +1419,7 @@ mod tests {
                     jwk_service: Arc::new(service),
                     jwt_issuer: None,
                     jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ: None,
                     identity_claim: identity_claim.to_string(),
                 }
             }
@@ -1463,6 +1509,7 @@ mod tests {
                     jwk_service: Arc::new(service),
                     jwt_issuer: None,
                     jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ: None,
                     identity_claim: "preferred_username".to_string(),
                 };
                 let verified = verifier
@@ -1470,6 +1517,153 @@ mod tests {
                     .expect("verifies")
                     .expect("the cache answers");
                 assert_eq!(verified.identity(), "pu");
+            }
+        }
+
+        mod jwt_typ {
+            use super::*;
+
+            fn accepted(types: &[&str]) -> Option<Vec<String>> {
+                Some(types.iter().map(ToString::to_string).collect())
+            }
+
+            fn verifier_with_typ(jwt_typ: Option<Vec<String>>) -> JwtVerifier {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().returning(|_| {
+                    Ok((
+                        DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                        AGREED_UPON_ALGORITHM,
+                    ))
+                });
+                JwtVerifier {
+                    jwk_service: Arc::new(service),
+                    jwt_issuer: None,
+                    jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ,
+                    identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
+                }
+            }
+
+            /// A verifier whose key service must never be asked, on either path.
+            fn verifier_expecting_no_key_lookup(jwt_typ: Option<Vec<String>>) -> JwtVerifier {
+                let mut service = MockTestJWKService::new();
+                service.expect_get_key().times(0);
+                service.expect_get_cached_key().times(0);
+                service.expect_refresh_key().times(0);
+                JwtVerifier {
+                    jwk_service: Arc::new(service),
+                    jwt_issuer: None,
+                    jwt_audience: Some(vec!["Lore".to_string()]),
+                    jwt_typ,
+                    identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
+                }
+            }
+
+            /// `Header::new` sets `typ: "JWT"`; `None` here clears it, as a
+            /// header with no `typ` at all.
+            fn encode_jwt_with_typ(typ: Option<&str>) -> String {
+                let mut header = Header::new(AGREED_UPON_ALGORITHM);
+                header.kid = Some("the kid".into());
+                header.typ = typ.map(str::to_string);
+                encode(
+                    &header,
+                    &mock_authz_token(vec!["Lore".to_string()]),
+                    &EncodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                )
+                .unwrap()
+            }
+
+            /// Off by default: the legacy auth service's tokens carry `typ: JWT`,
+            /// and a token with no `typ` is a valid JWS.
+            #[tokio::test]
+            async fn unset_accepts_any_typ_and_none() {
+                let verifier = verifier_with_typ(None);
+                for typ in [None, Some("JWT"), Some("at+jwt")] {
+                    verifier
+                        .verify_token(&encode_jwt_with_typ(typ))
+                        .await
+                        .unwrap_or_else(|error| panic!("{typ:?} must verify: {error}"));
+                }
+            }
+
+            /// The RFC 9068 §4 rule: no `typ` and `typ: JWT` are refused,
+            /// `at+jwt` is accepted.
+            #[tokio::test]
+            async fn at_jwt_refuses_a_missing_or_plain_jwt_typ_without_a_key_lookup() {
+                let verifier = verifier_expecting_no_key_lookup(accepted(&["at+jwt"]));
+                for typ in [None, Some("JWT")] {
+                    let Err(error) = verifier.verify_token(&encode_jwt_with_typ(typ)).await else {
+                        panic!("{typ:?} must be refused");
+                    };
+                    assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+                }
+            }
+
+            #[tokio::test]
+            async fn at_jwt_verifies_under_the_rfc_9068_rule() {
+                verifier_with_typ(accepted(&["at+jwt"]))
+                    .verify_token(&encode_jwt_with_typ(Some("at+jwt")))
+                    .await
+                    .expect("at+jwt verifies");
+            }
+
+            /// RFC 7515 §4.1.9: `typ` is a media type, so the `application/`
+            /// prefix is optional on either side and case does not matter.
+            #[tokio::test]
+            async fn typ_compares_as_a_media_type() {
+                let bare = verifier_with_typ(accepted(&["at+jwt"]));
+                for typ in ["application/at+jwt", "AT+JWT", "Application/AT+JWT"] {
+                    bare.verify_token(&encode_jwt_with_typ(Some(typ)))
+                        .await
+                        .unwrap_or_else(|error| panic!("{typ} must verify: {error}"));
+                }
+                verifier_with_typ(accepted(&["application/at+jwt"]))
+                    .verify_token(&encode_jwt_with_typ(Some("at+jwt")))
+                    .await
+                    .expect("a prefixed configuration accepts the bare header");
+            }
+
+            /// Case and the prefix are the only tolerated variations. A header
+            /// padded with whitespace names no media type and is refused, so
+            /// this verifier agrees with a consumer reading `typ` strictly.
+            #[tokio::test]
+            async fn whitespace_around_the_typ_is_not_forgiven() {
+                let verifier = verifier_expecting_no_key_lookup(accepted(&["at+jwt"]));
+                for typ in [" at+jwt", "at+jwt ", " at+jwt ", "at+jwt\t"] {
+                    let Err(error) = verifier.verify_token(&encode_jwt_with_typ(Some(typ))).await
+                    else {
+                        panic!("{typ:?} must be refused");
+                    };
+                    assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+                }
+            }
+
+            /// A provider with its own convention lists what it emits, and the
+            /// list is exhaustive: anything else is refused.
+            #[tokio::test]
+            async fn a_listed_convention_is_accepted_and_nothing_else() {
+                let verifier = verifier_with_typ(accepted(&["JWT", "at+jwt"]));
+                for typ in ["JWT", "at+jwt"] {
+                    verifier
+                        .verify_token(&encode_jwt_with_typ(Some(typ)))
+                        .await
+                        .unwrap_or_else(|error| panic!("{typ} must verify: {error}"));
+                }
+                let error = verifier_expecting_no_key_lookup(accepted(&["JWT", "at+jwt"]))
+                    .verify_token(&encode_jwt_with_typ(Some("id+jwt")))
+                    .await
+                    .expect_err("an unlisted type is refused");
+                assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+            }
+
+            /// The interceptor's synchronous path refuses outright rather than
+            /// deferring: no key could change the verdict.
+            #[test]
+            fn the_cached_path_refuses_the_typ_too() {
+                let error = verifier_expecting_no_key_lookup(accepted(&["at+jwt"]))
+                    .try_verify_token_cached(&encode_jwt_with_typ(Some("JWT")))
+                    .expect_err("refused, not deferred");
+                assert!(matches!(error, JwtVerifierError::TypNotAccepted));
             }
         }
     }
