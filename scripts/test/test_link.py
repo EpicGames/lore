@@ -10065,6 +10065,63 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
 
 
 # ---------------------------------------------------------------------------
+# Content addresses on RevisionDiff and RevisionTree.
+# ---------------------------------------------------------------------------
+
+
+def _tree_address(nodes: list, path: str):
+    matches = [node for node in nodes if node.path == path]
+    assert len(matches) == 1, f"Expected one tree entry for {path}, got {matches}"
+    address = matches[0].address
+    assert address is not None, f"Tree entry for {path} carries no address"
+    return address
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_content_addresses_match_the_tree_at_the_same_path(
+    new_lore_repo, lore_grpc_target
+):
+    """A commit gives each file its own addressing context, so a content address
+    is only resolvable as a whole `(hash, context)` pair. `RevisionTree` is the
+    reference for what that pair is at a revision."""
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repository_id, before = _wire_identity(repo)
+
+    with repo.open_file("own.txt", "w+") as output_file:
+        output_file.writelines(["parent content, revised\n"])
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+
+    address_before = _tree_address(
+        revision_tree(lore_grpc_target, repository_id, before), "own.txt"
+    )
+    address_after = _tree_address(
+        revision_tree(lore_grpc_target, repository_id, after), "own.txt"
+    )
+    assert address_after.context, (
+        f"A committed file carries a generated addressing context, got {address_after}"
+    )
+
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+    own_changes = [change for change in changes if change.path == "own.txt"]
+    assert own_changes, f"Parent's own file change missing from diff: {changes}"
+
+    for change in own_changes:
+        assert change.content_from == address_before, (
+            f"The from side must carry the whole address the tree reports at "
+            f"{before.hex()}, got {change.content_from}"
+        )
+        assert change.content_to == address_after, (
+            f"The to side must carry the whole address the tree reports at "
+            f"{after.hex()}, got {change.content_to}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Branch archive cascading into links.
 # ---------------------------------------------------------------------------
 

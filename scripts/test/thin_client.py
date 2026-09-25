@@ -18,6 +18,7 @@ from protobuf_wire import (
     field_bool,
     field_bytes,
     field_int,
+    field_message,
     field_string,
     parse_fields,
 )
@@ -48,6 +49,7 @@ _DIFF_RESPONSE_PARTITION = 4
 
 _TREE_NODE_PATH = 1
 _TREE_NODE_NODE_TYPE = 2
+_TREE_NODE_ADDRESS = 3
 _TREE_NODE_TRACKING = 6
 
 _DIFF_CHANGE_PATH = 1
@@ -55,9 +57,22 @@ _DIFF_CHANGE_ACTION = 3
 _DIFF_CHANGE_NODE_TYPE = 4
 _DIFF_CHANGE_LINK_REPOSITORY_INDEX = 8
 _DIFF_CHANGE_TRACKING = 9
+_DIFF_CHANGE_CONTENT_FROM = 10
+_DIFF_CHANGE_CONTENT_TO = 11
 
 _DIFF_PARTITION_INDEX = 1
 _DIFF_PARTITION_LINK_PARTITION = 2
+
+_ADDRESS_HASH = 1
+_ADDRESS_CONTEXT = 2
+
+
+@dataclass(frozen=True)
+class ContentAddress:
+    """A decoded `lore.model.v1.Address`, both halves hex-encoded."""
+
+    hash: str
+    context: str
 
 
 @dataclass(frozen=True)
@@ -67,6 +82,7 @@ class TreeNode:
     path: str
     node_type: int
     tracking: bool
+    address: ContentAddress | None
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,8 @@ class DiffChange:
     node_type: int
     tracking: bool
     partition: str
+    content_from: ContentAddress | None
+    content_to: ContentAddress | None
 
 
 class _PartitionTable:
@@ -109,12 +127,23 @@ def _payloads(response: bytes, payload_field: int) -> list[dict]:
     ]
 
 
+def _content_address(message: dict, field_number: int) -> ContentAddress | None:
+    address = field_message(message, field_number)
+    if address is None:
+        return None
+    return ContentAddress(
+        hash=field_bytes(address, _ADDRESS_HASH).hex(),
+        context=field_bytes(address, _ADDRESS_CONTEXT).hex(),
+    )
+
+
 def _tree_nodes(response: bytes) -> list[TreeNode]:
     return [
         TreeNode(
             path=field_string(node, _TREE_NODE_PATH),
             node_type=field_int(node, _TREE_NODE_NODE_TYPE),
             tracking=field_bool(node, _TREE_NODE_TRACKING),
+            address=_content_address(node, _TREE_NODE_ADDRESS),
         )
         for node in _payloads(response, _TREE_RESPONSE_NODE)
     ]
@@ -132,6 +161,8 @@ def _diff_changes(response: bytes, partitions: _PartitionTable) -> list[DiffChan
             partition=partitions.resolve(
                 field_int(change, _DIFF_CHANGE_LINK_REPOSITORY_INDEX)
             ),
+            content_from=_content_address(change, _DIFF_CHANGE_CONTENT_FROM),
+            content_to=_content_address(change, _DIFF_CHANGE_CONTENT_TO),
         )
         for change in _payloads(response, _DIFF_RESPONSE_CHANGE)
     ]

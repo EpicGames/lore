@@ -17,14 +17,6 @@ pub struct DiffChange {
     /// The kind of node at `path` in the "to" side.
     #[prost(enumeration = "NodeType", tag = "4")]
     pub node_type: i32,
-    /// Content address on the "from" side; empty if the action is ADD or
-    /// the side has no content here.
-    #[prost(bytes = "bytes", tag = "5")]
-    pub content_from: ::prost::bytes::Bytes,
-    /// Content address on the "to" side; empty if the action is DELETE or
-    /// the side has no content here.
-    #[prost(bytes = "bytes", tag = "6")]
-    pub content_to: ::prost::bytes::Bytes,
     /// True when the server auto-resolved this change in 3-way mode (only
     /// meaningful when the request set `autoresolve = true`).
     #[prost(bool, tag = "7")]
@@ -42,6 +34,18 @@ pub struct DiffChange {
     /// it from the entry for the mount path itself.
     #[prost(bool, tag = "9")]
     pub tracking: bool,
+    /// Content address on the "from" side; unset if the action is ADD. On a
+    /// DIRECTORY the hash is over the entry's children rather than over
+    /// content, so it identifies what the directory holds but cannot be
+    /// fetched.
+    #[prost(message, optional, tag = "10")]
+    pub content_from: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Content address on the "to" side; unset if the action is DELETE. On a
+    /// DIRECTORY the hash is over the entry's children rather than over
+    /// content, so it identifies what the directory holds but cannot be
+    /// fetched.
+    #[prost(message, optional, tag = "11")]
+    pub content_to: ::core::option::Option<crate::lore::model::v1::Address>,
 }
 impl ::prost::Name for DiffChange {
     const NAME: &'static str = "DiffChange";
@@ -237,22 +241,10 @@ impl ::prost::Name for Metadata {
     }
 }
 /// File-content diff request. ContentDiff is server-streaming and operates
-/// purely on CAS addresses — no path field, no per-revision context.
+/// purely on CAS addresses — no path field, no revision. Each address is
+/// one a `DiffChange` reported, so it resolves the same way here.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ContentDiffRequest {
-    /// Content address of the "from" side. Empty bytes represent
-    /// "no content" (e.g. file added).
-    #[prost(bytes = "bytes", tag = "1")]
-    pub address_from: ::prost::bytes::Bytes,
-    /// Content address of the "to" side. Empty bytes represent
-    /// "no content" (e.g. file deleted).
-    #[prost(bytes = "bytes", tag = "2")]
-    pub address_to: ::prost::bytes::Bytes,
-    /// Common ancestor's content address. Presence (set, non-empty)
-    /// triggers 3-way merge mode; absence gives 2-way unified diff. There
-    /// is no separate mode flag.
-    #[prost(bytes = "bytes", optional, tag = "3")]
-    pub address_base: ::core::option::Option<::prost::bytes::Bytes>,
     /// Number of context lines around each hunk in the unified diff
     /// output. Server picks a default if unset.
     #[prost(uint32, optional, tag = "4")]
@@ -271,6 +263,19 @@ pub struct ContentDiffRequest {
     /// summary stats are still computed.
     #[prost(uint64, optional, tag = "7")]
     pub max_diff_size: ::core::option::Option<u64>,
+    /// Content address of the "from" side. Unset represents "no content"
+    /// (e.g. file added).
+    #[prost(message, optional, tag = "8")]
+    pub address_from: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Content address of the "to" side. Unset represents "no content"
+    /// (e.g. file deleted).
+    #[prost(message, optional, tag = "9")]
+    pub address_to: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Common ancestor's content address. Presence triggers 3-way merge
+    /// mode; absence gives 2-way unified diff. There is no separate mode
+    /// flag.
+    #[prost(message, optional, tag = "10")]
+    pub address_base: ::core::option::Option<crate::lore::model::v1::Address>,
 }
 impl ::prost::Name for ContentDiffRequest {
     const NAME: &'static str = "ContentDiffRequest";

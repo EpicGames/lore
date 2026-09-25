@@ -163,10 +163,7 @@ async fn stream_tree(
         let node = thin_client_v1::TreeNode {
             path: tree_path.path.to_string(),
             node_type: node_flags_to_node_type(tree_path.flags) as i32,
-            address: tree_path.address.map(|address| model_v1::Address {
-                hash: address.hash.into(),
-                context: address.context.into(),
-            }),
+            address: tree_path.address.map(model_v1::Address::from),
             size: tree_path.size,
             mode: tree_path.mode,
             tracking: tree_path.tracking,

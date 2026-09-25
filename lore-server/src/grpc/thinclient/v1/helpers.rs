@@ -246,8 +246,6 @@ fn file_action_to_v1_action(action: FileAction) -> thin_client_v1::Action {
 /// Convert an internal `NodeChange` into a v1 `DiffChange`. The
 /// `to.flags` drive `node_type` for non-delete actions; for deletes
 /// `from.flags` is the surviving record of what the path used to be.
-/// `content_from` / `content_to` carry the from / to side's CAS hash,
-/// or empty bytes for ADD (no from) and DELETE (no to).
 ///
 /// `link_repository_index` is passed through verbatim; the handler
 /// resolves it, since the per-stream partition table lives there.
@@ -264,16 +262,8 @@ pub(super) async fn node_change_to_diff_change(
         .move_source()
         .map(|p| p.to_string())
         .unwrap_or_default();
-    let content_from = if action == thin_client_v1::Action::Add {
-        Bytes::new()
-    } else {
-        change.from.address.hash.into()
-    };
-    let content_to = if action == thin_client_v1::Action::Delete {
-        Bytes::new()
-    } else {
-        change.to.address.hash.into()
-    };
+    let content_from = (action != thin_client_v1::Action::Add).then(|| change.from.address.into());
+    let content_to = (action != thin_client_v1::Action::Delete).then(|| change.to.address.into());
     thin_client_v1::DiffChange {
         path: change.path().to_string(),
         path_from,
@@ -287,19 +277,23 @@ pub(super) async fn node_change_to_diff_change(
     }
 }
 
-/// A link's content is the revision it is pinned to, so the revision
-/// signatures go in `content_from` / `content_to`.
+/// A link's content is the revision it is pinned to, which lives in the
+/// linked repository rather than this one.
 pub(super) fn link_pin_change_to_diff_change(
     pin_change: &LinkPinChange,
     link_repository_index: u32,
 ) -> thin_client_v1::DiffChange {
+    let pinned_address = |revision: Hash| model_v1::Address {
+        hash: revision.into(),
+        context: pin_change.link_repository.into(),
+    };
     thin_client_v1::DiffChange {
         path: pin_change.link_path.clone(),
         path_from: String::new(),
         action: thin_client_v1::Action::Keep as i32,
         node_type: thin_client_v1::NodeType::Link as i32,
-        content_from: pin_change.revision_from.into(),
-        content_to: pin_change.revision_to.into(),
+        content_from: Some(pinned_address(pin_change.revision_from)),
+        content_to: Some(pinned_address(pin_change.revision_to)),
         automerged: false,
         link_repository_index,
         tracking: pin_change.tracking_to,
@@ -337,7 +331,6 @@ mod tests {
     use lore_revision::util::path::RelativePath;
     use lore_storage::Address;
     use lore_storage::Context;
-    use lore_storage::Hash;
     use lore_transport::ProtocolError;
 
     use super::*;
@@ -370,13 +363,26 @@ mod tests {
         }))
     }
 
+    /// The contexts are deliberately non-zero and the sides deliberately
+    /// differ: a hash-only projection compares equal on `hash`, and one that
+    /// reads a single side twice compares equal on both.
+    fn side_addresses() -> (Address, Address) {
+        (
+            Address {
+                hash: Hash::hash_buffer(&[1, 2, 3]),
+                context: Context::from([7u8; 16]),
+            },
+            Address {
+                hash: Hash::hash_buffer(&[4, 5, 6]),
+                context: Context::from([9u8; 16]),
+            },
+        )
+    }
+
     fn make_change(action: lore_revision::change::FileAction) -> NodeChange {
         let ctx = futures::executor::block_on(test_context());
         let state = Arc::new(state::State::new());
-        let address = Address {
-            hash: Hash::hash_buffer(&[1, 2, 3]),
-            context: Context::default(),
-        };
+        let (address_from, address_to) = side_addresses();
         NodeChange {
             action,
             flags: Flags::None,
@@ -387,7 +393,7 @@ mod tests {
                     repository: ctx.clone(),
                     state: state.clone(),
                 },
-                address,
+                address: address_from,
                 observed: None,
                 mode: 0,
                 flags: NodeFlags::File,
@@ -399,7 +405,7 @@ mod tests {
                     repository: ctx,
                     state,
                 },
-                address,
+                address: address_to,
                 observed: None,
                 mode: 0,
                 flags: NodeFlags::File,
@@ -422,6 +428,66 @@ mod tests {
 
         let mapped = node_change_to_diff_change(&change, 7).await;
         assert_eq!(mapped.link_repository_index, 7);
+    }
+
+    /// A consumer keys its content and metadata lookups on the whole
+    /// `(hash, context)` pair, not the hash alone.
+    #[tokio::test]
+    async fn node_change_carries_whole_address_on_every_side_it_reports() {
+        use lore_revision::change::FileAction;
+
+        let (address_from, address_to) = side_addresses();
+        let from = Some(model_v1::Address::from(address_from));
+        let to = Some(model_v1::Address::from(address_to));
+        for (action, expected_from, expected_to) in [
+            (FileAction::Keep, from.clone(), to.clone()),
+            (FileAction::Add, None, to.clone()),
+            (FileAction::Delete, from.clone(), None),
+            (FileAction::Move, from.clone(), to.clone()),
+        ] {
+            let mapped = node_change_to_diff_change(&make_change(action), 0).await;
+
+            assert_eq!(mapped.content_from, expected_from, "{action:?} from side");
+            assert_eq!(mapped.content_to, expected_to, "{action:?} to side");
+        }
+    }
+
+    /// A directory's hash is over its children, so a consumer can tell from
+    /// it whether the directory holds the same entries as before.
+    #[tokio::test]
+    async fn node_change_on_directory_reports_its_hash() {
+        let (address_from, address_to) = side_addresses();
+        let mut change = make_change(lore_revision::change::FileAction::Keep);
+        change.from.flags = NodeFlags::NoFlags;
+        change.to.flags = NodeFlags::NoFlags;
+
+        let mapped = node_change_to_diff_change(&change, 0).await;
+
+        assert_eq!(mapped.node_type, thin_client_v1::NodeType::Directory as i32);
+        assert_eq!(
+            mapped.content_from,
+            Some(model_v1::Address::from(address_from))
+        );
+        assert_eq!(mapped.content_to, Some(model_v1::Address::from(address_to)));
+    }
+
+    /// An empty file has no fragment, so its hash stays zero while the
+    /// context a metadata lookup keys on is still its own.
+    #[tokio::test]
+    async fn node_change_on_empty_file_still_carries_its_context() {
+        let empty = Address {
+            hash: Hash::default(),
+            context: side_addresses().0.context,
+        };
+        let mut change = make_change(lore_revision::change::FileAction::Keep);
+        change.from.address = empty;
+        change.to.address = empty;
+
+        let mapped = node_change_to_diff_change(&change, 0).await;
+
+        let expected = Some(model_v1::Address::from(empty));
+        assert_eq!(mapped.content_from, expected);
+        assert_eq!(mapped.content_to, expected);
     }
 
     /// Tracking is a link property: a file change reports it as false.
@@ -475,9 +541,10 @@ mod tests {
         }
     }
 
-    /// A moved pin carries both revisions as the link's content addresses.
+    /// A moved pin carries both revisions as the link's content addresses,
+    /// each resolving under the linked repository rather than the parent.
     #[test]
-    fn pin_change_carries_both_revisions() {
+    fn pin_change_carries_both_revisions_under_the_linked_repository() {
         let change = make_pin_change();
         let mapped = link_pin_change_to_diff_change(&change, 2);
 
@@ -485,8 +552,21 @@ mod tests {
         assert!(mapped.path_from.is_empty());
         assert_eq!(mapped.action, thin_client_v1::Action::Keep as i32);
         assert_eq!(mapped.node_type, thin_client_v1::NodeType::Link as i32);
-        assert_eq!(mapped.content_from, Bytes::from(change.revision_from));
-        assert_eq!(mapped.content_to, Bytes::from(change.revision_to));
+        let linked_context = Context::from(change.link_repository);
+        assert_eq!(
+            mapped.content_from,
+            Some(model_v1::Address::from(Address {
+                hash: change.revision_from,
+                context: linked_context,
+            })),
+        );
+        assert_eq!(
+            mapped.content_to,
+            Some(model_v1::Address::from(Address {
+                hash: change.revision_to,
+                context: linked_context,
+            })),
+        );
         assert_eq!(mapped.link_repository_index, 2);
         assert!(!mapped.automerged);
     }

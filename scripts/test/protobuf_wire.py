@@ -120,6 +120,19 @@ def field_bytes(fields: Fields, field_number: int) -> bytes:
     return value
 
 
+def field_message(fields: Fields, field_number: int) -> Fields | None:
+    """Parsed fields of a nested message field, or None when it is absent. A
+    message field has no default to stand in for "unset", so a caller can tell
+    an unset field from one carrying a message of all defaults."""
+    values = fields.get(field_number)
+    if not values:
+        return None
+    value = values[-1]
+    if not isinstance(value, bytes):
+        raise TypeError(f"Field {field_number} is a varint, not a message")
+    return parse_fields(value)
+
+
 def field_string(fields: Fields, field_number: int) -> str:
     """Value of a `string` field; absent reads back as the empty string."""
     strings = field_strings(fields, field_number)

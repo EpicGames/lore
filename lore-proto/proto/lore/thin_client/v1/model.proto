@@ -60,6 +60,9 @@ enum MetadataType {
 // In 3-way mode wrapped inside DiffConflict, the change is rooted at the
 // common ancestor.
 message DiffChange {
+  reserved 5; // deprecated hash-only content_from
+  reserved 6; // deprecated hash-only content_to
+
   // Destination path (where the entry lives in the "to" side).
   string path = 1;
   // Source path for MOVE / COPY actions; empty otherwise.
@@ -68,12 +71,6 @@ message DiffChange {
   Action action = 3;
   // The kind of node at `path` in the "to" side.
   NodeType node_type = 4;
-  // Content address on the "from" side; empty if the action is ADD or
-  // the side has no content here.
-  bytes content_from = 5;
-  // Content address on the "to" side; empty if the action is DELETE or
-  // the side has no content here.
-  bytes content_to = 6;
   // True when the server auto-resolved this change in 3-way mode (only
   // meaningful when the request set `autoresolve = true`).
   bool automerged = 7;
@@ -88,6 +85,16 @@ message DiffChange {
   // links and non-link changes. Only meaningful on a LINK-typed entry; read
   // it from the entry for the mount path itself.
   bool tracking = 9;
+  // Content address on the "from" side; unset if the action is ADD. On a
+  // DIRECTORY the hash is over the entry's children rather than over
+  // content, so it identifies what the directory holds but cannot be
+  // fetched.
+  lore.model.v1.Address content_from = 10;
+  // Content address on the "to" side; unset if the action is DELETE. On a
+  // DIRECTORY the hash is over the entry's children rather than over
+  // content, so it identifies what the directory holds but cannot be
+  // fetched.
+  lore.model.v1.Address content_to = 11;
 }
 
 // Pair of per-path changes describing a 3-way merge conflict at a single
@@ -184,18 +191,13 @@ message Metadata {
 }
 
 // File-content diff request. ContentDiff is server-streaming and operates
-// purely on CAS addresses — no path field, no per-revision context.
+// purely on CAS addresses — no path field, no revision. Each address is
+// one a `DiffChange` reported, so it resolves the same way here.
 message ContentDiffRequest {
-  // Content address of the "from" side. Empty bytes represent
-  // "no content" (e.g. file added).
-  bytes address_from = 1;
-  // Content address of the "to" side. Empty bytes represent
-  // "no content" (e.g. file deleted).
-  bytes address_to = 2;
-  // Common ancestor's content address. Presence (set, non-empty)
-  // triggers 3-way merge mode; absence gives 2-way unified diff. There
-  // is no separate mode flag.
-  optional bytes address_base = 3;
+  reserved 1; // deprecated hash-only address_from
+  reserved 2; // deprecated hash-only address_to
+  reserved 3; // deprecated hash-only address_base
+
   // Number of context lines around each hunk in the unified diff
   // output. Server picks a default if unset.
   optional uint32 context_lines = 4;
@@ -210,6 +212,16 @@ message ContentDiffRequest {
   // the response header sets `truncated = true` and emits no chunks;
   // summary stats are still computed.
   optional uint64 max_diff_size = 7;
+  // Content address of the "from" side. Unset represents "no content"
+  // (e.g. file added).
+  lore.model.v1.Address address_from = 8;
+  // Content address of the "to" side. Unset represents "no content"
+  // (e.g. file deleted).
+  lore.model.v1.Address address_to = 9;
+  // Common ancestor's content address. Presence triggers 3-way merge
+  // mode; absence gives 2-way unified diff. There is no separate mode
+  // flag.
+  lore.model.v1.Address address_base = 10;
 }
 
 // Server-streamed response for ContentDiff. The first message MUST carry

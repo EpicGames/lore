@@ -34,7 +34,12 @@ import grpc
 import pytest
 from error_types import LoreException
 from grpc_probe import REVISION_INFO, STORAGE_QUERY, call, repository_metadata
-from protobuf_wire import encode_bytes_field, field_bytes, field_int, parse_fields
+from protobuf_wire import (
+    encode_bytes_field,
+    field_int,
+    field_message,
+    parse_fields,
+)
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -812,7 +817,8 @@ def copy_item_code(
             item = next(stream)
         except grpc.RpcError as error:
             return error.code().value[0]
-    return field_int(parse_fields(field_bytes(parse_fields(item), 3)), 1)
+    error = field_message(parse_fields(item), 3)
+    return field_int(error, 1) if error else 0
 
 
 @pytest.mark.smoke

@@ -16,7 +16,12 @@ from lore_server import (
     generate_server_config,
     launch_lore_server,
 )
-from protobuf_wire import encode_bytes_field, field_bytes, field_string, parse_fields
+from protobuf_wire import (
+    encode_bytes_field,
+    field_message,
+    field_string,
+    parse_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +102,8 @@ def repository_name_in_response(body: bytes) -> str:
 
     `repository` is field 1 of the response and `name` is field 2 of
     `lore.model.v1.Repository`."""
-    repository = field_bytes(parse_fields(body), 1)
-    return field_string(parse_fields(repository), 2)
+    repository = field_message(parse_fields(body), 1)
+    return field_string(repository, 2) if repository else ""
 
 
 def log_contains(log_path: Path, expected: str, attempts: int = 30) -> bool:
