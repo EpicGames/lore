@@ -480,7 +480,7 @@ where
                 let (header_buf, header_len) = response_header.response_bytes();
                 send.lock()
                     .await
-                    .write(&header_buf[..header_len])
+                    .write_all(&header_buf[..header_len])
                     .await
                     .map_err(StreamHandlerError::WriteFailed)?;
                 trace!("Wrote error response header: {response_header:?}");
