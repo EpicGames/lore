@@ -46,7 +46,7 @@ default = []
 # An Oodle payload can only be read where the Oodle libraries are: without this every Oodle
 # fragment is counted unreadable and left behind. Building with it requires OODLE_LIB_DIR.
 oodle = ["lore-storage/oodle"]
-# The end-to-end test in tests/. It drives a local MinIO and DynamoDB Local, so it is behind the
+# The end-to-end test in tests/. It drives a local RustFS and DynamoDB Local, so it is behind the
 # same gate the Lore workspace puts its own AWS suite behind rather than running on a bare
 # `cargo test`.
 integration_tests = []

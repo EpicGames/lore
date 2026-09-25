@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 #![cfg(feature = "integration_tests")]
 
-//! End-to-end migration of a store written the old way, against a local `MinIO` and `DynamoDB`
+//! End-to-end migration of a store written the old way, against a local `RustFS` and `DynamoDB`
 //! Local.
 //!
 //! The store is seeded the way one that predates the fragment moving onto the S3 object looks:

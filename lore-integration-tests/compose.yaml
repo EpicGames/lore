@@ -3,15 +3,28 @@
 name: integration-tests
 
 services:
-  minio:
-    image: quay.io/minio/minio
+  # The S3 stand-in. RustFS rather than MinIO because MinIO's community edition
+  # no longer publishes images; see docs/developing/decisions/00020-s3-test-double.md.
+  # Pinned by digest so the fixture is reproducible and a bump is a reviewed
+  # change, the way the workflows pin their actions. Stricter than the other
+  # services here on purpose: this is the one whose 1.0 is recent enough that
+  # the tag may still move. The digest covers amd64 and arm64.
+  rustfs:
+    image: rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
     ports:
       - "9000:9000"
       - "9001:9001"
     environment:
-      - MINIO_ROOT_USER=lorelocal
-      - MINIO_ROOT_PASSWORD=lorelocal
-    command: server --console-address :9001 /data
+      - RUSTFS_ACCESS_KEY=lorelocal
+      - RUSTFS_SECRET_KEY=lorelocal
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+    # The bucket lives in tmpfs, so the store is wiped on restart the way
+    # DynamoDB Local's -inMemory wipes the tables. The mode is widened because
+    # the container runs as uid 10001 and tmpfs mounts come up root-owned 0755.
+    tmpfs:
+      - /data:mode=1777
+      - /logs:mode=1777
   dynamodb:
     image: amazon/dynamodb-local
     ports:
