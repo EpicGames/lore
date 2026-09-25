@@ -3,14 +3,7 @@
 use std::env;
 use std::path::Path;
 
-include!("../build-helper.rs");
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Populate environment with build details
-    vergen::Emitter::default()
-        .add_custom_instructions(&LoreVergen::default())?
-        .emit()?;
-
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("No manifest dir set");
     let native_dir = Path::join(Path::new(&crate_dir), "native");
 

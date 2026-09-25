@@ -11,12 +11,6 @@ use regex::Regex;
 include!("../build-helper.rs");
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Populate environment with build details
-    let version = LoreVergen::default();
-    vergen::Emitter::default()
-        .add_custom_instructions(&version)?
-        .emit()?;
-
     let path_sep = MAIN_SEPARATOR;
 
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();

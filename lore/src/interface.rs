@@ -7542,13 +7542,12 @@ pub extern "C" fn lore_set_allocator(
     }
 }
 
-/// Return the library version as a NUL-terminated string. The string is owned
-/// by the library and must not be freed by the caller.
+/// Return the library version as a NUL-terminated string: `LORE_INTERFACE_VERSION`,
+/// then `+` and the build name. The string is owned by the library and must not
+/// be freed by the caller.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_version() -> *const std::ffi::c_char {
-    lore_base::version::LORE_LIBRARY_VERSION_CSTR
-        .as_ptr()
-        .cast::<std::ffi::c_char>()
+    lore_base::version::LORE_LIBRARY_VERSION_CSTR.as_ptr()
 }
 
 pub fn user_directory() -> Option<PathBuf> {

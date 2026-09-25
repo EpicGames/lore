@@ -6,10 +6,7 @@ use std::error::Error;
 include!("../build-helper.rs");
 
 fn main() -> Result<(), Box<dyn Error>> {
-    // Populate environment with build details
-    vergen::Emitter::default()
-        .add_custom_instructions(&LoreVergen::default())?
-        .emit()?;
+    println!("cargo:rerun-if-changed=build.rs");
 
     // Compile metadata into lore.exe for Windows
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {

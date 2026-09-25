@@ -63,7 +63,17 @@ Pick this path to run a CLI built from your own checkout.
 
     The compiled binary lands at `target/release/lore` (`target\release\lore.exe` on Windows). The first build compiles from source and may take several minutes.
 
-2. **Put `lore` on your PATH.**
+2. **Stamp a build version (optional).**
+
+    A binary built from source reports its version as `<version>+local`, for example `0.10.1-nightly+local`. To give it a build name of your own, write the name into the binary:
+
+    ```bash
+    cargo run --release -p lore-base --bin lore-stamp -- --build my-build target/release/lore
+    ```
+
+    The binary then reports `0.10.1-nightly+my-build`. A build name holds letters, digits, and punctuation such as `.`, `-`, and `_`, but no spaces or slashes. On Windows, name `target\release\lore.exe`.
+
+3. **Put `lore` on your PATH.**
 
     Move the compiled binary into a directory on your PATH so you can run `lore` from any directory.
 
@@ -164,7 +174,7 @@ To make completions persistent, add that line to your PowerShell profile.
 lore --version
 ```
 
-Running this from any directory prints a `lore <version>` line. A source build derives its version from the repository checkout, so the exact string depends on the source tree you built from.
+Running this from any directory prints a `lore <version>` line. A source build prints the package version of the tree you built from, followed by `+local`, or by `+` and the build name you stamped into it.
 
 ## See also
 

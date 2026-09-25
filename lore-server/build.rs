@@ -12,8 +12,6 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-include!("../build-helper.rs");
-
 /// Files to exclude from code generation (infrastructure files).
 ///
 /// These files are part of the plugin/hook infrastructure and are always
@@ -65,7 +63,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .add_instructions(&vergen::BuildBuilder::all_build()?)?
         .add_instructions(&vergen::RustcBuilder::all_rustc()?)?
         .add_instructions(&vergen::SysinfoBuilder::all_sysinfo()?)?
-        .add_custom_instructions(&LoreVergen::default())?
         .emit()?;
 
     Ok(())

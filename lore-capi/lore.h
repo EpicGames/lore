@@ -11872,8 +11872,9 @@ int32_t lore_set_allocator(lore_alloc_fn alloc,
                            lore_realloc_fn realloc,
                            lore_dealloc_fn dealloc);
 
-// Return the library version as a NUL-terminated string. The string is owned
-// by the library and must not be freed by the caller.
+// Return the library version as a NUL-terminated string: `LORE_INTERFACE_VERSION`,
+// then `+` and the build name. The string is owned by the library and must not
+// be freed by the caller.
 const char *lore_version(void);
 
 // Return the path of the directory where the library keeps its per-user data

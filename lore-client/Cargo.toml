@@ -30,8 +30,6 @@ oodle = ["lore/oodle"]
 swfs = ["lore/swfs"]
 
 [build-dependencies]
-vergen = { workspace = true }
-anyhow = { workspace = true }
 winresource = "0.1.23"
 
 [[bin]]

@@ -75,7 +75,6 @@ x509-parser = { workspace = true }
 zerocopy = { workspace = true }
 
 [build-dependencies]
-anyhow = { workspace = true }
 tonic-prost-build = { workspace = true }
 vergen = { workspace = true }
 
