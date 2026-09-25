@@ -18,6 +18,7 @@ use pin_project::pinned_drop;
 use serde::Deserialize;
 use tokio::runtime::Handle;
 use tokio::task::JoinSet;
+use tokio::task::futures::TaskLocalFuture;
 
 // ---------------------------------------------------------------------------
 // Instruments
@@ -158,6 +159,50 @@ pub fn try_lore_context() -> Option<Arc<dyn Any + Send + Sync>> {
     LORE_CONTEXT.try_with(|ctx| ctx.clone()).ok()
 }
 
+/// A spawned task scoped to the `LORE_CONTEXT` it was spawned under, or unscoped if there was none.
+/// Both cases are one type, so the runtime's task machinery is compiled once for each spawned
+/// future type.
+#[pin_project(project = ContextTaskProjection)]
+pub enum ContextTask<F> {
+    Scoped(#[pin] TaskLocalFuture<Arc<dyn Any + Send + Sync>, ObservedTask<F>>),
+    Unscoped(#[pin] ObservedTask<F>),
+}
+
+impl<F: Future> Future for ContextTask<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        match self.project() {
+            ContextTaskProjection::Scoped(task) => task.poll(cx),
+            ContextTaskProjection::Unscoped(task) => task.poll(cx),
+        }
+    }
+}
+
+/// `future` observed and scoped to the current `LORE_CONTEXT`, if one is set, as a [`ContextTask`].
+#[track_caller]
+pub fn spawned_task<F: Future>(future: F) -> ContextTask<F> {
+    let task = ObservedTask::new(future);
+    match try_lore_context() {
+        Some(context) => ContextTask::Scoped(LORE_CONTEXT.scope(context, task)),
+        None => ContextTask::Unscoped(task),
+    }
+}
+
+/// `function`, to run within its caller's `LORE_CONTEXT`, if one is set. Both cases are one closure
+/// type, so the runtime's blocking task machinery is compiled once for each spawned closure type.
+pub fn spawned_blocking_task<F, T>(function: F) -> impl FnOnce() -> T + Send + 'static
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: 'static,
+{
+    let context = try_lore_context();
+    move || match context {
+        Some(context) => LORE_CONTEXT.sync_scope(context, function),
+        None => function(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spawn macros — propagate LORE_CONTEXT to spawned tasks
 // ---------------------------------------------------------------------------
@@ -176,51 +221,31 @@ macro_rules! lore_spawn {
     ($joinset:ident, $name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $joinset.spawn_on(
-                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
-                    &$crate::runtime::runtime(),
-                )
-            } else {
-                $joinset.spawn_on(__task, &$crate::runtime::runtime())
-            }
+            $joinset.spawn_on(
+                $crate::runtime::spawned_task($expression),
+                &$crate::runtime::runtime(),
+            )
         }
     }};
     ($joinset:ident, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $joinset.spawn_on(
-                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
-                    &$crate::runtime::runtime(),
-                )
-            } else {
-                $joinset.spawn_on(__task, &$crate::runtime::runtime())
-            }
+            $joinset.spawn_on(
+                $crate::runtime::spawned_task($expression),
+                &$crate::runtime::runtime(),
+            )
         }
     }};
     ($name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::runtime().spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
-            } else {
-                $crate::runtime::runtime().spawn(__task)
-            }
+            $crate::runtime::runtime().spawn($crate::runtime::spawned_task($expression))
         }
     }};
     ($expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::runtime().spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
-            } else {
-                $crate::runtime::runtime().spawn(__task)
-            }
+            $crate::runtime::runtime().spawn($crate::runtime::spawned_task($expression))
         }
     }};
     // Trailing-comma forms, so a multi-line call formats like any other.
@@ -247,27 +272,16 @@ macro_rules! lore_spawn_net {
     ($joinset:ident, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $joinset.spawn_on(
-                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
-                    &$crate::runtime::net_runtime(),
-                )
-            } else {
-                $joinset.spawn_on(__task, &$crate::runtime::net_runtime())
-            }
+            $joinset.spawn_on(
+                $crate::runtime::spawned_task($expression),
+                &$crate::runtime::net_runtime(),
+            )
         }
     }};
     ($expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::net_runtime()
-                    .spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
-            } else {
-                $crate::runtime::net_runtime().spawn(__task)
-            }
+            $crate::runtime::net_runtime().spawn($crate::runtime::spawned_task($expression))
         }
     }};
     // Trailing-comma forms, so a multi-line call formats like any other.
@@ -313,53 +327,31 @@ macro_rules! lore_spawn_core {
     ($joinset:ident, $name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $joinset.spawn_on(
-                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
-                    &$crate::runtime::core_runtime(),
-                )
-            } else {
-                $joinset.spawn_on(__task, &$crate::runtime::core_runtime())
-            }
+            $joinset.spawn_on(
+                $crate::runtime::spawned_task($expression),
+                &$crate::runtime::core_runtime(),
+            )
         }
     }};
     ($joinset:ident, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $joinset.spawn_on(
-                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
-                    &$crate::runtime::core_runtime(),
-                )
-            } else {
-                $joinset.spawn_on(__task, &$crate::runtime::core_runtime())
-            }
+            $joinset.spawn_on(
+                $crate::runtime::spawned_task($expression),
+                &$crate::runtime::core_runtime(),
+            )
         }
     }};
     ($name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::core_runtime()
-                    .spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
-            } else {
-                $crate::runtime::core_runtime().spawn(__task)
-            }
+            $crate::runtime::core_runtime().spawn($crate::runtime::spawned_task($expression))
         }
     }};
     ($expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            let __task = $crate::runtime::ObservedTask::new($expression);
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::core_runtime()
-                    .spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
-            } else {
-                $crate::runtime::core_runtime().spawn(__task)
-            }
+            $crate::runtime::core_runtime().spawn($crate::runtime::spawned_task($expression))
         }
     }};
     // Trailing-comma forms, so a multi-line call formats like any other.
@@ -385,51 +377,33 @@ macro_rules! lore_spawn_blocking {
     ($joinset:ident, $name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $joinset.spawn_blocking_on(
-                    move || $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression),
-                    &$crate::runtime::core_runtime(),
-                )
-            } else {
-                $joinset.spawn_blocking_on($expression, &$crate::runtime::core_runtime())
-            }
+            $joinset.spawn_blocking_on(
+                $crate::runtime::spawned_blocking_task($expression),
+                &$crate::runtime::core_runtime(),
+            )
         }
     }};
     ($joinset:ident, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $joinset.spawn_blocking_on(
-                    move || $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression),
-                    &$crate::runtime::core_runtime(),
-                )
-            } else {
-                $joinset.spawn_blocking_on($expression, &$crate::runtime::core_runtime())
-            }
+            $joinset.spawn_blocking_on(
+                $crate::runtime::spawned_blocking_task($expression),
+                &$crate::runtime::core_runtime(),
+            )
         }
     }};
     ($name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::core_runtime().spawn_blocking(move || {
-                    $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression)
-                })
-            } else {
-                $crate::runtime::core_runtime().spawn_blocking($expression)
-            }
+            $crate::runtime::core_runtime()
+                .spawn_blocking($crate::runtime::spawned_blocking_task($expression))
         }
     }};
     ($expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::core_runtime().spawn_blocking(move || {
-                    $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression)
-                })
-            } else {
-                $crate::runtime::core_runtime().spawn_blocking($expression)
-            }
+            $crate::runtime::core_runtime()
+                .spawn_blocking($crate::runtime::spawned_blocking_task($expression))
         }
     }};
 }
@@ -1225,6 +1199,40 @@ mod tests {
             "blocking work issued from a net task ran on {thread_name:?}, \
              which is not a core blocking thread"
         );
+    }
+
+    /// The label of the `LORE_CONTEXT` the caller runs within, if one is set.
+    fn context_label() -> Option<&'static str> {
+        try_lore_context().and_then(|context| context.downcast_ref::<&'static str>().copied())
+    }
+
+    #[test]
+    fn spawns_run_within_the_context_they_were_spawned_under() {
+        let context: Arc<dyn Any + Send + Sync> = Arc::new("spawner");
+        let labels = net_runtime().block_on(LORE_CONTEXT.scope(context, async {
+            let task = crate::lore_spawn!(async { context_label() });
+            let blocking = crate::lore_spawn_blocking!(context_label);
+            (
+                task.await.expect("task joins"),
+                blocking.await.expect("blocking task joins"),
+            )
+        }));
+
+        assert_eq!(labels, (Some("spawner"), Some("spawner")));
+    }
+
+    #[test]
+    fn spawns_outside_a_context_run_without_one() {
+        let labels = net_runtime().block_on(async {
+            let task = crate::lore_spawn!(async { context_label() });
+            let blocking = crate::lore_spawn_blocking!(context_label);
+            (
+                task.await.expect("task joins"),
+                blocking.await.expect("blocking task joins"),
+            )
+        });
+
+        assert_eq!(labels, (None, None));
     }
 
     /// The accessors sit on request paths, so they must resolve to the one

@@ -6,58 +6,19 @@
 //! would deny a later install. One test per binary keeps the install isolated.
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use lore_base::lore_spawn_net_nocontext;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::LoreTaskLifecycleEvent;
-use lore_base::runtime::LoreTaskSpawn;
-use lore_base::runtime::TaskLifecycleObserver;
 use lore_base::runtime::net_runtime;
 use lore_base::runtime::set_task_lifecycle_observer;
 use lore_base::runtime::try_lore_context;
 
-const SPAWNER_LABEL: &str = "spawner";
+mod observer;
 
-struct RecordedEvent {
-    event: LoreTaskLifecycleEvent,
-    file: &'static str,
-    line: u32,
-    context_label: &'static str,
-}
-
-#[derive(Default)]
-struct EventRecorder {
-    events: Mutex<Vec<RecordedEvent>>,
-}
-
-impl EventRecorder {
-    fn recorded(&self) -> std::sync::MutexGuard<'_, Vec<RecordedEvent>> {
-        self.events
-            .lock()
-            .expect("no test holds this lock on panic")
-    }
-}
-
-/// Shares its recorder with the test, which reads the events back after the observer is installed.
-struct RecordingObserver(Arc<EventRecorder>);
-
-impl TaskLifecycleObserver for RecordingObserver {
-    fn context_label(&self) -> &'static str {
-        try_lore_context()
-            .and_then(|context| Arc::downcast::<&'static str>(context).ok())
-            .map_or("<no context>", |label| *label)
-    }
-
-    fn on_event(&self, event: LoreTaskLifecycleEvent, spawn: &LoreTaskSpawn) {
-        self.0.recorded().push(RecordedEvent {
-            event,
-            file: spawn.file,
-            line: spawn.line,
-            context_label: spawn.context_label,
-        });
-    }
-}
+use observer::EventRecorder;
+use observer::RecordingObserver;
+use observer::SPAWNER_LABEL;
 
 /// Both ends of a task report the context it was spawned under, so an up/down counter keyed on
 /// the label pairs the task's increment with its decrement. The task here runs with no context of
