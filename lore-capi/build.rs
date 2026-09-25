@@ -15,11 +15,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
-    // Watch every source cbindgen reads, so the checked-in header cannot go stale: this crate's
-    // own, and the crates `cbindgen.toml` names under `parse.include`, which define C-API types
-    // of their own. Cargo does not re-run a build script when only a dependency crate changes.
+    // Watch every source cbindgen reads, so the checked-in header cannot go stale: the `lore`
+    // crate's, and those of the crates `cbindgen.toml` names under `parse.include`, which define
+    // C-API types of their own. Cargo does not re-run a build script when only a dependency
+    // crate changes.
     for pattern in [
-        "src/**/*.rs",
+        "../lore/src/**/*.rs",
         "../lore-base/src/**/*.rs",
         "../lore-notification/src/**/*.rs",
         "../lore-revision/src/**/*.rs",
@@ -44,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // run cbindgen to generate `lore.h`
     match cbindgen::Builder::new()
-        .with_crate(&crate_dir)
+        .with_crate(format!("{crate_dir}{path_sep}..{path_sep}lore"))
         .with_config(config)
         .generate()
     {
@@ -120,7 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             && !trimmed.starts_with("/*")
             && urc_re.is_match(line)
     }) {
-        panic!("lore.h header contains 'urc_' reference, update lore/cbindgen.toml: {line}");
+        panic!("lore.h header contains 'urc_' reference, update lore-capi/cbindgen.toml: {line}");
     }
 
     // Check for any CamelCase "Lore" prefix in non-comment lines
@@ -131,7 +132,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             && !trimmed.starts_with("/*")
             && line.contains("Lore")
     }) {
-        panic!("lore.h header contains camel cased 'Lore' type, update lore/cbindgen.toml: {line}");
+        panic!(
+            "lore.h header contains camel cased 'Lore' type, update lore-capi/cbindgen.toml: {line}"
+        );
     }
     std::fs::write(&header_gen, &contents).expect("Unable to write patched lore.h");
 
@@ -213,7 +216,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     // if the header contents changed, copy it to the /lore-capi directory
-    let header_target = format!("{crate_dir}{path_sep}..{path_sep}lore-capi{path_sep}lore.h");
+    let header_target = format!("{crate_dir}{path_sep}lore.h");
     let contents_old =
         std::fs::read_to_string(&header_target).expect("Unable to read /lore-capi/lore.h");
     let contents_new = contents;
@@ -229,7 +232,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos" {
         let dylib_name = "liblore.dylib";
-        println!("cargo:rustc-link-arg=-Wl,-install_name,@rpath/{dylib_name}");
+        println!("cargo:rustc-link-arg-cdylib=-Wl,-install_name,@rpath/{dylib_name}");
     }
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "linux" {
         let solib_name = "liblore.so";

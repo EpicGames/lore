@@ -44,6 +44,8 @@ cargo build
 cargo test
 ```
 
+`cargo build -p lore-capi` builds the C library, `liblore.so` and `liblore.a`, and its header `lore.h`; building only the `lore` crate, the CLI or the server does not.
+
 A build reports its version as `<package version>+local`. No build compiles a per-build version in, so a changing build number never invalidates the build cache. To give finished artifacts a build version, stamp them after building and before signing:
 
 ```sh

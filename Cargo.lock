@@ -2489,15 +2489,11 @@ name = "lore"
 version = "0.10.1-nightly"
 dependencies = [
  "bitcode",
- "blake3",
  "bytes",
- "cbindgen",
- "cc",
  "chrono",
  "ctor",
  "dashmap",
  "enum_dispatch",
- "glob",
  "libc",
  "lore-base",
  "lore-credential",
@@ -2510,7 +2506,6 @@ dependencies = [
  "lore-transport",
  "parking_lot",
  "rand",
- "regex",
  "serde",
  "serde_json",
  "serial_test",
@@ -2591,6 +2586,18 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zerocopy",
+]
+
+[[package]]
+name = "lore-capi"
+version = "0.10.1-nightly"
+dependencies = [
+ "blake3",
+ "cbindgen",
+ "cc",
+ "glob",
+ "lore",
+ "regex",
 ]
 
 [[package]]

@@ -27,9 +27,9 @@ Keep the language suitable for non-native English speakers.
 ## The interface crate
 
 The `extern "C"` functions in `lore/src/interface.rs` form the public C API. The build script
-(`lore/build.rs`) runs cbindgen to copy each function's rustdoc comment into the generated C header
-`lore-capi/lore.h`, where it becomes a C comment. The comment you write in Rust is the comment a C
-consumer reads.
+(`lore-capi/build.rs`) runs cbindgen to copy each function's rustdoc comment into the generated C
+header `lore-capi/lore.h`, where it becomes a C comment. The comment you write in Rust is the
+comment a C consumer reads.
 
 Write these comments for the C consumer:
 

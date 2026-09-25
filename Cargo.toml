@@ -4,6 +4,7 @@ members = [
     "lore",
     "lore-aws",
     "lore-base",
+    "lore-capi",
     "lore-chaos-client",
     "lore-client",
     "lore-credential",
