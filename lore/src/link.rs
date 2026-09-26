@@ -282,15 +282,15 @@ async fn info_local(
     .await
 }
 
-pub async fn list_staged(globals: LoreGlobalArgs, callback: LoreEventCallback) -> i32 {
-    repository_call_read(
+/// Lists the staged links. Blocks on the runtime, so it is called from outside it.
+pub fn list_staged(globals: LoreGlobalArgs, callback: LoreEventCallback) -> i32 {
+    crate::runtime().block_on(repository_call_read(
         globals,
         callback,
         (),
         list_staged,
         move |repository, _args| lore_revision::link::list::list_staged(repository),
-    )
-    .await
+    ))
 }
 
 /// Arguments for updating the pin or properties of an existing link.

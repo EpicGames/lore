@@ -865,12 +865,14 @@ pub struct LoreRevisionBisectArgs {
     pub end: LoreString,
 }
 
-pub async fn bisect(
+/// Bisects the revision range between two revisions. Blocks on the runtime, so it is called from
+/// outside it.
+pub fn bisect(
     globals: LoreGlobalArgs,
     args: LoreRevisionBisectArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    repository_call_write(
+    crate::runtime().block_on(repository_call_write(
         globals,
         callback,
         args,
@@ -882,8 +884,7 @@ pub async fn bisect(
             };
             bisect::bisect_boxed(repository, &token, options).await
         },
-    )
-    .await
+    ))
 }
 
 /// Arguments for finding revisions by metadata or revision number.

@@ -8,12 +8,11 @@ use std::sync::atomic::Ordering;
 use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
+use lore::call_delegation::run_command;
 use lore::dependency;
-use lore::file;
 use lore::file::DEFAULT_CONTEXT_LINES;
 use lore::file::LoreFileObliterateArgs;
 use lore::interface::*;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;
@@ -818,7 +817,7 @@ pub fn handle_file_info(globals: LoreGlobalArgs, args: &FileInfoArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::info(globals, info_args, callback)) as u8;
+    return run_command(globals, info_args.into(), callback) as u8;
 }
 
 pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
@@ -895,7 +894,7 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::diff(globals, diff_args, callback)) as u8;
+    return run_command(globals, diff_args.into(), callback) as u8;
 }
 
 pub fn handle_file_hash(globals: LoreGlobalArgs, args: &FileHashArgs) -> u8 {
@@ -933,7 +932,7 @@ pub fn handle_file_hash(globals: LoreGlobalArgs, args: &FileHashArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::hash(globals, hash_args, callback)) as u8;
+    return run_command(globals, hash_args.into(), callback) as u8;
 }
 
 pub fn handle_file_metadata_clear(globals: LoreGlobalArgs, args: &FileMetadataClearArgs) -> u8 {
@@ -955,7 +954,7 @@ pub fn handle_file_metadata_clear(globals: LoreGlobalArgs, args: &FileMetadataCl
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::metadata_clear(globals, clear_args, callback)) as u8;
+    return run_command(globals, clear_args.into(), callback) as u8;
 }
 
 pub fn handle_file_metadata_get(globals: LoreGlobalArgs, args: &FileMetadataGetArgs) -> u8 {
@@ -978,7 +977,7 @@ pub fn handle_file_metadata_get(globals: LoreGlobalArgs, args: &FileMetadataGetA
                 .with_defaults(),
         ));
 
-        return runtime().block_on(file::metadata_get(globals, get_args, callback)) as u8;
+        return run_command(globals, get_args.into(), callback) as u8;
     } else {
         let list_args = LoreFileMetadataListArgs {
             path: args.path.as_str().into(),
@@ -997,7 +996,7 @@ pub fn handle_file_metadata_get(globals: LoreGlobalArgs, args: &FileMetadataGetA
                 .with_defaults(),
         ));
 
-        runtime().block_on(file::metadata_list(globals, list_args, callback)) as u8
+        run_command(globals, list_args.into(), callback) as u8
     }
 }
 
@@ -1053,7 +1052,7 @@ pub fn handle_file_metadata_set(globals: LoreGlobalArgs, args: &FileMetadataSetA
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::metadata_set(globals, set_args, callback)) as u8;
+    return run_command(globals, set_args.into(), callback) as u8;
 }
 
 fn stage_info_display(count: &LoreFileStageCountData) -> String {
@@ -1154,7 +1153,7 @@ pub fn handle_file_stage(globals: LoreGlobalArgs, args: &FileStageArgs) -> u8 {
             scan: u8::from(args.scan),
         };
 
-        return runtime().block_on(file::stage(globals, stage_args, callback)) as u8;
+        return run_command(globals, stage_args.into(), callback) as u8;
     }
 
     // Stage move
@@ -1165,7 +1164,7 @@ pub fn handle_file_stage(globals: LoreGlobalArgs, args: &FileStageArgs) -> u8 {
                 to_path: LoreString::from(&sub_args.to),
             };
 
-            return runtime().block_on(file::stage_move(globals, stage_args, callback)) as u8;
+            return run_command(globals, stage_args.into(), callback) as u8;
         }
 
         FileStageCommands::Merge(sub_args) => {
@@ -1173,7 +1172,7 @@ pub fn handle_file_stage(globals: LoreGlobalArgs, args: &FileStageArgs) -> u8 {
 
             let stage_args = LoreFileStageMergeArgs { paths };
 
-            return runtime().block_on(file::stage_merge(globals, stage_args, callback)) as u8;
+            return run_command(globals, stage_args.into(), callback) as u8;
         }
     }
 }
@@ -1203,7 +1202,7 @@ pub fn handle_file_dirty(globals: LoreGlobalArgs, args: &FileDirtyArgs) -> u8 {
 
         let dirty_args = LoreFileDirtyArgs { paths };
 
-        return runtime().block_on(file::dirty(globals, dirty_args, callback)) as u8;
+        return run_command(globals, dirty_args.into(), callback) as u8;
     }
 
     // Dirty move/copy subcommands
@@ -1214,7 +1213,7 @@ pub fn handle_file_dirty(globals: LoreGlobalArgs, args: &FileDirtyArgs) -> u8 {
                 to_path: LoreString::from(&sub_args.to),
             };
 
-            runtime().block_on(file::dirty_move(globals, dirty_args, callback)) as u8
+            run_command(globals, dirty_args.into(), callback) as u8
         }
 
         FileDirtyCommands::Copy(sub_args) => {
@@ -1223,7 +1222,7 @@ pub fn handle_file_dirty(globals: LoreGlobalArgs, args: &FileDirtyArgs) -> u8 {
                 to_path: LoreString::from(&sub_args.to),
             };
 
-            runtime().block_on(file::dirty_copy(globals, dirty_args, callback)) as u8
+            run_command(globals, dirty_args.into(), callback) as u8
         }
     }
 }
@@ -1279,7 +1278,7 @@ pub fn handle_file_unstage(globals: LoreGlobalArgs, args: &FileUnstageArgs) -> u
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::unstage(globals, unstage_args, callback)) as u8;
+    return run_command(globals, unstage_args.into(), callback) as u8;
 }
 
 fn reset_info_total(count: &LoreFileResetCountData) -> u64 {
@@ -1342,11 +1341,7 @@ pub fn handle_file_reset(globals: LoreGlobalArgs, args: &FileResetArgs) -> u8 {
             branch: branch.into(),
         };
 
-        return runtime().block_on(file::reset_to_last_merged(
-            globals,
-            reset_last_merged_args,
-            callback,
-        )) as u8;
+        return run_command(globals, reset_last_merged_args.into(), callback) as u8;
     } else {
         let reset_args = LoreFileResetArgs {
             paths,
@@ -1354,7 +1349,7 @@ pub fn handle_file_reset(globals: LoreGlobalArgs, args: &FileResetArgs) -> u8 {
             purge: args.purge.into(),
         };
 
-        return runtime().block_on(file::reset(globals, reset_args, callback)) as u8;
+        return run_command(globals, reset_args.into(), callback) as u8;
     }
 }
 
@@ -1498,7 +1493,7 @@ pub fn handle_file_history(globals: LoreGlobalArgs, args: &FileHistoryArgs) -> u
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::history(globals, log_args, callback)) as u8;
+    return run_command(globals, log_args.into(), callback) as u8;
 }
 
 pub fn handle_file_write(globals: LoreGlobalArgs, args: &FileWriteArgs) -> u8 {
@@ -1535,7 +1530,7 @@ pub fn handle_file_write(globals: LoreGlobalArgs, args: &FileWriteArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::write(globals, write_args, callback)) as u8;
+    return run_command(globals, write_args.into(), callback) as u8;
 }
 
 pub fn handle_file_obliterate(globals: LoreGlobalArgs, args: &FileObliterateArgs) -> u8 {
@@ -1577,7 +1572,7 @@ pub fn handle_file_obliterate(globals: LoreGlobalArgs, args: &FileObliterateArgs
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::obliterate(globals, obliterate_args, callback)) as u8;
+    return run_command(globals, obliterate_args.into(), callback) as u8;
 }
 
 pub fn handle_file_dump(globals: LoreGlobalArgs, args: &FileDumpArgs) -> u8 {
@@ -1645,7 +1640,7 @@ pub fn handle_file_dump(globals: LoreGlobalArgs, args: &FileDumpArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(file::dump(globals, dump_args, callback)) as u8;
+    return run_command(globals, dump_args.into(), callback) as u8;
 }
 
 pub fn handle_file_metadata_commands(cmd: &FileMetadataCommands, globals: LoreGlobalArgs) -> u8 {
@@ -1709,7 +1704,7 @@ pub fn handle_file_dependency_add(globals: LoreGlobalArgs, args: &FileDependency
             .with_defaults(),
     ));
 
-    runtime().block_on(dependency::dependency_add(globals, add_args, callback)) as u8
+    run_command(globals, add_args.into(), callback) as u8
 }
 
 pub fn handle_file_dependency_remove(
@@ -1757,11 +1752,7 @@ pub fn handle_file_dependency_remove(
             .with_defaults(),
     ));
 
-    runtime().block_on(dependency::dependency_remove(
-        globals,
-        remove_args,
-        callback,
-    )) as u8
+    run_command(globals, remove_args.into(), callback) as u8
 }
 
 pub fn handle_file_dependency_list(globals: LoreGlobalArgs, args: &FileDependencyListArgs) -> u8 {
@@ -1816,7 +1807,7 @@ pub fn handle_file_dependency_list(globals: LoreGlobalArgs, args: &FileDependenc
             .with_defaults(),
     ));
 
-    runtime().block_on(dependency::dependency_list(globals, list_args, callback)) as u8
+    run_command(globals, list_args.into(), callback) as u8
 }
 
 fn format_tag_list(tags: &LoreArray<LoreString>) -> String {

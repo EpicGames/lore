@@ -10,9 +10,9 @@ use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreError;
 use lore_revision::relay::EventDispatcher;
 
-use crate::args::LoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::remote::command::LoreCommand;
 use crate::remote::message::MessageToClient;
 use crate::remote::message::MessageToServer;
 use crate::remote::message::SerializationType;
@@ -61,12 +61,12 @@ fn fill_working_directory(globals: &mut LoreGlobalArgs) {
 }
 
 /// Runs the call on the service, starting one when none is running.
-pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
+pub async fn service_call(
     globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
-    run_service_call(None, globals, args, callback).await
+    run_service_call(None, globals, command, callback).await
 }
 
 /// Runs the call over a connection the caller already holds, rather than one
@@ -75,25 +75,25 @@ pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
 /// A caller that acts on the service only when one is already running connects
 /// itself, so that its check for a service and the call it makes cannot
 /// disagree about whether there was one to act on.
-pub async fn service_call_over<ArgsType: LoreArgs + Clone + Send + 'static>(
+pub async fn service_call_over(
     connection: UdsStream,
     globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
-    run_service_call(Some(connection), globals, args, callback).await
+    run_service_call(Some(connection), globals, command, callback).await
 }
 
-async fn run_service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
+async fn run_service_call(
     connection: Option<UdsStream>,
     mut globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
     fill_working_directory(&mut globals);
     let mut event_dispatcher = EventDispatcher::new(callback);
 
-    let status = service_call_impl(&mut event_dispatcher, globals, args, connection)
+    let status = service_call_impl(&mut event_dispatcher, globals, command, connection)
         .await
         .unwrap_or_else(|err| {
             // The failure's own code, not a flat 1: a caller has to be able to
@@ -117,10 +117,10 @@ async fn run_service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
     status
 }
 
-pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
+pub async fn service_call_impl(
     event_dispatcher: &mut EventDispatcher,
     globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     connection: Option<UdsStream>,
 ) -> Result<i32, ServiceCallError> {
     if !uds_supported() {
@@ -142,10 +142,7 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     let connection = lore_base::lore_spawn_blocking!(move || {
         let mut connection = connection;
 
-        let message = MessageToServer {
-            globals,
-            command: args.to_command(),
-        };
+        let message = MessageToServer { globals, command };
 
         let message_bytes = write_v1_message(message, SerializationType::Json)
             .forward::<ServiceCallError>("serializing message")?;

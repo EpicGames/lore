@@ -4,6 +4,7 @@ pub mod run;
 
 use clap::Args;
 use clap::Subcommand;
+use lore::call_delegation::run_command_locally;
 use lore::interface::LoreEvent;
 use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
@@ -12,7 +13,6 @@ use lore::interface::LoreServiceSetUseAutomaticallyArgs;
 use lore::interface::LoreServiceStartArgs;
 use lore::interface::LoreServiceStopArgs;
 use lore::runtime;
-use lore::service;
 
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
@@ -107,13 +107,13 @@ fn service_callback() -> LoreEventCallback {
 fn handle_service_start(globals: LoreGlobalArgs, _args: &ServiceStartArgs) -> u8 {
     let start_args = LoreServiceStartArgs {};
 
-    return runtime().block_on(service::start(globals, start_args, service_callback())) as u8;
+    return run_command_locally(globals, start_args.into(), service_callback()) as u8;
 }
 
 fn handle_service_stop(globals: LoreGlobalArgs, _args: &ServiceStopArgs) -> u8 {
     let stop_args = LoreServiceStopArgs {};
 
-    return runtime().block_on(service::stop(globals, stop_args, service_callback())) as u8;
+    return run_command_locally(globals, stop_args.into(), service_callback()) as u8;
 }
 
 fn handle_service_set_executable(globals: LoreGlobalArgs, args: &ServiceSetExecutableArgs) -> u8 {
@@ -121,11 +121,7 @@ fn handle_service_set_executable(globals: LoreGlobalArgs, args: &ServiceSetExecu
         executable: args.executable.clone().unwrap_or_default().into(),
     };
 
-    return runtime().block_on(service::set_executable(
-        globals,
-        set_args,
-        service_callback(),
-    )) as u8;
+    return run_command_locally(globals, set_args.into(), service_callback()) as u8;
 }
 
 fn handle_service_set_use_automatically(
@@ -136,11 +132,7 @@ fn handle_service_set_use_automatically(
         enabled: u8::from(args.enabled),
     };
 
-    return runtime().block_on(service::set_use_automatically(
-        globals,
-        set_args,
-        service_callback(),
-    )) as u8;
+    return run_command_locally(globals, set_args.into(), service_callback()) as u8;
 }
 
 pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -> u8 {

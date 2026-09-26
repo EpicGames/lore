@@ -594,31 +594,30 @@ pub struct LoreRepositoryDeleteArgs {
     pub repository_url: LoreString,
 }
 
-pub async fn delete(
+/// Deletes a remote repository. Blocks on the runtime, so it is called from outside it.
+pub fn delete(
     globals: LoreGlobalArgs,
     args: LoreRepositoryDeleteArgs,
     callback: LoreEventCallback,
 ) -> i32 {
     let execution = setup_execution(globals, callback);
 
-    LORE_CONTEXT
-        .scope(execution, async move {
-            log_command_info(&delete, &args);
+    crate::runtime().block_on(LORE_CONTEXT.scope(execution, async move {
+        log_command_info(&delete, &args);
 
-            let time_start = Instant::now();
+        let time_start = Instant::now();
 
-            let repository_url = args.repository_url.as_str();
+        let repository_url = args.repository_url.as_str();
 
-            let result = lore_revision::repository::delete::delete(
-                repository_url,
-                execution_context().globals().identity().unwrap_or_default(),
-            )
-            .await;
+        let result = lore_revision::repository::delete::delete(
+            repository_url,
+            execution_context().globals().identity().unwrap_or_default(),
+        )
+        .await;
 
-            log_command_done(&delete, time_start);
-            execution_context().dispatcher.complete_result(result).await
-        })
-        .await
+        log_command_done(&delete, time_start);
+        execution_context().dispatcher.complete_result(result).await
+    }))
 }
 
 /// Arguments for releasing cached store references for the repository path.

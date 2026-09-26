@@ -3,14 +3,13 @@
 use clap::ArgAction;
 use clap::Args;
 use clap::Subcommand;
+use lore::call_delegation::run_command;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreSharedStoreCreateArgs;
 use lore::interface::LoreSharedStoreInfoArgs;
 use lore::interface::LoreSharedStoreSetUseAutomaticallyArgs;
 use lore::interface::LoreString;
-use lore::runtime;
-use lore::shared_store;
 use lore::shared_store::LoreSharedStoreListArgs;
 
 use crate::cli::EventCallbackExt;
@@ -103,7 +102,7 @@ pub fn handle_create(globals: LoreGlobalArgs, args: &SharedStoreCreateArgs) -> u
             .with_defaults(),
     ));
 
-    runtime().block_on(shared_store::create(globals, args, callback)) as u8
+    run_command(globals, args.into(), callback) as u8
 }
 
 fn display_bool(value: u8) -> &'static str {
@@ -150,7 +149,7 @@ pub fn handle_info(globals: LoreGlobalArgs, _args: &SharedStoreInfoArgs) -> u8 {
             .with_defaults(),
     ));
 
-    runtime().block_on(shared_store::info(globals, args, callback)) as u8
+    run_command(globals, args.into(), callback) as u8
 }
 
 pub fn handle_list(globals: LoreGlobalArgs, args: &SharedStoreListArgs) -> u8 {
@@ -192,7 +191,7 @@ pub fn handle_list(globals: LoreGlobalArgs, args: &SharedStoreListArgs) -> u8 {
         include_instances: args.include_instances.unwrap_or_default() as u8,
     };
 
-    runtime().block_on(shared_store::list(globals, args, callback)) as u8
+    run_command(globals, args.into(), callback) as u8
 }
 
 pub fn handle_set_use_automatically(
@@ -207,5 +206,5 @@ pub fn handle_set_use_automatically(
         (Box::new(|_event: &LoreEvent| {}) as EventCallbackFn).with_defaults(),
     ));
 
-    runtime().block_on(shared_store::set_use_automatically(globals, args, callback)) as u8
+    run_command(globals, args.into(), callback) as u8
 }

@@ -1470,19 +1470,20 @@ pub struct LoreBranchLatestListArgs {
     pub limit: u32,
 }
 
-pub async fn latest_list(
+/// Lists a branch's LATEST revision history. Blocks on the runtime, so it is called from outside
+/// it.
+pub fn latest_list(
     globals: LoreGlobalArgs,
     args: LoreBranchLatestListArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    repository_call_write(
+    crate::runtime().block_on(repository_call_write(
         globals,
         callback,
         args,
         latest_list,
         |repository, _token, args| latest_list_impl(repository, args),
-    )
-    .await
+    ))
 }
 
 async fn latest_list_impl(

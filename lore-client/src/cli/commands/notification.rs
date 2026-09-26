@@ -4,11 +4,11 @@ use std::time::Duration;
 
 use clap::Args;
 use clap::Subcommand;
+use lore::call_delegation::run_command;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreNotificationSubscribeArgs;
 use lore::interface::LoreNotificationUnsubscribeArgs;
-use lore::notification;
 use lore::runtime;
 
 use crate::cli::EventCallbackExt;
@@ -78,7 +78,7 @@ fn handle_notification_subscribe(globals: LoreGlobalArgs, args: &SubscribeArgs) 
 
     println!("Subscribing to notifications...");
 
-    let result = runtime().block_on(notification::subscribe(globals.clone(), args, callback)) as u8;
+    let result = run_command(globals.clone(), args.into(), callback) as u8;
     if result != 0 {
         return result;
     }
@@ -104,7 +104,7 @@ fn handle_notification_subscribe(globals: LoreGlobalArgs, args: &SubscribeArgs) 
             .with_defaults(),
     ));
 
-    runtime().block_on(notification::unsubscribe(globals, args, callback));
+    run_command(globals, args.into(), callback);
 
     return result;
 }

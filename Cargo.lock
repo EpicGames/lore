@@ -2493,7 +2493,6 @@ dependencies = [
  "chrono",
  "ctor",
  "dashmap",
- "enum_dispatch",
  "libc",
  "lore-base",
  "lore-credential",

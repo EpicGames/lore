@@ -5,14 +5,13 @@ use std::sync::atomic::AtomicBool;
 
 use clap::Args;
 use clap::Subcommand;
+use lore::call_delegation::run_command;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreLayerAddArgs;
 use lore::interface::LoreLayerListArgs;
 use lore::interface::LoreLayerRemoveArgs;
 use lore::interface::LoreString;
-use lore::layer;
-use lore::runtime;
 
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
@@ -152,7 +151,7 @@ pub fn handle_layer_add(globals: LoreGlobalArgs, args: &LayerAddArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(layer::layer_add(globals, layer_args, callback)) as u8;
+    return run_command(globals, layer_args.into(), callback) as u8;
 }
 
 pub fn handle_layer_remove(globals: LoreGlobalArgs, args: &LayerRemoveArgs) -> u8 {
@@ -210,7 +209,7 @@ pub fn handle_layer_remove(globals: LoreGlobalArgs, args: &LayerRemoveArgs) -> u
             .with_defaults(),
     ));
 
-    return runtime().block_on(layer::layer_remove(globals, layer_args, callback)) as u8;
+    return run_command(globals, layer_args.into(), callback) as u8;
 }
 
 pub fn handle_layer_list(globals: LoreGlobalArgs) -> u8 {
@@ -249,7 +248,7 @@ pub fn handle_layer_list(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    let status = runtime().block_on(layer::layer_list(globals, layer_args, callback)) as u8;
+    let status = run_command(globals, layer_args.into(), callback) as u8;
 
     if status == 0 && !have_layers.load(std::sync::atomic::Ordering::Relaxed) {
         println!("No layers");

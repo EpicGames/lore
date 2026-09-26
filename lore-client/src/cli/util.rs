@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use lore::branch;
 use lore::branch::LoreBranchInfoArgs;
+use lore::call_delegation::run_command;
 use lore::interface::Context;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
@@ -21,7 +21,6 @@ use lore::interface::LoreRevisionResolveEventData;
 use lore::interface::LoreRevisionResolveTarget;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use crate::eprintln;
@@ -217,7 +216,7 @@ impl BranchNameResolver {
                 *name_cb.lock() = Some(data.name.to_string());
             }
         }));
-        runtime().block_on(branch::info(self.globals.clone(), args, callback));
+        run_command(self.globals.clone(), args.into(), callback);
         name.lock()
             .take()
             .filter(|name| !name.is_empty())

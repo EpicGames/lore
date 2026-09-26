@@ -12,10 +12,11 @@ use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreGlobalArgs;
 
-use crate::args::InvokableLoreArgs;
+use crate::args::LoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
 use crate::remote::call::service_call;
+use crate::remote::command::LoreCommand;
 use crate::remote::service_process::service_in_use;
 
 /// Rejection of a call whose arguments are malformed, before the verb runs.
@@ -70,16 +71,35 @@ fn validate_call_text<ArgsType: ValidateText>(
         .map_err(|error| ArgumentError::from(InvalidArguments::from(error)))
 }
 
-pub(crate) fn run_synchronously<
-    ArgsType: InvokableLoreArgs + ValidateText + Clone + Send + 'static,
-    Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
-    Fut: Future<Output = i32> + Send + 'static,
->(
+/// Runs a C API call to completion: checks its arguments, then hands its command to `run`.
+///
+/// Generic over the arguments only for the check and the conversion to a command, so running the
+/// command is compiled once for each `run` rather than once for each C API function.
+pub(crate) fn run_synchronously<ArgsType, Run, Fut>(
     globals: &LoreGlobalArgs,
     args: &ArgsType,
     callback: LoreEventCallbackConfig,
-    handler: Handler,
-) -> i32 {
+    run: Run,
+) -> i32
+where
+    ArgsType: ValidateText + Clone + Into<LoreCommand>,
+    Run: FnOnce(LoreGlobalArgs, LoreCommand, LoreEventCallback) -> Fut,
+    Fut: Future<Output = i32>,
+{
+    let command = validate_call_text(globals, args).map(|()| args.clone().into());
+    run_command_synchronously(globals, command, callback, run)
+}
+
+fn run_command_synchronously<Run, Fut>(
+    globals: &LoreGlobalArgs,
+    command: Result<LoreCommand, ArgumentError>,
+    callback: LoreEventCallbackConfig,
+    run: Run,
+) -> i32
+where
+    Run: FnOnce(LoreGlobalArgs, LoreCommand, LoreEventCallback) -> Fut,
+    Fut: Future<Output = i32>,
+{
     // Ahead of the sizing below, which would build the runtime that shutdown is
     // taking away.
     if lore_base::runtime::runtime_shutdown_started() {
@@ -91,9 +111,12 @@ pub(crate) fn run_synchronously<
     // itself — the client does, since it builds the runtime before calling in.
     crate::size_threads_for_relaying();
     let callback = lore_revision::event::convert_event_callback(callback);
-    if let Err(error) = validate_call_text(globals, args) {
-        return crate::runtime().block_on(reject_call(globals.clone(), callback, error));
-    }
+    let command = match command {
+        Ok(command) => command,
+        Err(error) => {
+            return crate::runtime().block_on(reject_call(globals.clone(), callback, error));
+        }
+    };
     let mut globals = globals.clone();
     // Resolving the credentials reads their text, so it follows the check above.
     if let Err(error) = globals.validate() {
@@ -103,34 +126,51 @@ pub(crate) fn run_synchronously<
             ArgumentError::from(error),
         ));
     }
-    let args = args.clone();
-    crate::runtime().block_on(handler(globals, args, callback))
+    crate::runtime().block_on(run(globals, command, callback))
 }
 
-pub(crate) fn run_asynchronously<
-    ArgsType: InvokableLoreArgs + ValidateText + Clone + Send + 'static,
-    Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
-    Fut: Future<Output = i32> + Send + 'static,
->(
+/// Checks a C API call's arguments as [`run_synchronously`] does, then starts its command on the
+/// runtime without waiting for it.
+pub(crate) fn run_asynchronously<ArgsType, Run, Fut>(
     globals: &LoreGlobalArgs,
     args: &ArgsType,
     callback: LoreEventCallbackConfig,
-    handler: Handler,
-) {
+    run: Run,
+) where
+    ArgsType: ValidateText + Clone + Into<LoreCommand>,
+    Run: FnOnce(LoreGlobalArgs, LoreCommand, LoreEventCallback) -> Fut,
+    Fut: Future<Output = i32> + Send + 'static,
+{
+    let command = validate_call_text(globals, args).map(|()| args.clone().into());
+    run_command_asynchronously(globals, command, callback, run);
+}
+
+fn run_command_asynchronously<Run, Fut>(
+    globals: &LoreGlobalArgs,
+    command: Result<LoreCommand, ArgumentError>,
+    callback: LoreEventCallbackConfig,
+    run: Run,
+) where
+    Run: FnOnce(LoreGlobalArgs, LoreCommand, LoreEventCallback) -> Fut,
+    Fut: Future<Output = i32> + Send + 'static,
+{
     if lore_base::runtime::runtime_shutdown_started() {
         reject_after_shutdown(callback);
         return;
     }
     crate::size_threads_for_relaying();
     let callback = lore_revision::event::convert_event_callback(callback);
-    if let Err(error) = validate_call_text(globals, args) {
-        drop(lore_base::lore_spawn!(reject_call(
-            globals.clone(),
-            callback,
-            error
-        )));
-        return;
-    }
+    let command = match command {
+        Ok(command) => command,
+        Err(error) => {
+            drop(lore_base::lore_spawn!(reject_call(
+                globals.clone(),
+                callback,
+                error
+            )));
+            return;
+        }
+    };
     let mut globals = globals.clone();
     // Resolving the credentials reads their text, so it follows the check above.
     if let Err(error) = globals.validate() {
@@ -141,8 +181,7 @@ pub(crate) fn run_asynchronously<
         )));
         return;
     }
-    let args = args.clone();
-    drop(lore_base::lore_spawn!(handler(globals, args, callback)));
+    drop(lore_base::lore_spawn!(run(globals, command, callback)));
 }
 
 /// Report a malformed call the way a failing command reports: the status on the
@@ -163,8 +202,51 @@ async fn reject_call(
     .await
 }
 
+/// Runs `command` to completion, in the Lore service when one is in use and in this process
+/// otherwise. Blocks on the runtime, so it is called from outside it.
+pub fn run_command(
+    globals: LoreGlobalArgs,
+    command: LoreCommand,
+    callback: LoreEventCallback,
+) -> i32 {
+    crate::runtime().block_on(dispatch_command(globals, command, callback))
+}
+
+/// Runs `command` to completion in this process, for the commands that act on the Lore service
+/// rather than through it. Blocks on the runtime, so it is called from outside it.
+pub fn run_command_locally(
+    globals: LoreGlobalArgs,
+    command: LoreCommand,
+    callback: LoreEventCallback,
+) -> i32 {
+    crate::runtime().block_on(invoke_locally(globals, command, callback))
+}
+
+/// Runs `command` in the Lore service when one is in use and in this process otherwise.
+pub(crate) async fn dispatch_command(
+    globals: LoreGlobalArgs,
+    command: LoreCommand,
+    callback: LoreEventCallback,
+) -> i32 {
+    if service_in_use().await {
+        service_call(globals, command, callback).await
+    } else {
+        command.invoke_local(globals, callback).await
+    }
+}
+
+/// Runs `command` in this process, for the commands that act on the Lore service rather than
+/// through it.
+pub(crate) fn invoke_locally(
+    globals: LoreGlobalArgs,
+    command: LoreCommand,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    command.invoke_local(globals, callback)
+}
+
 pub(crate) async fn dispatch_call<
-    ArgsType: InvokableLoreArgs + Clone + Send + 'static,
+    ArgsType: LoreArgs,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
     Fut: Future<Output = i32> + Send + 'static,
 >(
@@ -174,7 +256,7 @@ pub(crate) async fn dispatch_call<
     handler: Handler,
 ) -> i32 {
     if service_in_use().await {
-        service_call(globals, args, callback).await
+        service_call(globals, args.to_command(), callback).await
     } else {
         handler(globals, args, callback).await
     }
@@ -316,7 +398,7 @@ mod tests {
 
     /// Run `args` through the synchronous entry point and report the status
     /// together with whether the handler was reached.
-    fn dispatch<ArgsType: InvokableLoreArgs + ValidateText + Clone + Send + 'static>(
+    fn dispatch<ArgsType: ValidateText + Clone + Into<LoreCommand>>(
         globals: &LoreGlobalArgs,
         args: &ArgsType,
     ) -> (i32, bool) {

@@ -1,25 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore::error_set::prelude::*;
-use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
-use lore::lore_spawn;
 use lore::lore_spawn_blocking;
-use lore::remote::connection::ConnectionError;
-use lore::remote::connection::ConnectionErrorWithId;
 use lore::remote::connection::ConnectionId;
-use lore::remote::message::MessageToClient;
-use lore::remote::message::MessageToServer;
-use lore::remote::message::SerializationType;
-use lore::remote::message::V1Header;
-use lore::remote::message::blocking_read_v1_message;
-use lore::remote::message::write_v1_message;
+use lore::remote::connection::serve_connection;
 use lore::remote::network::UdsListener;
 use lore::remote::network::UdsStream;
 use lore::remote::network::uds_supported;
@@ -29,7 +19,6 @@ use lore::remote::service_process::service_executable;
 use lore::remote::service_socket_name;
 use lore::service::initialization::initialize_service;
 use lore::service::service_main::ServiceMainError;
-use tokio::sync::mpsc;
 
 use crate::eprintln;
 use crate::println;
@@ -133,11 +122,7 @@ pub async fn service_main(
                     }
                     let new_connection_id = connection_id;
                     connection_id += 1;
-                    lore_spawn!(async move {
-                        IpcConnection::new(ConnectionId(new_connection_id), stream)
-                            .handle_connection()
-                            .await;
-                    });
+                    serve_connection(ConnectionId(new_connection_id), stream);
                 }
                 Err(err) => {
                     if accept_shutting_down.load(Ordering::SeqCst) {
@@ -221,100 +206,4 @@ async fn wait_for_stop(stop_request: &ServiceStopRequest, termination: Option<Te
     // The caller that asked for the stop is waiting for its reply on a
     // connection this process owns, so the reply drains before the teardown.
     tokio::time::sleep(STOP_REPLY_DRAIN).await;
-}
-
-#[allow(dead_code)]
-struct IpcConnection {
-    id: ConnectionId,
-    connection: UdsStream,
-}
-
-impl IpcConnection {
-    fn new(id: ConnectionId, connection: UdsStream) -> Self {
-        Self { id, connection }
-    }
-
-    async fn send_message(
-        mut stream: UdsStream,
-        message: MessageToClient,
-        serialization_type: SerializationType,
-    ) -> Result<(), ConnectionError> {
-        let message_bytes = write_v1_message(message, serialization_type)
-            .forward::<ConnectionError>("writing message")?;
-        lore_spawn_blocking!(move || stream.writer().write_all(message_bytes.as_slice()))
-            .await
-            .internal("failed writing")?
-            .internal("io")?;
-        Ok(())
-    }
-
-    async fn handle_connection(self) {
-        let id = self.id;
-        if let Err(error) = self.handle_connection_impl().await {
-            eprintln!(
-                "Error in connection: {}",
-                ConnectionErrorWithId::new(error, id)
-            );
-        }
-    }
-
-    async fn handle_connection_impl(self) -> Result<(), ConnectionError> {
-        let mut connection = self.connection.try_clone().internal("cloning connection")?;
-        // Parks a core blocking thread until the peer sends or hangs up, so live
-        // connections consume core's blocking pool one thread apiece.
-        let message: Option<(V1Header, MessageToServer)> =
-            lore_spawn_blocking!(move || blocking_read_v1_message(connection.reader()))
-                .await
-                .internal("failed reading")?
-                .forward::<ConnectionError>("reading message")?;
-
-        let Some((header, command)) = message else {
-            return Ok(());
-        };
-
-        //TODO(UCS-16094): Determine if this should be unbounded or bounded
-        // Create a channel so the callback task can send messages to this network thread, so they
-        // can be forwarded to the client.
-        let (to_client_sender, mut to_client_receiver) =
-            mpsc::unbounded_channel::<(MessageToClient, SerializationType)>();
-
-        lore_spawn!(async move {
-            let sender = to_client_sender.clone();
-
-            // Note: this callback is intentionally NOT wrapped with .with_defaults().
-            // It is the server-side event forwarder that must pass every LoreEvent
-            // (including Error and Log) to the remote client so the client's own
-            // wrapped callback can handle them. Wrapping here would swallow those
-            // events on the server side and they would never reach the remote.
-            let cli_result = command
-                .invoke(Some(Box::new(move |event: &LoreEvent| {
-                    if let Err(error) = to_client_sender.send((
-                        MessageToClient::Event(event.clone()),
-                        header.serialization_type,
-                    )) {
-                        eprintln!("Failed to send Event message to connection task: {error}");
-                    }
-                })))
-                .await;
-
-            if let Err(error) = sender.send((
-                MessageToClient::ApiResult(cli_result),
-                header.serialization_type,
-            )) {
-                eprintln!("Failed to send ApiResult message to connection task: {error}");
-            }
-        });
-
-        while let Some((message, serialization_type)) = to_client_receiver.recv().await {
-            let stream = self.connection.try_clone().internal("cloning connection")?;
-            if let Err(error) = Self::send_message(stream, message, serialization_type).await {
-                eprintln!(
-                    "Failed to send message to client: {}",
-                    ConnectionErrorWithId::new(error, self.id)
-                );
-            }
-        }
-
-        Ok(())
-    }
 }

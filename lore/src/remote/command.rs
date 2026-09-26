@@ -1,15 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use enum_dispatch::enum_dispatch;
 use lore_macro::LoreCommand;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::args::LoreArgs;
-
-//  LoreCommand derive generates `invoke_local` async method that calls the LoreArgs' invoke_local method.
+// The LoreCommand derive generates `invoke_local`, which runs a variant's handler, and a `From`
+// conversion from each variant's arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, LoreCommand)]
-#[enum_dispatch(LoreArgs)]
 pub enum LoreCommand {
     AuthUserInfo(crate::auth::LoreAuthUserInfoArgs),
     AuthLoginWithToken(crate::auth::LoreAuthLoginWithTokenArgs),

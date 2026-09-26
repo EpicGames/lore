@@ -136,7 +136,7 @@ async fn stop_local(
     // on a service that is running and must not be what starts one.
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
-            let status = service_call_over(connection, globals, args, callback).await;
+            let status = service_call_over(connection, globals, args.into(), callback).await;
             if status != 0 {
                 return status;
             }

@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use clap::Args;
 use clap::Subcommand;
+use lore::call_delegation::run_command;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreLinkChangeEventData;
 use lore::interface::LoreLinkEntryEventData;
 use lore::interface::LoreString;
-use lore::link;
 use lore::link::LinkFlags;
 use lore::link::LoreLinkAddArgs;
 use lore::link::LoreLinkInfoArgs;
@@ -17,7 +17,6 @@ use lore::link::LoreLinkListArgs;
 use lore::link::LoreLinkRemoveArgs;
 use lore::link::LoreLinkStagedState;
 use lore::link::LoreLinkUpdateArgs;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;
@@ -179,7 +178,7 @@ fn handle_link_add(globals: LoreGlobalArgs, args: &LinkAddArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(link::add(globals, link_args, callback)) as u8;
+    return run_command(globals, link_args.into(), callback) as u8;
 }
 
 fn handle_link_remove(globals: LoreGlobalArgs, args: &LinkRemoveArgs) -> u8 {
@@ -212,7 +211,7 @@ fn handle_link_remove(globals: LoreGlobalArgs, args: &LinkRemoveArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(link::remove(globals, unlink_args, callback)) as u8;
+    return run_command(globals, unlink_args.into(), callback) as u8;
 }
 
 fn format_link_staged_state(state: LoreLinkStagedState) -> &'static str {
@@ -302,7 +301,7 @@ fn handle_link_info(globals: LoreGlobalArgs, args: &LinkInfoArgs) -> u8 {
             .with_defaults(),
     ));
 
-    let status = runtime().block_on(link::info(globals.clone(), info_args, callback)) as u8;
+    let status = run_command(globals.clone(), info_args.into(), callback) as u8;
 
     if let Some(data) = info.lock().take() {
         let mut branches = util::BranchNameResolver::new(globals);
@@ -360,7 +359,7 @@ fn handle_link_list(globals: LoreGlobalArgs, args: &LinkListArgs) -> u8 {
             .with_defaults(),
     ));
 
-    let status = runtime().block_on(link::list(globals.clone(), list_args, callback)) as u8;
+    let status = run_command(globals.clone(), list_args.into(), callback) as u8;
 
     let entries = entries.lock().split_off(0);
     if entries.is_empty() {
@@ -394,7 +393,7 @@ fn handle_link_list_staged(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     );
 
-    runtime().block_on(lore::link::list_staged(globals, callback));
+    lore::link::list_staged(globals, callback);
 
     let links = discovered_links.lock();
     if links.is_empty() {
@@ -454,7 +453,7 @@ fn handle_link_update(globals: LoreGlobalArgs, args: &LinkUpdateArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(link::update(globals, update_args, callback)) as u8;
+    return run_command(globals, update_args.into(), callback) as u8;
 }
 
 fn print_link_pin(data: &LoreLinkChangeEventData) {

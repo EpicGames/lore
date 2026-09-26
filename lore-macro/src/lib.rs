@@ -35,7 +35,7 @@ pub fn validate_text(input: TokenStream) -> TokenStream {
 pub fn lore_command(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 
-    lore_command::get_invoke_impl(&ast)
+    lore_command::get_lore_command_impl(&ast)
 }
 
 #[proc_macro_attribute]
