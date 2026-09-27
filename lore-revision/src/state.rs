@@ -4825,7 +4825,11 @@ pub async fn gather_tree_paths(
         if !node_link.is_valid() {
             return Err(NodeNotFound.into());
         }
-        if !can_read(node_link.repository) {
+        // `can_read` answers for partitions a link points into. The caller
+        // already reached this repository, so a prefix that resolves inside it
+        // is not asked again: an authorizer that cannot answer without I/O
+        // would otherwise deny every prefixed walk of the caller's own tree.
+        if node_link.repository != repository.id && !can_read(node_link.repository) {
             lore_debug!(
                 "Path resolution stops at unauthorized repository {}",
                 node_link.repository,
