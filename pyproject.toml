@@ -23,6 +23,9 @@ extend-exclude = [".urc", ".lore"]
 
 [tool.pytest.ini_options]
 addopts = "--dist loadgroup --tb=short -rsxX"
+# The harness logs every Lore command's output at INFO; capturing it means a
+# failure report shows what the command printed, not only the assertion.
+log_level = "INFO"
 # tmp_path_retention_policy is deliberately left at its default. "none" looks
 # right for a suite that cleans up after itself, but it sets keep=0 on the
 # numbered basetemp rotation, which makes pytest delete the *current* session's
