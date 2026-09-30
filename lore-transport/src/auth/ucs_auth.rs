@@ -57,7 +57,7 @@ fn is_loopback_http_url(auth_url: &str) -> bool {
 /// `https`: the auth URL arrives in the *remote server's* advertised
 /// environment config, so allowing http to an arbitrary host would let a rogue
 /// server downgrade the channel that carries login and exchange tokens.
-fn grpc_endpoint(auth_url: &str) -> String {
+pub fn grpc_endpoint(auth_url: &str) -> String {
     match auth_url.split_once("://") {
         Some(("https", _)) => auth_url.to_string(),
         Some(("http", _)) if is_loopback_http_url(auth_url) => auth_url.to_string(),
