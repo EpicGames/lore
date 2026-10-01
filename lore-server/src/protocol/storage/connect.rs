@@ -81,6 +81,16 @@ impl Message for Connect {
 
         debug!("Handling connect request");
 
+        // Before any verification or context mutation: a rejected Connect
+        // must not touch a connection already bound to another repository,
+        // or it leaves that connection holding this request's token.
+        if let Some(id) = context.get::<RepositoryId>()
+            && *id != self.repository
+        {
+            warn!("Attempted to set repository id for connection, but it was already set!");
+            return Err(MessageHandleError::AlreadyConnected);
+        }
+
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             match self.auth_token.as_ref() {
                 Some(auth_token) => {
@@ -118,17 +128,10 @@ impl Message for Connect {
             }
         }
 
-        if let Some(id) = context.get::<RepositoryId>() {
-            if *id != self.repository {
-                warn!("Attempted to set repository id for connection, but it was already set!");
-                Err(MessageHandleError::AlreadyConnected)
-            } else {
-                Ok(LoreResponse::Connect(ConnectResponse::default()))
-            }
-        } else {
-            context.insert(self.repository);
-            Ok(LoreResponse::Connect(ConnectResponse::default()))
-        }
+        // A first connect, or a reconnect to the same repository; the
+        // mismatched case returned above.
+        context.insert(self.repository);
+        Ok(LoreResponse::Connect(ConnectResponse::default()))
     }
 }
 
@@ -147,6 +150,7 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
     use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 
     #[test]
@@ -387,5 +391,44 @@ mod tests {
             assert!(context.get::<RepositoryId>().is_none());
             assert!(context.get::<PartitionGrants>().is_none());
         }
+    }
+
+    /// A reconnect naming a different repository is refused, and refusing it
+    /// must leave the connection's existing identity alone.
+    #[tokio::test]
+    async fn a_rejected_reconnect_leaves_the_existing_token_alone() {
+        let established = random::<RepositoryId>();
+        let context = Arc::new(AttributeMap::default());
+        context.insert(established);
+        let original = AuthorizationToken {
+            user_id: "original".to_string(),
+            ..Default::default()
+        };
+        context.insert(original);
+
+        let message = Connect {
+            repository: random::<RepositoryId>(),
+            auth_token: Some("would-be-verified".to_string()),
+        };
+        let result = message
+            .handle_auth(
+                context.clone(),
+                Arc::new(None),
+                Arc::new(AllowAllRepositoryAuthorizer),
+            )
+            .await;
+
+        assert!(matches!(result, Err(MessageHandleError::AlreadyConnected)));
+        assert_eq!(
+            context
+                .get::<AuthorizationToken>()
+                .expect("token should survive a rejected reconnect")
+                .user_id,
+            "original",
+        );
+        assert_eq!(
+            *context.get::<RepositoryId>().expect("repository"),
+            established
+        );
     }
 }
