@@ -11,6 +11,7 @@ use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
+use lore_transport::auth::ucs_auth::grpc_endpoint;
 use lore_transport::grpc::CorrelationInterceptor;
 use opentelemetry::KeyValue;
 use smallvec::SmallVec;
@@ -28,19 +29,27 @@ pub struct LoreAuthClientHelper {
     client: UrcAuthApiClient<InterceptedService<tonic::transport::Channel, CorrelationInterceptor>>,
 }
 
+/// Builds the endpoint to dial for `auth_url`, whose scheme is the configured
+/// one (`ucs-auth://`, `oidc://`) rather than one tonic can dial.
+fn auth_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> {
+    let auth_url = grpc_endpoint(auth_url);
+    let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
+        .warn_map_err(|_| Status::internal("Failed to create lore auth endpoint"))?;
+    if auth_url.starts_with("https://") {
+        endpoint = endpoint
+            .tls_config(
+                ClientTlsConfig::new()
+                    .assume_http2(true)
+                    .with_native_roots(),
+            )
+            .warn_map_err(|_| Status::internal("Failed to configure TLS for lore auth"))?;
+    }
+    Ok(endpoint)
+}
+
 impl LoreAuthClientHelper {
     async fn new(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
-        let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
-            .warn_map_err(|_| Status::internal("Failed to create lore auth endpoint"))?;
-        if auth_url.starts_with("https://") {
-            endpoint = endpoint
-                .tls_config(
-                    ClientTlsConfig::new()
-                        .assume_http2(true)
-                        .with_native_roots(),
-                )
-                .warn_map_err(|_| Status::internal("Failed to configure TLS for lore auth"))?;
-        }
+        let endpoint = auth_endpoint(&auth_url)?;
         // Connect from net so the hyper/h2 driver tasks this spawns bind there
         // rather than to the core runtime the caller runs on.
         let channel = lore_spawn_net!(async move { endpoint.connect().await })
@@ -83,5 +92,33 @@ pub async fn grpc_get_auth_client(auth_url: String) -> Result<LoreAuthClientHelp
 impl InstrumentProvider for LoreAuthClientHelper {
     fn namespace(&self) -> &'static str {
         "urc.authnz.urc_auth"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Dialling `ucs-auth://` unrewritten gets no TLS.
+    #[test]
+    fn ucs_auth_scheme_dials_https() {
+        let endpoint = auth_endpoint("ucs-auth://auth.example.com:8444").expect("endpoint");
+        assert_eq!(endpoint.uri().scheme_str(), Some("https"));
+        assert_eq!(
+            endpoint.uri().authority().map(|a| a.as_str()),
+            Some("auth.example.com:8444")
+        );
+    }
+
+    #[test]
+    fn https_auth_url_is_unchanged() {
+        let endpoint = auth_endpoint("https://auth.example.com:8444").expect("endpoint");
+        assert_eq!(endpoint.uri().scheme_str(), Some("https"));
+    }
+
+    #[test]
+    fn loopback_http_stays_plaintext() {
+        let endpoint = auth_endpoint("http://127.0.0.1:41339").expect("endpoint");
+        assert_eq!(endpoint.uri().scheme_str(), Some("http"));
     }
 }
