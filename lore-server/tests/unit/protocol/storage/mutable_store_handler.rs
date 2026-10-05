@@ -10,6 +10,7 @@ use lore_revision::lore::RepositoryId;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::LoreResponse;
 use lore_server::protocol::storage::messages::Message;
+use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::messages::MessageParseError;
 use lore_server::protocol::storage::mutable_store_handler::*;
 use rand::random;
@@ -173,4 +174,36 @@ async fn test_handle_store_independent_keys() {
             );
         })
         .await;
+}
+
+/// The dedicated APIs (`RepositoryMetadataSet`, `BranchMetadataSet`) validate
+/// read-only fields; reaching the same keys through the generic store would
+/// skip that.
+#[tokio::test]
+async fn rejects_repository_and_branch_metadata_key_types() {
+    let repository = random::<RepositoryId>();
+
+    for key_type in [KeyType::RepositoryMetadata, KeyType::BranchMetadata] {
+        let context = Arc::new(AttributeMap::default());
+        context.insert(repository);
+
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let message = MutableStoreOp {
+            key: Hash::hash_buffer(b"test-key"),
+            value: Hash::hash_buffer(b"test-value"),
+            key_type,
+        };
+        let result = LORE_CONTEXT
+            .scope(execution, async move {
+                message.handle_mutable(context, mutable_store.clone()).await
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(MessageHandleError::AuthorizationFailure(_))),
+            "{key_type:?} must be refused on the generic path, got {result:?}"
+        );
+    }
 }

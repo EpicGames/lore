@@ -49,6 +49,14 @@ impl MutableStoreOp {
     }
 }
 
+/// Key types with their own dedicated, more-restrictive write API
+/// (`RepositoryMetadataSet`, `BranchMetadataSet`) that validates read-only
+/// fields before writing -- this generic path, reachable from gRPC v1,
+/// QUIC v4 and the legacy QUIC protocol, must not become a way to write
+/// them directly and bypass that validation.
+pub const DISALLOWED_KEY_TYPES: &[KeyType] =
+    &[KeyType::RepositoryMetadata, KeyType::BranchMetadata];
+
 pub async fn handle_mutable_store(
     key: Hash,
     value: Hash,
@@ -58,6 +66,12 @@ pub async fn handle_mutable_store(
     user_id: String,
     mutable_store: Arc<dyn MutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
+    if DISALLOWED_KEY_TYPES.contains(&key_type) {
+        return Err(MessageHandleError::AuthorizationFailure(format!(
+            "key_type {key_type:?} must be written through its dedicated API, not MutableStore"
+        )));
+    }
+
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     debug!(
