@@ -81,6 +81,16 @@ impl Message for Connect {
 
         debug!("Handling connect request");
 
+        // Before any verification or context mutation: a rejected Connect must
+        // not touch a connection already bound to another repository, or it
+        // leaves that connection holding this request's token and grants.
+        if let Some(id) = context.get::<RepositoryId>()
+            && *id != self.repository
+        {
+            warn!("Attempted to set repository id for connection, but it was already set!");
+            return Err(MessageHandleError::AlreadyConnected);
+        }
+
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             match self.auth_token.as_ref() {
                 Some(auth_token) => {
@@ -118,17 +128,10 @@ impl Message for Connect {
             }
         }
 
-        if let Some(id) = context.get::<RepositoryId>() {
-            if *id != self.repository {
-                warn!("Attempted to set repository id for connection, but it was already set!");
-                Err(MessageHandleError::AlreadyConnected)
-            } else {
-                Ok(LoreResponse::Connect(ConnectResponse::default()))
-            }
-        } else {
-            context.insert(self.repository);
-            Ok(LoreResponse::Connect(ConnectResponse::default()))
-        }
+        // A first connect, or a reconnect to the same repository; the
+        // mismatched case returned above.
+        context.insert(self.repository);
+        Ok(LoreResponse::Connect(ConnectResponse::default()))
     }
 }
 

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_revision::lore::RepositoryId;
+use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -112,6 +113,45 @@ async fn test_set_repository_already_set_value_matched() {
             )
             .await
             .unwrap()
+    );
+}
+
+/// A reconnect naming a different repository is refused, and refusing it must
+/// leave the connection's existing identity alone.
+#[tokio::test]
+async fn a_rejected_reconnect_leaves_the_existing_token_alone() {
+    let established = random::<RepositoryId>();
+    let context = Arc::new(AttributeMap::default());
+    context.insert(established);
+    let original = AuthorizationToken {
+        user_id: "original".to_string(),
+        ..Default::default()
+    };
+    context.insert(original);
+
+    let message = Connect {
+        repository: random::<RepositoryId>(),
+        auth_token: Some("would-be-verified".to_string()),
+    };
+    let result = message
+        .handle_auth(
+            context.clone(),
+            Arc::new(None),
+            Arc::new(AllowAllRepositoryAuthorizer),
+        )
+        .await;
+
+    assert!(matches!(result, Err(MessageHandleError::AlreadyConnected)));
+    assert_eq!(
+        context
+            .get::<AuthorizationToken>()
+            .expect("token should survive a rejected reconnect")
+            .user_id,
+        "original",
+    );
+    assert_eq!(
+        *context.get::<RepositoryId>().expect("repository"),
+        established
     );
 }
 
