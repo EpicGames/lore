@@ -11,6 +11,7 @@ use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
+use lore_transport::auth::ucs_auth::grpc_endpoint;
 use lore_transport::grpc::CorrelationInterceptor;
 use opentelemetry::KeyValue;
 use smallvec::SmallVec;
@@ -42,19 +43,28 @@ pub struct RebacClientHelper {
         RebacApiGrpcClient<InterceptedService<tonic::transport::Channel, CorrelationInterceptor>>,
 }
 
+/// Builds the endpoint to dial for `auth_url`, whose scheme is the configured
+/// one (`ucs-auth://`, `oidc://`) rather than one tonic can dial.
+#[lore_macro::test_pub]
+fn rebac_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> {
+    let auth_url = grpc_endpoint(auth_url);
+    let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
+        .warn_map_err(|_| Status::internal("Failed to create rebac endpoint"))?;
+    if auth_url.starts_with("https://") {
+        endpoint = endpoint
+            .tls_config(
+                ClientTlsConfig::new()
+                    .assume_http2(true)
+                    .with_native_roots(),
+            )
+            .warn_map_err(|_| Status::internal("Failed to configure TLS for rebac"))?;
+    }
+    Ok(endpoint)
+}
+
 impl RebacClientHelper {
     async fn new(auth_url: String) -> Result<RebacClientHelper, Status> {
-        let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
-            .warn_map_err(|_| Status::internal("Failed to create rebac endpoint"))?;
-        if auth_url.starts_with("https://") {
-            endpoint = endpoint
-                .tls_config(
-                    ClientTlsConfig::new()
-                        .assume_http2(true)
-                        .with_native_roots(),
-                )
-                .warn_map_err(|_| Status::internal("Failed to configure TLS for rebac"))?;
-        }
+        let endpoint = rebac_endpoint(&auth_url)?;
         // Connect from net so the hyper/h2 driver tasks this spawns bind there
         // rather than to the core runtime the caller runs on.
         let channel = lore_spawn_net!(async move { endpoint.connect().await })
