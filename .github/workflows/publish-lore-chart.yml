@@ -9,8 +9,10 @@ name: Publish Lore Helm chart
 # `version` in Chart.yaml.
 #
 # The gates below live in this file, so they bind only runs of the reviewed
-# file. Someone who can push a tag or a branch can run an edited copy; a tag
-# ruleset on lore-chart-v* and a protected environment are what stop that.
+# file. Someone who can push a tag can run an edited copy, `environment:` line
+# and all removed, so the tag ruleset limiting who may create lore-chart-v*
+# tags is the control that matters. The chart-release environment (deployment
+# rule: lore-chart-v* tags, required reviewers) gates the reviewed path.
 on:
   push:
     tags: ["lore-chart-v*"]
@@ -127,6 +129,9 @@ jobs:
     name: push, sign and tag
     needs: package
     runs-on: ubuntu-latest
+    # Releases only: a dispatch publishes to charts-dev and needs no approval.
+    # An empty name means no environment.
+    environment: ${{ needs.package.outputs.release == 'true' && 'chart-release' || '' }}
     permissions:
       packages: write # Push the chart, its signature and its version tag
       id-token: write # Federate to Fulcio for keyless signing
