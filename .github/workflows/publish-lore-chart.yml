@@ -7,12 +7,16 @@ name: Publish Lore Helm chart
 # On its own `lore-chart-vX.Y.Z` tags rather than server releases, so a chart-only
 # fix ships without waiting for a loreserver release. The tag must match the
 # `version` in Chart.yaml.
+#
+# The gates below live in this file, so they bind only runs of the reviewed
+# file. Someone who can push a tag or a branch can run an edited copy; a tag
+# ruleset on lore-chart-v* and a protected environment are what stop that.
 on:
   push:
     tags: ["lore-chart-v*"]
-  # Proves the workflow from any branch. It always publishes a prerelease
-  # `X.Y.Z-dev.<run>` version, which `helm install` ignores without `--devel`,
-  # so it can never take or move a release version.
+  # Proves the workflow from any branch. It publishes `X.Y.Z-dev.<run>.<attempt>`
+  # to a separate charts-dev package, so a test build never sits beside the
+  # releases or outranks them for `--devel` and semver-range users.
   workflow_dispatch:
 
 permissions: {}
@@ -24,8 +28,6 @@ concurrency:
 env:
   HELM_VERSION: v3.19.5
   CRANE_VERSION: v0.22.1
-  # `helm push` appends the chart name to the registry path.
-  CHART: ghcr.io/epicgames/lore/charts/lore
 
 jobs:
   package:
@@ -36,14 +38,13 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       release: ${{ steps.version.outputs.release }}
+      chart: ${{ steps.version.outputs.chart }}
     defaults:
       run:
         working-directory: contrib/helm
     steps:
-      # Full history, so a release tag can be checked against main below.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
@@ -56,6 +57,8 @@ jobs:
           EVENT: ${{ github.event_name }}
           REF_NAME: ${{ github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
@@ -76,21 +79,32 @@ jobs:
               exit 1
             fi
             # Anyone who can push a tag can put it on any commit; only reviewed
-            # code becomes a release.
-            if ! git merge-base --is-ancestor "${GITHUB_SHA}" "origin/${DEFAULT_BRANCH}"; then
-              echo "::error::${REF_NAME} points at ${GITHUB_SHA}, which is not on ${DEFAULT_BRANCH}"
-              exit 1
-            fi
+            # code becomes a release. "behind" or "identical" means the commit
+            # is in the default branch's history.
+            status=$(gh api "repos/{owner}/{repo}/compare/${DEFAULT_BRANCH}...${GITHUB_SHA}" --jq .status)
+            case "${status}" in
+              behind | identical) ;;
+              *)
+                echo "::error::${REF_NAME} points at ${GITHUB_SHA}, which is not on ${DEFAULT_BRANCH} (${status})"
+                exit 1
+                ;;
+            esac
             version="${chart_version}"
             release=true
+            chart=ghcr.io/epicgames/lore/charts/lore
           else
-            # Run attempt too, so a re-run doesn't collide with its first try.
+            # A full re-run repackages, so the attempt keeps it from colliding
+            # with the first try. Re-running only the failed publish job reuses
+            # this version and artifact, which the publish job allows.
             version="${chart_version}-dev.${RUN_ID}.${RUN_ATTEMPT}"
             release=false
+            chart=ghcr.io/epicgames/lore/charts-dev/lore
           fi
+          # `helm push` appends the chart name to the registry path.
           {
             echo "version=${version}"
             echo "release=${release}"
+            echo "chart=${chart}"
           } >> "$GITHUB_OUTPUT"
           echo "version=${version} release=${release}"
 
@@ -125,8 +139,10 @@ jobs:
           - 5000:5000
     env:
       VERSION: ${{ needs.package.outputs.version }}
-      # Anchored on this workflow's path, not merely the repository.
-      IDENTITY_REGEXP: '^https://github\.com/${{ github.repository }}/\.github/workflows/publish-lore-chart\.yml@'
+      CHART: ${{ needs.package.outputs.chart }}
+      # Exact, ref included: a pattern that ends at `@` would also accept a
+      # signature from a dispatch on any unreviewed branch.
+      CERT_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/publish-lore-chart.yml@${{ github.ref }}
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -142,16 +158,6 @@ jobs:
         with:
           version: ${{ env.CRANE_VERSION }}
 
-      # Chart versions are meant to be immutable, and OCI tags are not: pushing
-      # the same version again would silently replace what people installed.
-      - name: Refuse a version that is already published
-        run: |
-          set -euo pipefail
-          if existing=$(crane digest "${CHART}:${VERSION}" 2>/dev/null); then
-            echo "::error::${CHART}:${VERSION} is already published (${existing}); bump the chart version"
-            exit 1
-          fi
-
       - id: stage
         name: Push to the staging registry
         run: |
@@ -160,6 +166,35 @@ jobs:
           digest=$(crane digest "localhost:5000/charts/lore:${VERSION}")
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "staged ${digest}"
+
+      # Chart versions are meant to be immutable, and OCI tags are not: pushing
+      # the same version again would silently replace what people installed.
+      # The same digest is fine: that is a re-run of this job, and pushing the
+      # same artifact again reproduces it byte for byte.
+      - name: Refuse a version already published at another digest
+        env:
+          DIGEST: ${{ steps.stage.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if existing=$(crane digest "${CHART}:${VERSION}" 2>&1); then
+            if [ "${existing}" != "${DIGEST}" ]; then
+              echo "::error::${CHART}:${VERSION} is already published at ${existing}; bump the chart version"
+              exit 1
+            fi
+            echo "::notice::${CHART}:${VERSION} is already this digest; re-running the remaining steps"
+            exit 0
+          fi
+          # Fail closed: only "not there" counts as absent, never a 5xx or a
+          # rate limit. GHCR answers DENIED for a package that does not exist
+          # yet; one that exists but this token cannot read could not be
+          # pushed to either, so that cannot overwrite anything.
+          case "${existing}" in
+            *MANIFEST_UNKNOWN* | *NAME_UNKNOWN* | *DENIED*) echo "not published yet" ;;
+            *)
+              echo "::error::could not check whether ${CHART}:${VERSION} exists: ${existing}"
+              exit 1
+              ;;
+          esac
 
       # A copy by digest, so nothing in GHCR is tagged yet.
       - name: Copy the chart to GHCR by digest
@@ -185,7 +220,7 @@ jobs:
         run: |
           set -euo pipefail
           cosign verify "${CHART}@${DIGEST}" \
-            --certificate-identity-regexp "${IDENTITY_REGEXP}" \
+            --certificate-identity "${CERT_IDENTITY}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             > /dev/null
           echo "signature verified"
@@ -204,11 +239,15 @@ jobs:
           fi
           echo "${CHART}:${VERSION} -> ${resolved}"
 
-      # What a user does, through helm itself rather than crane.
-      - name: Pull the chart back with helm
+      # What a user does: helm itself, with no credentials. setup-crane logged
+      # in to ghcr.io, and helm would otherwise borrow that login and pass even
+      # if the package were private.
+      - name: Pull the chart back anonymously with helm
         run: |
           set -euo pipefail
-          helm show chart "oci://${CHART}" --version "${VERSION}"
+          anon=$(mktemp -d)
+          DOCKER_CONFIG="${anon}" HELM_REGISTRY_CONFIG="${anon}/registry.json" \
+            helm show chart "oci://${CHART}" --version "${VERSION}"
 
       - name: Summarise what was published
         env:
@@ -220,7 +259,7 @@ jobs:
             echo "## Published \`${CHART}:${VERSION}\`"
             echo ""
             if [ "${RELEASE}" != "true" ]; then
-              echo "A prerelease from a manual dispatch: it installs only when asked for by exact version, or with \`--devel\`."
+              echo "A test build from a manual dispatch, in the separate charts-dev package; not a release."
               echo ""
             fi
             echo "Digest: \`${DIGEST}\`"
@@ -235,7 +274,7 @@ jobs:
             echo ""
             echo '```sh'
             echo "cosign verify ${CHART}@${DIGEST} \\"
-            echo "  --certificate-identity-regexp '${IDENTITY_REGEXP}' \\"
+            echo "  --certificate-identity '${CERT_IDENTITY}' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
