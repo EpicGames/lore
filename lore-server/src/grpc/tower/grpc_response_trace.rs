@@ -63,9 +63,15 @@ where
     }
 }
 
-// Use RUST_LOG to control verbosity of response logging
-// e.g. export RUST_LOG=info,lore_server::grpc::tower::grpc_response_trace=debug
-// to log all responses - not just errors
+/// Logs the outcome of each request with the time it took.
+///
+/// `elapsed_ms` counts from the first poll, when only the request headers have arrived, so it
+/// includes the time the client took to transmit the request body as well as the time spent
+/// handling it.
+///
+/// Use `RUST_LOG` to control verbosity of response logging, e.g.
+/// `RUST_LOG=info,lore_server::grpc::tower::grpc_response_trace=debug` logs all responses rather
+/// than errors alone.
 #[pin_project(PinnedDrop)]
 pub struct GrpcMetricsFuture<F> {
     #[pin]

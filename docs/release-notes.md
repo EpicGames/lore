@@ -9,6 +9,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore-server`: every gRPC request records a third latency histogram, `rpc.server.handler.duration`, counted from the server reading the request body to its end rather than from the request headers arriving. The two it joins, `rpc.server.duration` and `http.server.request.duration`, keep counting from the headers, so the gap between them holds the time the client took to send its request and any work done before the body is read, such as authorization, and a client slow to send skews only those two. A bidirectional stream, whose response is ready before its request has been read to its end, records the same value in all three
 - `lore-server`: `BranchPush` records how hard its fragment verification drives the immutable store, once per push and including pushes that fail or are cancelled part-way. Histograms under `lore.branch_push` give the per-address fragment lookups the collection spawns (`fragment_lookups` and `peak_fragment_lookups_in_flight`), the addresses it collects (`collected_addresses`), and the existence query batches sent at once (`concurrent_query_batches`). Debug logs report the same counts per push, with whether the push returned or was dropped, and per collection step
 
 ### Fixes & Improvements

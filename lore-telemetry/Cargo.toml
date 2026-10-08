@@ -11,6 +11,7 @@ test = false
 [dependencies]
 axum = { workspace = true }
 http = { workspace = true }
+http-body = { workspace = true }
 lore-error-set = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
@@ -27,7 +28,10 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true

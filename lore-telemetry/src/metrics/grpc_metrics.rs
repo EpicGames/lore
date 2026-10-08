@@ -55,6 +55,14 @@ pub static HTTP_SERVER_REQUEST_DURATION_METRIC: LazyLock<Histogram<f64>> =
 // Grpc metrics
 pub static RPC_SERVER_DURATION_METRIC: LazyLock<Histogram<f64>> =
     LazyLock::new(|| seconds_histogram(RPC_SERVER_DURATION));
+/// Latency of an RPC counted from the server reading the request body to its end, where the two
+/// convention histograms count from the request headers arriving. A unary handler runs once its
+/// request has been read, so the gap between them holds the client's transmission of the request
+/// and any work done before the body is read, such as authorization, and a client slow to send
+/// skews only those two.
+pub const RPC_SERVER_HANDLER_DURATION: &str = "rpc.server.handler.duration";
+pub static RPC_SERVER_HANDLER_DURATION_METRIC: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| seconds_histogram(RPC_SERVER_HANDLER_DURATION));
 
 pub(crate) struct GrpcRequestMetrics {
     method: KeyValue,
@@ -99,6 +107,7 @@ impl GrpcRequestMetrics {
     pub fn request_complete(
         &self,
         elapsed_seconds: f64,
+        handler_elapsed_seconds: f64,
         rpc_code: Code,
         status: Option<StatusCode>,
     ) {
@@ -117,6 +126,7 @@ impl GrpcRequestMetrics {
 
         HTTP_SERVER_REQUEST_DURATION_METRIC.record(elapsed_seconds, &attributes);
         RPC_SERVER_DURATION_METRIC.record(elapsed_seconds, &attributes);
+        RPC_SERVER_HANDLER_DURATION_METRIC.record(handler_elapsed_seconds, &attributes);
     }
 
     pub fn request_finished(&self) {

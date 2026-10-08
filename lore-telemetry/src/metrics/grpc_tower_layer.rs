@@ -3,16 +3,21 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::task::Context;
 use std::task::Poll;
+use std::task::ready;
 use std::time::Instant;
 
 use http::Request;
 use http::Response;
 use http::header::USER_AGENT;
+use http_body::Frame;
+use http_body::SizeHint;
 use pin_project::pin_project;
 use pin_project::pinned_drop;
 use tonic::Code;
+use tonic::body::Body;
 use tower::Layer;
 use tower::Service;
 
@@ -60,16 +65,19 @@ impl<S> Layer<S> for GrpcMetricsLayer {
     }
 }
 
-/// A `tower::Service` implementation that records standard metrics for http/gRPC calls
+/// A `tower::Service` implementation that records standard metrics for http/gRPC calls.
+///
+/// The request body is handed on re-wrapped, so that the service can tell when the inner
+/// service has finished reading it.
 #[derive(Clone)]
 pub struct GrpcMetricsService<S> {
     service: S,
     filter: Arc<UserAgentFilter>,
 }
 
-impl<S, B, C> Service<Request<B>> for GrpcMetricsService<S>
+impl<S, C> Service<Request<Body>> for GrpcMetricsService<S>
 where
-    S: Service<Request<B>, Response = Response<C>>,
+    S: Service<Request<Body>, Response = Response<C>>,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -79,7 +87,7 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, req: Request<B>) -> Self::Future {
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
         let method = req.method().to_string();
         let path = req.uri().path().to_owned();
 
@@ -94,9 +102,55 @@ where
             None => USER_AGENT_NONE.clone(),
         };
 
-        let f = self.service.call(req);
+        let (parts, body) = req.into_parts();
+        let request_received_at = Arc::new(OnceLock::new());
+        let body = Body::new(RequestReadBody {
+            inner: body,
+            read_at: request_received_at.clone(),
+        });
+        let f = self.service.call(Request::from_parts(parts, body));
 
-        GrpcMetricsFuture::new(&method, &path, user_agent, f)
+        GrpcMetricsFuture::new(&method, &path, user_agent, request_received_at, f)
+    }
+}
+
+/// A request body that notes the instant its reader reaches the end of it.
+///
+/// The instant is published through the shared cell once the wrapped body reports end of
+/// stream, and never before, so a reader finding the cell empty knows the body is still being
+/// read.
+#[pin_project]
+struct RequestReadBody<B> {
+    #[pin]
+    inner: B,
+    read_at: Arc<OnceLock<Instant>>,
+}
+
+impl<B> http_body::Body for RequestReadBody<B>
+where
+    B: http_body::Body,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        let frame = ready!(this.inner.as_mut().poll_frame(cx));
+        if frame.is_none() || this.inner.is_end_stream() {
+            let _ = this.read_at.set(Instant::now());
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -105,14 +159,22 @@ where
 pub struct GrpcMetricsFuture<F> {
     metrics: GrpcRequestMetrics,
     started_at: Option<Instant>,
+    request_received_at: Arc<OnceLock<Instant>>,
     #[pin]
     inner: F,
 }
 
 impl<F> GrpcMetricsFuture<F> {
-    pub fn new(method: &str, path: &str, user_agent: Arc<str>, inner: F) -> Self {
+    fn new(
+        method: &str,
+        path: &str,
+        user_agent: Arc<str>,
+        request_received_at: Arc<OnceLock<Instant>>,
+        inner: F,
+    ) -> Self {
         Self {
             started_at: None,
+            request_received_at,
             inner,
             metrics: GrpcRequestMetrics::new(method, path, user_agent),
         }
@@ -143,9 +205,21 @@ where
             // If the rpc returned `Unimplemented` do not emit metrics, it's likely a request from a
             // security scan.
             if !matches!(rpc_code, Code::Unimplemented) {
-                let elapsed_seconds = Instant::now().duration_since(*started_at).as_secs_f64();
-                this.metrics
-                    .request_complete(elapsed_seconds, rpc_code, status_code);
+                let now = Instant::now();
+                let elapsed = now.duration_since(*started_at);
+                // A response ready before the request has been read to its end, as a
+                // bidirectional stream's is, has no later point to count from than the
+                // request's start.
+                let handler_elapsed = this
+                    .request_received_at
+                    .get()
+                    .map_or(elapsed, |received_at| now.duration_since(*received_at));
+                this.metrics.request_complete(
+                    elapsed.as_secs_f64(),
+                    handler_elapsed.as_secs_f64(),
+                    rpc_code,
+                    status_code,
+                );
             }
             Poll::Ready(response)
         } else {

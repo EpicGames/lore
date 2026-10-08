@@ -2981,7 +2981,9 @@ name = "lore-telemetry"
 version = "0.10.2-nightly"
 dependencies = [
  "axum",
+ "bytes",
  "http 1.4.0",
+ "http-body 1.0.1",
  "lore-error-set",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
