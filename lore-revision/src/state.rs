@@ -1664,7 +1664,7 @@ impl State {
         repository: Arc<RepositoryContext>,
         block_index: usize,
     ) -> Option<JoinHandle<()>> {
-        let (hash_file_metadata, block_count, mut block_hash_bytes) = {
+        let (hash_file_metadata, block_count) = {
             let lock = self.runtime.read();
             if lock.block_file_metadata.len() > block_index
                 && lock.block_file_metadata[block_index].upgrade().is_some()
@@ -1672,63 +1672,19 @@ impl State {
                 return None;
             }
             let tree = lock.tree.as_ref()?;
-            (
-                tree.hash_file_metadata,
-                tree.block_count as usize,
-                lock.block_file_metadata_address.clone(),
-            )
+            (tree.hash_file_metadata, tree.block_count as usize)
         };
 
-        if block_index >= block_hash_bytes.count::<Hash>() {
-            if hash_file_metadata.is_zero() {
-                return None;
-            }
+        let hash = self
+            .file_metadata_addresses(&repository, hash_file_metadata, block_count)
+            .await
+            .ok()?
+            .as_type_slice::<Hash>()
+            .get(block_index)
+            .copied()
+            .filter(|hash| !hash.is_zero())?;
 
-            // One list covers every block, so the tasks prefetching for all the
-            // other blocks want it at the same moment and would each read it.
-            let Ok(_guard) = self.metadata_deserialize.acquire().await else {
-                return None;
-            };
-
-            block_hash_bytes = {
-                let lock = self.runtime.read();
-                lock.block_file_metadata_address.clone()
-            };
-
-            if block_index >= block_hash_bytes.count::<Hash>() {
-                // TODO(mjansson): To support huge trees we might want to selectively
-                // read the block addresses instead of all in one big buffer
-                let address = Address::zero_context_hash(hash_file_metadata);
-                let Ok(hash_bytes) = immutable::read(
-                    repository.clone(),
-                    address,
-                    None, /* Read the full array of block hashes */
-                    immutable::read_options_from_repository(&repository)
-                        .with_cache()
-                        .with_priority(),
-                )
-                .await
-                else {
-                    return None;
-                };
-                block_hash_bytes = hash_bytes;
-                if block_hash_bytes.count::<Hash>() < block_count {
-                    block_hash_bytes = block_hash_bytes
-                        .clone_and_resize_zeroed::<Hash>(block_count)
-                        .freeze();
-                }
-                {
-                    self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
-                }
-            }
-        }
-
-        let block_hash = block_hash_bytes.as_type_slice::<Hash>();
-        if block_hash[block_index].is_zero() {
-            return None;
-        }
-
-        let address = Address::zero_context_hash(block_hash[block_index]);
+        let address = Address::zero_context_hash(hash);
         Some(lore_spawn!(async move {
             let matched = query_one(&repository.immutable_store(), repository.id, address)
                 .await
@@ -1757,6 +1713,10 @@ impl State {
     /// this case, and that block is 65,568 bytes, is zeroed on allocation, and is
     /// published only as a `Weak` — so nothing keeps it alive and the next caller
     /// allocates another one.
+    ///
+    /// Nothing is stored for a tree with no address list, for a block the list holds
+    /// a zero hash for, or for a block past the end of the list, added since it was
+    /// read. A list not read yet is read by [`Self::block_file_metadata`].
     ///
     /// A resident block is always returned, whatever the tree has stored: it may
     /// hold metadata from a slot that has since been freed, which a caller
@@ -1791,21 +1751,13 @@ impl State {
             )));
         }
 
-        // Nothing has ever been written for this tree, so no block of it can
-        // hold anything.
         if hash_file_metadata.is_zero() {
             return Ok(None);
         }
-
-        // The address list records which blocks were written. A zero hash at this
-        // index is a block that never was. If the list has not been read yet,
-        // fall through — `block_file_metadata` reads it, and repeats the same
-        // test against it before deserializing.
         {
-            let block_hash_bytes = self.runtime.read().block_file_metadata_address.clone();
-            if block_index < block_hash_bytes.count::<Hash>()
-                && block_hash_bytes.as_type_slice::<Hash>()[block_index].is_zero()
-            {
+            let runtime = self.runtime.read();
+            let addresses = runtime.block_file_metadata_address.as_type_slice::<Hash>();
+            if !addresses.is_empty() && addresses.get(block_index).is_none_or(Hash::is_zero) {
                 return Ok(None);
             }
         }
@@ -1878,97 +1830,93 @@ impl State {
             }
         }
 
-        let mut block_hash_bytes = {
+        {
             let mut lock = self.runtime.write();
             if block_index >= lock.block_file_metadata.len() {
                 lock.block_file_metadata
                     .resize(block_count as usize, Weak::default());
             }
+        }
 
-            lock.block_file_metadata_address.clone()
-        };
-        // At this point block_index is guaranteed to be < block.len()
-
-        if block_index >= block_hash_bytes.count::<Hash>() {
-            let _guard = self
-                .metadata_deserialize
-                .acquire()
-                .await
-                .internal("Failed to deserialize metadata")?;
-
-            block_hash_bytes = {
-                let lock = self.runtime.read();
-                lock.block_file_metadata_address.clone()
-            };
-
-            if block_index >= block_hash_bytes.count::<Hash>() {
-                if hash_file_metadata.is_zero() {
-                    let block = Arc::new(NodeFileMetadataBlock::default());
-                    {
-                        let mut lock = self.runtime.write();
-                        if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
-                            return Ok(prev_block);
-                        }
-                        lock.block_file_metadata[block_index] = Arc::downgrade(&block);
-                    }
-                    return Ok(block);
-                }
-
-                // TODO(mjansson): To support huge trees we might want to selectively
-                // read the block addresses instead of all in one big buffer
-                let address = Address::zero_context_hash(hash_file_metadata);
-                block_hash_bytes = immutable::read(
+        let stored = self
+            .file_metadata_addresses(&repository, hash_file_metadata, block_count as usize)
+            .await?
+            .as_type_slice::<Hash>()
+            .get(block_index)
+            .copied()
+            .filter(|hash| !hash.is_zero());
+        let block = Arc::new(match stored {
+            Some(hash) => NodeFileMetadataBlock::new(
+                NodeFileMetadataBlockData::read_box_from_immutable_compat(
                     repository.clone(),
-                    address,
-                    None, /* Read the full array of block hashes */
-                    immutable::read_options_from_repository(&repository)
-                        .with_cache()
-                        .with_priority(),
+                    Address::zero_context_hash(hash),
+                    true,
                 )
                 .await
-                .forward::<StateError>("Failed to deserialize node block list")?;
-                if block_hash_bytes.count::<Hash>() < block_count as usize {
-                    block_hash_bytes = block_hash_bytes
-                        .clone_and_resize_zeroed::<Hash>(block_count as usize)
-                        .freeze();
-                }
-                {
-                    self.runtime.write().block_file_metadata_address = block_hash_bytes.clone();
-                }
-            }
-        }
-
-        let block_hash = block_hash_bytes.as_type_slice::<Hash>();
-        if block_hash[block_index].is_zero() {
-            let block = Arc::new(NodeFileMetadataBlock::default());
-            let mut lock = self.runtime.write();
-            if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
-                return Ok(prev_block);
-            }
-            lock.block_file_metadata[block_index] = Arc::downgrade(&block);
-            return Ok(block);
-        }
-
-        let address = Address::zero_context_hash(block_hash[block_index]);
-        let block = Arc::new({
-            let block_data = NodeFileMetadataBlockData::read_box_from_immutable_compat(
-                repository.clone(),
-                address,
-                true,
-            )
-            .await
-            .forward::<StateError>("Failed to deserialize file metadata block")?;
-            NodeFileMetadataBlock::new(block_data)
+                .forward::<StateError>("Failed to deserialize file metadata block")?,
+            ),
+            None => NodeFileMetadataBlock::default(),
         });
 
-        {
-            let mut lock = self.runtime.write();
-            if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
-                return Ok(prev_block);
-            }
-            lock.block_file_metadata[block_index] = Arc::downgrade(&block);
+        let mut lock = self.runtime.write();
+        if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
+            return Ok(prev_block);
         }
+        lock.block_file_metadata[block_index] = Arc::downgrade(&block);
         Ok(block)
+    }
+
+    /// The file metadata block address list, read from the store once.
+    ///
+    /// The list held covers every block the tree had when the list was read or written, so a
+    /// block past its end was added since and has nothing stored. It is empty for a tree with no
+    /// list. Every block's lookup wants the one list, so it is read under `metadata_deserialize`
+    /// rather than once by each. The read is boxed: it runs once per state, and inline it would
+    /// make every lookup's future as large as the read.
+    async fn file_metadata_addresses(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        hash_file_metadata: Hash,
+        block_count: usize,
+    ) -> Result<Bytes, StateError> {
+        {
+            let held = self.runtime.read().block_file_metadata_address.clone();
+            if !held.is_empty() || hash_file_metadata.is_zero() {
+                return Ok(held);
+            }
+        }
+
+        let _guard = self
+            .metadata_deserialize
+            .acquire()
+            .await
+            .internal("Failed to deserialize metadata")?;
+        {
+            let held = self.runtime.read().block_file_metadata_address.clone();
+            if !held.is_empty() {
+                return Ok(held);
+            }
+        }
+
+        // TODO(mjansson): To support huge trees we might want to selectively
+        // read the block addresses instead of all in one big buffer
+        let mut addresses = Box::pin(immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(hash_file_metadata),
+            None, /* Read the full array of block hashes */
+            immutable::read_options_from_repository(repository)
+                .with_cache()
+                .with_priority(),
+        ))
+        .await
+        .forward::<StateError>("Failed to deserialize file metadata block list")?;
+        if addresses.count::<Hash>() < block_count {
+            addresses = addresses
+                .clone_and_resize_zeroed::<Hash>(block_count)
+                .freeze();
+        }
+        self.runtime.write().block_file_metadata_address = addresses.clone();
+        Ok(addresses)
     }
 
     pub fn parents(&self) -> [Hash; 2] {

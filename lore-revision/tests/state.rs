@@ -2834,6 +2834,8 @@ mod block_single_flight {
         node_block: Address,
         /// Store address of the file metadata block.
         metadata_block: Address,
+        /// Store address of the file metadata block address list.
+        metadata_list: Address,
     }
 
     /// Store address of block `block_index` in the address list rooted at `list`.
@@ -2918,6 +2920,7 @@ mod block_single_flight {
         Seed {
             node_block: block_address(&repository, tree.hash_node, block_index).await,
             metadata_block: block_address(&repository, tree.hash_file_metadata, block_index).await,
+            metadata_list: Address::zero_context_hash(tree.hash_file_metadata),
             _tempdir: tempdir,
             store,
             repository,
@@ -3244,6 +3247,74 @@ mod block_single_flight {
                 assert!(
                     read[1..].iter().all(|block| block.upgrade().is_some()),
                     "the {MAX_CHECKED_FILE_METADATA_BLOCKS} blocks read last stay in memory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A block added since the file metadata address list was read stores nothing, which the
+    /// list read already answers: adds spilling into two new blocks, and lookups of those
+    /// blocks, read the list once and find nothing to clear in them. The seeded block is held
+    /// throughout, so the adds into it read nothing.
+    #[tokio::test]
+    async fn new_blocks_read_the_file_metadata_address_list_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store.take_reads();
+                let _seeded = state
+                    .block_file_metadata(seed.repository.clone(), seed.block_index)
+                    .await
+                    .expect("Failed to read the file metadata block");
+
+                let mut added = Vec::with_capacity(2);
+                let mut index = 0;
+                while added.len() < 2 {
+                    let name = format!("added{index}");
+                    index += 1;
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(node));
+                    if block_index != seed.block_index && added.last() != Some(&block_index) {
+                        added.push(block_index);
+                    }
+                }
+
+                for &block_index in &added {
+                    let existing = state
+                        .try_block_file_metadata_existing(seed.repository.clone(), block_index)
+                        .await
+                        .expect("Failed to check the file metadata block");
+                    assert!(existing.is_none(), "block {block_index} stores nothing");
+                    state
+                        .block_file_metadata(seed.repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block");
+                }
+
+                let reads = seed.store.take_reads();
+                assert_eq!(
+                    reads.get(&seed.metadata_list).copied(),
+                    Some(1),
+                    "the address list is read once, got {reads:?}"
                 );
             }))
             .await
