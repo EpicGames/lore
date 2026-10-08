@@ -1268,8 +1268,11 @@ async fn resolve_scan_targets(
     paths: &[Option<RelativePath>],
 ) -> Result<Vec<ScanTarget>, StatusError> {
     let mut resolved: Vec<(usize, ScanTarget)> = Vec::with_capacity(paths.len());
-    let mut tasks: JoinSet<(usize, Option<ScanTarget>)> = JoinSet::new();
+    let mut tasks = JoinSet::new();
     let mut failure = None;
+    let join_failure = |err: tokio::task::JoinError| {
+        StatusError::internal_with_context(err, "Failed to join scan target resolution task")
+    };
     for (index, path) in paths.iter().enumerate() {
         let Some(path) = path else {
             resolved.push((
@@ -1289,50 +1292,34 @@ async fn resolve_scan_targets(
                 state.clone(),
                 path.clone()
             )
-            .map(move |target| (index, target))
+            .map(move |target| target.map(|target| (index, target)))
         );
-        while let Some(joined) = tasks.try_join_next() {
-            collect_scan_target(joined, &mut resolved, &mut failure);
-        }
-        while tasks.len() >= MAX_CONCURRENT_TREE_TASKS
-            && let Some(joined) = tasks.join_next().await
-        {
-            collect_scan_target(joined, &mut resolved, &mut failure);
-        }
+        fan_out::join_below(
+            &mut tasks,
+            MAX_CONCURRENT_TREE_TASKS,
+            &mut failure,
+            join_failure,
+            |target| {
+                resolved.extend(target);
+                Ok(())
+            },
+        )
+        .await;
         if failure.is_some() {
             break;
         }
     }
-    while let Some(joined) = tasks.join_next().await {
-        collect_scan_target(joined, &mut resolved, &mut failure);
-    }
+    fan_out::join_below(&mut tasks, 1, &mut failure, join_failure, |target| {
+        resolved.extend(target);
+        Ok(())
+    })
+    .await;
     if let Some(err) = failure {
         return Err(err);
     }
 
     resolved.sort_unstable_by_key(|(index, _)| *index);
     Ok(resolved.into_iter().map(|(_, target)| target).collect())
-}
-
-/// Fold one finished resolution into `resolved`, keeping the first join failure
-/// rather than returning it: the caller drains the rest either way.
-fn collect_scan_target(
-    joined: Result<(usize, Option<ScanTarget>), tokio::task::JoinError>,
-    resolved: &mut Vec<(usize, ScanTarget)>,
-    failure: &mut Option<StatusError>,
-) {
-    match joined {
-        Ok((index, Some(target))) => resolved.push((index, target)),
-        Ok((_, None)) => {}
-        Err(err) => {
-            if failure.is_none() {
-                *failure = Some(StatusError::internal_with_context(
-                    err,
-                    "Failed to join scan target resolution task",
-                ));
-            }
-        }
-    }
 }
 
 /// Where `path` stands before it is scanned, or `None` where neither the tree nor the working

@@ -736,8 +736,11 @@ async fn route_and_resolve_targets(
         current_repository_paths: Vec::with_capacity(paths.len()),
         layer_paths: Vec::new(),
     };
-    let mut resolve_tasks: JoinSet<Result<ResolvedTarget, StageError>> = JoinSet::new();
+    let mut resolve_tasks = JoinSet::new();
     let mut failure: Option<StageError> = None;
+    let join_failure = |err: tokio::task::JoinError| {
+        StageError::internal_with_context(err, "Failed to join target resolution task")
+    };
 
     for path in paths.as_slice().iter() {
         if failure.is_some() {
@@ -768,19 +771,28 @@ async fn route_and_resolve_targets(
         lore_spawn!(resolve_tasks, async move {
             resolve_stage_target(task_repository, task_state, relative_path, options).await
         });
-        while let Some(joined) = resolve_tasks.try_join_next() {
-            collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
-        }
-        while resolve_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
-            && let Some(joined) = resolve_tasks.join_next().await
-        {
-            collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
-        }
+        fan_out::join_below(
+            &mut resolve_tasks,
+            MAX_CONCURRENT_TREE_TASKS,
+            &mut failure,
+            join_failure,
+            |resolved| {
+                resolved.map(|resolved| resolved.collect_into(&mut routed.current_repository_paths))
+            },
+        )
+        .await;
     }
 
-    while let Some(joined) = resolve_tasks.join_next().await {
-        collect_resolved(joined, &mut routed.current_repository_paths, &mut failure);
-    }
+    fan_out::join_below(
+        &mut resolve_tasks,
+        1,
+        &mut failure,
+        join_failure,
+        |resolved| {
+            resolved.map(|resolved| resolved.collect_into(&mut routed.current_repository_paths))
+        },
+    )
+    .await;
     match failure {
         Some(err) => Err(err),
         None => Ok(routed),
@@ -802,32 +814,6 @@ impl ResolvedTarget {
         match self {
             ResolvedTarget::Single(path) => targets.push(path),
             ResolvedTarget::Multiple(paths) => targets.extend(paths),
-        }
-    }
-}
-
-/// Fold one finished target resolution into the target list, keeping the first
-/// error rather than propagating it - the caller has to drain the rest either
-/// way, since a resolution in flight is reading state it has to finish reading.
-fn collect_resolved(
-    joined: Result<Result<ResolvedTarget, StageError>, tokio::task::JoinError>,
-    targets: &mut Vec<RelativePath>,
-    failure: &mut Option<StageError>,
-) {
-    match joined {
-        Ok(Ok(resolved)) => resolved.collect_into(targets),
-        Ok(Err(err)) => {
-            if failure.is_none() {
-                *failure = Some(err);
-            }
-        }
-        Err(err) => {
-            if failure.is_none() {
-                *failure = Some(StageError::internal_with_context(
-                    err,
-                    "Failed to join target resolution task",
-                ));
-            }
         }
     }
 }

@@ -101,26 +101,30 @@ where
     let mut failure: Option<E> = None;
 
     for level in ancestors.chunk_by(|left, right| left.depth() == right.depth()) {
-        let mut level_tasks: JoinSet<(usize, Result<Option<NodeID>, E>)> = JoinSet::new();
+        let mut level_tasks = JoinSet::new();
         for (index, ancestor) in level.iter().enumerate() {
             if failure.is_some() {
                 break;
             }
             let created = create(ancestor.path(), &nodes);
             lore_spawn!(level_tasks, created.map(move |created| (index, created)));
-
-            while let Some(joined) = level_tasks.try_join_next() {
-                collect_created(joined, level, &mut nodes, &mut failure, &join_failure);
-            }
-            while level_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
-                && let Some(joined) = level_tasks.join_next().await
-            {
-                collect_created(joined, level, &mut nodes, &mut failure, &join_failure);
-            }
+            join_below(
+                &mut level_tasks,
+                MAX_CONCURRENT_TREE_TASKS,
+                &mut failure,
+                &join_failure,
+                |(index, created)| record_created(level, index, created, &mut nodes),
+            )
+            .await;
         }
-        while let Some(joined) = level_tasks.join_next().await {
-            collect_created(joined, level, &mut nodes, &mut failure, &join_failure);
-        }
+        join_below(
+            &mut level_tasks,
+            1,
+            &mut failure,
+            &join_failure,
+            |(index, created)| record_created(level, index, created, &mut nodes),
+        )
+        .await;
         if failure.is_some() {
             break;
         }
@@ -132,28 +136,48 @@ where
     }
 }
 
-/// Fold one finished creation into the ancestor node map, keeping the first
-/// error rather than returning it: the caller drains the level either way.
-fn collect_created<'a, E>(
-    joined: Result<(usize, Result<Option<NodeID>, E>), JoinError>,
+/// Record the node the creation of `level[index]` answered, passing on its failure.
+fn record_created<'a, E>(
     level: &'a [DepthPath],
+    index: usize,
+    created: Result<Option<NodeID>, E>,
     nodes: &mut AncestorNodes<'a>,
-    failure: &mut Option<E>,
-    join_failure: &impl Fn(JoinError) -> E,
-) {
-    match joined {
-        Ok((index, Ok(Some(node)))) => {
-            nodes.insert(level[index].path(), node);
-        }
-        Ok((_, Ok(None))) => {}
-        Ok((_, Err(err))) => {
-            if failure.is_none() {
-                *failure = Some(err);
-            }
-        }
-        Err(err) => {
-            if failure.is_none() {
-                *failure = Some(join_failure(err));
+) -> Result<(), E> {
+    if let Some(node) = created? {
+        nodes.insert(level[index].path(), node);
+    }
+    Ok(())
+}
+
+/// Join the finished tasks of `tasks`, waiting on the rest while `limit` or more remain, and
+/// hand each output to `collect`. A `limit` of 1 joins every task.
+///
+/// The first failure is kept in `failure` rather than returned, since a task in flight is left
+/// to finish: a task that panicked or was cancelled, through `join_failure`, or an output
+/// `collect` refuses.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn join_below<'a, T: 'static, E>(
+    tasks: &'a mut JoinSet<T>,
+    limit: usize,
+    failure: &'a mut Option<E>,
+    join_failure: impl Fn(JoinError) -> E + 'a,
+    mut collect: impl FnMut(T) -> Result<(), E> + 'a,
+) -> impl Future<Output = ()> + 'a {
+    async move {
+        loop {
+            let joined = match tasks.try_join_next() {
+                Some(joined) => joined,
+                None if tasks.len() >= limit => match tasks.join_next().await {
+                    Some(joined) => joined,
+                    None => break,
+                },
+                None => break,
+            };
+            if let Err(err) = joined.map_err(&join_failure).and_then(&mut collect) {
+                failure.get_or_insert(err);
             }
         }
     }

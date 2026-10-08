@@ -3,15 +3,18 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::node::NodeID;
 use lore_revision::util::fan_out::*;
 use lore_revision::util::path::DepthPath;
 use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::path_depth;
+use tokio::task::JoinSet;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 
@@ -357,6 +360,186 @@ async fn a_creation_that_panics_is_reported_through_the_join_failure() {
             .await;
 
             assert_eq!(result, Err(CreateError::Joined));
+        })
+        .await;
+}
+
+#[derive(Debug, PartialEq)]
+enum JoinFailure {
+    Refused(u32),
+    Joined,
+}
+
+/// A task that has finished is joined below the limit as well, without waiting on the rest:
+/// each call returns at once, and one of them joins the task once it has finished.
+#[tokio::test]
+async fn join_below_joins_what_has_finished_without_waiting_below_the_limit() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mut tasks = JoinSet::new();
+            lore_spawn!(tasks, std::future::pending::<u32>());
+            lore_spawn!(tasks, async { 7 });
+            let mut joined = Vec::new();
+            let mut failure = None;
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while joined.is_empty() && std::time::Instant::now() < deadline {
+                join_below(
+                    &mut tasks,
+                    3,
+                    &mut failure,
+                    |_| JoinFailure::Joined,
+                    |output| {
+                        joined.push(output);
+                        Ok(())
+                    },
+                )
+                .await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+
+            assert_eq!(joined, vec![7]);
+            assert_eq!(tasks.len(), 1);
+        })
+        .await;
+}
+
+/// Tasks that never finish wait out the call, so it joins the one that finishes late, and
+/// returns once fewer than the limit remain.
+#[tokio::test]
+async fn join_below_waits_until_fewer_than_the_limit_remain() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mut tasks = JoinSet::new();
+            lore_spawn!(tasks, std::future::pending::<u32>());
+            lore_spawn!(tasks, std::future::pending::<u32>());
+            lore_spawn!(tasks, async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                7
+            });
+            let mut joined = Vec::new();
+            let mut failure = None;
+
+            join_below(
+                &mut tasks,
+                3,
+                &mut failure,
+                |_| JoinFailure::Joined,
+                |output| {
+                    joined.push(output);
+                    Ok(())
+                },
+            )
+            .await;
+
+            assert_eq!(joined, vec![7]);
+            assert_eq!(tasks.len(), 2);
+            assert_eq!(failure, None);
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn join_below_with_a_limit_of_one_joins_every_task() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mut tasks = JoinSet::new();
+            for output in 0..5u32 {
+                lore_spawn!(tasks, async move { output });
+            }
+            let mut joined = Vec::new();
+            let mut failure = None;
+
+            join_below(
+                &mut tasks,
+                1,
+                &mut failure,
+                |_| JoinFailure::Joined,
+                |output| {
+                    joined.push(output);
+                    Ok(())
+                },
+            )
+            .await;
+
+            joined.sort_unstable();
+            assert_eq!(joined, vec![0, 1, 2, 3, 4]);
+            assert!(tasks.is_empty());
+            assert_eq!(failure, None);
+        })
+        .await;
+}
+
+/// A task that panics and an output the collector refuses are each a failure, and the outputs
+/// beside them are still collected.
+#[tokio::test]
+async fn join_below_reports_a_panic_or_a_refusal_and_collects_the_rest() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mut tasks = JoinSet::new();
+            lore_spawn!(tasks, async { 1u32 });
+            lore_spawn!(tasks, async { panic!("the task panicked") });
+            let mut joined = Vec::new();
+            let mut failure = None;
+            join_below(
+                &mut tasks,
+                1,
+                &mut failure,
+                |_| JoinFailure::Joined,
+                |output| {
+                    joined.push(output);
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(joined, vec![1]);
+            assert_eq!(failure, Some(JoinFailure::Joined));
+
+            for output in [2u32, 3] {
+                lore_spawn!(tasks, async move { output });
+            }
+            let mut joined = Vec::new();
+            let mut failure = None;
+            join_below(
+                &mut tasks,
+                1,
+                &mut failure,
+                |_| JoinFailure::Joined,
+                |output| {
+                    if output == 3 {
+                        return Err(JoinFailure::Refused(output));
+                    }
+                    joined.push(output);
+                    Ok(())
+                },
+            )
+            .await;
+            assert_eq!(joined, vec![2]);
+            assert_eq!(failure, Some(JoinFailure::Refused(3)));
+        })
+        .await;
+}
+
+/// A failure already kept is the one a later call leaves in place.
+#[tokio::test]
+async fn join_below_keeps_the_first_failure() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mut tasks = JoinSet::new();
+            let mut failure = None;
+            for output in [1u32, 2] {
+                lore_spawn!(tasks, async move { output });
+                join_below(
+                    &mut tasks,
+                    1,
+                    &mut failure,
+                    |_| JoinFailure::Joined,
+                    |output| Err(JoinFailure::Refused(output)),
+                )
+                .await;
+            }
+
+            assert_eq!(failure, Some(JoinFailure::Refused(1)));
         })
         .await;
 }
