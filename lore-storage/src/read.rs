@@ -20,6 +20,7 @@ use crate::compress;
 use crate::concurrency::file_count_limit_acquire;
 use crate::defragment::DefragmentSink;
 use crate::defragment::defragment_pipeline;
+use crate::defragment::defragment_pipeline_leaves;
 use crate::defragment::read_defragment;
 use crate::error::StorageError;
 use crate::errors::SlowDown;
@@ -1440,6 +1441,8 @@ async fn load_resolved_local(
 /// retry re-resolves rather than re-reads, since the heal targets the resolved address and a
 /// fresh resolve costs the same single round trip.
 ///
+/// The root is expanded when `options.decompress` is set, and left as stored otherwise.
+///
 /// `flags` is a reserved bitmask forwarded to the server; 0 for default behaviour.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_root(
@@ -1452,7 +1455,6 @@ async fn resolve_root(
     options: ReadOptions,
     session: Option<Arc<StorageSession>>,
 ) -> Result<ResolvedRoot, StorageError> {
-    let options = options.with_decompress();
     let key_address = Address { hash: key, context };
 
     if options.local
@@ -1588,7 +1590,7 @@ pub async fn read_resolved(
         key,
         context,
         flags,
-        options,
+        options.with_decompress(),
         session,
     )
     .await?;
@@ -1607,10 +1609,11 @@ pub async fn read_resolved(
     Ok((root.resolved, bytes))
 }
 
-/// [`read_resolved`] delivering the content through `sender` one fragment at a time instead of
-/// reassembling it, mirroring what [`read_stream`] does for an address.
+/// [`read_resolved`] delivering the content through `sender` one leaf at a time instead of
+/// reassembling it, mirroring what [`read_stream`] does for an address. Each leaf arrives with its
+/// fragment, expanded when `options.decompress` is set and as stored otherwise.
 ///
-/// Returns the resolved hash and the content's total size; the bytes follow on the channel. Peak
+/// Returns the resolved hash and the content's total size; the leaves follow on the channel. Peak
 /// memory is bounded by the channel depth rather than by the content, which is what makes this
 /// usable for a key naming something large.
 #[allow(clippy::too_many_arguments)]
@@ -1622,10 +1625,9 @@ pub async fn read_resolved_stream(
     context: Context,
     flags: u32,
     options: ReadOptions,
-    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
+    sender: tokio::sync::mpsc::Sender<Result<(Fragment, Bytes), StorageError>>,
     session: Option<Arc<StorageSession>>,
 ) -> Result<(Hash, u64), StorageError> {
-    let options = options.with_decompress();
     let root = resolve_root(
         store.clone(),
         mutable,
@@ -1656,16 +1658,14 @@ pub async fn read_resolved_stream(
         let buffer = root.buffer;
         let remote_session = root.session;
         let report = sender.clone();
-        let pipeline_range = 0..fragment.size_content;
         lore_base::lore_spawn!(async move {
-            let result = defragment_pipeline(
+            let result = defragment_pipeline_leaves(
                 store,
                 partition,
                 address,
                 fragment,
                 buffer,
-                pipeline_range,
-                DefragmentSink::Stream { sender },
+                sender,
                 options,
                 remote_session,
             )
@@ -1681,7 +1681,7 @@ pub async fn read_resolved_stream(
         });
     } else {
         sender
-            .send(Ok(root.buffer))
+            .send(Ok((root.fragment, root.buffer)))
             .await
             .map_err(|_err| StorageError::internal("read stream closed"))?;
     }
@@ -1747,7 +1747,7 @@ pub async fn read_resolved_into_buffer(
         key,
         context,
         flags,
-        options,
+        options.with_decompress(),
         session,
     )
     .await?;

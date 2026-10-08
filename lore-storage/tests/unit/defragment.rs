@@ -1911,4 +1911,176 @@ mod defragment_integration {
             "every permit must come back once the payloads are delivered"
         );
     }
+
+    /// Stores `part` in `mode` under the hash of its content, returning the fragment and payload
+    /// stored; `NoCompression` stores it as it is.
+    async fn put_stored_leaf(
+        store: &Arc<dyn ImmutableStore>,
+        partition: Partition,
+        context: Context,
+        part: &[u8],
+        mode: lore_storage::CompressionMode,
+    ) -> (Address, Fragment, Bytes) {
+        let raw = Fragment {
+            flags: 0,
+            size_payload: part.len() as u32,
+            size_content: part.len() as u64,
+        };
+        let (fragment, payload) = match mode {
+            lore_storage::CompressionMode::NoCompression => (raw, Bytes::copy_from_slice(part)),
+            mode => lore_storage::compress(raw, part, mode).expect("compress leaf"),
+        };
+        let address = Address {
+            hash: hash::hash_slice(part),
+            context,
+        };
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("put leaf");
+        (address, fragment, payload)
+    }
+
+    /// The root list over `entries` for `size_content` bytes, as the leaf pipeline takes it.
+    fn list_over(entries: &[(Address, u64)], size_content: u64) -> (Fragment, Bytes) {
+        let list = Bytes::copy_from_slice(refs_at(entries).as_bytes());
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadFragmented.bits(),
+            size_payload: list.len() as u32,
+            size_content,
+        };
+        (fragment, list)
+    }
+
+    /// The leaf pipeline delivers every leaf whole and in content order with its fragment: as stored
+    /// without `decompress`, whatever its codec, and expanded with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leaf_pipeline_delivers_leaves_as_the_options_ask() {
+        use lore_storage::CompressionMode;
+
+        let (_dir, store) = make_store().await;
+        let partition = Partition::from([0x0C; 16]);
+        let context = Context::from([0x0C; 16]);
+        let content: Vec<u8> = (0..3 * 4096u32).map(|i| (i % 7) as u8).collect();
+
+        let mut entries = Vec::new();
+        let mut leaves = Vec::new();
+        for (index, mode) in [
+            CompressionMode::Zstd,
+            CompressionMode::Lz4,
+            CompressionMode::NoCompression,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let part = &content[index * 4096..(index + 1) * 4096];
+            let (address, fragment, payload) =
+                put_stored_leaf(&store, partition, context, part, mode).await;
+            entries.push((address, (index * 4096) as u64));
+            leaves.push((fragment, payload));
+        }
+        assert_ne!(leaves[0].0.flags & FragmentFlags::PayloadCompressed, 0);
+        assert_ne!(leaves[1].0.flags & FragmentFlags::PayloadCompressed, 0);
+
+        for options in [
+            ReadOptions::default().no_decompress().no_verify(),
+            ReadOptions::default(),
+        ] {
+            let (fragment, list) = list_over(&entries, content.len() as u64);
+            let (tx, mut rx) = channel(entries.len());
+            defragment_pipeline_leaves(
+                store.clone(),
+                partition,
+                Address::default(),
+                fragment,
+                list,
+                tx,
+                options,
+                None,
+            )
+            .await
+            .expect("leaf pipeline");
+
+            let mut delivered = Vec::new();
+            while let Ok(leaf) = rx.try_recv() {
+                delivered.push(leaf.expect("leaf"));
+            }
+            assert_eq!(delivered.len(), 3);
+            for (index, (fragment, payload)) in delivered.into_iter().enumerate() {
+                if options.decompress {
+                    assert_eq!(fragment.flags & FragmentFlags::PayloadCompressed, 0);
+                    assert_eq!(payload, content[index * 4096..(index + 1) * 4096]);
+                } else {
+                    assert_eq!((fragment, payload), leaves[index], "leaf {index} as stored");
+                }
+            }
+        }
+    }
+
+    /// A leaf the store does not hold fails the leaf pipeline rather than ending it short.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leaf_pipeline_fails_on_a_missing_leaf() {
+        let (_dir, store) = make_store().await;
+        let partition = Partition::from([0x0D; 16]);
+        let context = Context::from([0x0D; 16]);
+        let (present, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+        let missing = Address {
+            hash: hash::hash_slice(&[0xBB; 100]),
+            context,
+        };
+
+        let (fragment, list) = list_over(&[(present, 0), (missing, 100)], 200);
+        let (tx, _rx) = channel(2);
+        let result = defragment_pipeline_leaves(
+            store,
+            partition,
+            Address::default(),
+            fragment,
+            list,
+            tx,
+            ReadOptions::default().no_decompress().no_verify(),
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+}
+
+mod whole_leaf {
+    use super::*;
+
+    fn zstd(size_payload: u32, size_content: u64) -> Fragment {
+        Fragment {
+            flags: FragmentFlags::PayloadCompressedZstd.bits(),
+            size_payload,
+            size_content,
+        }
+    }
+
+    /// A whole leaf whose fragment agrees with its parent list and its payload goes out as loaded.
+    #[test]
+    fn a_whole_leaf_goes_out_as_loaded() {
+        let payload = Bytes::from_static(&[7u8; 10]);
+        let leaf = whole_leaf(zstd(10, 64), payload.clone(), 64, 0..64).unwrap();
+        assert_eq!(leaf, (zstd(10, 64), payload));
+    }
+
+    /// A leaf is refused when its fragment states another content size than its parent list, when
+    /// only part of it was asked for, when its payload is not the size its fragment states, or when
+    /// it is uncompressed and its fragment's sizes disagree.
+    #[test]
+    fn a_leaf_that_cannot_go_out_whole_and_as_described_is_refused() {
+        let payload = Bytes::from_static(&[7u8; 10]);
+        let uncompressed = Fragment {
+            flags: 0,
+            size_payload: 10,
+            size_content: 64,
+        };
+        assert!(whole_leaf(zstd(10, 63), payload.clone(), 64, 0..64).is_err());
+        assert!(whole_leaf(zstd(10, 64), payload.clone(), 64, 8..64).is_err());
+        assert!(whole_leaf(zstd(10, 64), payload.clone(), 64, 0..32).is_err());
+        assert!(whole_leaf(zstd(11, 64), payload.clone(), 64, 0..64).is_err());
+        assert!(whole_leaf(uncompressed, payload, 64, 0..64).is_err());
+    }
 }

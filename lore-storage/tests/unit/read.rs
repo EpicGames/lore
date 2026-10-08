@@ -1097,6 +1097,77 @@ async fn a_resolved_read_lands_in_the_caller_buffer() {
     assert_eq!(buffer.as_slice(), payload.as_ref());
 }
 
+/// A resolved stream with neither `decompress` nor `verify` hands a leaf over as stored: a zstd
+/// payload that does not decode arrives untouched, where checking or expanding it would fail.
+#[tokio::test]
+async fn a_raw_resolved_stream_neither_verifies_nor_expands() {
+    use lore_storage::local::mutable_store::LocalMutableStore;
+    use lore_storage::local::mutable_store::MutableStoreSettings;
+
+    let (dir, store) = make_test_store().await;
+    let partition = Partition::from([0x67; 16]);
+    let context = Context::from([0x67; 16]);
+    let payload = Bytes::from(vec![0x5a; 64]);
+    let address = Address {
+        hash: hash::hash_slice(b"content the payload does not decode to"),
+        context,
+    };
+    let fragment = Fragment {
+        flags: FragmentFlags::PayloadCompressedZstd.bits(),
+        size_payload: payload.len() as u32,
+        size_content: 128,
+    };
+    store
+        .clone()
+        .put(partition, address, fragment, Some(payload.clone()), false)
+        .await
+        .expect("put a leaf that does not decode");
+
+    let mutable: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(PathBuf::from(dir.as_ref())),
+            MutableStoreSettings::default(),
+            store.clone(),
+        )
+        .await
+        .expect("create mutable store"),
+    );
+    let key = hash::hash_slice(b"a key naming a leaf that does not decode");
+    mutable
+        .clone()
+        .store(partition, key, address.hash, KeyType::Resolve)
+        .await
+        .expect("publish the mapping");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let (resolved, size_content) = read_resolved_stream(
+        store,
+        mutable,
+        partition,
+        key,
+        context,
+        0,
+        ReadOptions::default()
+            .no_decompress()
+            .no_verify()
+            .no_remote(),
+        tx,
+        None,
+    )
+    .await
+    .expect("a raw resolved stream neither verifies nor expands");
+
+    assert_eq!(resolved, address.hash);
+    assert_eq!(size_content, fragment.size_content);
+    let (delivered_fragment, delivered) = rx.recv().await.expect("a leaf").expect("delivered");
+    assert_eq!(
+        delivered_fragment.flags & FragmentFlags::PayloadCompressed,
+        FragmentFlags::PayloadCompressedZstd.bits()
+    );
+    assert_eq!(delivered_fragment.size_content, fragment.size_content);
+    assert_eq!(delivered, payload);
+}
+
 /// Partitions are content namespacing, so the same bytes written by two tenants land on one
 /// address. Whether reading it back under a partition that never wrote it succeeds is the
 /// store's decision, not the caller's: a single-tenant client serves it, and a store holding

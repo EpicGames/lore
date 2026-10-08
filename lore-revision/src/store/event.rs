@@ -93,6 +93,25 @@ pub struct LoreStorageGetDataEventData {
     pub bytes: LoreBytes,
 }
 
+/// Per-leaf event for `get_resolved` with `fragments` set: one leaf fragment of the
+/// item's content and its payload. The `bytes` view is valid only during the callback invocation.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStorageGetFragmentEventData {
+    /// Correlation id of the item.
+    pub id: u64,
+    /// The content address of the item.
+    pub address: Address,
+    /// The byte offset of this leaf within the item's content.
+    pub offset: u64,
+    /// The leaf's fragment, describing `bytes`: the compression among its flags, the payload size
+    /// and the content size the payload expands to.
+    pub fragment: Fragment,
+    /// The leaf's payload, compressed as `fragment` states.
+    pub bytes: LoreBytes,
+}
+
 /// Terminal per-item event for `get`, `get_file`, `get_resolved` and
 /// `get_file_resolved`. For the two file variants this is emitted without any
 /// preceding `HEADER`/`DATA` events — the payload is written directly to the

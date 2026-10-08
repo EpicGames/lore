@@ -230,6 +230,7 @@ use crate::state::LoreRepositoryStateDumpEventData;
 use crate::state::LoreRepositoryStateDumpNodeEventData;
 use crate::store::event::LoreStorageCopyItemCompleteEventData;
 use crate::store::event::LoreStorageGetDataEventData;
+use crate::store::event::LoreStorageGetFragmentEventData;
 use crate::store::event::LoreStorageGetHeaderEventData;
 use crate::store::event::LoreStorageGetItemCompleteEventData;
 use crate::store::event::LoreStorageGetMetadataItemCompleteEventData;
@@ -1348,6 +1349,8 @@ pub enum LoreEvent {
     ServiceMessage(LoreServiceMessageEventData),
     /// An interactive login is still waiting for the user's approval.
     AuthPending(LoreAuthPendingEventData),
+    /// One leaf fragment and its payload for a get-resolved item.
+    StorageGetFragment(LoreStorageGetFragmentEventData),
 }
 
 impl LoreEvent {

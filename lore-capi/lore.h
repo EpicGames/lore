@@ -3302,6 +3302,22 @@ typedef struct lore_auth_pending_event_data_t {
   uint64_t remaining_secs;
 } lore_auth_pending_event_data_t;
 
+// Per-leaf event for `get_resolved` with `fragments` set: one leaf fragment of the
+// item's content and its payload. The `bytes` view is valid only during the callback invocation.
+typedef struct lore_storage_get_fragment_event_data_t {
+  // Correlation id of the item.
+  uint64_t id;
+  // The content address of the item.
+  struct lore_address_t address;
+  // The byte offset of this leaf within the item's content.
+  uint64_t offset;
+  // The leaf's fragment, describing `bytes`: the compression among its flags, the payload size
+  // and the content size the payload expands to.
+  struct lore_fragment_t fragment;
+  // The leaf's payload, compressed as `fragment` states.
+  struct lore_bytes_t bytes;
+} lore_storage_get_fragment_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3778,6 +3794,8 @@ enum lore_event_id_t {
   LORE_EVENT_SERVICE_MESSAGE,
   // An interactive login is still waiting for the user's approval.
   LORE_EVENT_AUTH_PENDING,
+  // One leaf fragment and its payload for a get-resolved item.
+  LORE_EVENT_STORAGE_GET_FRAGMENT,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4020,6 +4038,7 @@ typedef struct lore_event_t {
     struct lore_service_status_event_data_t service_status;
     struct lore_service_message_event_data_t service_message;
     struct lore_auth_pending_event_data_t auth_pending;
+    struct lore_storage_get_fragment_event_data_t storage_get_fragment;
   };
 } lore_event_t;
 
@@ -5291,8 +5310,13 @@ typedef struct lore_storage_get_resolved_item_t {
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
   uint8_t local_cache;
+  // Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
+  // carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
+  // is expanded or checked against its hash. An item with `data_out` supplied rejects with
+  // `INVALID_ARGUMENTS`
+  uint8_t fragments;
   // Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
-  // `GET_DATA` delivery.
+  // delivery in events.
   //
   // The capacity is the limit: content exceeding it fails the item with
   // `Oversized` rather than truncating. `GET_HEADER` reports the content
@@ -11609,12 +11633,17 @@ void lore_storage_get_async(const struct lore_global_args_t *globals,
 // materialised in memory before the first byte reaches the callback, so a key naming something
 // large should set it.
 //
+// Set `fragments` to receive one `LORE_EVENT_STORAGE_GET_FRAGMENT` per leaf fragment in place of
+// `LORE_EVENT_STORAGE_GET_DATA`, each carrying the leaf's `lore_fragment_t` and its payload as
+// stored. No leaf is expanded or checked against its hash.
+//
 // # Events
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
 // | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+// | `LORE_EVENT_STORAGE_GET_FRAGMENT` | `lore_storage_get_fragment_event_data_t` | One leaf fragment and its payload, in content order, when `fragments` is set. The payload is valid only during the callback invocation |
 // | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |

@@ -1268,6 +1268,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -4118,6 +4119,7 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
+                        fragments: 0,
                     },
                     LoreStorageGetResolvedItem {
                         data_out: Default::default(),
@@ -4127,6 +4129,7 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
+                        fragments: 0,
                     },
                 ];
                 get_resolved::get_resolved(
@@ -4186,6 +4189,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
+                            fragments: 0,
                         }]),
                     },
                     callback,
@@ -4340,6 +4344,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -4448,6 +4453,7 @@ mod storage_remote_tests {
                                     context: Context::default(),
                                     local_cache: 0,
                                     streaming: 0,
+                                    fragments: 0,
                                 }]),
                             },
                             callback,
@@ -4633,6 +4639,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 1,
                             streaming: 0,
+                            fragments: 0,
                         },
                         LoreStorageGetResolvedItem {
                             data_out: Default::default(),
@@ -4642,6 +4649,7 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
+                            fragments: 0,
                         },
                     ];
                     get_resolved::get_resolved(
@@ -4794,6 +4802,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -5113,6 +5122,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -5229,6 +5239,7 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 1,
+                                fragments: 0,
                             }]),
                         },
                         callback,
@@ -5259,6 +5270,206 @@ mod storage_remote_tests {
                         assembled, payload,
                         "streamed bytes must match what was published"
                     );
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// What one get-resolved item with `fragments` set delivered: the header's content
+    /// size, the item's error code, each `GET_FRAGMENT` as offset, fragment and payload, and how
+    /// many `GET_DATA` events arrived beside them.
+    #[derive(Default)]
+    struct FragmentRead {
+        size_content: Vec<u64>,
+        codes: Vec<i32>,
+        leaves: Vec<(u64, lore_base::types::Fragment, Vec<u8>)>,
+        data_events: usize,
+    }
+
+    async fn put_resolved_content(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        content: &[u8],
+    ) {
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::interface::LoreArray;
+
+        let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+        let codes_cb = codes.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+            if let LoreEvent::StoragePutItemComplete(d) = e {
+                codes_cb.lock().unwrap().push(d.error.error_code);
+            }
+        }));
+        put_resolved::put_resolved(
+            LoreGlobalArgs::default(),
+            LoreStoragePutResolvedArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context: Context::default(),
+                    data: LoreBytes {
+                        ptr: content.as_ptr().cast(),
+                        len: content.len(),
+                    },
+                    remote_write: 1,
+                    local_cache: 0,
+                    fixed_size_chunk: 64 * 1024,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(codes.lock().unwrap().clone(), vec![0]);
+    }
+
+    async fn read_fragments(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        data_out: lore_revision::event::LoreBytesMut,
+    ) -> FragmentRead {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore_base::types::Context;
+        use lore_revision::interface::LoreArray;
+
+        let read: Arc<Mutex<FragmentRead>> = Arc::default();
+        let read_cb = read.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+            let mut read = read_cb.lock().unwrap();
+            match e {
+                LoreEvent::StorageGetHeader(d) => read.size_content.push(d.size_content),
+                LoreEvent::StorageGetData(_) => read.data_events += 1,
+                LoreEvent::StorageGetFragment(d) => {
+                    // Safety: the view is valid for the length given during the callback.
+                    let payload = unsafe {
+                        std::slice::from_raw_parts(d.bytes.ptr.cast::<u8>(), d.bytes.len)
+                    };
+                    read.leaves.push((d.offset, d.fragment, payload.to_vec()));
+                }
+                LoreEvent::StorageGetItemComplete(d) => read.codes.push(d.error.error_code),
+                _ => {}
+            }
+        }));
+        get_resolved::get_resolved(
+            LoreGlobalArgs::default(),
+            LoreStorageGetResolvedArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                    data_out,
+                    id: 2,
+                    partition,
+                    key,
+                    context: Context::default(),
+                    local_cache: 0,
+                    streaming: 0,
+                    fragments: 1,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        std::mem::take(&mut *read.lock().unwrap())
+    }
+
+    /// Bytes nothing compresses: splitmix64 over a counter leaves no repetition for an encoder to
+    /// find.
+    fn incompressible(length: u64) -> Vec<u8> {
+        (0..length)
+            .map(|i| {
+                let mut v = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                v = (v ^ (v >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                v = (v ^ (v >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (v ^ (v >> 31)) as u8
+            })
+            .collect()
+    }
+
+    /// `fragments` delivers each leaf in content order with its fragment and its payload as stored:
+    /// zstd leaves compressed, a leaf stored uncompressed as it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_resolved_fragments_arrive_as_stored() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_storage::FragmentFlags;
+
+        let execution = setup_execution("storage-remote-resolve-fragments".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xdau8; 16]);
+                    let fragmented = Hash::hash_buffer(b"fragmented-key");
+                    let single = Hash::hash_buffer(b"single-leaf-key");
+                    let compressible: Vec<u8> =
+                        (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
+                    let incompressible = incompressible(48 * 1024);
+                    let handle_id = open_remote_handle(&server).await;
+                    put_resolved_content(handle_id, partition, fragmented, &compressible).await;
+                    put_resolved_content(handle_id, partition, single, &incompressible).await;
+                    let reader = open_remote_handle(&server).await;
+
+                    let read =
+                        read_fragments(reader, partition, fragmented, Default::default()).await;
+                    assert_eq!(read.codes, vec![0]);
+                    assert_eq!(read.size_content, vec![compressible.len() as u64]);
+                    assert_eq!(read.data_events, 0, "fragments replace GET_DATA");
+                    assert_eq!(read.leaves.len(), 8, "one fragment per 64 KiB leaf");
+                    let mut expected_offset = 0u64;
+                    for (offset, fragment, payload) in &read.leaves {
+                        assert_eq!(*offset, expected_offset, "offsets count content");
+                        assert_eq!(
+                            fragment.flags & FragmentFlags::PayloadCompressed,
+                            FragmentFlags::PayloadCompressedZstd.bits(),
+                            "a leaf stored with zstd arrives as stored"
+                        );
+                        assert_eq!(payload.len(), fragment.size_payload as usize);
+                        assert!(payload.len() < fragment.size_content as usize);
+                        let (_, content) = lore_storage::decompress(*fragment, payload).unwrap();
+                        let start = *offset as usize;
+                        let end = start + fragment.size_content as usize;
+                        assert_eq!(content.as_ref(), &compressible[start..end]);
+                        expected_offset += fragment.size_content;
+                    }
+                    assert_eq!(expected_offset, compressible.len() as u64);
+
+                    let read = read_fragments(reader, partition, single, Default::default()).await;
+                    assert_eq!(read.codes, vec![0]);
+                    assert_eq!(read.leaves.len(), 1);
+                    let (offset, fragment, payload) = &read.leaves[0];
+                    assert_eq!(*offset, 0);
+                    assert_eq!(
+                        fragment.flags & FragmentFlags::PayloadCompressed,
+                        0,
+                        "a leaf stored uncompressed arrives as stored"
+                    );
+                    assert_eq!(payload, &incompressible);
+
+                    let mut buffer = vec![0u8; incompressible.len()];
+                    let data_out = lore_revision::event::LoreBytesMut {
+                        ptr: buffer.as_mut_ptr().cast(),
+                        len: buffer.len(),
+                    };
+                    let read = read_fragments(reader, partition, single, data_out).await;
+                    assert_eq!(
+                        read.codes,
+                        vec![lore_base::error::InvalidArguments::FFI_CODE],
+                        "fragment delivery has no caller-buffer form"
+                    );
+                    assert!(read.leaves.is_empty());
 
                     close_handle(reader).await;
                     close_handle(handle_id).await;

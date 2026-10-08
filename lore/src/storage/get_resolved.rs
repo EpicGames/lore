@@ -21,6 +21,11 @@
 //! `GET_ITEM_COMPLETE`, no `GET_DATA`, and `streaming` ignored. Content exceeding the buffer's
 //! stated capacity fails the item with `Oversized`.
 //!
+//! With `fragments` set the leaves arrive as stored: `GET_HEADER`, then one
+//! `GET_FRAGMENT { id, address, offset, fragment, bytes }` per leaf in content order, then
+//! `GET_ITEM_COMPLETE`. `fragment` describes `bytes`. No leaf is expanded or checked against its
+//! hash. `offset` and the byte-count backstop count content, as in streaming mode.
+//!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
 //!
@@ -38,6 +43,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use lore_base::types::Address;
 use lore_base::types::Context;
+use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_macro::LoreArgs;
@@ -48,6 +54,7 @@ use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::lore::execution_context;
 use lore_revision::store::event::LoreStorageGetDataEventData;
+use lore_revision::store::event::LoreStorageGetFragmentEventData;
 use lore_revision::store::event::LoreStorageGetHeaderEventData;
 use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::StorageError;
@@ -89,8 +96,13 @@ pub struct LoreStorageGetResolvedItem {
     /// Cache fetched bytes back to the local store even without the producer's
     /// `PayloadLocalCachePriority` hint
     pub local_cache: u8,
+    /// Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
+    /// carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
+    /// is expanded or checked against its hash. An item with `data_out` supplied rejects with
+    /// `INVALID_ARGUMENTS`
+    pub fragments: u8,
     /// Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
-    /// `GET_DATA` delivery.
+    /// delivery in events.
     ///
     /// The capacity is the limit: content exceeding it fails the item with
     /// `Oversized` rather than truncating. `GET_HEADER` reports the content
@@ -106,6 +118,7 @@ impl core::fmt::Debug for LoreStorageGetResolvedItem {
             .field("id", &self.id)
             .field("streaming", &self.streaming)
             .field("local_cache", &self.local_cache)
+            .field("fragments", &self.fragments)
             .field("data_out", &self.data_out)
             .finish()
     }
@@ -162,7 +175,7 @@ async fn get_resolved_local(
     .await
 }
 
-/// Resolve and read one item, emitting the `HEADER` / `DATA` / `ITEM_COMPLETE` sequence.
+/// Resolve and read one item, emitting its `HEADER` ... `ITEM_COMPLETE` sequence.
 /// Returns the item's own error so the call-level reduction can pick the dominant failure.
 async fn get_resolved_item(
     store: Arc<StoreInternal>,
@@ -191,12 +204,41 @@ async fn get_resolved_item(
         read_options = read_options.with_cache();
     }
 
+    if item.fragments != 0 {
+        if item.data_out.is_supplied() {
+            return emit_item_complete(
+                item,
+                Address::default(),
+                Err(invalid_item("fragment delivery has no caller-buffer form")),
+            );
+        }
+        return get_resolved_item_streaming(
+            store,
+            item,
+            read_options.no_decompress().no_verify(),
+            remote_session,
+            emit_fragment,
+        )
+        .await;
+    }
+
     if item.data_out.is_supplied() {
         return get_resolved_item_into(store, item, read_options, remote_session).await;
     }
 
     if item.streaming != 0 {
-        return get_resolved_item_streaming(store, item, read_options, remote_session).await;
+        return get_resolved_item_streaming(
+            store,
+            item,
+            read_options,
+            remote_session,
+            |item, address, (_fragment, bytes), offset| {
+                let len = bytes.len() as u64;
+                emit_data(item, address, bytes, offset);
+                len
+            },
+        )
+        .await;
     }
 
     match read_resolved(
@@ -266,16 +308,18 @@ async fn get_resolved_item_into(
     }
 }
 
-/// Streaming counterpart of [`get_resolved_item`]: one `GET_DATA` per leaf instead of a single
-/// reassembled buffer, mirroring `get`'s streaming worker. The resolved address is not known
-/// until the key resolves, so `GET_HEADER` follows the resolve rather than preceding it.
+/// Streaming counterpart of [`get_resolved_item`]: one event per leaf instead of a single
+/// reassembled buffer, mirroring `get`'s streaming worker. `emit` sends a leaf at the content offset
+/// given and returns the content it covers. The resolved address is not known until the key
+/// resolves, so `GET_HEADER` follows the resolve rather than preceding it.
 async fn get_resolved_item_streaming(
     store: Arc<StoreInternal>,
     item: &LoreStorageGetResolvedItem,
     read_options: lore_storage::options::ReadOptions,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    emit: impl Fn(&LoreStorageGetResolvedItem, Address, (Fragment, Bytes), u64) -> u64,
 ) -> Result<(), StorageError> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(256);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<(Fragment, Bytes), StorageError>>(256);
     let stream_future = read_resolved_stream(
         store.immutable.clone(),
         store.mutable.clone(),
@@ -301,13 +345,9 @@ async fn get_resolved_item_streaming(
 
     let mut offset: u64 = 0;
     let mut result: Result<(), StorageError> = Ok(());
-    while let Some(chunk) = rx.recv().await {
-        match chunk {
-            Ok(chunk) => {
-                let len = chunk.len() as u64;
-                emit_data(item, address, chunk, offset);
-                offset += len;
-            }
+    while let Some(leaf) = rx.recv().await {
+        match leaf {
+            Ok(leaf) => offset += emit(item, address, leaf, offset),
             Err(err) => {
                 result = Err(err);
                 break;
@@ -346,6 +386,29 @@ fn emit_data(item: &LoreStorageGetResolvedItem, address: Address, bytes: Bytes, 
         bytes: data,
     });
     execution_context().dispatcher.send_with_bytes(event, bytes);
+}
+
+/// Emit `GET_FRAGMENT` with the payload attached as the callback-lifetime keepalive, as
+/// [`emit_data`] does. Returns the content the leaf covers.
+fn emit_fragment(
+    item: &LoreStorageGetResolvedItem,
+    address: Address,
+    (fragment, bytes): (Fragment, Bytes),
+    offset: u64,
+) -> u64 {
+    let data = LoreBytes {
+        ptr: bytes.as_ptr().cast(),
+        len: bytes.len(),
+    };
+    let event = LoreEvent::StorageGetFragment(LoreStorageGetFragmentEventData {
+        id: item.id,
+        address,
+        offset,
+        fragment,
+        bytes: data,
+    });
+    execution_context().dispatcher.send_with_bytes(event, bytes);
+    fragment.size_content
 }
 
 /// Emit the item's terminal event and return the outcome that was sent.

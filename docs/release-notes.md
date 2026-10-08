@@ -21,6 +21,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   collects (`collected_addresses`), and the existence query batches sent at once (`concurrent_query_batches`). Debug
   logs report the same counts per push, with whether the push returned or was dropped, and per collection step
 - `lore`: `lore service status` can be used to get the current status of the currently available Lore service, if any.
+- C API: `lore_storage_get_resolved_item_t` gains `fragments`, which delivers the item's content one leaf at a time as
+  `LORE_EVENT_STORAGE_GET_FRAGMENT`, each event carrying the leaf's `lore_fragment_t` and its payload as stored, in
+  place of `LORE_EVENT_STORAGE_GET_DATA`. No leaf is expanded or checked against its hash, so the reader decodes and
+  verifies what it takes. A reader that wants content compressed the way the store holds it takes the stored payloads
+  instead of the store expanding them and the reader compressing them again. The field sits in the struct's padding,
+  so its size and its other fields' offsets are unchanged, and a zero-initialized item reads as before
 
 ### Fixes & Improvements
 

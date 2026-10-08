@@ -784,8 +784,8 @@ async fn fetch_unordered(
     result
 }
 
-/// A fetched payload and the memory permit it is accounted against.
-type FetchResult = Result<(Bytes, SemaphorePermit<'static>), StorageError>;
+/// A fetched leaf and the memory permit it is accounted against.
+type FetchResult<T> = Result<(T, SemaphorePermit<'static>), StorageError>;
 
 /// The next leaf to fetch, or `None` once there are none left or nobody is left to fetch for.
 ///
@@ -830,15 +830,15 @@ async fn reserve_leaf_budget<T>(
 /// than as an error. The permit is released here rather than at load, so the budget bounds the
 /// pipeline.
 #[lore_macro::test_pub]
-async fn send_payload(
-    sender: &Sender<Result<Bytes, StorageError>>,
-    buffer: Bytes,
+async fn send_payload<T>(
+    sender: &Sender<Result<T, StorageError>>,
+    leaf: T,
     permit: SemaphorePermit<'static>,
 ) -> bool {
     let abandoned = sender
         .reserve()
         .await
-        .map(|slot| slot.send(Ok(buffer)))
+        .map(|slot| slot.send(Ok(leaf)))
         .is_err();
     drop(permit);
     abandoned
@@ -887,22 +887,123 @@ fn fetch_ordered_and_stream(
     )
 }
 
+/// [`fetch_ordered_and_stream`] with the fragment budget taken from `semaphore`.
 #[lore_macro::test_pub]
-async fn fetch_ordered_and_stream_from(
+fn fetch_ordered_and_stream_from(
+    semaphore: &'static Semaphore,
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    leaf_rx: Receiver<LeafReference>,
+    sender: Sender<Result<Bytes, StorageError>>,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> impl Future<Output = Result<(), StorageError>> {
+    // See fetch_unordered: defragmentation leaves are always decompressed.
+    fetch_ordered_from(
+        semaphore,
+        store,
+        partition,
+        leaf_rx,
+        sender,
+        options.with_decompress(),
+        remote_session,
+        content_leaf,
+    )
+}
+
+/// [`fetch_ordered_and_stream`] delivering each leaf whole with its fragment, loaded as `options`
+/// asks.
+fn fetch_ordered_leaves(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    leaf_rx: Receiver<LeafReference>,
+    sender: Sender<Result<(Fragment, Bytes), StorageError>>,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> impl Future<Output = Result<(), StorageError>> {
+    fetch_ordered_from(
+        fragment_limiter(),
+        store,
+        partition,
+        leaf_rx,
+        sender,
+        options,
+        remote_session,
+        whole_leaf,
+    )
+}
+
+/// A leaf loaded expanded, as the part of its content that was asked for.
+fn content_leaf(
+    _fragment: Fragment,
+    buffer: Bytes,
+    expected_size: u64,
+    clip: Range<u64>,
+) -> Result<Bytes, StorageError> {
+    if buffer.len() as u64 != expected_size {
+        return Err(StorageError::internal(format!(
+            "leaf fragment content size {} does not match expected {expected_size}",
+            buffer.len()
+        )));
+    }
+    // See `fetch_unordered`: clipped after the whole leaf is checked, and a view rather than a
+    // copy.
+    Ok(buffer.slice(clip.start as usize..clip.end as usize))
+}
+
+/// A leaf as loaded, with its fragment: held to the content size its parent list states, and its
+/// payload to the fragment. It is delivered whole, since a payload left compressed cannot be cut.
+#[lore_macro::test_pub]
+fn whole_leaf(
+    fragment: Fragment,
+    payload: Bytes,
+    expected_size: u64,
+    clip: Range<u64>,
+) -> Result<(Fragment, Bytes), StorageError> {
+    if fragment.size_content != expected_size {
+        return Err(StorageError::internal(format!(
+            "leaf fragment content size {} does not match expected {expected_size}",
+            fragment.size_content
+        )));
+    }
+    if clip != (0..expected_size) {
+        return Err(StorageError::internal(
+            "a leaf with its fragment is delivered whole, not in part",
+        ));
+    }
+    if payload.len() != fragment.size_payload as usize
+        || ((fragment.flags & FragmentFlags::PayloadCompressed) == 0
+            && fragment.size_payload as u64 != fragment.size_content)
+    {
+        return Err(StorageError::internal(format!(
+            "leaf payload of {} bytes does not match its fragment",
+            payload.len()
+        )));
+    }
+    Ok((fragment, payload))
+}
+
+/// The ordered fetch pool behind [`fetch_ordered_and_stream`]. Each leaf is loaded under
+/// `options` and handed to `make_leaf` with the content size its parent list states and the part
+/// of it that was asked for; what that returns is what the caller receives.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_ordered_from<T, F>(
     semaphore: &'static Semaphore,
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     mut leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Result<Bytes, StorageError>>,
+    sender: Sender<Result<T, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-) -> Result<(), StorageError> {
-    // See fetch_unordered: defragmentation leaves are always decompressed.
-    let options = options.with_decompress();
-
+    make_leaf: F,
+) -> Result<(), StorageError>
+where
+    T: Send + 'static,
+    F: Fn(Fragment, Bytes, u64, Range<u64>) -> Result<T, StorageError> + Copy + Send + 'static,
+{
     // Sized so it never binds before the budget does; every payload in it holds a permit.
     let max_tasks = FRAGMENT_BUDGET_KIB / FRAGMENT_MINIMUM_COST_KIB as usize;
-    let (fetch_queue_tx, mut fetch_queue_rx) = channel::<JoinHandle<FetchResult>>(max_tasks);
+    let (fetch_queue_tx, mut fetch_queue_rx) = channel::<JoinHandle<FetchResult<T>>>(max_tasks);
 
     // Launcher: read leaf refs from walker, spawn fetch tasks, push handles
     let launcher: JoinHandle<Result<(), StorageError>> = {
@@ -925,7 +1026,7 @@ async fn fetch_ordered_and_stream_from(
                 let expected_size = leaf.expected_size;
                 let clip = leaf.clip.clone();
 
-                let handle: JoinHandle<FetchResult> = lore_base::lore_spawn!(async move {
+                let handle: JoinHandle<FetchResult<T>> = lore_base::lore_spawn!(async move {
                     let (loaded_fragment, buffer) =
                         load_fragment(store, partition, subaddress, options, remote_session)
                             .await?;
@@ -934,15 +1035,10 @@ async fn fetch_ordered_and_stream_from(
                             "expected leaf fragment but peer returned an intermediate fragment list",
                         ));
                     }
-                    if buffer.len() as u64 != expected_size {
-                        return Err(StorageError::internal(format!(
-                            "leaf fragment content size {} does not match expected {expected_size}",
-                            buffer.len()
-                        )));
-                    }
-                    // See `fetch_unordered`: clipped after the whole leaf is checked, and a
-                    // view rather than a copy.
-                    Ok((buffer.slice(clip.start as usize..clip.end as usize), permit))
+                    Ok((
+                        make_leaf(loaded_fragment, buffer, expected_size, clip)?,
+                        permit,
+                    ))
                 });
 
                 if fetch_queue_tx.send(handle).await.is_err() {
@@ -961,8 +1057,8 @@ async fn fetch_ordered_and_stream_from(
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
             .and_then(|r| r)
         {
-            Ok((buffer, permit)) => {
-                if send_payload(&sender, buffer, permit).await {
+            Ok((leaf, permit)) => {
+                if send_payload(&sender, leaf, permit).await {
                     break;
                 }
             }
@@ -1153,6 +1249,49 @@ pub async fn defragment_pipeline(
                 .and(joined(write_result))
         }
     }
+}
+
+/// [`defragment_pipeline`] delivering a whole content's leaves in content order on `sender`, each
+/// with its fragment and loaded as `options` asks.
+///
+/// Not a [`DefragmentSink`] variant, which would grow every future holding a sink.
+#[allow(clippy::too_many_arguments)]
+pub async fn defragment_pipeline_leaves(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    source_buffer: Bytes,
+    sender: Sender<Result<(Fragment, Bytes), StorageError>>,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<(), StorageError> {
+    let (leaf_tx, leaf_rx) = channel::<LeafReference>(PIPELINE_LEAF_CHANNEL_SIZE);
+
+    let store_walker = store.clone();
+    let session_walker = remote_session.clone();
+    let walker = lore_base::lore_spawn!(walk_fragment_tree(
+        store_walker,
+        partition,
+        address,
+        fragment,
+        source_buffer,
+        0..fragment.size_content,
+        leaf_tx,
+        options,
+        session_walker,
+    ));
+    let fetcher = lore_base::lore_spawn!(fetch_ordered_leaves(
+        store,
+        partition,
+        leaf_rx,
+        sender,
+        options,
+        remote_session,
+    ));
+
+    let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
+    joined(walk_result).and(joined(fetch_result))
 }
 
 /// A destination a defragmenting read divides among the leaves it walks.

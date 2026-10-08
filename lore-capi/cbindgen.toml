@@ -515,6 +515,7 @@ include = [
 "LoreStoragePutItemCompleteEventData" = "lore_storage_put_item_complete_event_data_t"
 "LoreStorageGetHeaderEventData" = "lore_storage_get_header_event_data_t"
 "LoreStorageGetDataEventData" = "lore_storage_get_data_event_data_t"
+"LoreStorageGetFragmentEventData" = "lore_storage_get_fragment_event_data_t"
 "LoreStorageGetItemCompleteEventData" = "lore_storage_get_item_complete_event_data_t"
 "LoreStorageCopyItemCompleteEventData" = "lore_storage_copy_item_complete_event_data_t"
 "LoreStorageObliterateItemCompleteEventData" = "lore_storage_obliterate_item_complete_event_data_t"

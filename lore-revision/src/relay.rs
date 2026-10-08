@@ -26,9 +26,9 @@ use crate::util;
 /// optional `Bytes` keepalive that pins a buffer referenced by the
 /// event's payload for the duration of the callback invocation.
 ///
-/// The only event that uses the keepalive today is
-/// `LoreEvent::StorageGetData`, whose `LoreBytes` view points into the
-/// carried `Bytes`. The forwarder holds the `Bytes` clone while the
+/// The events that use the keepalive today are `LoreEvent::StorageGetData`
+/// and `LoreEvent::StorageGetFragment`, whose `LoreBytes` views point into
+/// the carried `Bytes`. The forwarder holds the `Bytes` clone while the
 /// callback runs, then drops it. Since `Bytes` is itself refcounted,
 /// the caller's task may drop its own clone as soon as `send_with_bytes`
 /// returns — the buffer stays alive until every registered keepalive
