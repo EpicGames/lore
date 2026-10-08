@@ -86,6 +86,7 @@ use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::request_tracker::StoreRequestTracker;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch merge starts.
@@ -4261,6 +4262,7 @@ async fn merge_into_link(
         state_branch.clone(),
         state_new.clone(),
         true,
+        Arc::new(StoreRequestTracker::default()),
     )
     .await
     .forward::<MergeError>("collecting new fragments")?;
@@ -4618,6 +4620,7 @@ pub async fn merge_into(
         state_branch.clone(),
         state_new.clone(),
         true, /* Ignore already durably stored fragments */
+        Arc::new(StoreRequestTracker::default()),
     )
     .await
     .forward::<MergeError>("collecting new fragments")?;

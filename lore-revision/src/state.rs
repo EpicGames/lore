@@ -97,6 +97,7 @@ use crate::store::StoreMatch;
 use crate::store::query_one;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::request_tracker::StoreRequestTracker;
 
 /// Data for an event summarizing a dumped repository state.
 #[repr(C)]
@@ -7896,19 +7897,25 @@ fn collect_diff_addresses(from: Vec<Address>, to: Vec<Address>) -> Vec<Address> 
 }
 
 /// Returns sorted and deduplicated addresses
+///
+/// `tracker` counts the store reads of the per-address tasks the collection spawns to look up
+/// each candidate fragment.
 pub async fn collect_new_fragments(
     repository: Arc<RepositoryContext>,
     state_from: Arc<State>,
     state_to: Arc<State>,
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let from_state_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_from.clone();
+        let tracker = tracker.clone();
         async move {
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             // Collect all from block addresses, even uploaded, as we want to diff against these
-            let mut addresses = collect_new_addresses(repository, &addresses, false).await?;
+            let mut addresses =
+                collect_new_addresses(repository, &addresses, false, tracker).await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -7917,10 +7924,12 @@ pub async fn collect_new_fragments(
     let to_new_state_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_to.clone();
+        let tracker = tracker.clone();
         async move {
             let addresses = collect_state_fragments(repository.clone(), state).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, ignore_durably_stored).await?;
+                collect_new_addresses(repository, &addresses, ignore_durably_stored, tracker)
+                    .await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -7972,6 +7981,7 @@ pub async fn collect_new_fragments(
         let repository = repository.clone();
         let state_from = state_from.clone();
         let state_to = state_to.clone();
+        let tracker = tracker.clone();
         async move {
             // Safe to filter these directly to only contain not uploaded fragments, we don't
             // use it as input to any other collection
@@ -7982,6 +7992,7 @@ pub async fn collect_new_fragments(
                 ROOT_NODE,
                 ROOT_NODE,
                 ignore_durably_stored,
+                tracker,
             )
             .await
         }
@@ -7990,11 +8001,13 @@ pub async fn collect_new_fragments(
     let new_revision_metadata_address = lore_spawn!({
         let repository = repository.clone();
         let metadata_hash = state_to.metadata_hash();
+        let tracker = tracker.clone();
         async move {
             collect_new_revision_metadata_fragments(
                 repository,
                 metadata_hash,
                 ignore_durably_stored,
+                tracker,
             )
             .await
         }
@@ -8043,10 +8056,12 @@ pub async fn collect_new_fragments(
     let new_name_address = lore_spawn!({
         let repository = repository.clone();
         let blocks = diff_block_address.clone();
+        let tracker = tracker.clone();
         async move {
             let addresses = collect_name_fragments(repository.clone(), blocks).await?;
             let mut addresses =
-                collect_new_addresses(repository, &addresses, ignore_durably_stored).await?;
+                collect_new_addresses(repository, &addresses, ignore_durably_stored, tracker)
+                    .await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8056,10 +8071,15 @@ pub async fn collect_new_fragments(
     // collected the name block addresses from the diff list
     let new_block_address = lore_spawn!({
         let repository = repository.clone();
+        let tracker = tracker.clone();
         async move {
-            let mut addresses =
-                collect_new_addresses(repository, &diff_block_address, ignore_durably_stored)
-                    .await?;
+            let mut addresses = collect_new_addresses(
+                repository,
+                &diff_block_address,
+                ignore_durably_stored,
+                tracker,
+            )
+            .await?;
             addresses.sort_unstable();
             Ok(addresses)
         }
@@ -8154,6 +8174,7 @@ pub async fn collect_new_fragments(
                         *to_block_address,
                         block_index,
                         ignore_durably_stored,
+                        tracker.clone(),
                     )
                 );
             }
@@ -8245,12 +8266,13 @@ pub async fn collect_new_fragments(
             repository.clone(),
             &[Address::zero_context_hash(metadata_hash)],
             ignore_durably_stored,
+            tracker,
         )
         .await;
         if let Ok(mut metadata_fragments) = metadata_fragments {
-            lore_trace!(
+            lore_debug!(
                 "Collected {} new addresses from branch metadata",
-                fragments.len()
+                metadata_fragments.len()
             );
             fragments.append(&mut metadata_fragments);
         } else {
@@ -8304,6 +8326,7 @@ pub async fn collect_new_fragments(
 
     fragments.sort_unstable();
     fragments.dedup();
+    lore_debug!("Collected {} new addresses in total", fragments.len());
 
     Ok(fragments)
 }
@@ -8320,6 +8343,7 @@ async fn collect_new_file_fragments(
     node_from: NodeID,
     node_to: NodeID,
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let (from, to) = join!(
         state_from.collect_children_unsorted(
@@ -8375,13 +8399,16 @@ async fn collect_new_file_fragments(
             if to_node.is_file() {
                 let repository = to.repository.clone();
                 let address = [to_node.address];
+                let tracker = tracker.clone();
                 lore_spawn!(tasks, async move {
-                    collect_new_addresses(repository, &address, ignore_durably_stored).await
+                    collect_new_addresses(repository, &address, ignore_durably_stored, tracker)
+                        .await
                 });
             } else {
                 let repository = to.repository.clone();
                 let state_from = from.state.clone();
                 let state_to = to.state.clone();
+                let tracker = tracker.clone();
                 lore_spawn!(tasks, async move {
                     collect_new_file_fragments_recurse(
                         repository,
@@ -8390,6 +8417,7 @@ async fn collect_new_file_fragments(
                         from_node_id,
                         to_node_id,
                         ignore_durably_stored,
+                        tracker,
                     )
                     .await
                 });
@@ -8427,6 +8455,7 @@ fn collect_new_file_fragments_recurse(
     node_from: NodeID,
     node_to: NodeID,
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + 'static>> {
     Box::pin(collect_new_file_fragments(
         repository,
@@ -8435,6 +8464,7 @@ fn collect_new_file_fragments_recurse(
         node_from,
         node_to,
         ignore_durably_stored,
+        tracker,
     ))
 }
 
@@ -8477,6 +8507,7 @@ async fn collect_new_node_metadata_fragments(
     block_address_to: Address,
     block_index: usize,
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let metadata_block_from = if let Some(address) = block_address_from {
         NodeFileMetadataBlockData::read_box_from_immutable_compat(repository.clone(), address, true)
@@ -8523,10 +8554,15 @@ async fn collect_new_node_metadata_fragments(
         collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
     }
 
-    let mut addresses =
-        collect_new_addresses(repository.clone(), &metadata_blobs, ignore_durably_stored).await?;
+    let mut addresses = collect_new_addresses(
+        repository.clone(),
+        &metadata_blobs,
+        ignore_durably_stored,
+        tracker.clone(),
+    )
+    .await?;
     let mut more_addresses =
-        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored).await?;
+        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored, tracker).await?;
     addresses.append(&mut more_addresses);
 
     addresses.sort_unstable();
@@ -8543,6 +8579,7 @@ async fn collect_new_revision_metadata_fragments(
     repository: Arc<RepositoryContext>,
     metadata_hash: Hash,
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     if metadata_hash.is_zero() {
         return Ok(vec![]);
@@ -8556,7 +8593,7 @@ async fn collect_new_revision_metadata_fragments(
     collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
 
     let mut addresses =
-        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored).await?;
+        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored, tracker).await?;
 
     addresses.sort_unstable();
     addresses.dedup();
@@ -8568,6 +8605,7 @@ async fn collect_new_addresses(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, StateError> {
     let mut new_addresses = Vec::with_capacity(addresses.len());
 
@@ -8580,21 +8618,28 @@ async fn collect_new_addresses(
 
         let address = *address;
         let repository = repository.clone();
+        let tracker = tracker.clone();
         lore_spawn!(task, {
             async move {
-                if let Ok(query) = repository
-                    .immutable_store()
-                    .get_metadata(repository.id, address)
-                    .await
-                {
+                let query = {
+                    let _request = tracker.track();
+                    repository
+                        .immutable_store()
+                        .get_metadata(repository.id, address)
+                        .await
+                };
+                if let Ok(query) = query {
                     let mut addresses = vec![];
                     if query.fragment.flags & FragmentFlags::PayloadFragmented != 0
-                        && let Ok((_fragment, buffer)) = immutable::load_raw(
-                            repository.clone(),
-                            address,
-                            immutable::read_options_from_repository(&repository),
-                        )
-                        .await
+                        && let Ok((_fragment, buffer)) = {
+                            let _request = tracker.track();
+                            immutable::load_raw(
+                                repository.clone(),
+                                address,
+                                immutable::read_options_from_repository(&repository),
+                            )
+                            .await
+                        }
                     {
                         let buffer = buffer.to_aligned::<FragmentReference>();
                         let mut subaddress =
@@ -8609,6 +8654,7 @@ async fn collect_new_addresses(
                             repository.clone(),
                             subaddress.as_slice(),
                             ignore_durably_stored,
+                            tracker.clone(),
                         )
                         .await
                         {
@@ -8656,11 +8702,13 @@ fn collect_new_addresses_recurse(
     repository: Arc<RepositoryContext>,
     addresses: &[Address],
     ignore_durably_stored: bool,
+    tracker: Arc<StoreRequestTracker>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + '_>> {
     Box::pin(collect_new_addresses(
         repository,
         addresses,
         ignore_durably_stored,
+        tracker,
     ))
 }
 

@@ -46,6 +46,7 @@ use crate::repository::RepositoryWriteToken;
 use crate::state;
 use crate::state::State;
 use crate::store::StoreMatch;
+use crate::util::request_tracker::StoreRequestTracker;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch push starts.
@@ -1884,6 +1885,7 @@ async fn upload_revision_fragments(
         state_parent,
         state.clone(),
         true, /* Ignore already durably stored fragments */
+        Arc::new(StoreRequestTracker::default()),
     )
     .await
     .forward::<PushError>("collecting new fragments")?;

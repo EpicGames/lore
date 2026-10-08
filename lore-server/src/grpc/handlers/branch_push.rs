@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use lore_base::error::AddressNotFound;
 use lore_base::lore_drain_tasks;
@@ -25,6 +26,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
@@ -33,6 +35,7 @@ use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::address_not_found_status;
+use opentelemetry::metrics::Histogram;
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
 use tonic::Request;
@@ -59,6 +62,89 @@ use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
+
+struct BranchPushInstrumentProvider;
+
+impl InstrumentProvider for BranchPushInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "lore.branch_push"
+    }
+}
+
+static PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider
+        .length_histogram("peak_fragment_lookups_in_flight", peak_boundaries())
+});
+
+static FRAGMENT_LOOKUPS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram("fragment_lookups", count_boundaries())
+});
+
+static CONCURRENT_QUERY_BATCHES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram("concurrent_query_batches", peak_boundaries())
+});
+
+static COLLECTED_ADDRESSES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram("collected_addresses", count_boundaries())
+});
+
+fn peak_boundaries() -> Vec<f64> {
+    vec![
+        1., 10., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 25_000., 50_000.,
+        100_000., 250_000.,
+    ]
+}
+
+fn count_boundaries() -> Vec<f64> {
+    vec![
+        10., 100., 1_000., 10_000., 50_000., 100_000., 500_000., 1_000_000., 5_000_000.,
+    ]
+}
+
+/// The store requests one push makes to verify its fragments, recorded once when dropped, so a
+/// push that fails or is cancelled part-way still reports what it made.
+///
+/// `lookups` counts the per-address fragment lookups the collection spawns, across every
+/// verification the push runs. The address and batch counts are those of its latest
+/// verification, since a push verifies again only for the same revision.
+#[derive(Default)]
+struct PushStoreRequests {
+    lookups: Arc<StoreRequestTracker>,
+    collected_addresses: Option<u64>,
+    concurrent_query_batches: Option<u64>,
+    /// Whether the push returned, with success or an error, rather than being dropped part-way
+    /// as a cancelled request is.
+    finished: bool,
+}
+
+impl Drop for PushStoreRequests {
+    fn drop(&mut self) {
+        let num_lookups = self.lookups.requests();
+        // A push that never walks its fragments, such as one rejected as not a fast-forward,
+        // would only skew the distributions.
+        if num_lookups == 0 {
+            return;
+        }
+
+        let peak_lookups_in_flight = self.lookups.peak_in_flight();
+        PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT.record(peak_lookups_in_flight, &[]);
+        FRAGMENT_LOOKUPS.record(num_lookups, &[]);
+        if let Some(collected_addresses) = self.collected_addresses {
+            COLLECTED_ADDRESSES.record(collected_addresses, &[]);
+        }
+        if let Some(concurrent_query_batches) = self.concurrent_query_batches {
+            CONCURRENT_QUERY_BATCHES.record(concurrent_query_batches, &[]);
+        }
+        debug!(
+            peak_lookups_in_flight,
+            num_lookups,
+            num_collected_addresses = self.collected_addresses,
+            num_concurrent_query_batches = self.concurrent_query_batches,
+            finished = self.finished,
+            "Branch push store requests"
+        );
+    }
+}
 
 #[lore_macro::test_pub]
 pub(crate) fn extract_client_ip<T>(request: &Request<T>) -> Option<IpAddr> {
@@ -330,7 +416,7 @@ pub async fn push(
         }
     }
 
-    let mut current_head = load_latest(repository.clone(), branch)
+    let current_head = load_latest(repository.clone(), branch)
         .await
         .filter_slow_down()?
         .unwrap_or_default();
@@ -359,6 +445,39 @@ pub async fn push(
         });
     }
 
+    let mut store_requests = PushStoreRequests::default();
+    let result = store_new_head(
+        repository,
+        branch,
+        latest,
+        state,
+        current_head,
+        force,
+        fast_forward_merge,
+        history_step_size,
+        acceleration,
+        &mut store_requests,
+    )
+    .await;
+    store_requests.finished = true;
+    result
+}
+
+/// Verifies the fragments `state` introduces and stores it as the latest revision of `branch`,
+/// retrying while the head moves underneath it.
+#[allow(clippy::too_many_arguments)]
+async fn store_new_head(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    state: Arc<State>,
+    mut current_head: Hash,
+    force: bool,
+    fast_forward_merge: bool,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    store_requests: &mut PushStoreRequests,
+) -> Result<PushResult, Status> {
     let mut new_head = latest;
     loop {
         // Verify the current latest revision is parent of the incoming revision unless the push is forced
@@ -387,6 +506,7 @@ pub async fn push(
                 current_head,
                 history_step_size,
                 acceleration,
+                store_requests,
             )
             .await;
         }
@@ -406,6 +526,7 @@ pub async fn push(
             state_parent.clone(),
             state_other.clone(),
             state.clone(),
+            store_requests,
         )
         .await?;
 
@@ -486,6 +607,7 @@ async fn try_fast_forward_merge(
     mut current_head: Hash,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    store_requests: &mut PushStoreRequests,
 ) -> Result<PushResult, Status> {
     let incoming_revision = incoming_state.revision();
     let original_base = incoming_state.parent_self();
@@ -514,6 +636,7 @@ async fn try_fast_forward_merge(
         base_state,
         other_parent_state,
         incoming_state.clone(),
+        store_requests,
     )
     .await?;
 
@@ -751,6 +874,7 @@ async fn collect_new_addresses(
     parent_state: Arc<State>,
     other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
+    store_requests: Arc<StoreRequestTracker>,
 ) -> Result<Vec<Address>, Status> {
     // Each walk appends what it found rather than returning it, so the drain below can
     // be the shared one: it joins every task before reporting a failure. A walk must
@@ -760,12 +884,15 @@ async fn collect_new_addresses(
     let collect = async |parent_state: Arc<State>,
                          repository: Arc<RepositoryContext>,
                          to_state: Arc<State>,
-                         collected: Arc<Mutex<Vec<Address>>>| {
+                         collected: Arc<Mutex<Vec<Address>>>,
+                         store_requests: Arc<StoreRequestTracker>| {
+        let parent = parent_state.revision();
         let mut fragments = state::collect_new_fragments(
             repository,
             parent_state,
             to_state,
             true, /* Ignore already durably stored fragments */
+            store_requests,
         )
             .instrument(span!(Level::DEBUG, "collect_new_addresses"))
             .await
@@ -783,6 +910,7 @@ async fn collect_new_addresses(
                     "Failed to collect new fragments for verification: {err}"
                 ))
             })?;
+        debug!(%parent, num_addresses = fragments.len(), "Collected new fragments against parent");
 
         collected.lock().append(&mut fragments);
         Ok(())
@@ -795,7 +923,8 @@ async fn collect_new_addresses(
             parent_state,
             repository.clone(),
             state.clone(),
-            collected.clone()
+            collected.clone(),
+            store_requests.clone(),
         )
         .in_current_span()
     );
@@ -805,7 +934,14 @@ async fn collect_new_addresses(
             .push(Address::zero_context_hash(state.parent_other()));
         lore_spawn!(
             collect_tasks,
-            collect(other_parent_state, repository, state, collected.clone()).in_current_span()
+            collect(
+                other_parent_state,
+                repository,
+                state,
+                collected.clone(),
+                store_requests
+            )
+            .in_current_span()
         );
     }
     lore_drain_tasks!(
@@ -819,6 +955,11 @@ async fn collect_new_addresses(
     // better than `sort_unstable()`
     new_fragments.sort();
     new_fragments.dedup();
+
+    debug!(
+        num_addresses = new_fragments.len(),
+        "Collected new addresses for verification"
+    );
 
     Ok(new_fragments)
 }
@@ -840,9 +981,18 @@ async fn verify_fragments(
     parent_state: Arc<State>,
     other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
+    store_requests: &mut PushStoreRequests,
 ) -> Result<(), Status> {
-    let mut new_fragments =
-        collect_new_addresses(repository.clone(), parent_state, other_parent_state, state).await?;
+    let mut new_fragments = collect_new_addresses(
+        repository.clone(),
+        parent_state,
+        other_parent_state,
+        state,
+        store_requests.lookups.clone(),
+    )
+    .await?;
+    store_requests.collected_addresses = Some(new_fragments.len() as u64);
+    store_requests.concurrent_query_batches = None;
 
     let mut retry = lore_revision::util::time::retry(
         push::RETRY_START_DURATION,
@@ -858,10 +1008,11 @@ async fn verify_fragments(
 
     let mut tasks = JoinSet::new();
     while !new_fragments.is_empty() || !tasks.is_empty() {
+        let num_addresses = new_fragments.len();
         let batch_span = span!(
             Level::DEBUG,
             "exist_batch",
-            items = new_fragments.len(),
+            items = num_addresses,
             batch_size = max_batch_size
         );
 
@@ -885,6 +1036,15 @@ async fn verify_fragments(
                 );
             }
         });
+        // A wave after a slow-down resends only the throttled batches, so the first wave is
+        // the one that holds the peak.
+        store_requests
+            .concurrent_query_batches
+            .get_or_insert(tasks.len() as u64);
+        debug!(
+            num_batches = tasks.len(),
+            num_addresses, "Sent existence query batches"
+        );
 
         let mut num_slow_downs = 0;
         while let Some(result) = tasks.join_next().await {

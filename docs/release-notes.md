@@ -9,6 +9,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore-server`: `BranchPush` records how hard its fragment verification drives the immutable store, once per push and including pushes that fail or are cancelled part-way. Histograms under `lore.branch_push` give the per-address fragment lookups the collection spawns (`fragment_lookups` and `peak_fragment_lookups_in_flight`), the addresses it collects (`collected_addresses`), and the existence query batches sent at once (`concurrent_query_batches`). Debug logs report the same counts per push, with whether the push returned or was dropped, and per collection step
+
 ### Fixes & Improvements
 
 - `lore-server`: the `UrcAuthApi` and ReBAC clients dial `[environment.endpoint] auth_url` over TLS when it's configured to use the `ucs-auth://` scheme. The URL was previously handed to tonic unrewritten, which applies TLS only to a literal `https` scheme. This change makes the client->server and server->server grpc calls behave in the same manner.

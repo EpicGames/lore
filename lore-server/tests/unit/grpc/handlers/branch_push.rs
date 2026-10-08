@@ -19,6 +19,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push::*;
 use lore_server::grpc::server::RevisionListAcceleration;
@@ -877,6 +878,7 @@ mod collect_new_addresses {
                 parent.clone(),
                 merge.clone(),
                 true,
+                Arc::new(StoreRequestTracker::default()),
             )
             .await
             .expect("collect against the first parent");
@@ -885,6 +887,7 @@ mod collect_new_addresses {
                 other.clone(),
                 merge.clone(),
                 true,
+                Arc::new(StoreRequestTracker::default()),
             )
             .await
             .expect("collect against the second parent");
@@ -899,6 +902,7 @@ mod collect_new_addresses {
                 parent,
                 Some(other.clone()),
                 merge.clone(),
+                Arc::new(StoreRequestTracker::default()),
             )
             .await
             .expect("collect against both parents");
@@ -971,12 +975,24 @@ mod collect_new_addresses {
 
             // The walk against the first parent reads only what is here, so its
             // success is what leaves the failure beside it the only one to report.
-            state::collect_new_fragments(repository.clone(), parent.clone(), merge.clone(), true)
-                .await
-                .expect("the first parent has to be walkable");
+            state::collect_new_fragments(
+                repository.clone(),
+                parent.clone(),
+                merge.clone(),
+                true,
+                Arc::new(StoreRequestTracker::default()),
+            )
+            .await
+            .expect("the first parent has to be walkable");
 
-            let Err(status) =
-                collect_new_addresses(repository.clone(), parent, Some(other), merge).await
+            let Err(status) = collect_new_addresses(
+                repository.clone(),
+                parent,
+                Some(other),
+                merge,
+                Arc::new(StoreRequestTracker::default()),
+            )
+            .await
             else {
                 panic!("a parent whose tree cannot be read cannot be collected against");
             };

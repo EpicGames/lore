@@ -21,6 +21,7 @@ mod tests {
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
+    use lore_revision::util::request_tracker::StoreRequestTracker;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
     use zerocopy::IntoBytes;
@@ -367,6 +368,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -400,6 +402,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -425,6 +428,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -445,6 +449,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -506,6 +511,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -535,6 +541,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -646,6 +653,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -662,6 +670,74 @@ mod tests {
                         "Content of file-{index:03} was collected, which the old revision already names"
                     );
                 }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Every content fragment a collection looks up in the store is counted by the tracker it
+    /// is given, so each added file adds at least one request.
+    #[tokio::test]
+    async fn collect_new_fragments_counts_its_store_reads() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+
+                let state_from = State::new();
+                let signature_from = state_from
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+
+                let state_to = State::deserialize(repository.clone(), signature_from)
+                    .await
+                    .expect("Failed to deserialize state");
+                const ADDED: u64 = 8;
+                for index in 0..ADDED {
+                    let name = format!("added-{index}");
+                    state_to
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            file_node(&name, file_content(4000 + index)),
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a file");
+                }
+                let signature_to = state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let tracker = Arc::new(StoreRequestTracker::default());
+                collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                    tracker.clone(),
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    tracker.requests() >= ADDED,
+                    "{} requests counted for {ADDED} added files",
+                    tracker.requests()
+                );
+                assert!(tracker.peak_in_flight() >= 1);
             }))
             .await
             .expect("Test task failed");
