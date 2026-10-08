@@ -4,12 +4,16 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::io::Write;
 use std::pin::pin;
+use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_revision::service_state::ServiceStateImpl;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use crate::interface::LoreEvent;
+use crate::interface::LoreLogLevel;
 use crate::remote::message::MessageToClient;
 use crate::remote::message::MessageToServer;
 use crate::remote::message::SerializationType;
@@ -48,18 +52,40 @@ impl ConnectionErrorWithId {
 
 /// Serves the command a client sends over `connection` on a task of its own, relaying the
 /// command's events and then its status back over the same connection.
-pub fn serve_connection(id: ConnectionId, connection: UdsStream) {
-    lore_base::lore_spawn!(IpcConnection::new(id, connection).handle_connection());
+pub fn serve_connection(
+    accept_state: Arc<ServiceStateImpl>,
+    id: ConnectionId,
+    connection: UdsStream,
+) {
+    let counted = accept_state.increment_connections();
+    let connection_state = Arc::clone(&accept_state);
+    lore_spawn!(async move {
+        // Moved into the task so the count falls when the task
+        // ends, including on a cancellation that skips the body.
+        let _counted = counted;
+        let connection = IpcConnection::new(id, connection, connection_state.clone());
+        if let Err(err) = connection.handle_connection().await {
+            connection_state.push_log(
+                LoreLogLevel::Error,
+                format!("Failed to handle connection: {err}"),
+            );
+        }
+    });
 }
 
 struct IpcConnection {
     id: ConnectionId,
     connection: UdsStream,
+    service_state: Arc<ServiceStateImpl>,
 }
 
 impl IpcConnection {
-    fn new(id: ConnectionId, connection: UdsStream) -> Self {
-        Self { id, connection }
+    fn new(id: ConnectionId, connection: UdsStream, service_state: Arc<ServiceStateImpl>) -> Self {
+        Self {
+            id,
+            connection,
+            service_state,
+        }
     }
 
     async fn send_message(
@@ -78,17 +104,7 @@ impl IpcConnection {
         Ok(())
     }
 
-    async fn handle_connection(self) {
-        let id = self.id;
-        if let Err(error) = self.handle_connection_impl().await {
-            eprintln!(
-                "Error in connection: {}",
-                ConnectionErrorWithId::new(error, id)
-            );
-        }
-    }
-
-    async fn handle_connection_impl(self) -> Result<(), ConnectionError> {
+    async fn handle_connection(self) -> Result<(), ConnectionError> {
         let mut connection = self.connection.try_clone().internal("cloning connection")?;
         // Parks a core blocking thread until the peer sends or hangs up, so live
         // connections consume core's blocking pool one thread apiece.
@@ -108,8 +124,10 @@ impl IpcConnection {
         let (to_client_sender, mut to_client_receiver) =
             mpsc::unbounded_channel::<(MessageToClient, SerializationType)>();
 
+        let invoke_state = Arc::clone(&self.service_state);
         lore_base::lore_spawn!(async move {
             let sender = to_client_sender.clone();
+            let callback_state = Arc::clone(&invoke_state);
 
             // Note: this callback is intentionally NOT wrapped with .with_defaults().
             // It is the server-side event forwarder that must pass every LoreEvent
@@ -121,7 +139,10 @@ impl IpcConnection {
                     MessageToClient::Event(event.clone()),
                     header.serialization_type,
                 )) {
-                    eprintln!("Failed to send Event message to connection task: {error}");
+                    callback_state.push_log(
+                        LoreLogLevel::Error,
+                        format!("Failed to send Event message to connection task: {error}"),
+                    );
                 }
             }))));
             let cli_result = handler.await;
@@ -130,16 +151,22 @@ impl IpcConnection {
                 MessageToClient::ApiResult(cli_result),
                 header.serialization_type,
             )) {
-                eprintln!("Failed to send ApiResult message to connection task: {error}");
+                invoke_state.push_log(
+                    LoreLogLevel::Error,
+                    format!("Failed to send ApiResult message to connection task: {error}"),
+                );
             }
         });
 
         while let Some((message, serialization_type)) = to_client_receiver.recv().await {
             let stream = self.connection.try_clone().internal("cloning connection")?;
             if let Err(error) = Self::send_message(stream, message, serialization_type).await {
-                eprintln!(
-                    "Failed to send message to client: {}",
-                    ConnectionErrorWithId::new(error, self.id)
+                self.service_state.push_log(
+                    LoreLogLevel::Error,
+                    format!(
+                        "Failed to send message to client: {}",
+                        ConnectionErrorWithId::new(error, self.id)
+                    ),
                 );
             }
         }

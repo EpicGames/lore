@@ -13,6 +13,7 @@ Run as a script, this module is the driver a test invokes as a subprocess:
     python lore_ffi.py branch-latest-list <library-path> <repository-path> <keep-store-alive-seconds>
     python lore_ffi.py service-start <library-path>
     python lore_ffi.py service-stop <library-path>
+    python lore_ffi.py service-status <library-path>
     python lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
     python lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
     python lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>
@@ -148,6 +149,12 @@ class LoreServiceStopArgs(Structure):
     _fields_ = [("_unused", c_int)]
 
 
+class LoreServiceStatusArgs(Structure):
+    """`lore_service_status_args_t`. Carries no arguments of its own."""
+
+    _fields_ = [("_unused", c_int)]
+
+
 class LoreRepositoryDeleteArgs(Structure):
     """`lore_repository_delete_args_t`."""
 
@@ -190,6 +197,7 @@ MIRRORED_STRUCTS = [
     ("lore_branch_latest_list_args_t", LoreBranchLatestListArgs),
     ("lore_service_start_args_t", LoreServiceStartArgs),
     ("lore_service_stop_args_t", LoreServiceStopArgs),
+    ("lore_service_status_args_t", LoreServiceStatusArgs),
     ("lore_repository_delete_args_t", LoreRepositoryDeleteArgs),
     ("lore_revision_sync_args_t", LoreRevisionSyncArgs),
     ("lore_revision_bisect_args_t", LoreRevisionBisectArgs),
@@ -255,6 +263,12 @@ class LoreLibrary:
             POINTER(LoreServiceStopArgs),
             LoreEventCallbackConfig,
         ]
+        self._lib.lore_service_status.restype = c_int32
+        self._lib.lore_service_status.argtypes = [
+            POINTER(LoreGlobalArgs),
+            POINTER(LoreServiceStatusArgs),
+            LoreEventCallbackConfig,
+        ]
         self._lib.lore_repository_delete.restype = c_int32
         self._lib.lore_repository_delete.argtypes = [
             POINTER(LoreGlobalArgs),
@@ -296,7 +310,7 @@ class LoreLibrary:
         )
 
     def branch_latest_list(
-        self, repository_path: str, keep_store_alive_seconds: int
+            self, repository_path: str, keep_store_alive_seconds: int
     ) -> int:
         """Call `lore_branch_latest_list` for the current branch, returning its
         FFI code. The stores stay open for `keep_store_alive_seconds` after the
@@ -338,6 +352,17 @@ class LoreLibrary:
             LoreEventCallbackConfig(0, None),
         )
 
+    def service_status(self) -> int:
+        """Call `lore_service_status`, returning its FFI code.
+        `0` whether or not one is running: nothing listening is an answer to
+        what was asked rather than a failure to reach anything.
+        """
+        return self._lib.lore_service_status(
+            ctypes.byref(LoreGlobalArgs()),
+            ctypes.byref(LoreServiceStatusArgs()),
+            LoreEventCallbackConfig(0, None),
+        )
+
     def repository_delete(self, repository_path: str, repository_url: str) -> int:
         """Call `lore_repository_delete` for `repository_url`, returning its FFI
         code."""
@@ -359,7 +384,6 @@ class LoreLibrary:
     def revision_sync(self, repository_path: str, view: str) -> int:
         """Call `lore_revision_sync` with `view` and nothing else set, returning
         its FFI code.
-
         The entry point an SDK consumer reaches a view change through. `view`
         empty is the call every consumer that does not want one makes, and has
         to leave the instance's own view standing.
@@ -381,7 +405,7 @@ class LoreLibrary:
         )
 
     def revision_bisect(
-        self, repository_path: str, start: str, end: str, keep_store_alive_seconds: int
+            self, repository_path: str, start: str, end: str, keep_store_alive_seconds: int
     ) -> int:
         """Call `lore_revision_bisect` over the range from `start` to `end`,
         returning its FFI code. The stores stay open for
@@ -413,6 +437,8 @@ USAGE = """usage:
   lore_ffi.py branch-latest-list <library-path> <repository-path> <keep-store-alive-seconds>
   lore_ffi.py service-start <library-path>
   lore_ffi.py service-stop <library-path>
+  lore_ffi.py service-status <library-path>
+  lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
   lore_ffi.py repository-delete <library-path> <repository-path> <repository-url>
   lore_ffi.py revision-sync <library-path> <repository-path> <view-file>
   lore_ffi.py revision-bisect <library-path> <repository-path> <start> <end> <keep-store-alive-seconds>"""
@@ -430,6 +456,8 @@ def main(argv: list[str]) -> int:
             return LoreLibrary(library_path).service_start()
         case ["service-stop", library_path]:
             return LoreLibrary(library_path).service_stop()
+        case ["service-status", library_path]:
+            return LoreLibrary(library_path).service_status()
         case ["repository-delete", library_path, repository_path, repository_url]:
             return LoreLibrary(library_path).repository_delete(
                 repository_path, repository_url

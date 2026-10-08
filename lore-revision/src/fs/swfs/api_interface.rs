@@ -103,6 +103,7 @@ mod swfs_impl {
     use std::ffi::c_void;
     use std::ptr::slice_from_raw_parts_mut;
 
+    use lore_base::log::LoreLogLevel;
     use lore_error_set::ForwardStrict;
     use lore_error_set::WrapInternal;
     use tokio::task::yield_now;
@@ -127,7 +128,7 @@ mod swfs_impl {
     use crate::fs::swfs::mount_resources::MountResources;
     use crate::fs::swfs::mount_resources::SwfsWorkError;
     use crate::fs::swfs::paths::SwfsPath;
-    use crate::lore_error;
+    use crate::service_state::ServiceStateImpl;
 
     impl SwfsInterface {
         pub fn resources(&self) -> &MountResources {
@@ -311,12 +312,17 @@ mod swfs_impl {
         ) -> bool {
             let source_filename = unsafe { CStr::from_ptr(source_filename) };
             let error_message = unsafe { CStr::from_ptr(error_message) };
-            lore_error!(
-                "SWFS Error ({}): {}::{}: {}",
-                error_code,
-                source_filename.to_string_lossy(),
-                source_line_number,
-                error_message.to_string_lossy()
+            // SWFS calls this from C with nothing of ours to carry the state,
+            // so this is one of the paths that reaches for the global.
+            ServiceStateImpl::global().push_log(
+                LoreLogLevel::Error,
+                format!(
+                    "SWFS Error ({}): {}::{}: {}",
+                    error_code,
+                    source_filename.to_string_lossy(),
+                    source_line_number,
+                    error_message.to_string_lossy()
+                ),
             );
             false
         }
@@ -342,7 +348,8 @@ mod swfs_impl {
             error: impl lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
         ) {
             let error_detail = LoreErrorDetail::from_error(&error);
-            lore_error!("{}", error_detail.message_with_trace());
+            ServiceStateImpl::global()
+                .push_log(LoreLogLevel::Error, error_detail.message_with_trace());
         }
     }
 

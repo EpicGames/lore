@@ -3266,6 +3266,29 @@ typedef struct lore_branch_push_stats_event_data_t {
   uint64_t put;
 } lore_branch_push_stats_event_data_t;
 
+// Data for the service status event, reporting whether the service is running
+// and its current metadata.
+typedef struct lore_service_status_event_data_t {
+  // Whether the service is running: 1 for running, 0 for not running.
+  uint8_t running;
+  // Path to the service binary.
+  struct lore_string_t binary_path;
+  // Milliseconds since the service started.
+  uint64_t uptime_ms;
+  // Number of active client connections.
+  uint32_t connection_count;
+  // Number of SWFS mounts currently active.
+  uint32_t swfs_mount_count;
+} lore_service_status_event_data_t;
+
+// Data for a service log message captured outside command execution.
+typedef struct lore_service_message_event_data_t {
+  // The severity level of the log message.
+  enum lore_log_level_t level;
+  // The log message text.
+  struct lore_string_t message;
+} lore_service_message_event_data_t;
+
 // Event data for one wait in an interactive login: the user has not
 // approved it yet, and the client is about to wait `interval_secs` before
 // asking again. Emitted once per poll, so a consumer can show that the
@@ -3749,6 +3772,10 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_COMMIT_STATS,
   // What a push has cost so far, or in total once it has finished.
   LORE_EVENT_BRANCH_PUSH_STATS,
+  // The status of the background service.
+  LORE_EVENT_SERVICE_STATUS,
+  // A log message captured by the service outside command execution.
+  LORE_EVENT_SERVICE_MESSAGE,
   // An interactive login is still waiting for the user's approval.
   LORE_EVENT_AUTH_PENDING,
 };
@@ -3990,6 +4017,8 @@ typedef struct lore_event_t {
     struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
     struct lore_revision_commit_stats_event_data_t revision_commit_stats;
     struct lore_branch_push_stats_event_data_t branch_push_stats;
+    struct lore_service_status_event_data_t service_status;
+    struct lore_service_message_event_data_t service_message;
     struct lore_auth_pending_event_data_t auth_pending;
   };
 } lore_event_t;
@@ -5752,6 +5781,11 @@ typedef struct lore_service_start_args_t {
 typedef struct lore_service_stop_args_t {
   int _unused;
 } lore_service_stop_args_t;
+
+// Arguments for querying the Lore service status (no parameters).
+typedef struct lore_service_status_args_t {
+  int _unused;
+} lore_service_status_args_t;
 
 // Arguments for naming the executable the Lore service runs from.
 typedef struct lore_service_set_executable_args_t {
@@ -12011,6 +12045,67 @@ int32_t lore_service_stop(const struct lore_global_args_t *globals,
 void lore_service_stop_async(const struct lore_global_args_t *globals,
                              const struct lore_service_stop_args_t *args,
                              struct lore_event_callback_config_t callback);
+
+// Report whether the Lore background service is running, and its metadata.
+//
+// Answers from inside the service when called there, and otherwise reaches the
+// one that is listening. Nothing listening is an answer rather than a failure:
+// the call returns `0` with `running` set to `0`, so a caller branches on the
+// event rather than on a connection error. Also hands back the log messages the
+// service buffered while no command was running, emptying the buffer as it
+// reads it.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Operation-Specific Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+int32_t lore_service_status(const struct lore_global_args_t *globals,
+                            const struct lore_service_status_args_t *args,
+                            struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_service_status`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+//
+// ## Operation-Specific Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_SERVICE_STATUS` | `lore_service_status_event_data_t` | Service running state and metadata |
+// | `LORE_EVENT_SERVICE_MESSAGE` | `lore_service_message_event_data_t` | A log message the service buffered outside command execution |
+void lore_service_status_async(const struct lore_global_args_t *globals,
+                               const struct lore_service_status_args_t *args,
+                               struct lore_event_callback_config_t callback);
 
 // Name the executable the Lore background service runs from, for this machine.
 //

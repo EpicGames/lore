@@ -75,7 +75,29 @@ lore service start
 Lore service is running
 ```
 
-## Step 5 — Override the setting for one command
+## Step 5 — See what the service is doing
+
+`lore service status` reports on the service without changing it. It names the build that is serving the machine, how long that service has been up, how many clients are connected to it, and how many SWFS mounts it holds. With nothing running it says so and still succeeds, so a script can branch on the output rather than on a connection failing.
+
+```bash
+lore service status
+```
+
+```text
+Lore service is running
+  Executable: /usr/local/bin/lore
+  Uptime: 1h 4m 12s
+  Connections: 1
+  SWFS mounts: 0
+```
+
+The command counts its own connection, so a service nothing else is talking to reports one.
+
+Trouble the service ran into while no command was running is buffered and printed under the status that reports it: failures while it was initializing, failures in the loop that accepts connections, and errors raised by SWFS callbacks. A service that has hit none of those reports none, so a status with no messages under it is the healthy reading rather than a missing one.
+
+The buffer holds the most recent messages and is emptied as it is read, so each call shows what has arrived since the last one, and a call that finds messages were dropped says how many. These messages are the answer to the command that asked for them rather than diagnostics about it, so they are printed whatever `--log-level` is set to.
+
+## Step 6 — Override the setting for one command
 
 `LORE_USE_SERVICE` decides one command without changing the stored setting. It reads `0`, `false`, `no` and `off` as off.
 
@@ -164,6 +186,10 @@ starting /opt/lore/bin/lore failed: No such file or directory (os error 2)
 ```
 
 The command never ran, because no service could be reached and none could be started from the executable that is named. Check that the path in `[service] executable` still exists — this is what you see after a build directory is cleaned or a version is uninstalled. Exit code `32` means the service was unreachable, distinct from the command itself having run and failed, so a script can retry it after starting a service.
+
+### A command reached a service, but not the one you expected
+
+A build directory that is still on the machine keeps serving commands after you have moved on to another one, because the executable is resolved from the stored setting rather than from the client you ran. `lore service status` names the build that is actually serving the socket, so compare its `Executable` against the client you meant to use and re-run `lore service set-executable <path>` followed by `lore service stop` if they differ. The next command starts a service from the newly named build.
 
 ### A test run or a second checkout keeps stopping your service
 

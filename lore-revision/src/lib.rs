@@ -56,6 +56,7 @@ pub mod relay;
 pub mod repository;
 pub mod revision;
 pub mod runtime;
+pub mod service_state;
 pub mod stage;
 pub mod state;
 pub mod store;

@@ -51,9 +51,12 @@ LORE_SERVICE_LISTENING_MESSAGE = "Lore service listening"
 LORE_NO_SERVICE_MESSAGE = "No Lore service is running"
 # `lore service start` prints this once a service is reachable.
 LORE_SERVICE_RUNNING_MESSAGE = "Lore service is running"
-# Printed by the `service` setters when relaying is on but no executable is set.
-# Commands can use a running service, but cannot start one without an executable.
+# Printed by the `service` setters when the two settings relaying needs are left
+# in a state that will not relay.
 LORE_NO_SERVICE_EXECUTABLE_MESSAGE = "No service executable is set"
+# Headings `lore service status` prints for the metadata it reports. Only the
+# labels, because the values are the machine's rather than the suite's.
+LORE_SERVICE_STATUS_LABELS = ("Executable:", "Uptime:", "Connections:", "SWFS mounts:")
 
 
 def service_supported():

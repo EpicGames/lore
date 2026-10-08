@@ -1793,10 +1793,11 @@ class Lore:
         )
 
     def service_capi(self, library_path: str, command: str) -> int:
-        """Start or stop the service through the public C API, returning the FFI
-        code. `command` is `service-start` or `service-stop`.
+        """Start, stop or query the service through the public C API, returning
+        the FFI code. `command` is `service-start`, `service-stop` or
+        `service-status`.
 
-        The CLI's `service start`/`stop` wrap these, so a test driving the CLI
+        The CLI's `service start`/`stop`/`status` wrap these, so a test driving the CLI
         covers the wrapper rather than the entry point an SDK consumer calls.
         Running out of process matters twice over here: the library records a
         service running in its own process, which no later test could undo.
@@ -2531,6 +2532,9 @@ class Lore:
 
     def service_stop(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["service", "stop"], **kwargs)
+
+    def service_status(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["service", "status"], **kwargs)
 
     def notification_subscribe(
         self, timeout: int | None = None, **kwargs: Unpack[GlobalOptions]

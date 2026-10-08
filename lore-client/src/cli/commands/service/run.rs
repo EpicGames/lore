@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use lore::error_set::prelude::*;
 use lore::interface::LoreGlobalArgs;
+use lore::interface::LoreLogLevel;
 use lore::lore_spawn_blocking;
 use lore::remote::connection::ConnectionId;
 use lore::remote::connection::serve_connection;
@@ -19,8 +20,8 @@ use lore::remote::service_process::service_executable;
 use lore::remote::service_socket_name;
 use lore::service::initialization::initialize_service;
 use lore::service::service_main::ServiceMainError;
+use lore::service::state::ServiceStateImpl;
 
-use crate::eprintln;
 use crate::println;
 use crate::util::TerminationSignals;
 
@@ -62,10 +63,14 @@ fn detached_working_directory() -> std::path::PathBuf {
 pub async fn service_main(
     globals: LoreGlobalArgs,
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    service_state: Arc<ServiceStateImpl>,
 ) -> Result<(), ServiceMainError> {
     if !uds_supported() {
         return Err(ServiceMainError::internal("IPC not supported on this OS"));
     }
+
+    // Initialize uptime tracking early so all errors can be captured.
+    service_state.initialize();
 
     // Ahead of the socket, because a signal ends the process outright until a
     // handler is in place: registering after binding leaves a window in which a
@@ -75,20 +80,27 @@ pub async fn service_main(
     let termination = match TerminationSignals::register() {
         Ok(signals) => Some(signals),
         Err(error) => {
-            eprintln!("Failed to listen for termination signals: {error}");
+            service_state.push_log(
+                LoreLogLevel::Error,
+                format!("Failed to listen for termination signals: {error}"),
+            );
             None
         }
     };
 
     let detached = detached_working_directory();
     if let Err(error) = std::env::set_current_dir(&detached) {
-        eprintln!(
-            "Failed to set working directory to {}: {error}",
-            detached.display()
+        service_state.push_log(
+            LoreLogLevel::Error,
+            format!(
+                "Failed to set working directory to {}: {error}",
+                detached.display()
+            ),
         );
     }
 
-    initialize_service(globals)
+    // Brings up the mount manager and routes its events into the service state.
+    initialize_service(globals, Arc::clone(&service_state))
         .await
         .forward::<ServiceMainError>("Failed initializing service")?;
 
@@ -112,6 +124,7 @@ pub async fn service_main(
 
     // Parks a blocking thread for the service's lifetime; pinned to core because
     // it would occupy net's single blocking thread outright.
+    let accept_state = Arc::clone(&service_state);
     let accept_task = lore_spawn_blocking!(move || {
         let mut connection_id = 0;
         loop {
@@ -122,13 +135,18 @@ pub async fn service_main(
                     }
                     let new_connection_id = connection_id;
                     connection_id += 1;
-                    serve_connection(ConnectionId(new_connection_id), stream);
+                    serve_connection(
+                        accept_state.clone(),
+                        ConnectionId(new_connection_id),
+                        stream,
+                    );
                 }
                 Err(err) => {
                     if accept_shutting_down.load(Ordering::SeqCst) {
                         break;
                     }
-                    eprintln!("Failed when accepting: {err}");
+                    accept_state
+                        .push_log(LoreLogLevel::Error, format!("Failed when accepting: {err}"));
                 }
             }
         }
@@ -139,13 +157,19 @@ pub async fn service_main(
     println!("Shutting down Lore service");
     shutting_down.store(true, Ordering::SeqCst);
     if let Err(error) = UdsStream::connect(service_socket_name()) {
-        eprintln!("Failed to wake the accept loop: {error}");
+        service_state.push_log(
+            LoreLogLevel::Error,
+            format!("Failed to wake the accept loop: {error}"),
+        );
     }
     if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)
         .await
         .is_err()
     {
-        eprintln!("Timed out waiting for the accept loop to stop");
+        service_state.push_log(
+            LoreLogLevel::Error,
+            "Timed out waiting for the accept loop to stop".to_string(),
+        );
     }
 
     Ok(())

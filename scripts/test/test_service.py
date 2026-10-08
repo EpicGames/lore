@@ -17,6 +17,7 @@ from service_util import (
     LORE_SERVICE_RUNNING_MESSAGE,
     SERVICE_UNAVAILABLE,
     stop_lore_service,
+    LORE_SERVICE_STATUS_LABELS,
 )
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,15 @@ logger = logging.getLogger(__name__)
 # Commands run at once with no service running. Each of them starts one, only
 # one of those can hold the socket, and the rest have to reach the one that does.
 CONCURRENT_COMMAND_COUNT = 5
+
+
+def _same_file_path(left: str, right: str) -> bool:
+    """Whether two paths name the same file, after the differences that do not
+    change which file that is: a symlinked or relative path, and, on Windows,
+    the case and the separator."""
+    return os.path.normcase(os.path.realpath(left)) == os.path.normcase(
+        os.path.realpath(right)
+    )
 
 
 def service_command_environment(repo: Lore) -> dict[str, str]:
@@ -251,6 +261,78 @@ def test_commands_run_at_once_all_reach_one_service(
 
 
 @pytest.mark.smoke
+def test_status_reports_the_running_service_and_its_metadata(
+    new_lore_repo, stops_background_services
+):
+    """`service status` reports the service that is running, along with the
+    metadata an operator asks it for.
+
+    Against a service this test started, so that reporting one is distinct from
+    reporting whatever the machine happened to have running.
+    """
+    repo: Lore = new_lore_repo()
+    repo.run(["service", "start"])
+
+    status = repo.service_status()
+    # Both ways round: "Lore service is running" is a substring of "No Lore
+    # service is running", so the first assertion alone would pass against the
+    # output that says the opposite.
+    assert LORE_SERVICE_RUNNING_MESSAGE in status, (
+        f"status must report the running service: {status}"
+    )
+    assert LORE_NO_SERVICE_MESSAGE not in status, (
+        f"status must not report the service as not running: {status}"
+    )
+    for label in LORE_SERVICE_STATUS_LABELS:
+        assert label in status, f"status must report {label!r}: {status}"
+
+    # The whole path rather than the file name, which every build of the client
+    # shares: this is what makes the report worth reading, because an operator
+    # uses it to tell which build is serving the machine.
+    reported = next(
+        (
+            line.split("Executable:", 1)[1].strip()
+            for line in status.splitlines()
+            if "Executable:" in line
+        ),
+        None,
+    )
+    assert reported is not None, f"status must report an executable: {status}"
+    assert _same_file_path(reported, repo.lore_executable_path), (
+        f"status must name the build under test as the service: reported "
+        f"{reported!r}, expected {repo.lore_executable_path!r}"
+    )
+
+
+@pytest.mark.smoke
+def test_status_reports_no_service_rather_than_failing_to_reach_one(
+    new_lore_repo, stops_background_services, lore_service_runner
+):
+    """With nothing running, `service status` says so and succeeds.
+
+    A connection error would be the wrong answer: the question was whether a
+    service is running, and it was answered.
+    """
+    repo: Lore = new_lore_repo()
+
+    status = repo.service_status()
+    assert LORE_NO_SERVICE_MESSAGE in status, (
+        f"status must report that no service is running: {status}"
+    )
+    # Nothing to report about a service that is not running, so the metadata is
+    # left off rather than printed as zeroes.
+    for label in LORE_SERVICE_STATUS_LABELS:
+        assert label not in status, (
+            f"status must not report {label!r} with no service running: {status}"
+        )
+
+    # Asking did not start one: a query must not change what it reports on.
+    assert LORE_NO_SERVICE_MESSAGE in stop_lore_service(
+        repo.lore_executable_path, lore_service_runner.global_dir_name
+    ), "status must not start a service in order to report on one"
+
+
+@pytest.mark.smoke
 def test_start_reports_a_reachable_service_whether_or_not_it_started_one(
     new_lore_repo, stops_background_services
 ):
@@ -289,6 +371,55 @@ def test_stop_ends_the_service_and_reports_when_there_is_none(
     assert LORE_NO_SERVICE_MESSAGE in with_none_running, (
         f"A stop with no service running must report that: {with_none_running}"
     )
+
+
+@pytest.mark.smoke
+def test_the_api_reports_the_status_when_no_service_is_running(
+    new_lore_repo, lore_library_path, stops_background_services
+):
+    """`lore_service_status` succeeds with nothing running, as the CLI's
+    `service status` does. Asking whether a service is running is answered by
+    there being none, rather than failing to reach one.
+
+    Through the C API rather than the CLI: the CLI wraps this entry point, so
+    driving it covers the wrapper and not what an SDK consumer calls.
+    """
+    repo: Lore = new_lore_repo()
+
+    assert repo.service_capi(lore_library_path, "service-status") == 0, (
+        "a status with no service running must succeed"
+    )
+
+    # Asking did not start one, which is the other half of what a query must
+    # not do. The API's code says the call succeeded, not what it left behind.
+    assert LORE_NO_SERVICE_MESSAGE in stop_lore_service(
+        repo.lore_executable_path, repo.global_dir
+    ), "the API's status must not start a service in order to report on one"
+
+
+@pytest.mark.smoke
+def test_the_api_reports_the_status_of_a_running_service(
+    new_lore_repo, lore_library_path, stops_background_services
+):
+    """The same call against a service that is running reaches it and succeeds.
+
+    Paired with the test above because neither tells you much alone: a status
+    that reported success without reaching anything passes the not-running
+    case, and one that could only answer from inside the service passes
+    nothing.
+    """
+    repo: Lore = new_lore_repo()
+    repo.run(["service", "start"])
+
+    assert repo.service_capi(lore_library_path, "service-status") == 0, (
+        "a status must reach the running service and succeed"
+    )
+
+    # The service is still there afterwards: a query reports on what it finds
+    # rather than disturbing it.
+    assert LORE_NO_SERVICE_MESSAGE not in stop_lore_service(
+        repo.lore_executable_path, repo.global_dir
+    ), "the API's status must leave the running service alone"
 
 
 @pytest.mark.smoke

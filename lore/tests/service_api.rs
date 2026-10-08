@@ -34,6 +34,7 @@ mod tests {
     use lore::service::LoreServiceSetExecutableArgs;
     use lore::service::LoreServiceSetUseAutomaticallyArgs;
     use lore::service::LoreServiceStartArgs;
+    use lore::service::LoreServiceStatusArgs;
     use lore::service::LoreServiceStopArgs;
     use lore::shared_store::LoreSharedStoreListArgs;
     use lore_base::error::ServiceUnavailable;
@@ -161,6 +162,10 @@ mod tests {
 
     async fn start(callback: LoreEventCallback) -> i32 {
         lore::service::start(globals(), LoreServiceStartArgs {}, callback).await
+    }
+
+    async fn status(callback: LoreEventCallback) -> i32 {
+        lore::service::status(globals(), LoreServiceStatusArgs {}, callback).await
     }
 
     /// The code a caller branches on when a call did not run because no service
@@ -571,6 +576,59 @@ mod tests {
         assert!(
             reported.contains("no-such-lore"),
             "the failure must name the executable it could not start: {reported}"
+        );
+    }
+
+    /// A status with no service running succeeds with running=false, rather than
+    /// failing with a connection error. This is the expected behavior when the
+    /// service is not started.
+    #[test]
+    #[serial]
+    fn status_without_service_returns_not_running() {
+        let _settings = machine_settings("service-api-status-none-");
+
+        let status_events: Arc<Mutex<Vec<lore_revision::event::LoreServiceStatusEventData>>> =
+            Arc::default();
+        let recorder = Arc::clone(&status_events);
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::ServiceStatus(data) = event {
+                recorder
+                    .lock()
+                    .expect("the collector lock is not poisoned")
+                    .push(data.clone());
+            }
+        }));
+
+        let exit_code = lore::runtime().block_on(status(callback));
+
+        assert_eq!(
+            exit_code, 0,
+            "status with no service running should succeed"
+        );
+
+        let events = status_events
+            .lock()
+            .expect("the collector lock is not poisoned");
+        assert_eq!(events.len(), 1, "exactly one ServiceStatus event expected");
+        assert_eq!(
+            events[0].running, 0,
+            "running should be 0 when service is not running"
+        );
+        assert!(
+            events[0].binary_path.is_empty(),
+            "binary_path should be empty when not running"
+        );
+        assert_eq!(
+            events[0].uptime_ms, 0,
+            "uptime_ms should be 0 when not running"
+        );
+        assert_eq!(
+            events[0].connection_count, 0,
+            "connection_count should be 0 when not running"
+        );
+        assert_eq!(
+            events[0].swfs_mount_count, 0,
+            "swfs_mount_count should be 0 when not running"
         );
     }
 

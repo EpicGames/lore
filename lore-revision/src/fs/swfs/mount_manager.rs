@@ -205,4 +205,9 @@ impl MountManager {
             .get(&WrappedHandle::new(handle))
             .map(|entry| entry.value().clone())
     }
+
+    /// Returns the number of currently mounted SWFS paths.
+    pub fn mount_count(&self) -> usize {
+        self.mounted_paths.len()
+    }
 }

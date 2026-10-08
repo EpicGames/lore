@@ -831,6 +831,35 @@ pub struct LoreCompactionEndEventData {
     pub total_compacted_bytes: u64,
 }
 
+/// Data for the service status event, reporting whether the service is running
+/// and its current metadata.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreServiceStatusEventData {
+    /// Whether the service is running: 1 for running, 0 for not running.
+    pub running: u8,
+    /// Path to the service binary.
+    pub binary_path: LoreString,
+    /// Milliseconds since the service started.
+    pub uptime_ms: u64,
+    /// Number of active client connections.
+    pub connection_count: u32,
+    /// Number of SWFS mounts currently active.
+    pub swfs_mount_count: u32,
+}
+
+/// Data for a service log message captured outside command execution.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreServiceMessageEventData {
+    /// The severity level of the log message.
+    pub level: lore_base::log::LoreLogLevel,
+    /// The log message text.
+    pub message: LoreString,
+}
+
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 /// An event delivered to a callback. Each variant names a kind of event and
@@ -1313,6 +1342,10 @@ pub enum LoreEvent {
     RevisionCommitStats(LoreRevisionCommitStatsEventData),
     /// What a push has cost so far, or in total once it has finished.
     BranchPushStats(LoreBranchPushStatsEventData),
+    /// The status of the background service.
+    ServiceStatus(LoreServiceStatusEventData),
+    /// A log message captured by the service outside command execution.
+    ServiceMessage(LoreServiceMessageEventData),
     /// An interactive login is still waiting for the user's approval.
     AuthPending(LoreAuthPendingEventData),
 }
