@@ -24,6 +24,7 @@ use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
 use lore_revision::lore::RepositoryId;
+use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
@@ -39,6 +40,10 @@ pub struct TestFilesystemProvider {
     pub holds_name_count: Arc<AtomicUsize>,
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
+    /// Paths whose scan fails.
+    pub failing_scans: Arc<Mutex<Vec<String>>>,
+    /// Paths whose scan finds the named node stale.
+    pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
     finalize_fails: bool,
     write_fails: bool,
     holds_paths: bool,
@@ -116,6 +121,8 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
                 holds_paths: self.holds_paths,
+                failing_scans: self.failing_scans.clone(),
+                stale_on_scan: self.stale_on_scan.clone(),
             }),
         )))
     }

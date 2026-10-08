@@ -3455,4 +3455,381 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// The children of `parent` in `state` named `name`.
+    async fn children_named(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        state: &Arc<State>,
+        parent: lore_revision::node::NodeID,
+        name: &str,
+    ) -> Vec<lore_revision::node::NodeID> {
+        let name_hash = hash_string(name);
+        let mut named = Vec::new();
+        for child in state
+            .node_children(repository.clone(), parent)
+            .await
+            .expect("Failed to list the children")
+        {
+            let node = state
+                .node(repository.clone(), child)
+                .await
+                .expect("Failed to read a child");
+            if node.name_hash == name_hash {
+                named.push(child);
+            }
+        }
+        named
+    }
+
+    fn scan_status_options() -> lore_revision::repository::status::StatusOptions {
+        lore_revision::repository::status::StatusOptions {
+            staged: false,
+            scan: true,
+            check_dirty: false,
+            reset: false,
+            sync_point: false,
+            revision_only: false,
+            count: false,
+        }
+    }
+
+    fn relative_path(path: &str) -> lore_revision::util::path::RelativePath {
+        lore_revision::util::path::RelativePath::new_from_initial_path(path)
+            .expect("Path init failed")
+    }
+
+    /// A repository opened as the command line opens it, so a status run finds its branch and
+    /// reads `ignore` as the `.loreignore` it holds, with `files` and one more file committed.
+    /// The write token it holds is what lets a scan persist a node it creates.
+    async fn committed_repository(
+        ignore: &str,
+        files: &[String],
+    ) -> (Arc<lore_revision::repository::RepositoryContext>, TempDir) {
+        let tempdir = generate_tempdir();
+        let path = tempdir.to_path_buf();
+        let branch_id = lore_revision::lore::BranchId::from(uuid::Uuid::now_v7());
+        let write_token =
+            lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+        lore_revision::repository::create_local(
+            path.as_path(),
+            &write_token,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+            branch_id,
+            lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
+            lore_revision::repository::RepositoryConfig::default(),
+            false,
+        )
+        .await
+        .expect("Failed to initialize repository");
+        test_file_write(
+            path.join(lore_revision::repository::DOT_LOREIGNORE)
+                .as_path(),
+            ignore.as_bytes(),
+        );
+        test_file_write(path.join("seed.txt").as_path(), b"seed");
+        for file in files {
+            let file = path.join(file);
+            std::fs::create_dir_all(file.parent().expect("A file has a parent"))
+                .expect("Create directory failed");
+            test_file_write(file.as_path(), b"committed");
+        }
+
+        let repository = lore_revision::repository::load_and_connect_with_token(
+            path.as_path(),
+            lore_revision::repository::RepositoryAccess::ReadWrite,
+            Some(write_token),
+        )
+        .await
+        .expect("Failed to open the repository");
+        lore_revision::instance::store_current_anchor_branch(&repository, branch_id)
+            .await
+            .expect("Failed to store anchor branch");
+
+        let token = repository
+            .try_write_token()
+            .expect("The repository was opened for writing");
+        file::stage::stage(
+            repository.clone(),
+            token,
+            LoreArray::from_vec(vec![LoreString::from(&path)]),
+            StageOptions {
+                scan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Stage failed");
+        commit::commit_boxed(
+            repository.clone(),
+            token,
+            CommitOptions::new("Seed".to_string()),
+        )
+        .await
+        .expect("Commit failed");
+
+        (repository, tempdir)
+    }
+
+    /// A status scan reconciles the paths it is given in parallel, and the scan of an untracked
+    /// path creates the directory nodes the tree lacks above it. Many untracked files sharing new
+    /// directories must still leave each directory as one node, holding each file once.
+    #[tokio::test]
+    async fn status_scan_of_untracked_files_creates_each_shared_new_directory_once() {
+        const FILES: usize = 64;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                let root = tempdir.to_path_buf();
+
+                let mut paths = Vec::new();
+                for directory in ["fresh/one", "fresh/two"] {
+                    std::fs::create_dir_all(root.join(directory)).expect("Create directory failed");
+                    for index in 0..FILES {
+                        let path = format!("{directory}/{index:03}.txt");
+                        test_file_write(root.join(&path).as_path(), b"new");
+                        paths.push(relative_path(&path));
+                    }
+                }
+
+                lore_revision::repository::status::status_boxed(
+                    repository.clone(),
+                    Some(paths),
+                    scan_status_options(),
+                )
+                .await
+                .expect("Status scan failed");
+
+                let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+                let staged = staged.expect("The scan persists the nodes it created");
+
+                let fresh = children_named(&repository, &staged, ROOT_NODE, "fresh").await;
+                assert_eq!(fresh.len(), 1, "one node for the shared directory");
+                for directory in ["one", "two"] {
+                    let nodes = children_named(&repository, &staged, fresh[0], directory).await;
+                    assert_eq!(nodes.len(), 1, "one node for fresh/{directory}");
+                    for index in 0..FILES {
+                        let name = format!("{index:03}.txt");
+                        let files = children_named(&repository, &staged, nodes[0], &name).await;
+                        assert_eq!(files.len(), 1, "one node for fresh/{directory}/{name}");
+                    }
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A scan creates no directory node above a path it does not scan. Two ignored files share a
+    /// directory the tree lacks, as do two paths nothing holds, and scanning them leaves the tree,
+    /// and so the staged state, as it was.
+    #[tokio::test]
+    async fn status_scan_creates_no_directory_shared_only_by_ignored_or_missing_paths() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (repository, tempdir) = committed_repository("*.tmp\n", &[]).await;
+                let root = tempdir.to_path_buf();
+
+                std::fs::create_dir_all(root.join("ignored")).expect("Create directory failed");
+                test_file_write(root.join("ignored/a.tmp").as_path(), b"ignored");
+                test_file_write(root.join("ignored/b.tmp").as_path(), b"ignored");
+
+                lore_revision::repository::status::status_boxed(
+                    repository.clone(),
+                    Some(vec![
+                        relative_path("ghost/a.txt"),
+                        relative_path("ghost/b.txt"),
+                        relative_path("ignored/a.tmp"),
+                        relative_path("ignored/b.tmp"),
+                    ]),
+                    scan_status_options(),
+                )
+                .await
+                .expect("Status scan failed");
+
+                let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+                assert!(
+                    staged.is_none(),
+                    "the scan created a node for a directory it scanned nothing in"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Whether `state` holds `path`.
+    async fn holds(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        state: &Arc<State>,
+        path: &str,
+    ) -> bool {
+        state
+            .find_node_link(repository.clone(), path)
+            .await
+            .is_ok_and(|link| link.is_valid())
+    }
+
+    /// A marking walk handed a queue for what it finds stale leaves it there for its caller, who
+    /// discards it once every walk over the tree has drained. A walk handed none discards it
+    /// itself once it has drained, before its changes are answered.
+    #[tokio::test]
+    async fn a_walk_handed_a_discard_queue_leaves_its_discards_to_the_caller() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                test_file_write(fixture.path.join("seed.txt").as_path(), b"seed");
+                test_commit_tree(&fixture, "Seed").await;
+                let (current, staged) = test_anchor_states(&repository).await;
+
+                let added = fixture.path.join("added.txt");
+                test_file_write(added.as_path(), b"added");
+                test_scan(repository.clone(), staged.clone(), current.clone()).await;
+                assert!(holds(&repository, &staged, "added.txt").await);
+                std::fs::remove_file(&added).expect("Remove failed");
+
+                let operation =
+                    lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
+                        repository.file_system().as_ref(),
+                    )
+                    .await
+                    .expect("Failed to start filesystem operation");
+                let discards = Arc::new(lore_revision::state::WalkDiscards::default());
+                lore_revision::state::diff_filesystem_queuing(
+                    &operation,
+                    lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+                        repository: repository.clone(),
+                        state: staged.clone(),
+                    },
+                    lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+                        repository: repository.clone(),
+                        state: current.clone(),
+                    },
+                    None,
+                    lore_revision::filter::FilterMode::Full,
+                    lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+                    Arc::new(Vec::new()),
+                    Some(discards.clone()),
+                )
+                .await
+                .expect("Failed to diff filesystem")
+                .collect()
+                .await
+                .expect("Failed to diff filesystem");
+                operation
+                    .finalize()
+                    .await
+                    .expect("Failed to finish filesystem operation");
+                assert!(
+                    holds(&repository, &staged, "added.txt").await,
+                    "the walk left the discard to its caller"
+                );
+                discards.apply().await.expect("Discarding failed");
+                assert!(!holds(&repository, &staged, "added.txt").await);
+
+                test_file_write(added.as_path(), b"added");
+                test_scan(repository.clone(), staged.clone(), current.clone()).await;
+                assert!(holds(&repository, &staged, "added.txt").await);
+                std::fs::remove_file(&added).expect("Remove failed");
+                test_scan(repository.clone(), staged.clone(), current.clone()).await;
+                assert!(
+                    !holds(&repository, &staged, "added.txt").await,
+                    "a walk handed no queue discards once it has drained"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A status scan of many directories at once, with an add reverted in half of them and a
+    /// committed file modified in the other half, discards the reverted adds, leaves their
+    /// directories unmarked, and keeps the directory they share marked for the modified files.
+    #[tokio::test]
+    async fn a_parallel_status_scan_discards_reverted_adds_and_keeps_shared_marks() {
+        const DIRECTORIES: usize = 32;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let kept: Vec<String> = (0..DIRECTORIES)
+                    .map(|index| format!("shared/d{index:02}/keep.txt"))
+                    .collect();
+                let (repository, tempdir) = committed_repository("", &kept).await;
+                let root = tempdir.to_path_buf();
+                let directories: Vec<_> = (0..DIRECTORIES)
+                    .map(|index| relative_path(&format!("shared/d{index:02}")))
+                    .collect();
+
+                for index in (1..DIRECTORIES).step_by(2) {
+                    let added = root.join(format!("shared/d{index:02}/added.txt"));
+                    test_file_write(added.as_path(), b"added");
+                }
+                lore_revision::repository::status::status_boxed(
+                    repository.clone(),
+                    Some(directories.clone()),
+                    scan_status_options(),
+                )
+                .await
+                .expect("Status scan failed");
+
+                for index in 0..DIRECTORIES {
+                    if index % 2 == 1 {
+                        std::fs::remove_file(root.join(format!("shared/d{index:02}/added.txt")))
+                            .expect("Remove failed");
+                    } else {
+                        let kept = root.join(format!("shared/d{index:02}/keep.txt"));
+                        test_file_write(kept.as_path(), b"modified");
+                    }
+                }
+                lore_revision::repository::status::status_boxed(
+                    repository.clone(),
+                    Some(directories),
+                    scan_status_options(),
+                )
+                .await
+                .expect("Status scan failed");
+
+                let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+                let staged = staged.expect("The scans persist what they marked");
+                let shared = children_named(&repository, &staged, ROOT_NODE, "shared").await;
+                assert_eq!(shared.len(), 1);
+                let shared_node = staged
+                    .node(repository.clone(), shared[0])
+                    .await
+                    .expect("The node reads back");
+                assert!(shared_node.is_dirty(), "shared holds modified files");
+                for index in 0..DIRECTORIES {
+                    let name = format!("d{index:02}");
+                    let directory = children_named(&repository, &staged, shared[0], &name).await;
+                    assert_eq!(directory.len(), 1);
+                    let added =
+                        children_named(&repository, &staged, directory[0], "added.txt").await;
+                    assert!(added.is_empty(), "the reverted add in {name} is discarded");
+                    let node = staged
+                        .node(repository.clone(), directory[0])
+                        .await
+                        .expect("The node reads back");
+                    assert_eq!(
+                        node.is_dirty(),
+                        index % 2 == 0,
+                        "{name} is marked exactly when a file below it is"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }

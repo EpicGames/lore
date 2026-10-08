@@ -547,6 +547,10 @@ pub struct LinkMergeState {
     pub flags: u32,
 }
 const MAX_BLOCK_CACHE: usize = 5000;
+/// How many file metadata blocks a state keeps from checking recycled slots, at 65,568 bytes
+/// each. Adds land in the few blocks with free slots, so a handful is the usual working set.
+#[lore_macro::test_pub]
+const MAX_CHECKED_FILE_METADATA_BLOCKS: usize = 64;
 
 struct StateRuntime {
     /// Signature state was deserialized from
@@ -569,6 +573,11 @@ struct StateRuntime {
     block_file_metadata: Vec<Weak<NodeFileMetadataBlock>>,
     /// Dirty blocks kept in memory
     block_file_metadata_dirty: Vec<(Arc<NodeFileMetadataBlock>, usize)>,
+    /// Blocks read to check a recycled slot, kept in memory so the next check in the same block
+    /// does not read it again
+    block_file_metadata_checked: Vec<Arc<NodeFileMetadataBlock>>,
+    /// Slot the next checked block replaces once the list is full
+    block_file_metadata_checked_next: usize,
     /// Link list
     link_list: Option<Vec<LinkReference>>,
     /// Name table (read only, for old data formats)
@@ -590,9 +599,27 @@ impl StateRuntime {
             block_file_metadata_address: Bytes::default(),
             block_file_metadata: vec![],
             block_file_metadata_dirty: vec![],
+            block_file_metadata_checked: vec![],
+            block_file_metadata_checked_next: 0,
             link_list: None,
             name_table_deprecated: None,
             rehash_node_names,
+        }
+    }
+
+    /// Keeps `block` in memory, in place of the oldest block kept once there are
+    /// [`MAX_CHECKED_FILE_METADATA_BLOCKS`].
+    fn keep_checked_file_metadata(&mut self, block: &Arc<NodeFileMetadataBlock>) {
+        let checked = &mut self.block_file_metadata_checked;
+        if checked.iter().any(|kept| Arc::ptr_eq(kept, block)) {
+            return;
+        }
+        if checked.len() < MAX_CHECKED_FILE_METADATA_BLOCKS {
+            checked.push(block.clone());
+        } else {
+            let slot = self.block_file_metadata_checked_next % MAX_CHECKED_FILE_METADATA_BLOCKS;
+            checked[slot] = block.clone();
+            self.block_file_metadata_checked_next = slot + 1;
         }
     }
 }
@@ -1733,6 +1760,11 @@ impl State {
     /// A resident block is always returned, whatever the tree has stored: it may
     /// hold metadata from a slot that has since been freed, which a caller
     /// recycling that slot has to clear.
+    ///
+    /// A block this reads from the store stays resident, up to `MAX_CHECKED_FILE_METADATA_BLOCKS`
+    /// of them. [`Self::node_add`] asks for the block on every add into it, and a block held only
+    /// as a `Weak` would be read again for each of them. A block with nothing stored is not kept:
+    /// the address list answers for it once read.
     pub async fn try_block_file_metadata_existing(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1777,9 +1809,17 @@ impl State {
             }
         }
 
-        self.block_file_metadata(repository, block_index)
-            .await
-            .map(Some)
+        let block = self.block_file_metadata(repository, block_index).await?;
+        let mut runtime = self.runtime.write();
+        let stored = runtime
+            .block_file_metadata_address
+            .as_type_slice::<Hash>()
+            .get(block_index)
+            .is_some_and(|hash| !hash.is_zero());
+        if stored {
+            runtime.keep_checked_file_metadata(&block);
+        }
+        Ok(Some(block))
     }
 
     /// The file-metadata block for `block_index`, loaded unless it is resident.
@@ -6266,8 +6306,37 @@ fn walk_filter_mode(filter_mode: FilterMode, intent: FilesystemDiffIntent) -> Fi
 /// into a configured layer. Pass an empty Arc for non-layer-aware callers; the
 /// layer-internal recursion always passes empty, there being no nested layer mounts under
 /// non-overlapping layers.
+///
+/// A marking walk discards what it finds stale once it has drained. A caller running several
+/// walks over one tree uses `diff_filesystem_queuing` instead.
 #[allow(clippy::too_many_arguments)]
-pub async fn diff_filesystem(
+pub fn diff_filesystem<'a>(
+    operation: &'a Arc<InstanceOperationImpl>,
+    from: FilesystemDiffTree,
+    current: FilesystemDiffTree,
+    path: Option<RelativePath>,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    layer_mounts: Arc<Vec<LayerMountInfo>>,
+) -> impl Future<Output = Result<ChangeStream<FilesystemDiffStats>, StateError>> + Send + 'a {
+    diff_filesystem_queuing(
+        operation,
+        from,
+        current,
+        path,
+        filter_mode,
+        intent,
+        layer_mounts,
+        None,
+    )
+}
+
+/// [`diff_filesystem`], holding what a marking walk finds stale on `discards` where given, for
+/// the caller to discard once every walk over the tree has drained, rather than discarding it
+/// once this walk has drained.
+#[lore_macro::test_pub]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn diff_filesystem_queuing(
     operation: &Arc<InstanceOperationImpl>,
     from: FilesystemDiffTree,
     current: FilesystemDiffTree,
@@ -6275,6 +6344,7 @@ pub async fn diff_filesystem(
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
+    discards: Option<Arc<WalkDiscards>>,
 ) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
     let FilesystemDiffTree {
         repository: repository_from,
@@ -6336,6 +6406,7 @@ pub async fn diff_filesystem(
                 intent,
                 layer_mounts,
                 link_mounts,
+                discards,
             },
         ));
     };
@@ -6387,6 +6458,7 @@ pub async fn diff_filesystem(
             intent,
             layer_mounts,
             link_mounts,
+            discards,
         },
     ))
 }
@@ -6395,9 +6467,10 @@ pub async fn diff_filesystem(
 /// entry behind a nested-repository boundary, or an entry neither the file system nor any commit
 /// holds — and [clear the propagation](clear_propagation) each leaves stale on its ancestor
 /// chain. A directory node goes with the whole subtree below it, so no slot is left holding an
-/// entry unreachable from the root. Must only be called after the corresponding walk's task set
-/// has drained — discarding mid-walk mutates `parent.child` / sibling chains under walks that
-/// are still reading them and races into `node_discard_patch`'s `"Discard hierarchy broken"`.
+/// entry unreachable from the root. Must only be called after every walk over the tree has
+/// drained — discarding mid-walk mutates `parent.child` / sibling chains under walks that are
+/// still reading them and races into `node_discard_patch`'s `"Discard hierarchy broken"`, and
+/// clears marks other walks are still carrying up.
 pub(crate) async fn apply_pending_discards(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -6445,6 +6518,55 @@ pub(crate) async fn apply_pending_discards(
     Ok(())
 }
 
+/// Nodes walks over a tree found stale, each with the tree it belongs to, held for
+/// `apply_pending_discards` until every walk that marks the tree has drained.
+///
+/// A walk crosses into linked and layer trees, so what it holds can belong to several.
+#[derive(Default)]
+pub struct WalkDiscards {
+    batches: parking_lot::Mutex<Vec<DiscardBatch>>,
+}
+
+/// Children of one directory of `state` a walk found stale.
+struct DiscardBatch {
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    nodes: Vec<NodeID>,
+}
+
+impl WalkDiscards {
+    /// Hold `nodes`, children of one directory of `state`, for discarding.
+    pub(crate) fn queue(
+        &self,
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        nodes: Vec<NodeID>,
+    ) {
+        if !nodes.is_empty() {
+            self.batches.lock().push(DiscardBatch {
+                state,
+                repository,
+                nodes,
+            });
+        }
+    }
+
+    /// Whether no node is held, which leaves nothing to [apply](Self::apply).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.batches.lock().is_empty()
+    }
+
+    /// Discard every node held. Call only once every walk holding nodes here has drained.
+    #[lore_macro::test_pub]
+    pub(crate) async fn apply(&self) -> Result<(), StateError> {
+        let batches = std::mem::take(&mut *self.batches.lock());
+        for batch in batches {
+            apply_pending_discards(batch.state, batch.repository, batch.nodes).await?;
+        }
+        Ok(())
+    }
+}
+
 /// Whether `node` is staged only because something below it is: the bare `Staged` bit
 /// [`State::node_mark`] carries up to the ancestors of the node it marks. An action bit can be the
 /// node's own staged action or its dirty one, so a node carrying one, a merge flag, or a link is
@@ -6459,6 +6581,10 @@ fn is_staged_for_descendants_only(node: &Node) -> bool {
 /// above it, for a node that has since left the tree, in one walk up the chain. `Dirty` is cleared
 /// up to the first node that still has a dirty child, `Staged` up to the first that still has a
 /// staged child or is not [staged for descendants only](is_staged_for_descendants_only).
+///
+/// Must not run while another task marks nodes in the tree. Marking stops at the first ancestor
+/// already carrying the bit, so a node marked between this checking an ancestor's children and
+/// clearing its bit is left below an ancestor without it.
 pub(crate) async fn clear_propagation(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
@@ -6549,6 +6675,7 @@ pub async fn diff_filesystem_subtree(
             intent,
             layer_mounts,
             link_mounts,
+            discards: None,
         },
     ))
 }

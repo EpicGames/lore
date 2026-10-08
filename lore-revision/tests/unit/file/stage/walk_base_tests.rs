@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use lore_revision::file::stage::*;
+use lore_revision::util::fan_out::AncestorNodes;
 use lore_revision::util::path::RelativePath;
 
 const NODE_A: lore_revision::node::NodeID = 11;
@@ -18,16 +19,6 @@ fn resolved(entries: &[(&str, &str)]) -> Arc<lore_revision::util::fs::ResolvedPr
         prefixes.insert((*path).to_string(), (*variation).to_string());
     }
     Arc::new(prefixes)
-}
-
-#[test]
-fn longest_ancestor_takes_the_deepest_one_created() {
-    let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
-    assert_eq!(longest_ancestor("a/b/c/d", &nodes), Some(("a/b", NODE_AB)));
-    // In the map, but a walk about to stage it has to start above it.
-    assert_eq!(longest_ancestor("a/b", &nodes), Some(("a", NODE_A)));
-    assert_eq!(longest_ancestor("a", &nodes), None);
-    assert_eq!(longest_ancestor("x/y", &nodes), None);
 }
 
 fn path(path: &str) -> RelativePath {

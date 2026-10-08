@@ -56,18 +56,21 @@ use crate::state::stream::emit;
 use crate::util::path::EntryPath;
 use crate::util::path::RelativePath;
 
-/// Find-or-create the directory node chain from `ROOT_NODE` down to `path`,
-/// marking newly created segments as dirty-add. A path-filtered scan can enter
-/// a directory (or a file's parent) present on disk but absent from `state_from`;
-/// creating the chain lets adds discovered inside resolve their parent node.
-/// Returns the node for the final path segment.
-async fn ensure_scan_dir_chain(
+/// Find-or-create the directory node chain from `start` down to `path`, relative
+/// to it, marking newly created segments as dirty-add. A path-filtered scan can
+/// enter a directory (or a file's parent) present on disk but absent from
+/// `state_from`; creating the chain lets adds discovered inside resolve their
+/// parent node. Returns the node for the final path segment.
+///
+/// `path` is generic so a caller spawning this future can hand over an owned path.
+pub(crate) async fn ensure_scan_dir_chain(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    path: &str,
+    start: NodeID,
+    path: impl AsRef<str>,
 ) -> Result<NodeID, StateError> {
-    let mut current_node = ROOT_NODE;
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
+    let mut current_node = start;
+    for segment in path.as_ref().split('/').filter(|s| !s.is_empty()) {
         if is_reserved_node_name(segment) {
             return Err(NodeNotFound.into());
         }
@@ -115,6 +118,7 @@ async fn diff_filesystem_subtree_impl(
                 let entry_node = ensure_scan_dir_chain(
                     ctx.from.repository.clone(),
                     ctx.from.state.clone(),
+                    ROOT_NODE,
                     ctx.filesystem_path.as_str(),
                 )
                 .await?;
@@ -130,8 +134,13 @@ async fn diff_filesystem_subtree_impl(
                 && let Some(parent) = ctx.filesystem_path.parent()
                 && !parent.is_empty()
             {
-                ensure_scan_dir_chain(ctx.from.repository.clone(), ctx.from.state.clone(), parent)
-                    .await?;
+                ensure_scan_dir_chain(
+                    ctx.from.repository.clone(),
+                    ctx.from.state.clone(),
+                    ROOT_NODE,
+                    parent,
+                )
+                .await?;
             }
             diff_filesystem_single_file(ctx, item, changes).await
         }
@@ -866,12 +875,13 @@ async fn diff_filesystem_directory(
     let drain_result = lore_drain_tasks!(tasks, StateError::internal("Task failure"));
     work_result?;
     drain_result?;
-    apply_pending_discards(
-        node_list.state.clone(),
-        node_list.repository.clone(),
-        pending_discards,
-    )
-    .await?;
+    if let Some(discards) = &ctx.discards {
+        discards.queue(
+            node_list.state.clone(),
+            node_list.repository.clone(),
+            pending_discards,
+        );
+    }
     Ok(stats)
 }
 
@@ -1572,6 +1582,7 @@ async fn diff_filesystem_linked_directory(
             from_states: from_item_states,
             filter_mode: ctx.filter_mode,
             intent: ctx.intent,
+            discards: ctx.discards.clone(),
             layer_mounts: ctx.layer_mounts.clone(),
             link_mounts: Arc::new(linked_mounts),
         },
@@ -1749,6 +1760,7 @@ async fn diff_filesystem_matched_directory(
             from_states: from_item_states,
             filter_mode: ctx.filter_mode,
             intent: ctx.intent,
+            discards: ctx.discards.clone(),
             layer_mounts: ctx.layer_mounts.clone(),
             link_mounts: link_mounts_recurse,
         },
@@ -1841,6 +1853,7 @@ async fn diff_filesystem_type_change(
                 from_states: item_states,
                 filter_mode: ctx.filter_mode,
                 intent: ctx.intent,
+                discards: ctx.discards.clone(),
                 layer_mounts: ctx.layer_mounts.clone(),
                 link_mounts: ctx.link_mounts.clone(),
             },
@@ -2110,6 +2123,7 @@ async fn diff_filesystem_new_entries(
                         from_states: child_states,
                         filter_mode: ctx.filter_mode,
                         intent: ctx.intent,
+                        discards: ctx.discards.clone(),
                         // Non-overlapping layers: no nested mounts inside a layer.
                         layer_mounts: Arc::new(vec![]),
                         // Crossing into the layer state; parent's link mounts
@@ -2208,6 +2222,7 @@ async fn diff_filesystem_new_entries(
                     from_states: dir_from_states,
                     filter_mode: ctx.filter_mode,
                     intent: ctx.intent,
+                    discards: ctx.discards.clone(),
                     layer_mounts: ctx.layer_mounts.clone(),
                     // Same parent state; deeper paths may still match a link.
                     link_mounts: ctx.link_mounts.clone(),
@@ -2554,9 +2569,27 @@ fn diff_filesystem_subtree_recurse<'a>(
 /// The module's entry, and what
 /// [`OsOperation`](crate::fs::os::OsOperation)'s
 /// `changes_from_filesystem_to_state` answers with.
-pub(crate) async fn diff_os_filesystem(
-    diff: FilesystemDiffContext,
+///
+/// A marking walk handed no queue for what it finds stale holds it on one of its own and
+/// discards it once the whole walk has drained, so no directory discards while another is
+/// still marking. Discarding is boxed as the cold path: most walks find nothing stale.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn diff_os_filesystem(
+    mut diff: FilesystemDiffContext,
     changes: &ChangeSender,
-) -> Result<FilesystemDiffStats, StateError> {
-    diff_filesystem_subtree_recurse(diff, changes).await
+) -> impl Future<Output = Result<FilesystemDiffStats, StateError>> + Send + '_ {
+    let owned = (diff.discards.is_none() && diff.intent.marks_dirty()).then(|| {
+        let discards = Arc::new(WalkDiscards::default());
+        diff.discards = Some(discards.clone());
+        discards
+    });
+    async move {
+        let stats = diff_filesystem_subtree_recurse(diff, changes).await?;
+        if let Some(discards) = owned.filter(|discards| !discards.is_empty()) {
+            Box::pin(discards.apply()).await?;
+        }
+        Ok(stats)
+    }
 }

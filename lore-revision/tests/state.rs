@@ -2557,6 +2557,7 @@ mod block_single_flight {
     use lore_revision::immutable::ReadFromImmutable;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::nametable::NameTable;
+    use lore_revision::node::BLOCK_NODE_COUNT;
     use lore_revision::node::Node;
     use lore_revision::node::NodeBlock;
     use lore_revision::node::NodeFileMetadata;
@@ -2565,6 +2566,7 @@ mod block_single_flight {
     use lore_revision::node::node_to_file_metadata;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::MAX_CHECKED_FILE_METADATA_BLOCKS;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::Tree;
@@ -2974,6 +2976,198 @@ mod block_single_flight {
                 assert!(
                     reads.values().all(|&count| count == 1),
                     "the burst must read nothing twice, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Every add asks for its block's file metadata block, to clear what a recycled slot may
+    /// still carry, and lets go of it when the slot is clear. A run of adds into one block must
+    /// still cost the store one read of it.
+    #[tokio::test]
+    async fn adds_into_a_block_with_stored_metadata_read_it_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store.take_reads();
+
+                for index in 0..BURST {
+                    let name = format!("added{index}");
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    assert_eq!(
+                        NodeFileMetadataBlock::index(node_to_file_metadata(node)),
+                        seed.block_index,
+                        "every add lands in the block whose file metadata is stored"
+                    );
+                }
+
+                let reads = seed.store.take_reads();
+                assert_eq!(
+                    reads.get(&seed.metadata_block).copied(),
+                    Some(1),
+                    "{BURST} adds into one block must read its file metadata block once"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An add into a block with no file metadata stored is answered by the address list once
+    /// it is read. Keeping the zeroed block the first such add is handed would hold 65,568 bytes
+    /// for nothing.
+    #[tokio::test]
+    async fn a_state_keeps_no_metadata_block_with_nothing_stored() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let mut appended = None;
+                for index in 0..=BLOCK_NODE_COUNT {
+                    let name = format!("added{index}");
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(node));
+                    if block_index != seed.block_index {
+                        appended = Some(block_index);
+                        break;
+                    }
+                }
+                let block_index = appended.expect("The adds fill the seeded block");
+
+                let kept = state
+                    .try_block_file_metadata_existing(seed.repository.clone(), block_index)
+                    .await
+                    .expect("Failed to check the file metadata block");
+                assert!(
+                    kept.is_none(),
+                    "a block with nothing stored stays out of memory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The stored file metadata blocks a state checks are kept, but no more of them than the
+    /// limit: past it, the block kept longest is let go of first. The tree holds a node carrying
+    /// metadata in each of one block more than the limit.
+    #[tokio::test]
+    async fn a_state_keeps_the_metadata_blocks_it_checks_up_to_a_limit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let blocks = MAX_CHECKED_FILE_METADATA_BLOCKS + 1;
+                let state = State::new();
+                let mut stored = Vec::with_capacity(blocks);
+                let mut index = 0;
+                while stored.len() < blocks {
+                    let name = format!("node{index}");
+                    index += 1;
+                    let node = state
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let metadata_node = node_to_file_metadata(node);
+                    let block_index = NodeFileMetadataBlock::index(metadata_node);
+                    if stored.last() == Some(&block_index) {
+                        continue;
+                    }
+                    let metadata_block = state
+                        .block_file_metadata(repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block");
+                    {
+                        let mut writer = metadata_block.write();
+                        writer.node(NodeFileMetadata::index(metadata_node)).metadata =
+                            Hash::from_u64(9);
+                        writer.mark_dirty();
+                    }
+                    state.block_file_metadata_modified(metadata_block, block_index);
+                    stored.push(block_index);
+                }
+                state.mark_dirty();
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let state = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                let mut read = Vec::with_capacity(blocks);
+                for &block_index in &stored {
+                    let metadata_block = state
+                        .try_block_file_metadata_existing(repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block")
+                        .expect("Every block has metadata stored");
+                    read.push(Arc::downgrade(&metadata_block));
+                }
+
+                assert!(
+                    read[0].upgrade().is_none(),
+                    "the block read first is let go of once {blocks} have been read"
+                );
+                assert!(
+                    read[1..].iter().all(|block| block.upgrade().is_some()),
+                    "the {MAX_CHECKED_FILE_METADATA_BLOCKS} blocks read last stay in memory"
                 );
             }))
             .await

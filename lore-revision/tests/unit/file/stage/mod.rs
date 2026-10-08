@@ -3,5 +3,4 @@
 
 mod classify_tests;
 mod mask_tests;
-mod shared_ancestor_tests;
 mod walk_base_tests;

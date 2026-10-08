@@ -4,6 +4,7 @@
 pub mod collect_stream;
 pub mod config;
 pub mod encoding;
+pub mod fan_out;
 pub mod fs;
 pub mod inflight;
 pub mod path;

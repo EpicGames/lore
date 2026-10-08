@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
@@ -42,34 +43,12 @@ use crate::stage::StageStats;
 use crate::state;
 use crate::state::NodeMapping;
 use crate::state::State;
+use crate::util::fan_out;
+use crate::util::fan_out::AncestorNodes;
+use crate::util::fan_out::longest_ancestor;
 use crate::util::path::DepthPath;
 use crate::util::path::RelativePath;
 use crate::util::path::path_depth;
-use crate::util::path::shared_component_depth;
-
-/// The node of each shared ancestor already created, borrowed from the list they
-/// are created from.
-#[lore_macro::test_pub]
-type AncestorNodes<'a> = std::collections::HashMap<&'a str, crate::node::NodeID>;
-
-/// The deepest strict ancestor of `path` that has a node, and that node.
-///
-/// Starts at the parent, never at `path` itself: the caller is about to stage
-/// `path`, and starting its walk on top of it would skip it.
-#[lore_macro::test_pub]
-fn longest_ancestor<'a>(
-    path: &'a str,
-    nodes: &AncestorNodes<'_>,
-) -> Option<(&'a str, crate::node::NodeID)> {
-    let mut end = path.rfind('/')?;
-    loop {
-        let candidate = &path[..end];
-        if let Some(node) = nodes.get(candidate) {
-            return Some((candidate, *node));
-        }
-        end = candidate.rfind('/')?;
-    }
-}
 
 /// Where a walk has reached and where it is going: the point it starts from, what is left to
 /// consume below it, and the case resolutions it may use on the way.
@@ -138,71 +117,6 @@ fn walk_start(
         node,
         remainder: target,
     }
-}
-
-/// Fold one finished pre-create into the ancestor node map, keeping the first
-/// error rather than returning it: the caller drains the level either way.
-fn collect_precreate<'a>(
-    joined: Result<(usize, Result<crate::node::NodeLink, StageError>), tokio::task::JoinError>,
-    ancestors: &'a [DepthPath],
-    nodes: &mut AncestorNodes<'a>,
-    failure: &mut Option<StageError>,
-) {
-    match joined {
-        Ok((index, Ok(node_link))) => {
-            if node_link.is_valid() {
-                nodes.insert(ancestors[index].path(), node_link.node);
-            }
-        }
-        Ok((_, Err(err))) => {
-            if failure.is_none() {
-                *failure = Some(err);
-            }
-        }
-        Err(err) => {
-            if failure.is_none() {
-                *failure = Some(StageError::internal_with_context(
-                    err,
-                    "Failed to join pre-create task",
-                ));
-            }
-        }
-    }
-}
-
-/// The directories two or more of `targets` share, shallowest first and
-/// contiguous per depth. Only such a directory is a place where parallel walks
-/// would race to create the same node.
-///
-/// `targets` must be an antichain in lexicographic order, which puts the targets
-/// under a directory in one run: a directory is shared exactly when two
-/// neighbours agree that far, and emitting it at the first target of its run
-/// yields the set once over.
-///
-/// The result is prefix-closed and holds one case variation of each entry, so a
-/// depth is a set of distinct nodes whose parents the depth above holds.
-#[lore_macro::test_pub]
-fn shared_ancestors(targets: &[RelativePath]) -> Vec<DepthPath> {
-    let mut shared: Vec<DepthPath> = Vec::new();
-    let mut preceding = 0;
-    for (index, target) in targets.iter().enumerate() {
-        let following = targets.get(index + 1).map_or(0, |next| {
-            shared_component_depth(target.as_str(), next.as_str())
-        });
-        let target = target.as_str();
-        for (depth, (end, _)) in target.match_indices('/').enumerate() {
-            let depth = depth + 1;
-            if depth > following {
-                break;
-            }
-            if depth > preceding {
-                shared.push(DepthPath::new(target[..end].to_string()));
-            }
-        }
-        preceding = following;
-    }
-    shared.sort_unstable();
-    shared
 }
 
 /// Spawn a stage task into the given layer's repository covering `remain` (the
@@ -343,11 +257,8 @@ async fn resolve_shared_prefixes(
     Ok(Some(prefixes))
 }
 
-/// Create the node for every directory the targets share, a depth level at a time.
-///
-/// A level's nodes are the next level's parents, so each level is drained before the
-/// next starts. A pre-create in flight is allocating nodes and is drained even where an
-/// earlier one failed, rather than cancelled part way through.
+/// Create the node for every directory the targets share, by staging it without its
+/// children, as [`fan_out::create_shared_ancestors`] orders it.
 async fn precreate_shared_ancestors<'a>(
     walk: &StageWalk,
     shared_ancestors: &'a [DepthPath],
@@ -355,63 +266,26 @@ async fn precreate_shared_ancestors<'a>(
 ) -> Result<AncestorNodes<'a>, StageError> {
     let mut options = walk.options;
     options.no_children = true;
-    let mut nodes = AncestorNodes::with_capacity(shared_ancestors.len());
-    let mut failure: Option<StageError> = None;
-
-    for level in shared_ancestors.chunk_by(|left, right| left.depth() == right.depth()) {
-        if failure.is_some() {
-            break;
-        }
-
-        let mut level_tasks: JoinSet<(usize, Result<crate::node::NodeLink, StageError>)> =
-            JoinSet::new();
-        for (index, ancestor) in level.iter().enumerate() {
-            if failure.is_some() {
-                break;
-            }
-            let walk_path = walk.walk(
-                RelativePath::new_from_clean_parts(ancestor.path(), ""),
-                &nodes,
-            );
-            let operation = walk.operation.clone();
-            let stats = walk.stats.clone();
-            let link_tracker = walk.link_tracker.clone();
-            let global_mask = walk.global_mask.clone();
-            let discards = discards.clone();
-            lore_spawn!(level_tasks, async move {
-                let result = stage::stage_filesystem_path(
-                    operation,
-                    walk_path.at,
-                    walk_path.remainder,
-                    stats,
-                    options,
-                    Some(link_tracker),
-                    global_mask,
-                    walk_path.prefixes,
-                    Some(discards),
-                )
-                .await;
-                (index, result)
-            });
-
-            while let Some(joined) = level_tasks.try_join_next() {
-                collect_precreate(joined, level, &mut nodes, &mut failure);
-            }
-            while level_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
-                && let Some(joined) = level_tasks.join_next().await
-            {
-                collect_precreate(joined, level, &mut nodes, &mut failure);
-            }
-        }
-        while let Some(joined) = level_tasks.join_next().await {
-            collect_precreate(joined, level, &mut nodes, &mut failure);
-        }
-    }
-
-    match failure {
-        Some(err) => Err(err),
-        None => Ok(nodes),
-    }
+    fan_out::create_shared_ancestors(
+        shared_ancestors,
+        |ancestor, nodes| {
+            let walk_path = walk.walk(RelativePath::new_from_clean_parts(ancestor, ""), nodes);
+            stage::stage_filesystem_path(
+                walk.operation.clone(),
+                walk_path.at,
+                walk_path.remainder,
+                walk.stats.clone(),
+                options,
+                Some(walk.link_tracker.clone()),
+                walk.global_mask.clone(),
+                walk_path.prefixes,
+                Some(discards.clone()),
+            )
+            .map(|staged| staged.map(|link| link.is_valid().then_some(link.node)))
+        },
+        |err| StageError::internal_with_context(err, "Failed to join pre-create task"),
+    )
+    .await
 }
 
 /// Spawn a walk per target into `tasks`.
@@ -624,7 +498,7 @@ pub async fn stage(
     };
     let antichain_len = antichain.len();
 
-    let shared_ancestors = shared_ancestors(&antichain);
+    let shared_ancestors = fan_out::shared_ancestors(&antichain);
     let precreate_count = shared_ancestors.len();
 
     let main_count = antichain_len + precreate_count;

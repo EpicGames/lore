@@ -269,6 +269,10 @@ pub struct FilesystemDiffContext {
     /// Every link mount in the compared tree, so a mount is told from a directory only
     /// the filesystem holds. Read from the trees, which is why the caller supplies it.
     pub link_mounts: Arc<Vec<LinkMountInfo>>,
+    /// Where a marking walk holds the nodes it finds stale. `None` has the walk hold them itself
+    /// and discard them once it has drained; a caller running several walks over one tree hands
+    /// each the same queue and discards it once all of them have drained.
+    pub discards: Option<Arc<crate::state::WalkDiscards>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1029,10 +1033,12 @@ pub mod test_util {
     use crate::fs::filesystem_provider::InstanceOperation;
     use crate::lore::Address;
     use crate::node::Node;
+    use crate::node::NodeID;
     use crate::repository::RepositoryContext;
     use crate::state::ChangeStream;
     use crate::state::FilesystemDiffStats;
     use crate::state::NodeComparison;
+    use crate::state::StateError;
     use crate::util::path::RelativePath;
 
     /// Answers the reads and the directory create these tests make, and records each finalize.
@@ -1045,6 +1051,11 @@ pub mod test_util {
         pub finalize_fails: bool,
         pub write_fails: bool,
         pub holds_paths: bool,
+        /// Paths whose scan fails, as one over a working tree that cannot be read does.
+        pub failing_scans: Arc<Mutex<Vec<String>>>,
+        /// Paths whose scan finds the named node of the tree it walks stale, and queues it for
+        /// discarding where it is handed a queue.
+        pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
     }
 
     impl TestOperation {
@@ -1074,11 +1085,33 @@ pub mod test_util {
 
     impl InstanceOperation for TestOperation {
         /// Reports a working tree holding exactly what the state does, which is what a walk over a
-        /// tree with nothing to reconcile answers.
+        /// tree with nothing to reconcile answers, except where the provider was told the path's
+        /// scan fails or finds a node stale.
         fn changes_from_filesystem_to_state(
             &self,
-            _diff: FilesystemDiffContext,
+            diff: FilesystemDiffContext,
         ) -> ChangeStream<FilesystemDiffStats> {
+            let path = diff.filesystem_path.as_str();
+            if let Some(discards) = diff.discards.as_ref() {
+                let stale: Vec<NodeID> = self
+                    .stale_on_scan
+                    .lock()
+                    .iter()
+                    .filter(|(stale_path, _)| stale_path == path)
+                    .map(|(_, node)| *node)
+                    .collect();
+                discards.queue(diff.from.state.clone(), diff.from.repository.clone(), stale);
+            }
+            if self
+                .failing_scans
+                .lock()
+                .iter()
+                .any(|failing| failing == path)
+            {
+                return ChangeStream::spawn(|_changes| async {
+                    Err(StateError::internal("The working tree cannot be read"))
+                });
+            }
             ChangeStream::nothing()
         }
 

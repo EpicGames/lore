@@ -641,6 +641,12 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
 
     let result = run_command(globals, args.into(), callback) as u8;
 
+    for files in [&staged, &unmerged, &unstaged] {
+        files
+            .lock()
+            .sort_unstable_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    }
+
     // CLI process, so this is the user's terminal directory.
     #[allow(clippy::disallowed_methods)]
     let cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
