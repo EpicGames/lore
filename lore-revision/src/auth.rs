@@ -28,3 +28,19 @@ pub struct LoreAuthUrlEventData {
     /// Authentication URL
     pub url: LoreString,
 }
+
+/// Event data for one wait in an interactive login: the user has not
+/// approved it yet, and the client is about to wait `interval_secs` before
+/// asking again. Emitted once per poll, so a consumer can show that the
+/// login is still in progress against a provider with a long interval.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreAuthPendingEventData {
+    /// Whole seconds since polling began.
+    pub elapsed_secs: u64,
+    /// Whole seconds until the next poll.
+    pub interval_secs: u64,
+    /// Whole seconds left before the session expires unapproved.
+    pub remaining_secs: u64,
+}

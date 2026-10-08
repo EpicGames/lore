@@ -21,6 +21,7 @@ mod tests {
     use lore_base::error::NotSupported;
     use lore_revision::lore::RepositoryId;
     use lore_transport::AuthSession;
+    use lore_transport::AuthSessionPoll;
     use lore_transport::Authentication;
     use lore_transport::AuthenticationToken;
     use lore_transport::AuthorizationToken;
@@ -80,8 +81,8 @@ mod tests {
             _client_state: &str,
             _session_code: &str,
             _correlation_id: &str,
-        ) -> Result<Option<AuthenticationToken>, ProtocolError> {
-            Ok(None)
+        ) -> Result<AuthSessionPoll, ProtocolError> {
+            Ok(AuthSessionPoll::Pending)
         }
 
         async fn exchange_external_token(

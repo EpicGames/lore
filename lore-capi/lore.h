@@ -3266,6 +3266,19 @@ typedef struct lore_branch_push_stats_event_data_t {
   uint64_t put;
 } lore_branch_push_stats_event_data_t;
 
+// Event data for one wait in an interactive login: the user has not
+// approved it yet, and the client is about to wait `interval_secs` before
+// asking again. Emitted once per poll, so a consumer can show that the
+// login is still in progress against a provider with a long interval.
+typedef struct lore_auth_pending_event_data_t {
+  // Whole seconds since polling began.
+  uint64_t elapsed_secs;
+  // Whole seconds until the next poll.
+  uint64_t interval_secs;
+  // Whole seconds left before the session expires unapproved.
+  uint64_t remaining_secs;
+} lore_auth_pending_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3736,6 +3749,8 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_COMMIT_STATS,
   // What a push has cost so far, or in total once it has finished.
   LORE_EVENT_BRANCH_PUSH_STATS,
+  // An interactive login is still waiting for the user's approval.
+  LORE_EVENT_AUTH_PENDING,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3975,6 +3990,7 @@ typedef struct lore_event_t {
     struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
     struct lore_revision_commit_stats_event_data_t revision_commit_stats;
     struct lore_branch_push_stats_event_data_t branch_push_stats;
+    struct lore_auth_pending_event_data_t auth_pending;
   };
 } lore_event_t;
 
@@ -6359,6 +6375,7 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
                                     const struct lore_auth_login_interactive_args_t *args,
@@ -6386,6 +6403,7 @@ int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
                                        const struct lore_auth_login_interactive_args_t *args,

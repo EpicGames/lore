@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
 use async_trait::async_trait;
 use lore_base::error::NotSupported;
 use lore_base::types::RepositoryId;
@@ -23,6 +25,14 @@ use crate::types::*;
 /// honours plaintext for loopback hosts and upgrades any other http URL to
 /// https (see [`grpc_endpoint`]).
 pub const SCHEMES: [&str; 3] = ["ucs-auth", "https", "http"];
+
+/// The polling cadence the UCS Auth API expects. The API does not report
+/// one, so the client supplies the default cadence.
+pub const SESSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a UCS Auth login session is polled before the client gives up.
+/// The API does not report a lifetime, so returns the default.
+pub const SESSION_LIFETIME: Duration = Duration::from_secs(150);
 
 /// Strips the custom scheme from an auth URL and returns a URL suitable for
 /// gRPC connection.
@@ -126,6 +136,9 @@ impl Authentication for UcsAuthentication {
         Ok(AuthSession {
             session_code: inner.session_code,
             login_url: inner.login_url,
+            user_code: String::new(),
+            interval: SESSION_POLL_INTERVAL,
+            expires_in: SESSION_LIFETIME,
         })
     }
 
@@ -135,7 +148,7 @@ impl Authentication for UcsAuthentication {
         client_state: &str,
         session_code: &str,
         _correlation_id: &str,
-    ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+    ) -> Result<AuthSessionPoll, ProtocolError> {
         let mut client = connect_client(auth_url).await?;
 
         let request = GetAuthSessionRequest {
@@ -148,7 +161,7 @@ impl Authentication for UcsAuthentication {
             .map_err(ProtocolError::from)?;
 
         match res.into_inner().user_token {
-            Some(token) => Ok(Some(AuthenticationToken {
+            Some(token) => Ok(AuthSessionPoll::Complete(AuthenticationToken {
                 token: token.user_token,
                 user_id: token.user_id,
                 user_name: token.user_name,
@@ -156,8 +169,9 @@ impl Authentication for UcsAuthentication {
                 // Populated by orchestration layer via JWT decode, not the proto response
                 acceptable_root_domains: Vec::new(),
                 refresh_token: None,
+                scope: None,
             })),
-            None => Ok(None),
+            None => Ok(AuthSessionPoll::Pending),
         }
     }
 
@@ -192,6 +206,7 @@ impl Authentication for UcsAuthentication {
             // Populated by orchestration layer via JWT decode, not the proto response
             acceptable_root_domains: Vec::new(),
             refresh_token: None,
+            scope: None,
         })
     }
 

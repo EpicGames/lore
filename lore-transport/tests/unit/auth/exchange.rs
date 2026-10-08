@@ -127,6 +127,7 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
     use lore_transport::error::ProtocolError;
     use lore_transport::traits::Authentication;
     use lore_transport::types::AuthSession;
+    use lore_transport::types::AuthSessionPoll;
     use lore_transport::types::AuthenticationToken;
     use lore_transport::types::AuthorizationToken;
 
@@ -184,7 +185,7 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
             _client_state: &str,
             _session_code: &str,
             _correlation_id: &str,
-        ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+        ) -> Result<AuthSessionPoll, ProtocolError> {
             Err(ProtocolError::internal(
                 "the stub only serves authorization exchanges",
             ))

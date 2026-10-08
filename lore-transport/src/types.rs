@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
 use bytes::Bytes;
 use lore_base::types::*;
 use serde::Deserialize;
@@ -255,10 +257,32 @@ pub struct MetadataSetResult {
 /// Result of an interactive login session initiation.
 #[derive(Clone, Debug)]
 pub struct AuthSession {
-    /// Opaque session identifier for polling.
+    /// Opaque session identifier for polling. The device grant's
+    /// `device_code`.
     pub session_code: String,
-    /// URL the user should visit to authenticate.
+    /// URL the user should visit to authenticate. The device grant's
+    /// `verification_uri_complete`.
     pub login_url: String,
+    /// Code the user types at `login_url` from another machine. Empty when
+    /// the backend embeds it in `login_url` and offers no other entry.
+    pub user_code: String,
+    /// Minimum time between two polls of the session.
+    pub interval: Duration,
+    /// How long the session stays open for approval, counted from when it
+    /// was started.
+    pub expires_in: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthSessionPoll {
+    /// The user has not approved the login yet. Poll again after the
+    /// session's `interval`.
+    Pending,
+    /// The user has not approved the login yet, and the backend wants a
+    /// longer gap before the next poll than the session's `interval`.
+    SlowDown,
+    /// The user approved the login and the backend issued a token.
+    Complete(AuthenticationToken),
 }
 
 /// Authentication token with user identity metadata.
@@ -283,6 +307,9 @@ pub struct AuthenticationToken {
     /// without re-authenticating. `None` if the auth backend does not support
     /// refresh. Consumed on use -- the next refresh returns a new one.
     pub refresh_token: Option<String>,
+    /// The scope the backend granted, space-delimited as RFC 6749 §3.3 has
+    /// it. `None` when the backend reports no scope.
+    pub scope: Option<String>,
 }
 
 /// Authorization token scoped to a specific resource.

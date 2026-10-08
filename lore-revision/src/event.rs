@@ -10,6 +10,7 @@ use lore_macro::VariantTypeSize;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::auth::LoreAuthPendingEventData;
 use crate::auth::LoreAuthUrlEventData;
 use crate::auth::userinfo::LoreAuthIdentityEventData;
 use crate::auth::userinfo::LoreAuthUserInfoEventData;
@@ -1312,6 +1313,8 @@ pub enum LoreEvent {
     RevisionCommitStats(LoreRevisionCommitStatsEventData),
     /// What a push has cost so far, or in total once it has finished.
     BranchPushStats(LoreBranchPushStatsEventData),
+    /// An interactive login is still waiting for the user's approval.
+    AuthPending(LoreAuthPendingEventData),
 }
 
 impl LoreEvent {

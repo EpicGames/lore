@@ -76,6 +76,8 @@ lore-revision = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
+# `start_paused` for the tests that drive a polling loop on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 
 [features]

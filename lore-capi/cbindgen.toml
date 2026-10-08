@@ -114,6 +114,7 @@ include = [
 "LoreAuthUserInfoArgs" = "lore_auth_user_info_args_t"
 "LoreAuthLoginWithTokenArgs" = "lore_auth_login_with_token_args_t"
 "LoreAuthUrlEventData" = "lore_auth_url_event_data_t"
+"LoreAuthPendingEventData" = "lore_auth_pending_event_data_t"
 "LoreAuthLoginInteractiveArgs" = "lore_auth_login_interactive_args_t"
 "LoreAuthUserInfoEventData" = "lore_auth_user_info_event_data_t"
 "LoreAuthUserTokenEventData" = "lore_auth_user_token_event_data_t"
