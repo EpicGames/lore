@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Re-encodes Oodle-compressed payloads held in a local immutable store.
+//! Re-encodes Oodle-compressed payloads held only in a local immutable store.
 //!
 //! Oodle is no longer a supported codec: nothing writes it, and a build without the `oodle`
 //! feature cannot decode it, so a payload still encoded with it is unreadable the moment support
-//! is removed.
+//! is removed. A durably stored payload is not re-encoded on its own account: a read that cannot
+//! decode one replaces it with the remote's encoding. It still adopts the re-encoded payload of
+//! a local-only entry with the same hash that the pass reaches first.
 //!
 //! A pass is resumable and idempotent: progress is recorded per group, and a re-encoded entry no
 //! longer carries `PayloadCompressedOodle2`.
@@ -42,7 +44,7 @@ const MIGRATION_UPDATE_NUM_ENTRIES: usize = 10_000;
 struct MigrationCounts {
     migrated: usize,
     invalid: usize,
-    durably_skipped: usize,
+    durably_left: usize,
 }
 
 /// Warn about `entry`, naming the packfile location a reader needs to inspect the payload.
@@ -90,10 +92,10 @@ async fn migrate_bucket(
         num_entries += 1;
         if num_entries % MIGRATION_UPDATE_NUM_ENTRIES == 0 {
             lore_info!(
-                "Group '{group_index}' bucket '{bucket_index}' migration: {} Oodle migrated, {} Invalid Oodle, {} Skipped because durably stored",
+                "Group '{group_index}' bucket '{bucket_index}' migration: {} Oodle migrated, {} Invalid Oodle, {} Left because durably stored",
                 counts.migrated,
                 counts.invalid,
-                counts.durably_skipped
+                counts.durably_left
             );
         }
 
@@ -109,16 +111,13 @@ async fn migrate_bucket(
         if entry.data.flags & FragmentFlags::PayloadCompressedOodle2 == 0 {
             continue;
         }
-        // A durable payload is held upstream, where it is re-encoded on ingress, so the local
-        // copy is a cache of bytes that are about to become undecodable. Releasing it is cheaper
-        // than re-encoding it and loses nothing: the next read misses locally and refetches the
-        // upstream encoding.
+        // A durable payload is held upstream, where it is re-encoded on ingress. Leaving the
+        // entry untouched keeps the bucket clean, so a group holding nothing else costs no
+        // rewrite; a read that cannot decode the local copy refetches the upstream encoding and
+        // overwrites it. A durable entry later in a run led by a local-only one is not reached
+        // here: it adopts the leader's re-encoded payload below.
         if entry.data.flags & FragmentFlags::PayloadStoredDurable != 0 {
-            counts.durably_skipped += 1;
-            let entry = &mut bucket.entry[entry_index];
-            entry.data.pack_file = 0;
-            entry.data.pack_offset = 0;
-            entry.data.flags &= !FragmentFlags::PayloadStoredLocal;
+            counts.durably_left += 1;
             continue;
         }
 
@@ -215,6 +214,9 @@ async fn migrate_bucket(
         };
         counts.migrated += 1;
 
+        // Durable siblings adopt the payload as well. It holds the same content, checked against
+        // the hash above, in a form this build decodes, and the leader has already dirtied the
+        // bucket they share, so adopting costs nothing and saves the sibling a refetch.
         while next_entry < bucket.sorted_index.len() {
             let sibling_index = bucket.sorted_index[next_entry] as usize;
             if bucket.entry[sibling_index].address.hash != entry.address.hash {
@@ -229,7 +231,7 @@ async fn migrate_bucket(
         }
     }
 
-    if counts.migrated > 0 || counts.durably_skipped > 0 {
+    if counts.migrated > 0 {
         group.dirty[bucket_index].store(true, Ordering::Relaxed);
     }
 
@@ -292,7 +294,7 @@ async fn migrate_group(
             Ok(bucket_counts) => {
                 counts.migrated += bucket_counts.migrated;
                 counts.invalid += bucket_counts.invalid;
-                counts.durably_skipped += bucket_counts.durably_skipped;
+                counts.durably_left += bucket_counts.durably_left;
             }
             Err(err) => result = result.and(Err(err)),
         }
@@ -308,10 +310,10 @@ async fn migrate_group(
     .await?;
 
     lore_info!(
-        "Group '{group_index}' migrated: {} Oodle migrated, {} Invalid Oodle, {} Skipped because durably stored",
+        "Group '{group_index}' migrated: {} Oodle migrated, {} Invalid Oodle, {} Left because durably stored",
         counts.migrated,
         counts.invalid,
-        counts.durably_skipped
+        counts.durably_left
     );
     Ok(())
 }

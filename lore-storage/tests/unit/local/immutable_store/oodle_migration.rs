@@ -295,7 +295,7 @@ mod migrate_bucket {
 
         let (after, matched) = observed(&store, address).await;
         assert_eq!(counts.migrated, 0);
-        assert_eq!(counts.durably_skipped, 0);
+        assert_eq!(counts.durably_left, 0);
         assert_eq!(counts.invalid, 0);
         assert_eq!(after.flags, before.flags);
         assert!(!matched.stored_local);
@@ -316,7 +316,7 @@ mod migrate_bucket {
 
         let (after, matched) = observed(&store, address).await;
         assert_eq!(counts.migrated, 0);
-        assert_eq!(counts.durably_skipped, 0);
+        assert_eq!(counts.durably_left, 0);
         assert_eq!(counts.invalid, 0);
         assert_eq!(after.flags, before.flags);
         assert_eq!(after.size_payload, before.size_payload);
@@ -324,41 +324,34 @@ mod migrate_bucket {
         assert_eq!(content(&store, address).await, payload);
     }
 
-    /// A durable payload is held upstream, so the local copy is released rather than re-encoded
-    /// and the next read refetches it. A release that never reaches disk is not a release, so it
-    /// has to survive a reopen.
+    /// A durable payload is held upstream, so the local copy is left exactly as it is, and a
+    /// bucket holding nothing else stays clean and costs its group no rewrite.
     #[tokio::test]
-    async fn a_durable_entry_releases_its_local_payload() {
-        let dir = lore_base::test_util::TempDir::new("om_durable_");
+    async fn a_durable_entry_is_left_alone_and_its_bucket_clean() {
+        let (_dir, store) = open_store("om_durable_").await;
         let payload = compressible(3, 4096);
         let address = address_of(&payload, 0);
+        put_as_oodle(&store, address, &payload).await;
+        store.mark_all_as_durably_stored().await;
+        flush(&store).await;
+        let (before, _) = observed(&store, address).await;
 
-        {
-            let store = reopen(dir.path()).await;
-            put_as_oodle(&store, address, &payload).await;
-            store.mark_all_as_durably_stored().await;
-            flush(&store).await;
+        let counts = migrate_bucket_holding(&store, address)
+            .await
+            .expect("migration succeeds");
 
-            let counts = migrate_bucket_holding(&store, address)
-                .await
-                .expect("migration succeeds");
-            assert_eq!(counts.durably_skipped, 1);
-            assert_eq!(counts.migrated, 0);
-
-            let (_, matched) = observed(&store, address).await;
-            assert!(!matched.stored_local, "the local copy was released");
-            assert!(
-                matched.stored_durable,
-                "durability is what made releasing it safe"
-            );
-
-            flush(&store).await;
-        }
-
-        let store = reopen(dir.path()).await;
-        let (_, matched) = observed(&store, address).await;
-        assert!(!matched.stored_local, "the release has to reach disk");
+        let (after, matched) = observed(&store, address).await;
+        assert_eq!(counts.durably_left, 1);
+        assert_eq!(counts.migrated, 0);
+        assert_eq!(after.flags, before.flags);
+        assert_eq!(after.size_payload, before.size_payload);
+        assert!(matched.stored_local);
         assert!(matched.stored_durable);
+        assert_eq!(content(&store, address).await, payload);
+
+        let group = &store.group[group_of(&address)];
+        let (bucket_index, _bucket) = lock_bucket_for_hash(group, &address.hash).await;
+        assert!(!group.dirty[bucket_index].load(Ordering::Relaxed));
     }
 
     /// The bucket a pass finds on a reopened store has not been deserialized yet, which is the
@@ -454,7 +447,8 @@ mod migrate_bucket {
     }
 
     /// Durability is a fact about one (partition, address) pair, not about the payload a run
-    /// shares, so an adopting sibling must not inherit the leader's.
+    /// shares, so an adopting sibling must not inherit the leader's. A durable sibling still
+    /// adopts the payload a local-only leader was re-encoded to.
     #[tokio::test]
     async fn an_adopting_sibling_keeps_its_own_durability() {
         let (_dir, store) = open_store("om_dedup_durable_").await;
@@ -474,10 +468,19 @@ mod migrate_bucket {
             .expect("migration succeeds");
 
         let (_, leader) = observed(&store, addresses[0]).await;
-        let (_, sibling) = observed(&store, addresses[1]).await;
+        let (sibling_fragment, sibling) = observed(&store, addresses[1]).await;
         assert!(!leader.stored_durable);
         assert!(sibling.stored_durable);
         assert!(leader.stored_local && sibling.stored_local);
+        assert_eq!(
+            sibling_fragment.flags & FragmentFlags::PayloadCompressedOodle2.bits(),
+            0,
+            "the durable sibling kept its Oodle payload rather than adopting the leader's"
+        );
+        assert_ne!(
+            sibling_fragment.flags & FragmentFlags::PayloadCompressedZstd.bits(),
+            0
+        );
         assert_eq!(content(&store, addresses[1]).await, payload);
     }
 
@@ -541,7 +544,7 @@ mod migrate_bucket {
 
         assert_eq!(counts.migrated, 0);
         assert_eq!(counts.invalid, 0);
-        assert_eq!(counts.durably_skipped, 0);
+        assert_eq!(counts.durably_left, 0);
     }
 }
 
@@ -713,11 +716,13 @@ mod migrate_groups {
             -1
         );
 
-        let (_, matched) = observed(&store, durable_address).await;
-        assert!(
-            !matched.stored_local,
-            "a durable payload is released, not re-encoded"
+        let (fragment, matched) = observed(&store, durable_address).await;
+        assert_ne!(
+            fragment.flags & FragmentFlags::PayloadCompressedOodle2.bits(),
+            0,
+            "a durable payload is left as it is, not re-encoded"
         );
+        assert!(matched.stored_local);
         assert!(matched.stored_durable);
 
         let (fragment, matched) = observed(&store, local_address).await;
