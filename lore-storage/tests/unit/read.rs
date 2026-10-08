@@ -2088,3 +2088,121 @@ async fn read_into_single_fragment_respects_range() {
 
     assert_eq!(&out[..], &payload[10..50]);
 }
+
+#[cfg(not(feature = "oodle"))]
+mod load_fragment_of_undecodable_oodle {
+    use lore_transport::ProtocolError;
+    use lore_transport::StorageSession;
+
+    use super::*;
+
+    /// Store a payload under flags claiming it is Oodle-encoded, durably stored or not. A build
+    /// without Oodle cannot decode it.
+    async fn put_oodle(
+        store: &Arc<dyn ImmutableStore>,
+        seed: u8,
+        durable: bool,
+    ) -> (Partition, Address) {
+        let (partition, address, fragment, payload) = make_input(seed);
+        let mut flags = fragment.flags | FragmentFlags::PayloadCompressedOodle2.bits();
+        if durable {
+            flags |= FragmentFlags::PayloadStoredDurable.bits();
+        }
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                Fragment { flags, ..fragment },
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("put the Oodle-flagged entry");
+        (partition, address)
+    }
+
+    /// A session whose remote holds nothing, so a read that asks it reports a miss.
+    fn empty_remote() -> Arc<StorageSession> {
+        Arc::new(StorageSession::pending(|| async {
+            Err(ProtocolError::from(lore_base::error::NotFound))
+        }))
+    }
+
+    /// With no remote to replace it from, the payload is reported as undecodable rather than
+    /// missing, since it is held.
+    #[tokio::test]
+    async fn is_reported_not_supported_without_a_remote() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address) = put_oodle(&store, 0xa1, true).await;
+
+        let err = load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default().no_remote(),
+            None,
+        )
+        .await
+        .expect_err("an Oodle payload cannot be decoded by this build");
+
+        assert!(err.is_not_supported(), "unexpected error: {err:?}");
+    }
+
+    /// A read allowed to fall back to the remote but handed no session has nothing to fetch
+    /// from either, and reports the same.
+    #[tokio::test]
+    async fn is_reported_not_supported_without_a_session() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address) = put_oodle(&store, 0xa2, true).await;
+
+        let err = load_fragment(store, partition, address, ReadOptions::default(), None)
+            .await
+            .expect_err("an Oodle payload cannot be decoded by this build");
+
+        assert!(err.is_not_supported(), "unexpected error: {err:?}");
+    }
+
+    /// A durably stored payload is fetched from the remote, so what the remote answers is what
+    /// the read reports.
+    #[tokio::test]
+    async fn is_fetched_from_the_remote_when_durable() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address) = put_oodle(&store, 0xa3, true).await;
+
+        let err = load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(empty_remote()),
+        )
+        .await
+        .expect_err("the remote holds nothing");
+
+        assert!(
+            matches!(err, StorageError::AddressNotFound(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// A local-only payload has no copy upstream, so it is reported as undecodable without
+    /// asking the remote.
+    #[tokio::test]
+    async fn is_reported_not_supported_when_local_only() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address) = put_oodle(&store, 0xa4, false).await;
+
+        let err = load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(empty_remote()),
+        )
+        .await
+        .expect_err("an Oodle payload cannot be decoded by this build");
+
+        assert!(err.is_not_supported(), "unexpected error: {err:?}");
+    }
+}

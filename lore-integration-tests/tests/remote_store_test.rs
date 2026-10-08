@@ -9,6 +9,7 @@ mod remote_store_tests {
     use std::time::Duration;
 
     use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::FragmentFlags;
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
     use lore_revision::environment::EnvironmentConfig;
@@ -338,6 +339,79 @@ mod remote_store_tests {
                 assert_eq!(payload, got_payload);
                 assert_eq!(fragment.size_payload, got_fragment.size_payload);
                 assert_eq!(fragment.size_content, got_fragment.size_content);
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// A durably stored local payload in an encoding this build no longer decodes is replaced by
+    /// the remote's copy on the first read, even one that does not ask to cache, so later reads
+    /// are answered locally.
+    #[tokio::test]
+    async fn an_undecodable_durable_local_payload_is_replaced_from_the_remote() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let repository = random::<RepositoryId>();
+                let (fragment, address, payload) = fragment::generate_random();
+                server
+                    .immutable_store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload.clone()), false)
+                    .await?;
+
+                let local = lore_storage::local::immutable_store::create(
+                    None::<&str>,
+                    ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings {
+                        implicit_durable_stored: false,
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                let oodle = lore_base::types::Fragment {
+                    flags: fragment.flags
+                        | (FragmentFlags::PayloadCompressedOodle2
+                            | FragmentFlags::PayloadStoredDurable)
+                            .bits(),
+                    ..fragment
+                };
+                local
+                    .clone()
+                    .put(repository, address, oodle, Some(payload.clone()), false)
+                    .await?;
+
+                let session = server.immutable_store.session(repository).await?;
+                let options = lore_storage::ReadOptions::default();
+                assert!(!options.cache, "the read under test does not ask to cache");
+                let (_, content) = lore_storage::read::load_fragment(
+                    local.clone(),
+                    repository,
+                    address,
+                    options,
+                    Some(session),
+                )
+                .await?;
+                assert_eq!(content, payload);
+
+                let stored = local.clone().get_metadata(repository, address).await?;
+                assert_eq!(
+                    stored.fragment.flags & FragmentFlags::PayloadCompressedOodle2.bits(),
+                    0,
+                    "the local entry still claims Oodle"
+                );
+                let (_, content) = lore_storage::read::load_fragment(
+                    local,
+                    repository,
+                    address,
+                    options.no_remote(),
+                    None,
+                )
+                .await?;
+                assert_eq!(content, payload);
 
                 Ok(())
             })

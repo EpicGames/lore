@@ -237,19 +237,30 @@ pub async fn load_fragment(
 
     enum LocalFailure {
         Corrupt,
+        /// A durably stored payload in an encoding this build no longer decodes, which the remote
+        /// holds re-encoded. Carries the decode error to report when there is no remote to fetch
+        /// from.
+        DurableMigrated(StorageError),
         Other,
     }
 
     // Callers that bind a handle to remote-only mode disable the local probe entirely via
     // `options.local`.
-    let decompress_result = if options.local {
+    let local_failure = if options.local {
         let local_result = read_raw(store.clone(), partition, address, options.verify).await;
 
         // Decompress + verify local data
         match local_result {
             Ok((fragment, buffer)) => {
+                let durable_oodle = (fragment.flags & FragmentFlags::PayloadCompressedOodle2) != 0
+                    && (fragment.flags & FragmentFlags::PayloadStoredDurable) != 0;
                 match decompress_and_verify(fragment, buffer, address, options) {
-                    Ok((fragment, buffer)) => Ok((fragment, buffer)),
+                    Ok((fragment, buffer)) => return Ok((fragment, buffer)),
+                    // The remote re-encodes Oodle on ingress, so it holds a durable payload in a
+                    // form this build decodes. A local-only one has no such copy to fall back on.
+                    Err(err) if durable_oodle && matches!(err, StorageError::NotSupported(_)) => {
+                        LocalFailure::DurableMigrated(err)
+                    }
                     Err(err) if matches!(err, StorageError::NotSupported(_)) => return Err(err),
                     Err(err) => {
                         lore_base::lore_debug!(
@@ -260,7 +271,7 @@ pub async fn load_fragment(
                             false,
                             "Local store data failed decompression or verification"
                         );
-                        Err(LocalFailure::Corrupt)
+                        LocalFailure::Corrupt
                     }
                 }
             }
@@ -269,29 +280,28 @@ pub async fn load_fragment(
                     "Fragment {} failed loading from local store: {e:?}",
                     address.hash
                 );
-                Err(LocalFailure::Other)
+                LocalFailure::Other
             }
         }
     } else {
-        Err(LocalFailure::Other)
+        LocalFailure::Other
     };
 
-    let local_corrupt = matches!(decompress_result, Err(LocalFailure::Corrupt));
-    if let Ok((fragment, payload)) = decompress_result {
-        return Ok((fragment, payload));
-    }
-
-    // No remote session -> nothing more to try
-    if !options.remote {
-        return Err(StorageError::from(crate::errors::AddressNotFound::from(
-            address,
-        )));
-    }
-    let Some(session) = remote_session else {
-        return Err(StorageError::from(crate::errors::AddressNotFound::from(
-            address,
-        )));
-    };
+    // The failure is consumed here rather than kept, so the future does not carry it across the
+    // fetch. A corrupt or undecodable local entry has to be overwritten, not deduplicated against.
+    let (session, local_corrupt, local_replace) =
+        match (options.remote, remote_session, local_failure) {
+            (true, Some(session), LocalFailure::Corrupt) => (session, true, true),
+            (true, Some(session), LocalFailure::DurableMigrated(_)) => (session, false, true),
+            (true, Some(session), LocalFailure::Other) => (session, false, false),
+            // The payload is there, just undecodable, which a miss would misreport.
+            (_, _, LocalFailure::DurableMigrated(err)) => return Err(err),
+            (_, _, LocalFailure::Corrupt | LocalFailure::Other) => {
+                return Err(StorageError::from(crate::errors::AddressNotFound::from(
+                    address,
+                )));
+            }
+        };
 
     lore_base::lore_trace!("Fetch immutable fragment {} from remote", address);
 
@@ -310,16 +320,16 @@ pub async fn load_fragment(
         match decompress_and_verify(fragment, buffer, address, options) {
             Ok((fragment, buffer)) => {
                 // Cache the fragment locally. Skip the put entirely when
-                // caching is disabled and data is not corrupt and has no
+                // caching is disabled, no local entry needs replacing, and the data has no
                 // local cache priority flag -- matching the original two-level
                 // gate in urc-core's load_raw.
                 let should_store = options.cache
-                    || local_corrupt
+                    || local_replace
                     || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
 
                 if should_store {
                     let local_payload = if options.cache
-                        || local_corrupt
+                        || local_replace
                         || (fragment.flags & FragmentFlags::PayloadLocalCachePriority)
                             == FragmentFlags::PayloadLocalCachePriority
                     {
@@ -327,7 +337,7 @@ pub async fn load_fragment(
                     } else {
                         None
                     };
-                    let force = local_corrupt;
+                    let force = local_replace;
                     let _ = store
                         .clone()
                         .put(partition, address, store_fragment, local_payload, force)
