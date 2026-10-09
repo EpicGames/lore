@@ -1872,11 +1872,7 @@ pub async fn create_immutable_store_at_path(
         Some(path.as_path()),
         create_options,
         false, /* Don't deserialize all buckets on load */
-        ImmutableStoreSettings {
-            protect_local_fragment: true, /* Protect local fragments from eviction */
-            verify_write,
-            ..Default::default()
-        },
+        crate::store::immutable::client_settings(verify_write),
     )
     .await
     .forward::<RepositoryError>("Failed to create local store")?;

@@ -1805,6 +1805,11 @@ impl LocalImmutableStore {
                 // If we have a previous payload or if no payload was given there is
                 // no update to do and we can early out - unless force write payload
                 if (!force && data.pack_file != 0) || payload.is_none() {
+                    let updated = current_flags != data.flags;
+                    drop(bucket);
+                    if updated {
+                        self.flush_later(group_index, current_flags).await;
+                    }
                     return Ok(());
                 }
             }
@@ -1920,25 +1925,7 @@ impl LocalImmutableStore {
 
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
         drop(bucket);
-
-        {
-            let mut flush = group.flush.lock().await;
-            let _ = flush.try_join_next();
-
-            let stored_durable = fragment_flags & FragmentFlags::PayloadStoredDurable
-                == FragmentFlags::PayloadStoredDurable;
-            if (!stored_durable || self.settings.flush_background) && flush.is_empty() {
-                let weak_self = Arc::downgrade(&self);
-                lore_base::lore_spawn!(
-                    flush,
-                    ImmutableStoreGroup::flush_delayed(
-                        weak_self,
-                        group_index,
-                        self.settings.flush_delay_seconds,
-                    )
-                );
-            }
-        }
+        self.flush_later(group_index, fragment_flags).await;
 
         if self.settings.verify_write
             && pack_file != 0
@@ -2188,23 +2175,33 @@ impl LocalImmutableStore {
 
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
         drop(bucket);
+        self.flush_later(group_index, FragmentFlags::PayloadObliterated.bits())
+            .await;
 
-        let mut flush = group.flush.lock().await;
+        Ok(())
+    }
+
+    /// Starts the group's delayed flush unless one is pending, after an index change that leaves
+    /// an entry with `flags`. A change to a durable entry waits for an explicit flush unless
+    /// [`ImmutableStoreSettings::flush_background`] is set, since it is stored upstream as well.
+    async fn flush_later(self: &Arc<Self>, group_index: usize, flags: u32) {
+        if flags & FragmentFlags::PayloadStoredDurable == FragmentFlags::PayloadStoredDurable
+            && !self.settings.flush_background
+        {
+            return;
+        }
+        let mut flush = self.group[group_index].flush.lock().await;
         let _ = flush.try_join_next();
-
         if flush.is_empty() {
-            let weak_self = Arc::downgrade(&self);
             lore_base::lore_spawn!(
                 flush,
                 ImmutableStoreGroup::flush_delayed(
-                    weak_self,
+                    Arc::downgrade(self),
                     group_index,
                     self.settings.flush_delay_seconds,
                 )
             );
         }
-
-        Ok(())
     }
 
     pub async fn load(
@@ -4280,7 +4277,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 .merge_from_copy_source(source_data, behavior.durable);
             if entry.data != before {
                 entry.data.last_access = Self::last_access();
+                let flags = entry.data.flags;
                 group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+                drop(bucket);
+                self.flush_later(group_index, flags).await;
             }
             return Ok(());
         }
@@ -4297,6 +4297,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             data,
         });
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        drop(bucket);
+        self.flush_later(group_index, data.flags).await;
 
         Ok(())
     }

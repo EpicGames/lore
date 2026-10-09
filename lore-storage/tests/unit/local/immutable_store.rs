@@ -104,6 +104,170 @@ fn client_settings() -> ImmutableStoreSettings {
     }
 }
 
+/// A client store over `dir` flushing after no delay, in the background as `flush_background`
+/// says.
+async fn open_flushing(dir: &Path, flush_background: bool) -> Arc<LocalImmutableStore> {
+    LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            flush_background,
+            flush_delay_seconds: 0,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens")
+}
+
+/// Whether a delayed flush was pending for `address`'s group, having awaited it.
+async fn awaited_flush(store: &LocalImmutableStore, address: Address) -> bool {
+    store.group[address.hash.data()[0] as usize]
+        .flush
+        .lock()
+        .await
+        .join_next()
+        .await
+        .is_some()
+}
+
+/// A fragment of `payload` stored with `flags`.
+fn stored_fragment(payload: &Bytes, flags: FragmentFlags) -> Fragment {
+    Fragment {
+        flags: flags.as_u32(),
+        size_payload: payload.len() as u32,
+        size_content: payload.len() as u64,
+    }
+}
+
+/// A durable write schedules the delayed flush only with `flush_background`, so only then does
+/// its entry reach the on-disk index without an explicit flush.
+#[tokio::test]
+async fn a_durable_write_reaches_the_index_only_with_background_flush() {
+    let partition = Partition::from([9u8; 16]);
+    let (address, payload) = payload_off_bucket_zero(0);
+    let fragment = stored_fragment(&payload, FragmentFlags::PayloadStoredDurable);
+    for flush_background in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_durable_flush_");
+        {
+            let store = open_flushing(dir.path(), flush_background).await;
+            let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+            dyn_store
+                .put(partition, address, fragment, Some(payload.clone()), false)
+                .await
+                .expect("put succeeds");
+            assert_eq!(awaited_flush(&store, address).await, flush_background);
+        }
+        let store: Arc<dyn lore_storage::immutable_store::ImmutableStore> =
+            open_flushing(dir.path(), flush_background).await;
+        assert_eq!(
+            store.get(partition, address).await.is_ok(),
+            flush_background,
+            "flush_background {flush_background}"
+        );
+    }
+}
+
+/// Marking a flushed local entry durable, without a payload to store, reaches the on-disk index
+/// in the background only with `flush_background`.
+#[tokio::test]
+async fn a_durable_mark_on_a_local_entry_reaches_the_index_only_with_background_flush() {
+    let partition = Partition::from([9u8; 16]);
+    let (address, payload) = payload_off_bucket_zero(0);
+    for flush_background in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_durable_mark_");
+        {
+            let store = open_flushing(dir.path(), flush_background).await;
+            let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+            dyn_store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    stored_fragment(&payload, FragmentFlags::PayloadStoredLocal),
+                    Some(payload.clone()),
+                    false,
+                )
+                .await
+                .expect("local put succeeds");
+            assert!(awaited_flush(&store, address).await);
+            dyn_store
+                .put(
+                    partition,
+                    address,
+                    stored_fragment(&payload, FragmentFlags::PayloadStoredDurable),
+                    None,
+                    false,
+                )
+                .await
+                .expect("durable mark succeeds");
+            assert_eq!(awaited_flush(&store, address).await, flush_background);
+        }
+        let found = open_flushing(dir.path(), flush_background)
+            .await
+            .find(partition, address)
+            .await
+            .expect("the local entry was flushed");
+        assert_eq!(
+            found.data.flags & FragmentFlags::PayloadStoredDurable
+                == FragmentFlags::PayloadStoredDurable,
+            flush_background,
+            "flush_background {flush_background}"
+        );
+    }
+}
+
+/// A durable copy into another partition reaches the on-disk index in the background only with
+/// `flush_background`.
+#[tokio::test]
+async fn a_durable_copy_reaches_the_index_only_with_background_flush() {
+    let source = Partition::from([9u8; 16]);
+    let destination = Partition::from([10u8; 16]);
+    let (address, payload) = payload_off_bucket_zero(0);
+    for flush_background in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_durable_copy_");
+        {
+            let store = open_flushing(dir.path(), flush_background).await;
+            let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
+            dyn_store
+                .clone()
+                .put(
+                    source,
+                    address,
+                    stored_fragment(&payload, FragmentFlags::PayloadStoredLocal),
+                    Some(payload.clone()),
+                    false,
+                )
+                .await
+                .expect("local put succeeds");
+            assert!(awaited_flush(&store, address).await);
+            dyn_store
+                .copy(
+                    source,
+                    address,
+                    destination,
+                    address.context,
+                    CopyBehavior {
+                        durable: true,
+                        do_not_replicate: false,
+                    },
+                )
+                .await
+                .expect("copy succeeds");
+            assert_eq!(awaited_flush(&store, address).await, flush_background);
+        }
+        let found = open_flushing(dir.path(), flush_background)
+            .await
+            .find(destination, address)
+            .await
+            .expect("the source entry was flushed");
+        assert_eq!(
+            found.partition == destination,
+            flush_background,
+            "flush_background {flush_background}"
+        );
+    }
+}
+
 /// Server-shaped settings: groups start at the full 256 buckets.
 fn server_settings() -> ImmutableStoreSettings {
     ImmutableStoreSettings {

@@ -29,7 +29,6 @@ use crate::repository::StoreConfig;
 use crate::shared_store::registry::SharedStoreRegistry;
 use crate::store::immutable;
 use crate::store::immutable::ImmutableStoreCreateOptions;
-use crate::store::immutable::ImmutableStoreSettings;
 use crate::store::mutable;
 use crate::util;
 use crate::util::config;
@@ -247,15 +246,13 @@ async fn create_shared_store_at(
         Some(shared_store_path),
         options,
         false,
-        ImmutableStoreSettings {
-            protect_local_fragment: true, /* Protect local fragments from eviction */
-            verify_write: shared_store_config
+        immutable::client_settings(
+            shared_store_config
                 .store_config
                 .as_ref()
                 .and_then(|config| config.verify_write)
                 .unwrap_or_default(),
-            ..Default::default()
-        },
+        ),
     )
     .await
     .forward::<SharedStoreError>("creating immutable store")?;

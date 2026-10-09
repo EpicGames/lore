@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use lore_base::error::InvalidPath;
@@ -21,6 +22,9 @@ use crate::interface::LoreGlobalArgs;
 pub enum ServiceInitializationError {
     InvalidPath,
 }
+
+/// Seconds after a write that the service's immutable disk stores flush their index.
+const SERVICE_STORE_FLUSH_SECONDS: NonZeroU64 = NonZeroU64::new(30).unwrap();
 
 /// Builds the execution context callback that buffers service-level logs and
 /// errors in `service_state`, so a status report can hand them back later.
@@ -43,6 +47,7 @@ pub async fn initialize_service(
     globals: LoreGlobalArgs,
     service_state: Arc<ServiceStateImpl>,
 ) -> Result<(), ServiceInitializationError> {
+    lore_revision::store::immutable::set_background_flush_delay(SERVICE_STORE_FLUSH_SECONDS);
     service_state.initialize();
 
     let execution = setup_execution(globals, service_log_callback(service_state));

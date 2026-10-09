@@ -39,6 +39,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- The Lore service's immutable disk stores flush their index 30 seconds after a write, durable writes included.
+  Content the service fetches is stored flagged durable, which scheduled no flush, so a crash lost every entry the
+  service stored since its last explicit flush. Writes that are not durable now flush 30 seconds after the write too,
+  rather than 5
+- A local immutable store schedules its delayed index flush after a write that only changes an existing entry's stored
+  flags, and after a copy, as it does after any other write. Marking a local entry durable and copying content into
+  another partition changed the index without scheduling one, so a crash before the next explicit flush lost those
+  changes
 - `lore-server`: the generic `MutableStore` and `MutableCompareAndSwap` storage requests refuse the repository
   metadata, branch metadata and branch latest pointer key types on every transport, answering `InvalidArgument` over
   gRPC and the generic `Failed` over QUIC, which has no code for a rejected argument. They previously wrote these keys
