@@ -179,6 +179,19 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
 
+// Which authentication path a client takes if a server advertises both its
+// gRPC auth service and an OIDC issuer. A path the server does not
+// advertise cannot be taken.
+typedef enum lore_auth_mode_t {
+  // Follow the server's preference: the OIDC path if the server marks it
+  // preferred, the gRPC path otherwise.
+  LORE_AUTH_MODE_AUTO = 0,
+  // The gRPC path, through the auth service at `auth_url`.
+  LORE_AUTH_MODE_GRPC = 1,
+  // The OIDC path, through the advertised OIDC issuer.
+  LORE_AUTH_MODE_OIDC = 2,
+} lore_auth_mode_t;
+
 // Virtual File System type for repository operations.
 //
 // When not `None`, the `vfs` field causes the repository to create a Virtual File System
@@ -4122,6 +4135,9 @@ typedef struct lore_global_args_t {
   // whatever `stats` is set to, statistics being reported once at the end
   // rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
   uint64_t event_interval_ms;
+  // Which authentication path to take if the server advertises both its
+  // gRPC auth service and an OIDC issuer.
+  enum lore_auth_mode_t auth_mode;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote user service.

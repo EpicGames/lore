@@ -2,4 +2,5 @@
 // SPDX-License-Identifier: MIT
 
 mod login;
+mod mode;
 mod userinfo;

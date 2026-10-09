@@ -6,6 +6,7 @@
 //! second time in test mode. A test that needs a process of its own goes in a
 //! separate `tests/*.rs` file instead.
 
+mod auth_mode;
 mod client_main;
 mod commands;
 mod stats_display;

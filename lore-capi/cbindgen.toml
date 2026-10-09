@@ -102,6 +102,7 @@ include = [
 
 [export.rename]
 "Address" = "lore_address_t"
+"AuthMode" = "lore_auth_mode_t"
 "BranchId" = "lore_branch_id_t"
 "CompressionMode" = "lore_compression_mode_t"
 "Context" = "lore_context_t"

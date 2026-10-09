@@ -38,6 +38,9 @@ pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
 
 /// Named by `lore_repository_create_args_t::use_shared_store`; re-exported so callers need no
 /// dependency on `lore_revision`.
+pub use lore_revision::auth::AuthMode;
+pub use lore_revision::auth::AuthPath;
+pub use lore_revision::auth::UnknownAuthMode;
 pub use lore_revision::repository::LoreSharedStoreMode;
 
 use crate::call_delegation::dispatch_command;

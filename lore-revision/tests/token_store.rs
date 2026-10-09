@@ -265,6 +265,69 @@ mod tests {
             .expect("Task failure");
     }
 
+    /// Entries are keyed by the endpoint that issued them, so a user who logs
+    /// in on the gRPC path, then on the OIDC path, and then switches back
+    /// finds the first credentials intact and need not log in a third time.
+    #[tokio::test]
+    async fn a_token_from_one_endpoint_survives_a_login_at_another() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                const OIDC_ISSUER: &str = "https://issuer.storeload.example.com";
+                let identity = "identity0";
+                let grpc_token = "grpc-token";
+                let oidc_token = "oidc-token";
+                let _ = token_store::remove_user_token(OIDC_ISSUER, identity).await;
+
+                token_store::store_user_token(AUTH_ENDPOINT, identity, grpc_token, vec![])
+                    .await
+                    .expect("Failed to store the gRPC token");
+                token_store::store_user_token(OIDC_ISSUER, identity, oidc_token, vec![])
+                    .await
+                    .expect("Failed to store the OIDC token");
+
+                let found = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("The gRPC token must still load");
+                assert_eq!(found.as_str(), grpc_token);
+
+                let found = token_store::load_user_token_from_store(
+                    OIDC_ISSUER,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("The OIDC token must load");
+                assert_eq!(found.as_str(), oidc_token);
+
+                token_store::remove_user_token(OIDC_ISSUER, identity)
+                    .await
+                    .expect("Failed to remove the OIDC token");
+                let found = token_store::load_user_token_from_store(
+                    AUTH_ENDPOINT,
+                    identity,
+                    vulnerable_all_tokens(),
+                )
+                .await
+                .expect("Removing the OIDC token must leave the gRPC token");
+                assert_eq!(found.as_str(), grpc_token);
+
+                token_store::remove_user_token(AUTH_ENDPOINT, identity)
+                    .await
+                    .expect("Failed to remove the gRPC token");
+            }))
+            .await
+            .expect("Task failure");
+    }
+
     #[tokio::test]
     async fn can_filter_tokens_by_specific_domain() {
         let _lock = sequential_mutex_lock().await;

@@ -78,7 +78,13 @@ pub fn client_main() -> ExitCode {
         lore::size_threads_for_relaying();
     }
 
-    let mut globals = lore_globals_from_args(&cli);
+    let mut globals = match lore_globals_from_args(&cli) {
+        Ok(globals) => globals,
+        Err(err) => {
+            crate::eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(err) = globals.validate() {
         crate::eprintln!("Error: {err}");
         return ExitCode::FAILURE;

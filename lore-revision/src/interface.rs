@@ -26,6 +26,7 @@ use serde::ser::SerializeSeq;
 use tokio::sync::Mutex;
 use zerocopy::IntoBytes;
 
+use crate::auth::AuthMode;
 use crate::change::FileAction;
 use crate::event::LoreBytes;
 use crate::event::LoreBytesMut;
@@ -825,6 +826,9 @@ pub struct LoreGlobalArgs {
     /// whatever `stats` is set to, statistics being reported once at the end
     /// rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
     pub event_interval_ms: u64,
+    /// Which authentication path to take if the server advertises both its
+    /// gRPC auth service and an OIDC issuer.
+    pub auth_mode: AuthMode,
 }
 
 impl LoreGlobalArgs {

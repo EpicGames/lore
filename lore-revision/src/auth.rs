@@ -6,7 +6,12 @@ use serde::Serialize;
 use crate::interface::LoreString;
 
 pub mod login;
+pub mod mode;
 pub mod userinfo;
+
+pub use mode::AuthMode;
+pub use mode::AuthPath;
+pub use mode::UnknownAuthMode;
 
 /////////////////////////////////
 // General Notes for Auth token handling

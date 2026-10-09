@@ -1,8 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::ffi::OsString;
+
 use clap::Parser;
 use clap::Subcommand;
+use clap::ValueEnum;
 use lore::LORE_LIBRARY_VERSION;
+use lore::interface::AuthMode;
 use lore::interface::LoreEvent;
 use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
@@ -86,6 +90,12 @@ pub struct LoreCli {
     /// authentication service
     #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
     pub access_token: Option<String>,
+
+    /// Which authentication path to take if the server has enabled both its gRPC
+    /// auth service and an OIDC issuer. `auto` follows the server's preference.
+    /// `grpc` uses gRPC auth. `oidc` uses OIDC auth.
+    #[clap(global = true, hide = true, long, value_name = "mode", value_enum)]
+    pub auth_mode: Option<AuthModeArg>,
 
     /// Avoid using compression
     #[clap(global = true, hide = true, long, action)]
@@ -370,9 +380,55 @@ pub fn handle_lore_commands(cmd: &LoreCommands, globals: LoreGlobalArgs) -> u8 {
 pub enum LoreCliError {
     #[error("Log level '{0}' is not valid. Choose one of [trace, debug, info, warn, error].")]
     ParseLogLevel(String),
+    #[error("Auth mode '{0}' in {AUTH_MODE_VAR} is not valid. Choose one of [auto, grpc, oidc].")]
+    ParseAuthMode(String),
 }
 
-pub fn lore_globals_from_args(cli: &LoreCli) -> LoreGlobalArgs {
+/// The authentication path, as the `--auth-mode` flag names it.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthModeArg {
+    /// Follow the server's preference: OIDC where the server marks it
+    /// preferred, the gRPC auth service otherwise
+    Auto,
+    /// The gRPC auth service at the advertised auth URL
+    Grpc,
+    /// The advertised OIDC issuer
+    Oidc,
+}
+
+impl AuthModeArg {
+    pub fn to_lore(self) -> AuthMode {
+        match self {
+            AuthModeArg::Auto => AuthMode::Auto,
+            AuthModeArg::Grpc => AuthMode::Grpc,
+            AuthModeArg::Oidc => AuthMode::Oidc,
+        }
+    }
+}
+
+pub const AUTH_MODE_VAR: &str = "LORE_AUTH_MODE";
+
+pub fn resolve_auth_mode(
+    from_flag: Option<AuthModeArg>,
+    from_env: Option<OsString>,
+) -> Result<AuthMode, LoreCliError> {
+    if let Some(from_flag) = from_flag {
+        return Ok(from_flag.to_lore());
+    }
+    if let Some(from_env) = from_env {
+        let from_env = from_env.to_string_lossy();
+        if !from_env.trim().is_empty() {
+            return from_env
+                .parse()
+                .map_err(|error: lore::interface::UnknownAuthMode| {
+                    LoreCliError::ParseAuthMode(error.0)
+                });
+        }
+    }
+    Ok(AuthMode::Auto)
+}
+
+pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliError> {
     let mut args = LoreGlobalArgs {
         repository_path: get_repository_path(cli.repository.clone()),
 
@@ -426,7 +482,9 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> LoreGlobalArgs {
         0
     };
 
-    args
+    args.auth_mode = resolve_auth_mode(cli.auth_mode, std::env::var_os(AUTH_MODE_VAR))?;
+
+    Ok(args)
 }
 
 // TODO(vri): Add command shortcuts

@@ -111,6 +111,7 @@ class LoreGlobalArgs(Structure):
         ("access_token", LoreString),
         ("stats", c_uint32),
         ("event_interval_ms", c_uint64),
+        ("auth_mode", c_int),
     ]
 
 

@@ -6,6 +6,7 @@ mod binary_tests;
 mod event_interval_tests;
 mod metadata_repr_tests;
 
+use lore_revision::auth::AuthMode;
 use lore_revision::interface::*;
 
 /// An empty array holds a null pointer whichever constructor built it. `Drop` frees only a
@@ -120,6 +121,13 @@ fn a_token_that_is_not_utf8_is_reported_by_field() {
             .field(),
         "access_token"
     );
+}
+
+#[test]
+fn an_unset_auth_mode_is_auto() {
+    let mut globals = LoreGlobalArgs::default();
+    assert!(globals.validate().is_ok());
+    assert_eq!(globals.auth_mode, AuthMode::Auto);
 }
 
 #[test]

@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-09-25
+updated: 2026-10-08
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -49,7 +49,7 @@ The most important changes from the current scheme:
 - **Migration is gradual and revertible.** The old and new paths run side by side through phased
   rollout, existing deployments keep working untouched, and the gRPC API retires only when its
   last client moves. While a server advertises both paths, a client-side flag picks which one a
-  caller takes, so a deployment can keep its fleet on the legacy path while individual users and CI
+  caller takes, so a deployment can keep its fleet on the gRPC path while individual users and CI
   jobs test the new one against the same server (D2).
 
 The rest of this document gives the technical design: the required OIDC provider capability profile
@@ -446,7 +446,7 @@ discriminates: deployments advertise `https://` URLs, and `https` is registered 
 fallback to `UcsAuthentication`, so an OIDC issuer, which is an `https://` URL by definition, cannot
 be told apart by scheme. Selection therefore keys on the presence of `oidc_issuer` below, gated
 during the migration by the opt-in described at the end of this section, and the scheme registry
-keeps serving the legacy path only.
+keeps serving the gRPC path only.
 
 `lore.environment.v1.Environment`
 ([`environment.proto`](../../lore-proto/proto/lore/environment/v1/environment.proto)) gains an
@@ -471,7 +471,7 @@ The rest of this proposal calls the first four fields
 
 `Endpoint` gains `user_url`, from `[environment.endpoint]`: the user directory clients resolve
 names at, `auth_url` by default (D7). Independent of the auth path, so an OIDC deployment can
-advertise a directory without a legacy auth service.
+advertise a directory without a gRPC auth service.
 
 The list of hosts a token may be sent to is deliberately *not* advertised here: it comes from the
 issuer-signed token, because the environment response is served by the same party a stolen token
@@ -517,18 +517,18 @@ The Lore server runs the same fetch against `jwt_issuer` to resolve `jwks_uri`, 
 
 A server on phases 3 and 4 advertises `auth_url` and `oidc_issuer` at once. Taking the OIDC path
 just because it is advertised would move a whole fleet the moment an operator adds the field, so a
-client-side setting, `auth_mode`, chooses instead. It takes `legacy`, `oidc` or `auto`, and `auto`
+client-side setting, `auth_mode`, chooses instead. It takes `grpc`, `oidc` or `auto`, and `auto`
 follows the new `oidc_preferred` field in the environment response. An operator therefore leaves
-the default on the legacy path while a few people test the new one, then flips the whole fleet
+the default on the gRPC path while a few people test the new one, then flips the whole fleet
 without a client release. Asking for a path the server does not advertise is a configuration error
 rather than a silent fall back to the other one.
 
 `auth_mode` is a global CLI flag rather than a `lore login` flag, since every operation that
-touches auth needs it, and it reads from `LORE_AUTH_MODE` and the per-user `config.toml` as well,
-so a tester opts in once instead of per command. The library carries the same value in
-`LoreGlobalArgs`, which is what lets one CI job or one embedding move on its own. The token store
-keys entries by the endpoint that issued them, so a switch in either direction leaves the other
-path's credentials intact. The setting retires with the legacy path in phase 5.
+touches auth needs it, and it reads from `LORE_AUTH_MODE` as well, so a tester opts in once per
+shell instead of per command. The library carries the
+same value in `LoreGlobalArgs`, which is what lets one CI job or one embedding move on its own.
+The token store keys entries by the endpoint that issued them, so a switch in either direction
+leaves the other path's credentials intact. The setting retires with the gRPC path in phase 5.
 
 ### D3. Standard grants replace the custom RPCs
 
@@ -1171,8 +1171,8 @@ than requiring a claim for a partition that does not exist.
   them and reads `auth_url` as it does now, and a new client falls back to `auth_url` when
   `oidc_issuer` is absent or when the deployment has not made OIDC the default (D2).
   No `UrcAuthApi` method changes. The OIDC client stops calling them. A new
-  client against an old server sees no `oidc_issuer` and uses the legacy path. An old client
-  against a new server works as long as the server keeps its legacy `auth_url` advertised, which the
+  client against an old server sees no `oidc_issuer` and uses the gRPC path. An old client
+  against a new server works as long as the server keeps its gRPC `auth_url` advertised, which the
   migration phases require until the last phase. Two trait signatures change.
 - **What `lore repo list` shows** — A deployment with no `RepositoryCatalog` implementation lists
   every partition the server holds rather than the subset the caller was granted (D7). On Tier 1
@@ -1197,12 +1197,12 @@ than requiring a claim for a partition that does not exist.
   it. The
   granted-scope field the refresh path wants is additive and `#[serde(default)]`. An existing
   `tokenstore.toml` parses unchanged, and entries written by the new client and read by an old one
-  lose only that field. Tokens on the legacy path keep working untouched, as does partition
+  lose only that field. Tokens on the gRPC path keep working untouched, as does partition
   data. The legacy `tokens.toml` is already left alone by the current code and stays that way.
 - **CLI and public API** — The CLI gains a global `--auth-mode` flag and the library an `auth_mode`
   field on `LoreGlobalArgs`, both optional and both defaulting to what the server advertises (D2).
   The field appends to `lore_global_args_t`, and a C caller that leaves it unset gets that same
-  default. Both retire with the legacy path in phase 5.
+  default. Both retire with the gRPC path in phase 5.
   `lore login` gains `--client-id` and `--client-secret`, the latter
   reading from an environment variable or stdin rather than taking a literal by default (see
   Security Considerations). No flag selects the grant in phase 3. The device grant serves both the
@@ -1263,8 +1263,8 @@ phase-3 client on Tier 1 reaches the interceptor's services on its first push, a
 query` reaches the repository-query handlers immediately after.
 
 **Phase 3, client OIDC provider, Tier 1.** The OIDC `Authentication` implementation, discovery, the
-device grant, client credentials, refresh, and revocation. Tokens on the legacy path are unaffected.
-The server starts advertising `oidc_issuer` alongside `auth_url`, with the legacy path still the
+device grant, client credentials, refresh, and revocation. Tokens on the gRPC path are unaffected.
+The server starts advertising `oidc_issuer` alongside `auth_url`, with the gRPC path still the
 default for clients that express no preference. Users and CI jobs opt into the new path with
 `auth_mode` (D2), which is how the new implementation gets exercised against a real deployment
 before anyone else moves, and the operator flips the default with `oidc_preferred` when it holds
@@ -1275,15 +1275,15 @@ in parallel for the whole phase, which is what makes rollback cheap: clear `oidc
 A deployment on the custom-issuer variant can advertise `oidc_issuer` only once its auth service
 serves discovery, the device grant and tokens whose `iss` is the issuer URL (D1). That work
 happens outside this repository and needs starting early. Until it lands the deployment stays on
-the legacy path, which this phase leaves fully working.
+the gRPC path, which this phase leaves fully working.
 
 **Phase 4, Tier 2.** Token exchange with resource indicators. Gated per deployment by
 `token_exchange_issuer` and one of the two partition-naming templates (D2), so a deployment that
 sets none of them stays on Tier 1 indefinitely. For a deployment on the custom-issuer variant this
 phase waits on that issuer's exchange grant (D1), and nothing regresses while it is pending: the
-deployment stays on the legacy path or on Tier 1 until the grant is live.
+deployment stays on the gRPC path or on Tier 1 until the grant is live.
 
-**Phase 5, retire the legacy client path.** Only once no supported deployment advertises a
+**Phase 5, retire the gRPC client path.** Only once no supported deployment advertises a
 non-OIDC `auth_url`, and `auth_mode` goes with it. For a deployment still serving
 `UrcAuthApi` the route to that state is the
 custom-issuer variant: the same service adds the standard endpoints (D1) and serves both
@@ -1306,7 +1306,7 @@ here and are the natural follow-up. A deployment that grants a wide suffix is ex
 as it is today.
 
 **Downgrade during migration.** For the duration of phases 3 and 4 a server advertises both a
-legacy `auth_url` and an OIDC issuer, so an attacker who can modify the environment response can
+gRPC `auth_url` and an OIDC issuer, so an attacker who can modify the environment response can
 steer a client to whichever is weaker. The environment endpoint is served over TLS and the client
 validates the certificate, so this needs a compromised transport, the same position from which the
 attacker could strip auth entirely today. An attacker cannot steer a client that pins `auth_mode`
@@ -1388,7 +1388,7 @@ endpoint's `body_excerpt`: bounded, and never echoing a credential.
   auth service, including serving discovery at a URL its tokens carry as `iss` (D1). This is work
   outside this repository, and for the deployment driving this proposal it is in hand.
   — *invalidated if:* an auth service cannot be extended, in which case that deployment stays on
-  the legacy path and phase 5 waits on it.
+  the gRPC path and phase 5 waits on it.
 
 **Risks**
 
