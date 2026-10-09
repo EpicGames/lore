@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/rbe-lore", "crates/rbe-proto", "crates/rbe-server", "crates/rbe-worker"]
+# Its own workspace, built from within contrib/bazel: a remote execution server on Lore's storage
+# API, built and run on its own and not part of what the Lore workspace builds and tests. It
+# reaches the Lore crates by path and pins its dependencies in a committed `Cargo.lock`.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Lore's own lint table, which a workspace of its own does not inherit.
+[workspace.lints.rust]
+future_incompatible = { level = "warn", priority = -1 }
+nonstandard_style = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+rbe-lore = { path = "crates/rbe-lore" }
+rbe-proto = { path = "crates/rbe-proto" }
+
+lore = { path = "../../lore" }
+lore-base = { path = "../../lore-base" }
+lore-macro = { path = "../../lore-macro" }
+lore-revision = { path = "../../lore-revision" }
+
+anyhow = "1.0.103"
+bytes = "1.11"
+clap = { version = "4.5", features = ["derive"] }
+dashmap = "6.1"
+futures = "0.3"
+hex = "0.4"
+libc = "0.2"
+prost = "0.14"
+prost-types = "0.14"
+sha2 = "0.10"
+tokio = { version = "1.47", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.18", features = ["v4"] }
+zstd = "0.13"
+
+# Same vendored quinn-proto the Lore workspace patches in. A patch table belongs to a workspace
+# root, so standing outside that workspace means restating it: the Lore crates reach
+# lore-transport, which is written against the vendored crate rather than the published one.
+[patch.crates-io]
+quinn-proto = { path = "../../vendor/quinn-proto" }

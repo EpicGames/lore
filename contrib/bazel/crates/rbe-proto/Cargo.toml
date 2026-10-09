@@ -1,0 +1,17 @@
+[package]
+name = "rbe-proto"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

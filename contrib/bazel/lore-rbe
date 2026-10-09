@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# Lifecycle helper for the Lore-backed Bazel remote execution server.
+#
+#   lore-rbe build                  build the binaries here and loreserver in the Lore root
+#   lore-rbe seed DIR               publish the hermetic toolchain of the bazel project in DIR into
+#                                   the durable partition, so bazel stops uploading it
+#   lore-rbe up [opts]              start loreserver + rbe-server + workers
+#   lore-rbe workers [opts]         start workers only, joining a fleet on another machine
+#   lore-rbe down                   stop everything
+#   lore-rbe status                 what is running, and the cache counters
+#   lore-rbe counters               the last counter line of every process this host ran
+#   lore-rbe wipe-all               empty EVERY tier: a genuinely cold cache
+#   lore-rbe wipe-local             empty the machine-local tiers, keeping the shared cache
+#                                   in the Lore server warm
+#   lore-rbe flags                  print the bazel flags a build needs
+#   lore-rbe source-repo [opts]     the project as a fresh Lore repository in $LORE_RBE_SOURCES
+#                                   (default ~/lore-rbe-sources), stamped, committed and pushed
+#   lore-rbe deps-repos [opts]      the toolchain and the third-party dependencies, from the
+#                                   project's output base, as two more such repositories
+#
+# `source-repo` / `deps-repos` options:
+#   --project DIR   the bazel project, required
+#   --upstream URL  the loreserver to create the repositories on (default this stack's)
+#   --publish       source-repo: also publish its CAS keys
+#   --xattr         source-repo: write the digest xattrs bazel reads instead of hashing
+#   --publish LIST  deps-repos: which of toolchain,third-party to publish
+#
+# `up` options:
+#   --workers N     worker processes (default 4)
+#   --slots S       concurrent actions per worker (default 5)
+#   --upstream URL  use an already-running lore-server instead of starting one
+#   --host ADDR     the address other machines dial this one on; also switches the bind
+#                   address from loopback to 0.0.0.0. Default 127.0.0.1, i.e. private.
+#
+# LOG_CAS_WRITES=1 makes `up` record the digest and size of every blob bazel uploads in
+# $LORE_RBE_STATE/cas-writes.log.
+#
+# LORE_RBE_STATE is where stores, logs, pid files and scratch go (default .rbe-state next to this
+# script). BAZEL is the bazel binary `seed` and `deps-repos` query (default bazel on PATH).
+#
+# `workers` options: --workers, --slots, plus the two that say where the fleet is:
+#   --server URL    the scheduler, e.g. http://build-host:8980
+#   --upstream URL  the shared store, e.g. lore://build-host:41337
+#
+# Two machines:
+#   build-host$  lore-rbe up --host 10.0.0.1 --workers 2
+#   worker-host$ lore-rbe workers --server http://10.0.0.1:8980 --upstream lore://10.0.0.1:41337
+#
+# Every process here has its own machine-local Lore tier: the rbe-server has one, and so does
+# each worker. The lore-server's store is the tier they share, and it is the only way a worker
+# ever sees what bazel uploaded.
+#
+# The two wipe commands decide what a cold and a warm build start from, so it is worth being
+# precise about what they mean. `wipe-local` clears the rbe-server's tier and every worker's tier and
+# leaves the lore-server's store intact, which is what "clean executors, populated shared cache"
+# means -- missing the worker tiers would leave the next build reading its own cache and looking
+# warm for the wrong reason. `wipe-all` clears those and the shared store too, which is "clean
+# executors, nothing shared".
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LORE_SRC="$(cd "$ROOT/../.." && pwd)"
+STATE="${LORE_RBE_STATE:-$ROOT/.rbe-state}"
+
+RBE_SERVER_BIN="$ROOT/target/release/lore-rbe-server"
+RBE_WORKER_BIN="$ROOT/target/release/lore-rbe-worker"
+INDEX_BIN="$ROOT/target/release/lore-rbe-index"
+LORESERVER_BIN="$LORE_SRC/target/release/loreserver"
+BAZEL="${BAZEL:-bazel}"
+
+RBE_PORT="${RBE_PORT:-8980}"
+LORE_PORT="${LORE_PORT:-41337}"
+JOBS="${JOBS:-6}"
+# The address this stack is reachable at. Loopback keeps a single-machine run private; `up --host`
+# sets it to something routable, which also switches the bind address to 0.0.0.0.
+HOST="${HOST:-127.0.0.1}"
+
+CACHE_REPO="$STATE/cache-repo"          # rbe-server local tier
+WORKER_REPOS="$STATE/worker-repos"      # one local tier per worker process
+SEED_REPO="$STATE/seed-repo"            # the seeder's local tier
+SERVER_STORE="$STATE/lore-store"        # loreserver's own store (the shared cache)
+SERVER_CONFIG="$STATE/lore-config"
+
+log()  { printf '\033[1;34m[lore-rbe]\033[0m %s\n' "$*" >&2; }
+warn() { printf '\033[1;33m[lore-rbe]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m[lore-rbe]\033[0m %s\n' "$*" >&2; exit 1; }
+
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- 3<&-; }
+
+wait_port() {  # wait_port PORT SECONDS
+  local i=0
+  while (( i < ${2:-30} * 10 )); do
+    port_open "$1" && return 0
+    sleep 0.1; i=$((i+1))
+  done
+  return 1
+}
+
+wait_port_gone() {
+  local i=0
+  while (( i < 300 )); do
+    port_open "$1" || return 0
+    sleep 0.1; i=$((i+1))
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------------------------
+
+cmd_build() {
+  (( $# == 0 )) || die "build takes no options"
+  log "building lore-rbe-server, lore-rbe-worker and lore-rbe-index (release, -j$JOBS) ..."
+  ( cd "$ROOT" && cargo build --release -j"$JOBS" )
+  # From within the Lore root rather than with --manifest-path: cargo reads .cargo/config.toml
+  # from the working directory up, and lore-server needs the rustflags set there.
+  log "building loreserver (release, -j$JOBS) ..."
+  ( cd "$LORE_SRC" && cargo build --release -p lore-server --bin loreserver -j"$JOBS" )
+}
+
+write_lore_config() {
+  mkdir -p "$SERVER_CONFIG" "$SERVER_STORE/immutable" "$SERVER_STORE/mutable"
+  cat > "$SERVER_CONFIG/local.toml" <<EOF
+# Generated by lore-rbe. QUIC (blob storage) + gRPC (metadata) on port $LORE_PORT,
+# reached as lore://127.0.0.1:$LORE_PORT.
+#   * No [server.quic.certificate] -> the public QUIC endpoint auto-generates an ephemeral
+#     self-signed cert and the lore:// client skips verification, so no cert files are needed.
+#     Do NOT point --config at the Lore repo's shipped local.toml: it references test-cert
+#     paths relative to the checkout.
+#   * No [environment] section -> the server advertises no endpoint URLs, so the client uses
+#     the host:port it dialed for both gRPC and QUIC storage.
+#   * The HTTP endpoint is unused here but enabled by default, so it is moved alongside the
+#     others: left on its default port it collides with any other loreserver on the machine.
+# Only the ports and store paths are overridden; everything else comes from the server's
+# baked-in defaults.
+[server.grpc]
+port = $LORE_PORT
+[server.quic]
+port = $LORE_PORT
+[server.http]
+port = $((LORE_PORT + 2))
+[immutable_store.local]
+path = "$SERVER_STORE/immutable"
+[mutable_store.local]
+path = "$SERVER_STORE/mutable"
+EOF
+}
+
+start_loreserver() {
+  if port_open "$LORE_PORT"; then
+    local pid; pid="$(cat "$STATE/loreserver.pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "loreserver already running (pid $pid)"
+      return 0
+    fi
+    # Someone else's server. Using it would put this stack's entries in a store it does not
+    # manage, and wipe-all could not empty it, so every "cold" run would quietly be warm.
+    die "port $LORE_PORT is held by a process this stack did not start; set LORE_PORT to a free port, or pass --upstream lore://HOST:$LORE_PORT to use that server deliberately"
+  fi
+  [[ -x "$LORESERVER_BIN" ]] || die "loreserver not built - run: $0 build"
+  write_lore_config
+  log "starting loreserver on $LORE_PORT ..."
+  # No LORE_ALLOCATOR override: the server never forks, so rpmalloc's large virtual
+  # reservation is harmless here.
+  "$LORESERVER_BIN" --config "$SERVER_CONFIG" < /dev/null > "$STATE/loreserver.log" 2>&1 &
+  echo $! > "$STATE/loreserver.pid"
+  wait_port "$LORE_PORT" 60 || die "loreserver did not open $LORE_PORT (see $STATE/loreserver.log)"
+  log "loreserver up (pid $(cat "$STATE/loreserver.pid"))"
+}
+
+cmd_up() {
+  local workers=4 slots=5 upstream="" no_upstream=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --workers) workers="$2"; shift 2 ;;
+      --slots)   slots="$2";   shift 2 ;;
+      --upstream) upstream="$2"; shift 2 ;;
+      --no-upstream) no_upstream=1; shift ;;
+      # The address other machines dial this one on. Everything binds 0.0.0.0 once it is set to
+      # anything but loopback, because a fleet cannot reach a server bound to 127.0.0.1.
+      --host)    HOST="$2";    shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  mkdir -p "$STATE"
+  [[ -x "$RBE_SERVER_BIN" ]] || die "not built - run: $0 build"
+
+  if (( no_upstream )); then
+    # Workers read the input root from their own tier, so with nothing shared they can never
+    # see what bazel uploaded to the rbe-server and every action fails on a missing input.
+    die "--no-upstream cannot work: an executor reaches bazel's uploads only through the shared store"
+  elif [[ -z "$upstream" ]]; then
+    start_loreserver
+    upstream="lore://$HOST:$LORE_PORT"
+  else
+    log "using external upstream $upstream"
+  fi
+
+  if port_open "$RBE_PORT"; then
+    die "something is already listening on $RBE_PORT - run: $0 down"
+  fi
+
+  local bind="$HOST"
+  [[ "$HOST" == "127.0.0.1" ]] || bind="0.0.0.0"
+
+  local extra=()
+  if [[ "${LOG_CAS_WRITES:-0}" == 1 ]]; then
+    rm -f "$STATE/cas-writes.log"
+    extra+=(--log-cas-writes "$STATE/cas-writes.log")
+  fi
+
+  # The loreserver started above runs on this machine, so the scheduler keeps no copy of its own:
+  # one would be every upload and every download written to the same disk a second time.
+  log "starting lore-rbe-server on $bind:$RBE_PORT (local tier: $CACHE_REPO, metadata only)"
+  "$RBE_SERVER_BIN" \
+    --listen "$bind:$RBE_PORT" \
+    --lore-repo "$CACHE_REPO" \
+    --lore-server "$upstream" \
+    --local-cache "${RBE_SERVER_LOCAL_CACHE:-false}" \
+    --cache-size 0 \
+    --stats-interval 30 \
+    "${extra[@]}" \
+    < /dev/null > "$STATE/rbe-server.log" 2>&1 &
+  echo $! > "$STATE/rbe-server.pid"
+  wait_port "$RBE_PORT" 60 || die "lore-rbe-server did not start (see $STATE/rbe-server.log)"
+
+  start_workers "$workers" "$slots" "http://$HOST:$RBE_PORT" "$upstream"
+  log "up. bazel flags: $0 flags"
+}
+
+# Start N worker processes against a scheduler and a shared store, either of which may be on
+# another machine. Worker ids carry the hostname so a fleet's logs and `ExecutedActionMetadata`
+# stay readable once more than one machine is leasing.
+start_workers() {  # start_workers COUNT SLOTS SERVER_URL UPSTREAM_URL
+  local count="$1" slots="$2" server="$3" upstream="$4"
+  [[ -x "$RBE_WORKER_BIN" ]] || die "not built - run: $0 build"
+  mkdir -p "$STATE"
+
+  log "starting $count worker(s) x $slots slot(s) = $((count * slots)) concurrent actions"
+  log "  scheduler $server, shared store $upstream"
+  # A log left by a worker this start does not replace would read as one of this run's.
+  rm -f "$STATE"/worker-*.log
+  local host; host="$(hostname -s)"
+  for i in $(seq 1 "$count"); do
+    # LORE_ALLOCATOR=system is mandatory, not a tuning knob: a worker forks to spawn compilers,
+    # and Lore's rpmalloc reserves enough virtual address space that fork() fails under
+    # vm.overcommit_memory = 0. The worker refuses to start without it.
+    LORE_ALLOCATOR=system "$RBE_WORKER_BIN" \
+      --server "$server" \
+      --lore-server "$upstream" \
+      --slots "$slots" \
+      --worker-id "$host-w$i" \
+      --lore-repo "$WORKER_REPOS/w$i" \
+      --cache-size 0 \
+      --stats-interval 30 \
+      --scratch "$STATE/scratch/w$i" \
+      < /dev/null > "$STATE/worker-$i.log" 2>&1 &
+    echo $! > "$STATE/worker-$i.pid"
+  done
+}
+
+# Workers only, for a second machine joining a fleet whose scheduler and store are elsewhere.
+cmd_workers() {
+  local count=4 slots=5 server="" upstream=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --workers)  count="$2";    shift 2 ;;
+      --slots)    slots="$2";    shift 2 ;;
+      --server)   server="$2";   shift 2 ;;
+      --upstream) upstream="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$server"   ]] || die "--server is required, e.g. --server http://build-host:$RBE_PORT"
+  [[ -n "$upstream" ]] || die "--upstream is required, e.g. --upstream lore://build-host:$LORE_PORT"
+  start_workers "$count" "$slots" "$server" "$upstream"
+  log "workers up"
+}
+
+# Publish the toolchain a project resolved into the durable partition.
+#
+# Bazel has already downloaded it into the project's output base, so that is where the bytes are
+# taken from -- seeding from the same files the build will hash means the digests match by
+# construction rather than by agreeing on a version twice.
+cmd_seed() {
+  (( $# == 1 )) || die "usage: $0 seed DIR"
+  local dir="$1" project; project="$(basename "$1")"
+  [[ -d "$dir" ]] || die "no such project: $dir"
+  [[ -x "$INDEX_BIN" ]] || die "not built - run: $0 build"
+  port_open "$LORE_PORT" || die "no loreserver on $LORE_PORT - run: $0 up"
+
+  local base; base="$(cd "$dir" && "$BAZEL" info output_base 2>/dev/null)" \
+    || die "could not read the output base of $project; build it once first"
+
+  shopt -s nullglob
+  local repos=("$base"/external/toolchains_llvm_bootstrapped*)
+  (( ${#repos[@]} )) || die "no toolchain repositories under $base/external - build $project once first"
+
+  local noun=repositories
+  if (( ${#repos[@]} == 1 )); then noun=repository; fi
+  log "seeding ${#repos[@]} toolchain $noun from $project"
+  "$INDEX_BIN" seed \
+    --lore-repo "$SEED_REPO" \
+    --lore-server "lore://127.0.0.1:$LORE_PORT" \
+    "${repos[@]}"
+}
+
+# --- Sources stored in Lore ---------------------------------------------------------------------
+#
+# Bazel can build a checkout of a Lore repository whose content is already on the loreserver that
+# holds the build cache. Each repository is made from scratch on a fresh server: copied from the
+# project directory, stamped with each file's SHA-256, committed and pushed. Publishing then makes
+# every file resolvable under the CAS key bazel asks for, by having the server copy the pushed
+# content into the durable partition rather than receiving it again.
+
+SOURCES="${LORE_RBE_SOURCES:-$HOME/lore-rbe-sources}"
+
+# A Lore repository cannot be created inside another one, and when that fails every lore command
+# after it acts on the enclosing repository instead -- the Lore source tree, if the directory is
+# under it.
+check_sources_dir() {
+  mkdir -p "$SOURCES"
+  local real root d
+  real="$(cd "$SOURCES" && pwd -P)"
+  root="$(cd "$LORE_SRC" && pwd -P)"
+  [[ "$real/" == "$root/"* ]] && die "$SOURCES is inside $LORE_SRC; set LORE_RBE_SOURCES to a directory outside it"
+  d="$real"
+  while [[ "$d" != / ]]; do
+    [[ -d "$d/.lore" ]] && die "$SOURCES is inside the Lore workspace $d; set LORE_RBE_SOURCES elsewhere"
+    d="$(dirname "$d")"
+  done
+}
+
+repo_id() { (cd "$1" && lore status) | sed -n 's/^Repository \([0-9a-f]*\).*/\1/p'; }
+
+# make_lore_repo NAME DIR UPSTREAM: turn DIR into a new repository NAME on UPSTREAM, with every
+# file stamped, committed and pushed.
+make_lore_repo() {
+  local name="$1" dir="$2" upstream="$3"
+  [[ -x "$INDEX_BIN" ]] || die "not built - run: $0 build"
+  # Each repository gets a store of its own under $SOURCES, recreated every time. Left to its
+  # configuration, lore may put a new repository's store in a machine-wide shared store keyed by
+  # the server's address, which no wipe reaches: after the server is wiped, that store would
+  # still remember content as stored on it, and a commit could skip uploading what the fresh
+  # server lacks.
+  local store="$SOURCES/.stores/$name"
+  rm -rf "$store"
+  mkdir -p "$store"
+  (cd "$dir" && lore repository create --use-shared-store --shared-store-path "$store" \
+    "$upstream/$name" > /dev/null)
+  [[ -d "$dir/.lore" ]] || die "lore repository create did not create $dir/.lore"
+  local id; id="$(repo_id "$dir")"
+  [[ -n "$id" ]] || die "no repository id for $dir"
+  if [[ -d "$LORE_SRC/.lore" && "$id" == "$(repo_id "$LORE_SRC")" ]]; then
+    die "$dir resolved to the Lore source repository; refusing to commit"
+  fi
+  (cd "$dir" && lore stage --scan . > /dev/null)
+  "$INDEX_BIN" stamp "$dir"
+  (cd "$dir" && lore commit "$name, stamped by lore-rbe-index" > /dev/null)
+  local pushed
+  pushed="$(cd "$dir" && lore push)" || die "lore push failed for $name"
+  grep -E '^Pushed revision' <<< "$pushed" >&2 || true
+  log "repository $name ($id) pushed to $upstream"
+}
+
+# source-repo --project DIR [--upstream URL] [--publish] [--xattr]: the project as a Lore checkout.
+cmd_source_repo() {
+  local src="" upstream="lore://127.0.0.1:$LORE_PORT" publish=0 xattr=0
+  while (( $# )); do
+    case "$1" in
+      --project)  src="$2";      shift 2 ;;
+      --upstream) upstream="$2"; shift 2 ;;
+      --publish)  publish=1;     shift ;;
+      --xattr)    xattr=1;       shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$src" ]] || die "--project is required"
+  [[ -d "$src" ]] || die "no such project: $src"
+  check_sources_dir
+  local project; project="$(basename "$src")"
+  local ws="$SOURCES/$project"
+
+  log "recreating $ws from $src"
+  rm -rf "$ws"
+  rsync -a --exclude .git --exclude '/bazel-*' --exclude .lore "$src/" "$ws/"
+  # Bazel would otherwise walk the workspace's .lore directory looking for packages.
+  printf '.lore\n' >> "$ws/.bazelignore"
+  make_lore_repo "$project" "$ws" "$upstream"
+
+  if (( publish )); then
+    "$INDEX_BIN" publish "$ws" --lore-server "$upstream"
+  fi
+  if (( xattr )); then
+    "$INDEX_BIN" xattr "$ws"
+  fi
+}
+
+# deps-repos --project DIR [--upstream URL] [--publish LIST]: the toolchain and the third-party
+# dependencies as two Lore repositories, built from this machine's output base for the project.
+# LIST is a comma-separated subset of toolchain,third-party to publish.
+cmd_deps_repos() {
+  local src="" upstream="lore://127.0.0.1:$LORE_PORT" publish=""
+  while (( $# )); do
+    case "$1" in
+      --project)  src="$2";      shift 2 ;;
+      --upstream) upstream="$2"; shift 2 ;;
+      --publish)  publish="$2";  shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$src" ]] || die "--project is required"
+  [[ -d "$src" ]] || die "no such project: $src"
+  check_sources_dir
+  local project; project="$(basename "$src")"
+  local base; base="$(cd "$src" && "$BAZEL" info output_base 2>/dev/null)" \
+    || die "could not read the output base of $project; build it once first"
+  [[ -d "$base/external" ]] || die "no $base/external - build $project once first"
+
+  # Hardlink when the output base and $SOURCES share a filesystem, copy when they do not.
+  local cp_flags=(-rL) probe_src
+  probe_src="$(find -L "$base/external" -maxdepth 3 -type f -print -quit)"
+  if [[ -n "$probe_src" ]] && ln "$probe_src" "$SOURCES/.link-probe" 2> /dev/null; then
+    cp_flags+=(--link)
+  else
+    warn "cannot hardlink from $base into $SOURCES (another filesystem?); copying instead"
+  fi
+  rm -f "$SOURCES/.link-probe"
+
+  local name
+  for name in toolchain third-party; do
+    local dir="$SOURCES/$name" errors="$SOURCES/$name.copy-errors"
+    rm -rf "$dir" "$errors"
+    mkdir -p "$dir"
+    local repo n=0
+    for repo in "$base"/external/*/; do
+      repo="$(basename "$repo")"
+      [[ "$repo" == _main ]] && continue
+      case "$name:$repo" in
+        toolchain:toolchains_llvm_bootstrapped*|third-party:*) ;;
+        *) continue ;;
+      esac
+      [[ "$name" == third-party && "$repo" == toolchains_llvm_bootstrapped* ]] && continue
+      # Dereferenced: Lore does not commit symlinks, and several repositories (bazel_tools in
+      # particular) are symlinks into bazel's install base. The content is what an action reads.
+      # Hardlinked where possible (see cp_flags): the toolchain links one clang binary under many
+      # names, so a dereferencing copy is 5 GB where the distinct content is under 500 MB. The
+      # files are only read, to commit them. Dangling links (the minimal LLVM distribution links
+      # tools it does not ship) are skipped and listed in $errors.
+      cp "${cp_flags[@]}" "$base/external/$repo" "$dir/" 2>> "$errors" \
+        || warn "$name: not everything under $repo could be linked (see $errors)"
+      n=$((n + 1))
+    done
+    # A project without the hermetic toolchain has nothing for the toolchain repository,
+    # and Lore will not commit an empty one.
+    if (( n == 0 )); then
+      warn "$name: no bazel repositories under $base/external for $project; not created"
+      continue
+    fi
+    log "$name: $n bazel repositories, $(du -sh --apparent-size "$dir" | cut -f1)"
+    make_lore_repo "$name" "$dir" "$upstream"
+    if [[ ",$publish," == *",$name,"* ]]; then
+      "$INDEX_BIN" publish "$dir" --lore-server "$upstream"
+    fi
+  done
+}
+
+wait_pid_gone() {  # wait_pid_gone PID SECONDS
+  local i=0
+  while (( i < ${2:-30} * 10 )); do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1; i=$((i+1))
+  done
+  return 1
+}
+
+cmd_down() {
+  shopt -s nullglob
+  # Only the host that ran a server has its port to wait for. A workers-only host sharing a
+  # machine with the server would otherwise wait out the timeout on a port it never held.
+  local ran_rbe_server=0 ran_loreserver=0
+  [[ -f "$STATE/rbe-server.pid" ]] && ran_rbe_server=1
+  [[ -f "$STATE/loreserver.pid" ]] && ran_loreserver=1
+  # Order matters: workers first (so nothing is mid-upload), then the rbe-server, then the
+  # loreserver. Each is *waited on* rather than just signalled -- on SIGTERM the rbe-server
+  # runs Lore's close/drain/flush, and killing the loreserver out from under it, or wiping
+  # a store before it finishes, is how a "warm" cache silently comes back cold.
+  for pidfile in "$STATE"/worker-*.pid "$STATE"/rbe-server.pid "$STATE"/loreserver.pid; do
+    local pid; pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "stopping $(basename "$pidfile" .pid) (pid $pid)"
+      kill "$pid" 2>/dev/null || true
+      wait_pid_gone "$pid" 60 || { warn "pid $pid did not exit; sending SIGKILL"; kill -9 "$pid" 2>/dev/null || true; }
+    fi
+    rm -f "$pidfile"
+  done
+  if (( ran_rbe_server )); then
+    wait_port_gone "$RBE_PORT" || warn "port $RBE_PORT still busy"
+  fi
+  if (( ran_loreserver )); then
+    wait_port_gone "$LORE_PORT" || warn "port $LORE_PORT still busy"
+  fi
+  log "down"
+}
+
+cmd_wipe_all() {
+  cmd_down
+  log "wiping every tier (server $CACHE_REPO, workers $WORKER_REPOS, shared $SERVER_STORE)"
+  rm -rf "$CACHE_REPO" "$WORKER_REPOS" "$SEED_REPO" "$SERVER_STORE" "$STATE/scratch"
+}
+
+cmd_wipe_local() {
+  log "wiping the machine-local tiers ($CACHE_REPO, $WORKER_REPOS); the Lore server is kept"
+  rm -rf "$CACHE_REPO" "$WORKER_REPOS" "$SEED_REPO" "$STATE/scratch"
+}
+
+cmd_status() {
+  if port_open "$LORE_PORT"; then log "loreserver: listening on $LORE_PORT"; else log "loreserver: down"; fi
+  if port_open "$RBE_PORT"; then log "rbe-server: listening on $RBE_PORT"; else log "rbe-server: down"; fi
+  local n=0
+  shopt -s nullglob
+  for pidfile in "$STATE"/worker-*.pid; do
+    local pid; pid="$(cat "$pidfile")"
+    kill -0 "$pid" 2>/dev/null && n=$((n+1))
+  done
+  log "workers running: $n"
+  if [[ -f "$STATE/rbe-server.log" ]]; then grep -h 'ac: ' "$STATE/rbe-server.log" | tail -1 || true; fi
+  for d in "$CACHE_REPO" "$WORKER_REPOS" "$SERVER_STORE"; do
+    if [[ -d "$d" ]]; then log "$(du -sh "$d" 2>/dev/null | cut -f1)  $d"; fi
+  done
+}
+
+# `<process>: <counters>` for the rbe-server and every worker this host ran. Each process prints
+# its counters once more as it shuts down, so after `down` these are complete. This is how a
+# benchmark reads a run's counters off a machine it is not on.
+cmd_counters() {
+  shopt -s nullglob
+  local f line
+  for f in "$STATE"/rbe-server.log "$STATE"/worker-*.log; do
+    [[ -f "$f" ]] || continue  # a workers-only host has no rbe-server.log
+    line="$(grep 'ac: ' "$f" | tail -1 \
+      | sed -E 's/\x1b\[[0-9;]*m//g; s/^.*(lore_rbe_server|rbe_worker): //' || true)"
+    [[ -n "$line" ]] && printf '%s: %s\n' "$(basename "$f" .log)" "$line"
+  done
+  return 0
+}
+
+cmd_flags() {
+  # --remote_executor alone is enough: one endpoint serves both the cache and the executor.
+  # No --remote_instance_name: this server has a single namespace and ignores the field.
+  # --incompatible_strict_action_env keeps the client's PATH out of actions and their cache keys,
+  # so every checkout and every user of the shared cache computes the same keys.
+  # --experimental_throttle_remote_action_building=false lifts bazel's limit of one remote action
+  # per client core building and uploading at once, which far from the server caps the build rate.
+  # Pair it with a --jobs of two to three times the executor slots.
+  cat <<EOF
+--remote_executor=grpc://$HOST:$RBE_PORT
+--remote_timeout=3600
+--incompatible_strict_action_env
+--experimental_throttle_remote_action_building=false
+EOF
+}
+
+case "${1:-help}" in
+  build)      shift; cmd_build "$@" ;;
+  seed)       shift; cmd_seed "$@" ;;
+  source-repo) shift; cmd_source_repo "$@" ;;
+  deps-repos) shift; cmd_deps_repos "$@" ;;
+  up)         shift; cmd_up "$@" ;;
+  workers)    shift; cmd_workers "$@" ;;
+  down)       shift; cmd_down ;;
+  status)     shift; cmd_status ;;
+  counters)   shift; cmd_counters ;;
+  wipe-all)   shift; cmd_wipe_all ;;
+  wipe-local) shift; cmd_wipe_local ;;
+  flags)      shift; cmd_flags ;;
+  # The header comment is the usage text. Bounded by where it ends rather than by a line
+  # number, so editing it cannot start printing code.
+  *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}" ;;
+esac

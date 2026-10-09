@@ -1,0 +1,53 @@
+[package]
+name = "rbe-server"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+test = false
+
+[[bin]]
+name = "lore-rbe-server"
+path = "src/main.rs"
+test = false
+
+[[bin]]
+name = "lore-rbe-index"
+path = "src/bin/lore_rbe_index.rs"
+test = false
+
+[dependencies]
+rbe-lore = { workspace = true }
+rbe-proto = { workspace = true }
+
+lore-base = { workspace = true }
+lore-macro = { workspace = true }
+
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+zstd = { workspace = true }
+
+[features]
+test-util = []
+
+[dev-dependencies]
+rbe-server = { path = ".", features = ["test-util"] }

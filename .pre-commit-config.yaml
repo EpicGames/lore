@@ -1,4 +1,5 @@
-exclude: /thirdparty/|lore-server/src/protocol/test_data/|tps/
+# contrib/ holds standalone projects with checks of their own.
+exclude: /thirdparty/|lore-server/src/protocol/test_data/|tps/|^contrib/
 
 repos:
   - repo: local
@@ -31,7 +32,7 @@ repos:
         # `](WrapInternal::internal)`, no open paren after — is not a hit.
         entry: >-
           bash -c '! rg -n "\bWrapInternal::internal(_with)?\s*\("
-          --glob "*.rs" --glob "!target/**" .
+          --glob "*.rs" --glob "!target/**" --glob "!contrib/**" .
           || { echo "Use .forward()/.forward_any(), or Target::internal_with_context() to collapse deliberately."; exit 1; }'
         pass_filenames: false
         always_run: true

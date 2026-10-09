@@ -15,6 +15,7 @@
 lore-server/config/local*.toml
 lore-integration-tests/consul-data
 **/.grafana.local.yaml
+contrib/bazel/.rbe-state/
 
 #################
 ## Visual Studio

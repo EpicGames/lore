@@ -1,0 +1,73 @@
+// Internal scheduler <-> worker protocol.
+//
+// REAPI standardises the client side (bazel -> scheduler) but not how a scheduler hands work
+// to its workers; every implementation invents that part. This is the smallest thing that
+// works: workers long-poll for a lease, do everything themselves (fetch the action, build the
+// input root, run it, store the outputs in the Lore store the scheduler serves bazel from), and
+// report back an ActionResult. No blob content crosses this protocol.
+
+syntax = "proto3";
+
+package lore.rbe.worker.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+
+service WorkerQueue {
+  // Long-poll for the next action to run. Returns have_work = false when the poll times out
+  // with an empty queue, so the worker just calls again.
+  rpc TakeLease(TakeLeaseRequest) returns (TakeLeaseResponse);
+
+  // Report the outcome of a lease. An action that ran and exited non-zero is a *successful*
+  // lease with a non-zero exit_code in the result; `failure` is for the worker itself failing
+  // (could not fetch an input, could not spawn, timed out).
+  rpc CompleteLease(CompleteLeaseRequest) returns (CompleteLeaseResponse);
+
+  // Renew every lease a worker still holds. One call per worker rather than per lease, so the
+  // rate does not scale with slot count. A lease not renewed inside the server's window is
+  // assumed dead and its action re-queued.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  repeated string lease_ids = 2;
+}
+
+message HeartbeatResponse {
+  // Leases the server has already given up on. The worker should stop working on them: its
+  // results would be discarded, since the action has been handed to someone else.
+  repeated string unknown_lease_ids = 1;
+}
+
+message TakeLeaseRequest {
+  string worker_id = 1;
+  // How long the server may hold the poll open before answering have_work = false.
+  int32 wait_seconds = 2;
+}
+
+message TakeLeaseResponse {
+  bool have_work = 1;
+  string lease_id = 2;
+  string instance_name = 3;
+  build.bazel.remote.execution.v2.Digest action_digest = 4;
+  build.bazel.remote.execution.v2.DigestFunction.Value digest_function = 5;
+  // Wall-clock deadline hint, seconds; 0 means the server's default.
+  int64 timeout_seconds = 6;
+}
+
+message CompleteLeaseRequest {
+  string lease_id = 1;
+  string worker_id = 2;
+  // Populated when the action ran to completion, whatever its exit code.
+  build.bazel.remote.execution.v2.ActionResult result = 3;
+  // Non-empty when the worker could not run the action at all.
+  string failure = 4;
+  // The action exceeded its timeout and was killed. Reported as DEADLINE_EXCEEDED to the client
+  // rather than as an execution failure.
+  bool timed_out = 5;
+  // Action.do_not_cache, reported by the worker because it has already decoded the Action.
+  // Reading it here saves the scheduler a redundant CAS fetch on every single action.
+  bool do_not_cache = 6;
+}
+
+message CompleteLeaseResponse {}

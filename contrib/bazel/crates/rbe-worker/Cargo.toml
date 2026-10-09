@@ -1,0 +1,45 @@
+[package]
+name = "rbe-worker"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/lib.rs"
+test = false
+
+[[bin]]
+name = "lore-rbe-worker"
+path = "src/main.rs"
+test = false
+
+# This process links Lore and also forks to spawn compilers, which do not mix by default: Lore's
+# rpmalloc reserves a ~344 GB virtual heap, and under vm.overcommit_memory = 0 a fork() from a
+# process holding that much accountable private mapping fails with ENOMEM. `LORE_ALLOCATOR=system`
+# is the escape, and `run` refuses to start without it -- see the check there.
+[dependencies]
+rbe-lore = { workspace = true }
+rbe-proto = { workspace = true }
+
+lore-base = { workspace = true }
+lore-macro = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+test-util = []
+
+[dev-dependencies]
+lore-base = { workspace = true, features = ["test-util"] }
+rbe-worker = { path = ".", features = ["test-util"] }

@@ -27,6 +27,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   verifies what it takes. A reader that wants content compressed the way the store holds it takes the stored payloads
   instead of the store expanding them and the reader compressing them again. The field sits in the struct's padding,
   so its size and its other fields' offsets are unchanged, and a zero-initialized item reads as before
+- Add a Bazel remote execution server on Lore's storage API under `contrib/bazel/`: a Remote Execution API v2 endpoint
+  and scheduler whose action cache and content-addressable storage are Lore partitions, executors that move content
+  between their input roots and a shared loreserver by path, and a script that builds, runs and stops them. A
+  standalone workspace, built from within `contrib/bazel`
 
 ### Fixes & Improvements
 
