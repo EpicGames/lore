@@ -10,6 +10,7 @@ use lore_revision::lore::RepositoryId;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::LoreResponse;
 use lore_server::protocol::storage::messages::Message;
+use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::messages::MessageParseError;
 use lore_server::protocol::storage::mutable_store_handler::*;
 use rand::random;
@@ -173,4 +174,44 @@ async fn test_handle_store_independent_keys() {
             );
         })
         .await;
+}
+
+/// Repository and branch metadata and a branch's latest pointer are written
+/// only through requests that validate the write; reaching the same keys
+/// through the generic store would skip that.
+#[tokio::test]
+async fn rejects_key_types_with_a_dedicated_write_request() {
+    let repository = random::<RepositoryId>();
+
+    for key_type in [
+        KeyType::RepositoryMetadata,
+        KeyType::BranchMetadata,
+        KeyType::BranchLatestPointer,
+    ] {
+        let context = Arc::new(AttributeMap::default());
+        context.insert(repository);
+
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let message = MutableStoreOp {
+            key: Hash::hash_buffer(b"test-key"),
+            value: Hash::hash_buffer(b"test-value"),
+            key_type,
+        };
+        let error = LORE_CONTEXT
+            .scope(execution, async move {
+                message.handle_mutable(context, mutable_store.clone()).await
+            })
+            .await
+            .expect_err("a protected key type must be refused on the generic path");
+
+        let MessageHandleError::InvalidArgument(reason) = error else {
+            panic!("{key_type:?} must be refused as an invalid argument, got {error:?}");
+        };
+        assert!(
+            reason.contains(&format!("{key_type:?}")),
+            "the reason must name {key_type:?}, got {reason:?}"
+        );
+    }
 }

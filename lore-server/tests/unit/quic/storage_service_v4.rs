@@ -161,6 +161,25 @@ async fn authorize_start_returns_slow_down_when_session_limit_reached() {
     assert!(!error_info.is_appropriate_for_logging);
 }
 
+/// QUIC has no code for a rejected argument, so `InvalidArgument` answers the
+/// generic `Failed`, is labelled as itself, and is not an internal error.
+#[tokio::test]
+async fn transform_protocol_error_maps_invalid_argument_to_failed() {
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let service = make_service(immutable_store, mutable_store);
+
+    let error_info = service
+        .transform_protocol_error(&MessageHandleError::InvalidArgument("bad key_type".into()));
+
+    assert_eq!(
+        error_info.response_error_code,
+        QuicServiceError::Failed as QuicErrorStatus,
+    );
+    assert_eq!(error_info.message_handle_label, "InvalidArgument");
+    assert!(!error_info.is_internal_error);
+}
+
 mod authorized_session {
     use std::ops::Add;
     use std::time::Duration;

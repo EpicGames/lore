@@ -10,6 +10,7 @@ use lore_revision::lore::RepositoryId;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::LoreResponse;
 use lore_server::protocol::storage::messages::Message;
+use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::messages::MessageParseError;
 use lore_server::protocol::storage::mutable_cas::*;
 use rand::random;
@@ -225,4 +226,62 @@ async fn test_handle_cas_on_nonexistent_key() {
             assert_eq!(loaded, new_value);
         })
         .await;
+}
+
+/// Repository and branch metadata and a branch's latest pointer are written
+/// only through requests that validate the write; a compare-and-swap through
+/// the generic path would skip that, so it is refused and the stored value is
+/// left as it was.
+#[tokio::test]
+async fn rejects_key_types_with_a_dedicated_write_request() {
+    let repository = random::<RepositoryId>();
+    let key = Hash::hash_buffer(b"cas-protected-key");
+    let initial_value = Hash::hash_buffer(b"initial");
+    let new_value = Hash::hash_buffer(b"new");
+
+    for key_type in [
+        KeyType::RepositoryMetadata,
+        KeyType::BranchMetadata,
+        KeyType::BranchLatestPointer,
+    ] {
+        let context = Arc::new(AttributeMap::default());
+        context.insert(repository);
+
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                mutable_store
+                    .clone()
+                    .store(repository, key, initial_value, key_type)
+                    .await
+                    .expect("seeding the protected key");
+
+                let message = MutableCas {
+                    key,
+                    expected: initial_value,
+                    value: new_value,
+                    key_type,
+                };
+                let error = message
+                    .handle_mutable(context, mutable_store.clone())
+                    .await
+                    .expect_err("a protected key type must be refused on the generic path");
+                let MessageHandleError::InvalidArgument(reason) = error else {
+                    panic!("{key_type:?} must be refused as an invalid argument, got {error:?}");
+                };
+                assert!(
+                    reason.contains(&format!("{key_type:?}")),
+                    "the reason must name {key_type:?}, got {reason:?}"
+                );
+
+                let loaded = mutable_store
+                    .load(repository, key, key_type)
+                    .await
+                    .expect("loading the protected key");
+                assert_eq!(loaded, initial_value);
+            })
+            .await;
+    }
 }

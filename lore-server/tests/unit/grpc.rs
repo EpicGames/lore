@@ -788,3 +788,22 @@ mod filter_slow_down_tests {
         assert_eq!(status.code(), Code::ResourceExhausted);
     }
 }
+
+mod map_message_handle_error_to_status {
+    use lore_server::protocol::storage::messages::MessageHandleError;
+
+    use super::*;
+
+    /// A rejected argument is the client's fault: it answers `InvalidArgument`
+    /// with the reason, and is not counted as a server error.
+    #[test]
+    fn invalid_argument_answers_invalid_argument() {
+        let error = MessageHandleError::InvalidArgument("bad key_type".into());
+
+        let status = lore_server::grpc::map_message_handle_error_to_status(&error, None, None);
+
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert_eq!(status.message(), "Invalid argument: bad key_type");
+        assert!(!is_code_considered_server_error(&status.code()));
+    }
+}

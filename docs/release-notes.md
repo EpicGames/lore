@@ -39,6 +39,15 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-server`: the generic `MutableStore` and `MutableCompareAndSwap` storage requests refuse the repository
+  metadata, branch metadata and branch latest pointer key types on every transport, answering `InvalidArgument` over
+  gRPC and the generic `Failed` over QUIC, which has no code for a rejected argument. They previously wrote these keys
+  directly, skipping the checks the dedicated requests make: `RepositoryMetadataSet` and `BranchMetadataSet` check
+  that read-only fields are unchanged and that referenced blobs exist, and `BranchPush` checks branch protection and
+  that the pushed revision's fragments are present. Write these keys through those requests. The C API's
+  `lore_storage` mutable store and compare-and-swap calls made with `remote` set, and a server running with
+  `mutable_store.mode = "remote"`, send these same requests, so neither can write these key types to a server any
+  longer. The C API calls on a handle's local store are unchanged
 - The vendored `quinn-proto` moves to 0.11.19, with `quinn` 0.11.12 and `quinn-udp` 0.5.16. A peer's minimum ACK delay
   can no longer panic an endpoint that has the ACK frequency extension enabled, and the remote memory-exhaustion,
   stream-limit bypass and Retry-token issues upstream fixed along the way are closed with it. The MTU black-hole

@@ -3648,7 +3648,7 @@ mod storage_remote_tests {
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
 
-    const REMOTE_KEY_TYPE: KeyType = KeyType::BranchLatestPointer;
+    const REMOTE_KEY_TYPE: KeyType = KeyType::Untyped;
 
     fn remote_globals() -> LoreGlobalArgs {
         LoreGlobalArgs {

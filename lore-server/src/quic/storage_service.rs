@@ -408,6 +408,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::InvalidFragment => "InvalidFragment",
         MessageHandleError::HandlerTimeout => "HandlerTimeout",
         MessageHandleError::SessionLimitReached => "SessionLimitReached",
+        MessageHandleError::InvalidArgument(_) => "InvalidArgument",
     }
 }
 
@@ -429,7 +430,8 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::Metadata
         | MessageHandleError::HashFailed
         | MessageHandleError::InvalidFragment
-        | MessageHandleError::SessionLimitReached => false,
+        | MessageHandleError::SessionLimitReached
+        | MessageHandleError::InvalidArgument(_) => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError
         | MessageHandleError::NotImplemented
