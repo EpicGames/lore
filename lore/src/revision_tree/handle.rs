@@ -35,8 +35,6 @@ use lore_revision::repository::RepositoryContextCreationArgs;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::storage::store::StoreInternal;
@@ -46,7 +44,7 @@ use crate::storage::store::StoreInternal;
 /// Treat this as an opaque value; never cast it directly to or from raw
 /// pointers.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreRevisionTree {
     /// Registry key; `0` is the reserved invalid/unregistered sentinel (zero-init = null handle)
     pub handle_id: u64,

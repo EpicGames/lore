@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use bitflags::bitflags;
 use dashmap::DashMap;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::bitflagsops;
@@ -1255,7 +1254,7 @@ impl FilterInstance {
 
 /// Data for the event emitted when a path is excluded by a filter.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFilterExcludeEventData {
     /// Reason the path was excluded.

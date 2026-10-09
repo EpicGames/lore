@@ -7,6 +7,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- A client and the Lore service it relays commands to must come from the same build. Commands, their events and their
+  status cross as bitcode under message protocol version 2, where they crossed as JSON, and bitcode carries no field
+  names to tell two builds apart. A client and a service on either side of this change refuse each other's messages, so
+  restart the service after upgrading
+
 ### Features
 
 - `lore-server`: every gRPC request records a third latency histogram, `rpc.server.handler.duration`, counted from the
@@ -80,6 +85,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   every directory and every path of the scan has been walked
 - `lore status` lists the files in each section in path order. It listed them in the order the scan found them, which
   changes from run to run once a scan walks several directories or paths at once
+- A command carried out by the Lore service reads the global configuration and the credentials of the process that ran
+  it, from that process's `LORE_GLOBAL_PATH` and `LORE_AUTH_PATH`. It read the service's own, so a caller that pointed
+  either somewhere else was served from the wrong config and token store
+- `lore_storage_put`, `lore_storage_put_resolved`, `lore_storage_get` and `lore_storage_get_resolved` can be carried out
+  by the Lore service. A buffer a call or a `GET_DATA` event carries could not be read back on the other side of the
+  socket, so relaying one failed
 - Bound how many tasks resolving a conflict to one side runs at once, which `lore branch merge resolve mine` and
   `theirs` drive, as do the resolves of `lore revision cherry-pick` and `lore revision revert`. It ran a task for every
   directory it was given and another for every change below each, all live at the same time, so peak memory followed the

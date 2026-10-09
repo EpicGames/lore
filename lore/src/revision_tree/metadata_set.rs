@@ -25,8 +25,6 @@ use lore_revision::interface::LoreString;
 use lore_revision::metadata::METADATA_MAX_SIZE;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataType;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -38,7 +36,7 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 /// One metadata pair to record. `value` is a typed value that carries its own
 /// kind, so there is no separate format tag and nothing to parse.
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(Clone, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreRevisionTreeMetadataSetEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_SET_COMPLETE`
     pub entry_id: u64,
@@ -60,7 +58,7 @@ impl Default for LoreRevisionTreeMetadataSetEntry {
 
 /// Arguments for `lore_revision_tree_metadata_set`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_set_impl)]
 pub struct LoreRevisionTreeMetadataSetArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

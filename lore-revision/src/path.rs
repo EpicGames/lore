@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::InvalidArguments;
@@ -15,7 +14,7 @@ use crate::util::path::RelativePath;
 
 /// Event data naming a path that was ignored or could not be resolved.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LorePathIgnoreEventData {
     /// The ignored path

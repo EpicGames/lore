@@ -39,8 +39,6 @@ use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::StorageError;
 use lore_storage::read::read_into_file;
 use lore_storage::read::write_all_to_file;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -55,7 +53,7 @@ use crate::storage::store::StoreInternal;
 /// One `get_file` item — read content at `(partition, address)` and
 /// write it to the file at `path`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
+#[derive(Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStorageGetFileItem {
     /// Caller-chosen id echoed back in `GET_ITEM_COMPLETE`
     pub id: u64,
@@ -89,7 +87,7 @@ impl core::fmt::Debug for LoreStorageGetFileItem {
 
 /// Arguments for `lore_storage_get_file`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(get_file_local)]
 pub struct LoreStorageGetFileArgs {
     /// Open storage handle

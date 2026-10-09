@@ -10,8 +10,6 @@ use lore_revision::layer::LayerError;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util::path::RelativePath;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -23,7 +21,7 @@ mod list;
 mod remove;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_add_local)]
 /// Arguments for adding a layer from a source repository into the current repository.
 pub struct LoreLayerAddArgs {
@@ -102,7 +100,7 @@ async fn layer_add_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_remove_local)]
 /// Arguments for removing a layer from the repository at the specified path.
 pub struct LoreLayerRemoveArgs {
@@ -183,7 +181,7 @@ async fn layer_remove_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_list_local)]
 /// Arguments for listing all layers configured in the repository (no parameters).
 pub struct LoreLayerListArgs {}
@@ -231,7 +229,7 @@ fn layer_list_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(layer_list_staged_local)]
 /// Arguments for listing configured layers that have staged changes (no parameters).
 pub struct LoreLayerListStagedArgs {}

@@ -16,8 +16,6 @@ use lore_revision::lore_info;
 use lore_revision::lore_warn;
 use lore_revision::service_state::ServiceStateImpl;
 use lore_revision::util::config::SaveableConfig;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::interface::LoreEvent;
@@ -35,7 +33,7 @@ use crate::remote::service_process::service_runs_in_this_process;
 use crate::remote::service_process::wait_until_no_service_is_listening;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(start_local)]
 /// Arguments for starting the Lore service process (no parameters).
 pub struct LoreServiceStartArgs {}
@@ -91,7 +89,7 @@ fn start_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stop_local)]
 /// Arguments for stopping the Lore service process.
 pub struct LoreServiceStopArgs {}
@@ -191,7 +189,7 @@ async fn stop_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(set_executable_local)]
 /// Arguments for naming the executable the Lore service runs from.
 pub struct LoreServiceSetExecutableArgs {
@@ -269,7 +267,7 @@ async fn set_executable_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(set_use_automatically_local)]
 /// Arguments for setting whether commands are carried out by the Lore service.
 pub struct LoreServiceSetUseAutomaticallyArgs {
@@ -341,7 +339,7 @@ async fn set_use_automatically_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(status_local)]
 /// Arguments for querying the Lore service status (no parameters).
 pub struct LoreServiceStatusArgs {}

@@ -14,8 +14,6 @@ use lore_revision::shared_store::SharedStoreError;
 use lore_revision::shared_store::find_existing_shared_store_in_dir;
 use lore_revision::shared_store::registry::SharedStoreRegistry;
 use lore_revision::util::config::SaveableConfig;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -26,7 +24,7 @@ use crate::interface::LoreGlobalArgs;
 use crate::interface::LoreString;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(create_local)]
 /// Arguments for creating a new shared store.
 pub struct LoreSharedStoreCreateArgs {
@@ -92,7 +90,7 @@ fn create_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 /// Arguments for querying the configured default shared store (no parameters).
 pub struct LoreSharedStoreInfoArgs {}
@@ -165,7 +163,7 @@ async fn info_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(list_local)]
 /// Arguments for listing the registry of shared stores.
 pub struct LoreSharedStoreListArgs {
@@ -244,7 +242,7 @@ async fn list_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(set_use_automatically_local)]
 /// Arguments for setting whether to automatically use the shared store.
 pub struct LoreSharedStoreSetUseAutomaticallyArgs {

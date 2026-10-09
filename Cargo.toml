@@ -123,7 +123,9 @@ async-stream = "0.3.6"
 async-trait = "0.1.92"
 axum = "0.8.4"
 base64 = "0.22.1"
-bitcode = { version = "0.6.9", features = ["serde"] }
+# Pinned: the C API pointer types implement the derive-support traits bitcode exports for its own
+# derive macro, which its semver guarantees do not cover.
+bitcode = "=0.6.9"
 bitflags = "2.9.4"
 blake3 = "1.8.2"
 bytes = { version = "1.11.1", features = ["serde"] }

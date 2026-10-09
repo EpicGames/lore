@@ -33,8 +33,6 @@ use lore_revision::interface::LoreString;
 use lore_storage::StorageError;
 use lore_storage::options::WriteOptions;
 use lore_storage::write::write_resolved_from_file;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -47,7 +45,7 @@ use crate::storage::store::StoreInternal;
 
 /// One `put_file_resolved` item — the file to store and the mutable key to publish it under.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
+#[derive(Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStoragePutFileResolvedItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -86,7 +84,7 @@ impl core::fmt::Debug for LoreStoragePutFileResolvedItem {
 
 /// Arguments for `lore_storage_put_file_resolved`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(put_file_resolved_local)]
 pub struct LoreStoragePutFileResolvedArgs {
     /// Open storage handle

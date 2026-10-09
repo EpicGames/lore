@@ -17,6 +17,7 @@ pub fn get_lore_command_impl(input: &DeriveInput) -> TokenStream {
 
     let mut inside_match = quote! {};
     let mut run_match = quote! {};
+    let mut validate_match = quote! {};
     let mut conversions = quote! {};
     for variant in variants.iter() {
         let ident = &variant.ident;
@@ -37,6 +38,10 @@ pub fn get_lore_command_impl(input: &DeriveInput) -> TokenStream {
                 #name::#ident(args) => args,
                 _ => unreachable!(),
             }),
+        };
+        validate_match = quote! {
+            #validate_match
+            #name::#ident(args) => ::lore_base::text::ValidateText::validate_text(args),
         };
         conversions = quote! {
             #conversions
@@ -71,6 +76,14 @@ pub fn get_lore_command_impl(input: &DeriveInput) -> TokenStream {
             pub(crate) fn run_local(self, globals: crate::interface::LoreGlobalArgs, callback: crate::interface::LoreEventCallback) -> i32 {
                 match self {
                     #run_match
+                }
+            }
+        }
+
+        impl ::lore_base::text::ValidateText for #name {
+            fn validate_text(&self) -> ::std::result::Result<(), ::lore_base::text::TextNotUtf8> {
+                match self {
+                    #validate_match
                 }
             }
         }

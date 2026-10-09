@@ -3,7 +3,6 @@
 use std::path::Path;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::FileConfig;
@@ -30,7 +29,7 @@ use crate::util;
 
 /// Data for the event emitted when a repository is created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCreateEventData {
     /// Identifier of the created repository.

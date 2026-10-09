@@ -22,8 +22,6 @@ use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageMutableListEntryEventData;
 use lore_revision::store::event::LoreStorageMutableListItemCompleteEventData;
 use lore_storage::StorageError;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -35,7 +33,9 @@ use crate::storage::store::StoreInternal;
 
 /// One `mutable_list` item — the `(partition, key_type)` to list.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreStorageMutableListItem {
     /// Caller-chosen id echoed back on every entry and the terminal event
     pub id: u64,
@@ -47,7 +47,7 @@ pub struct LoreStorageMutableListItem {
 
 /// Arguments for `lore_storage_mutable_list`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(mutable_list_local)]
 pub struct LoreStorageMutableListArgs {
     /// Open storage handle

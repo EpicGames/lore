@@ -160,12 +160,6 @@ typedef enum lore_revision_resolve_target_t {
 // thing as the code on `Complete.status`. This enum names the subset a
 // per-item event can carry; it is not a second numbering.
 //
-// The variant order is the serialized wire format, not the numbering. Serde
-// encodes a variant by its declaration index in a non-self-describing format,
-// and `LoreEvent` crosses the service boundary in one, so reordering these
-// would silently redecode old payloads as different errors. Add new variants
-// at the end and change discriminants in place.
-//
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
   LORE_ERROR_CODE_NONE = 0,
@@ -374,9 +368,7 @@ typedef struct lore_complete_event_data_t {
   // The completion status code of the operation.
   int32_t status;
   // The error detail for the operation. The empty default detail on
-  // success; the populated detail on failure. `#[serde(default)]` lets an
-  // older payload that lacks this field deserialize: the detail then reads
-  // back as the empty default with an empty trace list.
+  // success; the populated detail on failure.
   struct lore_error_detail_t error;
 } lore_complete_event_data_t;
 
@@ -2629,9 +2621,7 @@ typedef struct lore_storage_put_item_complete_event_data_t {
   struct lore_address_t address;
   // The outcome for the item.
   struct lore_error_detail_t error;
-  // Non-zero when the local store holds the content. Trailing, so a payload that lacks it still
-  // decodes: the IPC wire format is non-self-describing, where only a missing trailing field is
-  // recoverable.
+  // Non-zero when the local store holds the content.
   uint8_t stored_local;
   // Non-zero when the content reached the remote, or was already durable there. A remote
   // write that fails still reports success if the local write succeeded — this is how a

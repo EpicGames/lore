@@ -1,13 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_macro::LoreCommand;
-use serde::Deserialize;
-use serde::Serialize;
 
 // The LoreCommand derive generates `invoke_local`, which runs a variant's handler as a future,
-// `run_local`, which runs it to completion on the calling thread, and a `From` conversion from
-// each variant's arguments.
-#[derive(Debug, Clone, Serialize, Deserialize, LoreCommand)]
+// `run_local`, which runs it to completion on the calling thread, `ValidateText`, which checks the
+// variant's arguments, and a `From` conversion from each variant's arguments.
+#[derive(Debug, Clone, LoreCommand, bitcode::Encode, bitcode::Decode)]
 pub enum LoreCommand {
     AuthUserInfo(crate::auth::LoreAuthUserInfoArgs),
     AuthLoginWithToken(crate::auth::LoreAuthLoginWithTokenArgs),

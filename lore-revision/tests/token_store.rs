@@ -6,6 +6,7 @@ mod tests {
 
     use keyring::mock;
     use keyring::set_default_credential_builder;
+    use lore_base::env::CallEnvironment;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_credential::token_store;
@@ -13,6 +14,7 @@ mod tests {
     use lore_credential::token_store::vulnerable_all_tokens;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::relay::EventDispatcher;
 
     include!("helper.rs");
 
@@ -638,6 +640,111 @@ mod tests {
                     "a supplied identity token must not be served a stored authorization token"
                 );
             }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// The context of a call relayed from a process whose token store is `auth_dir`.
+    fn relayed_from(auth_dir: &TempDir) -> Arc<ExecutionContext> {
+        Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [None, Some(auth_dir.display().to_string())],
+                }),
+        )
+    }
+
+    /// A call relayed from another process reads the token store its caller names, so one
+    /// process caches each store apart: an identity stored through one caller's store is not
+    /// served to a caller naming another.
+    #[tokio::test]
+    async fn a_relayed_call_reads_only_its_callers_token_store() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (first_dir, second_dir) = (generate_tempdir(), generate_tempdir());
+        let (first, second) = (relayed_from(&first_dir), relayed_from(&second_dir));
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(async move {
+                LORE_CONTEXT
+                    .scope(first, async {
+                        token_store::store_user_token(AUTH_ENDPOINT, "first", "token", vec![])
+                            .await
+                            .expect("Failed to store token");
+                        assert_eq!(
+                            token_store::load_identities(AUTH_ENDPOINT)
+                                .await
+                                .expect("Failed to get identities"),
+                            ["first"]
+                        );
+                    })
+                    .await;
+                let identities = LORE_CONTEXT
+                    .scope(second, token_store::load_identities(AUTH_ENDPOINT))
+                    .await
+                    .expect("Failed to get identities");
+                assert!(
+                    identities.is_empty(),
+                    "a caller naming another store must not be served this one's identities"
+                );
+            })
+            .await
+            .expect("Task failure");
+    }
+
+    /// An authorization one caller's token store earned is cached for that store alone: a caller
+    /// naming a store that holds nothing for the identity is not served it.
+    ///
+    /// `AUTH_ENDPOINT` has an `http` scheme, which no `Authentication` implementation is
+    /// registered for, so a call that misses the cache and the store fails before any network call.
+    #[tokio::test]
+    async fn a_relayed_call_is_served_only_its_callers_authorization() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (first_dir, second_dir) = (generate_tempdir(), generate_tempdir());
+        let (first, second) = (relayed_from(&first_dir), relayed_from(&second_dir));
+        let identity = "relayed-authz-identity";
+        let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id");
+        let exchange = move || {
+            lore_transport::auth::exchange::exchange(
+                AUTH_ENDPOINT,
+                identity,
+                repository,
+                "example.com".to_string(),
+                "",
+                "",
+            )
+        };
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(async move {
+                LORE_CONTEXT
+                    .scope(first, async {
+                        token_store::store_user_token(
+                            &format!("{AUTH_ENDPOINT}/{repository}"),
+                            identity,
+                            SUPPLIED_JWT,
+                            vec!["example.com".into()],
+                        )
+                        .await
+                        .expect("Failed to store authorization token");
+                        assert_eq!(
+                            exchange().await.expect("the stored authorization is used"),
+                            SUPPLIED_JWT
+                        );
+                    })
+                    .await;
+                assert!(
+                    LORE_CONTEXT.scope(second, exchange()).await.is_err(),
+                    "a caller naming another store must not be served this one's authorization"
+                );
+            })
             .await
             .expect("Task failure");
     }

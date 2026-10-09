@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::ID;
@@ -27,7 +26,7 @@ use crate::runtime::execution_context;
 
 /// Descriptive data for a repository.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryDataEventData {
     /// Remote URL of the repository.

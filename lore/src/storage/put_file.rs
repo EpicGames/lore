@@ -27,8 +27,6 @@ use lore_revision::interface::LoreString;
 use lore_storage::StorageError;
 use lore_storage::options::WriteOptions;
 use lore_storage::write::write_from_file;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -42,7 +40,7 @@ use crate::storage::store::StoreInternal;
 /// One `put_file` item — read the file at `path` and store it at
 /// `(partition, context)`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
+#[derive(Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStoragePutFileItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -74,7 +72,7 @@ impl core::fmt::Debug for LoreStoragePutFileItem {
 
 /// Arguments for `lore_storage_put_file`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(put_file_local)]
 pub struct LoreStoragePutFileArgs {
     /// Open storage handle

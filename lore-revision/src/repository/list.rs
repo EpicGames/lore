@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::RepositoryError;
@@ -13,7 +12,7 @@ use crate::protocol;
 
 /// One entry in a repository listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryListEntryEventData {
     /// Repository identifier.

@@ -94,6 +94,10 @@ def subscribe_and_wait_listening(executor, repo: Lore, timeout: int, expected_me
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process(
+    "a relayed subscription delivers to the subscribe call's connection, which closes "
+    "when the call returns"
+)
 class TestNotifications:
     def test_branch_archive_event(
         self,

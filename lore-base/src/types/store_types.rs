@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use serde::Deserialize;
-use serde::Serialize;
 
 /// Kind of value a stored key refers to.
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Copy, Clone, Default, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub enum KeyType {
     /// Key has no specific type.
     #[default]

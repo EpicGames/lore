@@ -24,8 +24,6 @@ use lore_revision::lore::execution_context;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::StorageError;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -55,7 +53,7 @@ pub(crate) fn spawn_flush_stores(
 
 /// Arguments for `lore_storage_close`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(close_local)]
 pub struct LoreStorageCloseArgs {
     /// Handle to release; from `LORE_EVENT_STORAGE_OPENED`

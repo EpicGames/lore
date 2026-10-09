@@ -11,8 +11,6 @@ pub use lore_revision::link::LinkFlags;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util::path::RelativePath;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -22,7 +20,7 @@ use crate::interface::LoreString;
 
 /// Arguments for adding a new link to a linked repository at the given path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(add_local)]
 pub struct LoreLinkAddArgs {
     /// Link repository URL
@@ -114,7 +112,7 @@ async fn add_impl(
 
 /// Arguments for removing a link from the repository at the given path.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(remove_local)]
 pub struct LoreLinkRemoveArgs {
     /// Path within this repository where the link is removed
@@ -177,7 +175,7 @@ async fn remove_impl(
 
 /// Arguments for listing all linked repositories in the current repository.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(list_local)]
 pub struct LoreLinkListArgs {}
 
@@ -221,7 +219,7 @@ fn list_local(
 
 /// Arguments for reading detailed information about a single link.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 pub struct LoreLinkInfoArgs {
     /// Path within this repository of the link to describe
@@ -280,7 +278,7 @@ fn info_local(
 
 /// Arguments for listing the links whose linked repositories hold staged changes.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(list_staged_local)]
 pub struct LoreLinkListStagedArgs {}
 
@@ -328,7 +326,7 @@ fn list_staged_local(
 
 /// Arguments for updating the pin or properties of an existing link.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(update_local)]
 pub struct LoreLinkUpdateArgs {
     /// Path within this repository of the link to update

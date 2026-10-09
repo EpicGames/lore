@@ -362,6 +362,40 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--disable-auto-server` | `false` | Don't auto start the server |
 | `--keep-test-data` | `false` | Leave repositories, stores and server roots on disk |
 
+### Running every test through one service
+
+`LORE_TEST_SHARED_SERVICE=1` starts one service from the build under test before
+the run and stops it when the run ends. Every command of every test then runs in
+that service, except in the tests that manage a service of their own through
+`lore_service_runner`, which keep theirs, and in the tests marked
+`runs_in_process(reason)`, whose commands stay in their own process. No
+executable is named for the relayed commands, so a service that stops partway
+fails the tests that follow instead of being replaced.
+
+```bash
+LORE_TEST_SHARED_SERVICE=1 uv run pytest scripts/test/ -m smoke -n 4
+```
+
+The service listens on a socket named for the run, with a global directory of
+its own, so several runs proceed side by side. A run ended by Ctrl+C, SIGTERM or
+SIGHUP stops it as a finished run does. On Linux the kernel stops it when the run
+is killed outright, as it does every service and server a test or an xdist
+worker starts when that process ends. The server the workers share outlives the
+worker that launched it, which can finish first: the run's cleanups stop it, and
+on Linux so does the run's main process ending.
+
+`LORE_TEST_SERVICE_SOCKET` names the socket of a service started some other way,
+which the run then uses in place of starting one:
+
+```bash
+LORE_SERVICE_SOCKET=lore_service-smoke LORE_GLOBAL_PATH=$(mktemp -d) \
+    target/release/lore service run &
+LORE_TEST_SERVICE_SOCKET=lore_service-smoke uv run pytest scripts/test/ -m smoke -n 4
+```
+
+Each call carries the test's `LORE_GLOBAL_PATH` and `LORE_AUTH_PATH`, which the
+service reads in place of its own, so the tests stay isolated from each other.
+
 ### Per-test timeout
 
 Every test is bounded at ten minutes (`timeout` in `pyproject.toml`), and the

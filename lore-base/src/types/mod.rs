@@ -179,6 +179,8 @@ where
     Immutable,
     Serialize,
     Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 #[serde(transparent)]
 pub struct Context {
@@ -209,6 +211,8 @@ pub struct Context {
     Immutable,
     Serialize,
     Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 #[serde(transparent)]
 pub struct Partition {
@@ -238,6 +242,8 @@ pub struct Partition {
     Immutable,
     Serialize,
     Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 #[serde(transparent)]
 pub struct Hash {
@@ -256,7 +262,20 @@ pub const HASH_STRING_LENGTH: usize = std::mem::size_of::<Hash>() * 2;
 /// Pairs a content hash with a context identifier, so the same content can be
 /// addressed under different contexts.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, Eq, PartialOrd, Ord, IntoBytes, FromBytes, Immutable)]
+#[derive(
+    Copy,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    IntoBytes,
+    FromBytes,
+    Immutable,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 pub struct Address {
     /// Content hash.
     pub hash: Hash,
@@ -282,6 +301,8 @@ pub struct Address {
     KnownLayout,
     Serialize,
     Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 pub struct Fragment {
     /// Flags

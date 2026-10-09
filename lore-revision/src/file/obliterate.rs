@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -25,7 +24,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event emitted when file content is obliterated.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileObliterateEventData {
     /// Address of the obliterated content.

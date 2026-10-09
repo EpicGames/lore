@@ -31,8 +31,6 @@ use lore_revision::revision::info::InfoOptions;
 use lore_revision::revision::restore::RestoreOptions;
 use lore_revision::revision::sync;
 use lore_revision::revision::sync::SyncOptions;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -43,7 +41,7 @@ use crate::util::convert_user_paths;
 
 /// Arguments for committing staged changes into a new revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(commit_local)]
 pub struct LoreRevisionCommitArgs {
     /// Commit message
@@ -51,19 +49,14 @@ pub struct LoreRevisionCommitArgs {
     /// If set, commit only this linked repository (mount path relative to repo root)
     pub link: LoreString,
     /// Array of link relative paths that have specific messages
-    #[serde(default)]
     pub link_paths: LoreArray<LoreString>,
     /// Array of messages corresponding to each link path (parallel array with `link_paths`)
-    #[serde(default)]
     pub link_messages: LoreArray<LoreString>,
     /// If set, commit only this layer (mount path relative to repo root)
-    #[serde(default)]
     pub layer: LoreString,
     /// Array of layer mount paths that have specific messages
-    #[serde(default)]
     pub layer_paths: LoreArray<LoreString>,
     /// Array of messages corresponding to each layer path (parallel array with `layer_paths`)
-    #[serde(default)]
     pub layer_messages: LoreArray<LoreString>,
 }
 
@@ -173,7 +166,7 @@ fn commit_local(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LoreRevisionCommitWithMetadataArgs {
     // Message
     pub message: LoreString,
@@ -221,7 +214,7 @@ pub async fn commit_with_metadata(
 
 /// Arguments for amending the most recent revision's commit message.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(amend_local)]
 pub struct LoreRevisionAmendArgs {
     /// New commit message
@@ -279,7 +272,7 @@ fn amend_local(
 
 /// Arguments for retrieving metadata and file information for a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 pub struct LoreRevisionInfoArgs {
     /// Revision to get info for; empty for current
@@ -337,7 +330,7 @@ fn info_local(
 
 /// Arguments for clearing all metadata from the current revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_clear_local)]
 pub struct LoreRevisionMetadataClearArgs {}
 
@@ -387,7 +380,7 @@ fn metadata_clear_local(
 
 /// Arguments for retrieving a single metadata value by key from a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_get_local)]
 pub struct LoreRevisionMetadataGetArgs {
     /// Metadata key to look up
@@ -441,7 +434,7 @@ async fn metadata_get_impl(
 
 /// Arguments for listing all metadata key/value pairs of a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_list_local)]
 pub struct LoreRevisionMetadataListArgs {
     /// Revision to list metadata for; empty for current
@@ -499,7 +492,7 @@ fn metadata_list_local(
 
 /// Arguments for setting metadata key/value pairs on the current revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_set_local)]
 pub struct LoreRevisionMetadataSetArgs {
     /// Metadata keys (parallel with `values` and `formats`)
@@ -583,7 +576,7 @@ async fn metadata_set_impl(
 
 /// Arguments for retrieving the revision history of a branch or revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(history_local)]
 pub struct LoreRevisionHistoryArgs {
     /// Start from this revision; empty for current
@@ -647,7 +640,7 @@ fn history_local(
 
 /// Arguments for restoring the current branch to a previously synced revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(restore_local)]
 pub struct LoreRevisionRestoreArgs {
     /// Commit message for the restored revision
@@ -720,7 +713,7 @@ fn restore_local(
 
 /// Arguments for synchronizing the working directory to a target revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(sync_local)]
 pub struct LoreRevisionSyncArgs {
     /// Revision to synchronize to; empty for branch tip
@@ -739,7 +732,6 @@ pub struct LoreRevisionSyncArgs {
     pub dependency_depth_limit: u32,
     /// View filter file to leave the working files materialized under; empty to keep the view the
     /// instance holds
-    #[serde(default)]
     pub view: LoreString,
 }
 
@@ -849,7 +841,7 @@ fn sync_local(
 
 /// Arguments for bisecting the revision range between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(bisect_local)]
 pub struct LoreRevisionBisectArgs {
     /// Starting (known-good) revision of the bisect range
@@ -920,7 +912,7 @@ fn bisect_local(
 
 /// Arguments for finding revisions by metadata or revision number.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(find_local)]
 pub struct LoreRevisionFindArgs {
     /// Metadata key to search for; non-empty selects key/value search
@@ -988,7 +980,7 @@ async fn find_impl(
 
 /// Arguments for computing file-level differences between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(diff_local)]
 pub struct LoreRevisionDiffArgs {
     /// Source revision to diff from
@@ -1078,7 +1070,7 @@ async fn diff_impl(
 
 /// Arguments for cherry-picking a revision onto the current branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_local)]
 pub struct LoreRevisionCherryPickArgs {
     /// Revision to cherry pick
@@ -1091,7 +1083,6 @@ pub struct LoreRevisionCherryPickArgs {
     /// Metadata keys to carry from the picked revision onto the revision this
     /// creates. Empty carries nothing; the single entry `*` carries every key
     /// that is not reserved to the cherry-pick itself.
-    #[serde(default)]
     pub inherit_metadata: LoreArray<LoreString>,
 }
 
@@ -1177,7 +1168,7 @@ fn cherry_pick_local(
 
 /// Arguments for aborting a cherry-pick operation in progress.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_abort_local)]
 pub struct LoreRevisionCherryPickAbortArgs {}
 
@@ -1205,7 +1196,7 @@ fn cherry_pick_abort_local(
 
 /// Arguments for marking cherry-pick paths as unresolved again.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_unresolve_local)]
 pub struct LoreRevisionCherryPickUnresolveArgs {
     /// Repository-relative paths to mark unresolved
@@ -1238,7 +1229,7 @@ fn cherry_pick_unresolve_local(
 
 /// Arguments for restarting cherry-pick conflict resolution for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_restart_local)]
 pub struct LoreRevisionCherryPickRestartArgs {
     /// Repository-relative paths to re-materialize for resolution
@@ -1271,7 +1262,7 @@ fn cherry_pick_restart_local(
 
 /// Arguments for marking cherry-pick conflicts as resolved for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_resolve_local)]
 pub struct LoreRevisionCherryPickResolveArgs {
     /// Repository-relative paths to mark resolved
@@ -1304,7 +1295,7 @@ fn cherry_pick_resolve_local(
 
 /// Arguments for resolving cherry-pick conflicts by keeping the "mine" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_resolve_mine_local)]
 pub struct LoreRevisionCherryPickResolveMineArgs {
     /// Repository-relative paths to resolve in favor of "mine"
@@ -1339,7 +1330,7 @@ fn cherry_pick_resolve_mine_local(
 
 /// Arguments for resolving cherry-pick conflicts by keeping the "theirs" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(cherry_pick_resolve_theirs_local)]
 pub struct LoreRevisionCherryPickResolveTheirsArgs {
     /// Repository-relative paths to resolve in favor of "theirs"
@@ -1374,7 +1365,7 @@ fn cherry_pick_resolve_theirs_local(
 
 /// Arguments for reverting the working directory to a specified revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_local)]
 pub struct LoreRevisionRevertArgs {
     /// Revision to revert
@@ -1460,7 +1451,7 @@ pub fn revert_local(
 
 /// Arguments for aborting a revert operation in progress.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_abort_local)]
 pub struct LoreRevisionRevertAbortArgs {}
 
@@ -1510,7 +1501,7 @@ fn revert_abort_local(
 
 /// Arguments for marking revert paths as unresolved again.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_unresolve_local)]
 pub struct LoreRevisionRevertUnresolveArgs {
     /// Repository-relative paths to mark unresolved
@@ -1564,7 +1555,7 @@ fn revert_unresolve_local(
 
 /// Arguments for restarting revert conflict resolution for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_restart_local)]
 pub struct LoreRevisionRevertRestartArgs {
     /// Repository-relative paths to re-materialize for resolution
@@ -1619,7 +1610,7 @@ fn revert_restart_local(
 
 /// Arguments for marking revert conflicts as resolved for paths.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_resolve_local)]
 pub struct LoreRevisionRevertResolveArgs {
     /// Repository-relative paths to mark resolved
@@ -1673,7 +1664,7 @@ fn revert_resolve_local(
 
 /// Arguments for resolving revert conflicts by keeping the "mine" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_resolve_mine_local)]
 pub struct LoreRevisionRevertResolveMineArgs {
     /// Repository-relative paths to resolve in favor of "mine"
@@ -1729,7 +1720,7 @@ fn revert_resolve_mine_local(
 
 /// Arguments for resolving revert conflicts by keeping the "theirs" version.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(revert_resolve_theirs_local)]
 pub struct LoreRevisionRevertResolveTheirsArgs {
     /// Repository-relative paths to resolve in favor of "theirs"

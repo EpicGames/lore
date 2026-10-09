@@ -111,19 +111,10 @@ pub async fn close_all_handles() {
 /// and running the close sequence on each. Client-mode handles (no connection id recorded)
 /// are unaffected. Per-handle drains run in parallel.
 ///
-/// IPC buffer-bearing args policy: `lore_storage_put` and `lore_storage_put_resolved` carry a
-/// `LoreBytes` view into caller memory in their *args*, which has no natural cross-process
-/// representation. `LoreBytes::deserialize` always errors, so those args cannot be reconstructed
-/// on the server side of the IPC boundary. `lore_storage_put_file` and
-/// `lore_storage_put_file_resolved` name a path instead, so they carry across it unchanged and are
-/// the delegable way to write content a service holds on disk.
-///
-/// Two caveats worth knowing before relying on this. Nothing enforces it: every op goes through
-/// `dispatch_call` and is delegated whenever service mode is active, and the failure surfaces as
-/// a message that fails to read — dropping the connection — rather than as the `InvalidArguments`
-/// a caller would expect. And the read ops (`lore_storage_get`, `lore_storage_get_resolved`) are
-/// *not* in this family despite emitting `LoreBytes`: they carry it only in events, whose
-/// lifetime is the callback, so their args round-trip fine.
+/// Buffers across the IPC boundary: the `LoreBytes` a `lore_storage_put` or
+/// `lore_storage_put_resolved` item views crosses as its bytes, which the service reads in the
+/// message they arrived in. A get item's `data_out` names memory the service cannot write, so it
+/// does not cross, and a relayed get answers with `GET_DATA` events instead.
 ///
 /// Revision tree handles loaded against a drained storage handle are closed too, and this
 /// is the only path that closes one for its caller: elsewhere a tree outlives its parent by

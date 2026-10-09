@@ -16,7 +16,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::RevisionListIdentifier;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::mpsc;
@@ -1259,7 +1258,7 @@ pub async fn tree(
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreRevisionResolveTarget {
     /// A revision by its number on the branch.
@@ -1276,7 +1275,7 @@ pub enum LoreRevisionResolveTarget {
 /// a long stretch of history. A specifier that names no branch resolves to
 /// itself and reports nothing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionResolveEventData {
     /// Repository identifier in which repository

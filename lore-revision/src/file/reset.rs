@@ -8,7 +8,6 @@ use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -59,7 +58,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event emitted when a reset operation begins.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileResetBeginEventData {
     /// Number of paths requested for reset.
@@ -68,7 +67,7 @@ pub struct LoreFileResetBeginEventData {
 
 /// Running counts of items processed during a reset operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileResetCountData {
     /// Number of directories that were reset.
@@ -83,7 +82,7 @@ pub struct LoreFileResetCountData {
 
 /// Data for the progress event emitted periodically during a reset operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileResetProgressEventData {
     /// Current counts of items processed.
@@ -92,7 +91,7 @@ pub struct LoreFileResetProgressEventData {
 
 /// Data for the event emitted when a reset operation completes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileResetEndEventData {
     /// Final counts of items processed.
@@ -101,7 +100,7 @@ pub struct LoreFileResetEndEventData {
 
 /// Data for the event emitted for each file affected by a reset operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileResetFileEventData {
     /// Path of the file.

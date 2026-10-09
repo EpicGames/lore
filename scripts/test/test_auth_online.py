@@ -1083,6 +1083,10 @@ def test_cli_push_and_sync_follow_the_grant(auth_env, make_actor):
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process(
+    "a relayed subscription delivers to the subscribe call's connection, which closes "
+    "when the call returns"
+)
 def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
     """`lore notification subscribe` under the online rules: a granted
     member's subscription is accepted and receives the owner's lock events

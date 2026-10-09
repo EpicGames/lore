@@ -457,7 +457,16 @@ pub struct GRPCConnection {
     connection: Weak<Connection>,
     remote_url: Url,
     channel: parking_lot::RwLock<Channel>,
-    auth: DashMap<(AuthUrl, UserIdentity, ResourceId, FromSuppliedCredentials), GRPCAuthRef>,
+    auth: DashMap<
+        (
+            AuthUrl,
+            UserIdentity,
+            ResourceId,
+            FromSuppliedCredentials,
+            crate::connection::CredentialStore,
+        ),
+        GRPCAuthRef,
+    >,
     reconnect: AtomicU32,
     reconnector: Semaphore,
 }
@@ -493,6 +502,7 @@ impl GRPCConnection {
             identity.to_string(),
             repository.to_string(),
             credentials.from_supplied_credentials(),
+            crate::connection::credential_store(),
         );
 
         if let Some(auth) = self.auth.get(&key) {
@@ -528,6 +538,7 @@ impl GRPCConnection {
             identity.to_string(),
             resource.to_string(),
             credentials.from_supplied_credentials(),
+            crate::connection::credential_store(),
         );
 
         if let Some(auth) = self.auth.get(&key) {

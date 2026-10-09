@@ -30,7 +30,6 @@ pub use diff::GraftOracle;
 use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 pub use stream::ChangeSender;
 pub use stream::ChangeStream;
@@ -101,7 +100,7 @@ use crate::util::request_tracker::StoreRequestTracker;
 
 /// Data for an event summarizing a dumped repository state.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStateDumpEventData {
     /// Sequence number of the revision.
@@ -116,7 +115,7 @@ pub struct LoreRepositoryStateDumpEventData {
 
 /// Data for an event describing a single node in a dumped repository state.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStateDumpNodeEventData {
     /// Name of the node.

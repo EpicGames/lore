@@ -28,6 +28,8 @@ use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 
 use crate::auth::authentication;
+use crate::connection::CredentialStore;
+use crate::connection::credential_store;
 
 #[error_set]
 pub enum ExchangeError {
@@ -56,6 +58,7 @@ type AuthzCache = Mutex<
             CacheResourceId,
             RecipientDomain,
             CredentialFingerprint,
+            CredentialStore,
         ),
         String,
     >,
@@ -88,7 +91,9 @@ pub fn is_expired(expires: u64) -> bool {
 /// the store. Also the on-disk store is not read in this case to not mix the
 /// external tokens with cached login tokens. The in-memory cache keeps them
 /// apart too: an entry is keyed by the credential that earned it, so a supplied
-/// token is never served an authorization that another credential produced.
+/// token is never served an authorization that another credential produced, and
+/// by the token store the call reads, so a call is never served an authorization
+/// another caller's store produced.
 ///
 /// Token store keys use `"{auth_url}/{repository_id}"` (no implementation-
 /// specific prefix). The `Authentication` implementation handles resource ID
@@ -134,6 +139,7 @@ pub async fn exchange(
         repo_id_str.clone(),
         recipient_domain.clone(),
         credential_fingerprint,
+        credential_store(),
     );
     let mut cache = cache().lock().await;
 
@@ -310,6 +316,7 @@ pub async fn exchange_custom_resource(
         resource_id.to_string(),
         recipient_domain.clone(),
         credential_fingerprint,
+        credential_store(),
     );
     let mut cache = cache().lock().await;
 

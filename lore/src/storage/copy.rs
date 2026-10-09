@@ -52,8 +52,6 @@ use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::options::ReadOptions;
 use lore_storage::read::load_fragment;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
@@ -68,7 +66,9 @@ use crate::storage::store::StoreInternal;
 /// One copy item — relocate content from `(source_partition, source_address)` to
 /// `(target_partition, source_address.hash, target_context)`, preserving the content hash.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreStorageCopyItem {
     /// Caller-chosen id echoed back in `COPY_ITEM_COMPLETE`
     pub id: u64,
@@ -86,7 +86,7 @@ pub struct LoreStorageCopyItem {
 
 /// Arguments for `lore_storage_copy`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(copy_local)]
 pub struct LoreStorageCopyArgs {
     /// Open storage handle

@@ -20,7 +20,7 @@ use crate::storage::store::StoreInternal;
 
 /// Opaque handle to an open content-addressed storage instance.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStore {
     /// Registry key; `0` is the reserved invalid/unregistered sentinel (zero-init = null handle)
     pub handle_id: u64,

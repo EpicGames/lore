@@ -6,6 +6,7 @@ use std::sync::Once;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
 
+use lore_base::env::AUTH_PATH_VAR;
 use lore_base::lore_debug;
 use lore_base::lore_spawn_net;
 use lore_base::lore_trace;
@@ -83,13 +84,19 @@ pub fn add(scheme: &str, protocol: Arc<dyn Protocol>) -> Result<(), ProtocolErro
 /// [`SuppliedCredentials`] carries a rotation within one mode.
 type FromSuppliedCredentials = bool;
 
-#[allow(clippy::type_complexity)]
-/// Connections are keyed by `(remote_url, identity, from_supplied_credentials)`. Storage uses per-session auth,
-/// and non-storage services (revision, admin, lock) are created lazily per-repository
-/// with per-repository authz tokens.
-static CONNECTION_MAP: Mutex<
-    Option<HashMap<(String, String, FromSuppliedCredentials), Arc<Connection>>>,
-> = Mutex::new(None);
+/// The token store a call reads its credentials from, by the directory naming it: empty for the
+/// per-user default. A process carrying out calls for other processes reads the store each caller
+/// names, so what is cached from a store is keyed by it.
+pub(crate) type CredentialStore = String;
+
+/// What a connection is cached under: the remote URL, the identity, whether the caller supplied
+/// its own credentials, and the token store the connection authenticated from.
+type ConnectionKey = (String, String, FromSuppliedCredentials, CredentialStore);
+
+/// Connections are keyed by [`ConnectionKey`]. Storage uses per-session auth, and non-storage
+/// services (revision, admin, lock) are created lazily per-repository with per-repository authz
+/// tokens.
+static CONNECTION_MAP: Mutex<Option<HashMap<ConnectionKey, Arc<Connection>>>> = Mutex::new(None);
 
 /// Whether a cached connection answers for `remote_url` in this mode, for the
 /// fallback that serves a caller who has not resolved an identity yet.
@@ -101,8 +108,8 @@ static CONNECTION_MAP: Mutex<
 /// alone, rather than on the full key.
 ///
 /// Only a call working from the token store may. The identity it will resolve is
-/// deterministic for a given URL and store, so any entry under that URL is the
-/// one it would have opened anyway.
+/// deterministic for a given URL and store, so any entry under that URL opened
+/// from the same store is the one it would have opened anyway.
 ///
 /// A call that supplied its own credentials is the opposite case: whose
 /// connection sits under that URL depends on whose token opened it, and the URL
@@ -121,13 +128,19 @@ fn may_match_on_url_alone(
 }
 
 #[lore_macro::test_pub]
-fn matches_url_and_mode(
-    key: &(String, String, FromSuppliedCredentials),
+fn matches_url_mode_and_store(
+    key: &ConnectionKey,
     remote_url: &str,
     from_supplied_credentials: FromSuppliedCredentials,
+    credential_store: &str,
 ) -> bool {
-    let (url, _identity, supplied) = key;
-    url == remote_url && *supplied == from_supplied_credentials
+    let (url, _identity, supplied, store) = key;
+    url == remote_url && *supplied == from_supplied_credentials && store == credential_store
+}
+
+/// The [`CredentialStore`] this call reads.
+pub(crate) fn credential_store() -> CredentialStore {
+    lore_base::env::var(AUTH_PATH_VAR).unwrap_or_default()
 }
 
 pub fn find_connection(
@@ -142,10 +155,12 @@ pub fn find_connection(
     // cached the resolved entry. An identity-less call takes this too: it only
     // matches an entry that also resolved no identity, such as one opened against
     // a server that does not authenticate.
+    let credential_store = credential_store();
     let key = (
         remote_url.to_string(),
         identity.to_string(),
         from_supplied_credentials,
+        credential_store,
     );
     if let Some(connection) = map.get(&key) {
         if !connection.stale.load(Ordering::Relaxed) {
@@ -160,12 +175,12 @@ pub fn find_connection(
 
     // Caller has no identity yet (config omits it). The resolved identity is
     // deterministic for a given url/credential store, so reuse any non-stale entry
-    // keyed under the same URL. Without this, every call that omits an identity
-    // re-enters `connect_impl` and re-issues `EnvironmentService/Get` even though
-    // the Connection would be reused by the inner lookup after auth_exchange.
+    // keyed under the same URL and store. Without this, every call that omits an
+    // identity re-enters `connect_impl` and re-issues `EnvironmentService/Get` even
+    // though the Connection would be reused by the inner lookup after auth_exchange.
     map.iter()
-        .find(|(key, c)| {
-            matches_url_and_mode(key, remote_url, from_supplied_credentials)
+        .find(|(candidate, c)| {
+            matches_url_mode_and_store(candidate, remote_url, from_supplied_credentials, &key.3)
                 && !c.stale.load(Ordering::Relaxed)
         })
         .map(|(_, c)| c.clone())
@@ -181,6 +196,7 @@ pub fn add_connection(
         remote_url.to_string(),
         identity.to_string(),
         from_supplied_credentials,
+        credential_store(),
     );
     let mut map = CONNECTION_MAP.lock();
     if let Some(map) = map.as_mut() {

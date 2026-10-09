@@ -35,8 +35,6 @@ use lore_revision::state::State;
 use lore_revision::state::StateError;
 use lore_revision::state::StateNodeChildrenIterator;
 use lore_storage::hash::hash_string;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
@@ -49,7 +47,7 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 /// One node to add. The parent is `parent_node_id`, or the node created by an
 /// earlier entry when `parent_node_id` is the invalid-node sentinel.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreRevisionTreeAddEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `ADD_COMPLETE`
     pub entry_id: u64,
@@ -72,7 +70,7 @@ pub struct LoreRevisionTreeAddEntry {
 
 /// Arguments for `lore_revision_tree_add`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(add_impl)]
 pub struct LoreRevisionTreeAddArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

@@ -10,6 +10,7 @@ test = false
 
 [dependencies]
 async-trait = { workspace = true }
+bitcode = { workspace = true }
 bitflags = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }

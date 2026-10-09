@@ -7,7 +7,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::quic::storage_service::QueryStatus;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -26,7 +25,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Result of a query against the immutable store for a single fragment.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStoreImmutableQueryEventData {
     /// Address of fragment

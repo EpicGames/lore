@@ -16,8 +16,6 @@ use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::metadata::CREATED_BY;
 use lore_revision::metadata::Metadata;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -27,7 +25,7 @@ use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_info`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_impl)]
 pub struct LoreRevisionTreeInfoArgs {
     /// Per-call correlation id echoed back in events

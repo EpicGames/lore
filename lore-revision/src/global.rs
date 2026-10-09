@@ -7,6 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use lore_base::directories::project_directory;
+use lore_base::env::GLOBAL_PATH_VAR;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -27,10 +28,8 @@ fn make_path_if_nonexistent(path: &PathBuf) -> Result<(), GlobalConfigError> {
     Ok(())
 }
 
-const LORE_GLOBAL_PATH_VAR: &str = "LORE_GLOBAL_PATH";
-
 pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("config")
     } else {
         project_directory()
@@ -43,7 +42,7 @@ pub fn get_global_config_dir() -> Result<PathBuf, GlobalConfigError> {
 }
 
 pub fn get_global_data_dir() -> Result<PathBuf, GlobalConfigError> {
-    let path = if let Ok(override_dir) = std::env::var(LORE_GLOBAL_PATH_VAR) {
+    let path = if let Some(override_dir) = lore_base::env::var(GLOBAL_PATH_VAR) {
         PathBuf::from(override_dir).join("data")
     } else {
         project_directory()

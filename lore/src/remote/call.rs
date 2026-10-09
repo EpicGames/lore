@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::io::Write;
-
+use bytes::Bytes;
+use lore_base::env::CallEnvironment;
 use lore_base::error::ServiceUnavailable;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
@@ -14,10 +14,8 @@ use crate::interface::LoreGlobalArgs;
 use crate::remote::command::LoreCommand;
 use crate::remote::message::MessageToClient;
 use crate::remote::message::MessageToServer;
-use crate::remote::message::SerializationType;
-use crate::remote::message::V1Header;
-use crate::remote::message::blocking_read_v1_message;
-use crate::remote::message::write_v1_message;
+use crate::remote::message::blocking_read_message;
+use crate::remote::message::write_message;
 use crate::remote::network::UdsStream;
 use crate::remote::network::uds_supported;
 use crate::remote::service_process::connect_or_spawn_service;
@@ -125,15 +123,13 @@ pub async fn service_call_impl(
     let connection = lore_base::lore_spawn_blocking!(move || {
         let mut connection = connection;
 
-        let message = MessageToServer { globals, command };
-
-        let message_bytes = write_v1_message(message, SerializationType::Json)
-            .forward::<ServiceCallError>("serializing message")?;
-
-        connection
-            .writer()
-            .write_all(&message_bytes)
-            .internal("sending message")?;
+        let message = MessageToServer {
+            globals,
+            command,
+            environment: CallEnvironment::capture(),
+        };
+        write_message(connection.writer(), &message)
+            .forward::<ServiceCallError>("sending message")?;
         Ok::<UdsStream, ServiceCallError>(connection)
     })
     .await
@@ -141,14 +137,14 @@ pub async fn service_call_impl(
 
     'read_from_stream: loop {
         let mut connection = connection.try_clone().internal("cloning connection")?;
-        let message: Option<(V1Header, MessageToClient)> =
-            lore_base::lore_spawn_blocking!(move || blocking_read_v1_message(connection.reader()))
+        let message: Option<(MessageToClient, Bytes)> =
+            lore_base::lore_spawn_blocking!(move || blocking_read_message(connection.reader()))
                 .await
                 .internal("joining receive task")?
                 .forward::<ServiceCallError>("receiving message")?;
         match message {
-            Some((_header, message)) => {
-                if let Some(api_result) = handle_message(event_dispatcher, message)? {
+            Some((message, payload)) => {
+                if let Some(api_result) = handle_message(event_dispatcher, message, payload)? {
                     return Ok(api_result);
                 }
             }
@@ -163,13 +159,16 @@ pub async fn service_call_impl(
     ))
 }
 
+/// Hands an event to the callback, keeping `payload`, which holds any `LoreBytes` it carries,
+/// alive until the callback has run.
 pub fn handle_message(
     event_dispatcher: &mut EventDispatcher,
     message: MessageToClient,
+    payload: Bytes,
 ) -> Result<Option<i32>, ServiceCallError> {
     match message {
         MessageToClient::Event(event) => {
-            event_dispatcher.send(event);
+            event_dispatcher.send_with_bytes(event, payload);
             Ok(None)
         }
         MessageToClient::ApiResult(api_result) => Ok(Some(api_result)),

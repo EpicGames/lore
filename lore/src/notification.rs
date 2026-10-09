@@ -4,15 +4,13 @@ use std::sync::Once;
 
 use lore_macro::LoreArgs;
 use lore_revision::interface::LoreGlobalArgs;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_no_store;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(subscribe_local)]
 /// Arguments for subscribing to repository notifications (no parameters).
 pub struct LoreNotificationSubscribeArgs {}
@@ -51,7 +49,7 @@ pub async fn subscribe(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(unsubscribe_local)]
 /// Arguments for unsubscribing from repository notifications (no parameters).
 pub struct LoreNotificationUnsubscribeArgs {}

@@ -13,8 +13,6 @@ use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::lore::execution_context;
 use lore_storage::StorageError;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -24,7 +22,7 @@ use crate::storage::handle::LoreStore;
 
 /// Arguments for `lore_storage_flush`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(flush_local)]
 pub struct LoreStorageFlushArgs {
     /// Open handle whose pending writes to flush

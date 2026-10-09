@@ -16,7 +16,6 @@ use dashmap::Entry;
 use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -180,7 +179,7 @@ impl Drop for RepositoryCloneGuard {
 
 /// Data for the event emitted when a clone starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneBeginEventData {
     /// Identifier of the repository being cloned.
@@ -195,7 +194,7 @@ pub struct LoreRepositoryCloneBeginEventData {
 
 /// Progress counts for a clone operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneCountData {
     /// Number of files finished.
@@ -238,7 +237,7 @@ impl LoreRepositoryCloneCountData {
 
 /// Data for the event emitted to report clone progress.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneProgressEventData {
     /// Current progress counts.
@@ -247,7 +246,7 @@ pub struct LoreRepositoryCloneProgressEventData {
 
 /// Data for the event emitted when a clone finishes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneEndEventData {
     /// Name of the branch that was cloned.

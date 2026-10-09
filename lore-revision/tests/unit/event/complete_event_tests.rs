@@ -50,23 +50,6 @@ fn serializes_error_detail_fields_in_camel_case() {
 }
 
 #[test]
-fn deserializes_old_payload_without_error_detail() {
-    // A serialized payload that carries only the `status` field.
-    let json = r#"{ "status": 7 }"#;
-
-    let event: LoreCompleteEventData = serde_json::from_str(json).unwrap();
-
-    // The status is read back unchanged.
-    assert_eq!(event.status, 7);
-
-    // The missing detail defaults to the empty success detail: code 0,
-    // empty message, and an empty trace list.
-    assert_eq!(event.error.error_code, 0);
-    assert!(event.error.message.is_empty());
-    assert!(event.error.trace_locations.is_empty());
-}
-
-#[test]
 fn legacy_status_field_keeps_its_name_position_and_type() {
     // The `status` field serializes under its existing key.
     let event = LoreCompleteEventData {

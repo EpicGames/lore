@@ -375,7 +375,7 @@ def test_stop_ends_the_service_and_reports_when_there_is_none(
 
 @pytest.mark.smoke
 def test_the_api_reports_the_status_when_no_service_is_running(
-    new_lore_repo, lore_library_path, stops_background_services
+    new_lore_repo, lore_library_path, stops_background_services, global_dir_name
 ):
     """`lore_service_status` succeeds with nothing running, as the CLI's
     `service status` does. Asking whether a service is running is answered by
@@ -393,13 +393,13 @@ def test_the_api_reports_the_status_when_no_service_is_running(
     # Asking did not start one, which is the other half of what a query must
     # not do. The API's code says the call succeeded, not what it left behind.
     assert LORE_NO_SERVICE_MESSAGE in stop_lore_service(
-        repo.lore_executable_path, repo.global_dir
+        repo.lore_executable_path, global_dir_name
     ), "the API's status must not start a service in order to report on one"
 
 
 @pytest.mark.smoke
 def test_the_api_reports_the_status_of_a_running_service(
-    new_lore_repo, lore_library_path, stops_background_services
+    new_lore_repo, lore_library_path, stops_background_services, global_dir_name
 ):
     """The same call against a service that is running reaches it and succeeds.
 
@@ -418,7 +418,7 @@ def test_the_api_reports_the_status_of_a_running_service(
     # The service is still there afterwards: a query reports on what it finds
     # rather than disturbing it.
     assert LORE_NO_SERVICE_MESSAGE not in stop_lore_service(
-        repo.lore_executable_path, repo.global_dir
+        repo.lore_executable_path, global_dir_name
     ), "the API's status must leave the running service alone"
 
 

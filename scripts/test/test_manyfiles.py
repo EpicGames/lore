@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process("terminates the process carrying out a commit")
 def test_file(new_lore_repo, lore_executable_path):
     repo: Lore = new_lore_repo()
     for i in range(10):

@@ -41,6 +41,15 @@ def name_service_executable(
 # runs could not proceed at once.
 LORE_SERVICE_SOCKET_VAR = "LORE_SERVICE_SOCKET"
 
+# Names the socket of a service started before the run, which then carries out
+# every command of every test that neither manages a service of its own nor is
+# marked `runs_in_process`. See `docs/developing/code-standards/testing.md`.
+LORE_TEST_SERVICE_SOCKET_VAR = "LORE_TEST_SERVICE_SOCKET"
+
+# Set to have the suite start that service itself, from the build under test,
+# and stop it when the run ends.
+LORE_TEST_SHARED_SERVICE_VAR = "LORE_TEST_SHARED_SERVICE"
+
 # Lines the client prints about the service. They are matched rather than
 # parsed, so they are kept here next to each other: each one pairs with a string
 # in the Rust sources and has to be changed with it.

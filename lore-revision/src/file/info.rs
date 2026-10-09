@@ -7,7 +7,6 @@ use std::sync::OnceLock;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -114,7 +113,7 @@ impl EventError for InfoError {
 
 /// Data for the event reporting information about a single file or directory.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileInfoEventData {
     /// Path of the file or directory.

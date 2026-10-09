@@ -11,7 +11,6 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
 use tokio::task::JoinSet;
@@ -58,7 +57,7 @@ use lore_storage::options::WriteOptions;
 
 /// Event data reporting a single fragment written or deduplicated.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFragmentWriteEventData {
     /// The fragment that was written

@@ -13,7 +13,6 @@ use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -76,7 +75,7 @@ use crate::util::path::RelativePathBuf;
 
 /// Data for the event emitted when a stage operation begins.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageBeginEventData {
     /// Number of paths requested for staging.
@@ -85,7 +84,7 @@ pub struct LoreFileStageBeginEventData {
 
 /// Running counts of items processed during a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageCountData {
     /// Number of directories staged as modified.
@@ -141,7 +140,7 @@ impl LoreFileStageCountData {
 
 /// Data for the progress event emitted periodically during a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageProgressEventData {
     /// Current counts of items processed.
@@ -150,7 +149,7 @@ pub struct LoreFileStageProgressEventData {
 
 /// Data for the event emitted when a stage operation completes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageEndEventData {
     /// Final counts of items processed.
@@ -159,7 +158,7 @@ pub struct LoreFileStageEndEventData {
 
 /// Data for the event identifying the repository and revision involved in a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageRevisionEventData {
     /// Identifier of the repository.
@@ -170,7 +169,7 @@ pub struct LoreFileStageRevisionEventData {
 
 /// Data for the event emitted for each file affected by a stage operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageFileEventData {
     /// Previous path of the file, when it was moved, relative to the root of the working tree.

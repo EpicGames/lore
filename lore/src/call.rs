@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use lore_base::env::CallEnvironment;
 use lore_base::error::RepositoryNotFound;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
@@ -28,14 +29,29 @@ use crate::interface::LoreEventCallback;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
+tokio::task_local! {
+    /// The environment of the process a call running in this task was relayed from.
+    static RELAYED_ENVIRONMENT: CallEnvironment;
+}
+
+/// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
+/// up reads that environment in place of this process's.
+pub(crate) fn with_relayed_environment<F: Future>(
+    environment: CallEnvironment,
+    call: F,
+) -> impl Future<Output = F::Output> {
+    RELAYED_ENVIRONMENT.scope(environment, call)
+}
+
 pub fn setup_execution(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Arc<ExecutionContext> {
-    Arc::new(ExecutionContext::new_client(
-        globals,
-        EventDispatcher::new(callback),
-    ))
+    let execution = ExecutionContext::new_client(globals, EventDispatcher::new(callback));
+    Arc::new(match RELAYED_ENVIRONMENT.try_with(Clone::clone) {
+        Ok(environment) => execution.with_environment(environment),
+        Err(_) => execution,
+    })
 }
 
 /// Read-only repository call. No `RepositoryWriteToken` is minted, so

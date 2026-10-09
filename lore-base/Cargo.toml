@@ -38,6 +38,7 @@ thiserror = { workspace = true }
 lore-error-set = { workspace = true }
 
 # types
+bitcode = { workspace = true }
 bitflags = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
@@ -69,8 +70,9 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 # The crate's tests, the unit tests and the lore-stamp tests included, are built against the
 # library as other crates see it, without the `test` cfg, so they reach test_util through the feature.
 lore-base = { path = ".", features = ["test-util"] }
-# The non-self-describing format the identifier types must round-trip through.
-bitcode = { workspace = true }
+# Its serde integration: the non-self-describing format the identifier types' serde impls must
+# round-trip through.
+bitcode = { workspace = true, features = ["serde"] }
 serde_json = { workspace = true, features = ["std"] }
 
 [build-dependencies]

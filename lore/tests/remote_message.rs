@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use bytes::Bytes;
 use lore::remote::command::LoreCommand;
-use lore::remote::message::MessageError;
+use lore::remote::message::Header;
+use lore::remote::message::MessageToClient;
 use lore::remote::message::MessageToServer;
 use lore::remote::message::SerializationType;
-use lore::remote::message::V1Header;
-use lore::remote::message::blocking_read_v1_message;
-use lore::remote::message::write_v1_message;
+use lore::remote::message::blocking_read_message;
+use lore::remote::message::encode_message;
+use lore::remote::message::write_message;
+use lore::remote::message::write_payload;
 use lore::repository::LoreRepositoryDeleteArgs;
 use lore::repository::LoreRepositoryStatusArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
@@ -18,30 +21,55 @@ use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
 use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
 use lore::revision_tree::move_node::LoreRevisionTreeMoveArgs;
 use lore::revision_tree::move_node::LoreRevisionTreeMoveEntry;
+use lore_base::env::CallEnvironment;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_revision::event::LoreBytes;
+use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreString;
 
+/// `message` as a peer reads it back from the bytes written for it, beside the payload it views.
+fn read_back<Message: bitcode::Encode + bitcode::DecodeOwned>(
+    message: &Message,
+) -> (Message, Bytes) {
+    let mut written = Vec::new();
+    write_message(&mut written, message).expect("a message must write");
+    blocking_read_message(&mut written.as_slice())
+        .expect("a message must read back")
+        .expect("a whole message must be present")
+}
+
+/// `command` as the service reads it back from the message a client writes for it.
+fn relayed(command: LoreCommand) -> LoreCommand {
+    let message = MessageToServer {
+        globals: LoreGlobalArgs::default(),
+        command,
+        environment: CallEnvironment::default(),
+    };
+    read_back(&message).0.command
+}
+
 #[test]
 fn header_to_and_from_bytes() {
-    let header = V1Header::new(0xffeeddcc, SerializationType::Bincode);
+    let header = Header::new(0xffeeddcc, SerializationType::Bitcode);
 
     let bytes = header.to_bytes();
-    let processed_header = V1Header::from_bytes(&bytes);
+    let processed_header = Header::from_bytes(&bytes);
 
     assert!(processed_header.is_ok());
     assert_eq!(processed_header.unwrap().payload_size, header.payload_size);
 
     let mut bad_bytes = bytes;
     bad_bytes[4] = 0xff;
-    let bad_processed_header = V1Header::from_bytes(&bad_bytes);
+    let bad_processed_header = Header::from_bytes(&bad_bytes);
 
     assert!(bad_processed_header.is_err());
 }
 
+/// A message from a client carries its globals, its command and its environment.
 #[tokio::test]
 async fn message_to_server_to_and_from_bytes() {
     let path = LoreString::from_str("abc");
@@ -49,6 +77,9 @@ async fn message_to_server_to_and_from_bytes() {
         LoreString::from_str("abc"),
         LoreString::from_str("def"),
     ]);
+    let environment = CallEnvironment {
+        values: [Some("/tmp/global".to_string()), None],
+    };
     let message = MessageToServer {
         globals: LoreGlobalArgs {
             repository_path: path.clone(),
@@ -64,19 +95,14 @@ async fn message_to_server_to_and_from_bytes() {
             count: 0,
             paths: paths.clone(),
         }),
+        environment: environment.clone(),
     };
 
-    let message_bytes = write_v1_message(message, SerializationType::Json).unwrap();
+    let (read, _payload) = read_back(&message);
 
-    let processed_message: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-        blocking_read_v1_message(&mut message_bytes.as_slice());
-
-    assert!(processed_message.is_ok());
-    let processed_message = processed_message.unwrap();
-    assert!(processed_message.is_some());
-    let processed_message = processed_message.unwrap();
-    assert_eq!(processed_message.1.globals.repository_path, path);
-    match processed_message.1.command {
+    assert_eq!(read.globals.repository_path, path);
+    assert_eq!(read.environment, environment);
+    match read.command {
         LoreCommand::RepositoryStatus(repository_status) => {
             assert_eq!(repository_status.paths.as_slice(), paths.as_slice());
         }
@@ -86,33 +112,143 @@ async fn message_to_server_to_and_from_bytes() {
     }
 }
 
+/// Text crosses as the bytes the caller sent, whether or not they are UTF-8: the service checks
+/// it, so that it refuses what the caller's entry point refuses.
+#[test]
+fn text_that_is_not_utf8_crosses_unchanged() {
+    let path = LoreString::from_bytes(b"repo\xff");
+    let message = MessageToServer {
+        globals: LoreGlobalArgs {
+            repository_path: path.clone(),
+            ..Default::default()
+        },
+        command: LoreCommand::LinkListStaged(lore::link::LoreLinkListStagedArgs {}),
+        environment: CallEnvironment::default(),
+    };
+
+    assert_eq!(read_back(&message).0.globals.repository_path, path);
+}
+
+/// The service refuses text that is not UTF-8 with the error the caller's own entry point gives,
+/// before a handler could read it as `&str`.
+#[tokio::test]
+async fn the_service_refuses_text_that_is_not_utf8() {
+    let message = MessageToServer {
+        globals: LoreGlobalArgs {
+            repository_path: LoreString::from_bytes(b"repo\xff"),
+            ..Default::default()
+        },
+        command: LoreCommand::LinkListStaged(lore::link::LoreLinkListStagedArgs {}),
+        environment: CallEnvironment::default(),
+    };
+
+    let status = Box::pin(read_back(&message).0.invoke(None)).await;
+
+    assert_eq!(
+        status,
+        lore_revision::event::LoreErrorCode::InvalidArguments as i32
+    );
+}
+
+/// A put relayed to the service carries the bytes its items view, and the service reads them
+/// where they arrived rather than from a copy.
+#[test]
+fn a_put_carries_its_bytes_to_the_service() {
+    use lore::storage::put::LoreStoragePutArgs;
+    use lore::storage::put::LoreStoragePutItem;
+
+    let contents: [&[u8]; 3] = [b"first", b"", b"third item"];
+    let items = contents
+        .iter()
+        .enumerate()
+        .map(|(id, bytes)| LoreStoragePutItem {
+            id: id as u64,
+            partition: Default::default(),
+            context: Default::default(),
+            data: LoreBytes {
+                ptr: bytes.as_ptr().cast(),
+                len: bytes.len(),
+            },
+            remote_write: 0,
+            local_cache: 0,
+            fixed_size_chunk: 0,
+        })
+        .collect();
+    let message = MessageToServer {
+        globals: LoreGlobalArgs::default(),
+        command: LoreCommand::StoragePut(LoreStoragePutArgs {
+            handle: Default::default(),
+            items: LoreArray::from_vec(items),
+        }),
+        environment: CallEnvironment::default(),
+    };
+
+    let (read, payload) = read_back(&message);
+
+    let LoreCommand::StoragePut(args) = read.command else {
+        panic!("Unexpected command");
+    };
+    let payload = payload.as_ptr_range();
+    for (item, expected) in args.items.as_slice().iter().zip(contents) {
+        // SAFETY: `payload` is alive, and the view points into it.
+        assert_eq!(unsafe { item.data.as_slice() }, expected);
+        if !expected.is_empty() {
+            assert!(
+                payload.contains(&item.data.ptr.cast()),
+                "the view must point into the payload"
+            );
+        }
+    }
+}
+
+/// The service encodes an event it is handed by reference, and a client reads it back as the
+/// event, with the bytes a data event views.
+#[test]
+fn a_borrowed_data_event_reaches_a_client_as_itself() {
+    use lore_revision::store::event::LoreStorageGetDataEventData;
+
+    let contents = b"fragment payload";
+    let event = LoreEvent::StorageGetData(LoreStorageGetDataEventData {
+        id: 3,
+        address: Address::default(),
+        offset: 64,
+        bytes: LoreBytes {
+            ptr: contents.as_ptr().cast(),
+            len: contents.len(),
+        },
+    });
+
+    let mut written = Vec::new();
+    write_payload(
+        &mut written,
+        &encode_message(&MessageToClient::Event(&event)),
+    )
+    .unwrap();
+    let (read, _payload): (MessageToClient, Bytes) = blocking_read_message(&mut written.as_slice())
+        .expect("an event must read back")
+        .expect("a whole message must be present");
+
+    match read {
+        MessageToClient::Event(LoreEvent::StorageGetData(data)) => {
+            assert_eq!((data.id, data.offset), (3, 64));
+            // SAFETY: the payload is alive, and the view points into it.
+            assert_eq!(unsafe { data.bytes.as_slice() }, contents);
+        }
+        _ => panic!("expected a data event"),
+    }
+}
+
 /// A command whose arguments carry no fields still has to reach the service as
-/// itself, in both serializations.
+/// itself.
 #[tokio::test]
 async fn link_list_staged_survives_the_wire() {
     use lore::link::LoreLinkListStagedArgs;
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::LinkListStaged(LoreLinkListStagedArgs {}),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        assert!(
-            matches!(processed.1.command, LoreCommand::LinkListStaged(_)),
-            "{label} must read back as the same command: {:?}",
-            processed.1.command
-        );
-    }
+    let command = relayed(LoreCommand::LinkListStaged(LoreLinkListStagedArgs {}));
+    assert!(
+        matches!(command, LoreCommand::LinkListStaged(_)),
+        "must read back as the same command: {command:?}"
+    );
 }
 
 /// A LATEST history listing relayed to the service carries the branch and the entry limit.
@@ -125,27 +261,11 @@ async fn branch_latest_list_args_survive_the_wire() {
         limit: 7,
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::BranchLatestList(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::BranchLatestList(read_back) => {
-                assert_eq!(read_back, args, "{label} must carry every field unchanged");
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::BranchLatestList(args.clone())) {
+        LoreCommand::BranchLatestList(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
@@ -157,36 +277,17 @@ async fn repository_delete_survives_the_wire() {
         repository_url: LoreString::from_str("lore://127.0.0.1:41337/org/project"),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RepositoryDelete(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RepositoryDelete(read_back) => {
-                assert_eq!(read_back, args, "{label} must carry the URL unchanged");
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RepositoryDelete(args.clone())) {
+        LoreCommand::RepositoryDelete(read_back) => {
+            assert_eq!(read_back, args, "must carry the URL unchanged");
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
-/// A command carrying an address must survive both wire encodings. Bincode is
-/// the one that used to fail: `Hash`, `Context` and `Address` were read with
-/// `deserialize_any`, which a non-self-describing format cannot answer, so every
-/// such command was unreadable however it was written.
+/// A command carrying an address carries every byte of it.
 #[tokio::test]
-async fn a_command_carrying_an_address_survives_both_serializations() {
+async fn a_command_carrying_an_address_survives_the_wire() {
     let address = Address {
         hash: Hash::from([0x37u8; 32]),
         context: Context::from([0x73u8; 16]),
@@ -206,32 +307,16 @@ async fn a_command_carrying_an_address_survives_both_serializations() {
         }]),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionTreeAdd(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionTreeAdd(read_back) => {
-                assert_eq!(
-                    read_back.entries.as_slice()[0].address,
-                    address,
-                    "{label} must carry the address unchanged"
-                );
-                assert_eq!(read_back.entries.as_slice(), args.entries.as_slice());
-            }
-            _ => panic!("Unexpected command"),
+    match relayed(LoreCommand::RevisionTreeAdd(args.clone())) {
+        LoreCommand::RevisionTreeAdd(read_back) => {
+            assert_eq!(
+                read_back.entries.as_slice()[0].address,
+                address,
+                "must carry the address unchanged"
+            );
+            assert_eq!(read_back.entries.as_slice(), args.entries.as_slice());
         }
+        _ => panic!("Unexpected command"),
     }
 }
 
@@ -265,33 +350,17 @@ async fn revision_tree_modify_batch_survives_the_wire() {
         entries: entries.clone(),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionTreeModify(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionTreeModify(read_back) => {
-                assert_eq!(read_back.batch_id, args.batch_id, "{label}");
-                assert_eq!(read_back.handle.handle_id, args.handle.handle_id, "{label}");
-                assert_eq!(
-                    read_back.entries.as_slice(),
-                    entries.as_slice(),
-                    "{label} must carry every entry field unchanged"
-                );
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RevisionTreeModify(args.clone())) {
+        LoreCommand::RevisionTreeModify(read_back) => {
+            assert_eq!(read_back.batch_id, args.batch_id);
+            assert_eq!(read_back.handle.handle_id, args.handle.handle_id);
+            assert_eq!(
+                read_back.entries.as_slice(),
+                entries.as_slice(),
+                "must carry every entry field unchanged"
+            );
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
@@ -316,33 +385,17 @@ async fn revision_tree_delete_batch_survives_the_wire() {
         entries: entries.clone(),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionTreeDelete(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionTreeDelete(read_back) => {
-                assert_eq!(read_back.batch_id, args.batch_id, "{label}");
-                assert_eq!(read_back.handle.handle_id, args.handle.handle_id, "{label}");
-                assert_eq!(
-                    read_back.entries.as_slice(),
-                    entries.as_slice(),
-                    "{label} must carry every entry field unchanged"
-                );
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RevisionTreeDelete(args.clone())) {
+        LoreCommand::RevisionTreeDelete(read_back) => {
+            assert_eq!(read_back.batch_id, args.batch_id);
+            assert_eq!(read_back.handle.handle_id, args.handle.handle_id);
+            assert_eq!(
+                read_back.entries.as_slice(),
+                entries.as_slice(),
+                "must carry every entry field unchanged"
+            );
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
@@ -370,33 +423,17 @@ async fn revision_tree_move_batch_survives_the_wire() {
         entries: entries.clone(),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionTreeMove(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionTreeMove(read_back) => {
-                assert_eq!(read_back.batch_id, args.batch_id, "{label}");
-                assert_eq!(read_back.handle.handle_id, args.handle.handle_id, "{label}");
-                assert_eq!(
-                    read_back.entries.as_slice(),
-                    entries.as_slice(),
-                    "{label} must carry every entry field unchanged"
-                );
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RevisionTreeMove(args.clone())) {
+        LoreCommand::RevisionTreeMove(read_back) => {
+            assert_eq!(read_back.batch_id, args.batch_id);
+            assert_eq!(read_back.handle.handle_id, args.handle.handle_id);
+            assert_eq!(
+                read_back.entries.as_slice(),
+                entries.as_slice(),
+                "must carry every entry field unchanged"
+            );
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
@@ -414,42 +451,20 @@ async fn revision_tree_commit_survives_the_wire() {
         options: LoreRevisionTreeCommitOptions { remote_write: 1 },
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionTreeCommit(args),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionTreeCommit(read_back) => {
-                assert_eq!(read_back, args, "{label} must carry every field unchanged");
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RevisionTreeCommit(args)) {
+        LoreCommand::RevisionTreeCommit(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
 /// A metadata read delivers its value to the caller as an event, and an
-/// out-of-process caller only ever sees the serialized form. Binary values are
+/// out-of-process caller only ever sees the encoded form. Binary values are
 /// the ones with no textual representation to fall back on, so they are the
 /// case worth pinning.
-///
-/// Only JSON is exercised: `LoreEvent` is adjacently tagged, which bitcode
-/// cannot deserialize, so no event of any kind survives a `Bincode`
-/// connection today. That gap is independent of the payload type.
 #[tokio::test]
 async fn a_metadata_event_carries_a_binary_value_to_a_client() {
-    use lore::remote::message::MessageToClient;
-    use lore_revision::event::LoreEvent;
     use lore_revision::event::LoreMetadataEventData;
     use lore_revision::interface::LoreBinary;
     use lore_revision::interface::LoreMetadata;
@@ -460,14 +475,7 @@ async fn a_metadata_event_carries_a_binary_value_to_a_client() {
         value: value.clone(),
     });
 
-    let bytes = write_v1_message(MessageToClient::Event(event), SerializationType::Json).unwrap();
-    let read: Result<Option<(V1Header, MessageToClient)>, MessageError> =
-        blocking_read_v1_message(&mut bytes.as_slice());
-    let read = read
-        .unwrap_or_else(|error| panic!("a metadata event must read back: {error:?}"))
-        .expect("a whole message must be present");
-
-    match read.1 {
+    match read_back(&MessageToClient::Event(event)).0 {
         MessageToClient::Event(LoreEvent::Metadata(data)) => {
             assert_eq!(data.key.as_str(), "thumbnail");
             assert_eq!(
@@ -480,8 +488,7 @@ async fn a_metadata_event_carries_a_binary_value_to_a_client() {
 }
 
 /// The set verb carries a typed value rather than text, so the value union has
-/// to cross the wire in both serializations — a command that only survives one
-/// of them is unusable on the other transport.
+/// to cross the wire whole.
 #[tokio::test]
 async fn revision_tree_metadata_set_batch_survives_the_wire() {
     use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
@@ -507,27 +514,11 @@ async fn revision_tree_metadata_set_batch_survives_the_wire() {
         entries: entries.clone(),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionTreeMetadataSet(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionTreeMetadataSet(read_back) => {
-                assert_eq!(read_back.entries.as_slice(), entries.as_slice(), "{label}");
-            }
-            _ => panic!("Unexpected command"),
+    match relayed(LoreCommand::RevisionTreeMetadataSet(args.clone())) {
+        LoreCommand::RevisionTreeMetadataSet(read_back) => {
+            assert_eq!(read_back.entries.as_slice(), entries.as_slice());
         }
+        _ => panic!("Unexpected command"),
     }
 }
 
@@ -541,27 +532,11 @@ async fn revision_bisect_args_survive_the_wire() {
         end: LoreString::from_str("main@11"),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionBisect(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionBisect(read_back) => {
-                assert_eq!(read_back, args, "{label} must carry every field unchanged");
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RevisionBisect(args.clone())) {
+        LoreCommand::RevisionBisect(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
@@ -578,36 +553,19 @@ async fn revision_cherry_pick_args_survive_the_wire() {
         inherit_metadata: LoreArray::from_vec(vec![LoreString::from_str("change-request")]),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionCherryPick(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionCherryPick(read_back) => {
-                assert_eq!(
-                    (read_back.revision, read_back.message, read_back.no_commit),
-                    (args.revision.clone(), args.message.clone(), args.no_commit),
-                    "{label}"
-                );
-                assert_eq!(
-                    read_back.inherit_metadata.as_slice(),
-                    args.inherit_metadata.as_slice(),
-                    "{label} must carry the inherited keys unchanged"
-                );
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RevisionCherryPick(args.clone())) {
+        LoreCommand::RevisionCherryPick(read_back) => {
+            assert_eq!(
+                (read_back.revision, read_back.message, read_back.no_commit),
+                (args.revision.clone(), args.message.clone(), args.no_commit)
+            );
+            assert_eq!(
+                read_back.inherit_metadata.as_slice(),
+                args.inherit_metadata.as_slice(),
+                "must carry the inherited keys unchanged"
+            );
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
@@ -635,56 +593,32 @@ async fn revision_sync_args_survive_the_wire() {
         view: LoreString::from_str("/tmp/a narrow view.txt"),
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::RevisionSync(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::RevisionSync(read_back) => {
-                assert_eq!(
-                    read_back.view, args.view,
-                    "{label} must carry the view unchanged"
-                );
-                assert_eq!(read_back.revision, args.revision, "{label}");
-                assert_eq!(
-                    read_back.root_files.as_slice(),
-                    args.root_files.as_slice(),
-                    "{label}"
-                );
-                assert_eq!(
-                    read_back.dependency_tags.as_slice(),
-                    args.dependency_tags.as_slice(),
-                    "{label}"
-                );
-                assert_eq!(
-                    (
-                        read_back.forward_changes,
-                        read_back.reset,
-                        read_back.dependency_recursive,
-                        read_back.dependency_depth_limit,
-                    ),
-                    (
-                        args.forward_changes,
-                        args.reset,
-                        args.dependency_recursive,
-                        args.dependency_depth_limit,
-                    ),
-                    "{label} must carry every flag unchanged"
-                );
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::RevisionSync(args.clone())) {
+        LoreCommand::RevisionSync(read_back) => {
+            assert_eq!(read_back.view, args.view, "must carry the view unchanged");
+            assert_eq!(read_back.revision, args.revision);
+            assert_eq!(read_back.root_files.as_slice(), args.root_files.as_slice());
+            assert_eq!(
+                read_back.dependency_tags.as_slice(),
+                args.dependency_tags.as_slice()
+            );
+            assert_eq!(
+                (
+                    read_back.forward_changes,
+                    read_back.reset,
+                    read_back.dependency_recursive,
+                    read_back.dependency_depth_limit,
+                ),
+                (
+                    args.forward_changes,
+                    args.reset,
+                    args.dependency_recursive,
+                    args.dependency_depth_limit,
+                ),
+                "must carry every flag unchanged"
+            );
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }
 
@@ -698,26 +632,10 @@ async fn shared_store_list_args_survive_the_wire() {
         include_instances: 1,
     };
 
-    for (serialization, label) in [
-        (SerializationType::Json, "json"),
-        (SerializationType::Bincode, "bincode"),
-    ] {
-        let message = MessageToServer {
-            globals: LoreGlobalArgs::default(),
-            command: LoreCommand::SharedStoreList(args.clone()),
-        };
-        let message_bytes = write_v1_message(message, serialization).unwrap();
-        let processed: Result<Option<(V1Header, MessageToServer)>, MessageError> =
-            blocking_read_v1_message(&mut message_bytes.as_slice());
-        let processed = processed
-            .unwrap_or_else(|error| panic!("{label} must read back: {error:?}"))
-            .expect("a whole message must be present");
-
-        match processed.1.command {
-            LoreCommand::SharedStoreList(read_back) => {
-                assert_eq!(read_back, args, "{label} must carry every field unchanged");
-            }
-            other => panic!("Unexpected command: {other:?}"),
+    match relayed(LoreCommand::SharedStoreList(args.clone())) {
+        LoreCommand::SharedStoreList(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
         }
+        other => panic!("Unexpected command: {other:?}"),
     }
 }

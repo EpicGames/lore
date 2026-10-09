@@ -28,8 +28,6 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
@@ -41,7 +39,9 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One node to rewrite. The node must already exist and be a file.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreRevisionTreeModifyEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `MODIFY_COMPLETE`
     pub entry_id: u64,
@@ -57,7 +57,7 @@ pub struct LoreRevisionTreeModifyEntry {
 
 /// Arguments for `lore_revision_tree_modify`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(modify_impl)]
 pub struct LoreRevisionTreeModifyArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

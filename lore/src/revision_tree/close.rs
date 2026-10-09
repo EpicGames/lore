@@ -12,8 +12,6 @@ use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use lore_revision::interface::LoreError;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -24,7 +22,7 @@ use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_close`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(close_impl)]
 pub struct LoreRevisionTreeCloseArgs {
     /// Per-call correlation id echoed back in events

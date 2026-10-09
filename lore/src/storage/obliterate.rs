@@ -25,8 +25,6 @@ use lore_revision::store::event::LoreStorageObliterateItemCompleteEventData;
 use lore_storage::StorageError;
 use lore_storage::store_types::StoreObliterateStats;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -39,7 +37,9 @@ use crate::storage::store::StoreInternal;
 
 /// One obliterate item — the `(partition, address)` to delete.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreStorageObliterateItem {
     /// Caller-chosen id echoed back in `OBLITERATE_ITEM_COMPLETE`
     pub id: u64,
@@ -51,7 +51,7 @@ pub struct LoreStorageObliterateItem {
 
 /// Arguments for `lore_storage_obliterate`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(obliterate_local)]
 pub struct LoreStorageObliterateArgs {
     /// Open storage handle

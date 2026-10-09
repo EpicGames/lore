@@ -13,7 +13,6 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::event::LoreErrorCode;
@@ -24,7 +23,7 @@ use crate::node::NodeID;
 /// Delivered on successful `lore_revision_tree_load`. Carries the registry
 /// id the caller must pass to subsequent verbs against this revision tree.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeLoadedEventData {
     /// Registry id for the loaded revision tree.
@@ -36,7 +35,7 @@ pub struct LoreRevisionTreeLoadedEventData {
 /// the tree it belongs to (they differ from the handle's when the path crosses
 /// a link). On failure `node_id` is undefined and `error_code` is populated.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeResolvePathCompleteEventData {
     /// Correlation id of the originating call.
@@ -55,7 +54,7 @@ pub struct LoreRevisionTreeResolvePathCompleteEventData {
 /// the caller correlates entries by `id` and detects end-of-list via the
 /// trailing `Complete` event.
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeChildEventData {
     /// Correlation id of the originating call.
@@ -89,7 +88,7 @@ pub struct LoreRevisionTreeChildEventData {
 /// zeroed and `error_code` is populated. This is revision-scoped, not
 /// node-scoped — it takes no node id.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeInfoEventData {
     /// Correlation id of the originating call.
@@ -119,7 +118,7 @@ pub struct LoreRevisionTreeInfoEventData {
 /// separate concern served by `lore_revision_tree_info`. On failure the record
 /// is undefined and `error_code` is populated.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeNodeInfoEventData {
     /// Correlation id of the originating call.
@@ -157,7 +156,7 @@ pub struct LoreRevisionTreeNodeInfoEventData {
 /// (the handle's own — `node_path` walks within the handle's revision and does
 /// not follow links). On failure `path` is empty and `error_code` is populated.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeNodePathEventData {
     /// Correlation id of the originating call.
@@ -181,7 +180,7 @@ pub struct LoreRevisionTreeNodePathEventData {
 /// than to a single entry, such as an unknown or closed handle. A per-entry
 /// failure is reported on that entry's own terminal instead.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeBatchCompleteEventData {
     /// Correlation id the call was submitted under
@@ -195,7 +194,7 @@ pub struct LoreRevisionTreeBatchCompleteEventData {
 /// nothing was created. The call as a whole reports separately on
 /// `RevisionTreeBatchComplete`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeAddCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
@@ -209,7 +208,7 @@ pub struct LoreRevisionTreeAddCompleteEventData {
 /// Terminal per-entry event for `delete`. The call as a whole reports
 /// separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeDeleteCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
@@ -226,7 +225,7 @@ pub struct LoreRevisionTreeDeleteCompleteEventData {
 /// failure it is the invalid-node sentinel, since nothing was rewritten. The
 /// call as a whole reports separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeModifyCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
@@ -241,7 +240,7 @@ pub struct LoreRevisionTreeModifyCompleteEventData {
 /// the caller observes that `file_id` is preserved across the reparent. The
 /// call as a whole reports separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMoveCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
@@ -255,7 +254,7 @@ pub struct LoreRevisionTreeMoveCompleteEventData {
 /// Terminal per-entry event for `metadata_set`. The call as a whole reports
 /// separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataSetCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
@@ -269,7 +268,7 @@ pub struct LoreRevisionTreeMetadataSetCompleteEventData {
 /// error code alone cannot tell the two apart. The call as a whole reports
 /// separately on `RevisionTreeBatchComplete`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataClearCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
@@ -285,7 +284,7 @@ pub struct LoreRevisionTreeMetadataClearCompleteEventData {
 /// missing-key case emits no value event and lets the trailing `Complete`
 /// fire on its own.
 #[repr(C)]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeMetadataGetCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
@@ -308,7 +307,7 @@ pub struct LoreRevisionTreeMetadataGetCompleteEventData {
 /// reports `Internal` with the reason in the completion detail — the same code
 /// the file-system commit returns.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeCommitCompleteEventData {
     /// Correlation id of the originating call.
@@ -323,7 +322,7 @@ pub struct LoreRevisionTreeCommitCompleteEventData {
 
 /// Terminal per-call event for `close`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeCloseCompleteEventData {
     /// Correlation id of the originating call.
@@ -338,7 +337,7 @@ pub struct LoreRevisionTreeCloseCompleteEventData {
 /// reopen that tree to act on the children's node ids. On failure carries the
 /// outcome with a zeroed `repository`/`revision` and no children follow.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionTreeListChildrenBeginEventData {
     /// Correlation id of the originating call.

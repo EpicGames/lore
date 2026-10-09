@@ -6,9 +6,9 @@ use lore_revision::interface::LoreString;
 
 /// The JSON shape is a published wire format that existing clients read, and
 /// the serializer producing it is hand-written rather than derived, so the
-/// exact bytes are the contract — not just that a round trip works. Every
-/// kind is pinned, because each reaches JSON by its own route: a bool for a
-/// byte, hex text for the identifiers, and base64 for a block of raw bytes.
+/// exact bytes are the contract. Every kind is pinned, because each reaches
+/// JSON by its own route: a bool for a byte, hex text for the identifiers, and
+/// base64 for a block of raw bytes.
 #[test]
 fn json_keeps_the_adjacently_tagged_shape() {
     let hash = lore_base::types::Hash::from([0xabu8; 32]);
@@ -55,25 +55,20 @@ fn json_keeps_the_adjacently_tagged_shape() {
     for (value, want) in cases {
         let json = serde_json::to_string(&value).expect("serialize");
         assert_eq!(json, want, "the published shape must not drift");
-        let back: LoreMetadata = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(back, value);
     }
 }
 
-/// A boolean is a JSON bool but a byte in the C union, and the two must not
-/// disagree: any non-zero byte is true, and true reads back as exactly 1.
+/// A boolean is a JSON bool but a byte in the C union: any non-zero byte is true.
 #[test]
-fn a_non_zero_boolean_byte_normalizes_through_json() {
+fn a_non_zero_boolean_byte_serializes_as_true() {
     let json = serde_json::to_string(&LoreMetadata::Boolean(37)).expect("serialize");
     assert_eq!(json, r#"{"tagName":"boolean","data":true}"#);
-    let back: LoreMetadata = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(back, LoreMetadata::Boolean(1));
 }
 
-/// Every variant has to survive the format used between a client and the
-/// service, which cannot read the tagged shape at all.
+/// Every variant has to survive the encoding used between a client and the
+/// service.
 #[test]
-fn every_variant_survives_the_compact_format() {
+fn every_variant_survives_the_service_encoding() {
     let values = [
         LoreMetadata::Address(lore_base::types::Address::default()),
         LoreMetadata::Boolean(1),
@@ -85,8 +80,10 @@ fn every_variant_survives_the_compact_format() {
     ];
 
     for value in values {
-        let encoded = bitcode::serialize(&value).expect("serialize");
-        let decoded: LoreMetadata = bitcode::deserialize(&encoded).expect("deserialize");
-        assert_eq!(decoded, value, "{value:?} must survive the compact format");
+        let decoded: LoreMetadata = bitcode::decode(&bitcode::encode(&value)).expect("decode");
+        assert_eq!(
+            decoded, value,
+            "{value:?} must survive the service encoding"
+        );
     }
 }

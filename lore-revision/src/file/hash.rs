@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::InvalidArguments;
@@ -37,7 +36,7 @@ impl EventError for HashError {
 
 /// Data for the event reporting the hash of a single file.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileHashEventData {
     /// Path of the file.

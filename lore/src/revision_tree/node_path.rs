@@ -16,8 +16,6 @@ use lore_revision::interface::LoreString;
 use lore_revision::node::NodeID;
 use lore_revision::node::NodeIDExt;
 use lore_revision::node::ROOT_NODE;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -27,7 +25,7 @@ use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_node_path`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(node_path_impl)]
 pub struct LoreRevisionTreeNodePathArgs {
     /// Per-call correlation id echoed back in events

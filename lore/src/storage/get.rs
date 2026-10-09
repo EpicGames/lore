@@ -49,8 +49,6 @@ use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::StorageError;
 use lore_storage::read::read;
 use lore_storage::read::read_stream;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -64,7 +62,7 @@ use crate::storage::store::StoreInternal;
 
 /// One get item — the `(partition, address)` to read, and the range of it to read.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(Copy, Clone, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStorageGetItem {
     /// Caller-chosen id echoed back in every event for this item
     pub id: u64,
@@ -92,7 +90,7 @@ pub struct LoreStorageGetItem {
     /// `Oversized` rather than truncating. `GET_HEADER` reports the whole
     /// content's size, which with `offset` and `length` gives the bytes written; no `GET_DATA`
     /// follows, and `streaming` is ignored. The buffer holds unspecified bytes when the item fails.
-    #[serde(skip)]
+    #[bitcode(skip)]
     pub data_out: LoreBytesMut,
 }
 
@@ -111,7 +109,7 @@ impl core::fmt::Debug for LoreStorageGetItem {
 
 /// Arguments for `lore_storage_get`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(get_local)]
 pub struct LoreStorageGetArgs {
     /// Open storage handle

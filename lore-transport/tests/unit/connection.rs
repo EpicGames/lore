@@ -22,26 +22,57 @@ use lore_transport::types::*;
 #[test]
 fn the_no_identity_fallback_does_not_cross_credential_modes() {
     let remote = "lores://mode-isolation.test.invalid";
-    let stored = (remote.to_string(), "alice".to_string(), false);
-    let supplied = (remote.to_string(), "alice".to_string(), true);
+    let stored = (
+        remote.to_string(),
+        "alice".to_string(),
+        false,
+        String::new(),
+    );
+    let supplied = (remote.to_string(), "alice".to_string(), true, String::new());
 
-    assert!(matches_url_and_mode(&stored, remote, false));
-    assert!(matches_url_and_mode(&supplied, remote, true));
+    assert!(matches_url_mode_and_store(&stored, remote, false, ""));
+    assert!(matches_url_mode_and_store(&supplied, remote, true, ""));
 
     assert!(
-        !matches_url_and_mode(&supplied, remote, false),
+        !matches_url_mode_and_store(&supplied, remote, false, ""),
         "a store-mode call must not be given a supplied-credential connection"
     );
     assert!(
-        !matches_url_and_mode(&stored, remote, true),
+        !matches_url_mode_and_store(&stored, remote, true, ""),
         "a supplied-credential call must not be given a store-mode connection"
     );
 
-    assert!(!matches_url_and_mode(
+    assert!(!matches_url_mode_and_store(
         &stored,
         "lores://elsewhere.invalid",
-        false
+        false,
+        ""
     ));
+}
+
+/// Nor does it cross token stores: a process carrying out calls for other processes reads the
+/// store each caller names, and the identity a call resolves is fixed by the URL and its own store,
+/// not by whichever store opened the connection cached under the URL.
+#[test]
+fn the_no_identity_fallback_does_not_cross_token_stores() {
+    let remote = "lores://store-isolation.test.invalid";
+    let alices = (
+        remote.to_string(),
+        "alice".to_string(),
+        false,
+        "/home/alice/tokens".to_string(),
+    );
+
+    assert!(matches_url_mode_and_store(
+        &alices,
+        remote,
+        false,
+        "/home/alice/tokens"
+    ));
+    assert!(
+        !matches_url_mode_and_store(&alices, remote, false, "/home/bob/tokens"),
+        "a call reading another store must not be given the connection alice's opened"
+    );
 }
 
 /// A call that supplied its own credentials must never be matched on URL

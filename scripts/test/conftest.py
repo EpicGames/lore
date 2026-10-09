@@ -5,6 +5,7 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
 import typing
@@ -23,6 +24,8 @@ from lore_server import (
     _get_worker_id,
     _SessionCleanup,
     allocate_free_port,
+    ends_with_launcher,
+    ends_with_session,
     generate_server_config,
     launch_lore_server,
     lore_local_server,
@@ -30,6 +33,8 @@ from lore_server import (
 from service_util import (
     LORE_SERVICE_LISTENING_MESSAGE,
     LORE_SERVICE_SOCKET_VAR,
+    LORE_TEST_SERVICE_SOCKET_VAR,
+    LORE_TEST_SHARED_SERVICE_VAR,
     service_supported,
     stop_lore_service,
 )
@@ -337,6 +342,7 @@ class TrackedServices(object):
                 stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
+                **ends_with_launcher(),
             )
         # Tracked before the wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.
@@ -429,6 +435,31 @@ def lore_service_socket():
     del os.environ[LORE_SERVICE_SOCKET_VAR]
 
 
+@pytest.fixture(autouse=True)
+def _relays_to_the_shared_service(request, monkeypatch):
+    """Carries out every command of the test in the service named by
+    `LORE_TEST_SERVICE_SOCKET`, one started before the run and shared by every
+    test in it.
+
+    A test that manages a service of its own, through `lore_service_runner`,
+    keeps it and this run's socket, and a test marked `runs_in_process` keeps
+    its commands in their own process. No executable is named, so a command that
+    finds the shared service gone fails rather than starting one of its own.
+    Each call carries the test's global and auth paths, which the service reads
+    in place of its own.
+    """
+    socket_name = os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
+    if (
+        socket_name
+        and "lore_service_runner" not in request.fixturenames
+        and request.node.get_closest_marker("runs_in_process") is None
+    ):
+        monkeypatch.setenv("LORE_USE_SERVICE", "1")
+        monkeypatch.setenv(LORE_SERVICE_SOCKET_VAR, socket_name)
+        # Blank rather than unset, so `name_service_executable` leaves it so.
+        monkeypatch.setenv("LORE_SERVICE_EXECUTABLE", " ")
+
+
 @pytest.fixture(scope="function")
 def stops_background_services(lore_service_runner):
     """Leaves no service running for a test whose commands must start one, and
@@ -454,9 +485,14 @@ def lore_executable_path(request):
     """
     Validates and returns the path of the Lore executable
     """
+    return _lore_executable_path(request.config)
+
+
+def _lore_executable_path(config) -> str:
+    """The Lore executable under test, exiting the run if there is none."""
     executable_path = os.getenv("LORE_EXECUTABLE_PATH")
     if not executable_path:
-        binary = request.config.getoption("--lore-client-binary")
+        binary = config.getoption("--lore-client-binary")
         if binary in ("release", "debug"):
             executable = "lore.exe" if sys.platform == "win32" else "lore"
             executable_path = str(Path.cwd() / "target" / binary / executable)
@@ -700,8 +736,12 @@ def auto_lore_local_server(
         (server_root, server_env) = lore_local_server_config
         try:
             server_proc, server_log_path, server_log_fd = launch_lore_server(
-                server_root, server_env, lore_server_executable_path
+                server_root,
+                server_env,
+                lore_server_executable_path,
+                outlives_launcher=True,
             )
+            ends_with_session(server_proc.pid)
             info_path.write_text(
                 json.dumps(
                     {
@@ -775,13 +815,71 @@ def _sandbox_machine_settings(config):
     logger.info("Standing in for the machine's Lore settings with %s", machine_settings)
 
 
+def _interrupt(signum, frame):
+    """Ends the run as Ctrl+C does, so that its cleanups run."""
+    raise KeyboardInterrupt
+
+
+def _interrupt_on_termination(config):
+    """Ends the run as Ctrl+C does on SIGTERM or SIGHUP, so that its cleanups
+    stop what outlives the process that launched it: the shared service, and the
+    server every xdist worker shares. Only the process running the session: a
+    worker that ends takes what it launched with it."""
+    if hasattr(config, "workerinput"):
+        return
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _interrupt)
+
+
+def _start_shared_service(config):
+    """Starts the service `LORE_TEST_SHARED_SERVICE` asks for, from the build
+    under test, names it in `LORE_TEST_SERVICE_SOCKET` for the run, and stops it
+    when the run ends.
+
+    Started once, by the process running the session: xdist starts its workers
+    after this, and each inherits the variable rather than starting a service of
+    its own. A run that already names a service in `LORE_TEST_SERVICE_SOCKET`
+    uses that one. The socket name is generated, so that runs proceed side by
+    side.
+
+    A run ended by Ctrl+C, SIGTERM or SIGHUP stops the service in its cleanups.
+    One killed outright leaves that to the kernel, which `ends_with_launcher`
+    asks on Linux.
+    """
+    if (
+        not os.environ.get(LORE_TEST_SHARED_SERVICE_VAR)
+        or os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
+        or hasattr(config, "workerinput")
+    ):
+        return
+    service_dir = tempfile.mkdtemp(prefix="lore_shared_service_")
+    config.add_cleanup(lambda: shutil.rmtree(service_dir, ignore_errors=True))
+    socket_name = f"lore_service-shared-{uuid.uuid4().hex[:12]}"
+    env = lore_test_env(service_dir)
+    env[LORE_SERVICE_SOCKET_VAR] = socket_name
+    services = TrackedServices(_lore_executable_path(config), env, service_dir)
+    config.add_cleanup(services.terminate_all)
+    services.start(service_dir)
+    os.environ[LORE_TEST_SERVICE_SOCKET_VAR] = socket_name
+    config.add_cleanup(lambda: os.environ.pop(LORE_TEST_SERVICE_SOCKET_VAR, None))
+    logger.info("Relaying the run to the Lore service on socket %s", socket_name)
+
+
 def pytest_configure(config):
     """Register the session cleanup plugin early so its pytest_sessionfinish
     hook fires on the controller process."""
     _sandbox_machine_settings(config)
+    _interrupt_on_termination(config)
+    _start_shared_service(config)
     config.pluginmanager.register(_SessionCleanup(), "lore_session_cleanup")
     config.addinivalue_line(
         "markers", "regression: mark tests that don't run on every CI"
+    )
+    config.addinivalue_line(
+        "markers",
+        "runs_in_process(reason): keep the test's commands in their own process when "
+        "LORE_TEST_SERVICE_SOCKET relays the rest of the run to a service",
     )
     config.addinivalue_line(
         "markers",

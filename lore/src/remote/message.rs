@@ -2,28 +2,28 @@
 // SPDX-License-Identifier: MIT
 use std::io::ErrorKind;
 use std::io::Read;
+use std::io::Write;
 
+use bytes::Bytes;
+use futures::future::Either;
+use lore_base::env::CallEnvironment;
 use lore_error_set::prelude::*;
 use lore_revision::interface::LoreGlobalArgs;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
 use crate::remote::command::LoreCommand;
 
 #[error_set]
-pub enum SerializeError {}
-
-#[error_set]
-pub enum DeserializeError {}
-
-#[error_set]
 pub enum MessageError {}
 
-pub fn blocking_read_v1_message<Message: for<'a> Deserialize<'a>, Reader: Read + Unpin>(
+/// Reads one message, or `None` when the peer has closed the connection.
+///
+/// Returns the payload the message was decoded from beside it: a `LoreBytes` the message carries
+/// views the payload, so the payload has to outlive every read of the view.
+pub fn blocking_read_message<Message: bitcode::DecodeOwned, Reader: Read + Unpin>(
     reader: &mut Reader,
-) -> Result<Option<(V1Header, Message)>, MessageError> {
+) -> Result<Option<(Message, Bytes)>, MessageError> {
     let mut version_byte: [u8; 1] = [0];
     let version = match reader.read_exact(&mut version_byte) {
         Ok(_) => version_byte[0],
@@ -39,86 +39,74 @@ pub fn blocking_read_v1_message<Message: for<'a> Deserialize<'a>, Reader: Read +
         }
     };
 
-    if version != MessageProtocol::V1 as u8 {
+    if version != MessageProtocol::V2 as u8 {
         return Err(MessageError::internal(
             "Message received with wrong version",
         ));
     }
 
-    let mut header_bytes = [0; V1Header::SIZE];
+    let mut header_bytes = [0; Header::SIZE];
     reader
         .read_exact(&mut header_bytes)
         .internal("reading message header")?;
-    let header = V1Header::from_bytes(&header_bytes).unwrap();
+    let header = Header::from_bytes(&header_bytes)?;
 
-    let mut message_bytes = vec![0; header.payload_size as usize];
+    let mut payload = vec![0; header.payload_size as usize];
     reader
-        .read_exact(&mut message_bytes)
+        .read_exact(&mut payload)
         .internal("reading message payload")?;
+    let payload = Bytes::from(payload);
 
-    let message = deserialize_message(message_bytes.as_slice(), header.serialization_type)
-        .forward::<MessageError>("deserializing message")?;
-    Ok(Some((header, message)))
+    let message = bitcode::decode(&payload).internal("decoding message")?;
+    Ok(Some((message, payload)))
 }
 
-pub fn write_v1_message<Message: Serialize>(
-    message: Message,
-    serialization_type: SerializationType,
-) -> Result<Vec<u8>, MessageError> {
-    let message_bytes = serialize_message(message, serialization_type)
-        .forward::<MessageError>("serializing message")?;
-    let header = V1Header::new(message_bytes.len() as u32, serialization_type);
-
-    let mut result_bytes = Vec::new();
-    result_bytes.push(MessageProtocol::V1 as u8);
-    result_bytes.extend_from_slice(&header.to_bytes());
-    result_bytes.extend_from_slice(&message_bytes);
-
-    Ok(result_bytes)
+/// Writes one message.
+pub fn write_message<Message: bitcode::Encode, Writer: Write>(
+    writer: &mut Writer,
+    message: &Message,
+) -> Result<(), MessageError> {
+    write_payload(writer, &encode_message(message))
 }
 
-pub fn serialize_message<Message: Serialize>(
-    message: Message,
-    serialization_type: SerializationType,
-) -> Result<Vec<u8>, SerializeError> {
-    Ok(match serialization_type {
-        SerializationType::Bincode => bitcode::serialize(&message).internal("bitcode serialize")?,
-        SerializationType::Json => serde_json::to_vec(&message).internal("json serialize")?,
-    })
+/// The payload of one message, for a sender that encodes it before it writes it.
+pub fn encode_message<Message: bitcode::Encode>(message: &Message) -> Vec<u8> {
+    bitcode::encode(message)
 }
 
-pub fn deserialize_message<Message: for<'a> Deserialize<'a>>(
-    message_bytes: &[u8],
-    serialization_type: SerializationType,
-) -> Result<Message, DeserializeError> {
-    Ok(match serialization_type {
-        SerializationType::Bincode => {
-            bitcode::deserialize(message_bytes).internal("bitcode deserialize")?
-        }
-        SerializationType::Json => {
-            serde_json::from_slice(message_bytes).internal("json deserialize")?
-        }
-    })
+/// Writes one message, given the payload [`encode_message`] made of it.
+pub fn write_payload<Writer: Write>(
+    writer: &mut Writer,
+    payload: &[u8],
+) -> Result<(), MessageError> {
+    let payload_size = u32::try_from(payload.len()).internal("message too large")?;
+    let mut header = [0; 1 + Header::SIZE];
+    header[0] = MessageProtocol::V2 as u8;
+    header[1..].copy_from_slice(&Header::new(payload_size, SerializationType::Bitcode).to_bytes());
+    writer
+        .write_all(&header)
+        .and_then(|()| writer.write_all(payload))
+        .internal("writing message")?;
+    Ok(())
 }
 
 // Message wire format
-// | MessageProtocol |           V1Header           |      MessageToServer or     |
+// | MessageProtocol |            Header            |      MessageToServer or     |
 // |                 |                              |       MessageToClient       |
 // |------------------------------------------------------------------------------|
 // |     1 byte      |   4 bytes    |    1 byte     |     payload_size bytes      |
-// |        0        | payload_size | serialization | serialized bytes of message |
+// |        1        | payload_size | serialization |  bitcode bytes of message   |
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
 enum MessageProtocol {
-    V1 = 0,
+    V2 = 1,
 }
 
 #[repr(u8)]
 #[derive(Clone, Copy, PartialEq)]
 pub enum SerializationType {
-    Bincode = 0,
-    Json = 1,
+    Bitcode = 0,
 }
 
 impl TryFrom<u8> for SerializationType {
@@ -126,19 +114,18 @@ impl TryFrom<u8> for SerializationType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(SerializationType::Bincode),
-            1 => Ok(SerializationType::Json),
+            0 => Ok(SerializationType::Bitcode),
             _ => Err(()),
         }
     }
 }
 
-pub struct V1Header {
+pub struct Header {
     pub payload_size: u32,
     pub serialization_type: SerializationType,
 }
 
-impl V1Header {
+impl Header {
     const SIZE: usize = 5;
 
     pub fn new(payload_size: u32, serialization_type: SerializationType) -> Self {
@@ -148,7 +135,7 @@ impl V1Header {
         }
     }
 
-    pub fn from_bytes(bytes: &[u8; V1Header::SIZE]) -> Result<Self, MessageError> {
+    pub fn from_bytes(bytes: &[u8; Header::SIZE]) -> Result<Self, MessageError> {
         Ok(Self::new(
             bytes[0] as u32
                 | (bytes[1] as u32) << 8
@@ -163,7 +150,7 @@ impl V1Header {
         ))
     }
 
-    pub fn to_bytes(&self) -> [u8; V1Header::SIZE] {
+    pub fn to_bytes(&self) -> [u8; Header::SIZE] {
         [
             (self.payload_size & 0xff) as u8,
             (self.payload_size >> 8 & 0xff) as u8,
@@ -174,30 +161,49 @@ impl V1Header {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, bitcode::Encode, bitcode::Decode)]
 pub struct MessageToServer {
     pub globals: LoreGlobalArgs,
     pub command: LoreCommand,
+    pub environment: CallEnvironment,
 }
 
 impl MessageToServer {
-    /// Starts the command's handler in this process. The caller pins the future before awaiting
-    /// it, for the reason `LoreCommand::invoke_local` gives.
+    /// Starts the command's handler in this process, under the caller's environment. The caller
+    /// pins the future before awaiting it, for the reason `LoreCommand::invoke_local` gives.
     ///
-    /// Resolves a relative repository path against the caller's working directory first, since
+    /// Checks the text the call carries first, as the entry point did in the caller's process: it
+    /// arrives as the bytes the caller sent, and a handler reads it as `&str`. A call that fails
+    /// the check is refused as the entry point refuses it.
+    ///
+    /// Then resolves a relative repository path against the caller's working directory, since
     /// this process runs in a directory unrelated to the caller's. An empty path names no
     /// repository and is left empty.
     pub fn invoke(mut self, callback: LoreEventCallback) -> impl Future<Output = i32> {
-        if !self.globals.repository_path.is_empty() {
-            crate::call::resolve_repository_path(&mut self.globals);
-        }
-        self.command.invoke_local(self.globals, callback)
+        let run = match crate::call_delegation::validate_call_text(&self.globals, &self.command) {
+            Ok(()) => {
+                if !self.globals.repository_path.is_empty() {
+                    crate::call::resolve_repository_path(&mut self.globals);
+                }
+                Either::Left(self.command.invoke_local(self.globals, callback))
+            }
+            Err(error) => Either::Right(crate::call_delegation::reject_call(
+                self.globals,
+                callback,
+                error,
+            )),
+        };
+        crate::call::with_relayed_environment(self.environment, run)
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+/// What the service sends a client: the command's events, then its status.
+///
+/// Generic over the event so that the service can encode an event it is handed by reference,
+/// which encodes as the event itself, without copying it.
+#[derive(Clone, bitcode::Encode, bitcode::Decode)]
 #[allow(clippy::large_enum_variant)]
-pub enum MessageToClient {
-    Event(LoreEvent),
+pub enum MessageToClient<Event = LoreEvent> {
+    Event(Event),
     ApiResult(i32),
 }

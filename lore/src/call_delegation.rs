@@ -66,7 +66,7 @@ fn reject_after_shutdown(callback: LoreEventCallbackConfig) -> i32 {
 /// once, keeps a bad encoding a uniform argument rejection instead of leaving
 /// each verb to catch it — or to miss it and read invalid text.
 #[lore_macro::test_pub]
-fn validate_call_text<ArgsType: ValidateText>(
+pub(crate) fn validate_call_text<ArgsType: ValidateText>(
     globals: &LoreGlobalArgs,
     args: &ArgsType,
 ) -> Result<(), ArgumentError> {
@@ -194,7 +194,7 @@ fn run_command_asynchronously<Run, Fut>(
 /// Report a malformed call the way a failing command reports: the status on the
 /// return value and on a `Complete` event carrying the detail. No verb ran, so
 /// no verb-specific terminal event fires.
-async fn reject_call(
+pub(crate) async fn reject_call(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
     error: ArgumentError,

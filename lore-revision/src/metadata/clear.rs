@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use super::MetadataErrors;
@@ -21,7 +20,7 @@ use crate::util::path::RelativePath;
 
 /// Data for an event reporting that revision metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearRevisionEventData {
     /// Hash of the revision whose metadata was cleared.
@@ -30,7 +29,7 @@ pub struct LoreMetadataClearRevisionEventData {
 
 /// Data for an event reporting that a file's metadata was cleared.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreMetadataClearFileEventData {
     /// Path of the file whose metadata was cleared.

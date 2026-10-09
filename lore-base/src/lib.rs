@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 pub mod allocator;
 pub mod directories;
+pub mod env;
 pub mod error;
 pub mod fs;
 pub mod log;

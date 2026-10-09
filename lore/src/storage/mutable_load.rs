@@ -23,8 +23,6 @@ use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageMutableLoadItemCompleteEventData;
 use lore_storage::StorageError;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -38,7 +36,9 @@ use crate::storage::store::StoreInternal;
 
 /// One `mutable_load` item — the `(partition, key, key_type)` to read.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreStorageMutableLoadItem {
     /// Caller-chosen id echoed back in `MUTABLE_LOAD_ITEM_COMPLETE`
     pub id: u64,
@@ -52,7 +52,7 @@ pub struct LoreStorageMutableLoadItem {
 
 /// Arguments for `lore_storage_mutable_load`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(mutable_load_impl)]
 pub struct LoreStorageMutableLoadArgs {
     /// Open storage handle

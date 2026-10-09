@@ -15,7 +15,6 @@ Covers:
 import logging
 import socket
 import subprocess
-import sys
 from pathlib import Path
 
 import grpc
@@ -28,6 +27,7 @@ from lore_server import (
     allocate_free_port,
     generate_server_config,
     release_reserved_ports,
+    server_popen_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,12 +58,6 @@ def _launch_maintenance_server(server_root, server_env, executable_path):
     server_log_path = server_root / "server.log"
     server_log_fd = server_log_path.open("w", buffering=1, encoding="utf-8")
 
-    platform_kwargs = {}
-    if sys.platform == "win32":
-        platform_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        platform_kwargs["start_new_session"] = True
-
     # This launches the server itself rather than going through
     # launch_lore_server, so it owns the release of the port reservations that
     # allocate_free_port is still holding.  Without it the server cannot bind,
@@ -77,7 +71,7 @@ def _launch_maintenance_server(server_root, server_env, executable_path):
         stderr=subprocess.STDOUT,
         env=server_env,
         cwd=server_root,
-        **platform_kwargs,
+        **server_popen_kwargs(),
     )
 
     http_port = server_env["LORE__SERVER__HTTP__PORT"]

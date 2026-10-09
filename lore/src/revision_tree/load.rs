@@ -22,8 +22,6 @@ use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeLoadedEventData;
 use lore_revision::interface::LoreError;
 use lore_revision::state::State;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -38,7 +36,7 @@ use crate::storage::handle::LoreStore;
 
 /// Arguments for `lore_revision_tree_load`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(load_impl)]
 pub struct LoreRevisionTreeLoadArgs {
     /// Open storage handle the revision tree is loaded against

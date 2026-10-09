@@ -6,14 +6,15 @@ use core::fmt;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering;
 
-use serde::Deserialize;
 use serde::Serialize;
 
 /// Severity level of a log message.
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Debug, Copy, Clone, Default, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Debug, Copy, Clone, Default, PartialEq, PartialOrd, Serialize, bitcode::Encode, bitcode::Decode,
+)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreLogLevel {
     /// No logging.

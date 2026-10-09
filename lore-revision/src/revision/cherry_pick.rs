@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -35,7 +34,7 @@ use crate::state::State;
 
 /// Event data reported at the start of a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickStartBeginEventData {
     /// Branch identifier.
@@ -48,7 +47,7 @@ pub struct LoreCherryPickStartBeginEventData {
 
 /// Event data reported at the end of a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickStartEndEventData {
     /// Progress statistics for the applied changes.
@@ -61,7 +60,7 @@ pub struct LoreCherryPickStartEndEventData {
 
 /// Event data reported at the start of aborting a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickAbortBeginEventData {
     /// Identifier of the staged revision being discarded.
@@ -72,7 +71,7 @@ pub struct LoreCherryPickAbortBeginEventData {
 
 /// Event data reported at the end of aborting a cherry-pick.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickAbortEndEventData {
     /// Unused placeholder field.
@@ -81,7 +80,7 @@ pub struct LoreCherryPickAbortEndEventData {
 
 /// Event data reported for a file in conflict during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickConflictFileEventData {
     /// Path of the file.
@@ -90,7 +89,7 @@ pub struct LoreCherryPickConflictFileEventData {
 
 /// Event data reported when a file is unresolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickUnresolveFileEventData {
     /// Path of the file.
@@ -99,7 +98,7 @@ pub struct LoreCherryPickUnresolveFileEventData {
 
 /// Event data reported when a revision is unresolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickUnresolveRevisionEventData {
     /// Repository identifier.
@@ -110,7 +109,7 @@ pub struct LoreCherryPickUnresolveRevisionEventData {
 
 /// Event data reported when a file is resolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickResolveFileEventData {
     /// Path of the file.
@@ -119,7 +118,7 @@ pub struct LoreCherryPickResolveFileEventData {
 
 /// Event data reported when a revision is resolved during a cherry-pick.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreCherryPickResolveRevisionEventData {
     /// Repository identifier.

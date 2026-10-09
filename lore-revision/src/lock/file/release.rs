@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -98,7 +97,7 @@ impl EventError for ReleaseError {
 
 /// Data for an event that marks the start of a lock release report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileReleaseBeginEventData {
     /// Number of release entries that follow.
@@ -109,7 +108,7 @@ pub struct LoreLockFileReleaseBeginEventData {
 
 /// Data for an event reporting a path whose lock is being released.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileReleaseEventData {
     /// The path whose lock is being released.

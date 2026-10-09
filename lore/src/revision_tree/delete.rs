@@ -28,8 +28,6 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
 use lore_revision::state::StateNodeChildrenIterator;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
@@ -41,7 +39,9 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One subtree to remove. The node must already exist and must not be the root.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreRevisionTreeDeleteEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `DELETE_COMPLETE`
     pub entry_id: u64,
@@ -51,7 +51,7 @@ pub struct LoreRevisionTreeDeleteEntry {
 
 /// Arguments for `lore_revision_tree_delete`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(delete_impl)]
 pub struct LoreRevisionTreeDeleteArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

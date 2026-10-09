@@ -34,8 +34,6 @@ use lore_revision::stage;
 use lore_revision::stage::StageOptions;
 use lore_revision::util::path::is_path_inside_repository;
 use lore_revision::util::path::make_absolute;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -44,7 +42,7 @@ use crate::util::convert_user_paths;
 
 /// Arguments for retrieving file information (size, hash, staged status).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 pub struct LoreFileInfoArgs {
     /// Array of paths
@@ -113,7 +111,7 @@ async fn info_impl(
 
 /// Arguments for diffing files between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(diff_local)]
 pub struct LoreFileDiffArgs {
     /// An array of paths
@@ -196,7 +194,7 @@ async fn diff_impl(
 
 /// Arguments for clearing all metadata associated with a file.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_clear_local)]
 pub struct LoreFileMetadataClearArgs {
     /// Which file to clear metadata for
@@ -249,7 +247,7 @@ fn metadata_clear_local(
 
 /// Arguments for retrieving a single metadata value for a file by key and revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_get_local)]
 pub struct LoreFileMetadataGetArgs {
     /// Revision to get metadata for
@@ -311,7 +309,7 @@ fn metadata_get_local(
 
 /// Arguments for listing all metadata key/value pairs for a file at a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_list_local)]
 pub struct LoreFileMetadataListArgs {
     /// What to list metadata for
@@ -366,7 +364,7 @@ fn metadata_list_local(
 
 /// Arguments for setting metadata key/value pairs on one or more files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_set_local)]
 pub struct LoreFileMetadataSetArgs {
     /// An array of paths
@@ -473,7 +471,7 @@ async fn metadata_set_impl(
 
 /// Arguments for staging one or more files for the next commit.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stage_local)]
 pub struct LoreFileStageArgs {
     /// An array of paths
@@ -561,7 +559,7 @@ fn stage_local(
 
 /// Arguments for staging one or more files as merge resolutions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stage_merge_local)]
 pub struct LoreFileStageMergeArgs {
     /// Paths to files to stage as merge
@@ -617,7 +615,7 @@ fn stage_merge_local(
 
 /// Arguments for staging a file move from one path to another.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stage_move_local)]
 pub struct LoreFileStageMoveArgs {
     /// Original path of file
@@ -687,7 +685,7 @@ fn stage_move_local(
 
 /// Arguments for marking files dirty in the staged state (add/modify/delete inferred from filesystem).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dirty_local)]
 pub struct LoreFileDirtyArgs {
     /// An array of paths
@@ -718,7 +716,7 @@ fn dirty_local(
 
 /// Arguments for marking a file dirty-moved (relocates the staged node, no filesystem checks).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dirty_move_local)]
 pub struct LoreFileDirtyMoveArgs {
     /// Original path of file
@@ -755,7 +753,7 @@ fn dirty_move_local(
 
 /// Arguments for marking a file dirty-copied (creates a new staged destination node, no filesystem checks).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dirty_copy_local)]
 pub struct LoreFileDirtyCopyArgs {
     /// Source path of file
@@ -794,7 +792,7 @@ fn dirty_copy_local(
 
 /// Arguments for removing one or more files from the staged changeset.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(unstage_local)]
 pub struct LoreFileUnstageArgs {
     /// An array of paths
@@ -852,7 +850,7 @@ fn unstage_local(
 
 /// Arguments for resetting files to a revision, optionally purging untracked files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(reset_local)]
 pub struct LoreFileResetArgs {
     /// Pointer to an array of paths
@@ -920,7 +918,7 @@ fn reset_local(
 
 /// Arguments for resetting files to the last merged revision on a branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(reset_to_last_merged_local)]
 pub struct LoreFileResetToLastMergedArgs {
     /// Pointer to an array of paths
@@ -930,7 +928,6 @@ pub struct LoreFileResetToLastMergedArgs {
     /// Purge untracked files
     pub purge: u8,
     /// Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
-    #[serde(default)]
     pub merge_side: u32,
 }
 
@@ -996,7 +993,7 @@ fn reset_to_last_merged_local(
 
 /// Arguments for writing a file to a destination by path/revision or by address.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(write_local)]
 pub struct LoreFileWriteArgs {
     /// Address of data to write; takes precedence over `path` when non-empty
@@ -1108,7 +1105,7 @@ async fn write_impl(
 
 /// Arguments for permanently removing a file or address from repository history.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(obliterate_local)]
 pub struct LoreFileObliterateArgs {
     /// Address of data to obliterate; takes precedence over `path` when non-empty
@@ -1183,7 +1180,7 @@ async fn obliterate_impl(
 
 /// Arguments for dumping the binary content of a file by path or address.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dump_local)]
 pub struct LoreFileDumpArgs {
     /// Address of data to dump; takes precedence over `path` when non-empty
@@ -1248,7 +1245,7 @@ async fn dump_impl(
 
 /// Arguments for computing the hash and size of one or more files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(hash_local)]
 pub struct LoreFileHashArgs {
     /// An array of paths
@@ -1303,7 +1300,7 @@ async fn hash_impl(
 
 /// Arguments for retrieving the revision history of a specific file.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(history_local)]
 pub struct LoreFileHistoryArgs {
     /// A path to a file

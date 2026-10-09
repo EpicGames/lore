@@ -2507,6 +2507,7 @@ dependencies = [
  "chrono",
  "ctor",
  "dashmap",
+ "futures",
  "libc",
  "lore",
  "lore-base",
@@ -2850,7 +2851,6 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde",
- "serde_bytes",
  "serde_json",
  "serde_with",
  "smallvec",
@@ -2956,6 +2956,7 @@ name = "lore-storage"
 version = "0.10.2-nightly"
 dependencies = [
  "async-trait",
+ "bitcode",
  "bitflags",
  "blake3",
  "bytes",

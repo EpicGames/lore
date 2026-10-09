@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use lore_error_set::prelude::*;
 use lore_storage::options::ReadOptions;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -342,7 +341,7 @@ pub async fn cache_revision_list_states(
 
 /// Data for the event reporting a revision found by a search.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionFindEventData {
     /// Signature of the revision that was found.

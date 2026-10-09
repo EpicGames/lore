@@ -8,7 +8,6 @@ use dashmap::DashMap;
 use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::bitflagsops;
@@ -234,7 +233,7 @@ impl LinkTracker {
 
 /// Data for an event reporting a change to a link.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkChangeEventData {
     /// Path of the link within the parent repository.
@@ -281,7 +280,7 @@ impl LoreLinkChangeEventData {
 /// repository. A repository can be linked at more than one mount path, so a
 /// consumer must key on `link_path` together with `link_repository`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkBranchCreateEventData {
     /// Path of the link within the parent repository.

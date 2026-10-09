@@ -6,7 +6,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_base::types::LockData;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -99,7 +98,7 @@ impl EventError for AcquireError {
 
 /// Data for an event that marks the start of a lock acquire report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireBeginEventData {
     /// Number of acquire entries that follow.
@@ -110,7 +109,7 @@ pub struct LoreLockFileAcquireBeginEventData {
 
 /// Data for an event reporting a path whose lock is being acquired.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireEventData {
     /// The path whose lock is being acquired.

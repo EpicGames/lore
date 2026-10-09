@@ -12,7 +12,18 @@ use serde::Serialize;
 /// Which authentication path a client takes if a server advertises both its
 /// gRPC auth service and an OIDC issuer. A path the server does not
 /// advertise cannot be taken.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {
     /// Follow the server's preference: the OIDC path if the server marks it

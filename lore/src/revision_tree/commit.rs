@@ -27,8 +27,6 @@ use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -42,7 +40,9 @@ use crate::storage::store::PerCallFlags;
 
 /// Tuneables for `lore_revision_tree_commit`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreRevisionTreeCommitOptions {
     /// Also upload the new revision to remote (local-only by default)
     pub remote_write: u8,
@@ -50,7 +50,7 @@ pub struct LoreRevisionTreeCommitOptions {
 
 /// Arguments for `lore_revision_tree_commit`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(commit_impl)]
 pub struct LoreRevisionTreeCommitArgs {
     /// Per-call correlation id echoed back in events

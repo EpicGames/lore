@@ -9,7 +9,6 @@ use std::sync::Arc;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use lore_storage::store_types::KeyType;
-use serde::Deserialize;
 use serde::Serialize;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
@@ -68,7 +67,8 @@ pub const ANCHOR_STAGED: &str = "anchor-staged";
     FromBytes,
     Immutable,
     Serialize,
-    Deserialize,
+    bitcode::Encode,
+    bitcode::Decode,
 )]
 pub struct InstanceId {
     /// The raw 16-byte identifier
@@ -539,7 +539,7 @@ pub async fn instances_on_branch(
 
 /// Event data warning that several instances share the same checked-out branch.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchMultipleInstanceEventData {
     /// The branch checked out by more than one instance
@@ -940,7 +940,7 @@ use crate::event::LoreEvent;
 
 /// Event data describing an instance — used for both listing and prune notifications.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceEventData {
     /// Identifier of the instance

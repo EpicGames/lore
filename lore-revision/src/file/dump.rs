@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -15,7 +14,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event reporting the stored representation of file content.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDumpEventData {
     /// Address of the content.

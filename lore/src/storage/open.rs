@@ -39,8 +39,6 @@ use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::create as create_immutable;
 use lore_storage::local::mutable_store::LocalMutableStore;
 use lore_storage::local::mutable_store::MutableStoreSettings;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -53,7 +51,7 @@ use crate::storage::store::StoreInternal;
 
 /// Remote endpoint configuration for a storage handle.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
+#[derive(Debug, Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStorageRemoteConfig {
     /// gRPC endpoint of the peer storage service; authenticated with the open call's `globals.identity`
     pub remote_url: LoreString,
@@ -61,7 +59,7 @@ pub struct LoreStorageRemoteConfig {
 
 /// Arguments for `lore_storage_open`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(open_local)]
 pub struct LoreStorageOpenArgs {
     /// Path to an existing lore repository; must be empty when `in_memory` is set

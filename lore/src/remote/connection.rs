@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::io::Write;
 use std::pin::pin;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_revision::service_state::ServiceStateImpl;
@@ -16,10 +16,9 @@ use crate::interface::LoreEvent;
 use crate::interface::LoreLogLevel;
 use crate::remote::message::MessageToClient;
 use crate::remote::message::MessageToServer;
-use crate::remote::message::SerializationType;
-use crate::remote::message::V1Header;
-use crate::remote::message::blocking_read_v1_message;
-use crate::remote::message::write_v1_message;
+use crate::remote::message::blocking_read_message;
+use crate::remote::message::encode_message;
+use crate::remote::message::write_payload;
 use crate::remote::network::UdsStream;
 
 #[derive(Debug, Copy, Clone)]
@@ -88,19 +87,11 @@ impl IpcConnection {
         }
     }
 
-    async fn send_message(
-        mut stream: UdsStream,
-        message: MessageToClient,
-        serialization_type: SerializationType,
-    ) -> Result<(), ConnectionError> {
-        let message_bytes = write_v1_message(message, serialization_type)
+    async fn send_message(mut stream: UdsStream, payload: Vec<u8>) -> Result<(), ConnectionError> {
+        lore_base::lore_spawn_blocking!(move || write_payload(stream.writer(), &payload))
+            .await
+            .internal("failed writing")?
             .forward::<ConnectionError>("writing message")?;
-        lore_base::lore_spawn_blocking!(move || stream
-            .writer()
-            .write_all(message_bytes.as_slice()))
-        .await
-        .internal("failed writing")?
-        .internal("io")?;
         Ok(())
     }
 
@@ -108,21 +99,20 @@ impl IpcConnection {
         let mut connection = self.connection.try_clone().internal("cloning connection")?;
         // Parks a core blocking thread until the peer sends or hangs up, so live
         // connections consume core's blocking pool one thread apiece.
-        let message: Option<(V1Header, MessageToServer)> =
-            lore_base::lore_spawn_blocking!(move || blocking_read_v1_message(connection.reader()))
+        let message: Option<(MessageToServer, Bytes)> =
+            lore_base::lore_spawn_blocking!(move || blocking_read_message(connection.reader()))
                 .await
                 .internal("failed reading")?
                 .forward::<ConnectionError>("reading message")?;
 
-        let Some((header, command)) = message else {
+        let Some((command, payload)) = message else {
             return Ok(());
         };
 
         //TODO(UCS-16094): Determine if this should be unbounded or bounded
         // Create a channel so the callback task can send messages to this network thread, so they
         // can be forwarded to the client.
-        let (to_client_sender, mut to_client_receiver) =
-            mpsc::unbounded_channel::<(MessageToClient, SerializationType)>();
+        let (to_client_sender, mut to_client_receiver) = mpsc::unbounded_channel::<Vec<u8>>();
 
         let invoke_state = Arc::clone(&self.service_state);
         lore_base::lore_spawn!(async move {
@@ -134,11 +124,13 @@ impl IpcConnection {
             // (including Error and Log) to the remote client so the client's own
             // wrapped callback can handle them. Wrapping here would swallow those
             // events on the server side and they would never reach the remote.
+            //
+            // The event is encoded here rather than where it is sent: a `LoreBytes` it carries
+            // is valid only while the callback runs.
             let handler = pin!(command.invoke(Some(Box::new(move |event: &LoreEvent| {
-                if let Err(error) = to_client_sender.send((
-                    MessageToClient::Event(event.clone()),
-                    header.serialization_type,
-                )) {
+                if let Err(error) =
+                    to_client_sender.send(encode_message(&MessageToClient::Event(event)))
+                {
                     callback_state.push_log(
                         LoreLogLevel::Error,
                         format!("Failed to send Event message to connection task: {error}"),
@@ -146,10 +138,11 @@ impl IpcConnection {
                 }
             }))));
             let cli_result = handler.await;
+            // Holds the views of any `LoreBytes` the command carried.
+            drop(payload);
 
-            if let Err(error) = sender.send((
-                MessageToClient::ApiResult(cli_result),
-                header.serialization_type,
+            if let Err(error) = sender.send(encode_message(
+                &MessageToClient::<LoreEvent>::ApiResult(cli_result),
             )) {
                 invoke_state.push_log(
                     LoreLogLevel::Error,
@@ -158,9 +151,9 @@ impl IpcConnection {
             }
         });
 
-        while let Some((message, serialization_type)) = to_client_receiver.recv().await {
+        while let Some(message) = to_client_receiver.recv().await {
             let stream = self.connection.try_clone().internal("cloning connection")?;
-            if let Err(error) = Self::send_message(stream, message, serialization_type).await {
+            if let Err(error) = Self::send_message(stream, message).await {
                 self.service_state.push_log(
                     LoreLogLevel::Error,
                     format!(

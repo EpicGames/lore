@@ -10,6 +10,7 @@ from lore import Lore
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process("asserts what a command run outside a service refuses")
 def test_no_swfs_create_outside_service(new_lore_repo):
     lore: Lore = new_lore_repo(create_repo=False)
 
@@ -18,6 +19,7 @@ def test_no_swfs_create_outside_service(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process("asserts what a command run outside a service refuses")
 def test_no_swfs_clone_outside_service(new_lore_repo):
     lore: Lore = new_lore_repo()
 

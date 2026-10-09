@@ -20,8 +20,6 @@ use lore_revision::event::revision_tree::LoreRevisionTreeMetadataClearCompleteEv
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -32,7 +30,7 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One metadata key to remove.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(Clone, Debug, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreRevisionTreeMetadataClearEntry {
     /// Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_CLEAR_COMPLETE`
     pub entry_id: u64,
@@ -42,7 +40,7 @@ pub struct LoreRevisionTreeMetadataClearEntry {
 
 /// Arguments for `lore_revision_tree_metadata_clear`.
 #[repr(C)]
-#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_clear_impl)]
 pub struct LoreRevisionTreeMetadataClearArgs {
     /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`

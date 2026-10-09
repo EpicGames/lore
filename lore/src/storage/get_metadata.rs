@@ -39,8 +39,6 @@ use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageGetMetadataItemCompleteEventData;
 use lore_storage::StorageError;
 use lore_storage::store_types::StoreMatch;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
@@ -56,7 +54,9 @@ use crate::storage::store::StoreInternal;
 
 /// One `get_metadata` item — the `(partition, address)` to look up.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(
+    Copy, Clone, Default, Debug, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode,
+)]
 pub struct LoreStorageGetMetadataItem {
     /// Caller-chosen id echoed back in `GET_METADATA_ITEM_COMPLETE`
     pub id: u64,
@@ -68,7 +68,7 @@ pub struct LoreStorageGetMetadataItem {
 
 /// Arguments for `lore_storage_get_metadata`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(get_metadata_local)]
 pub struct LoreStorageGetMetadataArgs {
     /// Open storage handle

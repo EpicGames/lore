@@ -6,7 +6,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_base::types::LockData;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -97,7 +96,7 @@ impl EventError for StatusError {
 
 /// Data for an event that marks the start of a lock status report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileStatusBeginEventData {
     /// Number of status entries that follow.
@@ -106,7 +105,7 @@ pub struct LoreLockFileStatusBeginEventData {
 
 /// Data for an event reporting the lock status of a single path.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileStatusEventData {
     /// Path the status applies to.
