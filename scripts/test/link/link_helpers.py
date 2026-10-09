@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-import os
+"""Repository setup and output parsing shared by the link tests."""
+
 import re
 
 from lore_parsers import parse_status_json
@@ -8,9 +9,47 @@ from test_utils import unstaged_entries
 
 from lore import Lore
 
-# ---------------------------------------------------------------------------
-# Helpers for the link-reset tests below.
-# ---------------------------------------------------------------------------
+DEFAULT_LINK_MOUNT = "vendor/lib"
+DEFAULT_PARENT_FILE = "README.txt"
+
+
+def make_repo(new_lore_repo, files: dict, message: str = "Initial commit") -> Lore:
+    """A new repository holding `files`, committed and pushed."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(message, files)
+    return repo
+
+
+def make_parent_with_link(
+    new_lore_repo,
+    link_path: str = DEFAULT_LINK_MOUNT,
+    link_files: dict | None = None,
+    parent_files: dict | None = None,
+    source_path: str = "/",
+    **link_add_kwargs,
+) -> tuple[Lore, Lore]:
+    """Returns (parent_repo, link_repo) with the link committed and pushed."""
+    parent_repo = make_repo(
+        new_lore_repo, parent_files or {DEFAULT_PARENT_FILE: "baseline\n"}, "Baseline"
+    )
+    link_repo = make_repo(
+        new_lore_repo,
+        link_files or {"linked.txt": "linked content\n"},
+        "Initial linked content",
+    )
+
+    parent_repo.link_add(link_path, link_repo.get_id(), source_path, **link_add_kwargs)
+    parent_repo.commit("Add link")
+    parent_repo.push()
+    return parent_repo, link_repo
+
+
+def link_pin(repo: Lore, source_id: str) -> str:
+    """The revision `source_id` is pinned at, read from `link list`."""
+    output = repo.link_list()
+    match = re.search(rf"Link\s+{source_id}.*?Revision:\s*(\w+)", output, re.DOTALL)
+    assert match, f"No pin for {source_id} in link list:\n{output}"
+    return match.group(1)
 
 
 def assert_crr_clean(
@@ -44,63 +83,6 @@ def assert_crr_clean(
             )
 
 
-def commit_initial_main(new_lore_repo, file_name: str) -> Lore:
-    """Create a main repo with one committed file and push."""
-    repo: Lore = new_lore_repo()
-    with repo.open_file(file_name, "w+") as f:
-        f.writelines(["main repo initial content\n"])
-    repo.stage(scan=True)
-    repo.commit("initial main")
-    repo.push()
-    return repo
-
-
-def make_link_source(new_lore_repo, file_paths: list[str]) -> tuple[Lore, list[str]]:
-    """Create a link source repo with the given files committed and pushed."""
-    repo: Lore = new_lore_repo()
-    for path in file_paths:
-        directory = os.path.dirname(path)
-        if directory:
-            repo.make_dirs(directory)
-        with repo.open_file(path, "w+") as f:
-            f.writelines([f"link source content for {path}\n"])
-    repo.stage(scan=True)
-    repo.commit("initial source")
-    repo.push()
-    return repo, file_paths
-
-
-DEFAULT_LINK_MOUNT = "vendor/lib"
-
-
-DEFAULT_PARENT_FILE = "README.txt"
-
-
-def make_parent_with_link(
-    new_lore_repo,
-    link_path: str = DEFAULT_LINK_MOUNT,
-    link_files: dict | None = None,
-    parent_files: dict | None = None,
-    **link_add_kwargs,
-):
-    """Returns (parent_repo, link_repo) with the link committed and pushed."""
-    parent_repo: Lore = new_lore_repo()
-    link_repo: Lore = new_lore_repo()
-
-    parent_repo.write_commit_push(
-        "Baseline",
-        parent_files or {DEFAULT_PARENT_FILE: "baseline\n"},
-    )
-    link_repo.write_commit_push(
-        "Initial linked content", link_files or {"linked.txt": "linked content\n"}
-    )
-
-    parent_repo.link_add(link_path, link_repo.get_id(), "/", **link_add_kwargs)
-    parent_repo.commit("Add link")
-    parent_repo.push()
-    return parent_repo, link_repo
-
-
 def setup_link_merge_conflict(
     new_lore_repo, link_path="linked/repo", files=None, source_path="/"
 ):
@@ -121,59 +103,32 @@ def setup_link_merge_conflict(
             }
         ]
 
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-
-    # Create base files in linked repo, below the path the link exposes
+    # Base files sit below the path the link exposes in the linked repository.
     source_prefix = source_path.strip("/")
-    for file_info in files:
-        source_file = "/".join(filter(None, [source_prefix, file_info["path"]]))
-        dirs = "/".join(source_file.split("/")[:-1])
-        if dirs:
-            link_repo.make_dirs(dirs)
-        with link_repo.open_file(source_file, "w+") as f:
-            f.writelines([file_info["base"]])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"/".join(filter(None, [source_prefix, f["path"]])): f["base"] for f in files},
+        {"main-file.txt": "main repo content\n"},
+        source_path=source_path,
+    )
 
-    urc.link_add(link_path, link_repo.get_id(), source_path, debug=True)
-    urc.commit("Add link")
-    urc.push()
-
-    # Create feature branch
     urc.branch_create("feature-branch")
+    urc.write_commit_push(
+        "Feature branch changes",
+        {f"{link_path}/{f['path']}": f["theirs"] for f in files},
+    )
 
-    # Feature branch: modify files through mount path
-    for file_info in files:
-        with urc.open_file(f"{link_path}/{file_info['path']}", "w+") as f:
-            f.writelines([file_info["theirs"]])
-    urc.stage(scan=True)
-    urc.commit("Feature branch changes")
-    urc.push()
-
-    # Switch to main: modify same files differently
     urc.branch_switch("main")
-    for file_info in files:
-        with urc.open_file(f"{link_path}/{file_info['path']}", "w+") as f:
-            f.writelines([file_info["mine"]])
-    urc.stage(scan=True)
-    urc.commit("Main branch changes")
-    urc.push()
+    urc.write_commit_push(
+        "Main branch changes",
+        {f"{link_path}/{f['path']}": f["mine"] for f in files},
+    )
 
     return urc, link_repo, link_path
 
 
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
-
-
 DIFF_ACTIONS = frozenset({"A", "D", "M", "V", "C"})
 
 

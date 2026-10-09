@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-import re
 
 import pytest
-from link_helpers import setup_link_merge_conflict
-
-from lore import Lore
+from error_types import ImproperArgumentsError
+from link_helpers import (
+    link_pin,
+    make_parent_with_link,
+    make_repo,
+    setup_link_merge_conflict,
+)
 
 
 @pytest.mark.smoke
@@ -58,6 +61,7 @@ def test_link_merge_all_conflict_in_a_link_exposing_a_subtree(new_lore_repo):
         assert "resolved through the mount" in f.read()
 
 
+@pytest.mark.smoke
 def test_link_merge_all(new_lore_repo):
     """Default merge (no flags) across main + linked repos.
 
@@ -67,32 +71,17 @@ def test_link_merge_all(new_lore_repo):
     With orchestration, the linked repo is independently merged and both
     branches' files appear.
     """
-    urc: Lore = new_lore_repo()
-
-    # Create initial file in main repo
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    # Create linked repository with initial content
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
-    # Add link to main repo
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     # Create feature branch (auto-follows into linked repo)
     urc.branch_create("feature-branch")
@@ -166,27 +155,20 @@ def test_link_merge_all(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_all(new_lore_repo):
     """Abort-all rolls back all link pins and main repo changes."""
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
 
@@ -238,27 +220,20 @@ def test_link_merge_abort_all(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_ignore_links(new_lore_repo):
     """Abort --ignore-links strips merge metadata but preserves link pin updates."""
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("shared-file.txt", "w+") as f:
-        f.writelines(["base content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "shared-file.txt": "base content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
 
@@ -310,29 +285,22 @@ def test_link_merge_abort_ignore_links(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_resume(new_lore_repo):
     """Resume detection: a merge with --no-commit leaves staged state with
     LinkMergeState entries. Re-running merge (after commit) shows that the
     link merge infrastructure correctly tracks merged links."""
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
 
@@ -383,27 +351,20 @@ def test_link_merge_resume(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_dry_run(new_lore_repo):
     """Dry-run previews changes across all repos without modifying state."""
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
 
@@ -439,29 +400,22 @@ def test_link_merge_dry_run(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_file_conflict_resolve_in_place(new_lore_repo):
     """Default merge stages link file conflicts in place; resolve + commit finishes
     the merge without a `--link` re-entry."""
 
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("shared-link-file.txt", "w+") as f:
-        f.writelines(["base content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "shared-link-file.txt": "base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
     with urc.open_file(f"{link_path}/shared-link-file.txt", "w+") as f:
@@ -479,10 +433,7 @@ def test_link_merge_all_file_conflict_resolve_in_place(new_lore_repo):
 
     # Capture the pre-merge link pin (main's committed link revision)
     # so we can verify it advances after the merge resolves.
-    pin_before = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_before
+    pin_before = link_pin(urc, link_repo.get_id())
 
     # Default merge no longer fails — it stages the conflict in place.
     # The merge command must succeed (return without exception) even though
@@ -526,39 +477,28 @@ def test_link_merge_all_file_conflict_resolve_in_place(new_lore_repo):
     )
 
     # Link pin advanced to a new revision
-    link_list_after = urc.link_list()
-    pin_after = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", link_list_after, re.DOTALL
-    )
-    assert pin_after, f"Post-merge link pin not found in: {link_list_after}"
-    assert pin_before.group(1) != pin_after.group(1), (
+    pin_after = link_pin(urc, link_repo.get_id())
+    assert pin_before != pin_after, (
         f"Link pin should have advanced after merge.\n"
-        f"Before: {pin_before.group(1)}\nAfter: {pin_after.group(1)}"
+        f"Before: {pin_before}\nAfter: {pin_after}"
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_file_conflict_abort(new_lore_repo):
     """Default merge with a link file conflict can be aborted, restoring everything."""
 
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("shared-link-file.txt", "w+") as f:
-        f.writelines(["base content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "shared-link-file.txt": "base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
     with urc.open_file(f"{link_path}/shared-link-file.txt", "w+") as f:
@@ -575,10 +515,7 @@ def test_link_merge_all_file_conflict_abort(new_lore_repo):
     urc.push()
 
     # Capture pin AFTER main's commit (this is the value abort should restore to)
-    pin_before = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_before
+    pin_before = link_pin(urc, link_repo.get_id())
 
     # Default merge stages the conflict in place
     urc.branch_merge_start("feature-branch", message="Merge with link conflict")
@@ -599,13 +536,10 @@ def test_link_merge_all_file_conflict_abort(new_lore_repo):
     )
 
     # Link pin restored
-    pin_after = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_after
-    assert pin_before.group(1) == pin_after.group(1), (
+    pin_after = link_pin(urc, link_repo.get_id())
+    assert pin_before == pin_after, (
         f"Link pin should match pre-merge value after abort.\n"
-        f"Before: {pin_before.group(1)}\nAfter: {pin_after.group(1)}"
+        f"Before: {pin_before}\nAfter: {pin_after}"
     )
 
     # No staged state left behind
@@ -615,32 +549,33 @@ def test_link_merge_all_file_conflict_abort(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_mixed_clean_and_conflict(new_lore_repo):
     """One link merges cleanly, another has a file conflict.
     The clean link's merge survives while the user resolves the conflict in place."""
 
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # Link A — will merge cleanly (changes on different files per branch)
-    link_a = new_lore_repo()
-    with link_a.open_file("a-base.txt", "w+") as f:
-        f.writelines(["a base\n"])
-    link_a.stage(scan=True)
-    link_a.commit("Initial link A commit")
-    link_a.push()
+    link_a = make_repo(
+        new_lore_repo,
+        {
+            "a-base.txt": "a base\n",
+        },
+    )
 
     # Link B — will conflict (both branches modify the same file)
-    link_b = new_lore_repo()
-    with link_b.open_file("b-shared.txt", "w+") as f:
-        f.writelines(["b base\n"])
-    link_b.stage(scan=True)
-    link_b.commit("Initial link B commit")
-    link_b.push()
+    link_b = make_repo(
+        new_lore_repo,
+        {
+            "b-shared.txt": "b base\n",
+        },
+    )
 
     path_a = "libs/a"
     path_b = "libs/b"
@@ -671,13 +606,8 @@ def test_link_merge_all_mixed_clean_and_conflict(new_lore_repo):
     urc.push()
 
     # Capture pre-merge pins after main's commit
-    pin_a_before = re.search(
-        rf"{link_a.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    pin_b_before = re.search(
-        rf"{link_b.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_a_before and pin_b_before
+    pin_a_before = link_pin(urc, link_a.get_id())
+    pin_b_before = link_pin(urc, link_b.get_id())
 
     # Default merge: link A merges cleanly, link B conflicts.
     # Both link pins should be staged (A advanced to merged revision,
@@ -698,17 +628,12 @@ def test_link_merge_all_mixed_clean_and_conflict(new_lore_repo):
     urc.push()
 
     # Both link pins advanced from pre-merge state
-    pin_a_after = re.search(
-        rf"{link_a.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    pin_b_after = re.search(
-        rf"{link_b.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_a_after and pin_b_after
-    assert pin_a_before.group(1) != pin_a_after.group(1), (
+    pin_a_after = link_pin(urc, link_a.get_id())
+    pin_b_after = link_pin(urc, link_b.get_id())
+    assert pin_a_before != pin_a_after, (
         "Link A pin should have advanced (clean merge preserved)"
     )
-    assert pin_b_before.group(1) != pin_b_after.group(1), (
+    assert pin_b_before != pin_b_after, (
         "Link B pin should have advanced (conflict resolved)"
     )
 
@@ -722,27 +647,20 @@ def test_link_merge_all_mixed_clean_and_conflict(new_lore_repo):
     assert "local branch in sync with remote" in status.lower()
 
 
+@pytest.mark.smoke
 def test_link_merge_all_abort_specific_link(new_lore_repo):
     """Abort --link during a multi-repo merge rolls back only that link."""
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
 
@@ -793,28 +711,29 @@ def test_link_merge_all_abort_specific_link(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_multiple_links(new_lore_repo):
     """Default merge works across main + multiple linked repos."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
-    link_a = new_lore_repo()
-    with link_a.open_file("a-file.txt", "w+") as f:
-        f.writelines(["a base\n"])
-    link_a.stage(scan=True)
-    link_a.commit("Initial link A commit")
-    link_a.push()
+    link_a = make_repo(
+        new_lore_repo,
+        {
+            "a-file.txt": "a base\n",
+        },
+    )
 
-    link_b = new_lore_repo()
-    with link_b.open_file("b-file.txt", "w+") as f:
-        f.writelines(["b base\n"])
-    link_b.stage(scan=True)
-    link_b.commit("Initial link B commit")
-    link_b.push()
+    link_b = make_repo(
+        new_lore_repo,
+        {
+            "b-file.txt": "b base\n",
+        },
+    )
 
     path_a = "libs/a"
     path_b = "libs/b"
@@ -872,28 +791,29 @@ def test_link_merge_all_multiple_links(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_mixed_eligibility(new_lore_repo):
     """Default merge skips DisableAutoFollow links but still merges eligible ones."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
-    link_follow = new_lore_repo()
-    with link_follow.open_file("follow.txt", "w+") as f:
-        f.writelines(["follow base\n"])
-    link_follow.stage(scan=True)
-    link_follow.commit("Initial follow link commit")
-    link_follow.push()
+    link_follow = make_repo(
+        new_lore_repo,
+        {
+            "follow.txt": "follow base\n",
+        },
+    )
 
-    link_fixed = new_lore_repo()
-    with link_fixed.open_file("fixed.txt", "w+") as f:
-        f.writelines(["fixed base\n"])
-    link_fixed.stage(scan=True)
-    link_fixed.commit("Initial fixed link commit")
-    link_fixed.push()
+    link_fixed = make_repo(
+        new_lore_repo,
+        {
+            "fixed.txt": "fixed base\n",
+        },
+    )
 
     path_follow = "libs/follow"
     path_fixed = "libs/fixed"
@@ -904,7 +824,7 @@ def test_link_merge_all_mixed_eligibility(new_lore_repo):
     urc.push()
 
     # Record the fixed link's pin revision — should be unchanged after merge
-    link_list_before = urc.link_list()
+    fixed_before = link_pin(urc, link_fixed.get_id())
 
     # Feature branch: add file in auto-follow link only
     urc.branch_create("feature-branch")
@@ -937,51 +857,37 @@ def test_link_merge_all_mixed_eligibility(new_lore_repo):
         "Fixed link base file should persist"
     )
 
-    # The fixed link's pin revision should be unchanged (captured via link list)
-    link_list_after = urc.link_list()
-    # Extract fixed link's revision from both snapshots and confirm equal
-    # The link list output contains "Revision: <hash>" per link
-
-    def extract_revs(text: str, repo_id: str) -> list[str]:
-        # Find occurrences of the repo_id and capture the following Revision line
-        revs = []
-        for m in re.finditer(rf"{repo_id}.*?Revision:\s*(\w+)", text, re.DOTALL):
-            revs.append(m.group(1))
-        return revs
-
-    fixed_before = extract_revs(link_list_before, link_fixed.get_id())
-    fixed_after = extract_revs(link_list_after, link_fixed.get_id())
-    assert fixed_before and fixed_after, (
-        "Should find fixed link revision in both snapshots"
-    )
-    assert fixed_before[0] == fixed_after[0], (
+    # The fixed link's pin revision should be unchanged
+    fixed_after = link_pin(urc, link_fixed.get_id())
+    assert fixed_before == fixed_after, (
         f"Fixed (DisableAutoFollow) link pin should not change.\n"
-        f"Before: {fixed_before[0]}\nAfter: {fixed_after[0]}"
+        f"Before: {fixed_before}\nAfter: {fixed_after}"
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_preserves_tracked_branches(new_lore_repo):
     """After default merge, each link's tracked branch stays on main (not feature-branch)."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
-    link_a = new_lore_repo()
-    with link_a.open_file("a.txt", "w+") as f:
-        f.writelines(["a base\n"])
-    link_a.stage(scan=True)
-    link_a.commit("Initial link A commit")
-    link_a.push()
+    link_a = make_repo(
+        new_lore_repo,
+        {
+            "a.txt": "a base\n",
+        },
+    )
 
-    link_b = new_lore_repo()
-    with link_b.open_file("b.txt", "w+") as f:
-        f.writelines(["b base\n"])
-    link_b.stage(scan=True)
-    link_b.commit("Initial link B commit")
-    link_b.push()
+    link_b = make_repo(
+        new_lore_repo,
+        {
+            "b.txt": "b base\n",
+        },
+    )
 
     urc.link_add("libs/a", link_a.get_id(), "/")
     urc.link_add("libs/b", link_b.get_id(), "/")
@@ -1012,28 +918,29 @@ def test_link_merge_all_preserves_tracked_branches(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_all_restores_link_pins(new_lore_repo):
     """After branch merge abort, each link's pin/branch matches the pre-merge snapshot."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
-    link_a = new_lore_repo()
-    with link_a.open_file("a.txt", "w+") as f:
-        f.writelines(["a base\n"])
-    link_a.stage(scan=True)
-    link_a.commit("Initial link A commit")
-    link_a.push()
+    link_a = make_repo(
+        new_lore_repo,
+        {
+            "a.txt": "a base\n",
+        },
+    )
 
-    link_b = new_lore_repo()
-    with link_b.open_file("b.txt", "w+") as f:
-        f.writelines(["b base\n"])
-    link_b.stage(scan=True)
-    link_b.commit("Initial link B commit")
-    link_b.push()
+    link_b = make_repo(
+        new_lore_repo,
+        {
+            "b.txt": "b base\n",
+        },
+    )
 
     urc.link_add("libs/a", link_a.get_id(), "/")
     urc.link_add("libs/b", link_b.get_id(), "/")
@@ -1041,7 +948,9 @@ def test_link_merge_abort_all_restores_link_pins(new_lore_repo):
     urc.push()
 
     # Snapshot before any feature branch activity
-    link_list_before = urc.link_list()
+    pins_before = {
+        repo.get_id(): link_pin(urc, repo.get_id()) for repo in (link_a, link_b)
+    }
 
     urc.branch_create("feature-branch")
     with urc.open_file("libs/a/feature-a.txt", "w+") as f:
@@ -1069,24 +978,12 @@ def test_link_merge_abort_all_restores_link_pins(new_lore_repo):
         "Link B feature file should be gone after abort"
     )
 
-    # Link list should match the pre-merge snapshot for both links
-    link_list_after = urc.link_list()
-
-    def extract_revs(text: str, repo_id: str) -> list[str]:
-        revs = []
-        for m in re.finditer(rf"{repo_id}.*?Revision:\s*(\w+)", text, re.DOTALL):
-            revs.append(m.group(1))
-        return revs
-
-    for repo_id in [link_a.get_id(), link_b.get_id()]:
-        before_revs = extract_revs(link_list_before, repo_id)
-        after_revs = extract_revs(link_list_after, repo_id)
-        assert before_revs and after_revs, (
-            f"Should find {repo_id} revision in both snapshots"
-        )
-        assert before_revs[0] == after_revs[0], (
+    # Both pins should match the pre-merge snapshot
+    for repo_id, pin_before in pins_before.items():
+        pin_after = link_pin(urc, repo_id)
+        assert pin_before == pin_after, (
             f"Link {repo_id} pin should be restored after abort.\n"
-            f"Before: {before_revs[0]}\nAfter: {after_revs[0]}"
+            f"Before: {pin_before}\nAfter: {pin_after}"
         )
 
     # No merge should still be in progress
@@ -1096,29 +993,23 @@ def test_link_merge_abort_all_restores_link_pins(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_no_link_changes(new_lore_repo):
     """Default merge succeeds when only the main repo has diverged and linked repo is untouched."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # Capture link pin revision before any divergence — should stay unchanged
-    link_list_before = urc.link_list()
+    before = link_pin(urc, link_repo.get_id())
 
     # Feature branch: modify main repo only, don't touch the link
     urc.branch_create("feature-branch")
@@ -1145,41 +1036,27 @@ def test_link_merge_all_no_link_changes(new_lore_repo):
     assert urc.file_exists("main-only.txt")
 
     # Link pin should not have changed (no divergence → no new linked revision)
-    link_list_after = urc.link_list()
-
-    before = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", link_list_before, re.DOTALL
-    )
-    after = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", link_list_after, re.DOTALL
-    )
-    assert before and after
-    assert before.group(1) == after.group(1), (
+    after = link_pin(urc, link_repo.get_id())
+    assert before == after, (
         f"Link pin should be unchanged when linked repo hasn't diverged.\n"
-        f"Before: {before.group(1)}\nAfter: {after.group(1)}"
+        f"Before: {before}\nAfter: {after}"
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_all_sequential(new_lore_repo):
     """Two sequential default merges from the same feature branch succeed."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # Round 1: feature branch → main, both via default merge
     urc.branch_create("feature-branch")
@@ -1231,26 +1108,20 @@ def test_link_merge_all_sequential(new_lore_repo):
     assert urc.file_exists(f"{link_path}/round2-link.txt")
 
 
+@pytest.mark.smoke
 def test_link_merge_all_push_and_clone(new_lore_repo):
     """After default merge and push, a fresh clone correctly follows link pins."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # Divergent content in the linked repo across branches
     urc.branch_create("feature-branch")
@@ -1280,26 +1151,20 @@ def test_link_merge_all_push_and_clone(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_ignore_links_no_conflicts(new_lore_repo):
     """abort --ignore-links on a clean merge keeps link pin updates as staged changes."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # No conflicts: both branches add independent files in the linked repo
     urc.branch_create("feature-branch")
@@ -1353,29 +1218,23 @@ def test_link_merge_abort_ignore_links_no_conflicts(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_ignore_links_with_link_conflicts(new_lore_repo):
     """A link merge that produced file conflicts, then aborted with --ignore-links,
     must not leave .mine/.theirs/.base sidecars or marker bytes orphaned in the
     link mount. The parent has no merge metadata after the abort+re-pin, so any
     leftover artifacts would be unattributable."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("shared.txt", "w+") as f:
-        f.writelines(["link base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "shared.txt": "link base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # Feature branch: modify the shared file via mount
     urc.branch_create("feature-branch")
@@ -1448,29 +1307,23 @@ def test_link_merge_abort_ignore_links_with_link_conflicts(new_lore_repo):
         )
 
 
+@pytest.mark.smoke
 def test_link_merge_start_ignore_links(new_lore_repo):
     """`merge start --ignore-links` merges only the parent repo. The link pin
     is unchanged and the source-side link files do not appear at the mount.
     """
 
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
     with urc.open_file("feature-only.txt", "w+") as f:
@@ -1488,10 +1341,7 @@ def test_link_merge_start_ignore_links(new_lore_repo):
     urc.commit("Main branch additions")
     urc.push()
 
-    pin_before = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_before
+    pin_before = link_pin(urc, link_repo.get_id())
 
     # Merge with --ignore-links — should merge only the parent
     urc.branch_merge_start(
@@ -1503,13 +1353,10 @@ def test_link_merge_start_ignore_links(new_lore_repo):
     assert urc.file_exists("main-only.txt")
 
     # Link pin should be unchanged — link wasn't touched
-    pin_after = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_after
-    assert pin_before.group(1) == pin_after.group(1), (
+    pin_after = link_pin(urc, link_repo.get_id())
+    assert pin_before == pin_after, (
         f"Link pin should be unchanged with --ignore-links.\n"
-        f"Before: {pin_before.group(1)}\nAfter: {pin_after.group(1)}"
+        f"Before: {pin_before}\nAfter: {pin_after}"
     )
 
     # The link's feature-side content should NOT have been realized at the
@@ -1525,29 +1372,23 @@ def test_link_merge_start_ignore_links(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_start_ignore_links_link_conflict(new_lore_repo):
     """`merge start --ignore-links` succeeds even when the link would have a
     file conflict, because the link is not consulted at all.
     """
 
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("shared.txt", "w+") as f:
-        f.writelines(["base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "shared.txt": "base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
     with urc.open_file(f"{link_path}/shared.txt", "w+") as f:
@@ -1563,10 +1404,7 @@ def test_link_merge_start_ignore_links_link_conflict(new_lore_repo):
     urc.commit("Main branch link change")
     urc.push()
 
-    pin_before = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_before
+    pin_before = link_pin(urc, link_repo.get_id())
 
     # Merge with --ignore-links — the link's would-be conflict is ignored
     # since the link is skipped entirely. The merge succeeds with no
@@ -1584,11 +1422,8 @@ def test_link_merge_start_ignore_links_link_conflict(new_lore_repo):
         f"No conflict markers expected with --ignore-links - Got: {content}"
     )
 
-    pin_after = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert pin_after
-    assert pin_before.group(1) == pin_after.group(1)
+    pin_after = link_pin(urc, link_repo.get_id())
+    assert pin_before == pin_after
 
     urc.push()
     status = urc.status()
@@ -1597,36 +1432,27 @@ def test_link_merge_start_ignore_links_link_conflict(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_into_ignore_links(new_lore_repo):
     """`merge into <branch> <message> --ignore-links` skips link content and
     merges only the parent repo, with the auto-commit semantics of `merge into`.
     """
 
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # Capture main's link pin BEFORE branching — this is what `--ignore-links`
     # `merge into main` should leave unchanged on the main branch.
-    main_pin_before = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert main_pin_before
+    main_pin_before = link_pin(urc, link_repo.get_id())
 
     urc.branch_create("feature-branch")
     with urc.open_file("feature-only.txt", "w+") as f:
@@ -1658,39 +1484,28 @@ def test_link_merge_into_ignore_links(new_lore_repo):
 
     # Link pin on main is unchanged from its pre-branch state — `--ignore-links`
     # didn't merge any link revisions.
-    main_pin_after = re.search(
-        rf"{link_repo.get_id()}.*?Revision:\s*(\w+)", urc.link_list(), re.DOTALL
-    )
-    assert main_pin_after
-    assert main_pin_before.group(1) == main_pin_after.group(1), (
+    main_pin_after = link_pin(urc, link_repo.get_id())
+    assert main_pin_before == main_pin_after, (
         f"Main's link pin should be unchanged after --ignore-links merge_into.\n"
-        f"Before: {main_pin_before.group(1)}\nAfter: {main_pin_after.group(1)}"
+        f"Before: {main_pin_before}\nAfter: {main_pin_after}"
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_start_ignore_links_link_mutex(new_lore_repo):
     """Clap rejects the `--ignore-links --link <path>` combination at the CLI
     layer."""
-    from error_types import LoreException
-
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link\n",
+        },
+        {
+            "main-file.txt": "main\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
     with urc.open_file("f.txt", "w+") as f:
@@ -1701,47 +1516,41 @@ def test_link_merge_start_ignore_links_link_mutex(new_lore_repo):
 
     urc.branch_switch("main")
 
-    # Clap should reject both flags together — verify the command fails
-    # with an error mentioning the conflicting flags.
-    try:
+    # Clap rejects the two flags together before the merge starts.
+    with pytest.raises(ImproperArgumentsError):
         urc.branch_merge_start(
             "feature-branch",
             message="Should fail",
             link=link_path,
             ignore_links=True,
         )
-        assert False, "Expected merge start to reject --ignore-links --link"
-    except LoreException as e:
-        msg = str(e).lower()
-        assert "ignore-links" in msg or "ignore_links" in msg or "conflict" in msg, (
-            f"Error should mention the conflicting flags - Got: {e}"
-        )
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_all_then_resume_multiple_links(new_lore_repo):
     """Default abort with multiple links cleanly rolls everything back, and a
     subsequent re-attempted merge succeeds — exercises the abort-then-resume
     composition with N>1 links."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
-    link_a = new_lore_repo()
-    with link_a.open_file("a-file.txt", "w+") as f:
-        f.writelines(["a base\n"])
-    link_a.stage(scan=True)
-    link_a.commit("Initial link A commit")
-    link_a.push()
+    link_a = make_repo(
+        new_lore_repo,
+        {
+            "a-file.txt": "a base\n",
+        },
+    )
 
-    link_b = new_lore_repo()
-    with link_b.open_file("b-file.txt", "w+") as f:
-        f.writelines(["b base\n"])
-    link_b.stage(scan=True)
-    link_b.commit("Initial link B commit")
-    link_b.push()
+    link_b = make_repo(
+        new_lore_repo,
+        {
+            "b-file.txt": "b base\n",
+        },
+    )
 
     path_a = "libs/a"
     path_b = "libs/b"

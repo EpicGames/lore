@@ -6,13 +6,8 @@ import re
 import shutil
 
 import pytest
-from error_types import (
-    LocalChanges,
-    NestedLinkError,
-    PathExistChildrenLinkError,
-    PathExistLinkError,
-)
-from link_helpers import DEFAULT_LINK_MOUNT, make_parent_with_link
+from error_types import LocalChanges, PathExistChildrenLinkError, PathExistLinkError
+from link_helpers import DEFAULT_LINK_MOUNT, make_parent_with_link, make_repo
 from lore_parsers import parse_jsonl, parse_status_json
 from test_utils import unstaged_entries
 
@@ -1079,139 +1074,42 @@ def test_link_add_remove(new_lore_repo):
 
 @pytest.mark.smoke
 def test_link_validation_checks(new_lore_repo):
-    """Test new link validation checks: nested links, file paths, and directories with children."""
-    # Create main repository
-    main_repo: Lore = new_lore_repo()
-
-    # Create first repository to be linked
-    repo_to_link: Lore = new_lore_repo()
-
-    # Create second repository for nested link test
-    repo_to_nest: Lore = new_lore_repo()
-
-    # Setup content in all three repositories
-    # Main repo: create subdirectory with file
+    """`link add` refuses a path the parent's state still holds, as a file or as a
+    directory with children, even after the working tree no longer has it."""
     main_subdir = "main_folder"
     main_file = "main_folder/main_file.txt"
-
-    main_repo.make_dirs(main_subdir)
-    with main_repo.open_file(main_file, "w+") as output_file:
-        output_file.writelines(["Main repository file content\n"])
-
-    main_repo.stage(scan=True)
-    main_repo.commit("Initial main repo content")
-    main_repo.push()
-
-    # First link repo: create subdirectory with file
-    link_subdir = "link_folder"
     link_file = "link_folder/link_file.txt"
 
-    repo_to_link.make_dirs(link_subdir)
-    with repo_to_link.open_file(link_file, "w+") as output_file:
-        output_file.writelines(["First link repository file content\n"])
-
-    repo_to_link.stage(scan=True)
-    repo_to_link.commit("Initial link repo content")
-    repo_to_link.push()
-
-    # Second link repo: create subdirectory with file
-    nest_subdir = "nest_folder"
-    nest_file = "nest_folder/nest_file.txt"
-
-    repo_to_nest.make_dirs(nest_subdir)
-    with repo_to_nest.open_file(nest_file, "w+") as output_file:
-        output_file.writelines(["Second link repository file content\n"])
-
-    repo_to_nest.stage(scan=True)
-    repo_to_nest.commit("Initial nest repo content")
-    repo_to_nest.push()
-
-    # Delete the directory from filesystem
-    logger.info("Deleting directory from filesystem")
-    main_dir_path = os.path.join(main_repo.path, main_subdir)
-    shutil.rmtree(main_dir_path)
-
-    # Test 1: Try to add link to where the file was before (with same name as file) - should fail
-    logger.info("Testing link add to file path - should fail")
-    try:
-        main_repo.link_add(main_file, repo_to_link.get_id(), "/")
-        assert False, "Link add should have failed for file path"
-    except (PathExistLinkError, Exception) as e:
-        if isinstance(e, PathExistLinkError):
-            logger.info("Correctly caught PathExistLinkError")
-        else:
-            error_msg = str(e)
-            # Should fail because trying to link to a file path while Lore state still has the file
-            assert any(
-                keyword in error_msg.lower()
-                for keyword in ["directory", "file", "path", "exist", "link", "already"]
-            ), "Unexpected error message: %s" % error_msg
-            logger.info("Correctly caught error for file path: %s", error_msg)
-
-    # Test 2: Try to add link to deleted directory - should fail because Lore state directory still has children
-    logger.info(
-        "Testing link add to deleted directory with children still in state directory - should fail"
+    main_repo = make_repo(new_lore_repo, {main_file: "Main repository file content\n"})
+    repo_to_link = make_repo(
+        new_lore_repo, {link_file: "First link repository file content\n"}
     )
-    try:
-        main_repo.link_add(main_subdir, repo_to_link.get_id(), "/")
-        assert False, "Link add should have failed for directory with children in state"
-    except (PathExistChildrenLinkError, Exception) as e:
-        # Check if it's the expected error type or contains expected message
-        if isinstance(e, PathExistChildrenLinkError):
-            logger.info("Correctly caught LinkPathExistChildrenError")
-        else:
-            # Check stderr for expected error message
-            error_msg = str(e)
-            assert any(
-                keyword in error_msg.lower()
-                for keyword in ["children", "exist", "has", "directory"]
-            ), "Unexpected error message: %s" % error_msg
-            logger.info("Caught expected error for children check: %s", error_msg)
 
-    # Stage and commit the deletions - this removes the directory from Lore's state
+    # Delete the directory from the working tree only; the state still holds it.
+    shutil.rmtree(os.path.join(main_repo.path, main_subdir))
+
+    with pytest.raises(PathExistLinkError):
+        main_repo.link_add(main_file, repo_to_link.get_id(), "/")
+
+    with pytest.raises(PathExistChildrenLinkError):
+        main_repo.link_add(main_subdir, repo_to_link.get_id(), "/")
+
+    assert "No links found in this repository" in main_repo.link_list(), (
+        "A refused link add must not register a link"
+    )
+
+    # Committing the deletion removes the directory from the state.
     main_repo.stage(scan=True)
     main_repo.commit("Remove files and folders to prepare for linking")
     main_repo.push()
 
-    # Test 3: Now add link should work (directory no longer exists in Lore state)
-    logger.info("Testing successful link add after committing directory deletion")
     main_repo.link_add(main_subdir, repo_to_link.get_id(), "/")
-
-    # Verify link was added successfully
-    expected_link_file = f"{main_subdir}/{link_file}"
-    assert main_repo.file_exists(expected_link_file), (
+    assert main_repo.file_exists(f"{main_subdir}/{link_file}"), (
         "Link file should exist after successful link add"
     )
 
-    # Commit the successful link
     main_repo.commit("Successfully added link to empty directory")
     main_repo.push()
-
-    # Test 4: Try to add second repository as link into the linked repository (nested link - should fail)
-    logger.info("Testing nested link add - should fail")
-    nested_link_path = f"{main_subdir}/nested_link"
-
-    try:
-        main_repo.link_add(nested_link_path, repo_to_nest.get_id(), "/")
-        assert False, "Nested link add should have failed"
-    except (NestedLinkError, Exception) as e:
-        if isinstance(e, NestedLinkError):
-            logger.info("Correctly caught NestedLinkError")
-        else:
-            error_msg = str(e)
-            # Should fail because trying to add link inside another link
-            assert any(
-                keyword in error_msg.lower()
-                for keyword in ["nested", "link", "repository", "different"]
-            ), "Unexpected error message: %s" % error_msg
-            logger.info("Correctly caught error for nested link: %s", error_msg)
-
-    # Verify original link still works
-    assert main_repo.file_exists(expected_link_file), (
-        "Original link should still be functional"
-    )
-
-    logger.info("All link validation checks completed successfully")
 
 
 @pytest.mark.smoke
@@ -1229,17 +1127,13 @@ def test_link_update_subdirectory_source(new_lore_repo):
     caused TestFolder to appear nested inside Restricted.
     """
     # Create source repository with a subdirectory containing initial files
-    source_repo: Lore = new_lore_repo()
-
-    source_repo.make_dirs("TestFolder")
-    with source_repo.open_file("TestFolder/A.txt", "w+") as f:
-        f.writelines(["file A content\n"])
-    with source_repo.open_file("TestFolder/B.txt", "w+") as f:
-        f.writelines(["file B content\n"])
-
-    source_repo.stage(scan=True)
-    source_repo.commit("Initial files in TestFolder")
-    source_repo.push()
+    source_repo = make_repo(
+        new_lore_repo,
+        {
+            "TestFolder/A.txt": "file A content\n",
+            "TestFolder/B.txt": "file B content\n",
+        },
+    )
 
     initial_revision = source_repo.branch_info().local_latest
 

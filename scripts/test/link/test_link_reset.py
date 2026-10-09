@@ -4,7 +4,8 @@ import json
 import os
 
 import pytest
-from link_helpers import assert_crr_clean, commit_initial_main, make_link_source
+from error_types import LoreException
+from link_helpers import assert_crr_clean, make_parent_with_link, make_repo
 from lore_parsers import parse_status_json
 
 from lore import Lore
@@ -194,21 +195,7 @@ def test_link_reset(new_lore_repo):
         "Untracked file should be deleted after purge reset"
     )
 
-    # Test 7: Reset a staged file in a link returns error
-    with repo.open_file(expected_file1, "w+") as output_file:
-        output_file.writelines(["MODIFIED file 1 for staged test\n"])
-
-    repo.stage(expected_file1)
-
-    try:
-        repo.reset(expected_file1)
-        assert False, "Reset of staged file should have failed"
-    except Exception:
-        pass
-
-    repo.unstage(expected_file1)
-
-    # Test 8: Reset with multiple links
+    # Test 7: Reset with multiple links
     second_link_repo = new_lore_repo()
 
     second_link_file = "second-file.txt"
@@ -245,6 +232,37 @@ def test_link_reset(new_lore_repo):
     with repo.open_file(expected_second_file, "r") as f:
         assert "second link file original" in f.read(), (
             "Second link file should be restored after multi-link root reset"
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.xfail(
+    strict=True,
+    reason="reset of a staged file inside a link discards the staged edit instead "
+    "of refusing, as the same reset does outside a link",
+)
+def test_link_reset_refuses_a_staged_file_inside_a_link(new_lore_repo):
+    """`reset` refuses a file whose change is staged, inside a link as outside.
+
+    Outside a link the reset fails with `Failed to reset staged node` and leaves
+    the edit alone. Inside a link it currently restores the committed content and
+    reports success, which loses the staged edit.
+    """
+    link_path = "linked"
+    staged_file = f"{link_path}/file1.txt"
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"file1.txt": "link file 1 original\n"}
+    )
+
+    repo.write_files({staged_file: "MODIFIED file 1 for staged test\n"})
+    repo.stage(staged_file)
+
+    with pytest.raises(LoreException):
+        repo.reset(staged_file)
+
+    with repo.open_file(staged_file) as f:
+        assert f.read() == "MODIFIED file 1 for staged test\n", (
+            "A refused reset must leave the staged edit on disk"
         )
 
 
@@ -314,9 +332,11 @@ def test_link_reset_honours_a_directory_rule_naming_the_mount(new_lore_repo):
 def test_link_reset_staged_add(new_lore_repo):
     """`lore file reset` undoes a staged-add link: registry, on-disk content,
     and parent state are restored to pre-add."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo, source_files = make_link_source(
-        new_lore_repo, ["a.txt", "nested/b.txt"]
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_files = ["a.txt", "nested/b.txt"]
+    source_repo = make_repo(
+        new_lore_repo,
+        {path: f"link source content for {path}\n" for path in source_files},
     )
 
     link_path = "linked"
@@ -337,10 +357,11 @@ def test_link_reset_staged_add(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_reset_staged_add_reports_reset(new_lore_repo):
     """Resetting a staged-add link counts the node it reset in the summary."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo, _ = make_link_source(new_lore_repo, ["a.txt"])
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"a.txt": "link source content\n"})
 
     link_path = "linked"
     main_repo.link_add(link_path, source_repo.get_id(), "/")
@@ -359,11 +380,12 @@ def test_link_reset_staged_add_reports_reset(new_lore_repo):
     assert total >= 1, f"Reset of a staged link must count the reset, got: {count}"
 
 
+@pytest.mark.smoke
 def test_link_reset_staged_add_into_existing_directory(new_lore_repo):
     """If the link path was a committed directory before `link add`, reset
     restores the empty directory rather than removing it."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo, _ = make_link_source(new_lore_repo, ["a.txt"])
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"a.txt": "link source content\n"})
 
     # Commit an empty directory at the link path so it predates the link add.
     link_path = "linked"
@@ -388,11 +410,12 @@ def test_link_reset_staged_add_into_existing_directory(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_reset_staged_add_creates_parent_directories(new_lore_repo):
     """If `link add` had to auto-stage parent directories, reset removes
     both the link and the auto-staged parents."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo, _ = make_link_source(new_lore_repo, ["a.txt"])
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"a.txt": "link source content\n"})
 
     link_path = "deep/parent/chain/linked"
     main_repo.link_add(link_path, source_repo.get_id(), "/")
@@ -419,9 +442,11 @@ def test_link_reset_staged_add_creates_parent_directories(new_lore_repo):
 def test_link_reset_staged_remove(new_lore_repo):
     """`lore file reset` of a staged-remove link restores the registry, the
     link node, and re-materializes content on disk."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo, source_files = make_link_source(
-        new_lore_repo, ["a.txt", "nested/b.txt"]
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_files = ["a.txt", "nested/b.txt"]
+    source_repo = make_repo(
+        new_lore_repo,
+        {path: f"link source content for {path}\n" for path in source_files},
     )
 
     link_path = "linked"
@@ -456,14 +481,14 @@ def test_link_reset_staged_remove(new_lore_repo):
 def test_link_reset_staged_update(new_lore_repo):
     """`lore file reset` of a staged pin change restores the previous pin in
     the registry and re-realizes content from the previous pin."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
 
-    source_repo: Lore = new_lore_repo()
-    with source_repo.open_file("v1.txt", "w+") as f:
-        f.writelines(["v1\n"])
-    source_repo.stage(scan=True)
-    source_repo.commit("v1")
-    source_repo.push()
+    source_repo = make_repo(
+        new_lore_repo,
+        {
+            "v1.txt": "v1\n",
+        },
+    )
 
     source_repo.branch_create("feature")
     with source_repo.open_file("v2.txt", "w+") as f:
@@ -499,12 +524,13 @@ def test_link_reset_staged_update(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_reset_root_handles_staged_link_changes(new_lore_repo):
     """Root reset (`reset(".")`) traverses into the link node and reverts
     a staged add/remove/update there."""
     # --- staged-add ---
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo, _ = make_link_source(new_lore_repo, ["a.txt"])
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"a.txt": "link source content\n"})
     link_path = "linked"
     main_repo.link_add(link_path, source_repo.get_id(), "/")
     main_repo.reset(".")
@@ -550,12 +576,13 @@ def test_link_reset_root_handles_staged_link_changes(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_reset_does_not_affect_unrelated_links(new_lore_repo):
     """Reset of one staged link change must not touch unrelated committed
     links."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo_a, _ = make_link_source(new_lore_repo, ["a.txt"])
-    source_repo_b, _ = make_link_source(new_lore_repo, ["b.txt"])
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_repo_a = make_repo(new_lore_repo, {"a.txt": "link source content\n"})
+    source_repo_b = make_repo(new_lore_repo, {"b.txt": "link source content\n"})
 
     link_a = "linkA"
     link_b = "linkB"
@@ -586,11 +613,12 @@ def test_link_reset_does_not_affect_unrelated_links(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_reset_idempotent(new_lore_repo):
     """Running reset twice on the same staged-add link change is a no-op
     on the second call."""
-    main_repo = commit_initial_main(new_lore_repo, "main.txt")
-    source_repo, _ = make_link_source(new_lore_repo, ["a.txt"])
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"a.txt": "link source content\n"})
 
     link_path = "linked"
     main_repo.link_add(link_path, source_repo.get_id(), "/")

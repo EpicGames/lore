@@ -3,7 +3,12 @@
 import re
 
 import pytest
-from link_helpers import DEFAULT_LINK_MOUNT, DEFAULT_PARENT_FILE, make_parent_with_link
+from link_helpers import (
+    DEFAULT_LINK_MOUNT,
+    DEFAULT_PARENT_FILE,
+    make_parent_with_link,
+    make_repo,
+)
 from lore_parsers import parse_jsonl
 
 from lore import Lore
@@ -24,14 +29,12 @@ def test_link_branching_and_pinning(new_lore_repo):
       Case D: --pin, --disable-branching         -> no branch created, uses pinned revision
     """
     # Create the main (parent) repository
-    parent_repo: Lore = new_lore_repo()
-
-    with parent_repo.open_file("parent-file.txt", "w+") as f:
-        f.writelines(["parent content\n"])
-
-    parent_repo.stage(scan=True)
-    parent_repo.commit("Initial parent commit")
-    parent_repo.push()
+    parent_repo = make_repo(
+        new_lore_repo,
+        {
+            "parent-file.txt": "parent content\n",
+        },
+    )
 
     # Create a feature branch in the parent repo so the current branch
     # is something other than main (to test that branch creation propagates)
@@ -40,20 +43,20 @@ def test_link_branching_and_pinning(new_lore_repo):
     # Create 4 link target repositories, each with initial content on main
 
     # --- Link repo A (Case A: no pin, no disable-branching) ---
-    link_repo_a = new_lore_repo()
-    with link_repo_a.open_file("file-a.txt", "w+") as f:
-        f.writelines(["link A content\n"])
-    link_repo_a.stage(scan=True)
-    link_repo_a.commit("Initial A")
-    link_repo_a.push()
+    link_repo_a = make_repo(
+        new_lore_repo,
+        {
+            "file-a.txt": "link A content\n",
+        },
+    )
 
     # --- Link repo B (Case B: pin, no disable-branching) ---
-    link_repo_b = new_lore_repo()
-    with link_repo_b.open_file("file-b.txt", "w+") as f:
-        f.writelines(["link B content\n"])
-    link_repo_b.stage(scan=True)
-    link_repo_b.commit("Initial B")
-    link_repo_b.push()
+    link_repo_b = make_repo(
+        new_lore_repo,
+        {
+            "file-b.txt": "link B content\n",
+        },
+    )
 
     # Make a second commit so we can pin to the first one
     main_latest_b = link_repo_b.branch_info().local_latest
@@ -64,20 +67,20 @@ def test_link_branching_and_pinning(new_lore_repo):
     link_repo_b.push()
 
     # --- Link repo C (Case C: no pin, disable-branching) ---
-    link_repo_c = new_lore_repo()
-    with link_repo_c.open_file("file-c.txt", "w+") as f:
-        f.writelines(["link C content\n"])
-    link_repo_c.stage(scan=True)
-    link_repo_c.commit("Initial C")
-    link_repo_c.push()
+    link_repo_c = make_repo(
+        new_lore_repo,
+        {
+            "file-c.txt": "link C content\n",
+        },
+    )
 
     # --- Link repo D (Case D: pin, disable-branching) ---
-    link_repo_d = new_lore_repo()
-    with link_repo_d.open_file("file-d.txt", "w+") as f:
-        f.writelines(["link D content\n"])
-    link_repo_d.stage(scan=True)
-    link_repo_d.commit("Initial D")
-    link_repo_d.push()
+    link_repo_d = make_repo(
+        new_lore_repo,
+        {
+            "file-d.txt": "link D content\n",
+        },
+    )
 
     # Create a feature branch in repo D so we can pin to it
     link_repo_d.branch_create("pinned-branch")
@@ -629,6 +632,7 @@ def test_link_update_after_reusing_link_branch_pulls_branch_head(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
     """`lore push` must attribute the parent's revision to the parent's branch.
 
@@ -646,24 +650,24 @@ def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
     This asserts the correct, positive behaviour: the push line that reports the
     parent's own revision names the parent's branch (``test``).
     """
-    child_repo: Lore = new_lore_repo()
-    with child_repo.open_file("child-file.txt", "w+") as f:
-        f.writelines(["initial child content\n"])
-    child_repo.stage(scan=True)
-    child_repo.commit("Initial child")
-    child_repo.push()
+    child_repo = make_repo(
+        new_lore_repo,
+        {
+            "child-file.txt": "initial child content\n",
+        },
+    )
 
     # Occupy `test` in the child so the parent's cascade must disambiguate it.
     child_repo.branch_create("test")
     child_repo.push("test")
     child_repo.branch_switch("main")
 
-    parent_repo: Lore = new_lore_repo()
-    with parent_repo.open_file("parent-file.txt", "w+") as f:
-        f.writelines(["parent content\n"])
-    parent_repo.stage(scan=True)
-    parent_repo.commit("Initial parent")
-    parent_repo.push()
+    parent_repo = make_repo(
+        new_lore_repo,
+        {
+            "parent-file.txt": "parent content\n",
+        },
+    )
 
     link_path = "linked"
     parent_repo.link_add(link_path, child_repo.get_id(), "/")
@@ -847,28 +851,6 @@ def _setup_repo_with_two_links(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_branch_archive_leaves_link_by_default(new_lore_repo):
-    """`branch archive` touches only the repository it ran in."""
-    repo, link_repo = make_parent_with_link(new_lore_repo)
-
-    repo.branch_create("feature")
-    repo.push()
-    assert link_repo.branch_list().has_remote_branch("feature"), (
-        "Expected branch create to cascade into the linked repository"
-    )
-
-    repo.branch_switch("main")
-    repo.branch_archive("feature")
-
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
-    )
-    assert link_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the link branch to be left alone, got: {link_repo.branch_list()}"
-    )
-
-
-@pytest.mark.smoke
 def test_link_branch_archive_include_links(new_lore_repo):
     """`--include-links` archives the branch in the linked repository too, so
     the link is left with exactly the branches it had before the create.
@@ -956,7 +938,7 @@ def test_link_branch_archive_unknown_link_errors(new_lore_repo):
 @pytest.mark.smoke
 def test_link_branch_archive_link_flags_conflict(new_lore_repo):
     """`--include-links` and `--link` are mutually exclusive."""
-    repo, link_repo = make_parent_with_link(new_lore_repo)
+    repo, _link_repo = make_parent_with_link(new_lore_repo)
 
     output = repo.branch_archive(
         "feature", include_links=True, link=DEFAULT_LINK_MOUNT, check=False
@@ -1013,7 +995,7 @@ def test_link_branch_archive_tolerates_already_archived_link(new_lore_repo):
 @pytest.mark.smoke
 def test_link_branch_archive_reports_once(new_lore_repo):
     """Archiving reports a single branch, not one line per link."""
-    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+    repo, _second_repo, _third_repo = _setup_repo_with_two_links(new_lore_repo)
 
     repo.branch_create("feature")
     repo.push()

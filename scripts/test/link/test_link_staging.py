@@ -4,7 +4,7 @@ import os
 import re
 
 import pytest
-from link_helpers import DEFAULT_PARENT_FILE, make_parent_with_link
+from link_helpers import DEFAULT_PARENT_FILE, make_parent_with_link, make_repo
 from lore_parsers import parse_status_json
 from test_utils import unstaged_entries, working_tree_files
 
@@ -403,15 +403,12 @@ def test_link_staging(new_lore_repo):
 @pytest.mark.smoke
 def test_link_unstage(new_lore_repo):
     """Test selective unstaging of individual files within linked repositories."""
-    repo: Lore = new_lore_repo()
-
-    # Create source repository
-    with repo.open_file("source-file.txt", "w+") as output_file:
-        output_file.writelines(["source repository content\n"])
-
-    repo.stage(scan=True)
-    repo.commit()
-    repo.push()
+    repo = make_repo(
+        new_lore_repo,
+        {
+            "source-file.txt": "source repository content\n",
+        },
+    )
 
     # Create link repository with multiple files
     link_repo = new_lore_repo()
@@ -604,16 +601,13 @@ def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
     repo.commit()
     repo.push()
 
-    link_repo = new_lore_repo()
-    link_repo.make_dirs("sub/nested")
-    with link_repo.open_file("sub/inside.txt", "w+") as output_file:
-        output_file.writelines(["inside original\n"])
-    with link_repo.open_file("sub/nested/deep.txt", "w+") as output_file:
-        output_file.writelines(["deep original\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit()
-    link_repo.push()
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "sub/inside.txt": "inside original\n",
+            "sub/nested/deep.txt": "deep original\n",
+        },
+    )
 
     link_path = "linked"
     repo.link_add(link_path, link_repo.get_id(), "/sub")

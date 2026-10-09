@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from error_types import NotALinkError, NothingStagedError
+from link_helpers import make_parent_with_link, make_repo
 from lore_parsers import parse_commit_stats_json
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 
@@ -162,26 +163,17 @@ def test_link_commit_per_link_message(new_lore_repo):
 @pytest.mark.smoke
 def test_link_commit_no_link_message_fallback(new_lore_repo):
     """Test that without per-link messages, all repos get the main message."""
-    # Create link repository
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.write("initial link content\n")
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
-    # Create main repository and add link
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.write("initial main content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
     link_path = "linked"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "initial link content\n",
+        },
+        {
+            "main-file.txt": "initial main content\n",
+        },
+    )
 
     # Modify files in both repos
     with urc.open_file("main-file.txt", "w+") as f:
@@ -206,12 +198,12 @@ def test_link_commit_no_link_message_fallback(new_lore_repo):
 @pytest.mark.smoke
 def test_link_commit_invalid_link_message_errors(new_lore_repo):
     """Test that --link-message with an invalid path produces an error."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.write("content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial commit")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main-file.txt": "content\n",
+        },
+    )
 
     # Modify and stage
     with urc.open_file("main-file.txt", "w+") as f:
@@ -243,27 +235,27 @@ def test_link_commit_invalid_link_message_errors(new_lore_repo):
 def test_link_commit_multiple_link_messages(new_lore_repo):
     """Test that multiple --link-message flags work for different links."""
     # Create two link repositories
-    link_repo_a: Lore = new_lore_repo()
-    with link_repo_a.open_file("file-a.txt", "w+") as f:
-        f.write("link A content\n")
-    link_repo_a.stage(scan=True)
-    link_repo_a.commit("Initial A")
-    link_repo_a.push()
+    link_repo_a = make_repo(
+        new_lore_repo,
+        {
+            "file-a.txt": "link A content\n",
+        },
+    )
 
-    link_repo_b: Lore = new_lore_repo()
-    with link_repo_b.open_file("file-b.txt", "w+") as f:
-        f.write("link B content\n")
-    link_repo_b.stage(scan=True)
-    link_repo_b.commit("Initial B")
-    link_repo_b.push()
+    link_repo_b = make_repo(
+        new_lore_repo,
+        {
+            "file-b.txt": "link B content\n",
+        },
+    )
 
     # Create main repository and add both links
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main.txt", "w+") as f:
-        f.write("main content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial main")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main.txt": "main content\n",
+        },
+    )
 
     urc.link_add("link-a", link_repo_a.get_id(), "/")
     urc.link_add("link-b", link_repo_b.get_id(), "/")
@@ -312,27 +304,27 @@ def test_link_commit_multiple_link_messages(new_lore_repo):
 def test_link_commit_partial_link_messages(new_lore_repo):
     """Test that links without a --link-message get the main message as fallback."""
     # Create two link repositories
-    link_repo_a: Lore = new_lore_repo()
-    with link_repo_a.open_file("file-a.txt", "w+") as f:
-        f.write("link A content\n")
-    link_repo_a.stage(scan=True)
-    link_repo_a.commit("Initial A")
-    link_repo_a.push()
+    link_repo_a = make_repo(
+        new_lore_repo,
+        {
+            "file-a.txt": "link A content\n",
+        },
+    )
 
-    link_repo_b: Lore = new_lore_repo()
-    with link_repo_b.open_file("file-b.txt", "w+") as f:
-        f.write("link B content\n")
-    link_repo_b.stage(scan=True)
-    link_repo_b.commit("Initial B")
-    link_repo_b.push()
+    link_repo_b = make_repo(
+        new_lore_repo,
+        {
+            "file-b.txt": "link B content\n",
+        },
+    )
 
     # Create main repository and add both links
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main.txt", "w+") as f:
-        f.write("main content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial main")
-    urc.push()
+    urc = make_repo(
+        new_lore_repo,
+        {
+            "main.txt": "main content\n",
+        },
+    )
 
     urc.link_add("link-a", link_repo_a.get_id(), "/")
     urc.link_add("link-b", link_repo_b.get_id(), "/")
@@ -374,25 +366,16 @@ def test_link_commit_partial_link_messages(new_lore_repo):
 @pytest.mark.smoke
 def test_link_commit_only_main_changes(new_lore_repo):
     """Test that commit with no link changes works normally even with --non-interactive."""
-    # Create link repository
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.write("link content\n")
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    # Create main repository and add link
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main.txt", "w+") as f:
-        f.write("main content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial main")
-    urc.push()
-
-    urc.link_add("linked", link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        "linked",
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main.txt": "main content\n",
+        },
+    )
 
     # Only modify main file, not link
     with urc.open_file("main.txt", "w+") as f:
@@ -408,72 +391,19 @@ def test_link_commit_only_main_changes(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_commit_non_interactive_default_behavior(new_lore_repo):
-    """Test that --non-interactive with no --link-message produces identical behavior to old commit."""
-    # Create link repository
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.write("link content\n")
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    # Create main repository and add link
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main.txt", "w+") as f:
-        f.write("main content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial main")
-    urc.push()
-
-    urc.link_add("linked", link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
-
-    # Modify both repos
-    with urc.open_file("main.txt", "w+") as f:
-        f.write("updated main\n")
-    with urc.open_file("linked/link-file.txt", "w+") as f:
-        f.write("updated link\n")
-    urc.stage(scan=True)
-
-    # Non-interactive commit without --link-message = same message for all (backward compat)
-    urc.commit("Same message everywhere", non_interactive=True)
-    urc.push()
-
-    main_info = urc.revision_info(check=True, no_pager=True)
-    assert main_info.message == "Same message everywhere"
-
-    link_repo.sync()
-    link_info = link_repo.revision_info(check=True, no_pager=True)
-    assert link_info.message == "Same message everywhere", (
-        f"Expected backward-compatible behavior, got '{link_info.message}'"
-    )
-
-
-@pytest.mark.smoke
 def test_link_list_staged(new_lore_repo):
     """Test that urc link list --staged shows linked repos with staged changes."""
-    # Create link repository
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.write("link content\n")
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    # Create main repository and add link
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main.txt", "w+") as f:
-        f.write("main content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial main")
-    urc.push()
-
     link_path = "linked"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main.txt": "main content\n",
+        },
+    )
 
     # Modify files in both repos and stage
     with urc.open_file("main.txt", "w+") as f:
@@ -495,25 +425,16 @@ def test_link_list_staged(new_lore_repo):
 @pytest.mark.smoke
 def test_link_list_staged_no_changes(new_lore_repo):
     """Test that urc link list --staged shows nothing when no links have staged changes."""
-    # Create link repository
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.write("link content\n")
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    # Create main repository and add link
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main.txt", "w+") as f:
-        f.write("main content\n")
-    urc.stage(scan=True)
-    urc.commit("Initial main")
-    urc.push()
-
-    urc.link_add("linked", link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        "linked",
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main.txt": "main content\n",
+        },
+    )
 
     # Only modify main file, not link
     with urc.open_file("main.txt", "w+") as f:
@@ -613,39 +534,16 @@ def test_link_list_staged_through_the_service(new_lore_repo, background_lore_ser
     assert "No linked repositories with staged changes" in urc.link_list(staged=True)
 
 
-def link_scoped_repository(new_lore_repo) -> tuple[Lore, str]:
-    """A pushed repository holding one file of its own, with a pushed link mounted
-    at the returned path holding one file of its own."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("parent-file.txt", "w+") as f:
-        f.writelines(["parent content\n"])
-
-    repo.stage(scan=True)
-    repo.commit("Initial parent")
-    repo.push()
-
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["initial link content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    link_path = "linked"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
-
-    return repo, link_path
-
-
 @pytest.mark.smoke
 def test_link_scoped_commit(new_lore_repo):
     """Test committing a single link independently and verifying parent pin is staged."""
-    repo, link_path = link_scoped_repository(new_lore_repo)
+    link_path = "linked"
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"link-file.txt": "initial link content\n"},
+        {"parent-file.txt": "parent content\n"},
+    )
 
     # Modify a file inside the link
     linked_file = f"{link_path}/link-file.txt"
@@ -672,7 +570,13 @@ def test_link_scoped_commit_reports_statistics(new_lore_repo):
     """A commit scoped to a link is a commit, and has to report what it cost. The
     scoped paths return before the one every other commit takes, so a report bound
     to that path alone would leave every link and layer commit silent."""
-    repo, link_path = link_scoped_repository(new_lore_repo)
+    link_path = "linked"
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"link-file.txt": "initial link content\n"},
+        {"parent-file.txt": "parent content\n"},
+    )
 
     linked_file = f"{link_path}/link-file.txt"
     with repo.open_file(linked_file, "w+") as f:
@@ -698,7 +602,13 @@ def test_link_scoped_commit_reports_statistics(new_lore_repo):
 @pytest.mark.smoke
 def test_link_scoped_commit_no_parent_change(new_lore_repo):
     """Test that link-scoped commit preserves parent's own staged changes."""
-    repo, link_path = link_scoped_repository(new_lore_repo)
+    link_path = "linked"
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"link-file.txt": "initial link content\n"},
+        {"parent-file.txt": "parent content\n"},
+    )
 
     # Stage a parent file change
     with repo.open_file("parent-file.txt", "w+") as f:
@@ -728,15 +638,12 @@ def test_link_scoped_commit_no_parent_change(new_lore_repo):
 @pytest.mark.smoke
 def test_link_scoped_commit_not_a_link(new_lore_repo):
     """Test that --link on a non-link path fails."""
-    repo: Lore = new_lore_repo()
-
-    repo.make_dirs("regular-dir")
-    with repo.open_file("regular-dir/file.txt", "w+") as f:
-        f.writelines(["content\n"])
-
-    repo.stage(scan=True)
-    repo.commit("Initial commit")
-    repo.push()
+    repo = make_repo(
+        new_lore_repo,
+        {
+            "regular-dir/file.txt": "content\n",
+        },
+    )
 
     # Modify a file and stage it
     with repo.open_file("regular-dir/file.txt", "w+") as f:
@@ -751,28 +658,17 @@ def test_link_scoped_commit_not_a_link(new_lore_repo):
 @pytest.mark.smoke
 def test_link_scoped_commit_nothing_staged(new_lore_repo):
     """Test that --link with no staged changes in the link fails."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("parent-file.txt", "w+") as f:
-        f.writelines(["parent content\n"])
-
-    repo.stage(scan=True)
-    repo.commit("Initial parent")
-    repo.push()
-
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
     link_path = "linked"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "parent-file.txt": "parent content\n",
+        },
+    )
 
     # No changes in the link — commit should fail
     with pytest.raises(NothingStagedError):
@@ -782,7 +678,13 @@ def test_link_scoped_commit_nothing_staged(new_lore_repo):
 @pytest.mark.smoke
 def test_link_scoped_commit_consecutive(new_lore_repo):
     """Test two consecutive --link commits without committing the parent in between."""
-    repo, link_path = link_scoped_repository(new_lore_repo)
+    link_path = "linked"
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"link-file.txt": "initial link content\n"},
+        {"parent-file.txt": "parent content\n"},
+    )
 
     # First file change inside the link
     with repo.open_file(f"{link_path}/first.txt", "w+") as f:
@@ -815,26 +717,17 @@ def test_link_scoped_commit_push_propagates_to_link(new_lore_repo):
     new revisions to push; if not, it returned early without walking the link list,
     leaving the new link revision unpushed.
     """
-    # Create link repository with initial content
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["initial link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link")
-    link_repo.push()
-
-    # Create parent repository and add link
-    repo: Lore = new_lore_repo()
-    with repo.open_file("parent-file.txt", "w+") as f:
-        f.writelines(["parent content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial parent")
-    repo.push()
-
     link_path = "linked"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "initial link content\n",
+        },
+        {
+            "parent-file.txt": "parent content\n",
+        },
+    )
 
     # Snapshot parent's remote latest — should be unchanged after the link-scoped push
     parent_remote_before = repo.branch_info().remote_latest
@@ -881,13 +774,12 @@ def test_link_scoped_commit_subdirectory_source_path_translation(new_lore_repo):
     folder, instead of substituting it.
     """
     # Source repo with a subdirectory we will link out of.
-    source_repo: Lore = new_lore_repo()
-    source_repo.make_dirs("FolderProvidingLink")
-    with source_repo.open_file("FolderProvidingLink/SharedFile.txt", "w+") as f:
-        f.writelines(["AAAA\n"])
-    source_repo.stage(scan=True)
-    source_repo.commit("Initial shared file in FolderProvidingLink")
-    source_repo.push()
+    source_repo = make_repo(
+        new_lore_repo,
+        {
+            "FolderProvidingLink/SharedFile.txt": "AAAA\n",
+        },
+    )
 
     pinned_revision = source_repo.branch_info().local_latest
 

@@ -3,7 +3,7 @@
 import os
 
 import pytest
-from link_helpers import commit_initial_main, parse_revision_diff
+from link_helpers import make_repo, parse_revision_diff
 from lore_parsers import parse_status_json
 from thin_client import (
     ACTION_ADD,
@@ -15,31 +15,6 @@ from thin_client import (
 )
 
 from lore import Lore
-
-
-def _make_link_target_repo(new_lore_repo, file_name: str, content: str):
-    """Build a small repo to be used as a link target, with one file at root.
-
-    Returns (repo, pinned_revision_of_main).
-    """
-    target_repo: Lore = new_lore_repo()
-    with target_repo.open_file(file_name, "w+") as f:
-        f.writelines([content])
-    target_repo.stage(scan=True)
-    target_repo.commit("Initial linked content")
-    target_repo.push()
-    return target_repo, target_repo.branch_info().local_latest
-
-
-def _make_parent_repo_with_baseline(new_lore_repo):
-    """Build a parent repo with one baseline commit. Returns (repo, baseline_revision)."""
-    parent_repo: Lore = new_lore_repo()
-    with parent_repo.open_file("README.txt", "w+") as f:
-        f.writelines(["baseline\n"])
-    parent_repo.stage(scan=True)
-    parent_repo.commit("Baseline commit")
-    parent_repo.push()
-    return parent_repo, parent_repo.branch_info().local_latest
 
 
 @pytest.mark.smoke
@@ -66,10 +41,10 @@ def test_link_add_diff_reports_link_only(new_lore_repo):
     `file diff` does emit hunks when the linked repository's content
     actually changes.
     """
-    link_repo, pinned_revision = _make_link_target_repo(
-        new_lore_repo, "shared.txt", "main content\n"
-    )
-    parent_repo, baseline_revision = _make_parent_repo_with_baseline(new_lore_repo)
+    link_repo = make_repo(new_lore_repo, {"shared.txt": "main content\n"})
+    pinned_revision = link_repo.branch_info().local_latest
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
+    baseline_revision = parent_repo.branch_info().local_latest
 
     link_path = "libs/shared"
     linked_file = f"{link_path}/shared.txt"
@@ -145,16 +120,13 @@ def test_link_update_diff_reports_link_only(new_lore_repo):
     """
     # Link target with a stable mounted/ subtree and an evolving outside/
     # file. The parent will mount only mounted/.
-    link_repo: Lore = new_lore_repo()
-    link_repo.make_dirs("mounted")
-    with link_repo.open_file("mounted/stable.txt", "w+") as f:
-        f.writelines(["stable mounted content\n"])
-    link_repo.make_dirs("outside")
-    with link_repo.open_file("outside/v1.txt", "w+") as f:
-        f.writelines(["outside v1\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("v1 with mounted/ + outside/")
-    link_repo.push()
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "mounted/stable.txt": "stable mounted content\n",
+            "outside/v1.txt": "outside v1\n",
+        },
+    )
     pin_v1 = link_repo.branch_info().local_latest
 
     # Modify only outside/, leaving the mounted/ subtree untouched, so
@@ -168,7 +140,7 @@ def test_link_update_diff_reports_link_only(new_lore_repo):
 
     # Parent: baseline -> add link pinned to v1 mounting only mounted/ ->
     # re-pin to v2 (mounted/ subtree unchanged).
-    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
     link_path = "libs/shared"
     linked_file = f"{link_path}/stable.txt"
 
@@ -242,10 +214,9 @@ def test_link_remove_diff_reports_link_only(new_lore_repo):
     `file diff` does emit hunks when the linked repository's content
     actually changes.
     """
-    link_repo, pinned_revision = _make_link_target_repo(
-        new_lore_repo, "shared.txt", "main content\n"
-    )
-    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_repo = make_repo(new_lore_repo, {"shared.txt": "main content\n"})
+    pinned_revision = link_repo.branch_info().local_latest
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
 
     link_path = "libs/shared"
     linked_file = f"{link_path}/shared.txt"
@@ -298,12 +269,12 @@ def test_link_diff_file_added_in_linked_repo(new_lore_repo):
     """
     # Link target with two revisions: P1 has only "existing.txt"; P2 also
     # contains "new.txt".
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("existing.txt", "w+") as f:
-        f.writelines(["already here\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("existing only")
-    link_repo.push()
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "existing.txt": "already here\n",
+        },
+    )
     pin_v1 = link_repo.branch_info().local_latest
 
     with link_repo.open_file("new.txt", "w+") as f:
@@ -313,7 +284,7 @@ def test_link_diff_file_added_in_linked_repo(new_lore_repo):
     link_repo.push()
     pin_v2 = link_repo.branch_info().local_latest
 
-    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
     link_path = "libs/shared"
     added_file = f"{link_path}/new.txt"
 
@@ -346,12 +317,12 @@ def test_link_diff_file_modified_in_linked_repo(new_lore_repo):
     inside the linked repository, `lore file diff` must show that file as
     modified under the link path with the correct hunk content.
     """
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("shared.txt", "w+") as f:
-        f.writelines(["before\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("v1")
-    link_repo.push()
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "shared.txt": "before\n",
+        },
+    )
     pin_v1 = link_repo.branch_info().local_latest
 
     with link_repo.open_file("shared.txt", "w+") as f:
@@ -361,7 +332,7 @@ def test_link_diff_file_modified_in_linked_repo(new_lore_repo):
     link_repo.push()
     pin_v2 = link_repo.branch_info().local_latest
 
-    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
     link_path = "libs/shared"
     modified_file = f"{link_path}/shared.txt"
 
@@ -395,14 +366,13 @@ def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
     linked repository, `lore file diff` must show that file as removed
     under the link path.
     """
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("keep.txt", "w+") as f:
-        f.writelines(["keep me\n"])
-    with link_repo.open_file("doomed.txt", "w+") as f:
-        f.writelines(["delete me\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("v1 with both files")
-    link_repo.push()
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "keep.txt": "keep me\n",
+            "doomed.txt": "delete me\n",
+        },
+    )
     pin_v1 = link_repo.branch_info().local_latest
 
     link_repo.remove_file("doomed.txt")
@@ -411,7 +381,7 @@ def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
     link_repo.push()
     pin_v2 = link_repo.branch_info().local_latest
 
-    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
     link_path = "libs/shared"
     removed_file = f"{link_path}/doomed.txt"
 
@@ -453,15 +423,13 @@ def test_link_pin_update_revision_diff_reports_link_and_content(new_lore_repo):
       - an unrelated parent-side change in the same revision is still
         reported.
     """
-    link_repo: Lore = new_lore_repo()
-    with link_repo.open_file("a.txt", "w+") as f:
-        f.writelines(["v1\n"])
-    link_repo.make_dirs("sub")
-    with link_repo.open_file("sub/b.txt", "w+") as f:
-        f.writelines(["b1\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("v1")
-    link_repo.push()
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "a.txt": "v1\n",
+            "sub/b.txt": "b1\n",
+        },
+    )
     pin_v1 = link_repo.branch_info().local_latest
 
     # v2 modifies one mounted file and adds another.
@@ -474,7 +442,7 @@ def test_link_pin_update_revision_diff_reports_link_and_content(new_lore_repo):
     link_repo.push()
     pin_v2 = link_repo.branch_info().local_latest
 
-    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
     link_path = "libs/shared"
 
     parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pin_v1)
@@ -530,16 +498,13 @@ def test_link_pin_update_revision_diff_reports_link_when_content_identical(
     content walk finds nothing. Without an entry for the link node the diff
     comes back empty, reading as "this revision changed nothing".
     """
-    link_repo: Lore = new_lore_repo()
-    link_repo.make_dirs("mounted")
-    with link_repo.open_file("mounted/stable.txt", "w+") as f:
-        f.writelines(["stable mounted content\n"])
-    link_repo.make_dirs("outside")
-    with link_repo.open_file("outside/v1.txt", "w+") as f:
-        f.writelines(["outside v1\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("v1 with mounted/ + outside/")
-    link_repo.push()
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "mounted/stable.txt": "stable mounted content\n",
+            "outside/v1.txt": "outside v1\n",
+        },
+    )
     pin_v1 = link_repo.branch_info().local_latest
 
     with link_repo.open_file("outside/v2.txt", "w+") as f:
@@ -549,7 +514,7 @@ def test_link_pin_update_revision_diff_reports_link_when_content_identical(
     link_repo.push()
     pin_v2 = link_repo.branch_info().local_latest
 
-    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
     link_path = "libs/shared"
 
     parent_repo.link_add(link_path, link_repo.get_id(), "/mounted", pin=pin_v1)
@@ -586,10 +551,10 @@ def test_link_add_remove_revision_diff_reports_link_only(new_lore_repo):
     Guards the asymmetry with the pin-update tests above: only an *updated*
     link expands into the linked repository's changes.
     """
-    link_repo, pinned_revision = _make_link_target_repo(
-        new_lore_repo, "shared.txt", "main content\n"
-    )
-    parent_repo, baseline_revision = _make_parent_repo_with_baseline(new_lore_repo)
+    link_repo = make_repo(new_lore_repo, {"shared.txt": "main content\n"})
+    pinned_revision = link_repo.branch_info().local_latest
+    parent_repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
+    baseline_revision = parent_repo.branch_info().local_latest
 
     link_path = "libs/shared"
     linked_file = f"{link_path}/shared.txt"
@@ -658,9 +623,9 @@ def test_thin_client_tree_discriminates_tracking_from_pinned(
     its parent's branch reports tracking. Asserting all three off a single
     response is what proves the field is populated rather than left at its
     default."""
-    tracking_source = commit_initial_main(new_lore_repo, "inner.txt")
-    pinned_source = commit_initial_main(new_lore_repo, "inner.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    tracking_source = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    pinned_source = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     repo.link_add("tracked", tracking_source.get_id(), "/")
     repo.link_add("pinned", pinned_source.get_id(), "/", disable_branching=True)
@@ -706,8 +671,8 @@ def test_thin_client_diff_reports_tracking_on_added_link(
 ):
     """Adding a tracking link is reported as a tracking link entry on the
     thin-client revision diff."""
-    link_repo = commit_initial_main(new_lore_repo, "inner.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     repository_id, before = _wire_identity(repo)
 
@@ -736,8 +701,8 @@ def test_thin_client_diff_reports_tracking_on_removed_link(
 ):
     """Removing a tracking link reports tracking on the delete entry. A delete
     resolves against the "from" side, the only action that does."""
-    link_repo = commit_initial_main(new_lore_repo, "inner.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     link_path = "linked"
     repo.link_add(link_path, link_repo.get_id(), "/")
@@ -771,8 +736,8 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
     """Committing content through a tracking link moves its pin, and the pin
     move is reported as a tracking link entry on the thin-client revision
     diff, while the parent's own file change is not."""
-    link_repo = commit_initial_main(new_lore_repo, "inner.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     link_path = "linked"
     repo.link_add(link_path, link_repo.get_id(), "/")
@@ -821,8 +786,8 @@ def test_thin_client_diff_partitions_added_link_under_linked_repository(
     """A newly mounted link is the only diff entry for its mount path, and the
     content it names is a revision of the linked repository, so the entry must
     be partitioned there for a consumer to find that revision."""
-    link_repo = commit_initial_main(new_lore_repo, "inner.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     repository_id, before = _wire_identity(repo)
 
@@ -852,8 +817,8 @@ def test_thin_client_diff_partitions_removed_link_under_linked_repository(
     """A removed link names the revision it was pinned to, which still lives in
     the linked repository, so the delete entry must be partitioned there. A
     delete resolves against the "from" side, the only action that does."""
-    link_repo = commit_initial_main(new_lore_repo, "inner.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     link_path = "linked"
     repo.link_add(link_path, link_repo.get_id(), "/")
@@ -888,8 +853,8 @@ def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
     """Committing through a link moves its pin, and every entry the diff reports
     for the mount path must agree on the linked repository as its partition,
     while the parent's own file stays in the parent's."""
-    link_repo = commit_initial_main(new_lore_repo, "inner.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     link_path = "linked"
     repo.link_add(link_path, link_repo.get_id(), "/")
@@ -933,9 +898,9 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
 ):
     """Two links added in one commit take separate partition indices, and each
     mount entry resolves to the repository it mounts."""
-    first_repo = commit_initial_main(new_lore_repo, "first.txt")
-    second_repo = commit_initial_main(new_lore_repo, "second.txt")
-    repo = commit_initial_main(new_lore_repo, "own.txt")
+    first_repo = make_repo(new_lore_repo, {"first.txt": "initial content\n"})
+    second_repo = make_repo(new_lore_repo, {"second.txt": "initial content\n"})
+    repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
     repository_id, before = _wire_identity(repo)
 
@@ -957,61 +922,4 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
         ), (
             f"Mount path {link_path} mounts {link_repo.get_id()}, so its entries "
             f"must be partitioned there, got {mount_changes}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Content addresses on RevisionDiff and RevisionTree.
-# ---------------------------------------------------------------------------
-
-
-def _tree_address(nodes: list, path: str):
-    matches = [node for node in nodes if node.path == path]
-    assert len(matches) == 1, f"Expected one tree entry for {path}, got {matches}"
-    address = matches[0].address
-    assert address is not None, f"Tree entry for {path} carries no address"
-    return address
-
-
-@pytest.mark.smoke
-def test_thin_client_diff_content_addresses_match_the_tree_at_the_same_path(
-    new_lore_repo, lore_grpc_target
-):
-    """A commit gives each file its own addressing context, so a content address
-    is only resolvable as a whole `(hash, context)` pair. `RevisionTree` is the
-    reference for what that pair is at a revision."""
-    repo = commit_initial_main(new_lore_repo, "own.txt")
-
-    repository_id, before = _wire_identity(repo)
-
-    with repo.open_file("own.txt", "w+") as output_file:
-        output_file.writelines(["parent content, revised\n"])
-    repo.stage(scan=True)
-    repo.commit()
-    repo.push()
-
-    _, after = _wire_identity(repo)
-
-    address_before = _tree_address(
-        revision_tree(lore_grpc_target, repository_id, before), "own.txt"
-    )
-    address_after = _tree_address(
-        revision_tree(lore_grpc_target, repository_id, after), "own.txt"
-    )
-    assert address_after.context, (
-        f"A committed file carries a generated addressing context, got {address_after}"
-    )
-
-    changes = revision_diff(lore_grpc_target, repository_id, before, after)
-    own_changes = [change for change in changes if change.path == "own.txt"]
-    assert own_changes, f"Parent's own file change missing from diff: {changes}"
-
-    for change in own_changes:
-        assert change.content_from == address_before, (
-            f"The from side must carry the whole address the tree reports at "
-            f"{before.hex()}, got {change.content_from}"
-        )
-        assert change.content_to == address_after, (
-            f"The to side must carry the whole address the tree reports at "
-            f"{after.hex()}, got {change.content_to}"
         )

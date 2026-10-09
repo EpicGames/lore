@@ -1,38 +1,25 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-from link_helpers import setup_link_merge_conflict
+import re
 
-from lore import Lore
+import pytest
+from link_helpers import link_pin, make_parent_with_link, setup_link_merge_conflict
 
 
+@pytest.mark.smoke
 def test_link_merge_specific(new_lore_repo):
     """Merge only a specific linked repository via --link."""
-    urc: Lore = new_lore_repo()
-
-    # Create initial file in main repo
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    # Create link repository with initial content
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
-    # Add link to main repo
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-
-    urc.commit("Add link")
-    urc.push()
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     # Create feature branch (auto-follows into linked repo)
     urc.branch_create("feature-branch")
@@ -89,92 +76,20 @@ def test_link_merge_specific(new_lore_repo):
     )
 
 
-def test_link_merge_abort_specific(new_lore_repo):
-    """Abort only a specific linked repository merge via --link."""
-    urc: Lore = new_lore_repo()
-
-    # Create initial file in main repo
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    # Create link repository with initial content
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
-    # Add link to main repo
-    link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-
-    urc.commit("Add link")
-    urc.push()
-
-    # Create feature branch (auto-follows into linked repo)
-    urc.branch_create("feature-branch")
-
-    # On feature branch, add a new file in the linked repo
-    with urc.open_file(f"{link_path}/feature-link-file.txt", "w+") as f:
-        f.writelines(["feature branch link repo addition\n"])
-
-    urc.stage(scan=True)
-    urc.commit("Feature branch link addition")
-    urc.push()
-
-    # Switch back to main
-    urc.branch_switch("main")
-
-    # Merge only the linked repo with no_commit
-    urc.branch_merge_start("feature-branch", link=link_path, no_commit=True)
-
-    # Verify the linked repo file is present after merge
-    assert urc.file_exists(f"{link_path}/feature-link-file.txt"), (
-        "Feature link file should be present after merge"
-    )
-
-    # Abort the linked repo merge
-    urc.branch_merge_abort(link=link_path)
-
-    # Verify the linked repo file is rolled back
-    assert not urc.file_exists(f"{link_path}/feature-link-file.txt"), (
-        "Feature link file should not exist after link-specific abort"
-    )
-
-    # Verify main repo file is still present
-    assert urc.file_exists("main-file.txt"), (
-        "Main repo file should still exist after abort"
-    )
-
-
+@pytest.mark.smoke
 def test_link_merge_preserves_tracked_branch(new_lore_repo):
     """After merge --link, the link's tracked branch is preserved (not overwritten by source)."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial main commit")
-    repo.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main content\n",
+        },
+    )
 
     # Snapshot the link list before merge
     link_list_before = repo.link_list()
@@ -204,27 +119,20 @@ def test_link_merge_preserves_tracked_branch(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_sequential(new_lore_repo):
     """Two sequential link merges from the same feature branch work correctly."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial main commit")
-    repo.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main content\n",
+        },
+    )
 
     # Create feature branch and add first file
     repo.branch_create("feature-branch")
@@ -271,27 +179,20 @@ def test_link_merge_sequential(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_update_after_merge(new_lore_repo):
     """Link update works correctly after a link merge (tracked branch is intact)."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial main commit")
-    repo.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main content\n",
+        },
+    )
 
     # Create feature branch, add content, merge the link
     repo.branch_create("feature-branch")
@@ -324,30 +225,23 @@ def test_link_update_after_merge(new_lore_repo):
     repo.commit("Update link after merge")
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_restores_link_state(new_lore_repo):
     """After merge --link abort, link list shows original branch and revision."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial main commit")
-    repo.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main content\n",
+        },
+    )
 
     # Snapshot link state before merge
-    link_list_before = repo.link_list()
+    pin_before = link_pin(repo, link_repo.get_id())
 
     # Create feature branch with linked content
     repo.branch_create("feature-branch")
@@ -373,11 +267,17 @@ def test_link_merge_abort_restores_link_state(new_lore_repo):
     assert not repo.file_exists(f"{link_path}/feature-file.txt"), (
         "Feature file should not exist after abort"
     )
+    assert repo.file_exists("main-file.txt"), (
+        "Main repo file should still exist after abort"
+    )
 
     # Verify link state is restored to pre-merge state
     link_list_after = repo.link_list()
-    assert "main" in link_list_after, (
-        f"Link should still track 'main' branch after abort.\nGot: {link_list_after}"
+    assert re.search(
+        rf"Link\s+{link_repo.get_id()}.*?Branch:\s+main", link_list_after, re.DOTALL
+    ), f"Link should still track 'main' branch after abort.\nGot: {link_list_after}"
+    assert link_pin(repo, link_repo.get_id()) == pin_before, (
+        "Aborting the link merge must restore the link's pre-merge pin"
     )
 
     # Verify no merge is in progress — status should not say "pending merge"
@@ -387,27 +287,20 @@ def test_link_merge_abort_restores_link_state(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_abort_preserves_parent_staged_state(new_lore_repo):
     """Aborting a link merge must not destroy pre-existing staged changes in the parent repo."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial main commit")
-    repo.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main content\n",
+        },
+    )
 
     # Create feature branch with linked content
     repo.branch_create("feature-branch")
@@ -458,34 +351,20 @@ def test_link_merge_abort_preserves_parent_staged_state(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_file_conflict_resolve(new_lore_repo):
     """File conflict in linked repo is resolvable from the main repo."""
-    urc: Lore = new_lore_repo()
-
-    # Create initial file in main repo
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    # Create link repository with a file that will be conflicted
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("shared-data.txt", "w+") as f:
-        f.writelines(["base content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
-    # Add link to main repo
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "shared-data.txt": "base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     # Create feature branch (auto-follows into linked repo)
     urc.branch_create("feature-branch")
@@ -539,6 +418,7 @@ def test_link_merge_file_conflict_resolve(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_file_conflict_in_subdirectory(new_lore_repo):
     """File conflict in a subdirectory of a linked repo."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
@@ -569,6 +449,7 @@ def test_link_merge_file_conflict_in_subdirectory(new_lore_repo):
         assert "resolved subdirectory content" in f.read()
 
 
+@pytest.mark.smoke
 def test_link_merge_file_conflict_in_nested_subdirectory(new_lore_repo):
     """File conflict in a deeply nested subdirectory of a linked repo."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
@@ -599,6 +480,7 @@ def test_link_merge_file_conflict_in_nested_subdirectory(new_lore_repo):
         assert "resolved deep config" in f.read()
 
 
+@pytest.mark.smoke
 def test_link_merge_multiple_file_conflicts_across_directories(new_lore_repo):
     """Multiple file conflicts at different depths, resolved independently."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
@@ -655,6 +537,7 @@ def test_link_merge_multiple_file_conflicts_across_directories(new_lore_repo):
         assert "resolved helpers" in f.read()
 
 
+@pytest.mark.smoke
 def test_link_merge_directory_level_resolve(new_lore_repo):
     """Resolve multiple conflicts by specifying the directory path."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
@@ -694,30 +577,24 @@ def test_link_merge_directory_level_resolve(new_lore_repo):
         assert "resolved b" in f.read()
 
 
+@pytest.mark.smoke
 def test_link_merge_delete_vs_modify_in_link(new_lore_repo):
     """Delete-vs-modify file conflict inside a linked repo. Feature branch deletes
     the file; main branch modifies it. The default merge must surface the conflict
     in a recoverable way: either the file remains on disk with conflict markers,
     or `.mine` / `.theirs` / `.base` sidecars are present. The user must not see
     the file silently vanish."""
-    urc: Lore = new_lore_repo()
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main base\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("doomed.txt", "w+") as f:
-        f.writelines(["link base\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/")
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "doomed.txt": "link base\n",
+        },
+        {
+            "main-file.txt": "main base\n",
+        },
+    )
 
     # Feature branch: delete the link file via mount path
     urc.branch_create("feature-branch")
@@ -766,29 +643,21 @@ def test_link_merge_delete_vs_modify_in_link(new_lore_repo):
     urc.push()
 
 
+@pytest.mark.smoke
 def test_link_merge_mixed_conflict_and_clean(new_lore_repo):
     """Linked repo merge with both conflicting and cleanly merged files."""
-    urc: Lore = new_lore_repo()
-
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo content\n"])
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("conflict.txt", "w+") as f:
-        f.writelines(["base conflict\n"])
-    with link_repo.open_file("clean.txt", "w+") as f:
-        f.writelines(["base clean\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "conflict.txt": "base conflict\n",
+            "clean.txt": "base clean\n",
+        },
+        {
+            "main-file.txt": "main repo content\n",
+        },
+    )
 
     urc.branch_create("feature-branch")
 
@@ -842,6 +711,7 @@ def test_link_merge_mixed_conflict_and_clean(new_lore_repo):
     assert urc.file_exists(f"{link_path}/new-feature-file.txt")
 
 
+@pytest.mark.smoke
 def test_link_merge_file_conflict_resolve_mine(new_lore_repo):
     """File conflict in linked repo resolved with mine."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
@@ -873,6 +743,7 @@ def test_link_merge_file_conflict_resolve_mine(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_file_conflict_resolve_theirs(new_lore_repo):
     """File conflict in linked repo resolved with theirs."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
@@ -904,34 +775,20 @@ def test_link_merge_file_conflict_resolve_theirs(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_into_specific(new_lore_repo):
     """Merge current linked repo branch into target branch via --link."""
-    urc: Lore = new_lore_repo()
-
-    # Create initial file in main repo
-    with urc.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main repo base content\n"])
-
-    urc.stage(scan=True)
-    urc.commit("Initial main repo commit")
-    urc.push()
-
-    # Create link repository with initial content
-    link_repo = new_lore_repo()
-
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link repo base content\n"])
-
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link repo commit")
-    link_repo.push()
-
-    # Add link to main repo
     link_path = "linked/repo"
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
-
-    urc.commit("Add link")
-    urc.push()
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link repo base content\n",
+        },
+        {
+            "main-file.txt": "main repo base content\n",
+        },
+    )
 
     # Create feature branch (auto-follows into linked repo)
     urc.branch_create("feature-branch")
@@ -956,27 +813,20 @@ def test_link_merge_into_specific(new_lore_repo):
     assert urc.file_exists("main-file.txt"), "Main repo file should still exist"
 
 
+@pytest.mark.smoke
 def test_link_merge_into_scope_isolation(new_lore_repo):
     """merge into --link only merges linked repo changes, not main repo changes."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial main commit")
-    repo.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main content\n",
+        },
+    )
 
     # Create feature branch with changes in BOTH main repo and linked repo
     repo.branch_create("feature-branch")
@@ -1008,27 +858,20 @@ def test_link_merge_into_scope_isolation(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
 def test_link_merge_into_sequential(new_lore_repo):
     """Two sequential merge into --link operations from the same feature branch."""
-    repo: Lore = new_lore_repo()
-
-    with repo.open_file("main-file.txt", "w+") as f:
-        f.writelines(["main content\n"])
-    repo.stage(scan=True)
-    repo.commit("Initial main commit")
-    repo.push()
-
-    link_repo = new_lore_repo()
-    with link_repo.open_file("link-file.txt", "w+") as f:
-        f.writelines(["link content\n"])
-    link_repo.stage(scan=True)
-    link_repo.commit("Initial link commit")
-    link_repo.push()
-
     link_path = "linked/repo"
-    repo.link_add(link_path, link_repo.get_id(), "/")
-    repo.commit("Add link")
-    repo.push()
+    repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            "link-file.txt": "link content\n",
+        },
+        {
+            "main-file.txt": "main content\n",
+        },
+    )
 
     # Create feature branch, add first link file
     repo.branch_create("feature-branch")

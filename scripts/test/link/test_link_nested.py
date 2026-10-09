@@ -3,7 +3,41 @@
 import os
 
 import pytest
+from link_helpers import make_repo
 from test_utils import unstaged_entries, working_tree_files
+
+
+def _build_nested_link_repos_at(new_lore_repo, b_mount, c_inner_mount):
+    """Build A -> B -> C with configurable mount paths.
+
+    A links B at `b_mount`; C is linked at `<b_mount>/<c_inner_mount>` (i.e.
+    `c_inner_mount` is C's path *relative to B's root*). Returns
+    (repo_a, repo_b, repo_c, b_mount, nested_mount).
+
+    Lets tests control the relative depths of the outer and inner mounts, which
+    matters for the tracker's inner-first ordering.
+    """
+
+    repo_c = make_repo(
+        new_lore_repo, {"c-data/inner.txt": "content from repository C\n"}, "C initial"
+    )
+    repo_b = make_repo(
+        new_lore_repo, {"b-root.txt": "content from repository B\n"}, "B initial"
+    )
+    repo_a = make_repo(
+        new_lore_repo, {"a-root.txt": "content from repository A\n"}, "A initial"
+    )
+
+    repo_a.link_add(b_mount, repo_b.get_id(), "/")
+    repo_a.commit("A links B")
+    repo_a.push()
+
+    nested_mount = f"{b_mount}/{c_inner_mount}"
+    repo_a.link_add(nested_mount, repo_c.get_id(), "/")
+    repo_a.commit("A links B links C")
+    repo_a.push()
+
+    return repo_a, repo_b, repo_c, b_mount, nested_mount
 
 
 @pytest.mark.smoke
@@ -163,54 +197,6 @@ def test_nested_link_probe(new_lore_repo):
     )
 
 
-def _build_nested_link_repos(new_lore_repo):
-    """Build and commit an A -> B -> C nested-link structure.
-
-    A links B at `vendor/b`; C is linked at `vendor/b/vendor/c` (inside B's
-    mounted subtree). Returns (repo_a, repo_b, repo_c, b_mount, nested_mount).
-    """
-    # Repo C: innermost target.
-    repo_c = new_lore_repo()
-    repo_c.make_dirs("c-data")
-    with repo_c.open_file("c-data/inner.txt", "w+") as f:
-        f.writelines(["content from repository C\n"])
-    with repo_c.open_file("c-root.txt", "w+") as f:
-        f.writelines(["c root\n"])
-    repo_c.stage(scan=True)
-    repo_c.commit("C initial")
-    repo_c.push()
-
-    # Repo B: middle repo.
-    repo_b = new_lore_repo()
-    with repo_b.open_file("b-root.txt", "w+") as f:
-        f.writelines(["content from repository B\n"])
-    repo_b.stage(scan=True)
-    repo_b.commit("B initial")
-    repo_b.push()
-
-    # Repo A: outermost parent.
-    repo_a = new_lore_repo()
-    with repo_a.open_file("a-root.txt", "w+") as f:
-        f.writelines(["content from repository A\n"])
-    repo_a.stage(scan=True)
-    repo_a.commit("A initial")
-    repo_a.push()
-
-    # A links B.
-    b_mount = "vendor/b"
-    repo_a.link_add(b_mount, repo_b.get_id(), "/")
-    repo_a.commit("A links B")
-    repo_a.push()
-
-    # Nested: link C inside B's mounted subtree.
-    nested_mount = f"{b_mount}/vendor/c"
-    repo_a.link_add(nested_mount, repo_c.get_id(), "/")
-    repo_a.commit("A links B links C")
-    repo_a.push()
-
-    return repo_a, repo_b, repo_c, b_mount, nested_mount
-
-
 @pytest.mark.smoke
 def test_nested_link_stage_unstage_reset(new_lore_repo):
     """Stage / unstage / reset of content INSIDE a nested link (A -> B -> C).
@@ -219,8 +205,8 @@ def test_nested_link_stage_unstage_reset(new_lore_repo):
     levels deep (a file owned by C, mounted under B, mounted under A) back up
     through B's pin to A's staged anchor, and that unstage/reset undo it.
     """
-    repo_a, _repo_b, _repo_c, _b_mount, nested_mount = _build_nested_link_repos(
-        new_lore_repo
+    repo_a, _repo_b, _repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
     )
 
     inner_file = f"{nested_mount}/c-data/inner.txt"
@@ -290,8 +276,8 @@ def test_nested_link_update(new_lore_repo):
     The re-pin and its registry write must target B's registry, not A's, and
     the new B revision must propagate up to A's pin.
     """
-    repo_a, _repo_b, repo_c, _b_mount, nested_mount = _build_nested_link_repos(
-        new_lore_repo
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
     )
 
     # Advance C with a new revision the nested link can be re-pinned to.
@@ -329,8 +315,8 @@ def test_nested_link_remove(new_lore_repo):
     Removal must delete C's registry entry from B's registry, drop C's content
     from the mount, and propagate the new B revision up to A.
     """
-    repo_a, _repo_b, repo_c, _b_mount, nested_mount = _build_nested_link_repos(
-        new_lore_repo
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
     )
 
     inner_file = f"{nested_mount}/c-data/inner.txt"
@@ -369,8 +355,8 @@ def test_nested_link_list_shows_nesting(new_lore_repo):
     Both the B link (top-level) and the C link (nested in B) must appear, each
     with the correct full mount path.
     """
-    repo_a, repo_b, repo_c, b_mount, nested_mount = _build_nested_link_repos(
-        new_lore_repo
+    repo_a, repo_b, repo_c, b_mount, nested_mount = _build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
     )
 
     output = repo_a.link_list()
@@ -391,50 +377,6 @@ def test_nested_link_list_shows_nesting(new_lore_repo):
     assert nested_mount in fresh_output, (
         "Nested mount path should be listed in a fresh clone too"
     )
-
-
-def _build_nested_link_repos_at(new_lore_repo, b_mount, c_inner_mount):
-    """Build A -> B -> C with configurable mount paths.
-
-    A links B at `b_mount`; C is linked at `<b_mount>/<c_inner_mount>` (i.e.
-    `c_inner_mount` is C's path *relative to B's root*). Returns
-    (repo_a, repo_b, repo_c, b_mount, nested_mount).
-
-    Lets tests control the relative depths of the outer and inner mounts, which
-    matters for the tracker's inner-first ordering.
-    """
-    repo_c = new_lore_repo()
-    repo_c.make_dirs("c-data")
-    with repo_c.open_file("c-data/inner.txt", "w+") as f:
-        f.writelines(["content from repository C\n"])
-    repo_c.stage(scan=True)
-    repo_c.commit("C initial")
-    repo_c.push()
-
-    repo_b = new_lore_repo()
-    with repo_b.open_file("b-root.txt", "w+") as f:
-        f.writelines(["content from repository B\n"])
-    repo_b.stage(scan=True)
-    repo_b.commit("B initial")
-    repo_b.push()
-
-    repo_a = new_lore_repo()
-    with repo_a.open_file("a-root.txt", "w+") as f:
-        f.writelines(["content from repository A\n"])
-    repo_a.stage(scan=True)
-    repo_a.commit("A initial")
-    repo_a.push()
-
-    repo_a.link_add(b_mount, repo_b.get_id(), "/")
-    repo_a.commit("A links B")
-    repo_a.push()
-
-    nested_mount = f"{b_mount}/{c_inner_mount}"
-    repo_a.link_add(nested_mount, repo_c.get_id(), "/")
-    repo_a.commit("A links B links C")
-    repo_a.push()
-
-    return repo_a, repo_b, repo_c, b_mount, nested_mount
 
 
 @pytest.mark.smoke
@@ -497,7 +439,7 @@ def test_nested_link_list_staged_shows_nested(new_lore_repo):
     Stage a change two levels deep, then `link list --staged` must include the
     nested C link (not only the top-level B link).
     """
-    repo_a, _repo_b, repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(
+    repo_a, _repo_b, _repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(
         new_lore_repo, "vendor/b", "vendor/c"
     )
 
@@ -645,8 +587,8 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
     branch to remove; the cascade is observed reaching it through the debug log
     rather than through a branch that disappears.
     """
-    repo_a, repo_b, repo_c, _b_mount, _nested_mount = _build_nested_link_repos(
-        new_lore_repo
+    repo_a, repo_b, repo_c, _b_mount, _nested_mount = _build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
     )
 
     nested_before = sorted(repo_c.branch_list().remote_branches)
