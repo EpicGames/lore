@@ -6,6 +6,7 @@
 //! second time in test mode. A test that needs a process of its own goes in a
 //! separate `tests/*.rs` file instead.
 
+mod allocator;
 mod error;
 mod fs;
 mod retry;

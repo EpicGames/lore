@@ -9,7 +9,7 @@ mod tracking;
 use std::alloc::GlobalAlloc;
 use std::alloc::Layout;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 pub use growvec::GrowChunk;
@@ -73,7 +73,10 @@ unsafe impl GlobalAlloc for ExternalAllocator {
 static EXTERN_ALLOCATOR: OnceLock<ExternalAllocator> = OnceLock::new();
 static SELECTED_ALLOCATOR: OnceLock<&'static (dyn GlobalAlloc + Sync)> = OnceLock::new();
 static STANDARD_ALLOCATOR: std::alloc::System = std::alloc::System;
-static TRACKING_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+/// The allocation tracking options in effect, any combination of [`tracking::COUNT`] and
+/// [`tracking::TRACK`]. `tracking` in `LORE_ALLOCATOR` enables [`tracking::TRACK`] from the first
+/// allocation through the global allocator, unless an external allocator was set before it.
+static TRACKING_ALLOCATIONS: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_external_allocator(allocator: ExternalAllocator) -> bool {
     let mut was_set = false;
@@ -95,7 +98,7 @@ fn default_allocator() -> &'static (dyn GlobalAlloc + Sync) {
     unsafe {
         let allocator = libc::getenv(c"LORE_ALLOCATOR".as_ptr().cast());
         if !allocator.is_null() && !libc::strstr(allocator, c"tracking".as_ptr().cast()).is_null() {
-            TRACKING_ALLOCATIONS.store(true, Ordering::Relaxed);
+            TRACKING_ALLOCATIONS.fetch_or(tracking::TRACK, Ordering::Relaxed);
         }
         if !allocator.is_null() && !libc::strstr(allocator, c"system".as_ptr().cast()).is_null() {
             &STANDARD_ALLOCATOR
@@ -206,14 +209,15 @@ unsafe impl GlobalAlloc for LoreAllocator {
                 .get_or_init(|| default_allocator())
                 .alloc(layout)
         };
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) && !ptr.is_null() {
-            tracking::track_alloc(ptr, layout.size());
+        let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
+        if tracking != 0 && !ptr.is_null() {
+            tracking::track_alloc(tracking, ptr, layout.size());
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) && !ptr.is_null() {
+        if (TRACKING_ALLOCATIONS.load(Ordering::Relaxed) & tracking::TRACK) != 0 && !ptr.is_null() {
             tracking::track_dealloc(ptr);
         }
         unsafe {
@@ -229,8 +233,9 @@ unsafe impl GlobalAlloc for LoreAllocator {
                 .get_or_init(|| default_allocator())
                 .alloc_zeroed(layout)
         };
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) && !ptr.is_null() {
-            tracking::track_alloc(ptr, layout.size());
+        let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
+        if tracking != 0 && !ptr.is_null() {
+            tracking::track_alloc(tracking, ptr, layout.size());
         }
         ptr
     }
@@ -241,14 +246,17 @@ unsafe impl GlobalAlloc for LoreAllocator {
                 .get_or_init(|| default_allocator())
                 .realloc(ptr, layout, new_size)
         };
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) {
-            tracking::track_realloc(ptr, new_ptr, layout.size());
+        let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
+        if tracking != 0 {
+            tracking::track_realloc(tracking, ptr, new_ptr, layout.size());
         }
         new_ptr
     }
 }
 
+pub use tracking::set_allocation_counting;
 pub use tracking::spawn_allocation_file_dump;
+pub use tracking::thread_allocation_count;
 
 #[global_allocator]
 static GLOBAL: LoreAllocator = LoreAllocator;

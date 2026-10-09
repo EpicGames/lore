@@ -11,9 +11,30 @@ use zerocopy::IntoBytes;
 
 use super::TRACKING_ALLOCATIONS;
 
+/// Count each allocation on the allocating thread, read through [`thread_allocation_count`].
+pub(crate) const COUNT: u8 = 1;
+/// Record each allocation and free with its callstack to `allocations.dmp`.
+pub(crate) const TRACK: u8 = 2;
+
 thread_local! {
     /// Prevent tracking internal bookkeeping allocations
     pub(crate) static IN_ALLOCATOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ALLOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Enable or disable allocation counting. Disabled by default.
+pub fn set_allocation_counting(enabled: bool) {
+    if enabled {
+        TRACKING_ALLOCATIONS.fetch_or(COUNT, Ordering::Relaxed);
+    } else {
+        TRACKING_ALLOCATIONS.fetch_and(!COUNT, Ordering::Relaxed);
+    }
+}
+
+/// Allocations made on the calling thread, through the global allocator or a private rpmalloc
+/// heap, while counting was enabled. Enabling counting does not reset the count.
+pub fn thread_allocation_count() -> u64 {
+    ALLOCATIONS.with(std::cell::Cell::get)
 }
 
 /// How many frames of the allocating callstack a record carries.
@@ -81,7 +102,7 @@ fn allocation_dump() -> std::sync::mpsc::Sender<(u64, u64, u64, Callstack)> {
 }
 
 pub fn spawn_allocation_file_dump(receiver: std::sync::mpsc::Receiver<(u64, u64, u64, Callstack)>) {
-    if !TRACKING_ALLOCATIONS.load(Ordering::Relaxed) {
+    if (TRACKING_ALLOCATIONS.load(Ordering::Relaxed) & TRACK) == 0 {
         return;
     }
 
@@ -130,10 +151,14 @@ pub fn spawn_allocation_file_dump(receiver: std::sync::mpsc::Receiver<(u64, u64,
     });
 }
 
-pub(crate) fn track_alloc(ptr: *mut u8, size: usize) {
+/// Count or record, as the `tracking` options select, the allocation of `size` bytes at `ptr`.
+pub(crate) fn track_alloc(tracking: u8, ptr: *mut u8, size: usize) {
     IN_ALLOCATOR.with(|internal| {
         if !internal.replace(true) {
-            {
+            if (tracking & COUNT) != 0 {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            }
+            if (tracking & TRACK) != 0 {
                 let sender = allocation_dump();
                 let _ = sender.send((timestamp(), ptr as u64, size as u64, callstack()));
             }
@@ -154,10 +179,14 @@ pub(crate) fn track_dealloc(ptr: *mut u8) {
     });
 }
 
-pub(crate) fn track_realloc(old_ptr: *mut u8, new_ptr: *mut u8, old_size: usize) {
+/// Count or record, as the `tracking` options select, the reallocation of `old_ptr` to `new_ptr`.
+pub(crate) fn track_realloc(tracking: u8, old_ptr: *mut u8, new_ptr: *mut u8, old_size: usize) {
     IN_ALLOCATOR.with(|internal| {
         if !internal.replace(true) {
-            {
+            if (tracking & COUNT) != 0 && !new_ptr.is_null() {
+                ALLOCATIONS.with(|count| count.set(count.get() + 1));
+            }
+            if (tracking & TRACK) != 0 {
                 let callstack = callstack();
                 let sender = allocation_dump();
                 if !old_ptr.is_null() {

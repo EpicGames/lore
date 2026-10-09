@@ -143,14 +143,15 @@ unsafe impl GlobalAlloc for RpmallocHeapAllocator {
             }
             rpmalloc_heap_aligned_alloc(*heap, layout.align(), layout.size())
         };
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) && !ptr.is_null() {
-            tracking::track_alloc(ptr.cast(), layout.size());
+        let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
+        if tracking != 0 && !ptr.is_null() {
+            tracking::track_alloc(tracking, ptr.cast(), layout.size());
         }
         ptr.cast()
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) && !ptr.is_null() {
+        if (TRACKING_ALLOCATIONS.load(Ordering::Relaxed) & tracking::TRACK) != 0 && !ptr.is_null() {
             tracking::track_dealloc(ptr);
         }
         unsafe {
@@ -169,8 +170,9 @@ unsafe impl GlobalAlloc for RpmallocHeapAllocator {
             }
             rpmalloc_heap_aligned_zalloc(*heap, layout.align(), layout.size())
         };
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) && !ptr.is_null() {
-            tracking::track_alloc(ptr.cast(), layout.size());
+        let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
+        if tracking != 0 && !ptr.is_null() {
+            tracking::track_alloc(tracking, ptr.cast(), layout.size());
         }
         ptr.cast()
     }
@@ -190,8 +192,9 @@ unsafe impl GlobalAlloc for RpmallocHeapAllocator {
                 0,
             )
         };
-        if TRACKING_ALLOCATIONS.load(Ordering::Relaxed) {
-            tracking::track_realloc(ptr, new_ptr.cast(), layout.size());
+        let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
+        if tracking != 0 {
+            tracking::track_realloc(tracking, ptr, new_ptr.cast(), layout.size());
         }
         new_ptr.cast()
     }
