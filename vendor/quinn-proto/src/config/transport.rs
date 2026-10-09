@@ -128,12 +128,18 @@ impl TransportConfig {
         self
     }
 
-    /// Maximum number of bytes to transmit to a peer without acknowledgment
+    /// Maximum number of bytes retained from application writes across all streams of a connection
     ///
-    /// Provides an upper bound on memory when communicating with peers that issue large amounts of
-    /// flow control credit. Endpoints that wish to handle large numbers of connections robustly
-    /// should take care to set this low enough to guarantee memory exhaustion does not occur if
-    /// every connection uses the entire window.
+    /// Acknowledged data continues to count against this limit until its storage is released. This
+    /// can keep writes blocked while earlier data is awaiting acknowledgment or only part of a buffer
+    /// has been acknowledged.
+    ///
+    /// Limits memory use when communicating with peers that issue large amounts of flow control
+    /// credit. Endpoints that wish to handle large numbers of connections robustly should take care
+    /// to set this low enough to avoid memory exhaustion if every connection uses the entire window.
+    ///
+    /// The limit counts bytes accepted from application buffers. Slices of larger allocations can
+    /// retain more memory than this limit accounts for.
     pub fn send_window(&mut self, value: u64) -> &mut Self {
         self.send_window = value;
         self
@@ -212,11 +218,12 @@ impl TransportConfig {
     /// Must be at least 1200, which is the default, and lower than or equal to
     /// [`TransportConfig::initial_mtu`].
     ///
+    /// Client Initial datagrams and ack-eliciting server Initial datagrams are padded to at least
+    /// this size, subject to the peer's maximum UDP payload size.
+    ///
     /// Real-world MTUs can vary according to ISP, VPN, and properties of intermediate network links
-    /// outside of either endpoint's control. Extreme care should be used when raising this value
-    /// outside of private networks where these factors are fully controlled. If the provided value
-    /// is higher than what the network path actually supports, the result will be unpredictable and
-    /// catastrophic packet loss, without a possibility of repair. Prefer
+    /// outside of either endpoint's control. If this value exceeds what the network path supports,
+    /// connections may fail to be established because Initial datagrams cannot be delivered. Prefer
     /// [`TransportConfig::initial_mtu`] together with
     /// [`TransportConfig::mtu_discovery_config`] to set a maximum UDP payload size that robustly
     /// adapts to the network.
@@ -299,6 +306,8 @@ impl TransportConfig {
     /// The peer is forbidden to send single datagrams larger than this size. If the aggregate size
     /// of all datagrams that have been received from the peer but not consumed by the application
     /// exceeds this value, old datagrams are dropped until it is no longer exceeded.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_receive_buffer_size(&mut self, value: Option<usize>) -> &mut Self {
         self.datagram_receive_buffer_size = value;
         self
@@ -310,6 +319,8 @@ impl TransportConfig {
     /// than the link, or even the underlying hardware, can transmit them. This limits the amount of
     /// memory that may be consumed in that case. When the send buffer is full and a new datagram is
     /// sent, older datagrams are dropped until sufficient space is available.
+    ///
+    /// The amount of payload data buffered may be smaller than `value` due to overhead.
     pub fn datagram_send_buffer_size(&mut self, value: usize) -> &mut Self {
         self.datagram_send_buffer_size = value;
         self

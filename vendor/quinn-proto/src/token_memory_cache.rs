@@ -159,7 +159,7 @@ mod tests {
     use rand_pcg::Pcg32;
 
     fn new_rng() -> impl Rng {
-        Pcg32::from_seed(0xdeadbeefdeadbeefdeadbeefdeadbeefu128.to_le_bytes())
+        Pcg32::new(0xdeadbeefdeadbeef, 0xdeadbeefdeadbeef)
     }
 
     #[test]

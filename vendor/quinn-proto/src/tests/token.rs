@@ -1,6 +1,131 @@
 //! Tests specifically for tokens
 
+use std::io::Cursor;
+
+use bytes::BytesMut;
+
 use super::*;
+use crate::packet::{FixedLengthConnectionIdParser, Header, ProtectedHeader};
+
+#[test]
+fn oversized_cached_initial_token() {
+    let _guard = subscribe();
+    for (token_len, mtu, fits) in [
+        (0, 1200, true),
+        (1080, 1200, true),
+        // The 40-byte header overhead and 16-byte tag leave exactly 25 bytes
+        // for frames with a 1119-byte token, enough for CONNECTION_CLOSE.
+        (1118, 1200, true),
+        (1119, 1200, true),
+        (1120, 1200, false),
+        (1140, 1200, false),
+        (1200, 1200, false),
+        (1200, 1500, true),
+    ] {
+        let mut config = client_config();
+        Arc::get_mut(&mut config.transport)
+            .unwrap()
+            .initial_mtu(mtu);
+        config
+            .token_store
+            .insert("localhost", vec![0; token_len].into());
+        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let now = Instant::now();
+        let (_, mut conn) = endpoint
+            .connect(now, config, "[::1]:4433".parse().unwrap(), "localhost")
+            .unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(
+            conn.poll_transmit(now, 1, &mut buf).is_some(),
+            fits,
+            "token {token_len}, MTU {mtu}"
+        );
+        if fits {
+            assert!(buf.len() <= mtu as usize);
+            assert!(conn.stats().frame_tx.crypto > 0);
+        } else {
+            assert_matches!(
+                conn.poll(),
+                Some(Event::ConnectionLost { reason: ConnectionError::TransportError(err) })
+                if err.code == TransportErrorCode::PROTOCOL_VIOLATION
+            );
+            assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
+            assert!(buf.is_empty());
+        }
+    }
+}
+
+#[test]
+fn oversized_retry_token() {
+    let _guard = subscribe();
+    for (token_len, fits) in [
+        (64, true),
+        (1118, true),
+        (1119, true),
+        (1120, false),
+        (1140, false),
+        (1200, false),
+    ] {
+        let address = "[::1]:4433".parse().unwrap();
+        let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let now = Instant::now();
+        let (_, mut conn) = endpoint
+            .connect(now, client_config(), address, "localhost")
+            .unwrap();
+        let mut buf = Vec::new();
+        let _ = conn.poll_transmit(now, 1, &mut buf).unwrap();
+        let mut bytes = BytesMut::new();
+        bytes.extend_from_slice(&buf);
+        let ProtectedHeader::Initial(initial) = ProtectedHeader::decode(
+            &mut Cursor::new(bytes),
+            &FixedLengthConnectionIdParser::new(0),
+            DEFAULT_SUPPORTED_VERSIONS,
+            false,
+        )
+        .unwrap() else {
+            panic!("expected an Initial packet")
+        };
+        let header = Header::Retry {
+            src_cid: ConnectionId::new(&[1; 20]),
+            dst_cid: initial.src_cid,
+            version: initial.version,
+        };
+        let mut retry = Vec::new();
+        header.encode(&mut retry);
+        retry.resize(retry.len() + token_len, 0);
+        let tag = server_config()
+            .crypto
+            .retry_tag(initial.version, &initial.dst_cid, &retry);
+        retry.extend_from_slice(&tag);
+        let Some(DatagramEvent::ConnectionEvent(_, event)) = endpoint.handle(
+            now,
+            address,
+            None,
+            None,
+            BytesMut::from(&retry[..]),
+            &mut buf,
+        ) else {
+            panic!("Retry must be routed to the client connection")
+        };
+        conn.handle_event(event);
+        let now = now + Duration::from_secs(1);
+        let crypto_before = conn.stats().frame_tx.crypto;
+        buf.clear();
+        assert_eq!(conn.poll_transmit(now, 1, &mut buf).is_some(), fits);
+        if fits {
+            assert!(conn.stats().frame_tx.crypto > crypto_before);
+            assert!(buf.len() <= 1200);
+        } else {
+            assert_matches!(
+                conn.poll(),
+                Some(Event::ConnectionLost { reason: ConnectionError::TransportError(err) })
+                if err.code == TransportErrorCode::PROTOCOL_VIOLATION
+            );
+            assert!(conn.poll_transmit(now, 1, &mut buf).is_none());
+            assert!(buf.is_empty());
+        }
+    }
+}
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 use wasm_bindgen_test::wasm_bindgen_test as test;

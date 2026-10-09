@@ -13,6 +13,10 @@ pub(super) struct Send {
     pub(super) fin_pending: bool,
     /// Whether this stream is in the `connection_blocked` list of `Streams`
     pub(super) connection_blocked: bool,
+    /// Value of `max_data` for which a `STREAM_DATA_BLOCKED` frame was most recently queued
+    ///
+    /// A new frame is only queued once the peer has raised the limit.
+    pub(super) data_blocked_limit: Option<u64>,
     /// The reason the peer wants us to stop, if `STOP_SENDING` was received
     pub(super) stop_reason: Option<VarInt>,
 }
@@ -26,6 +30,7 @@ impl Send {
             priority: 0,
             fin_pending: false,
             connection_blocked: false,
+            data_blocked_limit: None,
             stop_reason: None,
         })
     }
@@ -88,6 +93,8 @@ impl Send {
         use SendState::*;
         if let DataSent { .. } | Ready = self.state {
             self.state = ResetSent;
+            self.pending.discard();
+            self.fin_pending = false;
         }
     }
 

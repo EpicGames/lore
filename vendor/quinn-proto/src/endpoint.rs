@@ -8,7 +8,10 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use rand::{Rng, RngCore, SeedableRng, rngs::StdRng};
+use rand::{
+    Rng, RngExt, SeedableRng,
+    rngs::{StdRng, SysRng},
+};
 use rustc_hash::FxHashMap;
 use slab::Slab;
 use thiserror::Error;
@@ -72,9 +75,12 @@ impl Endpoint {
         allow_mtud: bool,
         rng_seed: Option<[u8; 32]>,
     ) -> Self {
-        let rng_seed = rng_seed.or(config.rng_seed);
         Self {
-            rng: rng_seed.map_or(StdRng::from_os_rng(), StdRng::from_seed),
+            rng: match rng_seed.or(config.rng_seed) {
+                Some(seed) => StdRng::from_seed(seed),
+                None => StdRng::try_from_rng(&mut SysRng)
+                    .expect("failed to seed random number generator from system"),
+            },
             index: ConnectionIndex::default(),
             connections: Slab::new(),
             local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
@@ -88,6 +94,8 @@ impl Endpoint {
     }
 
     /// Replace the server configuration, affecting new incoming connections only
+    ///
+    /// Pending incoming connections retain the configuration active when they first arrived.
     pub fn set_server_config(&mut self, server_config: Option<Arc<ServerConfig>>) {
         self.server_config = server_config;
     }
@@ -170,6 +178,13 @@ impl Endpoint {
                     debug!("dropping packet with unsupported version");
                     return None;
                 }
+                // RFC 9000 §5.2.2: "Servers MUST drop smaller packets that specify unsupported
+                // versions." Responding to short packets would let a spoofed source elicit a
+                // Version Negotiation packet larger than the datagram that triggered it.
+                if datagram_len < MIN_INITIAL_SIZE as usize {
+                    debug!("dropping short packet with unsupported version");
+                    return None;
+                }
                 trace!("sending version negotiation");
                 // Negotiate versions
                 Header::VersionNegotiate {
@@ -208,7 +223,7 @@ impl Endpoint {
             match route_to {
                 RouteDatagramTo::Incoming(incoming_idx) => {
                     let incoming_buffer = &mut self.incoming_buffers[incoming_idx];
-                    let config = &self.server_config.as_ref().unwrap();
+                    let config = &incoming_buffer.server_config;
 
                     if incoming_buffer
                         .total_bytes
@@ -352,7 +367,11 @@ impl Endpoint {
         );
         let tls = config
             .crypto
-            .start_session(config.version, server_name, &params)?;
+            .start_session(config.version, server_name, &params)
+            .inspect_err(|_| {
+                // Remove just issued connection id
+                self.index.connection_ids.remove(&loc_cid);
+            })?;
 
         let conn = self.add_connection(
             ch,
@@ -503,7 +522,11 @@ impl Endpoint {
             }
         };
 
-        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer::default());
+        let incoming_idx = self.incoming_buffers.insert(IncomingBuffer {
+            server_config,
+            datagrams: Vec::new(),
+            total_bytes: 0,
+        });
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
 
@@ -546,8 +569,7 @@ impl Endpoint {
             version,
             ..
         } = incoming.packet.header;
-        let server_config =
-            server_config.unwrap_or_else(|| self.server_config.as_ref().unwrap().clone());
+        let server_config = server_config.unwrap_or_else(|| incoming_buffer.server_config.clone());
 
         if server_config
             .transport
@@ -728,10 +750,11 @@ impl Endpoint {
             return Err(RetryError(Box::new(incoming)));
         }
 
+        let server_config = self.incoming_buffers[incoming.incoming_idx]
+            .server_config
+            .clone();
         self.clean_up_incoming(&incoming);
         incoming.improper_drop_warner.dismiss();
-
-        let server_config = self.server_config.as_ref().unwrap();
 
         // First Initial
         // The peer will use this as the DCID of its following Initials. Initial DCIDs are
@@ -951,8 +974,8 @@ impl fmt::Debug for Endpoint {
 }
 
 /// Buffered Initial and 0-RTT messages for a pending incoming connection
-#[derive(Default)]
 struct IncomingBuffer {
+    server_config: Arc<ServerConfig>,
     datagrams: Vec<DatagramConnectionEvent>,
     total_bytes: u64,
 }

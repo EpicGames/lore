@@ -5,7 +5,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut, Bytes};
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 use crate::{
     Duration, RESET_TOKEN_SIZE, ServerConfig, SystemTime, UNIX_EPOCH,
@@ -412,7 +412,6 @@ mod test {
     use super::*;
     #[cfg(all(feature = "aws-lc-rs", not(feature = "ring")))]
     use aws_lc_rs::hkdf;
-    use rand::prelude::*;
     #[cfg(feature = "ring")]
     use ring::hkdf;
 
@@ -485,9 +484,6 @@ mod test {
 
     #[test]
     fn invalid_token_returns_err() {
-        use super::*;
-        use rand::RngCore;
-
         let rng = &mut rand::rng();
 
         let mut master_key = [0; 64];

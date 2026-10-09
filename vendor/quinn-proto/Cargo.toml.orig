@@ -1,6 +1,6 @@
 [package]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.19"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -50,6 +50,7 @@ lru-slab = { workspace = true }
 qlog = { workspace = true, optional = true }
 rustc-hash = { workspace = true }
 rand = { workspace = true }
+rand_pcg = "0.10"
 ring = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-platform-verifier = { workspace = true, optional = true }
@@ -69,7 +70,6 @@ web-time = { workspace = true }
 [dev-dependencies]
 assert_matches = { workspace = true }
 hex-literal = { workspace = true  }
-rand_pcg = "0.9"
 rcgen = { workspace = true }
 tracing-subscriber = { workspace = true }
 lazy_static = "1"

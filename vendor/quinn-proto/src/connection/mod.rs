@@ -10,12 +10,12 @@ use std::{
 use bytes::{Bytes, BytesMut};
 use frame::StreamMetaVec;
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, INITIAL_MTU, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
+    Dir, Duration, EndpointConfig, Frame, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
     MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
     TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
@@ -190,6 +190,13 @@ pub struct Connection {
     permit_idle_reset: bool,
     /// Negotiated idle timeout
     idle_timeout: Option<Duration>,
+    /// The time we send next bundled ACK
+    ///
+    /// The goal is to wait long enough for the peer to acknowledge our previous
+    /// bundled ACK (see `next_bundled_ack_delay`).
+    /// A packet-count threshold would over- or under-shoot this depending on how fast we happen
+    /// to be sending, so a time threshold is used instead.
+    next_bundled_ack_time: Option<Instant>,
     timers: TimerTable,
     /// Number of packets received which could not be authenticated
     authentication_failures: u64,
@@ -334,6 +341,7 @@ impl Connection {
             ack_frequency: AckFrequencyState::new(get_max_ack_delay(
                 &TransportParameters::default(),
             )),
+            next_bundled_ack_time: None,
 
             pto_count: 0,
 
@@ -466,6 +474,8 @@ impl Connection {
         // packets, this can be earlier than the start of the current QUIC packet.
         let mut datagram_start = 0;
         let mut segment_size = usize::from(self.path.current_mtu());
+        // The peer's maximum UDP payload size can reduce the path MTU below our configured minimum.
+        let min_mtu = Ord::min(self.config.min_mtu, self.path.current_mtu());
 
         if let Some(challenge) = self.send_path_challenge(now, buf) {
             return Some(challenge);
@@ -633,7 +643,7 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(MIN_INITIAL_SIZE);
+                        builder.pad_to(min_mtu);
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -645,7 +655,7 @@ impl Connection {
                         // optimal value.
                         //
                         // Additionally, if this datagram is a loss probe and `segment_size` is
-                        // larger than `INITIAL_MTU`, then padding it to `segment_size` to continue
+                        // larger than `min_mtu`, then padding it to `segment_size` to continue
                         // the GSO batch would risk failure to recover from a reduction in path
                         // MTU. Loss probes are the only packets for which we might grow
                         // `buf_capacity` by less than `segment_size`.
@@ -689,7 +699,7 @@ impl Connection {
                         // end up trying to send an empty packet. We can't easily compute the right
                         // segment size before the original call to `space_can_send`, because at
                         // that time we haven't determined whether we're going to coalesce with the
-                        // first datagram or potentially pad it to `MIN_INITIAL_SIZE`.
+                        // first datagram or potentially pad it to `min_mtu`.
                         if space_id == SpaceId::Data {
                             let frame_space_1rtt =
                                 segment_size.saturating_sub(self.predict_1rtt_overhead(Some(pn)));
@@ -708,7 +718,7 @@ impl Connection {
                         // Clamp the datagram to at most the minimum MTU to ensure that loss probes
                         // can get through and enable recovery even if the path MTU has shrank
                         // unexpectedly.
-                        std::cmp::min(segment_size, usize::from(INITIAL_MTU))
+                        std::cmp::min(segment_size, usize::from(min_mtu))
                     }
                 };
                 buf_capacity += next_datagram_size_limit;
@@ -788,24 +798,20 @@ impl Connection {
                 // especially important with ack delay, since the peer might not
                 // have gotten any other ACK for the data earlier on.
                 if !self.spaces[space_id].pending_acks.ranges().is_empty() {
-                    Self::populate_acks(
+                    // Reserve room for CONNECTION_CLOSE even when an Initial token leaves
+                    // little space after the header.
+                    Self::try_populate_acks(
                         now,
                         self.receiving_ecn,
                         &mut SentFrames::default(),
                         &mut self.spaces[space_id],
                         buf,
                         &mut self.stats,
+                        builder.max_size - frame::ConnectionClose::SIZE_BOUND,
                     );
                 }
 
-                // Since there only 64 ACK frames there will always be enough space
-                // to encode the ConnectionClose frame too. However we still have the
-                // check here to prevent crashes if something changes.
-                debug_assert!(
-                    buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size,
-                    "ACKs should leave space for ConnectionClose"
-                );
-                if buf.len() + frame::ConnectionClose::SIZE_BOUND < builder.max_size {
+                if buf.len() + frame::ConnectionClose::SIZE_BOUND <= builder.max_size {
                     let max_frame_size = builder.max_size - buf.len();
                     match self.state {
                         State::Closed(state::Closed { ref reason }) => {
@@ -899,6 +905,7 @@ impl Connection {
             if sent.largest_acked.is_some() {
                 self.spaces[space_id].pending_acks.acks_sent();
                 self.timers.stop(Timer::MaxAckDelay);
+                self.next_bundled_ack_time = Some(now + self.next_bundled_ack_delay());
             }
 
             // Keep information about the packet around until it gets finalized
@@ -911,10 +918,10 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(MIN_INITIAL_SIZE);
+                builder.pad_to(min_mtu);
             }
 
-            // If this datagram is a loss probe and `segment_size` is larger than `INITIAL_MTU`,
+            // If this datagram is a loss probe and `segment_size` is larger than `min_mtu`,
             // then padding it to `segment_size` would risk failure to recover from a reduction in
             // path MTU.
             // Loss probes are the only packets for which we might grow `buf_capacity`
@@ -1082,6 +1089,25 @@ impl Connection {
             can_send.other |= self.can_send_1rtt(frame_space_1rtt);
         }
         can_send
+    }
+
+    /// The delay to wait after sending an ACK before bundling the next one.
+    ///
+    /// This delay prevents waste of peer's resources with processing bundled
+    /// ACKs unnecessarily frequently.
+    ///
+    /// If we receive an ack-eliciting packet while this delay is still pending,
+    /// `next_bundled_ack_time` is reset to `now`, which means this delay will be ignored.
+    /// So this delay only matters when we keep sending but stop receiving ack-eliciting
+    /// packets for a while.
+    ///
+    /// This should be at least `RTT + peer's max_ack_delay`: since a bundled ACK frame rides
+    /// along with an ack-eliciting frame, the packet carrying it is itself ack-eliciting.
+    /// We should give the peer enough time to acknowledge it.
+    /// Otherwise, we risk bundling another ACK before the peer has even had a chance
+    /// to acknowledge the previous one, which is a waste of remote peer's resources.
+    fn next_bundled_ack_delay(&self) -> Duration {
+        self.path.rtt.get() + self.ack_frequency.peer_max_ack_delay + TIMER_GRANULARITY
     }
 
     /// Process `ConnectionEvent`s generated by the associated `Endpoint`
@@ -1263,6 +1289,7 @@ impl Connection {
     pub fn stats(&self) -> ConnectionStats {
         let mut stats = self.stats;
         stats.path.rtt = self.path.rtt.get();
+        stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
 
@@ -1377,6 +1404,11 @@ impl Connection {
         self.path.rtt.get()
     }
 
+    /// Minimum RTT seen on this path, ignoring ack delay
+    pub fn min_rtt(&self) -> Duration {
+        self.path.rtt.min()
+    }
+
     /// Current state of this connection's congestion controller, for debugging purposes
     pub fn congestion_state(&self) -> &dyn Controller {
         self.path.congestion.as_ref()
@@ -1385,7 +1417,7 @@ impl Connection {
     /// Resets path-specific settings.
     ///
     /// This will force-reset several subsystems related to a specific network path.
-    /// Currently this is the congestion controller, round-trip estimator, and the MTU
+    /// Currently this is the congestion controller, round-trip estimator, pacer, and MTU
     /// discovery.
     ///
     /// This is useful when it is known the underlying network path has changed and the old
@@ -1394,6 +1426,7 @@ impl Connection {
     /// configuration in the [`TransportConfig`].
     pub fn path_changed(&mut self, now: Instant) {
         self.path.reset(now, &self.config);
+        self.datagrams().drop_oversized();
     }
 
     /// Modify the number of remotely initiated streams that may be concurrently open
@@ -1763,9 +1796,7 @@ impl Connection {
                 self.path
                     .congestion
                     .on_mtu_update(self.path.mtud.current_mtu());
-                if let Some(max_datagram_size) = self.datagrams().max_size() {
-                    self.datagrams.drop_oversized(max_datagram_size);
-                }
+                self.datagrams().drop_oversized();
             }
 
             // Don't apply congestion penalty for lost ack-only packets
@@ -2899,22 +2930,7 @@ impl Connection {
                     match self.rem_cids.insert(frame) {
                         Ok(None) => {}
                         Ok(Some((retired, reset_token))) => {
-                            let pending_retired =
-                                &mut self.spaces[SpaceId::Data].pending.retire_cids;
-                            /// Ensure `pending_retired` cannot grow without bound. Limit is
-                            /// somewhat arbitrary but very permissive.
-                            const MAX_PENDING_RETIRED_CIDS: u64 = CidQueue::LEN as u64 * 10;
-                            // We don't bother counting in-flight frames because those are bounded
-                            // by congestion control.
-                            if (pending_retired.len() as u64)
-                                .saturating_add(retired.end.saturating_sub(retired.start))
-                                > MAX_PENDING_RETIRED_CIDS
-                            {
-                                return Err(TransportError::CONNECTION_ID_LIMIT_ERROR(
-                                    "queued too many retired CIDs",
-                                ));
-                            }
-                            pending_retired.extend(retired);
+                            self.spaces[SpaceId::Data].pending.retire_cids(retired)?;
                             self.set_reset_token(reset_token);
                         }
                         Err(InsertError::ExceedsLimit) => {
@@ -2927,8 +2943,7 @@ impl Connection {
                             // was retired all at once via retire_prior_to.
                             self.spaces[SpaceId::Data]
                                 .pending
-                                .retire_cids
-                                .push(frame.sequence);
+                                .retire_cids(frame.sequence..frame.sequence.saturating_add(1))?;
                             continue;
                         }
                     };
@@ -3009,6 +3024,7 @@ impl Connection {
         {
             self.timers
                 .set(Timer::MaxAckDelay, now + self.ack_frequency.max_ack_delay);
+            self.next_bundled_ack_time = Some(now);
         }
 
         // Issue stream ID credit due to ACKs of outgoing finish/resets and incoming finish/resets
@@ -3070,6 +3086,7 @@ impl Connection {
         let prev_pto = self.pto(SpaceId::Data);
 
         let mut prev = mem::replace(&mut self.path, new_path);
+        self.datagrams().drop_oversized();
         // Don't clobber the original path if the previous one hasn't been validated yet
         if prev.challenge.is_none() {
             prev.challenge = Some(self.rng.random());
@@ -3146,6 +3163,8 @@ impl Connection {
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
         space.pending_acks.maybe_ack_non_eliciting();
 
+        let pre_payload_len = buf.len();
+
         // HANDSHAKE_DONE
         if !is_0rtt && mem::replace(&mut space.pending.handshake_done, false) {
             buf.write(frame::FrameType::HANDSHAKE_DONE);
@@ -3173,13 +3192,14 @@ impl Connection {
 
         // ACK
         if space.pending_acks.can_send() {
-            Self::populate_acks(
+            Self::try_populate_acks(
                 now,
                 self.receiving_ecn,
                 &mut sent,
                 space,
                 buf,
                 &mut self.stats,
+                max_size,
             );
         }
 
@@ -3391,20 +3411,45 @@ impl Connection {
             self.stats.frame_tx.stream += sent.stream_frames.len() as u64;
         }
 
+        // Bundle ACK with other frames when there is room for them.
+        // We want to reuse encryption and underlying protocol overhead,
+        // but sending multiple ACKs for a single incoming packet is a waste of peer's resources,
+        // so we have next_bundled_ack_time to control when to send ACKs.
+        let any_frames_sent = buf.len() > pre_payload_len;
+        if any_frames_sent
+            && sent.largest_acked.is_none()
+            && self.next_bundled_ack_time.is_some_and(|time| time <= now)
+            && space.pending_acks.can_send_with_other_frames()
+        {
+            Self::try_populate_acks(
+                now,
+                self.receiving_ecn,
+                &mut sent,
+                space,
+                buf,
+                &mut self.stats,
+                max_size,
+            );
+        }
+
         sent
     }
 
-    /// Write pending ACKs into a buffer
+    /// Tries to write pending ACKs into a buffer if there is enough space.
+    ///
+    /// If the ACK frame does not fit into the buffer, the ACK frame will not
+    /// be sent at all.
     ///
     /// This method assumes ACKs are pending, and should only be called if
     /// `!PendingAcks::ranges().is_empty()` returns `true`.
-    fn populate_acks(
+    fn try_populate_acks(
         now: Instant,
         receiving_ecn: bool,
         sent: &mut SentFrames,
         space: &mut PacketSpace,
         buf: &mut Vec<u8>,
         stats: &mut ConnectionStats,
+        max_size: usize,
     ) {
         debug_assert!(!space.pending_acks.ranges().is_empty());
 
@@ -3415,7 +3460,6 @@ impl Connection {
         } else {
             None
         };
-        sent.largest_acked = space.pending_acks.ranges().max();
 
         let delay_micros = space.pending_acks.ack_delay(now).as_micros() as u64;
 
@@ -3429,7 +3473,14 @@ impl Connection {
             delay_micros
         );
 
+        let no_acks_len = buf.len();
         frame::Ack::encode(delay as _, space.pending_acks.ranges(), ecn, buf);
+        if buf.len() > max_size {
+            // The ACK frame is too large. Remove it.
+            buf.truncate(no_acks_len);
+            return;
+        }
+        sent.largest_acked = space.pending_acks.ranges().max();
         stats.frame_tx.acks += 1;
     }
 
@@ -3672,11 +3723,7 @@ impl Connection {
                 .as_ref()
                 .is_some_and(|(_, x)| x.challenge_pending)
             || !self.path_responses.is_empty()
-            || self
-                .datagrams
-                .outgoing
-                .front()
-                .is_some_and(|x| x.size(true) <= max_size)
+            || self.datagrams.outgoing.can_send_1rtt(max_size)
     }
 
     /// Update counters to account for a packet becoming acknowledged, lost, or abandoned
@@ -4066,6 +4113,92 @@ fn negotiate_max_idle_timeout(x: Option<VarInt>, y: Option<VarInt>) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "rustls-ring")]
+    #[test]
+    fn large_initial_token_leaves_room_for_close() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.cert.der().clone()).unwrap();
+        let config = crate::ClientConfig::with_root_certificates(Arc::new(roots)).unwrap();
+        // With 40 bytes of header overhead, a 16-byte tag, and a 35-byte ACK,
+        // a 1084-byte token leaves exactly ConnectionClose::SIZE_BOUND bytes.
+        for (token_len, ack_fits) in [
+            (1083, true),
+            (1084, true),
+            (1085, false),
+            (1100, false),
+            // Exactly enough frame space for CONNECTION_CLOSE alone.
+            (1119, false),
+        ] {
+            config
+                .token_store
+                .insert("localhost", vec![0; token_len].into());
+            let mut endpoint =
+                crate::Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+            let now = Instant::now();
+            let (_, mut conn) = endpoint
+                .connect(
+                    now,
+                    config.clone(),
+                    "[::1]:4433".parse().unwrap(),
+                    "localhost",
+                )
+                .unwrap();
+            let keys = conn
+                .crypto
+                .initial_keys(&conn.initial_dst_cid, Side::Server);
+            let space = &mut conn.spaces[SpaceId::Initial];
+            for pn in (0..32).step_by(2) {
+                space.pending_acks.insert_one(pn, now);
+                space.dedup.insert(pn);
+                space
+                    .pending_acks
+                    .packet_received(now, pn, true, &space.dedup);
+            }
+            conn.close(now, 0u32.into(), Bytes::new());
+            let mut buf = Vec::new();
+            assert!(conn.poll_transmit(now, 1, &mut buf).is_some());
+            assert!(buf.len() <= 1200);
+            assert!(!conn.close);
+
+            let (packet, rest) = PartialDecode::new(
+                buf.as_slice().into(),
+                &FixedLengthConnectionIdParser::new(0),
+                crate::DEFAULT_SUPPORTED_VERSIONS,
+                false,
+            )
+            .unwrap();
+            assert!(rest.is_none());
+            let mut packet = packet.finish(Some(&*keys.header.remote)).unwrap();
+            assert_eq!(packet.header_data.len(), 40 + token_len);
+            keys.packet
+                .remote
+                .decrypt(0, &packet.header_data, &mut packet.payload)
+                .unwrap();
+            let mut frames = frame::Iter::new(packet.payload.freeze())
+                .unwrap()
+                .map(Result::unwrap)
+                .filter(|frame| !matches!(frame, Frame::Padding));
+            if ack_fits {
+                assert!(
+                    matches!(frames.next(), Some(Frame::Ack(_))),
+                    "token {token_len}"
+                );
+            }
+            assert!(
+                matches!(
+                    frames.next(),
+                    Some(Frame::Close(Close::Connection(frame::ConnectionClose {
+                        error_code: TransportErrorCode::APPLICATION_ERROR,
+                        ..
+                    })))
+                ),
+                "token {token_len}"
+            );
+            assert!(frames.next().is_none());
+        }
+    }
 
     #[test]
     fn negotiate_max_idle_timeout_commutative() {

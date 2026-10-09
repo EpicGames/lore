@@ -12,7 +12,7 @@ use std::{
 };
 
 use bytes::{Buf, BufMut};
-use rand::{Rng as _, RngCore, seq::SliceRandom as _};
+use rand::{Rng, RngExt, seq::SliceRandom as _};
 use thiserror::Error;
 
 use crate::{
@@ -148,7 +148,7 @@ impl TransportParameters {
         cid_gen: &dyn ConnectionIdGenerator,
         initial_src_cid: ConnectionId,
         server_config: Option<&ServerConfig>,
-        rng: &mut impl RngCore,
+        rng: &mut impl Rng,
     ) -> Self {
         Self {
             initial_src_cid: Some(initial_src_cid),
@@ -435,6 +435,8 @@ impl TransportParameters {
                 continue;
             };
 
+            let remaining_before = r.remaining();
+
             match id {
                 TransportParameterId::OriginalDestinationConnectionId => {
                     decode_cid(len, &mut params.original_dst_cid, r)?
@@ -492,6 +494,10 @@ impl TransportParameters {
                     }
                     apply_params!(parse);
                 }
+            }
+
+            if remaining_before - r.remaining() != len {
+                return Err(Error::Malformed);
             }
         }
 
@@ -556,7 +562,7 @@ impl ReservedTransportParameter {
     /// The implementation is inspired by quic-go and quiche:
     /// 1. <https://github.com/quic-go/quic-go/blob/3e0a67b2476e1819752f04d75968de042b197b56/internal/wire/transport_parameters.go#L338-L344>
     /// 2. <https://github.com/google/quiche/blob/cb1090b20c40e2f0815107857324e99acf6ec567/quiche/quic/core/crypto/transport_parameters.cc#L843-L860>
-    fn random(rng: &mut impl RngCore) -> Self {
+    fn random(rng: &mut impl Rng) -> Self {
         let id = Self::generate_reserved_id(rng);
 
         let payload_len = rng.random_range(0..Self::MAX_PAYLOAD_LEN);
@@ -584,7 +590,7 @@ impl ReservedTransportParameter {
     /// Reserved transport parameter identifiers are used to test compliance with the requirement
     /// that unknown transport parameters must be ignored by peers.
     /// See: <https://www.rfc-editor.org/rfc/rfc9000.html#section-18.1> and <https://www.rfc-editor.org/rfc/rfc9000.html#section-22.3>
-    fn generate_reserved_id(rng: &mut impl RngCore) -> VarInt {
+    fn generate_reserved_id(rng: &mut impl Rng) -> VarInt {
         let id = {
             let rand = rng.random_range(0u64..(1 << 62) - 27);
             let n = rand / 31;
@@ -720,6 +726,10 @@ fn decode_cid(len: usize, value: &mut Option<ConnectionId>, r: &mut impl Buf) ->
 
 #[cfg(test)]
 mod test {
+    use std::convert::Infallible;
+
+    use rand::TryRng;
+
     use super::*;
 
     #[test]
@@ -783,21 +793,22 @@ mod test {
 
     struct StepRng(u64);
 
-    impl RngCore for StepRng {
+    impl TryRng for StepRng {
+        type Error = Infallible;
+
         #[inline]
-        fn next_u32(&mut self) -> u32 {
-            self.next_u64() as u32
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(self.next_u64() as u32)
         }
 
         #[inline]
-        fn next_u64(&mut self) -> u64 {
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
             let res = self.0;
             self.0 = self.0.wrapping_add(1);
-            res
+            Ok(res)
         }
 
-        #[inline]
-        fn fill_bytes(&mut self, dst: &mut [u8]) {
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
             let mut left = dst;
             while left.len() >= 8 {
                 let (l, r) = left.split_at_mut(8);
@@ -808,6 +819,8 @@ mod test {
             if n > 0 {
                 left.copy_from_slice(&self.next_u32().to_le_bytes()[..n]);
             }
+
+            Ok(())
         }
     }
 
@@ -856,6 +869,62 @@ mod test {
                 Err(Error::IllegalValue)
             );
         }
+    }
+
+    #[test]
+    fn read_length_mismatch() {
+        // `max_datagram_frame_size` claims three bytes of value but encodes a one-byte `VarInt`,
+        // so a whole `disable_active_migration` parameter fits inside its declared length.
+        let mut buf = Vec::new();
+        buf.write_var(TransportParameterId::MaxDatagramFrameSize as u64);
+        buf.write_var(3);
+        buf.write(VarInt::from_u32(0));
+        buf.write_var(TransportParameterId::DisableActiveMigration as u64);
+        buf.write_var(0);
+        assert_eq!(
+            TransportParameters::read(Side::Server, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn read_min_ack_delay_length_mismatch() {
+        // `min_ack_delay` claims no value at all, so its `VarInt` starts on the parameter that
+        // follows it.
+        let mut buf = Vec::new();
+        buf.write_var(TransportParameterId::MinAckDelayDraft07 as u64);
+        buf.write_var(0);
+        buf.write_var(TransportParameterId::InitialMaxData as u64);
+        buf.write_var(1);
+        buf.write(VarInt::from_u32(7));
+        assert_eq!(
+            TransportParameters::read(Side::Server, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
+    }
+
+    #[test]
+    fn read_preferred_address_length_mismatch() {
+        // `preferred_address` has a fixed size for a given connection ID length, so bytes past
+        // that size are read as a parameter of their own.
+        let address = PreferredAddress {
+            address_v4: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 42)),
+            address_v6: None,
+            connection_id: ConnectionId::new(&[0x42]),
+            stateless_reset_token: [0xab; RESET_TOKEN_SIZE].into(),
+        };
+        let mut value = Vec::new();
+        address.write(&mut value);
+        value.write_var(TransportParameterId::DisableActiveMigration as u64);
+        value.write_var(0);
+        let mut buf = Vec::new();
+        buf.write_var(TransportParameterId::PreferredAddress as u64);
+        buf.write_var(value.len() as u64);
+        buf.extend_from_slice(&value);
+        assert_eq!(
+            TransportParameters::read(Side::Client, &mut buf.as_slice()),
+            Err(Error::Malformed)
+        );
     }
 
     #[test]

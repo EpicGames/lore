@@ -83,9 +83,14 @@ impl MtuDiscovery {
         self.current_mtu = self.current_mtu.min(peer_max_udp_payload_size);
 
         if let Some(state) = self.state.as_mut() {
-            // MTUD is only active after the connection has been fully established, so it is
-            // guaranteed we will receive the peer's transport parameters before we start probing
-            debug_assert!(matches!(state.phase, Phase::Initial));
+            // It is possible for black hole detection to trigger before the connection has been
+            // fully established, if the initial MTU is greater the minimum MTU. We should never
+            // send probes before the connection has been fully established and we have received
+            // the peer's transport parameters though.
+            debug_assert!(
+                !matches!(state.phase, Phase::Searching(_)),
+                "Transport parameters received after MTU probing started"
+            );
             state.peer_max_udp_payload_size = peer_max_udp_payload_size;
         }
     }
@@ -398,9 +403,16 @@ impl BlackHoleDetector {
     }
 
     fn on_non_probe_acked(&mut self, pn: u64, len: u16) {
-        if len <= self.acked_mtu {
+        if len < self.acked_mtu {
             // We've already seen a larger packet since the most recent suspicious loss burst;
             // nothing to do.
+            return;
+        }
+        if len == self.acked_mtu {
+            // Another delivery of the largest size seen since the most recent suspicious loss
+            // burst. It doesn't raise `acked_mtu`, but loss bursts that precede it cannot be
+            // explained by an MTU reduction either, so remember it as the newest such delivery.
+            self.largest_post_loss_packet = self.largest_post_loss_packet.max(pn);
             return;
         }
         self.acked_mtu = len;
@@ -450,9 +462,9 @@ impl BlackHoleDetector {
         };
         // If a loss burst contains a packet smaller than the minimum MTU or a more recently
         // transmitted packet, it is not suspicious.
-        if burst.smallest_packet_size < self.min_mtu
+        if burst.smallest_packet_size <= self.min_mtu
             || (burst.latest_non_probe < self.largest_post_loss_packet
-                && burst.smallest_packet_size < self.acked_mtu)
+                && burst.smallest_packet_size <= self.acked_mtu)
         {
             return;
         }
@@ -733,10 +745,14 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic]
-    fn mtu_discovery_with_peer_max_udp_payload_size_after_search_panics() {
+    #[should_panic(expected = "Transport parameters received after MTU probing started")]
+    fn mtu_discovery_with_peer_max_udp_payload_size_during_search_panics() {
         let mut mtud = default_mtud();
-        drive_to_completion(&mut mtud, Instant::now(), 1500);
+        assert!(mtud.poll_transmit(Instant::now(), 0).is_some());
+        assert!(matches!(
+            mtud.state.as_ref().unwrap().phase,
+            Phase::Searching(_)
+        ));
         mtud.on_peer_max_udp_payload_size_received(1300);
     }
 
@@ -952,6 +968,36 @@ mod tests {
         assert!(
             bhd.black_hole_detected(),
             "1300 byte losses following a 1400 byte delivery are suspicious"
+        );
+    }
+
+    // Loss bursts that precede the delivery of another packet of the largest size seen so far
+    // are not suspicious: that delivery proves the path still carries packets of that size, even
+    // though it does not raise `acked_mtu`. This is the steady state of a bulk transfer, where
+    // every packet is full-size and one ACK typically both confirms new packets and reveals
+    // older losses.
+    #[test]
+    fn equal_size_delivery_clears_preceding_bursts() {
+        let mut bhd = BlackHoleDetector::new(1200);
+        // A full-size packet was delivered long ago...
+        bhd.on_non_probe_acked(0, 1400);
+        // ...and a newer full-size packet is delivered now, before loss detection runs
+        bhd.on_non_probe_acked((BLACK_HOLE_THRESHOLD + 1) as u64 * 2, 1400);
+        // Loss detection then reveals bursts that were transmitted before that delivery
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost(i as u64 * 2 + 1, 1400);
+        }
+        assert!(
+            !bhd.black_hole_detected(),
+            "full-size losses preceding a full-size delivery are not suspicious"
+        );
+        // Full-size losses transmitted after the last delivery are still suspicious
+        for i in 0..(BLACK_HOLE_THRESHOLD + 1) {
+            bhd.on_non_probe_lost((BLACK_HOLE_THRESHOLD as u64 + 1 + i as u64) * 2 + 1, 1400);
+        }
+        assert!(
+            bhd.black_hole_detected(),
+            "full-size losses following the last full-size delivery are suspicious"
         );
     }
 

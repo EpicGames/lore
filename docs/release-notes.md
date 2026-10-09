@@ -34,6 +34,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- The vendored `quinn-proto` moves to 0.11.19, with `quinn` 0.11.12 and `quinn-udp` 0.5.16. A peer's minimum ACK delay
+  can no longer panic an endpoint that has the ACK frequency extension enabled, and the remote memory-exhaustion,
+  stream-limit bypass and Retry-token issues upstream fixed along the way are closed with it. The MTU black-hole
+  detector no longer reads the ordinary congestion loss of a bulk transfer as a black hole, nor keeps a connection at
+  the minimum MTU once it has fired. A sender held back by flow control now says so with `DATA_BLOCKED` and
+  `STREAM_DATA_BLOCKED`, a path reset also resets pacing, ACKs ride in packets carrying stream data, and path statistics
+  report the minimum RTT. The local `max_rtt` and `TransportErrorCode::is_crypto` additions carry over unchanged
 - `lore-storage`: the local store's Oodle migration leaves durably stored Oodle payloads in place rather than releasing
   them, so a group holding no local-only Oodle is not rewritten and the pass finishes sooner. A read that cannot decode
   one replaces it with the remote's copy

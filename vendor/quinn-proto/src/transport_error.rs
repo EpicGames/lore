@@ -1,12 +1,11 @@
 use std::fmt;
 
-use bytes::Buf;
-use bytes::BufMut;
+use bytes::{Buf, BufMut};
 
-use crate::coding::BufExt;
-use crate::coding::BufMutExt;
-use crate::coding::{self};
-use crate::frame;
+use crate::{
+    coding::{self, BufExt, BufMutExt},
+    frame,
+};
 
 /// Transport-level errors occur when a peer violates the protocol specification
 #[derive(Debug, Clone, Eq, PartialEq)]
