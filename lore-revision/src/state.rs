@@ -607,6 +607,14 @@ impl StateRuntime {
         }
     }
 
+    /// Node blocks the tree has, whether or not any of them is in memory.
+    fn block_count(&self) -> usize {
+        self.tree
+            .as_ref()
+            .map_or(0, |tree| tree.block_count as usize)
+            .max(self.block.len())
+    }
+
     /// Keeps `block` in memory, in place of the oldest block kept once there are
     /// [`MAX_CHECKED_FILE_METADATA_BLOCKS`].
     fn keep_checked_file_metadata(&mut self, block: &Arc<NodeFileMetadataBlock>) {
@@ -1011,12 +1019,11 @@ impl State {
             });
         }
 
-        let mut block_hash_bytes = {
-            let lock = self.runtime.read();
-            // Resize buffer with empty hashes if needed
-            lock.block_address
-                .clone_and_resize_zeroed::<Hash>(block_count)
-        };
+        let hash_node = self.tree_readonly()?.hash_node;
+        let mut block_hash_bytes = self
+            .node_block_addresses(repository, hash_node, block_count)
+            .await?
+            .clone_and_resize_zeroed::<Hash>(block_count);
         {
             let block_hash = block_hash_bytes.as_type_slice_mut();
 
@@ -1384,15 +1391,9 @@ impl State {
         Ok(None)
     }
 
+    /// Node blocks the tree has, whether or not any of them is in memory.
     pub fn block_count(&self) -> usize {
-        let runtime = self.runtime.read();
-        let mut block_count = runtime.block.len();
-        if let Some(tree) = runtime.tree
-            && tree.block_count > block_count as u32
-        {
-            block_count = tree.block_count as usize;
-        }
-        block_count
+        self.runtime.read().block_count()
     }
 
     pub async fn block(
@@ -1530,29 +1531,9 @@ impl State {
                     return Ok(block);
                 }
 
-                // TODO(mjansson): To support huge trees we might want to selectively
-                // read the block addresses instead of all in one big buffer
-                lore_trace!("Deserialize block address list");
-                let address = Address::zero_context_hash(hash_node);
-                block_hash_bytes = immutable::read(
-                    repository.clone(),
-                    address,
-                    None, /* Read the full array of block hashes */
-                    immutable::read_options_from_repository(&repository)
-                        .with_cache()
-                        .with_priority(),
-                )
-                .await
-                .forward::<StateError>("Failed to deserialize node block list")?;
-                if block_hash_bytes.count::<Hash>() < block_count {
-                    block_hash_bytes = block_hash_bytes
-                        .clone_and_resize_zeroed::<Hash>(block_count)
-                        .freeze();
-                }
-                {
-                    self.runtime.write().block_address = block_hash_bytes.clone();
-                }
-                lore_trace!("Deserialized block address list");
+                block_hash_bytes = self
+                    .read_node_block_addresses(&repository, hash_node, block_count)
+                    .await?;
             }
         }
 
@@ -1915,6 +1896,69 @@ impl State {
                 .freeze();
         }
         self.runtime.write().block_file_metadata_address = addresses.clone();
+        Ok(addresses)
+    }
+
+    /// The node block address list, read from the store once: as
+    /// [`Self::file_metadata_addresses`], for the node blocks, under `block_deserialize`.
+    ///
+    /// Serialize writes the list from this, so a State that loaded no block still writes the
+    /// stored address of every block it did not change.
+    async fn node_block_addresses(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        hash_node: Hash,
+        block_count: usize,
+    ) -> Result<Bytes, StateError> {
+        {
+            let held = self.runtime.read().block_address.clone();
+            if !held.is_empty() || hash_node.is_zero() {
+                return Ok(held);
+            }
+        }
+
+        let _guard = self
+            .block_deserialize
+            .acquire()
+            .await
+            .internal("Failed to deserialize node block")?;
+        {
+            let held = self.runtime.read().block_address.clone();
+            if !held.is_empty() {
+                return Ok(held);
+            }
+        }
+        Box::pin(self.read_node_block_addresses(repository, hash_node, block_count)).await
+    }
+
+    /// Reads the node block address list `hash_node` names, padded with zero addresses to
+    /// `block_count`, and holds it. The caller holds `block_deserialize`.
+    async fn read_node_block_addresses(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        hash_node: Hash,
+        block_count: usize,
+    ) -> Result<Bytes, StateError> {
+        // TODO(mjansson): To support huge trees we might want to selectively
+        // read the block addresses instead of all in one big buffer
+        lore_trace!("Deserialize block address list");
+        let mut addresses = immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(hash_node),
+            None, /* Read the full array of block hashes */
+            immutable::read_options_from_repository(repository)
+                .with_cache()
+                .with_priority(),
+        )
+        .await
+        .forward::<StateError>("Failed to deserialize node block list")?;
+        if addresses.count::<Hash>() < block_count {
+            addresses = addresses
+                .clone_and_resize_zeroed::<Hash>(block_count)
+                .freeze();
+        }
+        self.runtime.write().block_address = addresses.clone();
+        lore_trace!("Deserialized block address list");
         Ok(addresses)
     }
 
@@ -2420,29 +2464,30 @@ impl State {
     /// allocation permit nothing else can take a slot from this one. The caller splices it in
     /// with [`Self::push_unused_block_list`] once it has taken its own, as the recycling path
     /// does.
+    ///
+    /// The block goes at [`Self::block_count`], past every block the tree has, whether or not
+    /// any of them is in memory. It is zeroed before the runtime write lock is taken, since every
+    /// reader of the State waits on that lock.
+    #[lore_macro::test_pub]
     fn allocate_fresh_block(&self) -> Result<(usize, Arc<NodeBlock>), StateError> {
+        let block = Arc::new(NodeBlock::new_zeroed());
+        block.write().mark_dirty();
         let mut runtime = self.runtime.write();
-        let block_index = runtime.block.len();
+        let block_index = runtime.block_count();
         if block_index >= MAX_TREE_BLOCK_COUNT as usize {
             return Err(StateError::from(Oversized {
                 context: format!("tree block count limit reached: {MAX_TREE_BLOCK_COUNT}"),
             }));
         }
-        let block = Arc::new(NodeBlock::new_zeroed());
         if block_index == 0 {
-            let mut block_writer = block.write();
-            block_writer.node_block().node_count = 1;
+            block.write().node_block().node_count = 1;
         }
+        runtime.block.resize(block_index, Weak::default());
         runtime.block.push(Arc::downgrade(&block));
 
         if let Some(tree) = runtime.tree.as_mut() {
             tree.block_count = 1 + block_index as u32;
             tree.flags |= TreeFlags::Dirty;
-        }
-        {
-            let mut block_writer = block.write();
-            block_writer.node_block().block_unused_next = INVALID_BLOCK;
-            block_writer.mark_dirty();
         }
         drop(runtime);
         self.block_modified(block.clone(), block_index);

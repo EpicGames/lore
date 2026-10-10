@@ -1857,3 +1857,89 @@ async fn tree_readers_hold_its_fields_not_the_tree() {
         })
         .await;
 }
+
+/// Files under `fill/` in [`stored_with_two_blocks`]: with the root and `fill/`, they run past the
+/// first node block.
+const FILL_NODES: usize = BLOCK_NODE_COUNT;
+
+/// A stored revision of two node blocks: the root holds `fill/`, and `fill/` holds
+/// [`FILL_NODES`] files running into the second.
+async fn stored_with_two_blocks(repository: &Arc<RepositoryContext>) -> Hash {
+    let state = State::new();
+    let fill = add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "fill",
+        NodeFlags::NoFlags,
+    )
+    .await;
+    for index in 0..FILL_NODES {
+        let name = format!("f{index}");
+        add_dirty_node(&state, repository.clone(), fill, &name, NodeFlags::File).await;
+    }
+    let token = repository
+        .try_write_token()
+        .expect("a null context carries a write token");
+    state
+        .serialize(repository.clone(), token)
+        .await
+        .expect("the State serializes")
+}
+
+/// A State with no node block in memory puts a fresh block past the tree's blocks, its block
+/// count grows by one rather than shrinking to the fresh block's, and serializing it keeps the
+/// blocks it never loaded.
+#[tokio::test]
+async fn a_fresh_block_of_a_state_with_no_block_in_memory_goes_past_the_trees_blocks() {
+    let repository = null_repository().await;
+    let stored = stored_with_two_blocks(&repository).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    let tree = state.tree(repository.clone()).await.expect("the tree");
+    let count = state.block_count();
+    assert_eq!(count, tree.block_count as usize);
+    assert_eq!(count, 2, "the tree holds two blocks");
+
+    let (index, block) = state.allocate_fresh_block().expect("a fresh block");
+    assert_eq!(index, count, "the fresh block goes past the tree's blocks");
+    assert_eq!(
+        state.block_count(),
+        count + 1,
+        "the block count grows by one"
+    );
+    let found = state
+        .block(repository.clone(), index)
+        .await
+        .expect("the fresh block");
+    assert!(
+        Arc::ptr_eq(&found, &block),
+        "the fresh block is found at its index"
+    );
+
+    state.mark_dirty();
+    let token = repository
+        .try_write_token()
+        .expect("a null context carries a write token");
+    let reserialized = state
+        .serialize(repository.clone(), token)
+        .await
+        .expect("the State serializes");
+    let reloaded = State::deserialize(repository.clone(), reserialized)
+        .await
+        .expect("the State reloads");
+    let fill = reloaded
+        .find_subnode(repository.clone(), ROOT_NODE, hash::hash_string("fill"))
+        .await
+        .expect("the root still holds fill");
+    assert_eq!(
+        reloaded
+            .node_children(repository, fill)
+            .await
+            .expect("fill's children")
+            .len(),
+        FILL_NODES,
+        "fill still holds its files"
+    );
+}
