@@ -29,32 +29,11 @@ use lore_transport::quic::command_header::COMMAND_HEADER_SIZE;
 use lore_transport::quic::command_header::CommandHeader;
 use quinn::Chunk;
 
+mod common;
+
+use common::cpu_time;
+
 const MAX_CHUNK_SIZE: usize = 1024 * 1024;
-
-/// Process CPU time, on the platforms that expose it.
-///
-/// `getrusage` is Unix-only. Elsewhere this is `None` and the CPU column reports `NaN`, rather
-/// than a wall-clock stand-in that would read like a measurement.
-#[cfg(unix)]
-fn cpu_time() -> Option<Duration> {
-    // SAFETY: `getrusage` only writes into the zeroed struct handed to it.
-    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
-    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
-    assert_eq!(result, 0, "getrusage failed");
-
-    let as_duration = |time: libc::timeval| {
-        Duration::new(
-            time.tv_sec as u64,
-            (time.tv_usec as u32).saturating_mul(1000),
-        )
-    };
-    Some(as_duration(usage.ru_utime) + as_duration(usage.ru_stime))
-}
-
-#[cfg(not(unix))]
-fn cpu_time() -> Option<Duration> {
-    None
-}
 
 struct Random(u64);
 

@@ -423,6 +423,11 @@ impl QuicConnection {
     pub async fn connection_stats(&self) -> ConnectionStats {
         self.connection.read().await.connection.stats().into()
     }
+
+    /// Requests outstanding on each stream, as the stream selection sees them.
+    pub fn stream_inflight(&self) -> [u64; STREAM_COUNT as usize] {
+        std::array::from_fn(|stream| self.stream_inflight[stream].load(Ordering::Relaxed))
+    }
 }
 
 #[derive(Debug, Error)]
