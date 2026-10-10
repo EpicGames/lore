@@ -156,7 +156,7 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 ///
 /// The context holds the session it is handed, so the resolver holds the context
 /// weakly: a strong reference there is a cycle neither end can free, and a context
-/// gone by the time a session resolves has no pool left to pick from. A call that
+/// gone by the time a session resolves has no pool left to take sessions from. A call that
 /// takes the session holds the context until it completes.
 #[lore_macro::test_pub]
 fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
@@ -182,7 +182,10 @@ fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSes
     }))
 }
 
-/// A pick from the pool the repository context holds, resolving it on first use.
+/// A session over the pool the repository context holds, resolving the pool on first use.
+///
+/// Each operation takes the next session of the pool, so the reads of a command spread over
+/// every storage connection.
 ///
 /// Going through [`RepositoryContext::session_pool`] rather than the connection is
 /// the point: the connection's own lookup owns a key and re-pins the pool, and
@@ -193,7 +196,9 @@ async fn pooled_session(
     repository: &Arc<RepositoryContext>,
     correlation_id: &str,
 ) -> Result<Arc<StorageSession>, ProtocolError> {
-    Ok(repository.session_pool(correlation_id).await?.pick())
+    Ok(Arc::new(StorageSession::pooled(
+        repository.session_pool(correlation_id).await?,
+    )))
 }
 
 // ---------------------------------------------------------------------------

@@ -676,7 +676,8 @@ pub struct LoreGlobalArgs {
     pub remote: u8,
     /// Dry run mode, only report what would have been changed and perform no changes to local file system
     pub dry_run: u8,
-    /// Maximum number of parallel connections for bulk data transfer
+    /// Number of parallel storage connections for bulk data transfer, 0 for the default of 1.
+    /// At most 10 are opened
     pub max_connections: u32,
     /// Search limit when iterating revisions
     pub search_limit: u32,

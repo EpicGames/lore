@@ -29,6 +29,12 @@ use crate::session::StorageSession;
 use crate::traits::*;
 use crate::types::*;
 
+/// Most storage connections a command opens.
+///
+/// The server paces each QUIC connection on its own, so one connection to a distant remote
+/// delivers a few MiB/s however many requests it carries, and bulk reads scale with the number
+/// of connections they are spread over. They connect in parallel, and storage is ready once the
+/// slowest of them has.
 pub static MAX_STORAGE_CONNECTIONS: usize = 10;
 pub static DEFAULT_PROTOCOL: &str = "lores";
 
@@ -435,27 +441,14 @@ async fn connect_impl(
 
     let credentials = Arc::new(SuppliedCredentials::new(&identity_token, &access_token));
 
-    let connection = Arc::new(Connection {
-        remote_url: remote_url.clone(),
-        auth_url: auth_url.clone(),
-        identity: identity.clone(),
-        credentials: credentials.clone(),
-        protocol: protocol.clone(),
+    let connection = Arc::new(Connection::unconnected(
+        remote_url.clone(),
+        auth_url.clone(),
+        identity.clone(),
+        credentials.clone(),
         environment,
-        storage_ready: ServiceReady::new(),
-        revision_ready: ServiceReady::new(),
-        lock_ready: ServiceReady::new(),
-        repository_ready: ServiceReady::new(),
-        storage_building: tokio::sync::Mutex::new(None),
-        storage: parking_lot::RwLock::new(None),
-        revision: dashmap::DashMap::new(),
-        admin: dashmap::DashMap::new(),
-        lock: dashmap::DashMap::new(),
-        repository: tokio::sync::Mutex::new(None),
-        session_cache: dashmap::DashMap::new(),
-        connector: tokio::sync::Mutex::new(None),
-        stale: std::sync::atomic::AtomicBool::new(false),
-    });
+        protocol.clone(),
+    ));
 
     let subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -904,6 +897,58 @@ impl Drop for Connection {
 }
 
 impl Connection {
+    /// A connection to `remote_url` that has connected to nothing yet: every service pending and
+    /// every cache empty.
+    fn unconnected(
+        remote_url: Url,
+        auth_url: String,
+        identity: String,
+        credentials: Arc<SuppliedCredentials>,
+        environment: EnvironmentConfig,
+        protocol: Arc<dyn Protocol>,
+    ) -> Self {
+        Connection {
+            remote_url,
+            auth_url,
+            identity,
+            credentials,
+            protocol,
+            environment,
+            storage_ready: ServiceReady::new(),
+            revision_ready: ServiceReady::new(),
+            lock_ready: ServiceReady::new(),
+            repository_ready: ServiceReady::new(),
+            storage_building: tokio::sync::Mutex::new(None),
+            storage: parking_lot::RwLock::new(None),
+            revision: dashmap::DashMap::new(),
+            admin: dashmap::DashMap::new(),
+            lock: dashmap::DashMap::new(),
+            repository: tokio::sync::Mutex::new(None),
+            session_cache: dashmap::DashMap::new(),
+            connector: tokio::sync::Mutex::new(None),
+            stale: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// A connection over `storage` that reaches no other service, for tests that connect
+    /// storage themselves.
+    #[cfg(feature = "test-util")]
+    pub fn detached(storage: Vec<Arc<dyn Storage>>) -> Arc<Self> {
+        let connection = Arc::new(Connection::unconnected(
+            Url::parse("lore://detached.invalid").expect("valid URL"),
+            String::new(),
+            String::new(),
+            Arc::default(),
+            EnvironmentConfig::default(),
+            Arc::new(LoreProtocol::default()),
+        ));
+        if !storage.is_empty() {
+            *connection.storage.write() = Some(Arc::new(StorageConnector::new(storage)));
+        }
+        connection.storage_ready.complete(Ok(()));
+        connection
+    }
+
     pub fn remote_url(&self) -> &str {
         self.remote_url.as_str()
     }
@@ -1028,17 +1073,21 @@ impl Connection {
     }
 
     /// Creates or reuses a `SessionPool` for the given partition and correlation
-    /// ID, returning a round-robin-picked session from it. The pool is pinned in
-    /// the connection's session cache so the `Weak` in `StorageConnector` stays
-    /// upgradeable for subsequent calls within the same command, keeping every
-    /// session in the pool alive without start/stop churn. Call
-    /// `release_session()` when the API call completes to release the pool.
+    /// ID, returning a session over it that runs each operation on the next
+    /// session of the pool, so a caller's operations spread over every storage
+    /// connection. The pool is pinned in the connection's session cache so the
+    /// `Weak` in `StorageConnector` stays upgradeable for subsequent calls within
+    /// the same command, keeping every session in the pool alive without
+    /// start/stop churn. Call `release_session()` when the API call completes to
+    /// release the pool.
     pub async fn session(
         self: &Arc<Self>,
         partition: Partition,
         correlation_id: &str,
     ) -> Result<Arc<StorageSession>, ProtocolError> {
-        Ok(self.session_pool(partition, correlation_id).await?.pick())
+        Ok(Arc::new(StorageSession::pooled(
+            self.session_pool(partition, correlation_id).await?,
+        )))
     }
 
     /// The pool of sessions for `(partition, correlation_id)`, pinned here so the
@@ -1093,16 +1142,17 @@ impl Connection {
             .remove(&(partition, correlation_id.to_string()));
     }
 
-    /// Drop every pinned `SessionPool`. Once no other strong refs hold the
-    /// pools alive (typically true between operations, or after callers
-    /// re-resolve their `StorageSession`), the `Weak`s in `StorageConnector`
-    /// fall out of scope and the next `Connection::session` call rebuilds
-    /// the pool — re-running `session_start` against the current connection
-    /// to obtain a fresh `session_id` the server actually knows about.
-    /// Called from `StorageSession::invalidate` when a server response
+    /// Mark every pinned `SessionPool` stale and drop it, so the next
+    /// `Connection::session` call rebuilds the pool even while another holder
+    /// keeps the old one — re-running `session_start` against the current
+    /// connection to obtain a fresh `session_id` the server actually knows
+    /// about. Called from `StorageSession::invalidate` when a server response
     /// indicates the session-id is stale (e.g. after a QUIC reconnect that
     /// rotated the server's `SessionMap`).
     pub fn invalidate_all_sessions(&self) {
+        for pool in self.session_cache.iter() {
+            pool.mark_stale();
+        }
         self.session_cache.clear();
     }
 

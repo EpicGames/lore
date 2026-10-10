@@ -101,7 +101,7 @@ pub struct LoreCli {
     #[clap(global = true, hide = true, long, action)]
     pub nocompress: bool,
 
-    /// Set maximum number of parallel connections
+    /// Set the number of parallel storage connections (default 1, at most 10)
     #[clap(global = true, long)]
     pub max_connections: Option<u32>,
 

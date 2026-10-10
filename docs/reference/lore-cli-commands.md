@@ -230,7 +230,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity
   the token was issued to
 * `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
-* `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::error::Disconnected;
@@ -60,34 +62,61 @@ fn absent_address() -> Address {
     }
 }
 
-/// A pool for the context to hold, with the strong reference left to the caller
-/// and the one session in it to compare a pick against. That session is never
-/// resolved: the test asks which pool answered, not what it yields.
-fn held_pool() -> (Arc<lore_transport::SessionPool>, Arc<StorageSession>) {
+/// A pool for the context to hold, with the strong reference left to the caller. Its one
+/// session is never resolved: the test asks which pool answered, not what it yields.
+fn held_pool() -> Arc<lore_transport::SessionPool> {
     let session = Arc::new(StorageSession::pending(|| async {
         Err(ProtocolError::internal(
             "a pooled session this test never resolves",
         ))
     }));
-    (
-        Arc::new(lore_transport::SessionPool::new(vec![session.clone()])),
-        session,
-    )
+    Arc::new(lore_transport::SessionPool::new(vec![session]))
 }
 
-/// What a read or write ends up using comes from the pool the context holds.
-/// This context's connect has failed, so reaching the pool at all is proof the
-/// session was not looked up through the connection per call.
+/// A session that counts how often it is resolved, and fails: the test asks which session
+/// answered, not what it yields.
+fn counting_session(resolutions: Arc<AtomicUsize>) -> Arc<StorageSession> {
+    Arc::new(StorageSession::pending(move || {
+        let resolutions = resolutions.clone();
+        async move {
+            resolutions.fetch_add(1, Ordering::Relaxed);
+            Err(ProtocolError::internal(
+                "a pooled session this test never resolves",
+            ))
+        }
+    }))
+}
+
+/// What a read or write ends up using comes from the pool the context holds, one session of
+/// it per operation, so a command's reads spread over every connection the pool spans. This
+/// context's connect has failed, so reaching the pool at all is proof the session was not
+/// looked up through the connection per call.
 #[tokio::test]
-async fn a_pooled_session_comes_from_the_pool_the_context_holds() {
+async fn a_pooled_session_takes_turns_over_the_pool_the_context_holds() {
     let context = context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
-    let (pool, pooled) = held_pool();
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+    let pool = Arc::new(lore_transport::SessionPool::new(vec![
+        counting_session(first.clone()),
+        counting_session(second.clone()),
+    ]));
     context.set_session_pool(&pool);
 
     let session = pooled_session(&context, "correlation")
         .await
         .expect("the pool the context holds answers, remote or no remote");
-    assert!(Arc::ptr_eq(&session, &pooled));
+    for _ in 0..4 {
+        assert!(session.get(&absent_address()).await.is_err());
+    }
+
+    assert_eq!(
+        (
+            first.load(Ordering::Relaxed),
+            second.load(Ordering::Relaxed)
+        ),
+        (1, 1),
+        "each session of the pool is reached and resolved once"
+    );
 }
 
 /// A context with no remote has nothing a session could resolve to, so the
@@ -175,7 +204,7 @@ async fn a_miss_on_an_offline_context_reports_the_address_not_found() {
 #[tokio::test]
 async fn a_read_handed_the_last_context_reference_reaches_the_pool() {
     let context = context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
-    let (pool, _pooled) = held_pool();
+    let pool = held_pool();
     context.set_session_pool(&pool);
 
     let err =

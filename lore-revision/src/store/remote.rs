@@ -76,8 +76,9 @@ impl RemoteImmutableStore {
         let connection = self.connection(partition).await?;
         let correlation_id = execution_context().globals().correlation_id.to_string();
         connection
-            .session(partition, &correlation_id)
+            .session_pool(partition, &correlation_id)
             .await
+            .map(|pool| pool.pick())
             .forward_with(|| format!("creating session to remote store at {}", self.remote_url))
     }
 
@@ -338,8 +339,9 @@ impl RemoteMutableStore {
         drop(lock);
         let correlation_id = execution_context().globals().correlation_id.to_string();
         connection
-            .session(partition, &correlation_id)
+            .session_pool(partition, &correlation_id)
             .await
+            .map(|pool| pool.pick())
             .forward_with(|| format!("creating session to remote store at {}", self.remote_url))
     }
 }

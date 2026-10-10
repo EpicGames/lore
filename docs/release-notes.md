@@ -43,6 +43,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- Remote reads and uploads spread over every storage connection a command opens. They all went through one connection
+  whatever `--max-connections` said
 - On Linux and macOS, two Lore services started at once no longer both run as the service. A service claims its
   socket name with a lock file beside the socket before it initializes, and one that finds the name claimed waits
   until the holder answers, then exits, so the commands that started either reach the same service

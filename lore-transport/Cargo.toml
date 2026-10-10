@@ -19,6 +19,7 @@ async-stream = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
+crossbeam = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }

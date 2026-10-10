@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
 use std::time::Duration;
 
 use lore_base::error::*;
@@ -7,6 +8,7 @@ use lore_base::types::*;
 use lore_error_set::ext::ResultExt;
 use lore_transport::connection::*;
 use lore_transport::error::ProtocolError;
+use lore_transport::session::StorageSession;
 use lore_transport::types::*;
 
 /// A long-lived process rotates the credentials it supplies. The connection
@@ -283,6 +285,97 @@ fn a_refusal_lasts_until_a_session_start_succeeds() {
     connector.mark_partition_authorized(partition);
     assert!(!connector.is_partition_refused(partition));
     assert!(connector.is_partition_authorized(partition));
+}
+
+/// A command's session takes turns over every storage connection, so bulk reads through it,
+/// such as a cache fill, are not held to the rate of the connection a single pick lands on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_spreads_requests_over_every_storage_connection() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_address;
+    use crate::quic::storage_service::test_server::test_partition;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(4).await);
+    let session = connection
+        .session(test_partition(), "correlation")
+        .await
+        .expect("session over the detached storage");
+
+    for index in 0..400 {
+        session.get(&test_address(index)).await.expect("fetch");
+    }
+
+    assert_eq!(server.gets_per_connection(), vec![100, 100, 100, 100]);
+}
+
+/// A reconnect numbers the server's sessions from 1 again, so the ids a stale pool holds may name
+/// the sessions its replacement starts. Replacing it stops none of them, and the replacement serves
+/// on every connection while the stale pool is still held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_pool_replaced_after_a_reconnect_leaves_its_replacement_serving() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_address;
+    use crate::quic::storage_service::test_server::test_partition;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(2).await);
+    let stale = connection
+        .session(test_partition(), "correlation")
+        .await
+        .expect("session over the detached storage");
+    stale.get(&test_address(0)).await.expect("fetch");
+
+    server.restart_sessions();
+    stale.invalidate().await;
+    let fresh = connection
+        .session(test_partition(), "correlation")
+        .await
+        .expect("a fresh session");
+
+    for index in 1..3 {
+        fresh
+            .get(&test_address(index))
+            .await
+            .expect("the fresh pool serves");
+    }
+    let gets = server.gets_per_connection();
+    assert!(
+        gets.iter().all(|&served| served > 0),
+        "a connection served nothing: {gets:?}"
+    );
+    drop(stale);
+}
+
+/// Invalidating a lazy session marks the pool it resolved to stale, so the next resolution starts
+/// a new pool even while another holder keeps the old one and its session ids.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalidated_pool_is_not_handed_out_again() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_address;
+    use crate::quic::storage_service::test_server::test_partition;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(2).await);
+    let resolving = connection.clone();
+    let lazy = StorageSession::pending(move || {
+        let connection = resolving.clone();
+        async move { connection.session(test_partition(), "correlation").await }
+    });
+    lazy.get(&test_address(0)).await.expect("fetch");
+    let held = connection
+        .session_pool(test_partition(), "correlation")
+        .await
+        .expect("the pool the lazy session resolved to");
+
+    lazy.invalidate().await;
+    let after = connection
+        .session_pool(test_partition(), "correlation")
+        .await
+        .expect("a pool after the invalidation");
+
+    assert!(held.is_stale());
+    assert!(!Arc::ptr_eq(&held, &after), "a fresh pool");
 }
 
 #[test]

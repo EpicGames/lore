@@ -619,7 +619,7 @@ pub struct RepositoryContext {
     is_layer: bool,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
-    /// The storage session pool this repository's reads and writes pick from,
+    /// The storage session pool this repository's reads and writes take sessions from,
     /// resolved on first use.
     ///
     /// Weak on purpose. The strong reference lives in the connection's session
@@ -1273,7 +1273,7 @@ impl RepositoryContext {
         self.lazy_session.write().get_or_insert_with(build).clone()
     }
 
-    /// The session pool if one is already resolved and still live, without
+    /// The session pool if one is already resolved, live and not stale, without
     /// touching the remote. `None` means "resolve it", not "there is none".
     ///
     /// Private so the pool is only ever reached through [`Self::session_pool`]. A
@@ -1282,7 +1282,10 @@ impl RepositoryContext {
     /// session resolution.
     #[lore_macro::test_pub]
     fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
-        self.session_pool.read().upgrade()
+        self.session_pool
+            .read()
+            .upgrade()
+            .filter(|pool| !pool.is_stale())
     }
 
     /// Hold `pool` as resolved, standing in for a resolution against a live remote.
