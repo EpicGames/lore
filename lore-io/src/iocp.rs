@@ -339,7 +339,7 @@ impl IocpDriver {
     /// a double free of the entry rather than a wrong byte count. Reporting the error at the open
     /// leaves the caller a backend to fall back to; guessing here would not.
     #[lore_macro::test_pub]
-    fn register(&self, file: &File) -> std::io::Result<()> {
+    pub(crate) fn register(&self, file: &File) -> std::io::Result<()> {
         let handle: HANDLE = file.as_raw_handle();
         // SAFETY: Calling OS functions. The handle is open and owned by `file`, and a completion
         // key of zero is what every operation here carries.

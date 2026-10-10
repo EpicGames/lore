@@ -253,6 +253,20 @@ impl IoDriver {
         Ok(IoFile::new(self.clone(), Arc::new(file)))
     }
 
+    /// Prepares `file`, which the caller opened, for this driver's operations as an open prepares
+    /// the files it opens: `iocp` binds it to the completion port, and the other backends need
+    /// nothing.
+    pub(crate) fn register(&self, file: &File) -> std::io::Result<()> {
+        match &*self.inner {
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.register(file),
+            _ => {
+                let _ = file;
+                Ok(())
+            }
+        }
+    }
+
     /// Opens a file and reads its first `head_len` bytes (or the whole
     /// file when smaller) in a single backend dispatch — open, stat,
     /// read. Returns the open file, its metadata, and the head bytes.

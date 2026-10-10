@@ -66,7 +66,7 @@ The capability this shape does not offer is reading into memory the caller alrea
 
 ## File handle operations
 
-`IoFile` pairs an `Arc<std::fs::File>` with the driver that opened it. Cloning shares the handle. There is no file cursor: every operation is positional, and concurrent operations on one handle at disjoint offsets are safe and unordered.
+`IoFile` pairs an `Arc<std::fs::File>` with the driver that runs its operations: the one whose `IoDriver::open` opened it, or the one `IoFile::from_std` wrapped a caller's file for. Cloning shares the handle. There is no file cursor: every operation is positional, and concurrent operations on one handle at disjoint offsets are safe and unordered.
 
 | Operation | Behavior |
 | --- | --- |
@@ -206,7 +206,9 @@ Four structural properties:
 
 **One port and one reaper.** A completion port has no per-instance submission lock, so there is nothing for sharding to relieve. The reaper count is one because the drain is batched: `GetQueuedCompletionStatusEx` takes up to 64 packets per syscall, and threads sharing a port divide the arriving packets between them, so each wakes for a partial batch and the syscall count rises with the thread count while the work does not. `LORE_IO_IOCP_REAPERS` overrides the count for measurement.
 
-**Inline completions are skipped, which is a correctness requirement.** `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` prevents an operation the kernel finishes during the issuing call from also queueing a packet. Without it the submitting thread would complete the operation and the reaper would complete it again, freeing the entry twice. An open that cannot set the mode fails rather than proceeding. `FILE_SKIP_SET_EVENT_ON_HANDLE` accompanies it: nothing here waits on the file handle's event, and leaving the I/O manager to signal it would make the handle a write-shared cache line between the concurrent operations this API exists to allow.
+**Inline completions are skipped, which is a correctness requirement.** `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS` prevents an operation the kernel finishes during the issuing call from also queueing a packet. Without it the submitting thread would complete the operation and the reaper would complete it again, freeing the entry twice. An open, or a `from_std` wrap, that cannot set the mode fails rather than proceeding. `FILE_SKIP_SET_EVENT_ON_HANDLE` accompanies it: nothing here waits on the file handle's event, and leaving the I/O manager to signal it would make the handle a write-shared cache line between the concurrent operations this API exists to allow.
+
+**A bound file takes I/O through its driver alone.** The reaper takes every packet carrying an `OVERLAPPED` for one of its own operation entries, so an operation another party issues on a bound file object would reach the reaper as a foreign pointer. An open keeps its handle inside the `IoFile`. `IoFile::from_std` is `unsafe` because the caller's handle, and any handle sharing its file object, stay with the caller.
 
 **One allocation per operation and no type erasure.** The `OVERLAPPED` the kernel writes into lives at offset zero of the operation entry, so the pointer returned by the port is the entry, and a `repr(C)` prefix carries the completion function monomorphised for that entry's payload type. Buffer ownership follows the contract above: the entry owns the buffer and the file handle for the kernel's whole view of the operation, and an abandoned future marks the entry rather than freeing anything.
 

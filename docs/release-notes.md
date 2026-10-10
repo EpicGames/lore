@@ -14,6 +14,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore-io`: `IoFile::from_std` wraps a `std::fs::File` the caller already holds, so an `IoDriver` runs positional
+  reads, writes and syncs on that handle without reopening it by path. On Windows the file must be opened with
+  `FILE_FLAG_OVERLAPPED`, and the `iocp` backend binds it to the driver's completion port. The call is `unsafe`: on
+  `iocp` the file takes I/O through that driver alone from then on
 - `lore-server`: every gRPC request records a third latency histogram, `rpc.server.handler.duration`, counted from the
   server reading the request body to its end rather than from the request headers arriving. The two it joins,
   `rpc.server.duration` and `http.server.request.duration`, keep counting from the headers, so the gap between them
