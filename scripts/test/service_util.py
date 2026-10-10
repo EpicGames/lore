@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import subprocess
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,8 @@ LORE_TEST_SHARED_SERVICE_VAR = "LORE_TEST_SHARED_SERVICE"
 #
 # `lore service run` prints this once it has bound its socket.
 LORE_SERVICE_LISTENING_MESSAGE = "Lore service listening"
+# `lore service run` exits with this when another service has claimed the socket.
+LORE_SERVICE_CLAIM_REFUSED_MESSAGE = "Another Lore service has claimed the socket"
 # `lore service stop` prints this when there was no service to stop.
 LORE_NO_SERVICE_MESSAGE = "No Lore service is running"
 # `lore service start` prints this once a service is reachable.
@@ -70,6 +73,14 @@ LORE_SERVICE_STATUS_LABELS = ("Executable:", "Uptime:", "Connections:", "SWFS mo
 
 def service_supported():
     return platform.system() in ("Windows", "Linux", "Darwin")
+
+
+def service_claim_path(socket_name: str) -> Path:
+    """The lock file a service claims `socket_name` with, beside the socket, on
+    systems with Unix sockets. Paired with `uds_sock_dir` in
+    `lore/src/remote/network/unix.rs`."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    return Path(base) / f"lore-{os.getuid()}" / f"{socket_name}.lock"
 
 
 def stop_lore_service(lore_executable_path: str, global_dir_name: str) -> str:

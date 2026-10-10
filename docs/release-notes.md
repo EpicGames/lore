@@ -43,6 +43,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- On Linux and macOS, two Lore services started at once no longer both run as the service. A service claims its
+  socket name with a lock file beside the socket before it initializes, and one that finds the name claimed waits
+  until the holder answers, then exits, so the commands that started either reach the same service
 - The Lore service's immutable disk stores flush their index 30 seconds after a write, durable writes included.
   Content the service fetches is stored flagged durable, which scheduled no flush, so a crash lost every entry the
   service stored since its last explicit flush. Writes that are not durable now flush 30 seconds after the write too,

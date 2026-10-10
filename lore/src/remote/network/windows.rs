@@ -83,7 +83,27 @@ pub struct UdsListener {
     socket: OwnedSocket,
 }
 
+/// A socket name to bind, not claimed: nothing reserves the name here, and
+/// [`UdsListener::new`] unlinks a socket already bound to it, so a second service can take the
+/// name from a running one.
+pub struct UdsListenerClaim {
+    name: String,
+}
+
+impl UdsListenerClaim {
+    pub fn listen(self) -> Result<UdsListener, UdsListenerError> {
+        UdsListener::new(&self.name)
+    }
+}
+
 impl UdsListener {
+    /// Always succeeds: see [`UdsListenerClaim`].
+    pub fn claim(name: &str) -> Result<Option<UdsListenerClaim>, UdsListenerError> {
+        Ok(Some(UdsListenerClaim {
+            name: name.to_string(),
+        }))
+    }
+
     pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
         let wide_file_name = uds_sock_path(name);
         // Ahead of the delete, so an address that cannot be built does not first

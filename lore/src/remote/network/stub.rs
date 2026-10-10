@@ -10,7 +10,19 @@ pub fn uds_supported() -> bool {
 
 pub struct UdsListener {}
 
+pub struct UdsListenerClaim {}
+
+impl UdsListenerClaim {
+    pub fn listen(self) -> Result<UdsListener, UdsListenerError> {
+        panic!("Networking not supported on this OS")
+    }
+}
+
 impl UdsListener {
+    pub fn claim(_name: &str) -> Result<Option<UdsListenerClaim>, UdsListenerError> {
+        panic!("Networking not supported on this OS")
+    }
+
     pub fn new(_name: &str) -> Result<UdsListener, UdsListenerError> {
         panic!("Networking not supported on this OS")
     }

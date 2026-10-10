@@ -39,7 +39,30 @@ impl FSLock {
         path: impl AsRef<Path>,
         create_directory_if_necessary: bool,
     ) -> std::io::Result<FSLock> {
-        let mut path = path.as_ref().to_path_buf();
+        let path = Self::file_lock_path(path.as_ref(), create_directory_if_necessary)?;
+        Self::acquire_exact_path(&path).await.map_err(|_err| {
+            std::io::Error::other(format!("Failed to acquire lock file \"{path:?}\""))
+        })
+    }
+
+    /// Takes the lock [`acquire_file_lock`](Self::acquire_file_lock) takes if no other holder
+    /// has it, without waiting: `None` while it is held.
+    pub fn try_acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<Option<FSLock>> {
+        let path = Self::file_lock_path(path.as_ref(), false)?;
+        let file = Self::open_lock_file(&path)?;
+        match Self::try_lock(&file) {
+            Ok(()) => Ok(Some(FSLock { file })),
+            Err(err) if is_lock_contended(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The lock file guarding `path`: `path` with `.lock` appended, in its canonical directory.
+    fn file_lock_path(
+        path: &Path,
+        create_directory_if_necessary: bool,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let mut path = path.to_path_buf();
         let mut file_name = path
             .file_name()
             .ok_or(std::io::Error::other(
@@ -53,9 +76,7 @@ impl FSLock {
         let mut path = path.canonicalize()?;
         file_name.push(".lock");
         path.push(file_name);
-        Self::acquire_exact_path(&path).await.map_err(|_err| {
-            std::io::Error::other(format!("Failed to acquire lock file \"{path:?}\""))
-        })
+        Ok(path)
     }
 
     /// Directory twin of [`acquire_file_lock`](Self::acquire_file_lock).

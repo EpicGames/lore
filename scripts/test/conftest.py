@@ -33,6 +33,7 @@ from lore_server import (
 from service_util import (
     LORE_SERVICE_LISTENING_MESSAGE,
     LORE_SERVICE_SOCKET_VAR,
+    service_claim_path,
     LORE_TEST_SERVICE_SOCKET_VAR,
     LORE_TEST_SHARED_SERVICE_VAR,
     service_supported,
@@ -322,6 +323,15 @@ class TrackedServices(object):
         """Starts the service, optionally with a chosen working directory. The service
         shares the test's isolated global config so shared stores it creates land
         where the client looks for them."""
+        process, log_path = self.launch(directory)
+        _wait_for_service_ready(process, log_path)
+
+        return process
+
+    def launch(self, directory: str | None = None):
+        """Starts the service as `start` does without waiting for it to accept
+        connections, for a test that does not expect it to become ready. Returns
+        the process and the file its output goes to."""
         assert self.service_processes.get(directory) is None
 
         env = self.lore_subprocess_env.copy()
@@ -344,12 +354,11 @@ class TrackedServices(object):
                 stderr=subprocess.STDOUT,
                 **ends_with_launcher(),
             )
-        # Tracked before the wait, so that a service which fails to become ready
+        # Tracked before any wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.
         self.service_processes[directory] = process
-        _wait_for_service_ready(process, log_path)
 
-        return process
+        return process, log_path
 
     def terminate(self, directory: str | None = None):
         process = self.service_processes.get(directory)
@@ -425,7 +434,10 @@ def lore_service_socket():
     Set on the test process's own environment because every Lore command and
     every service in the suite is started from a copy of it, including the
     services a command starts on its own. Under xdist each worker is its own
-    process and so gets its own socket."""
+    process and so gets its own socket.
+
+    A service claims the socket name with a lock file beside it, which it
+    leaves in place when it exits, so the run removes its own at the end."""
     socket_name = f"lore_service-test-{uuid.uuid4().hex[:12]}"
     logger.info("Using Lore service socket %s for this run", socket_name)
     os.environ[LORE_SERVICE_SOCKET_VAR] = socket_name
@@ -433,6 +445,8 @@ def lore_service_socket():
     yield socket_name
 
     del os.environ[LORE_SERVICE_SOCKET_VAR]
+    if hasattr(os, "getuid"):
+        service_claim_path(socket_name).unlink(missing_ok=True)
 
 
 @pytest.fixture(autouse=True)
@@ -859,6 +873,10 @@ def _start_shared_service(config):
     env = lore_test_env(service_dir)
     env[LORE_SERVICE_SOCKET_VAR] = socket_name
     services = TrackedServices(_lore_executable_path(config), env, service_dir)
+    if hasattr(os, "getuid"):
+        config.add_cleanup(
+            lambda: service_claim_path(socket_name).unlink(missing_ok=True)
+        )
     config.add_cleanup(services.terminate_all)
     services.start(service_dir)
     os.environ[LORE_TEST_SERVICE_SOCKET_VAR] = socket_name

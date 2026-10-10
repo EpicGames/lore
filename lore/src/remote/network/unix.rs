@@ -6,6 +6,7 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+use lore_base::fs::lock::FSLock;
 use lore_error_set::prelude::*;
 
 use crate::remote::network::UdsAcceptError;
@@ -35,6 +36,7 @@ fn uds_sock_dir() -> PathBuf {
     base.join(format!("lore-{uid}"))
 }
 
+#[lore_macro::test_pub]
 fn uds_sock_path(name: &str) -> PathBuf {
     uds_sock_dir().join(name)
 }
@@ -42,10 +44,36 @@ fn uds_sock_path(name: &str) -> PathBuf {
 pub struct UdsListener {
     listener: UnixListener,
     path: PathBuf,
+    /// Released when the listener is dropped, after its socket file is removed.
+    _claim: FSLock,
+}
+
+/// The claim on a socket name, held by at most one process from [`UdsListener::claim`] until the
+/// listener it becomes is dropped. A lock beside the socket rather than the socket itself, whose
+/// check, stale-file removal and bind are three steps: without the claim a second process can
+/// unlink a socket another has just bound, and both then run as the service. The lock file
+/// outlives the listener: unlinking it would let a later claimer lock a new file while an
+/// earlier one still holds the old.
+pub struct UdsListenerClaim {
+    path: PathBuf,
+    lock: FSLock,
 }
 
 impl UdsListener {
     pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
+        Self::claim(name)?
+            .ok_or_else(|| {
+                UdsListenerError::internal(format!(
+                    "another Lore service has claimed {}",
+                    uds_sock_path(name).display()
+                ))
+            })?
+            .listen()
+    }
+
+    /// Claims `name` without binding it: `None` while another process holds the claim or a
+    /// service answers on the socket, as one from a build that takes no claim may.
+    pub fn claim(name: &str) -> Result<Option<UdsListenerClaim>, UdsListenerError> {
         let dir = uds_sock_dir();
         fs::create_dir_all(&dir)
             .internal_with(|| format!("creating socket directory {}", dir.display()))?;
@@ -53,7 +81,28 @@ impl UdsListener {
             .internal_with(|| format!("restricting socket directory {}", dir.display()))?;
 
         let path = dir.join(name);
+        let Some(lock) = FSLock::try_acquire_file_lock(&path)
+            .internal_with(|| format!("locking the claim on {}", path.display()))?
+        else {
+            return Ok(None);
+        };
+        if UnixStream::connect(&path).is_ok() {
+            return Ok(None);
+        }
+        Ok(Some(UdsListenerClaim { path, lock }))
+    }
 
+    pub fn accept(&self) -> Result<UdsStream, UdsAcceptError> {
+        let (stream, _address) = self.listener.accept().internal("accept error")?;
+        Ok(UdsStream { stream })
+    }
+}
+
+impl UdsListenerClaim {
+    /// Binds the claimed name, removing a stale socket file. Fails if a service answers on it, as
+    /// one from a build that takes no claim may.
+    pub fn listen(self) -> Result<UdsListener, UdsListenerError> {
+        let Self { path, lock } = self;
         if path.exists() {
             if UnixStream::connect(&path).is_ok() {
                 return Err(UdsListenerError::internal(format!(
@@ -70,12 +119,11 @@ impl UdsListener {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
             .internal_with(|| format!("restricting socket {}", path.display()))?;
 
-        Ok(Self { listener, path })
-    }
-
-    pub fn accept(&self) -> Result<UdsStream, UdsAcceptError> {
-        let (stream, _address) = self.listener.accept().internal("accept error")?;
-        Ok(UdsStream { stream })
+        Ok(UdsListener {
+            listener,
+            path,
+            _claim: lock,
+        })
     }
 }
 

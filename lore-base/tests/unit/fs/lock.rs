@@ -31,6 +31,30 @@ async fn a_second_acquirer_waits_while_the_lock_is_held() {
     drop(held);
 }
 
+#[test]
+fn try_acquire_reports_a_held_lock_rather_than_waiting() {
+    let dir = TempDir::new("lore-base-lock-try");
+    let path = dir.path().join("name");
+    let held = FSLock::try_acquire_file_lock(&path)
+        .expect("first attempt")
+        .expect("a free lock is taken");
+
+    assert!(
+        FSLock::try_acquire_file_lock(&path)
+            .expect("second attempt")
+            .is_none(),
+        "a held lock is reported as held"
+    );
+
+    drop(held);
+    assert!(
+        FSLock::try_acquire_file_lock(&path)
+            .expect("third attempt")
+            .is_some(),
+        "a released lock is taken again"
+    );
+}
+
 /// Dropping the guard releases the OS lock, so the next acquisition completes. Bounded by a
 /// timeout because the wait is otherwise unbounded: a lock that was not released would hang
 /// the test rather than fail it.

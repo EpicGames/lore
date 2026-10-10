@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import contextlib
 import logging
 import os
 import platform
 import signal
 import subprocess
 from pathlib import Path
+from time import monotonic
 
 import pytest
 
@@ -13,9 +15,11 @@ from lore import Lore
 from service_util import (
     LORE_NO_SERVICE_EXECUTABLE_MESSAGE,
     LORE_NO_SERVICE_MESSAGE,
+    LORE_SERVICE_CLAIM_REFUSED_MESSAGE,
     LORE_SERVICE_ENVIRONMENT,
     LORE_SERVICE_RUNNING_MESSAGE,
     SERVICE_UNAVAILABLE,
+    service_claim_path,
     stop_lore_service,
     LORE_SERVICE_STATUS_LABELS,
 )
@@ -640,3 +644,76 @@ def test_a_command_that_reaches_no_service_reports_service_unavailable(
         f"forcing local execution must not reach for the service: "
         f"{local.stdout}{local.stderr}"
     )
+
+
+def catches_sigterm(pid: int) -> bool:
+    """Whether the process has a handler for SIGTERM, read from its status."""
+    status = Path(f"/proc/{pid}/status").read_text()
+    caught = next(line for line in status.splitlines() if line.startswith("SigCgt:"))
+    return bool(int(caught.split()[1], 16) & (1 << (signal.SIGTERM - 1)))
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    platform.system() != "Linux", reason="reads the signal mask from /proc"
+)
+def test_a_service_waiting_on_a_claimed_socket_stops_on_a_signal(
+    lore_service_runner, lore_service_socket
+):
+    """A service that finds the socket claimed waits for the holder to answer
+    before it exits, and a termination signal ends that wait."""
+    import fcntl
+
+    claim = service_claim_path(lore_service_socket)
+    claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(claim, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        waiting, log_path = lore_service_runner.launch()
+        deadline = monotonic() + 10
+        while (
+            monotonic() < deadline
+            and waiting.poll() is None
+            and not catches_sigterm(waiting.pid)
+        ):
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                waiting.wait(timeout=0.05)
+        alive = waiting.poll() is None
+        signalled = monotonic()
+        waiting.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            waiting.wait(timeout=5)
+        waited = monotonic() - signalled
+
+    output = log_path.read_text(errors="replace")
+    assert alive, f"the service exited before the signal: {output}"
+    assert waiting.poll() is not None and waited < 5, (
+        f"the service ended {waited:.1f}s after the signal: {output}"
+    )
+    assert (
+        LORE_SERVICE_CLAIM_REFUSED_MESSAGE in output
+        and "stopped waiting for it on a signal" in output
+    ), f"the signal ends the wait on the claim: {output}"
+
+
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="claims the socket with a lock file"
+)
+def test_a_service_waiting_on_a_claimed_socket_nobody_answers_on_gives_up(
+    lore_service_runner, lore_service_socket
+):
+    """A service that finds the socket claimed, by a holder that never answers,
+    exits once its wait runs out and says that nothing answered."""
+    import fcntl
+
+    claim = service_claim_path(lore_service_socket)
+    claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(claim, "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        waiting, log_path = lore_service_runner.launch()
+        waiting.wait(timeout=60)
+
+    output = log_path.read_text(errors="replace")
+    assert (
+        LORE_SERVICE_CLAIM_REFUSED_MESSAGE in output
+        and "it did not answer in time" in output
+    ), f"the refusal says nothing answered: {output}"

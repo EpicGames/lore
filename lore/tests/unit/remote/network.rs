@@ -65,9 +65,72 @@ fn run_both(name: &str) -> String {
     })
 }
 
+/// Removes the lock file a claim on `name` leaves behind.
+fn remove_claim_lock(name: &str) {
+    #[cfg(target_family = "unix")]
+    {
+        let mut lock = unix::uds_sock_path(name).into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
+    }
+    #[cfg(not(target_family = "unix"))]
+    let _ = name;
+}
+
 #[test]
 fn test_both() {
-    assert_eq!(run_both(&socket_name("uds-both")), TEST_STRING.to_string());
+    let name = socket_name("uds-both");
+    let result = run_both(&name);
+    remove_claim_lock(&name);
+    assert_eq!(result, TEST_STRING.to_string());
+}
+
+/// A second service must learn that it would lose the socket before it initializes, since
+/// initializing mounts every instance.
+#[cfg(target_family = "unix")]
+#[test]
+fn a_claimed_socket_name_refuses_a_second_claim_until_its_listener_drops() {
+    let name = socket_name("uds-claim");
+    let claim = UdsListener::claim(&name)
+        .expect("the first claim is made")
+        .expect("the first claim succeeds");
+    let while_claimed = UdsListener::claim(&name).expect("a second claim is made");
+
+    let listener = claim.listen().expect("the claim binds");
+    let while_listening = UdsListener::claim(&name).expect("a claim is made");
+
+    drop(listener);
+    let after = UdsListener::claim(&name).expect("a claim is made");
+    let freed = after.is_some();
+    drop(after);
+    remove_claim_lock(&name);
+    assert!(
+        while_claimed.is_none(),
+        "a claimed name refuses a second claim"
+    );
+    assert!(
+        while_listening.is_none(),
+        "a listening name refuses a claim"
+    );
+    assert!(freed, "the name is claimable once its listener drops");
+}
+
+/// A service from a build that takes no claim listens without one, and a new service must
+/// not start next to it.
+#[cfg(target_family = "unix")]
+#[test]
+fn a_socket_served_without_a_claim_refuses_a_claim() {
+    let name = socket_name("uds-unclaimed");
+    let socket = unix::uds_sock_path(&name);
+    std::fs::create_dir_all(socket.parent().expect("the socket has a directory"))
+        .expect("the socket directory exists");
+    let served = std::os::unix::net::UnixListener::bind(&socket).expect("binds");
+    let refused = UdsListener::claim(&name).expect("a claim is made");
+    let refused = refused.is_none();
+    drop(served);
+    let _ = std::fs::remove_file(&socket);
+    remove_claim_lock(&name);
+    assert!(refused, "a served socket refuses a claim");
 }
 
 /// A connect with nothing listening reports it rather than waiting.

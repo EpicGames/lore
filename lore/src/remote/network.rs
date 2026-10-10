@@ -9,16 +9,20 @@ mod stub;
 #[cfg(not(any(target_os = "windows", target_family = "unix")))]
 mod os_specific {
     pub use super::stub::UdsListener;
+    pub use super::stub::UdsListenerClaim;
     pub use super::stub::UdsStream;
     pub use super::stub::uds_supported;
 }
 
 // Reexport the unix specific module
-#[cfg(target_family = "unix")]
+#[cfg(all(target_family = "unix", not(feature = "test-util")))]
 mod unix;
+#[cfg(all(target_family = "unix", feature = "test-util"))]
+pub mod unix;
 #[cfg(target_family = "unix")]
 mod os_specific {
     pub use super::unix::UdsListener;
+    pub use super::unix::UdsListenerClaim;
     pub use super::unix::UdsStream;
     pub use super::unix::uds_supported;
 }
@@ -31,6 +35,7 @@ pub mod windows;
 #[cfg(target_os = "windows")]
 mod os_specific {
     pub use super::windows::UdsListener;
+    pub use super::windows::UdsListenerClaim;
     pub use super::windows::UdsStream;
     pub use super::windows::uds_supported;
 }

@@ -74,13 +74,14 @@ const SERVICE_RUN_ARGUMENTS: [&str; 2] = ["service", "run"];
 /// How long a caller waits for a service to answer after starting one. It
 /// covers starting a process and binding the socket, and when several callers
 /// start one at once it also covers the wait for whichever process won the
-/// socket, so it is measured in seconds rather than milliseconds.
+/// claim, so it is measured in seconds rather than milliseconds. A service that
+/// lost the claim waits as long for the winner to answer.
 const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How much of that wait is left once the service this caller started has
-/// exited. A service exits either because another one holds the socket, which
-/// means one is listening already, or because none can run here at all, and
-/// neither outcome is worth the rest of the wait.
+/// exited. A service that lost the claim exits once a service answers or
+/// [`SERVICE_START_TIMEOUT`] passes, and one that cannot run here exits at once;
+/// neither is worth the rest of the wait.
 const SERVICE_EXITED_GRACE: Duration = Duration::from_secs(2);
 
 /// Delay between connection attempts while waiting for a service to answer.
@@ -487,10 +488,10 @@ pub(crate) async fn connect_to_running_service() -> Result<Option<UdsStream>, Se
 /// Connects to the service, starting one when none is running.
 ///
 /// Several callers reach this at once with no service running, and each starts
-/// one. Only the first to bind the socket keeps running and the rest exit, so
-/// what is waited for afterwards is *a* service answering rather than the one
-/// this caller started: the callers whose service lost the socket become
-/// clients of the one that won it.
+/// one. Only the first to claim the socket keeps running, and the rest exit once
+/// it answers, so what is waited for afterwards is *a* service answering rather
+/// than the one this caller started: the callers whose service lost the claim
+/// become clients of the one that won it.
 pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProcessError> {
     if let Some(connection) = connect_to_running_service().await? {
         return Ok(connection);
@@ -533,6 +534,12 @@ pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProce
     }
 }
 
+/// Waits up to [`SERVICE_START_TIMEOUT`] for a service to accept a connection,
+/// and reports whether one did.
+pub async fn wait_until_a_service_is_listening() -> Result<bool, ServiceProcessError> {
+    wait_for_listening(true, SERVICE_START_TIMEOUT).await
+}
+
 /// Waits until nothing is listening.
 ///
 /// A service acknowledges a stop over IPC and then keeps its socket while the
@@ -542,21 +549,30 @@ pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProce
 /// second would find the socket taken.
 pub(crate) async fn wait_until_no_service_is_listening() -> Result<(), ServiceProcessError> {
     let started = Instant::now();
-    let deadline = started + STOP_RELEASE_TIMEOUT;
+    if wait_for_listening(false, STOP_RELEASE_TIMEOUT).await? {
+        return Ok(());
+    }
+    // Not `ServiceUnavailable`: one is available, which is the problem.
+    Err(ServiceProcessError::internal(format!(
+        "a Lore service was asked to stop and was still listening {:.1} seconds later",
+        started.elapsed().as_secs_f32()
+    )))
+}
 
+/// Polls the socket until a service answers on it when `listening`, or until none does
+/// otherwise, for up to `timeout`; answers whether that happened in time.
+async fn wait_for_listening(
+    listening: bool,
+    timeout: Duration,
+) -> Result<bool, ServiceProcessError> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if connect_attempt().await?.is_none() {
-            return Ok(());
+        if connect_attempt().await?.is_some() == listening {
+            return Ok(true);
         }
-
         if Instant::now() >= deadline {
-            // Not `ServiceUnavailable`: one is available, which is the problem.
-            return Err(ServiceProcessError::internal(format!(
-                "a Lore service was asked to stop and was still listening {:.1} seconds later",
-                started.elapsed().as_secs_f32()
-            )));
+            return Ok(false);
         }
-
         tokio::time::sleep(CONNECT_RETRY_DELAY).await;
     }
 }
