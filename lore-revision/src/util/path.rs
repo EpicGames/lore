@@ -1199,20 +1199,23 @@ impl RelativePathBuf {
 
     /// Append a path component, adding separator if needed.
     /// Updates `path_lower` to maintain lowercase invariant.
+    ///
+    /// Reserves the separator where it adds one and the name's length in each string.
     pub fn push(&mut self, name: impl AsRef<str>) -> &mut Self {
         let name = name.as_ref();
         if name.is_empty() {
             return self;
         }
 
-        self.path.reserve(1 + name.len());
-        if !self.path.is_empty() && !self.path.ends_with('/') {
+        let separator = !self.path.is_empty() && !self.path.ends_with('/');
+        self.path.reserve(usize::from(separator) + name.len());
+        if separator {
             self.path.push('/');
         }
         self.path.push_str(name);
 
-        self.path_lower.reserve(1 + name.len());
-        if !self.path_lower.is_empty() && !self.path_lower.ends_with('/') {
+        self.path_lower.reserve(usize::from(separator) + name.len());
+        if separator {
             self.path_lower.push('/');
         }
         push_lowercase(&mut self.path_lower, name);

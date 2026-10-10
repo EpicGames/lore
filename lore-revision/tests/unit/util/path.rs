@@ -4,6 +4,47 @@ use std::str::FromStr;
 
 use lore_revision::util::path::*;
 
+/// What `f` returns and the allocations the calling thread made running it.
+///
+/// Counting stays on, since switching it off would undercount a test measuring on another thread.
+fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
+    lore_base::allocator::set_allocation_counting(true);
+    let before = lore_base::allocator::thread_allocation_count();
+    let value = std::hint::black_box(f());
+    (
+        value,
+        lore_base::allocator::thread_allocation_count() - before,
+    )
+}
+
+/// A path built from a string makes its two strings and the shared data once each, never
+/// growing either string, however many names it holds.
+#[test]
+fn a_path_from_an_initial_string_allocates_its_two_strings_and_its_data_once() {
+    let (path, allocated) = allocations_during(|| {
+        RelativePath::new_from_initial_path("Content/Maps/Level01/Props.umap").expect("path")
+    });
+    assert_eq!(path.as_str(), "Content/Maps/Level01/Props.umap");
+    assert_eq!(path.as_lowercase_str(), "content/maps/level01/props.umap");
+    assert_eq!(
+        allocated, 3,
+        "allocations other than the two strings and the shared data"
+    );
+}
+
+/// A push reserves only the bytes it appends, so a path sized for a name grows neither string
+/// when the name is pushed into it.
+#[test]
+fn a_push_into_a_path_sized_for_it_grows_neither_string() {
+    let mut path = RelativePathBuf::with_capacity("Content/Maps".len());
+    let (_, allocated) = allocations_during(|| {
+        path.push("Content/Maps");
+    });
+    assert_eq!(path.as_str(), "Content/Maps");
+    assert_eq!(path.as_lowercase_str(), "content/maps");
+    assert_eq!(allocated, 0);
+}
+
 #[test]
 fn a_path_below_an_ancestor_is_the_names_between_them() {
     let path = RelativePath::new_from_clean_parts("thr/sub/file.txt", "");
