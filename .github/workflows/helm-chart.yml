@@ -1,21 +1,409 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 
-# Placeholder for contrib/helm's validation. The real workflow — lint, render
-# every example, then install into kind and run `helm test` — lands through a
-# GitHub PR, so it is tested on GitHub's runners before it gates anything.
-# Manual dispatch only until then, so it never reports a check it did not run.
+# Validates contrib/helm. Renders the chart, then proves it actually runs: a kind cluster, a real
+# loreserver image, and the chart's own `helm test` health probe.
+#
+# Everything comes from public sources: the loreserver image from GHCR, the
+# lore client from GitHub Releases, and the kind node and cert-manager images
+# from their upstream registries. No registry credentials are needed.
+#
+# --- Which examples/ files this workflow installs, and which it cannot ---
+#
+# kind offers exactly one StorageClass: `standard` (rancher.io/local-path). It
+# has no cloud volume types. Examples were classified by installing each one
+# into kind and checking whether its PVCs bind:
+#
+#   installed:
+#     observability          default storage, no external dependency
+#     presigned-urls         default storage; needs an HMAC Secret, created below
+#     local-nvme             hostPath cache + default class; needs a node label
+#     upstream-server        default class; needs cert-manager and a reachable upstream
+#     replication            default class; needs a replication TLS Secret
+#
+#   not installed:
+#     local-storage          storageClass: io2 - PVC never binds in kind
+#     production-read-fanout storageClass: io2 - PVC never binds in kind
+#     aws-s3-dynamodb        needs real S3 + DynamoDB and an IRSA role
+#     production-aws-backend needs real S3 + DynamoDB and an IRSA role
+#     localstack-aws-backend needs a LocalStack deployment with a seeded bucket and tables
+#
+# Every example, including the five above, is still rendered by the `render`
+# job. Only the live-install gate is limited.
 
 name: Validate Helm Chart
 
 on:
-  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - contrib/helm/**
+      - .github/workflows/helm-chart.yml
+  pull_request:
+    paths:
+      - contrib/helm/**
+      - .github/workflows/helm-chart.yml
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
+defaults:
+  run:
+    working-directory: contrib/helm
+
+env:
+  HELM_VERSION: v3.19.5
+  KIND_VERSION: v0.32.0
+  KIND_SHA256: 50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54
+  # Default node image for kind v0.32.0. Pinned by digest: a tag alone lets
+  # the upstream content change under us.
+  # Update this together with KIND_VERSION - kind releases and node images are
+  # not compatible across versions.
+  KIND_NODE_IMAGE: kindest/node:v1.36.1@sha256:3489c7674813ba5d8b1a9977baea8a6e553784dab7b84759d1014dbd78f7ebd5
+  KUBECTL_VERSION: v1.36.1
+  CERT_MANAGER_VERSION: v1.16.2
+  # The release under test: the public image and the matching client. Keep
+  # in step with appVersion in Chart.yaml.
+  LORESERVER_VERSION: 0.9.0
+  TEST_IMAGE: ghcr.io/epicgames/lore/loreserver:0.9.0
+  NAMESPACE: lore
+
 jobs:
-  validate:
+  render:
+    name: Lint and render
     runs-on: ubuntu-latest
     steps:
-      - run: echo "Helm chart validation is not implemented yet."
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Helm lint
+        run: helm lint .
+
+      - name: Render the default values
+        run: helm template lore . > /dev/null
+
+      # Every file under examples/ is a documented entry point. A rename or a
+      # schema change that breaks one is a user-facing break, so render them all
+      # - including the ones the e2e job cannot install.
+      - name: Render every example
+        run: |
+          set -eu
+          rc=0
+          for f in examples/*.values.yaml; do
+            echo "::group::${f}"
+            if helm template lore . --values "${f}" > /dev/null; then
+              echo "ok"
+            else
+              echo "::error file=${f}::helm template failed"
+              rc=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "${rc}"
+
+      # The only arithmetic the chart does. A wrong multiplier is invisible in a
+      # diff and surfaces later as a store that never compacts or thrashes.
+      - name: Assert the store caps render as bytes
+        run: |
+          set -eu
+          out=$(helm template lore . \
+            --set topology.mode=single \
+            --set data.store.maxSize=200Gi \
+            --set data.store.compactionDelaySeconds=900 \
+            --show-only templates/configmap.yaml)
+          echo "${out}" | grep -qx '    max_size = 214748364800'
+          echo "${out}" | grep -qx '    compaction_delay = 900000'
+
+          # A fraction must fail loudly: atoi truncates 1.5Gi to a 1-byte cap,
+          # which is a store that evicts everything it is given.
+          if helm template lore . --set data.store.maxSize=1.5Gi >/dev/null 2>&1; then
+            echo "::error::data.store.maxSize=1.5Gi should have been rejected"
+            exit 1
+          fi
+
+          # Stock values must emit no cap: the data tier is authoritative by
+          # default, so a cap appearing on its own would be silent deletion.
+          if helm template lore . | grep -qE 'max_size|max_capacity'; then
+            echo "::error::default values enabled a store cap"
+            exit 1
+          fi
+
+  e2e:
+    name: kind (${{ matrix.case.name }})
+    needs: render
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          # --- stock values ---
+          # The default install. Exercises the data pod, both handlers, the
+          # headless Service and the PVC.
+          - name: default-tiered
+            args: '--set topology.mode=tiered'
+          # The single-pod path. No handlers, so the helm test only probes the
+          # data tier.
+          - name: default-single
+            args: '--set topology.mode=single'
+          # Store caps on the single-pod path. `helm template` shows the keys
+          # render; this shows the server accepts them — they deserialize into
+          # usize, so a wrong-shaped value fails config load at startup.
+          - name: store-gc
+            args: >-
+              --set topology.mode=single
+              --set data.store.maxSize=1Gi
+              --set data.store.compactionDelaySeconds=60
+              --set data.store.maxCapacity=2000000
+              --set data.store.evictionDelaySeconds=5
+
+          # --- examples/ ---
+          - name: observability
+            values: examples/observability.values.yaml
+
+          - name: presigned-urls
+            values: examples/presigned-urls.values.yaml
+            # The example expects this Secret to already exist. The key must be
+            # hex and at least 32 bytes - the server rejects anything else with
+            # "presigned_url_hmac_key is not valid hex" and shuts down, which
+            # then times out `helm install --wait`. Generated per run rather
+            # than hardcoded, so no key-shaped literal lands in the repo.
+            setup: |
+              kubectl -n "${NAMESPACE}" create secret generic lore-presign \
+                --from-literal=hmac="$(openssl rand -hex 32)"
+
+          - name: local-nvme
+            values: examples/local-nvme.values.yaml
+            # The example pins pods to NVMe-labelled nodes. kind's single node
+            # carries no such label, so add it; the hostPath cache directory is
+            # DirectoryOrCreate and needs nothing else.
+            setup: |
+              kubectl label node \
+                "$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}')" \
+                lore.epicgames.com/local-nvme=true --overwrite
+
+          - name: upstream-server
+            values: examples/upstream-server.values.yaml
+            certManager: true
+            # Two kind-specific overrides:
+            # - upstreamURL: the example points at lore.central.example.com,
+            #   which does not resolve here. Readiness is a deep /health_check
+            #   against the store, so an unreachable upstream would hold the
+            #   handlers NotReady forever. Re-point at this release's own data
+            #   pod: same shape (an explicit upstream URL) and reachable.
+            # - service.type: kind runs no load balancer controller, so a
+            #   LoadBalancer Service never gets an ingress IP and `helm install
+            #   --wait` blocks on it until the timeout. Verified, not assumed.
+            args: >-
+              --set handler.upstreamURL=lore://lore-0.lore-headless.lore.svc.cluster.local:41337
+              --set service.type=NodePort
+            # With an upstream set, the public Service routes to the handlers,
+            # which cannot serve `repository list` from a remote store.
+            skipList: true
+
+          - name: replication
+            values: examples/replication.values.yaml
+            # The replication Service is LoadBalancer in the example; same kind
+            # limitation as upstream-server above, so pin it to NodePort.
+            args: '--set replication.service.type=NodePort'
+            # The example expects an operator-supplied peer TLS Secret. The
+            # fixed peer it lists is unreachable here; replication is a separate
+            # subsystem from the store health check, so that should not hold
+            # readiness. If this case ever hangs on --wait, that assumption is
+            # what broke.
+            setup: |
+              openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+                -subj /CN=lore-replication \
+                -keyout /tmp/repl.key -out /tmp/repl.crt
+              kubectl -n "${NAMESPACE}" create secret generic lore-replication-tls \
+                --from-file=tls.crt=/tmp/repl.crt \
+                --from-file=tls.key=/tmp/repl.key \
+                --from-file=ca.crt=/tmp/repl.crt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Helm
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # These runners carry no kubectl, and kind does not install one. Matched
+      # to KIND_NODE_IMAGE's Kubernetes version.
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4.0.1
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+
+      - name: Install kind
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+            -o "${RUNNER_TEMP}/bin/kind" \
+            "https://github.com/kubernetes-sigs/kind/releases/download/${KIND_VERSION}/kind-linux-amd64"
+          # Checksum is pinned rather than fetched, so a tampered release cannot
+          # supply its own matching checksum. Update it with KIND_VERSION.
+          echo "${KIND_SHA256}  ${RUNNER_TEMP}/bin/kind" | sha256sum --check --strict -
+          chmod +x "${RUNNER_TEMP}/bin/kind"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          # Every later kubectl and helm call uses a kubeconfig that only kind writes.
+          echo "KUBECONFIG=${RUNNER_TEMP}/kubeconfig" >> "${GITHUB_ENV}"
+
+      - name: Pull the loreserver image
+        run: docker pull --platform linux/amd64 "${TEST_IMAGE}"
+
+      - name: Create the kind cluster
+        run: kind create cluster --name "lore-${{ matrix.case.name }}" --image "${KIND_NODE_IMAGE}" --wait 120s
+
+      # Side-loaded rather than pulled by the cluster, so every matrix case tests
+      # exactly the image pulled above. imagePullPolicy=Never below makes a
+      # missing side-load fail loudly instead of falling back to a pull.
+      - name: Load the image into kind
+        run: kind load docker-image "${TEST_IMAGE}" --name "lore-${{ matrix.case.name }}"
+
+      - name: Install cert-manager
+        if: matrix.case.certManager
+        run: |
+          set -eu
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update jetstack
+          helm install cert-manager jetstack/cert-manager \
+            --namespace cert-manager --create-namespace \
+            --version "${CERT_MANAGER_VERSION}" \
+            --set crds.enabled=true \
+            --wait --timeout 5m
+
+      # Created up front so per-case setup can put Secrets in it before install.
+      - name: Create the namespace
+        run: kubectl create namespace "${NAMESPACE}"
+
+      - name: Case setup
+        if: matrix.case.setup
+        run: ${{ matrix.case.setup }}
+
+      # The chart's default requests are 2 CPU / 8Gi per pod, which is production
+      # sizing. A tiered install is 3 pods, so on a one-node kind cluster every
+      # pod stays Pending with "Insufficient memory". CI sizes them down; this
+      # gate tests the chart's wiring, not its production defaults. --set beats
+      # --values in Helm regardless of order, so the image pinned here wins over
+      # the `image:` each example carries.
+      - name: Install the chart
+        run: |
+          helm install lore . \
+            --namespace "${NAMESPACE}" \
+            ${{ matrix.case.values && format('--values {0}', matrix.case.values) || '' }} \
+            --set "image.repository=${TEST_IMAGE%:*}" \
+            --set "image.tag=${TEST_IMAGE##*:}" \
+            --set imagePullPolicy=Never \
+            --set resources.requests.cpu=250m \
+            --set resources.requests.memory=512Mi \
+            --set resources.limits.cpu=1 \
+            --set resources.limits.memory=1Gi \
+            ${{ matrix.case.args }} \
+            --wait --timeout 5m
+
+      # Same release as the server.
+      - name: Install the lore client
+        run: |
+          set -eu
+          curl -fsSL --retry 5 \
+            "https://github.com/EpicGames/lore/releases/download/v${LORESERVER_VERSION}/lore-v${LORESERVER_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xzf - -C "${RUNNER_TEMP}/bin" ./lore
+          chmod +x "${RUNNER_TEMP}/bin/lore"
+
+      # `helm test` runs the chart's own health probe: /health_check on the
+      # public Service, plus a handler pod directly when topology is tiered.
+      #
+      # No --logs. The test Pod sets hook-delete-policy: hook-succeeded, so Helm
+      # deletes it the moment it passes, and --logs then fails with `pods
+      # "lore-test-connection" not found` and exits 1 - turning a passing test
+      # into a red job. A FAILING test is not deleted, so the diagnostics step
+      # below still gets its logs, which is when they actually matter.
+      - name: Run the chart tests
+        run: helm test lore --namespace "${NAMESPACE}"
+
+      # The health probe above is much weaker than it looks. The server's
+      # /health_check handler returns a cached flag, and only consults it when
+      # store_health_check is on. The chart sets that true on the data tier but
+      # FALSE on the handler tier, so a handler answers 200 unconditionally -
+      # it proves the HTTP listener is up and nothing else. Neither tier's probe
+      # touches QUIC or gRPC on 41337, which is the actual client data path.
+      #
+      # So drive a real round trip through the NodePort with the real client:
+      # create a repository over gRPC, push a file over QUIC, then clone into a
+      # second directory and compare the bytes. A server that answers 200 but
+      # cannot store or serve content fails here and passes everything above.
+      - name: Exercise the client data path
+        run: |
+          set -eu
+          ctx="kind-lore-${{ matrix.case.name }}"
+          node_ip="$(kubectl --context "${ctx}" get node \
+            -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
+          # quic (UDP) and grpc (TCP) share one port number, so one nodePort covers both.
+          port="$(kubectl --context "${ctx}" get svc lore --namespace "${NAMESPACE}" \
+            -o jsonpath='{.spec.ports[?(@.name=="grpc")].nodePort}')"
+          remote="lore://${node_ip}:${port}"
+          echo "remote: ${remote}"
+
+          work="$(mktemp -d)"
+
+          echo "::group::create the repository (gRPC)"
+          lore repository create "${remote}/ci-probe"
+          echo "::endgroup::"
+
+          echo "::group::commit and push a file (QUIC)"
+          lore clone "${remote}/ci-probe" "${work}/first"
+          echo "${GITHUB_SHA}" > "${work}/first/probe.txt"
+          cd "${work}/first"
+          lore stage --scan .
+          lore commit "chart validation round trip"
+          lore push
+          echo "::endgroup::"
+
+          cd "${work}"
+          if [ "${{ matrix.case.skipList || false }}" != "true" ]; then
+            echo "::group::confirm the server lists the repository"
+            # `list` is served by the data tier only, so this also proves the
+            # public Service routed to the authoritative store.
+            lore repository list "${remote}"
+            echo "::endgroup::"
+          fi
+
+          echo "::group::clone from clean state and compare the bytes"
+          # Delete the local clone and use an empty HOME first. Nothing local
+          # can serve the content, so whatever comes back came from the server.
+          rm -rf "${work}/first"
+          mkdir -p "${work}/home"
+          HOME="${work}/home" lore clone "${remote}/ci-probe" "${work}/second"
+          grep -q "${GITHUB_SHA}" "${work}/second/probe.txt"
+          echo "::endgroup::"
+
+          echo "data path round trip OK"
+
+      # --context makes a missing kind cluster an error rather than a query
+      # against whatever cluster the runner's environment points at.
+      - name: Dump diagnostics
+        if: failure()
+        run: |
+          ctx="kind-lore-${{ matrix.case.name }}"
+          kubectl --context "${ctx}" get all,pvc,events --namespace "${NAMESPACE}" --output wide || true
+          kubectl --context "${ctx}" describe pods --namespace "${NAMESPACE}" || true
+          kubectl --context "${ctx}" logs --namespace "${NAMESPACE}" --selector app.kubernetes.io/instance=lore \
+            --all-containers --tail=200 --prefix || true
+          # Survives only when the test failed, which is exactly when it is worth reading.
+          kubectl --context "${ctx}" logs --namespace "${NAMESPACE}" lore-test-connection || true
+
+      # Non-fatal. The runner is discarded after the job, so a leaked cluster
+      # cannot outlive it, and a teardown error should not turn a green job red.
+      - name: Delete the kind cluster
+        if: always()
+        run: kind delete cluster --name "lore-${{ matrix.case.name }}" || true
