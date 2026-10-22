@@ -1717,7 +1717,7 @@ pub(crate) async fn resolve(
     signature: impl AsRef<str>,
     search_location: ResolveSearchLocation,
 ) -> Result<Hash, StateError> {
-    resolve_revision(repository, signature, search_location)
+    resolve_revision(repository, signature, None, search_location)
         .await
         .map(|(revision, _named_branch)| revision)
 }
@@ -1750,7 +1750,7 @@ pub async fn resolve_in_branch(
     search_location: ResolveSearchLocation,
 ) -> Result<ResolvedRevision, StateError> {
     let (revision, named_branch) =
-        resolve_revision(repository.clone(), signature, search_location).await?;
+        resolve_revision(repository.clone(), signature, None, search_location).await?;
 
     // Taken for the revision reached rather than the one named, since a `~<count>`
     // walk can cross the branch point into the branch this one was created from.
@@ -1761,11 +1761,14 @@ pub async fn resolve_in_branch(
 
 /// The revision a specifier names, and the branch it named to find it in.
 ///
-/// See [`resolve_in_branch`] for the specifier forms. The branch is reported as
-/// named rather than as the revision is taken on, which reads the revision.
-async fn resolve_revision(
+/// See [`resolve_in_branch`] for the specifier forms. A target given without a
+/// branch is taken on `implied_branch`, or on the branch the instance is on
+/// where that is `None`. The branch is reported as named rather than as the
+/// revision is taken on, which reads the revision.
+pub(crate) async fn resolve_revision(
     repository: Arc<RepositoryContext>,
     signature: impl AsRef<str>,
+    implied_branch: Option<BranchId>,
     search_location: ResolveSearchLocation,
 ) -> Result<(Hash, Option<(BranchId, Hash)>), StateError> {
     let original_input = signature.as_ref();
@@ -1805,15 +1808,19 @@ async fn resolve_revision(
         revision = parse_hash_signature(signature, original_input)?;
         lore_debug!("Resolved direct hash signature: {revision}");
     } else {
-        // An empty prefix is the branch the instance is on, which is what makes
-        // the `@` optional: no branch reads as a target, so a specifier carrying
-        // one and a specifier carrying none cannot be confused.
+        // An empty prefix names no branch, which is what makes the `@`
+        // optional: no branch reads as a target, so a specifier carrying one
+        // and a specifier carrying none cannot be confused.
         let (prefix, suffix) = signature.split_once("@").unwrap_or(("", signature));
         let target = branch_target(suffix, original_input)?;
 
         lore_debug!("Resolving branch {prefix} signature {signature}");
         let (branch, branch_metadata) = if prefix.is_empty() {
-            (current_anchor_branch(&repository).await?, Hash::default())
+            let branch = match implied_branch {
+                Some(branch) => branch,
+                None => current_anchor_branch(&repository).await?,
+            };
+            (branch, Hash::default())
         } else {
             let branch_status = branch::resolve(repository.clone(), prefix)
                 .await

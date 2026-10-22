@@ -316,7 +316,7 @@ Also see: revision, branch.
 
 ### Revision identifier
 
-How a revision is named to a command or across the API: its whole 64-character hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch the instance is on.
+How a revision is named to a command or across the API: its whole 64-character hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without a branch applying to the branch the instance is on, or in `lore branch switch` to the branch switched to.
 
 A revision identifies the branch it was created on. A branch point can also identify the child branch by naming that child branch.
 

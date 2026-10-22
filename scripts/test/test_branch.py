@@ -1100,6 +1100,39 @@ def test_branch_point_preserves_branch(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_branch_switch_to_revision_number(new_lore_repo):
+    """A revision number given to branch switch is numbered on the branch
+    switched to, not on the branch the instance is on, which holds a revision
+    with the same number."""
+
+    repo: Lore = new_lore_repo()
+    file = "file.txt"
+
+    repo.write_commit_push(None, {file: "main 1\n"})
+
+    repo.branch_create("feature")
+    repo.write_commit_push(None, {file: "feature 2\n"})
+    target = repo.revision_info(offline=True)
+    repo.write_commit_push(None, {file: "feature 3\n"})
+
+    repo.branch_switch("main")
+    repo.write_commit_push(None, {file: "main 2\n"})
+    assert repo.revision_info(offline=True).revision == target.revision
+    repo.write_commit_push(None, {file: "main 3\n"})
+
+    repo.branch_switch(name="feature", revision=target.revision)
+
+    assert get_status_branch(repo) == "feature", (
+        "Branch switch should be on the target branch"
+    )
+    assert repo.revision_info(offline=True).signature == target.signature, (
+        "Branch switch should be at the target branch revision"
+    )
+    with repo.open_file(file) as f:
+        assert f.read() == "feature 2\n"
+
+
+@pytest.mark.smoke
 def test_local_delete_and_switch_restores_from_remote(new_lore_repo):
     """Deleting a branch locally then switching to it should restore from remote."""
     repo: Lore = new_lore_repo()

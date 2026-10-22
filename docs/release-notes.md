@@ -25,6 +25,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   heals every fragment a flush in the same process moves to other index buckets meanwhile
 - `lore stage` of several paths under a directory missing from the working directory stages a delete of only those
   paths, where it staged a delete of the whole directory
+- `lore branch switch <branch> <revision>` takes a revision that names no branch, such as `1234` or `@1234`, on
+  `<branch>`, where it took it on the current branch and refused it as not on the target branch
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

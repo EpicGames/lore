@@ -3261,8 +3261,8 @@ pub async fn branch_switch(
 }
 
 /// The revision a switch to `branch_id` lands on, as `(latest local, latest remote, location,
-/// signature)`: the given signature, or the local or remote latest, creating the local branch
-/// where only the remote holds it.
+/// signature)`: the given signature, taken on `branch_id` where it names no branch, or the local
+/// or remote latest, creating the local branch where only the remote holds it.
 ///
 /// A function of its own because its locals live across several awaits: kept in
 /// [`branch_switch`] they would take space in its future while the layers switch as well.
@@ -3278,11 +3278,14 @@ async fn branch_switch_target(
     let global = context.globals();
 
     let signature = if let Some(revision) = options.signature.as_ref() {
-        let resolved =
-            revision::resolve_in_branch(repository.clone(), revision, global.search_location())
-                .await
-                .forward::<RepositoryError>("Invalid revision")?;
-        let revision = resolved.revision;
+        let (revision, _named_branch) = revision::resolve_revision(
+            repository.clone(),
+            revision,
+            Some(branch_id),
+            global.search_location(),
+        )
+        .await
+        .forward::<RepositoryError>("Invalid revision")?;
 
         let state = state::State::deserialize(repository.clone(), revision)
             .await
