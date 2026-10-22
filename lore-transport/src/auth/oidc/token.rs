@@ -7,6 +7,7 @@ use lore_base::lore_warn;
 use serde::Deserialize;
 
 use super::FormResponse;
+use super::PostError;
 use super::body_excerpt;
 use super::on_net_runtime;
 use super::post_form;
@@ -82,16 +83,38 @@ pub(super) async fn request_authorized<T>(
 where
     T: for<'de> Deserialize<'de> + Send + 'static,
 {
+    request_once(what, endpoint, form, authorization)
+        .await
+        .map_err(ProtocolError::from)
+}
+
+/// [`request_authorized`], telling a failure that sent nothing from one after which the
+/// provider may have acted on the request. Everything after a response arrives, a refusal
+/// that cannot be read and an unusable success included, may have been acted on.
+pub(super) async fn request_once<T>(
+    what: &'static str,
+    endpoint: &str,
+    form: Vec<(&'static str, String)>,
+    authorization: Option<String>,
+) -> Result<Outcome<T>, PostError>
+where
+    T: for<'de> Deserialize<'de> + Send + 'static,
+{
     let endpoint = endpoint.to_owned();
     on_net_runtime(async move {
         let form: Vec<(&str, &str)> = form
             .iter()
             .map(|(name, value)| (*name, value.as_str()))
             .collect();
-        let response = post_form(what, &endpoint, &form, authorization.as_deref()).await?;
-        parse(what, &response)
+        Ok(
+            match post_form(what, &endpoint, &form, authorization.as_deref()).await {
+                Ok(response) => parse(what, &response).map_err(PostError::MaybeSent),
+                Err(error) => Err(error),
+            },
+        )
     })
     .await
+    .map_err(PostError::MaybeSent)?
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(

@@ -193,8 +193,8 @@ fn a_server_advertising_no_authentication_selects_nothing() {
 /// implementation, and the token store keys the two apart. The OIDC
 /// implementation itself comes from the selection, bound to the advertised
 /// client, which the endpoint alone does not name.
-#[tokio::test]
-async fn the_oidc_endpoint_names_the_issuer_under_the_oidc_scheme() {
+#[test]
+fn the_oidc_endpoint_names_the_issuer_under_the_oidc_scheme() {
     let issuer = issuer("tagged");
     let environment = environment(Some(AUTH_URL), Some(oidc(&issuer, false)));
 
@@ -205,16 +205,6 @@ async fn the_oidc_endpoint_names_the_issuer_under_the_oidc_scheme() {
     let by_issuer = authentication::find(&issuer).expect("the https scheme");
     assert!(!Arc::ptr_eq(&selected.endpoint.auth, &by_issuer));
     assert!(authentication::find(&selected.endpoint.url).is_err());
-
-    // The OIDC refresh grant is not implemented yet, and says so without
-    // touching the network.
-    let refused = selected
-        .endpoint
-        .auth
-        .refresh_authentication(&selected.endpoint.url, "refresh", "")
-        .await
-        .expect_err("not implemented yet");
-    assert!(refused.is_not_supported(), "{refused}");
 }
 
 /// A server whose gRPC auth URL and OIDC issuer are the same string, which a

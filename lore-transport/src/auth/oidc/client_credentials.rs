@@ -63,6 +63,9 @@ pub fn basic_authorization(client_id: &str, client_secret: &str) -> String {
 /// Requests a token for the client `client_id` names. No scope is sent, so the provider
 /// grants the client's default scopes. A refusal of the credentials, `invalid_client`, is
 /// [`NotAuthenticated`].
+///
+/// A refresh token in the answer is dropped. Refreshing it needs the client's secret, which
+/// is not stored, and RFC 6749 §4.4.3 has the provider issue none.
 pub async fn login(
     document: &DiscoveryDocument,
     client_id: &str,
@@ -85,7 +88,10 @@ pub async fn login(
     )
     .await?
     {
-        Outcome::Token(response) => token::authentication_token(response),
+        Outcome::Token(response) => Ok(AuthenticationToken {
+            refresh_token: None,
+            ..token::authentication_token(response)?
+        }),
         Outcome::Refused(refusal) if refusal.error == "invalid_client" => {
             lore_debug!(
                 "OIDC token endpoint at {} refused the credentials of client {client_id}: {}",

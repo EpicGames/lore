@@ -9,6 +9,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- An OIDC login whose access token has expired is renewed with its refresh token (OAuth 2.0 refresh grant, RFC 6749
+  §6) on the next operation, without a new `lore auth login`. The provider's rotated refresh token replaces the used
+  one, and a refresh token the provider refuses is dropped, so the next operation asks for a new login. A client
+  credentials login stores no refresh token
+
 ### Fixes & Improvements
 
 - `lore repository verify` fails where it can't read part of the local store, where it passed over it, and checks and

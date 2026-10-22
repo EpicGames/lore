@@ -158,7 +158,7 @@ async fn exchange_token(
 }
 
 /// Checks that `authn` may be sent to `recipient_url` and stores it, with its refresh
-/// token if it has one, under `auth_url`.
+/// token and scope, under `auth_url`.
 async fn store_authentication(
     auth_url: &str,
     authn: AuthenticationToken,
@@ -175,21 +175,16 @@ async fn store_authentication(
     )
     .forward::<LoginError>("verifying JWT usage for remote")?;
 
-    token_store::store_user_token(
+    token_store::store_user_token_and_refresh_token(
         auth_url,
         user_info.id.as_str(),
         &authn.token,
         decoded_token.claims.acceptable_root_domains(),
+        authn.refresh_token.as_deref(),
+        authn.scope.as_deref(),
     )
     .await
     .forward::<LoginError>("storing user token")?;
-
-    // Store refresh token if issued
-    if let Some(ref refresh) = authn.refresh_token
-        && let Err(e) = token_store::store_refresh_token(auth_url, &user_info.id, refresh).await
-    {
-        lore_debug!("Failed to store refresh token for {}: {e}", user_info.id);
-    }
 
     Ok(user_info)
 }
@@ -247,11 +242,13 @@ pub(crate) async fn with_token(
             .forward::<LoginError>("verifying JWT usage for remote")?;
 
         if let Some(user_info) = lore_credential::user_info_from_token(token.to_string()) {
-            token_store::store_user_token(
+            token_store::store_user_token_and_refresh_token(
                 auth_url.as_str(),
                 user_info.id.as_str(),
                 token,
                 decoded_token.claims.acceptable_root_domains(),
+                None,
+                None,
             )
             .await
             .forward::<LoginError>("storing user token")?;
@@ -412,21 +409,16 @@ pub async fn interactive(
         .forward::<InteractiveLoginError>("verifying JWT usage for remote")?;
 
     lore_debug!("Auth successful");
-    token_store::store_user_token(
+    token_store::store_user_token_and_refresh_token(
         auth_url.as_str(),
         authn.user_id.as_str(),
         authn.token.as_str(),
         decoded_token.claims.acceptable_root_domains(),
+        authn.refresh_token.as_deref(),
+        authn.scope.as_deref(),
     )
     .await
     .forward::<InteractiveLoginError>("storing user token")?;
-
-    // Store refresh token if the backend issued one
-    if let Some(ref refresh) = authn.refresh_token
-        && let Err(e) = token_store::store_refresh_token(&auth_url, &authn.user_id, refresh).await
-    {
-        lore_debug!("Failed to store refresh token for {}: {e}", authn.user_id);
-    }
 
     let Some(mut user_info) = lore_credential::user_info(
         auth_url.as_str(),

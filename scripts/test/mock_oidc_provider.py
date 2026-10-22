@@ -24,6 +24,13 @@ discovery document leaves the field out and Basic is the RFC 8414 default.
 Wrong credentials, or credentials in a place the list does not name, answer
 `invalid_client` with HTTP 401.
 
+A device grant that asked for `offline_access` also hands out a refresh token,
+and the refresh token grant (RFC 6749 §6) rotates it: each one is good for one
+refresh, and presenting one again revokes every refresh token of that login,
+as UCS Auth does. `token_lifetime` sets the lifetime of the access tokens the
+two grants and the partition exchange mint, negative for one that has expired
+already.
+
 The token endpoint answers from a script the test sets: a list of RFC 8628
 §3.5 error codes answered in order, then the token. An empty script hands out
 the token on the first poll.
@@ -50,6 +57,7 @@ logger = logging.getLogger(__name__)
 
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 CLIENT_CREDENTIALS_GRANT = "client_credentials"
+REFRESH_TOKEN_GRANT = "refresh_token"
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"
 API_KEY_TOKEN_TYPE = "urn:lore:params:oauth:token-type:api-key"
@@ -144,6 +152,11 @@ class _Handler(BaseHTTPRequestHandler):
         logger.debug("mock oidc provider: " + format, *args)
 
 
+def _claims(token: str) -> dict:
+    payload = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+
+
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -191,6 +204,18 @@ class MockOidcProvider:
         self.clients: dict[str, tuple[str, OidcUser]] = {}
         # `token_endpoint_auth_methods_supported`; `None` leaves it out.
         self.token_endpoint_auth_methods: list[str] | None = None
+        # The lifetime of the access tokens the device and refresh grants and the
+        # partition exchange mint.
+        self.token_lifetime = DEFAULT_TOKEN_LIFETIME_SECONDS
+        # The scope the last device authorization asked for.
+        self._device_scope = ""
+        # Refresh tokens in the order issued, each to its login and whether it
+        # is still good.
+        self.refresh_tokens: dict[str, tuple[int, bool]] = {}
+        # Whether the refresh grant consumes the token and then answers HTTP 500, as a
+        # provider whose answer is lost on the way back.
+        self.lose_refresh_answers = False
+        self._logins = 0
         self._minted: set[str] = set()
         self._server: _Server | None = None
         self._thread: threading.Thread | None = None
@@ -222,6 +247,11 @@ class MockOidcProvider:
             self.api_keys.clear()
             self.clients.clear()
             self.token_endpoint_auth_methods = None
+            self.user = USER
+            self.token_lifetime = DEFAULT_TOKEN_LIFETIME_SECONDS
+            self._device_scope = ""
+            self.refresh_tokens.clear()
+            self.lose_refresh_answers = False
 
     def reset_requests(self) -> None:
         with self._lock:
@@ -241,6 +271,15 @@ class MockOidcProvider:
     def requests_to(self, path: str) -> list[Received]:
         with self._lock:
             return [r for r in self.requests if r.path == path]
+
+    def valid_refresh_tokens(self) -> list[str]:
+        with self._lock:
+            return [token for token, (_, valid) in self.refresh_tokens.items() if valid]
+
+    def revoke_refresh_tokens(self) -> None:
+        with self._lock:
+            for token, (login, _) in self.refresh_tokens.items():
+                self.refresh_tokens[token] = (login, False)
 
     # ------------------------------------------------------------------
     # Endpoints
@@ -271,6 +310,8 @@ class MockOidcProvider:
     def device_authorization(self, form: dict[str, str]) -> tuple[int, dict]:
         if form.get("client_id") != self.client_id:
             return 400, {"error": "invalid_client"}
+        with self._lock:
+            self._device_scope = form.get("scope", "")
         return 200, {
             "device_code": self.device_code,
             "user_code": self.user_code,
@@ -287,6 +328,8 @@ class MockOidcProvider:
             return self.token_exchange(form)
         if form.get("grant_type") == CLIENT_CREDENTIALS_GRANT:
             return self.client_credentials(form, authorization)
+        if form.get("grant_type") == REFRESH_TOKEN_GRANT:
+            return self.refresh(form)
         if form.get("grant_type") != DEVICE_CODE_GRANT:
             return 400, {"error": "unsupported_grant_type"}
         if form.get("client_id") != self.client_id:
@@ -299,17 +342,55 @@ class MockOidcProvider:
                 if error not in ("access_denied", "expired_token"):
                     self._poll_script.pop(0)
                 return 400, {"error": error}
-        return 200, {
-            "access_token": self.mint_token(self.user),
+            scope = self._device_scope
+        response = {
+            "access_token": self.mint_token(self.user, self.token_lifetime),
             "token_type": "Bearer",
-            "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
-            "scope": form.get("scope", "openid offline_access"),
+            "expires_in": max(self.token_lifetime, 0),
+            "scope": scope,
             "id_token": self.mint_id_token(self.user),
         }
+        if "offline_access" in scope.split():
+            with self._lock:
+                self._logins += 1
+                response["refresh_token"] = self._issue_refresh_token(self._logins)
+        return 200, response
+
+    def refresh(self, form: dict[str, str]) -> tuple[int, dict]:
+        """RFC 6749 §6 with rotation: the presented token is consumed, and a
+        consumed one presented again revokes its whole login."""
+        if form.get("client_id") != self.client_id:
+            return 400, {"error": "invalid_client"}
+        with self._lock:
+            presented = self.refresh_tokens.get(form.get("refresh_token", ""))
+            if presented is None:
+                return 400, {"error": "invalid_grant"}
+            login, valid = presented
+            if not valid:
+                for token, (other, _) in self.refresh_tokens.items():
+                    if other == login:
+                        self.refresh_tokens[token] = (login, False)
+                return 400, {"error": "invalid_grant"}
+            self.refresh_tokens[form["refresh_token"]] = (login, False)
+            refresh_token = self._issue_refresh_token(login)
+            if self.lose_refresh_answers:
+                return 500, {"error": "server_error"}
+        return 200, {
+            "access_token": self.mint_token(self.user, self.token_lifetime),
+            "token_type": "Bearer",
+            "expires_in": max(self.token_lifetime, 0),
+            "refresh_token": refresh_token,
+        }
+
+    def _issue_refresh_token(self, login: int) -> str:
+        """A new refresh token for `login`. The caller holds the lock."""
+        token = f"mock-refresh-{login}-{len(self.refresh_tokens) + 1}"
+        self.refresh_tokens[token] = (login, True)
+        return token
 
     def token_exchange(self, form: dict[str, str]) -> tuple[int, dict]:
-        """RFC 8693 §2.1: the subject token must be one this stub minted, and
-        the partition is read from the configured carrier."""
+        """RFC 8693 §2.1: the subject token must be an unexpired one this stub
+        minted, and the partition is read from the configured carrier."""
         if form.get("client_id") != self.client_id:
             return 400, {"error": "invalid_client"}
         if form.get("subject_token_type") in (API_KEY_TOKEN_TYPE, "api-key"):
@@ -318,6 +399,8 @@ class MockOidcProvider:
             minted = form.get("subject_token") in self._minted
         if not minted or form.get("subject_token_type") != ACCESS_TOKEN_TYPE:
             return 400, {"error": "invalid_grant"}
+        if _claims(form["subject_token"])["exp"] <= time.time():
+            return 400, {"error": "invalid_grant", "error_description": "expired"}
         prefix, _, suffix = self.exchange_template.partition("{id}")
         named = form.get(self.exchange_carrier, "")
         partition = named.removeprefix(prefix).removesuffix(suffix)
@@ -327,10 +410,12 @@ class MockOidcProvider:
             {"resource_id": f"urc-{partition}", "permission": self.grants[partition]}
         ]
         return 200, {
-            "access_token": self.mint_token(self.user, resources=resources),
+            "access_token": self.mint_token(
+                self.user, self.token_lifetime, resources=resources
+            ),
             "issued_token_type": ACCESS_TOKEN_TYPE,
             "token_type": "Bearer",
-            "expires_in": DEFAULT_TOKEN_LIFETIME_SECONDS,
+            "expires_in": max(self.token_lifetime, 0),
         }
 
     def client_credentials(

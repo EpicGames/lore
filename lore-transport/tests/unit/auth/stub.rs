@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! An `Authentication` that serves repository exchanges from a closure, so a test drives the
+//! An `Authentication` that serves exchanges from a closure, so a test drives the
 //! authorization exchange without a network, and tokens for it to trade.
 
 use std::sync::Arc;
@@ -27,10 +27,17 @@ pub(crate) const AUTHZ_TWO: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3M
 /// served before it.
 type Authorize = Box<dyn Fn(&str, usize) -> &'static str + Send + Sync>;
 
-/// Hands out the authorization `authorize` names, and counts the exchanges.
+/// Answers a refresh grant for the refresh token presented.
+type Refresh = Box<dyn Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync>;
+
+/// Hands out the authorization `authorize` names, and counts the exchanges. Refreshes are
+/// answered by `refresh`, and refused without one.
 pub(crate) struct StubAuthentication {
     exchanges: AtomicUsize,
     authorize: Authorize,
+    refresh: Option<Refresh>,
+    refresh_delay: std::time::Duration,
+    presented: parking_lot::Mutex<Vec<String>>,
 }
 
 impl StubAuthentication {
@@ -40,12 +47,48 @@ impl StubAuthentication {
         Arc::new(Self {
             exchanges: AtomicUsize::new(0),
             authorize: Box::new(authorize),
+            refresh: None,
+            refresh_delay: std::time::Duration::ZERO,
+            presented: parking_lot::Mutex::default(),
+        })
+    }
+
+    /// A stub that answers refresh grants with `refresh`, and trades [`AUTHN_ONE`] for
+    /// [`AUTHZ_ONE`] and any other token for [`AUTHZ_TWO`].
+    pub(crate) fn refreshing(
+        refresh: impl Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::refreshing_after(std::time::Duration::ZERO, refresh)
+    }
+
+    /// [`StubAuthentication::refreshing`], answering each refresh after `delay`.
+    pub(crate) fn refreshing_after(
+        delay: std::time::Duration,
+        refresh: impl Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            exchanges: AtomicUsize::new(0),
+            authorize: Box::new(|authn_token, _| {
+                if authn_token == AUTHN_ONE {
+                    AUTHZ_ONE
+                } else {
+                    AUTHZ_TWO
+                }
+            }),
+            refresh: Some(Box::new(refresh)),
+            refresh_delay: delay,
+            presented: parking_lot::Mutex::default(),
         })
     }
 
     /// Repository exchanges served so far.
     pub(crate) fn exchanges(&self) -> usize {
         self.exchanges.load(Ordering::Acquire)
+    }
+
+    /// The refresh tokens presented so far, in order.
+    pub(crate) fn presented(&self) -> Vec<String> {
+        self.presented.lock().clone()
     }
 }
 
@@ -116,23 +159,32 @@ impl Authentication for StubAuthentication {
     async fn refresh_authentication(
         &self,
         _auth_url: &str,
-        _refresh_token: &str,
+        refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(ProtocolError::internal(
-            "the stub only serves authorization exchanges",
-        ))
+        self.presented.lock().push(refresh_token.to_owned());
+        tokio::time::sleep(self.refresh_delay).await;
+        match &self.refresh {
+            Some(refresh) => refresh(refresh_token),
+            None => Err(ProtocolError::internal(
+                "the stub only serves authorization exchanges",
+            )),
+        }
     }
 
     async fn exchange_for_custom_resource(
         &self,
-        _auth_url: &str,
-        _authn_token: &str,
+        auth_url: &str,
+        authn_token: &str,
         _resource_id: &str,
-        _correlation_id: &str,
+        correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        Err(ProtocolError::internal(
-            "the stub only serves repository exchanges",
-        ))
+        self.exchange_for_repository(
+            auth_url,
+            authn_token,
+            RepositoryId::default(),
+            correlation_id,
+        )
+        .await
     }
 }

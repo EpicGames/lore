@@ -4,6 +4,7 @@ mod client_credentials;
 mod device;
 mod discovery;
 mod exchange;
+mod refresh;
 
 #[path = "../../support/oidc_provider.rs"]
 mod provider;

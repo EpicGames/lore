@@ -16,6 +16,7 @@ The same path against a real RFC 8693 issuer is the fixture repository's job.
 
 import base64
 import json
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ from lore_server import (
 )
 from mock_oidc_provider import (
     ACCESS_TOKEN_TYPE,
+    REFRESH_TOKEN_GRANT,
     TOKEN_EXCHANGE_GRANT,
     USER,
     MockOidcProvider,
@@ -188,6 +190,29 @@ def test_a_push_exchanges_the_login_token_for_the_partition(
         assert request.form["subject_token_type"] == ACCESS_TOKEN_TYPE
         assert request.form["client_id"] == provider.client_id
         assert "resources" not in decoded_claims(request.form["subject_token"])
+
+
+@pytest.mark.smoke
+def test_a_push_after_the_login_expires_refreshes_before_the_exchange(
+    exchange_env, make_repo
+):
+    """Once the login token and the partition token have expired, a push
+    refreshes the login token before it exchanges it for the partition, and
+    goes through without a new login."""
+    provider = exchange_env.provider
+    # Long enough to log in and create the repository, short enough to wait out.
+    provider.token_lifetime = 3
+    repo, _ = granted_repository(exchange_env, make_repo)
+    time.sleep(4)
+    provider.token_lifetime = 3600
+    provider.reset_requests()
+
+    seed_commit_and_push(repo)
+
+    grants = [r.form.get("grant_type") for r in provider.requests_to("/token")]
+    assert grants and grants[0] == REFRESH_TOKEN_GRANT, grants
+    assert grants.count(REFRESH_TOKEN_GRANT) == 1, grants
+    assert TOKEN_EXCHANGE_GRANT in grants, grants
 
 
 @pytest.mark.smoke
