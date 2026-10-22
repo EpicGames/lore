@@ -18,6 +18,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 - `lore repository verify` fails where it can't read part of the local store, where it passed over it, and checks and
   heals every fragment a flush in the same process moves to other index buckets meanwhile
+- `lore stage` of several paths under a directory missing from the working directory stages a delete of only those
+  paths, where it staged a delete of the whole directory
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

@@ -1301,6 +1301,80 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// Staging several files under a removed directory in one call stages a delete of only those
+    /// files, not of the directories they share or the other files in them.
+    #[tokio::test]
+    async fn staging_files_under_a_removed_ancestor_deletes_only_those_files() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                std::fs::create_dir_all(fixture.path.join("A/B/M")).expect("Create dir failed");
+                for file in [
+                    "A/B/M/a1.txt",
+                    "A/B/M/a2.txt",
+                    "A/B/M/a3.txt",
+                    "A/other.txt",
+                ] {
+                    test_file_write(&fixture.path.join(file), file.as_bytes());
+                }
+                test_commit_tree(&fixture, "Initial").await;
+
+                std::fs::remove_dir_all(fixture.path.join("A")).expect("Delete failed");
+
+                file::stage::stage(
+                    repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(
+                        ["A/B/M/a1.txt", "A/B/M/a2.txt"]
+                            .iter()
+                            .map(|target| {
+                                LoreString::from(
+                                    fixture.path.join(target).to_string_lossy().as_ref(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                    StageOptions::default(),
+                )
+                .await
+                .expect("Stage failed");
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged = state_staged.expect("Should have staged state");
+                for (path, deleted) in [
+                    ("A/B/M/a1.txt", true),
+                    ("A/B/M/a2.txt", true),
+                    ("A", false),
+                    ("A/B", false),
+                    ("A/B/M", false),
+                    ("A/B/M/a3.txt", false),
+                    ("A/other.txt", false),
+                ] {
+                    let node = state_staged
+                        .find_node(repository.clone(), path)
+                        .await
+                        .unwrap_or_else(|_| panic!("{path} is committed and stays in the tree"));
+                    assert_eq!(
+                        node.is_staged_delete(),
+                        deleted,
+                        "{path} staged for delete should be {deleted}"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// The staged tree's children of the root that are named `name`.
     async fn root_children_named(fixture: &TestRepository, name: &str) -> Vec<Node> {
         let repository = fixture.repository.clone();

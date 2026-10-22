@@ -697,6 +697,16 @@ pub(crate) async fn stage_filesystem_path(
             return Ok(NodeLink::default());
         }
 
+        // Without its children a missing directory is only located: deleting it would delete
+        // everything below it, where the caller stages only some of that.
+        if options.no_children {
+            return Ok(if node_link.repository == repository.id {
+                node_link
+            } else {
+                NodeLink::default()
+            });
+        }
+
         let mut current_repository = repository.clone();
         let node_state = if node_link.repository != repository.id {
             current_repository = repository.to_link_context(node_link.repository).await;
