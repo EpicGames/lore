@@ -4,6 +4,8 @@ pub mod initialization;
 pub mod service_main;
 pub mod state;
 
+use std::sync::Arc;
+
 use lore_base::error::MountsBusy;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
@@ -33,6 +35,7 @@ use crate::remote::service_process::report_settings_update_that_will_not_relay;
 use crate::remote::service_process::request_service_stop;
 use crate::remote::service_process::service_runs_in_this_process;
 use crate::remote::service_process::wait_until_no_service_is_listening;
+use crate::service::service_main::service_main;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
@@ -499,4 +502,87 @@ fn emit_not_running_status() {
         swfs_mount_count: 0,
     })
     .send();
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Default)]
+/// Arguments for running the Lore service in the current process (no parameters).
+///
+/// Does not derive `LoreArgs`: running the service is always local, as it is the
+/// service that handles IPC and so cannot itself be routed through it.
+pub struct LoreServiceRunArgs {}
+
+/// Run the Lore service in the current process.
+///
+/// Returns once the service has stopped, either by `lore service stop` over IPC
+/// or by [`quit`] from within this process.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+pub async fn run(
+    globals: LoreGlobalArgs,
+    args: LoreServiceRunArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    let service_globals = globals.clone();
+    no_repository_call(globals, callback, args, run, async move |_args| {
+        service_main(service_globals, Arc::clone(ServiceStateImpl::global())).await
+    })
+    .await
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Default)]
+/// Arguments for requesting the Lore service running in this process to quit (no parameters).
+pub struct LoreServiceQuitArgs {}
+
+/// Request the Lore service running in this process to quit.
+///
+/// This is an in-process cancellation mechanism: it asks a service started with
+/// [`run`] in this process to shut down cleanly, and does not reach a service in
+/// another process (use [`stop`] for that). When no service runs in this
+/// process, this is a no-op that returns success.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+pub async fn quit(
+    globals: LoreGlobalArgs,
+    args: LoreServiceQuitArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    // Like [`stop`], this acts where it was called: routed through the service
+    // it would start one just to be told to quit.
+    quit_local(globals, args, callback).await
+}
+
+async fn quit_local(
+    globals: LoreGlobalArgs,
+    args: LoreServiceQuitArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    no_repository_call(globals, callback, args, quit, move |_args| async move {
+        request_service_stop();
+        Ok::<(), ServiceProcessError>(())
+    })
+    .await
 }

@@ -495,12 +495,19 @@ def test_service_resolves_relative_paths_against_caller(
     ), f"Staged file should show as added: {status_output}"
 
 
-@pytest.mark.smoke
-@pytest.mark.skipif(
-    platform.system() not in ("Linux", "Darwin"),
-    reason="POSIX termination signals",
+# What can be sent to a service to ask it to stop. Windows has no SIGTERM to
+# send: `Popen.send_signal(SIGTERM)` there ends the process outright. A console
+# signal is the graceful route, and Ctrl-Break is the one that can be aimed at a
+# process in a group of its own, which is how the runner starts the service.
+TERMINATION_SIGNALS = (
+    [signal.CTRL_BREAK_EVENT]
+    if platform.system() == "Windows"
+    else [signal.SIGTERM, signal.SIGINT]
 )
-@pytest.mark.parametrize("termination_signal", [signal.SIGTERM, signal.SIGINT])
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("termination_signal", TERMINATION_SIGNALS)
 def test_the_service_shuts_down_cleanly_on_a_signal(
     lore_service_runner, tmp_path, termination_signal
 ):
@@ -691,7 +698,7 @@ def test_a_service_waiting_on_a_claimed_socket_stops_on_a_signal(
     )
     assert (
         LORE_SERVICE_CLAIM_REFUSED_MESSAGE in output
-        and "stopped waiting for it on a signal" in output
+        and "stopped waiting for it on a quit" in output
     ), f"the signal ends the wait on the claim: {output}"
 
 

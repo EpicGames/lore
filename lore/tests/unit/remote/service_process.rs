@@ -5,12 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore::remote::service_process::*;
-use tokio::sync::Notify;
 
 #[test]
 fn no_executable_set_reports_both_places_to_set_one() {
@@ -137,26 +134,23 @@ fn an_empty_environment_value_with_no_config_fails() {
 
 #[tokio::test]
 async fn a_stop_requested_before_the_wait_still_ends_it() {
-    let request = Arc::new(StopRequest {
-        requested: AtomicBool::new(false),
-        notify: Notify::new(),
-    });
+    let request = Arc::new(StopRequest::new());
+    assert!(request.begin_start());
+    request.set_running();
     let wait = ServiceStopRequest {
         request: Arc::clone(&request),
     };
 
-    request.requested.store(true, Ordering::Release);
-    request.notify.notify_one();
+    assert!(request.request_stop());
 
     wait.requested().await;
 }
 
 #[tokio::test]
 async fn a_stop_requested_during_the_wait_ends_it() {
-    let request = Arc::new(StopRequest {
-        requested: AtomicBool::new(false),
-        notify: Notify::new(),
-    });
+    let request = Arc::new(StopRequest::new());
+    assert!(request.begin_start());
+    request.set_running();
     let wait = ServiceStopRequest {
         request: Arc::clone(&request),
     };
@@ -164,9 +158,75 @@ async fn a_stop_requested_during_the_wait_ends_it() {
     // Both run on this task: the wait parks first, then the request lands.
     tokio::join!(wait.requested(), async {
         tokio::task::yield_now().await;
-        request.requested.store(true, Ordering::Release);
-        request.notify.notify_one();
+        assert!(request.request_stop());
     });
+}
+
+#[test]
+fn a_stop_asked_of_an_earlier_service_is_cleared_by_the_next_start() {
+    let request = StopRequest::new();
+    assert!(request.begin_start());
+    assert!(request.request_stop());
+    request.end_service();
+
+    assert!(request.begin_start());
+    assert!(
+        !request.is_requested(),
+        "a service started after one has stopped must not be stopped on arrival"
+    );
+}
+
+#[test]
+fn a_stop_after_the_start_began_is_kept() {
+    let request = StopRequest::new();
+    assert!(request.begin_start());
+
+    // The service is starting and not yet running, as while it mounts.
+    assert!(request.request_stop());
+    assert!(request.is_requested());
+}
+
+#[test]
+fn a_second_start_is_refused_and_leaves_the_first_alone() {
+    let request = StopRequest::new();
+    assert!(request.begin_start());
+    request.set_running();
+    assert!(request.request_stop());
+
+    assert!(!request.begin_start(), "one service runs per process");
+    assert!(request.is_running());
+    assert!(
+        request.is_requested(),
+        "a refused start must not clear a stop asked of the running service"
+    );
+}
+
+/// A stop that reports a service to ask is never lost to the start publishing it:
+/// start and stop race, and whichever order they land in, a stop that was
+/// accepted is still requested once the start has finished.
+#[test]
+fn an_accepted_stop_is_never_cleared_by_a_racing_start() {
+    for _ in 0..2000 {
+        let request = Arc::new(StopRequest::new());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let stopper = {
+            let (request, barrier) = (Arc::clone(&request), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                request.request_stop()
+            })
+        };
+        barrier.wait();
+        assert!(request.begin_start());
+        let accepted = stopper.join().unwrap();
+
+        assert_eq!(
+            request.is_requested(),
+            accepted,
+            "a stop reported as accepted must survive the start"
+        );
+    }
 }
 
 /// The session a process belongs to, read from `/proc`. `comm` can hold

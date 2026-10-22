@@ -9,6 +9,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore service run` runs the Lore service in the current process, returning once it stops, whether by
+  `lore service stop` or by `lore::service::quit` from within the same process. `lore::service::quit` asks a service
+  that `lore::service::run` started in this process to shut down cleanly, and does nothing when none runs there. Neither
+  has a C API equivalent: there is no `lore_service_run` or `lore_service_quit`, so they're available from Rust only.
+  `lore service stop` (C API: `lore_service_stop`) is the way to stop a service from another process.
 - An OIDC login whose access token has expired is renewed with its refresh token (OAuth 2.0 refresh grant, RFC 6749
   §6) on the next operation, without a new `lore auth login`. The provider's rotated refresh token replaces the used
   one, and a refresh token the provider refuses is dropped, so the next operation asks for a new login. A client

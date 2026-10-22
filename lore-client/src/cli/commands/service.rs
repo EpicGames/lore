@@ -1,8 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-pub mod run;
-
-use std::sync::Arc;
 
 use clap::Args;
 use clap::Subcommand;
@@ -20,17 +17,18 @@ use lore::interface::LoreServiceStatusEventData;
 use lore::interface::LoreServiceStopArgs;
 use lore::runtime;
 use lore::service;
-use lore::service::state::ServiceStateImpl;
+use lore::service::LoreServiceQuitArgs;
+use lore::service::LoreServiceRunArgs;
 
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
-use crate::commands::service::run::service_main;
 use crate::eprintln;
 use crate::println;
 use crate::styling::CommonStyles;
 use crate::styling::LogStyles;
 use crate::util;
+use crate::util::TerminationSignals;
 
 #[derive(Args)]
 pub struct ServiceArgs {
@@ -89,21 +87,78 @@ pub enum ServiceCommands {
     SetUseAutomatically(ServiceSetUseAutomaticallyArgs),
 }
 
-fn handle_service_run(globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
-    // The service process owns one state, taken from the global here so that
-    // everything below is handed the instance rather than reaching for it.
-    let service_state = Arc::clone(ServiceStateImpl::global());
-    match runtime().block_on(async move { service_main(globals, None, service_state).await }) {
-        Ok(_) => 0,
-        Err(error) => {
-            eprintln!(
-                "{}Error running service:{} {error}",
-                CommonStyles::FAILURE,
-                anstyle::Reset
-            );
-            1
-        }
+/// Where the service process parks its working directory. It inherits one from
+/// whoever started it, which is unrelated to the directories its callers run in,
+/// and holding that directory would also keep the filesystem under it busy.
+/// Callers send the directory their relative paths belong to, so the service
+/// never needs one of its own.
+///
+/// Done here and not in `service::run`, so that a program embedding the service
+/// keeps its own working directory.
+fn detached_working_directory() -> std::path::PathBuf {
+    #[cfg(target_family = "unix")]
+    {
+        std::path::PathBuf::from("/")
     }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from("C:\\"),
+            std::path::PathBuf::from,
+        )
+    }
+}
+
+fn handle_service_run(globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
+    let detached = detached_working_directory();
+    if let Err(error) = std::env::set_current_dir(&detached) {
+        eprintln!(
+            "{}Failed to set working directory to {}:{} {error}",
+            CommonStyles::FAILURE,
+            detached.display(),
+            anstyle::Reset
+        );
+    }
+
+    runtime().block_on(async move {
+        // Registered before the service starts, because a signal ends the process
+        // outright until a handler is in place: registering after the service
+        // binds its socket leaves a window in which a service callers can already
+        // reach dies rather than stopping, leaving the socket behind.
+        let signals = match TerminationSignals::register() {
+            Ok(signals) => Some(signals),
+            Err(error) => {
+                eprintln!(
+                    "{}Failed to listen for termination signals:{} {error}",
+                    CommonStyles::FAILURE,
+                    anstyle::Reset
+                );
+                // Without signals the service is still stoppable over IPC
+                None
+            }
+        };
+
+        let run = service::run(globals.clone(), LoreServiceRunArgs {}, service_callback());
+        tokio::pin!(run);
+
+        let Some(mut signals) = signals else {
+            return run.await as u8;
+        };
+
+        // The service ends by itself when stopped over IPC or when it fails to start,
+        // and by a quit when a signal arrives first.
+        // Biased towards the service, so that it is polled and has begun to start
+        // by the time a signal that arrived already is acted on: a quit before
+        // that has no service to reach.
+        tokio::select! {
+            biased;
+            status = &mut run => status as u8,
+            () = signals.recv() => {
+                service::quit(globals, LoreServiceQuitArgs {}, service_callback()).await;
+                run.await as u8
+            }
+        }
+    })
 }
 
 /// The default handlers, which put errors on stderr, plus the maintenance

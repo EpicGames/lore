@@ -367,6 +367,13 @@ class TrackedServices:
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 **ends_with_launcher(),
+                # A group of its own on Windows, so that a console signal sent to
+                # the service reaches it alone rather than the test run as well.
+                **(
+                    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                    if sys.platform == "win32"
+                    else {}
+                ),
             )
         # Tracked before any wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.

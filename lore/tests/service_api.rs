@@ -6,10 +6,11 @@
 //! service ...`, so it covers the CLI's wrapper and not the crate entry points a
 //! program linking `liblore` uses. These are those entry points.
 //!
-//! What is here is what runs without a service listening: the settings, the
-//! decision they feed, a stop with nothing to stop, and the error a relayed call
-//! fails with when no service can be reached. Starting one, and stopping one that
-//! is running, need a bound socket and stay with the smoke suite.
+//! What is here is the settings, the decision they feed, a stop with nothing to
+//! stop, and the error a relayed call fails with when no service can be reached.
+//! It also runs the service in this process with `service::run` and ends it with
+//! `service::quit`, which only a Rust embedder can do. Starting a service as a
+//! separate process, and stopping one, stay with the smoke suite.
 //!
 //! One process, so `LORE_GLOBAL_PATH`, the socket and the process-wide decision
 //! are shared: every test is `#[serial]`, and each sets the settings it depends
@@ -31,6 +32,8 @@ mod tests {
     use lore::interface::LoreEventCallback;
     use lore::interface::LoreString;
     use lore::revision::LoreRevisionCherryPickArgs;
+    use lore::service::LoreServiceQuitArgs;
+    use lore::service::LoreServiceRunArgs;
     use lore::service::LoreServiceSetExecutableArgs;
     use lore::service::LoreServiceSetUseAutomaticallyArgs;
     use lore::service::LoreServiceStartArgs;
@@ -67,9 +70,9 @@ mod tests {
     /// this makes the name unique so that two runs of this target at once do not
     /// stop each other's.
     ///
-    /// Nothing is left behind to clean up: no test here starts a service — the one
-    /// that relays names an executable that does not exist — and a name no service
-    /// ever bound has no socket to remove.
+    /// Nothing is left behind to clean up: the tests that run a service end it
+    /// before they finish, and a name no service ever bound has no socket to
+    /// remove.
     static SOCKET_NAME: LazyLock<String> = LazyLock::new(|| {
         let name = format!(
             "lore_service-api-test-{}",
@@ -158,6 +161,37 @@ mod tests {
             lore_revision::event::convert_event_callback(no_callback()),
         )
         .await
+    }
+
+    async fn quit() -> i32 {
+        lore::service::quit(
+            globals(),
+            LoreServiceQuitArgs {},
+            lore_revision::event::convert_event_callback(no_callback()),
+        )
+        .await
+    }
+
+    /// Runs the service in this process on a task of its own, as an embedder
+    /// would, and waits until it accepts connections.
+    async fn run_service_here() -> tokio::task::JoinHandle<i32> {
+        let service = tokio::spawn(lore::service::run(
+            globals(),
+            LoreServiceRunArgs {},
+            lore_revision::event::convert_event_callback(no_callback()),
+        ));
+        assert!(
+            lore::remote::service_process::wait_until_a_service_is_listening()
+                .await
+                .expect("waiting for the service must not fail"),
+            "the service must begin listening"
+        );
+        service
+    }
+
+    /// Whether anything accepts connections on this target's socket.
+    fn socket_is_accepting() -> bool {
+        lore::remote::network::UdsStream::connect(lore::remote::service_socket_name()).is_ok()
     }
 
     async fn start(callback: LoreEventCallback) -> i32 {
@@ -307,6 +341,216 @@ mod tests {
             0,
             "a stop with no service running asks for a state that already holds"
         );
+    }
+
+    /// A quit reaches only a service running in this process. With none there it
+    /// is a no-op that succeeds, and must not go looking for one elsewhere.
+    #[test]
+    #[serial]
+    fn quitting_when_no_service_runs_in_this_process_succeeds() {
+        let _settings = machine_settings("service-api-quit-none-");
+
+        assert_eq!(
+            lore::runtime().block_on(quit()),
+            0,
+            "a quit with no service in this process has nothing to do"
+        );
+    }
+
+    /// A quit ends a service running in this process: `run` returns success,
+    /// and the socket stops accepting.
+    #[test]
+    #[serial]
+    fn quitting_ends_a_service_running_in_this_process() {
+        let _settings = machine_settings("service-api-quit-running-");
+
+        lore::runtime().block_on(async {
+            let service = run_service_here().await;
+            assert!(socket_is_accepting());
+
+            assert_eq!(quit().await, 0);
+            let status = tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("the service must end after a quit")
+                .expect("the service task must not panic");
+            assert_eq!(status, 0, "a service that is quit ends successfully");
+
+            assert!(
+                !socket_is_accepting(),
+                "a service that has ended must not still hold its socket"
+            );
+        });
+    }
+
+    /// A service can be run again in the same process after one has been quit,
+    /// and the earlier quit does not stop the later service on arrival.
+    #[test]
+    #[serial]
+    fn a_service_can_run_again_after_being_quit() {
+        let _settings = machine_settings("service-api-quit-restart-");
+
+        lore::runtime().block_on(async {
+            for round in 0..2 {
+                let service = run_service_here().await;
+
+                // Still serving shortly after it began listening, which a stop
+                // left over from the previous round would not allow.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                assert!(
+                    !service.is_finished(),
+                    "round {round} must still be serving"
+                );
+                assert!(socket_is_accepting());
+
+                assert_eq!(quit().await, 0);
+                let status = tokio::time::timeout(Duration::from_secs(15), service)
+                    .await
+                    .expect("the service must end after a quit")
+                    .expect("the service task must not panic");
+                assert_eq!(status, 0);
+            }
+        });
+    }
+
+    /// A quit that arrives after `run` has begun but before the service is
+    /// serving, as a signal can, is kept and ends the service rather than being
+    /// lost.
+    #[test]
+    #[serial]
+    fn a_quit_while_the_service_is_starting_is_not_lost() {
+        let _settings = machine_settings("service-api-quit-starting-");
+
+        lore::runtime().block_on(async {
+            let service = lore::service::run(
+                globals(),
+                LoreServiceRunArgs {},
+                lore_revision::event::convert_event_callback(no_callback()),
+            );
+            tokio::pin!(service);
+
+            // Polled once, which takes it as far as its first wait: begun, and
+            // not yet listening.
+            assert!(
+                tokio::time::timeout(Duration::ZERO, &mut service)
+                    .await
+                    .is_err(),
+                "the service must still be starting after one poll"
+            );
+            assert_eq!(quit().await, 0);
+
+            let status = tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("a quit during start must still end the service");
+            assert_eq!(status, 0);
+            assert!(!socket_is_accepting());
+        });
+    }
+
+    /// A second `run` in a process that already runs a service fails without
+    /// disturbing the first: a later quit still reaches and ends it.
+    #[test]
+    #[serial]
+    fn a_concurrent_run_fails_and_leaves_the_service_quittable() {
+        let _settings = machine_settings("service-api-run-concurrent-");
+
+        lore::runtime().block_on(async {
+            let service = run_service_here().await;
+            // The socket accepts a moment before the service is recorded as running.
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !lore::remote::service_process::service_runs_in_this_process() {
+                assert!(Instant::now() < deadline, "the service must be recorded");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+
+            let second = lore::service::run(
+                globals(),
+                LoreServiceRunArgs {},
+                lore_revision::event::convert_event_callback(no_callback()),
+            )
+            .await;
+            assert_ne!(second, 0, "a second service in one process must be refused");
+
+            assert!(
+                lore::remote::service_process::service_runs_in_this_process(),
+                "the refused run must not clear the running service's state"
+            );
+            assert_eq!(quit().await, 0);
+            let status = tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("the service must still end after a quit")
+                .expect("the service task must not panic");
+            assert_eq!(status, 0);
+            assert!(!socket_is_accepting());
+        });
+    }
+
+    /// Dropping the `run` future before it finishes does not leave an
+    /// unreachable service holding the socket.
+    #[test]
+    #[serial]
+    fn dropping_run_releases_the_socket() {
+        let _settings = machine_settings("service-api-run-dropped-");
+
+        lore::runtime().block_on(async {
+            let service = run_service_here().await;
+            assert!(socket_is_accepting());
+
+            service.abort();
+            let _ = service.await;
+
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while socket_is_accepting() {
+                assert!(
+                    Instant::now() < deadline,
+                    "an abandoned service must stop accepting connections"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    /// Running the service leaves the process's working directory as it was,
+    /// since an embedder's is not the service's to change.
+    #[test]
+    #[serial]
+    fn running_the_service_leaves_the_working_directory_alone() {
+        let _settings = machine_settings("service-api-run-cwd-");
+
+        lore::runtime().block_on(async {
+            let before = std::env::current_dir().expect("a working directory");
+            let service = run_service_here().await;
+            assert_eq!(
+                std::env::current_dir().expect("a working directory"),
+                before
+            );
+
+            assert_eq!(quit().await, 0);
+            tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("the service must end after a quit")
+                .expect("the service task must not panic");
+        });
+    }
+
+    /// A quit with the service already gone is the state it asks for, so it
+    /// succeeds again rather than reaching for a service that has ended.
+    #[test]
+    #[serial]
+    fn quitting_twice_succeeds() {
+        let _settings = machine_settings("service-api-quit-twice-");
+
+        lore::runtime().block_on(async {
+            let service = run_service_here().await;
+            assert_eq!(quit().await, 0);
+            assert_eq!(quit().await, 0);
+            let status = tokio::time::timeout(Duration::from_secs(15), service)
+                .await
+                .expect("the service must end after a quit")
+                .expect("the service task must not panic");
+            assert_eq!(status, 0);
+
+            assert_eq!(quit().await, 0, "a quit after the service ended is a no-op");
+        });
     }
 
     /// The `use_automatically` setting alone turns relaying on. An executable is

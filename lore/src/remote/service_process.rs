@@ -9,8 +9,6 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_base::error::ServiceUnavailable;
@@ -22,6 +20,7 @@ use lore_revision::lore_debug;
 use lore_revision::lore_warn;
 use lore_revision::util::config::SaveableConfig;
 use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -588,17 +587,101 @@ fn started_service_state(service: &mut Child) -> String {
     }
 }
 
+/// The lifecycle of the service in this process, which changes only under the
+/// lock on [`StopRequest`] so that starting, running and being asked to stop
+/// cannot interleave.
+#[derive(Default)]
+struct StopState {
+    /// Set once a stop has been asked for, and kept until the next service
+    /// begins to start.
+    requested: bool,
+    /// Whether a service is running in this process at the moment: it has
+    /// bound its socket and not yet ended. Clear for a process that has stopped,
+    /// or has not got as far as serving.
+    running: bool,
+    /// Whether a service is starting in this process, from the moment it begins
+    /// until it ends. A stop asked for in that window is kept for the service
+    /// to find once it is serving, rather than lost.
+    starting: bool,
+}
+
 /// The stop request for a service running in this process.
 #[lore_macro::test_pub]
 struct StopRequest {
-    /// Set once a stop has been asked for. Read on its own so that a wait
-    /// cannot miss a request which lands before the wait parks.
-    requested: AtomicBool,
+    state: Mutex<StopState>,
     notify: Notify,
 }
 
+impl StopRequest {
+    #[lore_macro::test_pub]
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StopState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, StopState> {
+        self.state.lock()
+    }
+
+    /// Claims the start for the caller, answering `false` when a service already
+    /// starts or runs. Clearing the stop asked of an earlier service happens in
+    /// the same step as publishing the start, so a stop that sees the start
+    /// is never one this clears.
+    #[lore_macro::test_pub]
+    fn begin_start(&self) -> bool {
+        let mut state = self.state();
+        if state.starting {
+            return false;
+        }
+        state.requested = false;
+        state.starting = true;
+        true
+    }
+
+    /// Ends the service that holds the start.
+    #[lore_macro::test_pub]
+    fn end_service(&self) {
+        let mut state = self.state();
+        state.running = false;
+        state.starting = false;
+    }
+
+    #[lore_macro::test_pub]
+    fn set_running(&self) {
+        self.state().running = true;
+    }
+
+    #[lore_macro::test_pub]
+    fn is_running(&self) -> bool {
+        self.state().running
+    }
+
+    #[lore_macro::test_pub]
+    fn is_requested(&self) -> bool {
+        self.state().requested
+    }
+
+    /// Asks the service to stop, and reports whether there was one, starting or
+    /// running, to ask. The request is stored before the wait is woken, so a wait
+    /// that reads it afterwards sees the request either way.
+    #[lore_macro::test_pub]
+    fn request_stop(&self) -> bool {
+        {
+            let mut state = self.state();
+            if !(state.running || state.starting) {
+                return false;
+            }
+            state.requested = true;
+        }
+        self.notify.notify_one();
+        true
+    }
+}
+
 /// Held by the process that runs the service. It is both the request that
-/// process waits on and the record that a service runs here at all.
+/// process waits on and the record that a service runs here, or has run here.
 static STOP_REQUEST: OnceLock<Arc<StopRequest>> = OnceLock::new();
 
 /// The stop request the process running the service waits on.
@@ -611,42 +694,73 @@ impl ServiceStopRequest {
     /// Resolves once a stop has been requested, including one requested before
     /// the wait began.
     pub async fn requested(&self) {
-        while !self.request.requested.load(Ordering::Acquire) {
+        while !self.request.is_requested() {
             self.request.notify.notified().await;
         }
     }
 }
 
-/// Records that this process runs the service and returns the stop request it
-/// waits on. Repeated calls return the same request.
-pub fn register_service_process() -> ServiceStopRequest {
-    let request = STOP_REQUEST.get_or_init(|| {
-        Arc::new(StopRequest {
-            requested: AtomicBool::new(false),
-            notify: Notify::new(),
-        })
-    });
-    ServiceStopRequest {
-        request: Arc::clone(request),
+fn stop_request() -> &'static Arc<StopRequest> {
+    STOP_REQUEST.get_or_init(|| Arc::new(StopRequest::new()))
+}
+
+/// Held by a service from the moment it begins to start until it ends, however
+/// it ends. Dropping it makes the process one that runs no service.
+pub struct ServiceStartGuard {
+    request: Arc<StopRequest>,
+}
+
+impl ServiceStartGuard {
+    /// The stop request, to wait on before the service is serving as well.
+    pub fn stop_request(&self) -> ServiceStopRequest {
+        ServiceStopRequest {
+            request: Arc::clone(&self.request),
+        }
     }
+}
+
+impl Drop for ServiceStartGuard {
+    fn drop(&mut self) {
+        self.request.end_service();
+    }
+}
+
+/// Records that a service begins to start in this process, and answers `None` when
+/// one already has: a process runs one service, and a second start must not take
+/// the first's guard, whose drop would clear the state the running service still
+/// needs. From here a stop asked for in this process is kept until the service
+/// waits on it, so one that arrives while the service is still claiming its
+/// socket and mounting is not lost. Clears any stop asked for an earlier service,
+/// so that a service started after one has stopped is not stopped on arrival.
+pub fn begin_service_start() -> Option<ServiceStartGuard> {
+    let request = Arc::clone(stop_request());
+    // Built only on success: a guard made for a refused start would clear the state
+    // of the service that holds it when dropped.
+    request.begin_start().then(|| ServiceStartGuard { request })
+}
+
+/// Records that this process runs the service, which is what makes a stop act on
+/// it rather than reach for a socket this process owns. Left until the socket is
+/// bound, so that a process which lost it never claims to be the service for the
+/// moments before it exits.
+pub fn register_service_process(guard: &ServiceStartGuard) {
+    guard.request.set_running();
 }
 
 /// Whether the service runs in this process, which is what makes a stop act on
 /// it rather than reach for a socket this process owns.
 #[lore_macro::test_pub]
 pub(crate) fn service_runs_in_this_process() -> bool {
-    STOP_REQUEST.get().is_some()
+    STOP_REQUEST
+        .get()
+        .is_some_and(|request| request.is_running())
 }
 
 /// Asks the service running in this process to stop, and reports whether there
-/// was one to ask. The request is stored before the wait is woken, so a wait
-/// that reads it afterwards sees the request either way.
+/// was one to ask. This is the one path to a stop for both `stop` and `quit`.
 #[lore_macro::test_pub]
 pub(crate) fn request_service_stop() -> bool {
-    let Some(request) = STOP_REQUEST.get() else {
-        return false;
-    };
-    request.requested.store(true, Ordering::Release);
-    request.notify.notify_one();
-    true
+    STOP_REQUEST
+        .get()
+        .is_some_and(|request| request.request_stop())
 }
