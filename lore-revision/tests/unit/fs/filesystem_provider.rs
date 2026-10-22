@@ -35,8 +35,8 @@ use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
 use parking_lot::Mutex;
 
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
 
 #[derive(Default)]
 pub struct TestFilesystemProvider {

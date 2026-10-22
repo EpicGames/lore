@@ -24,7 +24,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
 use crate::fs::filesystem_provider::test_store_create;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::default_repository_creation_args;
 
 /// Past the directory budget the walk enters each subdirectory where it finds it, and resumes its
 /// parent once it is left, so the files arrive in the tree's depth-first order. `node_add`

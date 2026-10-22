@@ -17,8 +17,8 @@ use lore_revision::state::State;
 
 use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::test_store_create;
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
 
 /// **A marking walk that fails still lets the others' stale entries go**, as a status scan does.
 /// The discards are held until every walk has drained, so a failure returned before applying them

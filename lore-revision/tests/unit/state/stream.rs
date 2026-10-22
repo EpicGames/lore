@@ -21,7 +21,7 @@ use tokio::sync::oneshot;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_store_create;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::default_repository_creation_args;
 
 /// Records that the walk holding it has unwound. Stands for what a real walk captures and
 /// holds until it ends, such as the repository and the filesystem operation it reads through.

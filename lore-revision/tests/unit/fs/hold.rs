@@ -30,13 +30,13 @@ use lore_revision::state::State;
 use parking_lot::Mutex;
 
 use crate::fs::filesystem_provider::test_store_create;
+use crate::helper::RepositoryContextCreationArgsExt;
 use crate::helper::TestRepository;
+use crate::helper::default_repository_creation_args;
 use crate::helper::test_commit;
 use crate::helper::test_commit_tree;
 use crate::helper::test_file_write;
 use crate::helper::test_repository_create;
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
 
 /// A repository and the revisions its fixture committed, the first holding `a.txt`,
 /// `untouched.txt`, `dir/b.txt` and `dir/c.txt`.

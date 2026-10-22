@@ -16,8 +16,8 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
 
 use crate::fs::filesystem_provider::test_store_create;
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
 
 /// A repository over the working tree at `root`, admitting every path in it.
 async fn os_repository(root: &Path) -> Arc<RepositoryContext> {

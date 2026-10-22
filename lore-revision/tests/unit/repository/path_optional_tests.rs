@@ -9,8 +9,8 @@
 //! need a working-tree path.
 use lore_revision::repository::RepositoryContext;
 
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
 
 #[tokio::test]
 async fn require_path_returns_invalid_arguments_when_path_is_none() {

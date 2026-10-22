@@ -15,7 +15,7 @@ use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::get_or_create_repository_lock;
 use lore_storage::local::store_lock::StoreHold;
 
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::default_repository_creation_args;
 
 async fn in_memory_context() -> Arc<RepositoryContext> {
     let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()

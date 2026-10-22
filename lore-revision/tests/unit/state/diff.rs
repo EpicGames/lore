@@ -318,10 +318,7 @@ async fn walk_repository() -> Arc<RepositoryContext> {
             .await
             .expect("test stores");
     Arc::new(RepositoryContext::new(
-        crate::repository::test_helpers::default_repository_creation_args(
-            immutable_store,
-            mutable_store,
-        ),
+        crate::helper::default_repository_creation_args(immutable_store, mutable_store),
     ))
 }
 

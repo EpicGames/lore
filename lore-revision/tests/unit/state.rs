@@ -215,13 +215,10 @@ async fn working_tree_repository(path: &std::path::Path) -> Arc<RepositoryContex
 
     // Built with the path rather than assigned one afterwards, so the filesystem provider is
     // rooted where the working tree is.
-    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::helper::RepositoryContextCreationArgsExt;
     Arc::new(RepositoryContext::new(
-        crate::repository::test_helpers::default_repository_creation_args(
-            immutable_store,
-            mutable_store,
-        )
-        .with_path(path),
+        crate::helper::default_repository_creation_args(immutable_store, mutable_store)
+            .with_path(path),
     ))
 }
 

@@ -19,8 +19,8 @@ use lore_revision::util::path::RelativePathBuf;
 
 use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::test_store_create;
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
 
 /// Every path a call names is read through the one operation it opens, whatever the call
 /// finds: a provider that freezes hands out one snapshot, and a walk opening a second

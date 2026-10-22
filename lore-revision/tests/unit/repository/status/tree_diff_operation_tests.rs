@@ -17,8 +17,8 @@ use lore_revision::util::path::RelativePath;
 
 use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::test_store_create;
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
 
 /// Runs `plan` over a repository whose states are empty and whose working tree holds what they
 /// do, and answers how many operations it began and what each finalize reported.

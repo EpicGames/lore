@@ -36,8 +36,8 @@ use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_execution_with;
 use crate::fs::filesystem_provider::test_repository;
 use crate::fs::filesystem_provider::test_store_create;
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-use crate::repository::test_helpers::default_repository_creation_args;
+use crate::helper::RepositoryContextCreationArgsExt;
+use crate::helper::default_repository_creation_args;
 
 /// One commit reads the working tree through the one operation it opens, whatever it
 /// commits: a provider that freezes hands out one snapshot, and a second opened partway
