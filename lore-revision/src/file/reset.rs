@@ -1818,7 +1818,7 @@ async fn purge_untracked_children(
     if !operation
         .file_info(directory_path)
         .await
-        .is_ok_and(|info| info.exists())
+        .is_ok_and(|info| info.is_dir())
     {
         return Ok(());
     }

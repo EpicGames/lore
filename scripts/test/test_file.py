@@ -307,6 +307,68 @@ def test_file_reset_view(new_lore_repo, scratch_dir):
     )
 
 
+def _working_tree(root: str) -> dict[str, bytes | None]:
+    """Every path under `root` but the control directory, with a file's content and
+    `None` for a directory."""
+    tree: dict[str, bytes | None] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".lore", ".urc")]
+        for d in dirnames:
+            tree[os.path.relpath(os.path.join(dirpath, d), root)] = None
+        for f in filenames:
+            path = os.path.join(dirpath, f)
+            with open(path, "rb") as file:
+                tree[os.path.relpath(path, root)] = file.read()
+    return tree
+
+
+@pytest.mark.smoke
+def test_file_reset_dry_run_leaves_the_working_tree(new_lore_repo):
+    """`file reset --purge --dry-run` restores no modified or deleted file and purges
+    no untracked file or directory, at the root or in a subdirectory, where the same
+    reset without `--dry-run` does."""
+    repo: Lore = new_lore_repo("FileResetDryRun")
+
+    modified = "modified.txt"
+    deleted = "deleted.txt"
+    nested_modified = os.path.join("directory", "inner", "modified.txt")
+    nested_deleted = os.path.join("directory", "inner", "deleted.txt")
+    repo.write_commit_push(
+        "Initial commit",
+        {
+            modified: b"committed\n",
+            deleted: b"committed\n",
+            nested_modified: b"committed\n",
+            nested_deleted: b"committed\n",
+        },
+        offline=True,
+    )
+
+    repo.write_files(
+        {
+            modified: b"local\n",
+            nested_modified: b"local\n",
+            "untracked.txt": b"local\n",
+            os.path.join("directory", "untracked", "file.txt"): b"local\n",
+        }
+    )
+    os.remove(os.path.join(repo.path, deleted))
+    os.remove(os.path.join(repo.path, nested_deleted))
+
+    before = _working_tree(repo.path)
+    repo.file_reset(purge=True, dry_run=True, offline=True)
+    assert _working_tree(repo.path) == before, (
+        "file reset --dry-run changed the working tree"
+    )
+
+    repo.file_reset(purge=True, offline=True)
+    after = _working_tree(repo.path)
+    for path in (modified, deleted, nested_modified, nested_deleted):
+        assert after.get(path) == b"committed\n", f"file reset did not restore {path}"
+    for path in ("untracked.txt", os.path.join("directory", "untracked")):
+        assert path not in after, f"file reset --purge did not remove {path}"
+
+
 @pytest.mark.smoke
 def test_file_reset_last_merged_side(new_lore_repo):
     """`file reset --last-merged-from` restores the merge revision, and `--mine` and

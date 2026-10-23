@@ -28,7 +28,6 @@ use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::hash::hash_string;
 use crate::lore::Address;
 use crate::lore::Context;
-use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::node::Node;
@@ -828,6 +827,8 @@ pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
     /// What the provider that began the operation answers for [`FilesystemProvider::holds_state`].
     holds_state: bool,
+    /// Whether the operation began in a dry run, which writes nothing through it.
+    dry_run: bool,
     finalized: AtomicBool,
     changed: AtomicBool,
     modified_times: RecordedModifiedTimes,
@@ -840,6 +841,8 @@ impl InstanceOperationImpl {
         Self {
             dispatch,
             holds_state,
+            dry_run: crate::runtime::try_execution_context()
+                .is_some_and(|context| context.globals().dry_run()),
             finalized: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
@@ -865,6 +868,9 @@ impl InstanceOperationImpl {
         path: &RelativePath,
         mtime: u64,
     ) {
+        if self.dry_run {
+            return;
+        }
         self.modified_times.record(repository, path, mtime);
     }
 
@@ -1045,6 +1051,9 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1059,6 +1068,9 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1069,6 +1081,9 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1079,6 +1094,9 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1089,6 +1107,9 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1099,6 +1120,9 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1114,6 +1138,9 @@ impl InstanceOperation for InstanceOperationImpl {
         node: &Node,
         path: &RelativePath,
     ) -> Result<FileInfo, FsError> {
+        if self.dry_run {
+            return Ok(FileInfo::from_node_and_mtime(node, 0));
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1133,6 +1160,9 @@ impl InstanceOperation for InstanceOperationImpl {
         address: Address,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
+        if self.dry_run {
+            return Ok((Fragment::default(), None));
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1153,6 +1183,9 @@ impl InstanceOperation for InstanceOperationImpl {
         source_path: &RelativePath,
         destination_path: &RelativePath,
     ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
@@ -1201,7 +1234,7 @@ impl InstanceOperation for InstanceOperationImpl {
         repository: Arc<RepositoryContext>,
         committed: Arc<State>,
     ) -> Result<(), FsError> {
-        if !self.holds_state || execution_context().globals().dry_run() {
+        if !self.holds_state || self.dry_run {
             return Ok(());
         }
         self.record_change();

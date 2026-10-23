@@ -4,7 +4,9 @@
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
+    use std::collections::BTreeMap;
     use std::fs::File;
+    use std::future::Future;
     use std::io::Seek;
     use std::io::Write;
     use std::path::Path;
@@ -131,6 +133,258 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
+    }
+
+    /// Every path under `root` but the control directory, with a file's content and `None` for a
+    /// directory, which is what a dry run reset must leave as it found it.
+    fn working_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        fn walk(root: &Path, directory: &Path, tree: &mut BTreeMap<String, Option<Vec<u8>>>) {
+            for entry in std::fs::read_dir(directory).expect("Failed to list directory") {
+                let path = entry.expect("Failed to read directory entry").path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("Entry outside the root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if relative == ".lore" {
+                    continue;
+                }
+                if path.is_dir() {
+                    tree.insert(relative, None);
+                    walk(root, &path, tree);
+                } else {
+                    tree.insert(
+                        relative,
+                        Some(std::fs::read(&path).expect("Failed to read file")),
+                    );
+                }
+            }
+        }
+        let mut tree = BTreeMap::new();
+        walk(root, root, &mut tree);
+        tree
+    }
+
+    fn test_directory_create(path: &Path) {
+        std::fs::create_dir_all(path)
+            .unwrap_or_else(|_| panic!("Failed to create test directory at {}", path.display()));
+    }
+
+    /// Resets `paths`, relative to the fixture's root, purging what the revision does not hold.
+    async fn reset_purging(
+        fixture: &TestRepository,
+        paths: &[&str],
+    ) -> Result<(), lore_revision::file::reset::ResetError> {
+        reset::reset(
+            fixture.repository.clone(),
+            &fixture.write_token,
+            LoreArray::from_vec(
+                paths
+                    .iter()
+                    .map(|path| {
+                        LoreString::from(fixture.path.join(path).to_string_lossy().as_ref())
+                    })
+                    .collect(),
+            ),
+            LoreString::default(),
+            ResetOptions {
+                purge: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Resets `paths` in a dry run, which must leave the working tree as it found it.
+    async fn assert_dry_run_reset_leaves_the_working_tree(
+        fixture: &TestRepository,
+        paths: &[&str],
+    ) {
+        let before = working_tree(&fixture.path);
+        let dry_run = Arc::new(ExecutionContext::new_client(
+            LoreGlobalArgs {
+                dry_run: 1,
+                ..Default::default()
+            },
+            EventDispatcher::no_dispatch(),
+        ));
+        LORE_CONTEXT
+            .scope(dry_run, reset_purging(fixture, paths))
+            .await
+            .expect("A dry run reset must succeed");
+        assert_eq!(
+            working_tree(&fixture.path),
+            before,
+            "a dry run reset of {paths:?} changed the working tree"
+        );
+    }
+
+    /// Resets `paths` in a dry run, which must leave the working tree as it found it, and then
+    /// without one, which must change it: a reset with nothing to do would pass the first check
+    /// without testing anything. Returns the working tree the second reset leaves.
+    async fn assert_dry_run_reset_writes_nothing(
+        fixture: &TestRepository,
+        paths: &[&str],
+    ) -> BTreeMap<String, Option<Vec<u8>>> {
+        let before = working_tree(&fixture.path);
+        assert_dry_run_reset_leaves_the_working_tree(fixture, paths).await;
+
+        reset_purging(fixture, paths)
+            .await
+            .expect("A reset must succeed");
+        let after = working_tree(&fixture.path);
+        assert_ne!(after, before, "a reset of {paths:?} had nothing to change");
+        after
+    }
+
+    /// Runs `body` on a fresh repository fixture, in the test store's execution context.
+    async fn with_fixture<F>(body: impl FnOnce(TestRepository) -> F + Send + 'static)
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                body(test_repository_create(immutable_store, mutable_store, repository_id).await)
+                    .await;
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A dry run reset of the root restores no modified or deleted file and purges no untracked
+    /// one.
+    #[tokio::test]
+    async fn a_dry_run_reset_leaves_the_working_tree_alone() {
+        with_fixture(async |fixture| {
+            let path = fixture.path.clone();
+            test_file_write(&path.join("modified.txt"), b"committed");
+            test_file_write(&path.join("deleted.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            test_file_write(&path.join("modified.txt"), b"local");
+            std::fs::remove_file(path.join("deleted.txt")).expect("Failed to delete file");
+            test_file_write(&path.join("untracked.txt"), b"local");
+
+            assert_dry_run_reset_writes_nothing(&fixture, &[""]).await;
+        })
+        .await;
+    }
+
+    /// A dry run reset of files named inside a subdirectory leaves them alone, where the reset
+    /// restores them.
+    #[tokio::test]
+    async fn a_dry_run_reset_of_files_in_a_subdirectory_leaves_them_alone() {
+        with_fixture(async |fixture| {
+            let path = fixture.path.clone();
+            let directory = path.join("outer").join("inner");
+            test_directory_create(&directory);
+            test_file_write(&directory.join("modified.txt"), b"committed");
+            test_file_write(&directory.join("deleted.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            test_file_write(&directory.join("modified.txt"), b"local");
+            std::fs::remove_file(directory.join("deleted.txt")).expect("Failed to delete file");
+
+            let after = assert_dry_run_reset_writes_nothing(
+                &fixture,
+                &["outer/inner/modified.txt", "outer/inner/deleted.txt"],
+            )
+            .await;
+            assert_eq!(
+                after.get("outer/inner/modified.txt"),
+                Some(&Some(b"committed".to_vec()))
+            );
+            assert_eq!(
+                after.get("outer/inner/deleted.txt"),
+                Some(&Some(b"committed".to_vec()))
+            );
+        })
+        .await;
+    }
+
+    /// A dry run reset of a subdirectory recreates no deleted directory and purges no untracked
+    /// file or directory under it. The reset itself leaves what is outside the subdirectory alone.
+    #[tokio::test]
+    async fn a_dry_run_reset_of_a_subdirectory_leaves_it_alone() {
+        with_fixture(async |fixture| {
+            let path = fixture.path.clone();
+            let directory = path.join("directory");
+            test_directory_create(&directory.join("deleted"));
+            test_file_write(&directory.join("modified.txt"), b"committed");
+            test_file_write(&directory.join("deleted").join("file.txt"), b"committed");
+            test_file_write(&path.join("outside.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            test_file_write(&directory.join("modified.txt"), b"local");
+            std::fs::remove_dir_all(directory.join("deleted")).expect("Failed to delete directory");
+            test_file_write(&directory.join("untracked.txt"), b"local");
+            test_directory_create(&directory.join("untracked"));
+            test_file_write(&directory.join("untracked").join("file.txt"), b"local");
+            test_file_write(&path.join("outside.txt"), b"local");
+
+            let after = assert_dry_run_reset_writes_nothing(&fixture, &["directory"]).await;
+            assert_eq!(
+                after.get("directory/deleted/file.txt"),
+                Some(&Some(b"committed".to_vec()))
+            );
+            assert!(!after.contains_key("directory/untracked"));
+            assert!(!after.contains_key("directory/untracked.txt"));
+            assert_eq!(after.get("outside.txt"), Some(&Some(b"local".to_vec())));
+        })
+        .await;
+    }
+
+    /// A dry run reset leaves alone a file the working tree turned into a directory, where the
+    /// reset puts the file back.
+    #[tokio::test]
+    async fn a_dry_run_reset_of_a_file_turned_directory_leaves_it_alone() {
+        with_fixture(async |fixture| {
+            let path = fixture.path.clone();
+            let directory = path.join("directory");
+            test_directory_create(&directory);
+            test_file_write(&directory.join("was_file"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            std::fs::remove_file(directory.join("was_file")).expect("Failed to delete file");
+            test_directory_create(&directory.join("was_file"));
+            test_file_write(&directory.join("was_file").join("file.txt"), b"local");
+
+            let after = assert_dry_run_reset_writes_nothing(&fixture, &["directory"]).await;
+            assert_eq!(
+                after.get("directory/was_file"),
+                Some(&Some(b"committed".to_vec()))
+            );
+        })
+        .await;
+    }
+
+    /// A dry run reset leaves alone a directory the working tree turned into a file. Checked in a
+    /// dry run only: the reset itself fails to put the directory back, writing its files under
+    /// the file that holds its path.
+    #[tokio::test]
+    async fn a_dry_run_reset_of_a_directory_turned_file_leaves_it_alone() {
+        with_fixture(async |fixture| {
+            let path = fixture.path.clone();
+            let directory = path.join("directory");
+            test_directory_create(&directory.join("was_directory"));
+            test_file_write(
+                &directory.join("was_directory").join("file.txt"),
+                b"committed",
+            );
+            test_commit_tree(&fixture, "Initial").await;
+
+            std::fs::remove_dir_all(directory.join("was_directory"))
+                .expect("Failed to delete directory");
+            test_file_write(&directory.join("was_directory"), b"local");
+
+            assert_dry_run_reset_leaves_the_working_tree(&fixture, &["directory"]).await;
+        })
+        .await;
     }
 
     fn create_file(path: &Path) -> File {
