@@ -7577,9 +7577,9 @@ pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) 
         return;
     };
     let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
-        while !stamp_probe(&path)
+        while stamp_probe(&path)
             .await
-            .is_some_and(|stamp| mtime_max < stamp)
+            .is_none_or(|stamp| mtime_max >= stamp)
         {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
