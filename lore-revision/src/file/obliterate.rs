@@ -204,23 +204,27 @@ pub(crate) async fn obliterate_address(
 ) -> Result<(), ObliterateError> {
     let stats = Arc::new(StoreObliterateStats::default());
 
-    repository
-        .immutable_store()
-        .obliterate(repository.id, address, stats.clone())
-        .await
-        .forward_with::<ObliterateError, _>(|| {
-            format!("Failed to obliterate an address: {address}")
-        })?;
-
-    if let Ok(remote) = repository.remote().await
-        && let Ok(admin) = remote.admin(repository.id).await
-    {
-        admin
-            .obliterate(address)
+    // Obliterating removes the content here and on the remote, for good. A dry run reports the
+    // address with nothing counted.
+    if !crate::lore::execution_context().globals().dry_run() {
+        repository
+            .immutable_store()
+            .obliterate(repository.id, address, stats.clone())
             .await
             .forward_with::<ObliterateError, _>(|| {
-                format!("Failed to obliterate a remote address: {address}")
+                format!("Failed to obliterate an address: {address}")
             })?;
+
+        if let Ok(remote) = repository.remote().await
+            && let Ok(admin) = remote.admin(repository.id).await
+        {
+            admin
+                .obliterate(address)
+                .await
+                .forward_with::<ObliterateError, _>(|| {
+                    format!("Failed to obliterate a remote address: {address}")
+                })?;
+        }
     }
 
     event::LoreEvent::FileObliterate(LoreFileObliterateEventData {

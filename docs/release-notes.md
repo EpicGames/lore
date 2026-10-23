@@ -48,6 +48,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   values, `branch merge into` pushed the merge to the target branch, and `commit` uploaded the commit's content
 - `lore shared-store set-use-automatically`, `service set-use-automatically` and `service set-executable` change no
   setting with `--dry-run`, and the service setters say what they would set
+- `lore file obliterate --dry-run` removes no content, where it obliterated the content in the local store and on the
+  remote
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

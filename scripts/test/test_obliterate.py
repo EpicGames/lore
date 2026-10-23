@@ -114,3 +114,27 @@ def test_obliterate(new_lore_repo, scratch_dir):
 
     # Commit the files
     repo.commit(offline=True)
+
+
+@pytest.mark.smoke
+def test_obliterate_dry_run_removes_nothing(new_lore_repo, scratch_dir):
+    """`file obliterate --dry-run` keeps the content in the local store and on the remote,
+    where `file obliterate` removes it."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"secret.txt": b"secret content\n"})
+
+    output = repo.file_obliterate(path="secret.txt", dry_run=True)
+
+    assert "Would obliterate file" in output, output
+    assert "Store match : 0" not in repo.file_dump(path="secret.txt"), (
+        "a dry run removed the content from the local store"
+    )
+    clone = scratch_dir("obliterate-dry-run-clone")
+    repo.run(["repository", "clone", repo.remote_path, str(clone)])
+    assert (clone / "secret.txt").read_bytes() == b"secret content\n", (
+        "a dry run removed the content from the remote"
+    )
+
+    repo.file_obliterate(path="secret.txt")
+
+    assert "Store match : 0" in repo.file_dump(path="secret.txt")
