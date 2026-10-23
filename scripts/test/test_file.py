@@ -1643,3 +1643,25 @@ def test_file_audit_keeps_the_author_a_server_merge_preserved(new_lore_repo):
         f"the author survives the server's merge: {merged}"
     )
     assert merged.get("merged-by"), f"a merge records who made it: {merged}"
+
+
+@pytest.mark.smoke
+def test_file_write_dry_run_writes_nothing(new_lore_repo, scratch_dir):
+    """`file write --dry-run` writes neither an output outside the repository nor one inside
+    it, where `file write` without it does."""
+    repo: Lore = new_lore_repo("FileWriteDryRun")
+    repo.write_commit_push("Initial", {"source.txt": b"source\n"}, offline=True)
+    outside = scratch_dir("file-write-dry-run", create=True) / "outside.txt"
+    inside = os.path.join(repo.path, "inside.txt")
+
+    for output in (str(outside), inside):
+        written = repo.file_write(
+            path="source.txt", output=output, dry_run=True, offline=True
+        )
+        assert "Would write" in written, written
+        assert not os.path.exists(output), f"file write --dry-run wrote {output}"
+
+    for output in (str(outside), inside):
+        repo.file_write(path="source.txt", output=output, offline=True)
+        with open(output, "rb") as written_file:
+            assert written_file.read() == b"source\n"

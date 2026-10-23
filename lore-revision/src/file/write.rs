@@ -275,32 +275,40 @@ pub(crate) async fn write_file(
         .await?;
     } else {
         require_free_destination(host_file_info(&destination).await?, &destination)?;
-        let written_metadata = immutable::read_into_file(
-            repository.clone(),
-            node.address,
-            destination.as_path(),
-            None,
-            immutable::read_options_from_repository(&repository),
-        )
-        .await
-        .forward::<WriteError>("Failed to write file")?
-        .1;
+        // Checked only here: the tracked destination is written through a filesystem
+        // operation, which writes nothing in a dry run.
+        if !execution_context().globals().dry_run() {
+            let written_metadata = immutable::read_into_file(
+                repository.clone(),
+                node.address,
+                destination.as_path(),
+                None,
+                immutable::read_options_from_repository(&repository),
+            )
+            .await
+            .forward::<WriteError>("Failed to write file")?
+            .1;
 
-        // Taken from the write where it captured one on the open handle. The multi-fragment
-        // path surfaces none, since the handle travels through the defragment pipeline, so
-        // that case is the one that still asks.
-        let metadata = match written_metadata {
-            Some(metadata) => metadata,
-            None => lore_io::IoDriver::global()
-                .metadata(destination.as_path())
-                .await
-                .internal("Failed to write file")?,
-        };
+            // Taken from the write where it captured one on the open handle. The multi-fragment
+            // path surfaces none, since the handle travels through the defragment pipeline, so
+            // that case is the one that still asks.
+            let metadata = match written_metadata {
+                Some(metadata) => metadata,
+                None => lore_io::IoDriver::global()
+                    .metadata(destination.as_path())
+                    .await
+                    .internal("Failed to write file")?,
+            };
 
-        let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-        if node_executable != util::fs::file_is_executable(&metadata) {
-            util::fs::metadata_set_executable(destination.as_path(), &metadata, node_executable)
+            let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+            if node_executable != util::fs::file_is_executable(&metadata) {
+                util::fs::metadata_set_executable(
+                    destination.as_path(),
+                    &metadata,
+                    node_executable,
+                )
                 .await;
+            }
         }
     }
 
@@ -358,15 +366,17 @@ pub async fn write_address(
         .await?;
     } else {
         require_free_destination(host_file_info(&destination).await?, &destination)?;
-        immutable::read_into_file(
-            repository.clone(),
-            address_value,
-            destination.as_path(),
-            None,
-            immutable::read_options_from_repository(&repository),
-        )
-        .await
-        .forward::<WriteError>("Failed to write file")?;
+        if !execution_context().globals().dry_run() {
+            immutable::read_into_file(
+                repository.clone(),
+                address_value,
+                destination.as_path(),
+                None,
+                immutable::read_options_from_repository(&repository),
+            )
+            .await
+            .forward::<WriteError>("Failed to write file")?;
+        }
     }
 
     event::LoreEvent::FileWrite(LoreFileWriteEventData {

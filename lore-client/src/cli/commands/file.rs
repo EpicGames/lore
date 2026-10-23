@@ -1832,12 +1832,19 @@ pub fn handle_file_write(globals: LoreGlobalArgs, args: &FileWriteArgs) -> u8 {
         output: LoreString::from(&args.output),
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::FileWrite(data) => {
                 println!(
-                    "{}File written {}{}",
+                    "{}{} {}{}",
                     CommonStyles::SUCCESS,
+                    if dry_run {
+                        "Would write"
+                    } else {
+                        "File written"
+                    },
                     data.path,
                     anstyle::Reset
                 );

@@ -632,3 +632,27 @@ def test_link_reset_idempotent(new_lore_repo):
         expected_files_absent=[f"{link_path}/a.txt"],
         expected_link_registry={source_repo.get_id(): False},
     )
+
+
+@pytest.mark.smoke
+def test_dry_run_unstage_and_reset_keep_a_staged_link_add(new_lore_repo):
+    """`unstage --dry-run` and `reset --dry-run` of a staged link addition keep the link's
+    files and the staged link, where `unstage` without it removes both."""
+    repo = make_repo(new_lore_repo, {"a.txt": "a\n"})
+    link_repo = make_repo(new_lore_repo, {"linked.txt": "linked\n"})
+    repo.link_add("lnk", link_repo.get_id(), "/")
+    linked_file = os.path.join(repo.path, "lnk", "linked.txt")
+    assert os.path.isfile(linked_file)
+    links = repo.link_list()
+
+    repo.unstage("lnk", dry_run=True)
+    repo.reset("lnk", dry_run=True)
+    repo.reset(dry_run=True)
+
+    assert os.path.isfile(linked_file), "a dry run removed the link's files"
+    assert repo.link_list() == links, "a dry run changed the staged links"
+
+    repo.unstage("lnk")
+
+    assert not os.path.exists(linked_file), "unstage kept the link's files"
+    assert repo.link_list() != links, "unstage kept the staged link"

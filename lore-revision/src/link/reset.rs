@@ -10,6 +10,7 @@ use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
+use crate::lore::execution_context;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::state::NodeMapping;
@@ -51,18 +52,25 @@ pub(crate) async fn reset_staged_add_link(
         .await
         .forward::<LinkError>("Failed to remove link registry entry")?;
 
-    util::fs::unlink_recursive(absolute_path.as_path())
-        .await
-        .internal("removing the realized link directory")?;
+    // These write the working tree directly rather than through a filesystem operation, so
+    // they check the flag themselves.
+    let dry_run = execution_context().globals().dry_run();
+    if !dry_run {
+        util::fs::unlink_recursive(absolute_path.as_path())
+            .await
+            .internal("removing the realized link directory")?;
+    }
 
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on
         // disk and clear the staged-delete on its node so it returns to its
         // clean committed state.
-        lore_io::IoDriver::global()
-            .create_dir_all(absolute_path.as_path())
-            .await
-            .internal("recreating the placeholder directory")?;
+        if !dry_run {
+            lore_io::IoDriver::global()
+                .create_dir_all(absolute_path.as_path())
+                .await
+                .internal("recreating the placeholder directory")?;
+        }
 
         let block_index = NodeBlock::index(committed_node_id);
         let node_index = Node::index(committed_node_id);
@@ -80,6 +88,10 @@ pub(crate) async fn reset_staged_add_link(
             state_staged.mark_dirty();
         }
 
+        return Ok(());
+    }
+
+    if dry_run {
         return Ok(());
     }
 

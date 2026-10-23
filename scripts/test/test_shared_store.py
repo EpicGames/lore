@@ -1580,20 +1580,21 @@ def test_create_dry_run_creates_nothing(new_lore_repo, scratch_dir):
 
 
 @pytest.mark.smoke
-def test_clone_dry_run_creates_no_shared_store(new_lore_repo, scratch_dir, tmp_path):
+def test_clone_dry_run_creates_no_shared_store(new_lore_repo, scratch_dir):
     """`repository clone --dry-run --use-shared-store` with no shared store yet fails
     instead of creating one."""
     repo: Lore = new_lore_repo()
     repo.write_commit_push("First", {"a.txt": b"first\n"})
     containing_path = scratch_dir("dry-run-clone-store")
     store_path = per_url_store_path(str(containing_path), repo.remote)
+    clone_path = scratch_dir("dry-run-clone")
 
     output = repo.run(
         [
             "repository",
             "clone",
             repo.remote_path,
-            str(tmp_path / "clone"),
+            str(clone_path),
             "--use-shared-store",
             "--shared-store-path",
             str(containing_path),
@@ -1604,7 +1605,7 @@ def test_clone_dry_run_creates_no_shared_store(new_lore_repo, scratch_dir, tmp_p
 
     assert "--dry-run would create a shared store" in output, output
     assert not os.path.exists(store_path), "clone --dry-run created the shared store"
-    assert not (tmp_path / "clone").exists(), "clone --dry-run created the destination"
+    assert not clone_path.exists(), "clone --dry-run created the destination"
 
 
 @pytest.mark.smoke
