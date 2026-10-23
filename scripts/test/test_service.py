@@ -603,6 +603,28 @@ def test_the_setters_write_the_settings_the_config_reference_documents(
 
 
 @pytest.mark.smoke
+def test_the_setters_store_nothing_in_a_dry_run(new_lore_repo, global_dir_name):
+    """`service set-executable --dry-run` and `service set-use-automatically --dry-run` say
+    what they would set and leave the shared config as it was."""
+    repo: Lore = new_lore_repo()
+    config = Path(global_dir_name) / "config" / "config.toml"
+
+    def config_text() -> str | None:
+        return config.read_text(encoding="utf-8") if config.exists() else None
+
+    before = config_text()
+
+    named = repo.run(
+        ["service", "set-executable", repo.lore_executable_path], dry_run=True
+    )
+    automatic = repo.run(["service", "set-use-automatically", "true"], dry_run=True)
+
+    assert "would be set to" in named, named
+    assert "would be carried out by the service" in automatic, automatic
+    assert config_text() == before, "a dry run changed the shared config"
+
+
+@pytest.mark.smoke
 def test_a_command_that_reaches_no_service_reports_service_unavailable(
     new_lore_repo, stops_background_services, global_dir_name
 ):

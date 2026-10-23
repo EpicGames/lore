@@ -42,6 +42,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `--dry-run` writes no missing `.lore/instance` file and saves no identity or remote URL to `.lore/config.toml`
 - `lore unstage --dry-run` and `reset --dry-run` of a staged link addition keep the link's files, where they removed
   them, and `lore file write --dry-run` writes no output outside the repository
+- `lore shared-store set-use-automatically`, `service set-use-automatically` and `service set-executable` change no
+  setting with `--dry-run`, and the service setters say what they would set
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

@@ -1632,3 +1632,16 @@ def test_dry_run_keeps_a_legacy_shared_store_config(new_lore_repo, scratch_dir):
     assert os.path.exists(config) and not os.path.exists(legacy_config), (
         "stage did not move the legacy config"
     )
+
+
+@pytest.mark.smoke
+def test_set_use_automatically_dry_run_changes_nothing(new_lore_repo):
+    """`shared-store set-use-automatically --dry-run` leaves automatic use unset."""
+    repo: Lore = new_lore_repo(create_repo=False)
+    assert repo.shared_store_info().is_automatic is False
+
+    repo.run(["shared-store", "set-use-automatically", "true"], dry_run=True)
+
+    assert repo.shared_store_info().is_automatic is False, (
+        "a dry run turned on automatic shared store use"
+    )

@@ -255,6 +255,7 @@ async fn set_executable_local(
     args: LoreServiceSetExecutableArgs,
     callback: LoreEventCallback,
 ) -> i32 {
+    let dry_run = globals.dry_run();
     let command =
         async move |args: LoreServiceSetExecutableArgs| -> Result<(), ServiceProcessError> {
             let (mut config, lock) = GlobalConfig::load_locked()
@@ -265,13 +266,19 @@ async fn set_executable_local(
             // reads as unset everywhere it is resolved.
             let executable = args.executable.as_str().trim();
             config.service.executable = (!executable.is_empty()).then(|| executable.to_string());
+            let tense = if dry_run { "would be " } else { "" };
             match config.service_executable() {
-                Some(executable) => lore_info!("Lore service executable set to {executable}"),
-                None => lore_info!("Lore service executable cleared"),
+                Some(executable) => {
+                    lore_info!("Lore service executable {tense}set to {executable}");
+                }
+                None => lore_info!("Lore service executable {tense}cleared"),
             }
             // Clearing the executable is one of the two ways to end up with a pair
             // that does not relay.
             report_settings_update_that_will_not_relay(&config);
+            if dry_run {
+                return Ok(());
+            }
 
             config
                 .save(lock)
@@ -330,6 +337,7 @@ async fn set_use_automatically_local(
     args: LoreServiceSetUseAutomaticallyArgs,
     callback: LoreEventCallback,
 ) -> i32 {
+    let dry_run = globals.dry_run();
     let command =
         async move |args: LoreServiceSetUseAutomaticallyArgs| -> Result<(), ServiceProcessError> {
             let (mut config, lock) = GlobalConfig::load_locked()
@@ -338,19 +346,22 @@ async fn set_use_automatically_local(
 
             let enabled = args.enabled != 0;
             config.service.use_automatically = enabled.then_some(true);
-            config
-                .save(lock)
-                .await
-                .forward::<ServiceProcessError>("saving global config")?;
+            if !dry_run {
+                config
+                    .save(lock)
+                    .await
+                    .forward::<ServiceProcessError>("saving global config")?;
 
-            // This process may go on to make more calls, and it decided once whether
-            // to relay them.
-            forget_whether_service_is_in_use();
+                // This process may go on to make more calls, and it decided once whether
+                // to relay them.
+                forget_whether_service_is_in_use();
+            }
 
+            let tense = if dry_run { "would" } else { "will" };
             if enabled {
-                lore_info!("Lore commands will be carried out by the service");
+                lore_info!("Lore commands {tense} be carried out by the service");
             } else {
-                lore_info!("Lore commands will be carried out in the process that runs them");
+                lore_info!("Lore commands {tense} be carried out in the process that runs them");
             }
             // Reported after the line above rather than instead of it: the setting
             // was stored, and this says what it will and will not do on its own.

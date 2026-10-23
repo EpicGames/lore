@@ -276,6 +276,7 @@ async fn set_use_automatically_local(
     args: LoreSharedStoreSetUseAutomaticallyArgs,
     callback: LoreEventCallback,
 ) -> i32 {
+    let dry_run = globals.dry_run();
     let command = async move |_args| -> Result<(), SharedStoreError> {
         let (mut config, lock) = GlobalConfig::load_locked()
             .await
@@ -285,10 +286,12 @@ async fn set_use_automatically_local(
         } else {
             config.use_shared_store_automatically = None;
         }
-        config
-            .save(lock)
-            .await
-            .forward::<SharedStoreError>("saving global config")?;
+        if !dry_run {
+            config
+                .save(lock)
+                .await
+                .forward::<SharedStoreError>("saving global config")?;
+        }
         Ok(())
     };
     no_repository_call(globals, callback, args, info, command).await
