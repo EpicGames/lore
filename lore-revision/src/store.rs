@@ -8,6 +8,7 @@ pub mod mutable;
 pub mod remote;
 #[cfg(feature = "seeding")]
 pub mod seeder;
+pub mod write_discarding;
 
 // Re-export store types and traits from lore-storage for internal use
 pub(crate) use lore_base::types::KeyType;

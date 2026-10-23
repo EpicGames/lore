@@ -928,11 +928,14 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
         vfs: args.vfs.to_lore(),
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RepositoryCreate(data) => {
                 println!(
-                    "Created repository {} in {} with ID {}",
+                    "{} repository {} in {} with ID {}",
+                    if dry_run { "Would create" } else { "Created" },
                     data.name,
                     data.path.as_str(),
                     data.id,

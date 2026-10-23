@@ -220,6 +220,10 @@ pub(crate) async fn create_with_metadata(
             load_repository_config_from_dot_dir(existing_dot_dir.as_path())
                 .is_ok_and(|config| config.is_swfs());
         if call.force() && !existing_repository_is_swfs {
+            if call.dry_run() {
+                dry_run_created(id_or_new(&options), name, path);
+                return Ok(());
+            }
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -233,7 +237,14 @@ pub(crate) async fn create_with_metadata(
         }
     }
 
-    let id = options.id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
+    let id = id_or_new(&options);
+
+    // A dry run creates nothing, on the server or on disk: the setup below writes the
+    // repository's files directly, and its store writes would be discarded.
+    if call.dry_run() {
+        dry_run_created(id, name, path);
+        return Ok(());
+    }
 
     // TODO(mjansson): Make this configurable in arguments and command line
     let branch_name = branch::DEFAULT_DEFAULT_NAME;
@@ -376,6 +387,19 @@ pub(crate) async fn create_with_metadata(
     .send();
 
     Ok(())
+}
+
+fn id_or_new(options: &CreateOptions) -> RepositoryId {
+    options.id.unwrap_or_else(|| uuid::Uuid::now_v7().into())
+}
+
+fn dry_run_created(id: RepositoryId, name: String, path: &Path) {
+    event::LoreEvent::RepositoryCreate(LoreRepositoryCreateEventData {
+        id,
+        name: name.into(),
+        path: path.into(),
+    })
+    .send();
 }
 
 /// Boxed version of [`create_with_metadata`] for cross-crate use.

@@ -3142,3 +3142,30 @@ def test_layer_unstage_and_reset_leave_a_clean_layer_unpinned(new_lore_repo):
     assert parse_status_json(repo.status(json=True)) == [], (
         "Expected a clean status once the parent change is reset"
     )
+
+
+@pytest.mark.smoke
+def test_layer_dry_run_adds_and_removes_nothing(new_lore_repo):
+    """`layer add --dry-run` adds no layer and `layer remove --dry-run` removes none, where
+    the same commands without it do."""
+    repo: Lore = new_lore_repo()
+    source: Lore = new_lore_repo(repo.name + "_source")
+    repo.write_commit_push("Root", {"root.txt": b"root\n"})
+    source.write_commit_push("Source", {"lay/source.txt": b"source\n"})
+    layer_config = os.path.join(repo.dot_path(), "layer.toml")
+
+    repo.layer_add("lay", source, "lay/", dry_run=True)
+    assert "No layers" in repo.layer_list(), "layer add --dry-run added the layer"
+    assert not os.path.exists(layer_config), (
+        "layer add --dry-run wrote the layer config"
+    )
+
+    repo.layer_add("lay", source, "lay/")
+    layer_file = os.path.join(repo.path, "lay", "source.txt")
+    assert os.path.isfile(layer_file), "layer add did not write the layer's files"
+
+    repo.layer_remove("lay", dry_run=True)
+    assert "lay -> lay" in repo.layer_list(), "layer remove --dry-run removed the layer"
+    assert os.path.isfile(layer_file), (
+        "layer remove --dry-run removed the layer's files"
+    )

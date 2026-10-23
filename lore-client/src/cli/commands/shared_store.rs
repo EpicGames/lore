@@ -93,10 +93,16 @@ pub fn handle_create(globals: LoreGlobalArgs, args: &SharedStoreCreateArgs) -> u
         make_default: args.make_default.unwrap_or(true) as u8,
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
-        (Box::new(|event: &LoreEvent| {
+        (Box::new(move |event: &LoreEvent| {
             if let LoreEvent::SharedStoreCreate(data) = event {
-                println!("Created shared store in {}", data.path.as_str(),);
+                println!(
+                    "{} shared store in {}",
+                    if dry_run { "Would create" } else { "Created" },
+                    data.path.as_str(),
+                );
             }
         }) as EventCallbackFn)
             .with_defaults(),

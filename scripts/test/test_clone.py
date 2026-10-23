@@ -297,3 +297,67 @@ def test_failed_clone_sends_no_clone_end_event(new_lore_repo, scratch_dir):
     assert not parse_jsonl(output, "repositoryCloneEnd"), (
         f"a clone that failed sent a repositoryCloneEnd event: {output}"
     )
+
+
+@pytest.mark.smoke
+def test_clone_dry_run_into_an_existing_directory_leaves_it_empty(
+    new_lore_repo, tmp_path
+):
+    """`repository clone --dry-run` into an existing directory leaves nothing in it, and a
+    clone without it then succeeds."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": b"first\n"})
+    target = tmp_path / "existing"
+    target.mkdir()
+
+    repo.run(["repository", "clone", repo.remote_path, str(target)], dry_run=True)
+    assert list(target.iterdir()) == [], "clone --dry-run left files in the destination"
+
+    repo.run(["repository", "clone", repo.remote_path, str(target)])
+    assert (target / "a.txt").read_bytes() == b"first\n"
+
+
+@pytest.mark.smoke
+def test_clone_force_dry_run_keeps_the_existing_clone(new_lore_repo, tmp_path):
+    """`repository clone --force --dry-run` over an existing clone refuses, and the clone
+    keeps working."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": b"first\n"})
+    target = tmp_path / "cloned"
+    repo.run(["repository", "clone", repo.remote_path, str(target)])
+
+    output = repo.run(
+        ["repository", "clone", repo.remote_path, str(target)],
+        dry_run=True,
+        force=True,
+        check=False,
+    )
+    assert "--force would replace the repository" in output, output
+
+    status = repo.run(["status"], path=str(target), no_pager=True)
+    assert "On branch main" in status, status
+
+
+@pytest.mark.smoke
+def test_clone_dry_run_with_swfs_is_refused(new_lore_repo, tmp_path):
+    """`repository clone --dry-run --vfs swfs` fails before it mounts anything. Runs without
+    `--swfs`, since the refusal comes before any SWFS call."""
+    repo: Lore = new_lore_repo()
+    target = tmp_path / "swfs"
+
+    output = repo.run(
+        [
+            "repository",
+            "clone",
+            repo.remote_path,
+            str(target),
+            "--vfs",
+            "swfs",
+            "--use-shared-store",
+        ],
+        dry_run=True,
+        check=False,
+    )
+
+    assert "--dry-run is not supported for an SWFS clone" in output, output
+    assert not target.exists(), "clone --dry-run --vfs swfs created the destination"

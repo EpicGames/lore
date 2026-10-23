@@ -209,6 +209,9 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &LayerConfig,
 ) -> Result<(), LayerError> {
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
     crate::util::config::save(config, config_path)
         .await
         .forward::<LayerError>("Failed to save configuration")

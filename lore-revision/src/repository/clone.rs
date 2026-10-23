@@ -994,12 +994,35 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
+    // An SWFS clone mounts the repository, and a mount cannot be removed again.
+    if call.dry_run()
+        && options
+            .vfs_options
+            .as_ref()
+            .is_some_and(|vfs| vfs.vfs_type.is_swfs())
+    {
+        return Err(CloneError::from(InvalidArguments {
+            reason: "--dry-run is not supported for an SWFS clone".to_string(),
+        }));
+    }
+
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
         let existing_repository_is_swfs =
             load_repository_config_from_dot_dir(existing_dot_dir.as_path())
                 .is_ok_and(|config| config.is_swfs());
         if call.force() && !existing_repository_is_swfs {
+            // A dry run could not set up the clone without replacing the repository it would
+            // only report on, and a repository it removed cannot be restored afterwards.
+            if call.dry_run() {
+                return Err(CloneError::from(InvalidArguments {
+                    reason: format!(
+                        "--dry-run with --force would replace the repository in {}, clone to \
+                         another path to preview it",
+                        path.display()
+                    ),
+                }));
+            }
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -1018,6 +1041,7 @@ pub async fn clone(
         .forward::<CloneError>("Invalid repository URL")?;
 
     let mut repository_path_guard = RepositoryCloneGuard::new(path, call.dry_run());
+    let mut dot_directory_guard = RepositoryCloneGuard::new(&existing_dot_dir, call.dry_run());
 
     // Resolve the repository name
     let repository_data = repository::resolve_by_name(&remote_url, &name, identity)
@@ -1160,6 +1184,7 @@ pub async fn clone(
         layer,
         options,
         &mut repository_path_guard,
+        &mut dot_directory_guard,
     )
     .await
 }
@@ -1184,12 +1209,10 @@ async fn clone_into(
     layer: Option<CloneLayer>,
     options: CloneOptions,
     repository_path_guard: &mut RepositoryCloneGuard,
+    dot_directory_guard: &mut RepositoryCloneGuard,
 ) -> Result<(), CloneError> {
     let context = execution_context();
     let call = context.globals();
-
-    let mut dot_directory_guard =
-        RepositoryCloneGuard::new(repository.dot_dir_path()?, call.dry_run());
 
     // Copy the view definition if given
     let filter_view = if let Some(view) = view {

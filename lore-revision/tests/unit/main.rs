@@ -34,6 +34,7 @@ mod repository;
 mod revision;
 mod stage;
 mod state;
+mod store;
 mod util;
 
 /// Points the unit tests at a global data and config directory of their own, rather than the

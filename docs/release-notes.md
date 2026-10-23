@@ -29,6 +29,17 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `<branch>`, where it took it on the current branch and refused it as not on the target branch
 - `--dry-run` writes nothing to the working tree. `lore file reset --dry-run` restored, deleted and purged files as a
   reset without it does, and other commands could write files the same way
+- `--dry-run` changes no branch, revision, staged or layer state and creates no repository. `lore branch create`,
+  `branch reset`, `branch archive`, `revision amend`, `unstage`, `file dependency add`, `layer add` and
+  `repository create` made their changes with `--dry-run` as without it, and `repository create --force --dry-run`
+  removed the existing repository
+- `lore repository clone --dry-run` into an existing directory leaves nothing in it, where it left a `.lore` directory.
+  `repository clone --force --dry-run` over an existing repository fails instead of replacing it, and
+  `repository clone --dry-run --vfs swfs` fails instead of mounting the repository
+- `lore shared-store create --dry-run` creates and registers no shared store, and with `--force` keeps the existing one.
+  `repository clone --dry-run --use-shared-store` fails where it would create the shared store, and a dry run no
+  longer moves a shared store's legacy `global.toml` config to `shared_store.toml`
+- `--dry-run` writes no missing `.lore/instance` file and saves no identity or remote URL to `.lore/config.toml`
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

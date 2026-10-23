@@ -1139,6 +1139,40 @@ def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
 
 
 @pytest.mark.smoke
+def _config_identity(repo: Lore) -> str | None:
+    for line in (Path(repo.dot_path()) / "config.toml").read_text().splitlines():
+        if line.strip().startswith("identity"):
+            return line.split("=", 1)[1].strip().strip('"')
+    return None
+
+
+@pytest.mark.smoke
+def test_dry_run_does_not_save_the_identity_resolved_from_login(auth_env, make_actor):
+    """A write command run with `--dry-run` on a repository whose config has no identity
+    leaves the config without the identity it resolved from the login, where the same
+    command without it saves it."""
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    config = Path(owner.repo.dot_path()) / "config.toml"
+    config.write_text(
+        "".join(
+            line
+            for line in config.read_text().splitlines(keepends=True)
+            if not line.strip().startswith("identity")
+        )
+    )
+    owner.repo.write_files({"hello.txt": b"hello\n"})
+
+    owner.repo.stage(scan=True, dry_run=True)
+    assert _config_identity(owner.repo) is None, (
+        "stage --dry-run saved the identity to the config"
+    )
+
+    owner.repo.stage(scan=True)
+    assert _config_identity(owner.repo) == USER1.user_id, (
+        "stage did not save the identity resolved from the login"
+    )
+
+
 class TestForwardedRepositoryGetWithAuth:
     """The forwarded repository-get path under authentication.
 

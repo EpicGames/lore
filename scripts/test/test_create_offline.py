@@ -63,3 +63,29 @@ class TestCreateOfflineLocal:
         assert os.path.isdir(repo.dot_path()), (
             "Lore repo was not initialized with --offline against an unreachable remote"
         )
+
+    def test_create_dry_run_creates_nothing(self, new_lore_repo):
+        """--dry-run creates no repository, and a create after it makes a usable one."""
+        repo: Lore = new_lore_repo(create_repo=False)
+
+        output = repo.repository_create(offline=True, dry_run=True)
+
+        assert "Would create repository" in output, output
+        assert not os.path.exists(repo.dot_path()), "--dry-run created the repository"
+
+        repo.repository_create(offline=True)
+        repo.write_commit_push("First", {"a.txt": b"first\n"}, offline=True)
+
+    def test_create_force_dry_run_keeps_the_existing_repository(self, new_lore_repo):
+        """--force --dry-run leaves an existing repository in place."""
+        repo: Lore = new_lore_repo(create_repo=False)
+        repo.repository_create(offline=True)
+        repo.write_commit_push("First", {"a.txt": b"first\n"}, offline=True)
+        with open(os.path.join(repo.dot_path(), "id"), "rb") as id_file:
+            repository_id = id_file.read()
+
+        repo.repository_create(offline=True, force=True, dry_run=True)
+
+        with open(os.path.join(repo.dot_path(), "id"), "rb") as id_file:
+            assert id_file.read() == repository_id, "--dry-run replaced the repository"
+        assert "First" in repo.run(["history"], offline=True, no_pager=True)

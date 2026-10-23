@@ -3,6 +3,7 @@
 
 mod clone;
 mod clone_hold;
+mod dry_run_store_tests;
 mod name_validation_tests;
 mod path_optional_tests;
 mod prefetch;
