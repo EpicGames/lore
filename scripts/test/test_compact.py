@@ -621,3 +621,46 @@ def test_killed_commands_lose_no_local_content(new_lore_repo):
         store.assert_intact()
 
     assert kills >= 48, f"only {kills} of 192 commands were killed"
+
+
+def _store_files(repo: Lore) -> dict[str, bytes]:
+    store = Path(repo.dot_path()) / "immutable"
+    return {
+        str(path.relative_to(store)): path.read_bytes()
+        for path in store.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.smoke
+def test_repository_gc_dry_run_collects_nothing(new_lore_repo):
+    """`repository gc --dry-run` leaves a store that is over its caps as it was, where
+    `repository gc` evicts and compacts it."""
+    repo: Lore = new_lore_repo()
+    _seed_committed_data(repo, count=64)
+    repo.push(max_connections=16)
+    _set_store_caps(repo, max_size="100", max_capacity="100")
+    store = _store_files(repo)
+
+    out = repo.repository_gc(dry_run=True)
+
+    assert "Garbage collection skipped in a dry run" in out, out
+    assert _store_files(repo) == store, "a dry run collected garbage"
+
+    repo.repository_gc()
+    assert _store_files(repo) != store
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("dry_run", [True, False])
+def test_repository_gc_failure_reports_no_result(new_lore_repo, dry_run):
+    """`repository gc` that fails, here on an unreadable config, reports neither a skipped
+    nor a completed collection."""
+    repo: Lore = new_lore_repo()
+    _seed_committed_data(repo)
+    Path(repo.dot_path(), "config.toml").write_text("not = [valid", encoding="utf-8")
+
+    out = repo.run(["repository", "gc"], dry_run=dry_run, check=False)
+
+    assert "Garbage collection skipped" not in out, out
+    assert "Garbage collection complete" not in out, out

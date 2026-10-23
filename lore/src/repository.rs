@@ -1056,9 +1056,13 @@ pub async fn verify_state(
 
 async fn verify_state_local(
     globals: LoreGlobalArgs,
-    args: LoreRepositoryVerifyStateArgs,
+    mut args: LoreRepositoryVerifyStateArgs,
     callback: LoreEventCallback,
 ) -> i32 {
+    // A dry run reports what healing would repair, healing nothing.
+    if globals.dry_run() {
+        args.heal = 0;
+    }
     if args.heal != 0 {
         repository_call_write(
             globals,
@@ -1111,9 +1115,13 @@ pub async fn verify_fragment(
 
 fn verify_fragment_local(
     globals: LoreGlobalArgs,
-    args: LoreRepositoryVerifyFragmentArgs,
+    mut args: LoreRepositoryVerifyFragmentArgs,
     callback: LoreEventCallback,
 ) -> impl Future<Output = i32> {
+    // A dry run reports what healing would repair, healing nothing.
+    if globals.dry_run() {
+        args.heal = 0;
+    }
     repository_call_read(
         globals,
         callback,

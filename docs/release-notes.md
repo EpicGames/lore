@@ -50,6 +50,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   setting with `--dry-run`, and the service setters say what they would set
 - `lore file obliterate --dry-run` removes no content, where it obliterated the content in the local store and on the
   remote
+- `lore repository gc --dry-run` collects no garbage, where it evicted and compacted the local store, and
+  `repository verify --heal --dry-run` heals nothing, reporting what it finds as `repository verify` does
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

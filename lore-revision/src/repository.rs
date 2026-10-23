@@ -4021,6 +4021,11 @@ pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryErro
     let config = load_config(config_path.as_path())?;
     let config_store = config.store.as_ref();
 
+    // Collecting evicts and compacts the store's files, which no dry run may change.
+    if crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run()) {
+        return Ok(());
+    }
+
     let sync_data = crate::runtime::try_execution_context()
         .is_some_and(|context| context.globals().sync_data());
     let max_size = config_store
