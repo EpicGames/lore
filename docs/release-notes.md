@@ -42,6 +42,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `--dry-run` writes no missing `.lore/instance` file and saves no identity or remote URL to `.lore/config.toml`
 - `lore unstage --dry-run` and `reset --dry-run` of a staged link addition keep the link's files, where they removed
   them, and `lore file write --dry-run` writes no output outside the repository
+- `--dry-run` changes nothing on the remote. `lore branch create --dry-run` created the branch in linked and layer
+  repositories and with `--force` deleted the existing branch on the remote, `link add` and `layer add` created the
+  current branch in the linked or layer repository, `branch metadata set` and `repository metadata set` stored their
+  values, `branch merge into` pushed the merge to the target branch, and `commit` uploaded the commit's content
 - `lore shared-store set-use-automatically`, `service set-use-automatically` and `service set-executable` change no
   setting with `--dry-run`, and the service setters say what they would set
 

@@ -361,34 +361,42 @@ pub async fn add(
         .await
         .forward::<LayerError>("Failed getting branch metadata")?;
 
-        lore_debug!("Creating layer repository branch {branch_name} at revision {parent_latest}");
+        // A dry run reports the branch at the revision it would start at, creating nothing on
+        // the remote.
+        if execution_context().globals().dry_run() {
+            parent_latest
+        } else {
+            lore_debug!(
+                "Creating layer repository branch {branch_name} at revision {parent_latest}"
+            );
 
-        let user_id = execution_context().user_id().await;
+            let user_id = execution_context().user_id().await;
 
-        let branch_stack = vec![BranchPoint {
-            branch: default_branch_id,
-            revision: parent_latest,
-        }];
+            let branch_stack = vec![BranchPoint {
+                branch: default_branch_id,
+                revision: parent_latest,
+            }];
 
-        let revision = layer_remote
-            .revision(layer_repository.id)
-            .await
-            .forward::<LayerError>("Not connected")?;
-        let layer_latest = revision
-            .branch_create(
-                current_branch_id,
-                branch_name,
-                branch_category,
-                user_id.as_str(),
-                &branch_stack,
-            )
-            .await
-            .forward::<LayerError>("Failed to create branch in layer repository")?;
+            let revision = layer_remote
+                .revision(layer_repository.id)
+                .await
+                .forward::<LayerError>("Not connected")?;
+            let layer_latest = revision
+                .branch_create(
+                    current_branch_id,
+                    branch_name,
+                    branch_category,
+                    user_id.as_str(),
+                    &branch_stack,
+                )
+                .await
+                .forward::<LayerError>("Failed to create branch in layer repository")?;
 
-        lore_debug!(
-            "Layer repository branch {branch_name} created at latest revision {layer_latest}"
-        );
-        layer_latest
+            lore_debug!(
+                "Layer repository branch {branch_name} created at latest revision {layer_latest}"
+            );
+            layer_latest
+        }
     };
 
     lore_debug!("Find matching revision");

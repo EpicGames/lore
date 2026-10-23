@@ -206,6 +206,11 @@ async fn commit_metadata_hash(
         .await
         .forward::<RepositoryMetadataError>("remote connection required")?;
 
+    // The upload and the swap below change the remote, which no dry run may.
+    if crate::lore::execution_context().globals().dry_run() {
+        return Ok(());
+    }
+
     let correlation_id = crate::lore::execution_context()
         .globals()
         .correlation_id

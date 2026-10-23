@@ -4289,7 +4289,10 @@ async fn merge_into_link(
     let mut revision = signature;
     let mut revision_number = state_new.revision_number();
 
-    if let Ok(remote) = repository.remote().await {
+    // A dry run pushes nothing: the push moves the branch on the remote.
+    if !execution_context().globals().dry_run()
+        && let Ok(remote) = repository.remote().await
+    {
         let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let storage_protocol = remote
@@ -4651,7 +4654,10 @@ pub async fn merge_into(
     let mut revision = signature;
     let mut revision_number = state_new.revision_number();
 
-    if let Ok(remote) = repository.remote().await {
+    // A dry run pushes nothing: the push moves the branch on the remote.
+    if !execution_context().globals().dry_run()
+        && let Ok(remote) = repository.remote().await
+    {
         let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
 
         LoreEvent::BranchMergeIntoFragmentBegin(LoreBranchMergeIntoFragmentBeginEventData {

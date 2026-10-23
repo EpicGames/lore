@@ -114,6 +114,7 @@ pub async fn create(
 
     let branch_id = branch_id.unwrap_or_else(|| Context::from(uuid::Uuid::now_v7()));
     let user_id = execution_context().user_id().await;
+    let dry_run = execution_context().globals().dry_run();
 
     // Gather the parent branch stack
     let parent_metadata = branch::metadata(repository.clone(), current_branch)
@@ -138,14 +139,23 @@ pub async fn create(
         user_id.as_str(),
         util::time::timestamp(),
         stack.clone(),
-        false,
+        dry_run,
         true, /* Create linked repositories branches */
     )
     .await
     {
         Ok(_) => (),
         Err(err) if err.is_branch_already_exists() => {
-            if force {
+            // A forced dry run reports the branch as recreated at the current revision, which
+            // heads its stack: the delete below reaches the remote, which no dry run may change.
+            if force && dry_run {
+                crate::event::LoreEvent::BranchCreate(branch::LoreBranchCreateEventData {
+                    name: branch.as_str().into(),
+                    latest: state_current.revision(),
+                    is_commit: 0,
+                })
+                .send();
+            } else if force {
                 match branch::resolve(repository.clone(), branch.as_str()).await {
                     Ok(resolved) => {
                         if let Err(err) = branch::delete(repository.clone(), resolved.id).await {
@@ -275,7 +285,7 @@ async fn layer_branch_create(
             user_id.as_str(),
             util::time::timestamp(),
             stack,
-            false,
+            execution_context().globals().dry_run(),
             true, /* Create linked repositories branches */
         )
         .await

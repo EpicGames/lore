@@ -582,10 +582,22 @@ fn handle_branch_create(globals: LoreGlobalArgs, args: &BranchCreateArgs) -> u8 
         id,
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchCreate(data) => {
-                if data.is_commit == 0 {
+                if dry_run {
+                    println!(
+                        "{}Would create branch{} {}{}{} at revision {}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset,
+                        BranchStyles::CURRENT_BRANCH,
+                        data.name.as_str(),
+                        anstyle::Reset,
+                        data.latest,
+                    );
+                } else if data.is_commit == 0 {
                     println!(
                         "{}Created branch{} {}{}{} at revision {}",
                         CommonStyles::SUCCESS,

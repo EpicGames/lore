@@ -196,9 +196,15 @@ pub async fn add(
         (link_revision, current_branch_id)
     };
 
-    let branch_metadata = branch::metadata(link.clone(), link_branch)
-        .await
-        .forward::<LinkError>("Failed getting branch metadata")?;
+    // A dry run does not create a missing link branch, which takes the name of the branch it
+    // is created for in this repository.
+    let branch_metadata = match branch::metadata(link.clone(), link_branch).await {
+        Err(err) if err.is_branch_not_found() && execution_context().globals().dry_run() => {
+            branch::metadata(repository.clone(), link_branch).await
+        }
+        metadata => metadata,
+    }
+    .forward::<LinkError>("Failed getting branch metadata")?;
     let branch_name =
         branch::name(&branch_metadata).forward::<LinkError>("Failed getting branch metadata")?;
 

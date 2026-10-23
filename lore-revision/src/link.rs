@@ -370,6 +370,15 @@ pub async fn create_branch(
             branch_name
         };
 
+    // A dry run reports the branch at the revision it would start at, creating nothing on the
+    // remote.
+    if execution_context().globals().dry_run() {
+        return Ok(LinkBranchOutcome {
+            revision: parent_latest,
+            reused: false,
+        });
+    }
+
     let latest = revision
         .branch_create(
             branch_id,
