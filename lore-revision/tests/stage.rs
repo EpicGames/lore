@@ -2605,4 +2605,149 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// Stages `relatives` under `instance` as one `lore stage --scan` of those paths does.
+    async fn stage_relative(instance: &TestRepository, relatives: &[&str]) {
+        file::stage::stage(
+            instance.repository.clone(),
+            &instance.write_token,
+            LoreArray::from_vec(
+                relatives
+                    .iter()
+                    .map(|relative| LoreString::from(&instance.path.join(relative)))
+                    .collect(),
+            ),
+            StageOptions {
+                scan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Stage failed");
+    }
+
+    /// Moves `from` to `to` in the working tree of `instance` and stages the move, as
+    /// `lore stage move` does after the working tree was changed.
+    async fn move_and_stage(instance: &TestRepository, from: &str, to: &str) {
+        let from = instance.path.join(from);
+        let to = instance.path.join(to);
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent).expect("Create failed");
+        }
+        std::fs::rename(&from, &to).expect("Rename failed");
+        file::stage::stage_move(
+            instance.repository.clone(),
+            &instance.write_token,
+            from.to_string_lossy().to_string(),
+            to.to_string_lossy().to_string(),
+            StageOptions::default(),
+        )
+        .await
+        .expect("Stage move failed");
+    }
+
+    /// The file paths `state` holds, without the size and flags `staged_file_listing` adds.
+    async fn file_paths(
+        repository: Arc<RepositoryContext>,
+        state: Arc<state::State>,
+    ) -> Vec<String> {
+        staged_file_listing(repository, state)
+            .await
+            .into_iter()
+            .map(|entry| entry.split(' ').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// A delete staged inside a directory, of a file or of a directory, stays a delete when the
+    /// directory is moved afterwards in the same changeset: the move marks the directory's
+    /// children moved, which must not turn a deleted one into a moved one that the commit then
+    /// looks for at the new path.
+    #[tokio::test]
+    async fn a_directory_move_keeps_the_deletes_staged_inside_it() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                std::fs::create_dir_all(instance.path.join("d")).expect("Create failed");
+                test_file_write(&instance.path.join("d/x"), b"x, first");
+                test_file_write(&instance.path.join("d/y"), b"y, first");
+                std::fs::create_dir_all(instance.path.join("d/sub")).expect("Create failed");
+                test_file_write(&instance.path.join("d/sub/w"), b"w, first");
+                test_commit_tree(&instance, "Add").await;
+
+                std::fs::remove_file(instance.path.join("d/x")).expect("Remove failed");
+                std::fs::remove_dir_all(instance.path.join("d/sub")).expect("Remove failed");
+                stage_relative(&instance, &["d/x", "d/sub"]).await;
+                move_and_stage(&instance, "d", "e/d").await;
+                let state = test_commit(&instance, "Delete d/x, move d to e/d").await;
+
+                assert_eq!(
+                    file_paths(instance.repository.clone(), state).await,
+                    vec!["e/d/y".to_string()],
+                    "the commit kept the deleted file"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A file moved onto the name of a file deleted in the same changeset, whose directory is
+    /// then moved too, leaves one node at that name: the deleted node stays deleted rather than
+    /// coming back beside the moved one, which would leave later revisions two nodes at one path.
+    #[tokio::test]
+    async fn a_directory_move_after_a_move_onto_a_deleted_name_leaves_one_node_at_it() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                std::fs::create_dir_all(instance.path.join("d")).expect("Create failed");
+                test_file_write(&instance.path.join("d/x"), b"x, first");
+                test_file_write(&instance.path.join("d/y"), b"y, first, longer");
+                test_file_write(&instance.path.join("d/z"), b"z, first");
+                test_commit_tree(&instance, "Add").await;
+
+                std::fs::remove_file(instance.path.join("d/x")).expect("Remove failed");
+                stage_relative(&instance, &["d/x"]).await;
+                move_and_stage(&instance, "d/y", "d/x").await;
+                move_and_stage(&instance, "d", "e/d").await;
+                let state = test_commit(&instance, "Move d/y onto d/x, move d to e/d").await;
+
+                assert_eq!(
+                    file_paths(instance.repository.clone(), state.clone()).await,
+                    vec!["e/d/x".to_string(), "e/d/z".to_string()],
+                    "the commit holds other files than the working tree"
+                );
+                let directory = state
+                    .find_node_link(instance.repository.clone(), "e/d")
+                    .await
+                    .expect("Failed to find e/d");
+                let named = children_named(&instance.repository, &state, directory.node, "x").await;
+                assert_eq!(named.len(), 1, "e/d holds {} nodes named x", named.len());
+                let node = state
+                    .node(instance.repository.clone(), named[0])
+                    .await
+                    .expect("Failed to read e/d/x");
+                assert_eq!(
+                    node.size,
+                    b"y, first, longer".len() as u64,
+                    "e/d/x does not hold the moved file"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }

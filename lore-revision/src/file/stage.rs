@@ -957,6 +957,11 @@ async fn mark_children_moved(
             for child_id in children {
                 let child_node = state.node(repository.clone(), child_id).await?;
 
+                // Leave children staged for deletion as they are
+                if child_node.is_staged_delete() {
+                    continue;
+                }
+
                 // Determine the appropriate flag for this child
                 let child_flag = if child_node.is_staged_add() {
                     NodeFlags::StagedAdd
