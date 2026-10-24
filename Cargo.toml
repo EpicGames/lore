@@ -116,7 +116,7 @@ lore-storage = { path = "lore-storage" }
 lore-telemetry = { path = "lore-telemetry" }
 lore-transport = { path = "lore-transport" }
 anstyle = "1.0.11"
-anstream = "0.6.20"
+anstream = "1.0.0"
 anyhow = "1.0.103"
 async-channel = "2.5.0"
 async-stream = "0.3.6"
@@ -134,36 +134,46 @@ clap = { version = "4.5.47", features = ["derive", "string", "unicode"] }
 clap-markdown = "0.1.5"
 config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
-crossbeam = "0.8.4"
+crossbeam-epoch = "0.9.21"
+crossbeam-queue = "0.3.14"
 dashmap = "6.1.0"
 diffy = "0.5.2"
 directories = "6.0.0"
 enum_dispatch = "0.3.13"
 tracing-appender = "0.2.3"
-tracing-ecs = "0.4.1"
+tracing-ecs = "0.5.0"
 tracing-opentelemetry = "0.32.0"
 fastcdc = "3.2.1"
 futures = "0.3.31"
 glob-match = "0.2.1"
-governor = "0.10.1"
+governor = { version = "0.10.1", default-features = false, features = ["std"] }
 hex = "0.4.3"
 http = "1.3.1"
 http-body = "1.0.1"
 indexmap = "2.11.1"
 infer = "0.19.0"
 io-uring = "0.7"
-jsonwebtoken = "9.3.1"
-keyring = { version = "3.6.3", features = [
-    "apple-native",
-    "windows-native",
-    "linux-native",
-] }
+# PEM keys are never parsed; `use_pem` would pull in a second `pem`.
+jsonwebtoken = { version = "9.3.1", default-features = false }
+# The OS secure stores the token store keeps its encryption keys in, one per platform.
+keyring-core = "1.0.1"
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+linux-keyutils-keyring-store = "1.0.0"
+windows-native-keyring-store = { version = "1.1.0", default-features = false }
 libc = "0.2.175"
 lz4-sys = "1.11"
 zstd-sys = { version = "2.0", default-features = false, features = ["experimental"] }
 mockall = "0.13.1"
 opentelemetry = "0.31.0"
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "tls", "tls-roots"] }
+opentelemetry-otlp = { version = "0.31.0", default-features = false, features = [
+    "grpc-tonic",
+    "tls",
+    "tls-roots",
+    "trace",
+    "metrics",
+    "logs",
+    "internal-logs",
+] }
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 parking_lot = { version = "0.12.4", features = ["arc_lock"] }
@@ -187,7 +197,7 @@ reqwest = { version = "0.12.23", default-features = false, features = [
 ] }
 ring = "0.17.14"
 # We configure rustls to not bring in aws-lc-sys, which seems to have build issues on Windows.
-rustls = { version = "0.23.31", default-features = false, features = [
+rustls = { version = "0.23.46", default-features = false, features = [
     "std",
     "logging",
     "ring",
@@ -202,10 +212,10 @@ serde_with = { version = "3.14.0", default-features = false, features = ["alloc"
 serial_test = { version = "3.2.0" }
 socket2 = "0.6.0"
 syn = "2.0.106"
-sysinfo = { version = "0.37.0", features = ["linux-tmpfs"] }
+sysinfo = { version = "0.39.6", default-features = false, features = ["disk", "system", "linux-tmpfs"] }
 temp-env = "0.3.6"
 thiserror = "2.0.16"
-tokio = { version = "1.47.1", features = [
+tokio = { version = "1.53.3", features = [
     "fs",
     "io-util",
     "macros",
@@ -233,7 +243,6 @@ tracing-test = "0.2.5"
 url = "2.5.7"
 urlencoding = "2.1.3"
 uuid = { version = "1.18.1", default-features = false, features = ["v4", "v7"] }
-vergen = { version = "9.0.6", default-features = false, features = ["cargo", "rustc", "build", "si"] }
 webpki-roots = "1.0.11"
 windows-sys = "0.61.0"
 x509-parser = "0.18.0"

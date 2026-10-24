@@ -72,7 +72,7 @@ impl LoreAdminService {
                 features,
                 settings,
                 host: Some(HostInfo {
-                    arch: env!("VERGEN_RUSTC_HOST_TRIPLE").to_string(),
+                    arch: env!("LORE_RUSTC_HOST_TRIPLE").to_string(),
                     cpu,
                     ram,
                     hostname: sysinfo::System::host_name().unwrap_or("unknown".to_string()),

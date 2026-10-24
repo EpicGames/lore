@@ -14,7 +14,7 @@ bitcode = { workspace = true }
 bitflags = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam-queue = { workspace = true }
 dashmap = { workspace = true }
 fastcdc = { workspace = true }
 futures = { workspace = true }

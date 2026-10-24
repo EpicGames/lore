@@ -7,10 +7,10 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use crossbeam::epoch;
-use crossbeam::epoch::Atomic;
-use crossbeam::epoch::Owned;
-use crossbeam::epoch::Shared;
+use crossbeam_epoch as epoch;
+use crossbeam_epoch::Atomic;
+use crossbeam_epoch::Owned;
+use crossbeam_epoch::Shared;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lore_base::lore_spawn_net;

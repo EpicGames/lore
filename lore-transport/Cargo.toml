@@ -21,7 +21,7 @@ bitcode = { workspace = true }
 prost-types = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam-epoch = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }

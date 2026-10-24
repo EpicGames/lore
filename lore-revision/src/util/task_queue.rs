@@ -17,7 +17,6 @@ use futures::future::BoxFuture;
 use governor::Quota;
 use governor::RateLimiter;
 use governor::clock::Clock;
-use governor::clock::Reference;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_telemetry::InstrumentProvider;
@@ -270,11 +269,7 @@ where
                             lore_error!("num_rate_limited_counter not set");
                         }
 
-                        let delay = Duration::from_nanos(
-                            e.earliest_possible()
-                                .duration_since(limiter.clock().now())
-                                .as_u64(),
-                        );
+                        let delay = e.wait_time_from(limiter.clock().now());
                         lore_trace!(
                             "Rate limit check failed, waiting {delay:?} before trying again"
                         );

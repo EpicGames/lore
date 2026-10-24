@@ -78,13 +78,12 @@ mockall = { workspace = true, optional = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
-vergen = { workspace = true }
 
 [dev-dependencies]
 # The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
-axum-test = "18.1.0"
+axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 http-body = "1.0.1"
 http-body-util = "0.1.3"

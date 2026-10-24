@@ -11,7 +11,7 @@ test = false
 [dependencies]
 base64 = { workspace = true }
 jsonwebtoken = { workspace = true }
-keyring = { workspace = true }
+keyring-core = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
 ring = { workspace = true }
@@ -32,7 +32,14 @@ lore-credential = { workspace = true, features = ["test-util"] }
 test-util = []
 trace_log = ["lore-base/trace_log"]
 
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { workspace = true }
+
 [target.'cfg(target_family = "windows")'.dependencies]
+windows-native-keyring-store = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [lints]

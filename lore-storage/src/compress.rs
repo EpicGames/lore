@@ -375,16 +375,16 @@ static SCRATCH_BUFFER_LIMIT: OnceLock<usize> = OnceLock::new();
 static SCRATCH_BUFFER_HARD_LIMIT: usize = 256;
 
 #[cfg(feature = "oodle")]
-static COMPRESS_SCRATCH_BUFFER_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<BytesMut>> =
+static COMPRESS_SCRATCH_BUFFER_QUEUE: OnceLock<crossbeam_queue::ArrayQueue<BytesMut>> =
     OnceLock::new();
 #[cfg(feature = "oodle")]
-static DECOMPRESS_SCRATCH_BUFFER_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<BytesMut>> =
+static DECOMPRESS_SCRATCH_BUFFER_QUEUE: OnceLock<crossbeam_queue::ArrayQueue<BytesMut>> =
     OnceLock::new();
 
 #[cfg(feature = "oodle")]
-fn compress_scratch_buffer_queue() -> &'static crossbeam::queue::ArrayQueue<BytesMut> {
+fn compress_scratch_buffer_queue() -> &'static crossbeam_queue::ArrayQueue<BytesMut> {
     COMPRESS_SCRATCH_BUFFER_QUEUE
-        .get_or_init(|| crossbeam::queue::ArrayQueue::new(SCRATCH_BUFFER_HARD_LIMIT))
+        .get_or_init(|| crossbeam_queue::ArrayQueue::new(SCRATCH_BUFFER_HARD_LIMIT))
 }
 
 #[cfg(feature = "oodle")]
@@ -417,9 +417,9 @@ fn compress_scratch_buffer_done(buffer: BytesMut) {
 }
 
 #[cfg(feature = "oodle")]
-fn decompress_scratch_buffer_queue() -> &'static crossbeam::queue::ArrayQueue<BytesMut> {
+fn decompress_scratch_buffer_queue() -> &'static crossbeam_queue::ArrayQueue<BytesMut> {
     DECOMPRESS_SCRATCH_BUFFER_QUEUE
-        .get_or_init(|| crossbeam::queue::ArrayQueue::new(SCRATCH_BUFFER_HARD_LIMIT))
+        .get_or_init(|| crossbeam_queue::ArrayQueue::new(SCRATCH_BUFFER_HARD_LIMIT))
 }
 
 #[cfg(feature = "oodle")]
@@ -609,12 +609,11 @@ fn zstd_claim_pooled_slot(count: &AtomicUsize) -> bool {
     false
 }
 
-static ZSTD_COMPRESS_CTX_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<ZstdCCtx>> = OnceLock::new();
-static ZSTD_DECOMPRESS_CTX_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<ZstdDCtx>> =
-    OnceLock::new();
+static ZSTD_COMPRESS_CTX_QUEUE: OnceLock<crossbeam_queue::ArrayQueue<ZstdCCtx>> = OnceLock::new();
+static ZSTD_DECOMPRESS_CTX_QUEUE: OnceLock<crossbeam_queue::ArrayQueue<ZstdDCtx>> = OnceLock::new();
 
-fn zstd_compress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdCCtx> {
-    ZSTD_COMPRESS_CTX_QUEUE.get_or_init(|| crossbeam::queue::ArrayQueue::new(ZSTD_CTX_POOL_LIMIT))
+fn zstd_compress_ctx_queue() -> &'static crossbeam_queue::ArrayQueue<ZstdCCtx> {
+    ZSTD_COMPRESS_CTX_QUEUE.get_or_init(|| crossbeam_queue::ArrayQueue::new(ZSTD_CTX_POOL_LIMIT))
 }
 
 #[lore_macro::test_pub]
@@ -653,8 +652,8 @@ fn zstd_compress_ctx_done(ctx: ZstdCCtx) {
     }
 }
 
-fn zstd_decompress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdDCtx> {
-    ZSTD_DECOMPRESS_CTX_QUEUE.get_or_init(|| crossbeam::queue::ArrayQueue::new(ZSTD_CTX_POOL_LIMIT))
+fn zstd_decompress_ctx_queue() -> &'static crossbeam_queue::ArrayQueue<ZstdDCtx> {
+    ZSTD_DECOMPRESS_CTX_QUEUE.get_or_init(|| crossbeam_queue::ArrayQueue::new(ZSTD_CTX_POOL_LIMIT))
 }
 
 #[lore_macro::test_pub]

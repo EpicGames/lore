@@ -16,7 +16,7 @@ bitcode = { workspace = true }
 blake3 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam-queue = { workspace = true }
 dashmap = { workspace = true }
 diffy = { workspace = true }
 fastcdc = { workspace = true }
@@ -27,7 +27,6 @@ hex = { workspace = true }
 http = { workspace = true }
 infer = { workspace = true }
 jsonwebtoken = { workspace = true }
-keyring = { workspace = true }
 libc = { workspace = true }
 open = "5.3.2"
 opentelemetry = { workspace = true }
@@ -70,6 +69,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 
 [dev-dependencies]
 ctor = { workspace = true }
+keyring-core = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-revision = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }

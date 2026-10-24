@@ -61,6 +61,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   be derived from their public keys (RUSTSEC-2026-0382), whichever built-in, operating system or custom root its chain
   ends in, where they accepted it. The built-in roots no longer include emSign ECC Root CA - G3, emSign Root CA - C1 or
   emSign ECC Root CA - C3
+- TLS connections abort on a TLS 1.3 handshake message sent at the wrong encryption level, where they accepted it
+  (RUSTSEC-2026-0285). A forged ServerHello no longer makes later connections to the same server offer only a classical
+  key share, which a server could accept without post-quantum key exchange (RUSTSEC-2026-0349). Debug output of a
+  client session leaves out its secrets (RUSTSEC-2026-0346)
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

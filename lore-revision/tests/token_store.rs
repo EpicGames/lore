@@ -4,8 +4,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::OnceLock;
 
-    use keyring::mock;
-    use keyring::set_default_credential_builder;
     use lore_base::env::CallEnvironment;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
@@ -42,7 +40,9 @@ mod tests {
         unsafe {
             std::env::set_var("LORE_AUTH_PATH", auth_dir.display().to_string());
         }
-        set_default_credential_builder(mock::default_credential_builder());
+        keyring_core::set_default_store(
+            keyring_core::mock::Store::new().expect("Failed to create mock store"),
+        );
         let (_immutable_store, _mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         let _repository_id = RepositoryId::default();

@@ -409,7 +409,8 @@ fn store_fallback_path(name: &str, create_dir: bool) -> Result<PathBuf, TokenSto
     Ok(path.join(format!("sec-{name}")))
 }
 
-static KEYRING_ENTRIES: OnceLock<RwLock<HashMap<String, Arc<keyring::Entry>>>> = OnceLock::new();
+static KEYRING_ENTRIES: OnceLock<RwLock<HashMap<String, Arc<keyring_core::Entry>>>> =
+    OnceLock::new();
 
 /// In-memory cache of the loaded encryption keys, keyed by the directory of the
 /// token store each protects.
@@ -424,26 +425,58 @@ static ENCRYPTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::
 const SECURE_STORE_MSG: &str =
     "Failed to store secret in secure storage, encryption key will be stored in plain text";
 
-#[cfg(target_os = "macos")]
-fn new_keyring_entry(target: &str) -> Result<keyring::Entry, TokenStoreError> {
-    keyring::Entry::new_with_target("User", SERVICE_NAME, target).map_err(|e| {
+fn new_keyring_entry(target: &str) -> Result<keyring_core::Entry, TokenStoreError> {
+    secure_store_entry(target).map_err(|e| {
         lore_warn!("{SECURE_STORE_MSG}: {e}");
         TokenStoreError::internal_with_context(e, SECURE_STORE_MSG)
     })
 }
 
-#[cfg(not(target_os = "macos"))]
-fn new_keyring_entry(target: &str) -> Result<keyring::Entry, TokenStoreError> {
-    keyring::Entry::new_with_target(target, SERVICE_NAME, "identity").map_err(|e| {
-        lore_warn!("{SECURE_STORE_MSG}: {e}");
-        TokenStoreError::internal_with_context(e, SECURE_STORE_MSG)
-    })
+/// The secure-store entry for the token store `target` names.
+///
+/// A default store the process installed, such as the mock the tests install, takes precedence
+/// and is addressed by service and target. Otherwise the entry is the OS store's item that keyring
+/// 3 addressed for the same target, so a key it stored is still found.
+fn secure_store_entry(target: &str) -> keyring_core::Result<keyring_core::Entry> {
+    if keyring_core::get_default_store().is_some() {
+        return keyring_core::Entry::new(SERVICE_NAME, target);
+    }
+    os_store_entry(target)
+}
+
+/// The login keychain's generic password with service `SERVICE_NAME` and account `target`.
+#[cfg(target_os = "macos")]
+fn os_store_entry(target: &str) -> keyring_core::Result<keyring_core::Entry> {
+    use keyring_core::api::CredentialStoreApi;
+    apple_native_keyring_store::keychain::Store::new()?.build(SERVICE_NAME, target, None)
+}
+
+/// The generic credential named `target`.
+#[cfg(windows)]
+fn os_store_entry(target: &str) -> keyring_core::Result<keyring_core::Entry> {
+    use keyring_core::api::CredentialStoreApi;
+    let modifiers = HashMap::from([("target", target)]);
+    windows_native_keyring_store::Store::new()?.build(SERVICE_NAME, "identity", Some(&modifiers))
+}
+
+/// The session keyring's key described by `target`.
+#[cfg(target_os = "linux")]
+fn os_store_entry(target: &str) -> keyring_core::Result<keyring_core::Entry> {
+    use keyring_core::api::CredentialStoreApi;
+    let modifiers = HashMap::from([("description", target)]);
+    linux_keyutils_keyring_store::Store::new()?.build(SERVICE_NAME, "identity", Some(&modifiers))
+}
+
+/// No OS store elsewhere: the secret is kept in the fallback file.
+#[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+fn os_store_entry(_target: &str) -> keyring_core::Result<keyring_core::Entry> {
+    Err(keyring_core::Error::NoDefaultStore)
 }
 
 /// Returns the (cached) keyring entry for `target`. Entries are cached per
 /// target: a single cache slot would pin whichever target was requested first
 /// and hand that entry back for every other target.
-fn keyring_entry(target: &str) -> Result<Arc<keyring::Entry>, TokenStoreError> {
+fn keyring_entry(target: &str) -> Result<Arc<keyring_core::Entry>, TokenStoreError> {
     let entries = KEYRING_ENTRIES.get_or_init(|| RwLock::new(HashMap::new()));
     if let Ok(cache) = entries.read()
         && let Some(entry) = cache.get(target)
@@ -1194,7 +1227,7 @@ async fn secret_from_secure_store(target: &str) -> Result<Option<Vec<u8>>, Token
             lore_trace!("Loaded secret from secure store {target}");
             Ok(Some(secret))
         }
-        Err(keyring::Error::NoEntry) => {
+        Err(keyring_core::Error::NoEntry) => {
             lore_debug!("No secret in secure store {target}");
             Ok(None)
         }

@@ -38,7 +38,7 @@ hex = "0.4"
 libc = "0.2"
 prost = "0.14"
 prost-types = "0.14"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1.47", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"

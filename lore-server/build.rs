@@ -3,7 +3,7 @@
 //! Build script for lore-server that:
 //! 1. Auto-generates `mod.rs` files for `plugins/` and `hooks/` directories
 //! 2. Creates `register_all_plugins()` and `register_all_hooks()` functions
-//! 3. Populates environment with build details via vergen
+//! 3. Records the compiler's host triple for the admin service
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -58,12 +58,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     // backward compatibility but that no client crate links against
     compile_legacy_protos()?;
 
-    // Populate environment with build details
-    vergen::Emitter::default()
-        .add_instructions(&vergen::BuildBuilder::all_build()?)?
-        .add_instructions(&vergen::RustcBuilder::all_rustc()?)?
-        .add_instructions(&vergen::SysinfoBuilder::all_sysinfo()?)?
-        .emit()?;
+    // The compiler's host triple, which the admin service reports as the server's architecture
+    println!(
+        "cargo:rustc-env=LORE_RUSTC_HOST_TRIPLE={}",
+        std::env::var("HOST")?
+    );
 
     Ok(())
 }
