@@ -405,6 +405,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -778,13 +789,13 @@ dependencies = [
 
 [[package]]
 name = "fastbloom"
-version = "0.14.1"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e7f34442dbe69c60fe8eaf58a8cafff81a1f278816d8ab4db255b3bef4ac3c4"
+checksum = "ef975e30683b2d965054bb0a836f8973857c4ebf6acf274fe46617cd285060d8"
 dependencies = [
- "getrandom 0.3.4",
+ "foldhash 0.2.0",
  "libm",
- "rand",
+ "portable-atomic",
  "siphasher",
 ]
 
@@ -977,8 +988,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1016,7 +1030,7 @@ dependencies = [
  "parking_lot",
  "portable-atomic",
  "quanta",
- "rand",
+ "rand 0.9.5",
  "smallvec",
  "spinning_top",
  "web-time",
@@ -1572,12 +1586,13 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lore"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "bitcode",
  "bytes",
  "chrono",
  "dashmap",
+ "futures",
  "libc",
  "lore-base",
  "lore-credential",
@@ -1591,6 +1606,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "smallvec",
  "thiserror",
  "tokio",
  "toml",
@@ -1600,9 +1616,10 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "backtrace",
+ "bitcode",
  "bitflags 2.13.1",
  "blake3",
  "bytes",
@@ -1616,7 +1633,7 @@ dependencies = [
  "lore-macro",
  "parking_lot",
  "pin-project",
- "rand",
+ "rand 0.9.5",
  "serde",
  "tempfile",
  "thiserror",
@@ -1628,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "lore-credential"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -1637,6 +1654,7 @@ dependencies = [
  "lore-error-set",
  "ring",
  "serde",
+ "serde_json",
  "serde_with",
  "thiserror",
  "tokio",
@@ -1663,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "lore-io"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "bytes",
  "io-uring",
@@ -1675,7 +1693,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1684,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "lore-notification"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -1700,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "lore-base",
  "prost",
@@ -1712,11 +1730,12 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "bitcode",
  "bitflags 2.13.1",
  "blake3",
  "bytes",
@@ -1748,12 +1767,11 @@ dependencies = [
  "parking_lot",
  "prost-types",
  "quinn",
- "rand",
+ "rand 0.9.5",
  "ring",
  "rustls",
  "rustls-native-certs",
  "serde",
- "serde_bytes",
  "serde_with",
  "smallvec",
  "thiserror",
@@ -1772,9 +1790,10 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "async-trait",
+ "bitcode",
  "bitflags 2.13.1",
  "blake3",
  "bytes",
@@ -1794,7 +1813,7 @@ dependencies = [
  "opentelemetry",
  "parking_lot",
  "pin-project",
- "rand",
+ "rand 0.9.5",
  "serde",
  "smallvec",
  "thiserror",
@@ -1810,7 +1829,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "axum",
  "http",
@@ -1820,7 +1839,7 @@ dependencies = [
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
  "pin-project",
- "rand",
+ "rand 0.9.5",
  "regex",
  "serde",
  "smallvec",
@@ -1833,11 +1852,14 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.10.2-nightly"
+version = "0.11.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64 0.22.1",
+ "bitcode",
  "bytes",
+ "crossbeam",
  "dashmap",
  "futures",
  "http",
@@ -1850,7 +1872,7 @@ dependencies = [
  "prost-types",
  "quinn",
  "quinn-proto",
- "rand",
+ "rand 0.9.5",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1858,6 +1880,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "socket2",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -2086,7 +2109,7 @@ dependencies = [
  "futures-util",
  "opentelemetry",
  "percent-encoding",
- "rand",
+ "rand 0.9.5",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -2338,9 +2361,9 @@ dependencies = [
 
 [[package]]
 name = "quinn"
-version = "0.11.9"
+version = "0.11.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -2358,13 +2381,14 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.15"
+version = "0.11.19"
 dependencies = [
  "bytes",
  "fastbloom",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "lru-slab",
- "rand",
+ "rand 0.10.3",
+ "rand_pcg",
  "ring",
  "rustc-hash",
  "rustls",
@@ -2418,7 +2442,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
 dependencies = [
  "rand_chacha",
- "rand_core",
+ "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+dependencies = [
+ "chacha20",
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2428,7 +2463,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
 dependencies = [
  "ppv-lite86",
- "rand_core",
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -2438,6 +2473,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
+dependencies = [
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -2719,9 +2769,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.15"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -2799,16 +2849,6 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
-]
-
-[[package]]
-name = "serde_bytes"
-version = "0.11.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
-dependencies = [
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -3639,9 +3679,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.9"
+version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
+checksum = "f5f280bbb2b287bc8e7de7e3852945a0ff50d1bbcb5ed42b6c7a568c546df171"
 dependencies = [
  "rustls-pki-types",
 ]

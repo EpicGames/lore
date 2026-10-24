@@ -57,6 +57,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   the mutable store, took the mutable store's lock before the immutable store's, against a process holding the immutable
   store's lock and waiting for the mutable store's. Every process using the store needs this version: an older one still
   takes the two locks in that order
+- TLS connections refuse a server certificate issued through one of the eMudhra intermediate CAs whose private keys can
+  be derived from their public keys (RUSTSEC-2026-0382), whichever built-in, operating system or custom root its chain
+  ends in, where they accepted it. The built-in roots no longer include emSign ECC Root CA - G3, emSign Root CA - C1 or
+  emSign ECC Root CA - C3
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 
