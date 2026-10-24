@@ -14,10 +14,13 @@
 //! service from compose.yaml, so it is not behind `integration_tests`.
 //!
 //! [`across_processes`] has processes reload what they keep of a store after another process
-//! changes it.
+//! changes it. [`locks`] has calls take the stores' and the repository's locks in one order,
+//! whatever the process kept, and processes running calls on one store at once all finish.
 
 #[path = "store_retention/across_processes.rs"]
 mod across_processes;
+#[path = "store_retention/locks.rs"]
+mod locks;
 
 use std::io::Read;
 use std::path::Path;
@@ -69,6 +72,16 @@ const WINDOW_SECONDS: u64 = 60 * 60;
 
 /// The keep-alive window, in seconds, of a call whose test waits for the window to end.
 const ENDING_WINDOW_SECONDS: u64 = 1;
+
+/// The remote the repositories and shared stores name. Nothing connects to it.
+const REMOTE_URL: &str = "lore://localhost/store-retention";
+
+/// The test `test` of the module of this crate at `module`, as the harness names it: by its path
+/// within the crate.
+fn harness_name(module: &str, test: &str) -> String {
+    let within = module.split_once("::").map_or("", |(_, module)| module);
+    format!("{within}::{test}")
+}
 
 /// A copy of this binary that runs the test named `test`, with its global config, credentials
 /// and service socket in `sandbox`, its stdout piped to this process, and `LORE_STORE_RETAIN`
@@ -161,21 +174,33 @@ fn windowed_globals(repository: &Path, keep_alive: bool, window_seconds: u64) ->
 /// keeps nothing past [`ENDING_WINDOW_SECONDS`], so a test that waits for the stores to go is
 /// waiting for its own call's window.
 async fn create_repository(path: &Path) -> Stores {
+    create_repository_over(path, None).await;
+    Stores::of(path)
+}
+
+/// Creates an offline repository at `path` over the shared store at `shared`, or with stores of
+/// its own, keeping nothing past [`ENDING_WINDOW_SECONDS`].
+async fn create_repository_over(path: &Path, shared: Option<&Path>) {
     let status = repository::create(
         windowed_globals(path, false, ENDING_WINDOW_SECONDS),
         repository::LoreRepositoryCreateArgs {
-            repository_url: "lore://localhost/store-retention".into(),
+            repository_url: REMOTE_URL.into(),
             description: LoreString::default(),
             id: LoreString::default(),
-            use_shared_store: LoreSharedStoreMode::Disabled,
-            shared_store_path: LoreString::default(),
+            use_shared_store: if shared.is_some() {
+                LoreSharedStoreMode::Enabled
+            } else {
+                LoreSharedStoreMode::Disabled
+            },
+            shared_store_path: shared.map_or_else(LoreString::default, |shared| {
+                LoreString::from(shared.to_str().expect("a UTF-8 path"))
+            }),
             vfs: Default::default(),
         },
         None,
     )
     .await;
-    assert_eq!(status, 0, "creating the repository");
-    Stores::of(path)
+    assert_eq!(status, 0, "creating the repository at {}", path.display());
 }
 
 /// Locks on a repository's two store directories, held for a scenario so the directories' load
@@ -394,8 +419,8 @@ async fn get(repository: &Path, store: LoreStore, address: Address) -> Vec<u8> {
 }
 
 /// Waits for `condition`, with no limit of its own: [`HANG_GUARD`] bounds the copy running it.
-async fn until(mut condition: impl FnMut() -> bool) {
-    while !condition() {
+async fn until(mut condition: impl AsyncFnMut() -> bool) {
+    while !condition().await {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -495,7 +520,7 @@ async fn a_keep_alive_lets_the_claims_go_when_its_window_ends_without_retention(
             let stores = create_repository(dir.path()).await;
 
             let seen = call(dir.path(), true, ENDING_WINDOW_SECONDS).await;
-            until(|| {
+            until(async || {
                 stores.held() == [false, false]
                     && seen.immutable.upgrade().is_none()
                     && seen.mutable.upgrade().is_none()
@@ -567,7 +592,8 @@ async fn a_retaining_process_lets_its_stores_go_when_the_window_ends() {
             create_repository(dir.path()).await;
 
             let seen = call(dir.path(), false, ENDING_WINDOW_SECONDS).await;
-            until(|| seen.immutable.upgrade().is_none() && seen.mutable.upgrade().is_none()).await;
+            until(async || seen.immutable.upgrade().is_none() && seen.mutable.upgrade().is_none())
+                .await;
         },
     )
     .await;

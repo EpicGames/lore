@@ -32,9 +32,7 @@
 //! flock past the end of the span, because a process must not sit on changes another
 //! process cannot see. Each store answers whether it has any through [`LockedStore`]
 //! as the last guard goes, and a flush that leaves nothing flagged releases the flock
-//! then. A mutable store's unflushed modifications keep the immutable store's flock
-//! as well, since the immutable store is claimed first: kept alone, the mutable store's
-//! flock would be held while the immutable store's is claimed after it, out of order.
+//! then.
 //!
 //! A store holds no file open past the flock. As the flock is released, each store on
 //! the directory closes the packfiles it has open, before the release, so another
@@ -52,6 +50,17 @@
 //! enforces the release half by owning the claims it was taken under and declaring
 //! its own flock first, so Rust's drop order frees the repository before the stores
 //! containing it.
+//!
+//! **A mutable store's flock is held inside the flock of the immutable store it is opened
+//! beside**, for the same reason. The mutable store's lock is nested in the immutable
+//! store's, see [`StoreLock::new_within`]: taking the mutable flock first takes a hold on
+//! the immutable flock, and the hold is released only after the mutable flock. A command
+//! claims the immutable store first, but a path can reach the mutable store first — a
+//! store opened while the immutable store came from a cache, an operation outside any
+//! span — and the two flocks are taken in one order all the same. A process waiting for
+//! the immutable flock therefore holds no mutable flock, and whatever keeps the mutable
+//! flock past a span, unflushed modifications or files in use, keeps the immutable flock
+//! with it.
 //!
 //! A single order matters because `FSLock`'s wait is unbounded: a cycle is not a slow
 //! path, it is two processes that never return. The containment is what makes a
@@ -229,6 +238,16 @@ enum Contention {
     Skip,
 }
 
+/// The flock this process holds on a store directory, with the hold it took on the flock its lock
+/// is nested in, see [`StoreLock::new_within`]. Declared in that order, so the flock is released
+/// before the hold.
+struct Flock {
+    /// `None` once a release has unlocked it under the directory's state lock, see
+    /// [`PathLock::release_unless_in_use`].
+    lock: Option<FSLock>,
+    _enclosing: Option<StoreGuard>,
+}
+
 /// Everything about the lock that has to move together.
 ///
 /// Behind a `parking_lot::Mutex` rather than an async one because it is held for
@@ -243,7 +262,7 @@ struct LockState {
     /// opened, which a store directory deleted and recreated no longer contains — while
     /// another process locks the new one, and neither excludes the other. An epoch write in
     /// flight holds the flock too, until it has landed, see [`PathLock::write_epoch`].
-    held: Option<Arc<FSLock>>,
+    held: Option<Arc<Flock>>,
     /// Guards in flight, across every store object sharing this directory: the spans,
     /// and the operations that run outside any span.
     active: usize,
@@ -373,6 +392,12 @@ struct PathLock {
     /// `lstat` per path component for a path that cannot change — measured at 8.6 µs
     /// at depth 7 and growing with depth, on a path taken at the start of every span.
     lock_path: PathBuf,
+    /// A lock holding no store state on the directory whose lock this one is nested in, through
+    /// which taking this directory's flock first holds that directory's: see
+    /// [`StoreLock::new_within`]. Set by the first lock made with it. A flock taken before then,
+    /// through a lock made with [`StoreLock::new`], holds nothing of the enclosing directory,
+    /// which only tests do.
+    enclosing: std::sync::OnceLock<Arc<StoreLock>>,
     /// The bookkeeping shared by every store on this directory.
     state: Mutex<LockState>,
     /// What [`LockState`] last published for operations inside a hold: [`NOT_HELD`]
@@ -440,6 +465,9 @@ pub struct StoreLock {
     /// epoch it observed is unchanged. Without it, the store reloads at the first claim
     /// after any release.
     reuse_state_across_holds: bool,
+    /// Whether this lock belongs to a store with in-memory state to reload. The lock through
+    /// which a nested lock holds this one's flock has none, and is never stale.
+    holds_state: bool,
 }
 
 /// Whether state built against `observed` can still be used, given `current`.
@@ -493,6 +521,7 @@ impl StoreLock {
                     lock_path: key.join("lock"),
                     epoch_path: key.join(EPOCH_FILE),
                     epoch_staging_path: key.join(EPOCH_STAGING_FILE),
+                    enclosing: std::sync::OnceLock::new(),
                     state: Mutex::new(LockState {
                         held: None,
                         active: 0,
@@ -522,7 +551,38 @@ impl StoreLock {
             observed: Mutex::new(None),
             observed_generation: AtomicU64::new(NEVER_ADOPTED),
             reuse_state_across_holds,
+            holds_state: true,
         }))
+    }
+
+    /// As [`Self::new`], with the lock nested in `enclosing`: taking this directory's flock first
+    /// takes a hold on `enclosing`'s, released only after this one, so the two flocks are taken in
+    /// one order whichever lock a path reaches first. Every lock on a directory is nested in the
+    /// same one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn new_within(
+        path: impl AsRef<Path>,
+        reuse_state_across_holds: bool,
+        enclosing: &Self,
+    ) -> std::io::Result<Arc<Self>> {
+        let lock = Self::new(path, reuse_state_across_holds)?;
+        let nested_in = lock.shared.enclosing.get_or_init(|| {
+            Arc::new(Self {
+                shared: Arc::clone(&enclosing.shared),
+                observed: Mutex::new(None),
+                observed_generation: AtomicU64::new(NEVER_ADOPTED),
+                reuse_state_across_holds: false,
+                holds_state: false,
+            })
+        });
+        debug_assert!(
+            Arc::ptr_eq(&nested_in.shared, &enclosing.shared),
+            "every lock on a directory is nested in the same one"
+        );
+        Ok(lock)
     }
 
     /// Takes the lock for one operation, reporting whether the in-memory state
@@ -586,9 +646,12 @@ impl StoreLock {
     }
 
     /// The part of an acquisition that holds the gate: joining a flock another task took
-    /// while this one waited, or taking the flock and reading the epoch.
+    /// while this one waited, or taking the flock and reading the epoch. A flock taken here
+    /// is taken after a hold on the flock its lock is nested in, which it keeps, so the two
+    /// are taken in one order whichever lock a path reaches first.
     ///
-    /// `None` only under [`Contention::Skip`], when another process holds the flock.
+    /// `None` only under [`Contention::Skip`], when another process holds the flock or the
+    /// one its lock is nested in.
     ///
     /// # Errors
     ///
@@ -653,15 +716,28 @@ impl StoreLock {
             return Ok(Some(guard));
         }
 
-        let Some((held, recreated)) = self.shared.take_flock(contention).await? else {
+        let enclosing = match (self.shared.enclosing.get(), contention) {
+            (None, _) => None,
+            (Some(enclosing), Contention::Wait) => Some(enclosing.acquire(Intent::Read).await?),
+            (Some(enclosing), Contention::Skip) => {
+                match enclosing.try_acquire(Intent::Read).await? {
+                    Some(guard) => Some(guard),
+                    None => return Ok(None),
+                }
+            }
+        };
+        let Some((lock, recreated)) = self.shared.take_flock(contention).await? else {
             return Ok(None);
         };
-        let held = Arc::new(held);
+        let held = Arc::new(Flock {
+            lock: Some(lock),
+            _enclosing: enclosing,
+        });
         let on_disk = read_epoch(&self.shared.epoch_path).await;
         // Against what was on disk when the flock was taken, before this store's own
         // advance below. Another process may have written while the flock was not held,
         // so a generation decides nothing here.
-        let stale = recreated || self.is_stale_against(on_disk);
+        let stale = (recreated && self.holds_state) || self.is_stale_against(on_disk);
         let advance = intent == Intent::Write || recreated;
         let gate = if advance {
             self.advance(next_epoch(on_disk), Arc::clone(&held), gate, stale)
@@ -700,7 +776,7 @@ impl StoreLock {
     async fn advance(
         self: &Arc<Self>,
         stamp: Stamp,
-        held: Arc<FSLock>,
+        held: Arc<Flock>,
         gate: tokio::sync::OwnedMutexGuard<()>,
         stale: bool,
     ) -> std::io::Result<tokio::sync::OwnedMutexGuard<()>> {
@@ -729,7 +805,7 @@ impl StoreLock {
     async fn record_advance(
         self: Arc<Self>,
         stamp: Stamp,
-        held: Arc<FSLock>,
+        held: Arc<Flock>,
         gate: tokio::sync::OwnedMutexGuard<()>,
         stale: bool,
     ) -> std::io::Result<tokio::sync::OwnedMutexGuard<()>> {
@@ -860,8 +936,7 @@ impl StoreLock {
     /// anything unflushed. For a flush that has just finished, which may be what was
     /// keeping the flock past the last span.
     pub fn release_if_clean(&self) {
-        let mut state = self.shared.state.lock();
-        PathLock::release_if_idle(&self.shared, &mut state);
+        PathLock::release_if_idle(&self.shared, self.shared.state.lock());
     }
 
     /// Whether this store's in-memory state matches the directory's current epoch, for
@@ -890,9 +965,11 @@ impl StoreLock {
     /// Whether this store's state, adopted under an earlier generation, must be reloaded
     /// against `current`: always, unless the store reuses its state across holds, and then
     /// as [`is_stale`] answers. Within one hold a new generation comes with a new epoch, so
-    /// the setting decides only reuse across a release of the flock.
+    /// the setting decides only reuse across a release of the flock. Never for a lock that
+    /// holds no store state.
     fn is_stale_against(&self, current: Epoch) -> bool {
-        !self.reuse_state_across_holds || is_stale(*self.observed.lock(), current)
+        self.holds_state
+            && (!self.reuse_state_across_holds || is_stale(*self.observed.lock(), current))
     }
 
     /// Adopts the directory's current epoch and generation as this store's own.
@@ -958,22 +1035,30 @@ impl PathLock {
     /// task try the release again every [`RELEASE_RETRY`] until they are not, or a guard or an
     /// unflushed bucket takes the flock over. Polled rather than signalled by the I/O as it
     /// ends, which would run the release on an I/O completion thread.
-    fn release_if_idle(self: &Arc<Self>, state: &mut LockState) {
-        if self.release_unless_in_use(state) || state.retrying {
-            return;
-        }
-        state.retrying = true;
-        let shared = Arc::clone(self);
-        lore_base::lore_spawn!(async move {
-            loop {
-                tokio::time::sleep(RELEASE_RETRY).await;
-                let mut state = shared.state.lock();
-                if shared.release_unless_in_use(&mut state) {
-                    state.retrying = false;
-                    return;
+    ///
+    /// Takes the state lock's guard, and lets it go before the hold on the flock this one's lock
+    /// is nested in goes, since that release takes the enclosing directory's state lock.
+    fn release_if_idle(self: &Arc<Self>, mut state: parking_lot::MutexGuard<'_, LockState>) {
+        let mut released = None;
+        if !self.release_unless_in_use(&mut state, &mut released) && !state.retrying {
+            state.retrying = true;
+            let shared = Arc::clone(self);
+            lore_base::lore_spawn!(async move {
+                loop {
+                    tokio::time::sleep(RELEASE_RETRY).await;
+                    let mut released = None;
+                    let mut state = shared.state.lock();
+                    if shared.release_unless_in_use(&mut state, &mut released) {
+                        state.retrying = false;
+                        drop(state);
+                        drop(released);
+                        return;
+                    }
                 }
-            }
-        });
+            });
+        }
+        drop(state);
+        drop(released);
     }
 
     /// Waits until no files the stores on this directory opened are in use, polling every
@@ -1028,20 +1113,30 @@ impl PathLock {
     ///
     /// The stores close their files before the flock goes, not after: in between,
     /// another process could take the flock and open a packfile this one still had open.
-    fn release_unless_in_use(&self, state: &mut LockState) -> bool {
-        let mut released = true;
+    /// The flock released is unlocked here unless an epoch write in flight still holds it, and
+    /// moved into `released` with its hold on the flock its lock is nested in, see
+    /// [`Self::release_if_idle`].
+    fn release_unless_in_use(
+        &self,
+        state: &mut LockState,
+        released: &mut Option<Arc<Flock>>,
+    ) -> bool {
+        let mut done = true;
         if state.active == 0 && !state.has_unflushed() {
             if state.held.is_some() && !state.release_files() {
-                released = false;
+                done = false;
             } else {
                 #[cfg(feature = "test-util")]
                 self.assert_uncovered(state);
-                state.held = None;
+                *released = state.held.take();
+                if let Some(flock) = released.as_mut().and_then(Arc::get_mut) {
+                    drop(flock.lock.take());
+                }
                 state.advanced = false;
             }
         }
         state.publish(self);
-        released
+        done
     }
 
     /// Fails a release of the flock while an operation a span covered is still running: the
@@ -1083,13 +1178,15 @@ impl PathLock {
     /// acquisition dropped part way through the advance releases the flock only once the epoch
     /// it wrote is in place, so the epoch cannot go back past an advance another process makes
     /// once it has the flock. The sixteen bytes are handed to the driver owned, one small
-    /// allocation per advance.
+    /// allocation per advance. This call keeps `held` too until the write it awaits has
+    /// returned, so the last reference to the flock, and to the hold on the flock its lock is
+    /// nested in, is not dropped on the syscall pool.
     ///
     /// # Errors
     ///
     /// [`std::io::Error`] if the staging file cannot be created or written, or cannot be
     /// renamed over the epoch path.
-    async fn write_epoch(&self, stamp: Stamp, held: Arc<FSLock>) -> std::io::Result<Stamp> {
+    async fn write_epoch(&self, stamp: Stamp, held: Arc<Flock>) -> std::io::Result<Stamp> {
         #[cfg(feature = "test-util")]
         epoch_write_barrier::wait_if_installed(&self.epoch_path);
         #[cfg(feature = "test-util")]
@@ -1111,7 +1208,7 @@ impl PathLock {
         match write(Arc::clone(&held)).await {
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 driver.remove_file(&self.epoch_staging_path).await?;
-                write(held).await
+                write(Arc::clone(&held)).await
             }
             written => written,
         }
@@ -1431,7 +1528,7 @@ impl Drop for StoreGuard {
         if self.span {
             state.spans = state.spans.saturating_sub(1);
         }
-        self.lock.shared.release_if_idle(&mut state);
+        self.lock.shared.release_if_idle(state);
     }
 }
 

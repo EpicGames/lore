@@ -49,7 +49,6 @@ use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::query_one;
 use lore_storage::local::immutable_store::ImmutableStoreGroup;
-use lore_storage::local::store_lock::Intent;
 use lore_storage::local::store_lock::StoreGuard;
 use lore_storage::local::store_lock::StoreLock;
 use lore_storage::test_util::PausePoint;
@@ -187,8 +186,9 @@ impl Stores {
 
 /// How many times each store of a directory loaded in this process. Locks on the immutable and the
 /// mutable store directory, which take no flock of their own, kept for the process's life so that
-/// each directory's load count lasts across the store objects opened on it.
-pub struct Loads([Arc<StoreLock>; 2]);
+/// each directory's load count lasts across the store objects opened on it, and the lock file of
+/// each.
+pub struct Loads([Arc<StoreLock>; 2], [PathBuf; 2]);
 
 impl Loads {
     pub fn new(dir: &Path) -> Result<Loads, String> {
@@ -198,7 +198,10 @@ impl Loads {
                 .and_then(|()| StoreLock::new(&directory, false))
                 .map_err(|err| format!("lock {}: {err}", directory.display()))
         };
-        Ok(Loads([lock("immutable")?, lock("mutable")?]))
+        Ok(Loads(
+            [lock("immutable")?, lock("mutable")?],
+            ["immutable", "mutable"].map(|store| dir.join(store).join("lock")),
+        ))
     }
 
     pub fn now(&self) -> [usize; 2] {
@@ -211,12 +214,17 @@ impl Loads {
         [now[0] - before[0], now[1] - before[1]]
     }
 
-    /// Whether another process holds each store's flock.
+    /// Whether another process holds each store's flock. Tried on the lock file itself: an
+    /// acquisition on the mutable store takes the immutable store's flock first, so it would find
+    /// the mutable store busy whenever the immutable one is. A flock this process holds counts as
+    /// free: a call joins it, and a second lock on its file would fail against it.
     async fn busy(&self) -> Result<[bool; 2], String> {
         let mut busy = [false; 2];
-        for (lock, busy) in self.0.iter().zip(&mut busy) {
-            *busy = lock
-                .try_acquire(Intent::Read)
+        for ((lock, file), busy) in self.0.iter().zip(&self.1).zip(&mut busy) {
+            if lock.is_held() {
+                continue;
+            }
+            *busy = lore_base::fs::lock::FSLock::try_acquire_exact_path(file)
                 .await
                 .map_err(|err| err.to_string())?
                 .is_none();

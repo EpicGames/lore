@@ -52,6 +52,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   remote
 - `lore repository gc --dry-run` collects no garbage, where it evicted and compacted the local store, and
   `repository verify --heal --dry-run` heals nothing, reporting what it finds as `repository verify` does
+- Processes running commands on one repository or shared store at once, such as several `lore history`, no longer wait
+  on each other forever. A command whose process still had the immutable store open from the previous command, and not
+  the mutable store, took the mutable store's lock before the immutable store's, against a process holding the immutable
+  store's lock and waiting for the mutable store's. Every process using the store needs this version: an older one still
+  takes the two locks in that order
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

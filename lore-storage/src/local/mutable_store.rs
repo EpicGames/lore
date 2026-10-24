@@ -35,7 +35,6 @@ use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::local::fan_out::BucketGroup;
 use crate::local::fan_out::GroupLevel;
-use crate::local::immutable_store::LocalImmutableStore;
 use crate::local::immutable_store::SerializeFailureGuard;
 use crate::local::immutable_store::format_bucket_path;
 use crate::local::store_lock::Claim;
@@ -351,15 +350,10 @@ pub struct LocalMutableStore {
     ///
     /// Held for a span of use rather than for the store's lifetime, so a store kept
     /// alive between spans holds no flock of its own — see [`crate::local::store_lock`].
+    /// Nested in the lock of the immutable store this store was opened beside, where that
+    /// store has one: a command claims the immutable store first, and a path reaching this
+    /// store first takes the two flocks in the same order.
     lock: Option<Arc<StoreLock>>,
-    /// The lock of the immutable store this store was opened beside, whose flock this store's
-    /// unflushed changes keep as they keep its own.
-    ///
-    /// A command claims the immutable store before this one. A process keeping this store's
-    /// flock past a command for unflushed changes, without the immutable store's, would claim the
-    /// immutable store after it at its next command: out of order, and deadlocked against a
-    /// process holding the immutable store and waiting for this one.
-    immutable_lock: Option<Arc<StoreLock>>,
     /// The on-disk format version this store was opened at, which a reload needs
     /// in order to rebuild its groups the same way.
     version: MutableStoreVersion,
@@ -1199,8 +1193,12 @@ impl LocalMutableStore {
                     .create_dir_all(path.as_path())
                     .await;
             }
-            let lock = StoreLock::new(path.as_path(), settings.reuse_state_across_holds)
-                .internal("Failed to open the store's lock directory")?;
+            let reuse = settings.reuse_state_across_holds;
+            let lock = match immutable_store.store_lock() {
+                Some(immutable) => StoreLock::new_within(path.as_path(), reuse, &immutable),
+                None => StoreLock::new(path.as_path(), reuse),
+            }
+            .internal("Failed to open the store's lock directory")?;
 
             // Claimed across the probe, the version read, the stamp and the group survey
             // below. All of them are decisions about the store's on-disk state, so another
@@ -1295,9 +1293,6 @@ impl LocalMutableStore {
         // Read under the claim taken for the version probe, whose acquisition already
         // adopted the epoch — so the first operation does not reload what is read here.
         let group = Self::build_groups(mutable_path.as_ref(), &settings, version).await?;
-        let immutable_lock = lock
-            .as_ref()
-            .and_then(|_| LocalImmutableStore::lock_of(&immutable_store));
         if let Some(lock) = lock.as_ref() {
             for group in &group {
                 crate::local::fan_out::anchor_writes(&group.writes, lock);
@@ -1306,7 +1301,6 @@ impl LocalMutableStore {
         let store = LocalMutableStore {
             path: mutable_path,
             lock,
-            immutable_lock,
             group,
             flush_delay_seconds,
             needs_upgrade: AtomicBool::new(needs_upgrade),
@@ -1339,7 +1333,6 @@ impl LocalMutableStore {
         Self {
             path: Some(Arc::new(path)),
             lock: None,
-            immutable_lock: None,
             group: groups,
             flush_delay_seconds: 0,
             needs_upgrade: AtomicBool::new(false),
@@ -1421,11 +1414,8 @@ impl LocalMutableStore {
         let mut guard = lock
             .acquire(intent)
             .await
-            .internal("Failed to acquire mutable store lock")?;
+            .internal("Failed to acquire store lock")?;
         lock.watch(Arc::<Self>::downgrade(self));
-        if let Some(immutable) = self.immutable_lock.as_ref() {
-            immutable.watch(Arc::<Self>::downgrade(self));
-        }
         if guard.is_stale() {
             // Boxed: a reload is rare, and carried inline its state would be part of every
             // operation's future.
@@ -1442,13 +1432,10 @@ impl LocalMutableStore {
         Ok(Some(guard))
     }
 
-    /// Releases the flock, and the immutable store's this store's changes kept, if nothing is
+    /// Releases the flock, and with it the immutable store's its lock is nested in, if nothing is
     /// in flight and nothing is unflushed.
     fn note_flushed(&self) {
-        for lock in [self.lock.as_ref(), self.immutable_lock.as_ref()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(lock) = self.lock.as_ref() {
             lock.release_if_clean();
         }
     }
@@ -1594,8 +1581,8 @@ impl LocalMutableStore {
     /// group's flush lock, so that no write it started lands after the lock is released, and a
     /// share of the group's writes, so that the store stays claimed while it runs: the flush's
     /// claim goes with the flush, and a group flush has no write in flight between its writes.
-    /// Once it ends, it releases this store's flock, then the immutable store's, which this store's
-    /// changes keep as well, each if nothing keeps it, as [`Self::note_flushed`] does, see
+    /// Once it ends, it releases this store's flock, and with it the immutable store's its lock is
+    /// nested in, if nothing keeps it, as [`Self::note_flushed`] does, see
     /// [`crate::local::fan_out::releasing_once_done`].
     async fn flush_all(
         self: Arc<Self>,
@@ -1902,10 +1889,7 @@ impl LocalMutableStore {
             };
             lore_base::lore_spawn!(
                 tasks,
-                crate::local::fan_out::releasing_once_done(
-                    self.immutable_lock.clone(),
-                    crate::local::fan_out::releasing_once_done(self.lock.clone(), work)
-                )
+                crate::local::fan_out::releasing_once_done(self.lock.clone(), work)
             );
         }
 

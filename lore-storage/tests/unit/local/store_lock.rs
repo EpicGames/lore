@@ -1711,3 +1711,186 @@ async fn a_leftover_staging_file_does_not_block_an_advance() {
         "and nothing is left staged"
     );
 }
+
+/// Two store directories, the lock on the second nested in the lock on the first, removed with
+/// the test.
+fn nested(name: &str) -> (TempDir, TempDir, Arc<StoreLock>, Arc<StoreLock>) {
+    let outer_dir = dir(&format!("{name}-outer"));
+    let inner_dir = dir(&format!("{name}-inner"));
+    let outer = store_lock(outer_dir.path());
+    let inner = StoreLock::new_within(inner_dir.path(), true, &outer).expect("opens");
+    (outer_dir, inner_dir, outer, inner)
+}
+
+/// **A nested lock takes its flock inside the flock of the lock it is nested in.** An acquisition
+/// holds the enclosing flock before it waits for its own, and the last guard releases both. A
+/// path that took the nested flock alone would hold it while waiting for the enclosing one,
+/// against a process holding the enclosing one and waiting for it: neither returns.
+#[tokio::test]
+async fn a_nested_lock_takes_its_flock_inside_the_enclosing_one() {
+    let (_outer_dir, inner_dir, outer, inner) = nested("inside");
+    let elsewhere = FSLock::acquire_exact_path(&inner_dir.path().join("lock"))
+        .await
+        .expect("another process takes the nested flock");
+    let acquiring = lore_base::lore_spawn!({
+        let inner = Arc::clone(&inner);
+        async move { inner.acquire(Intent::Read).await }
+    });
+    assert!(
+        eventually(|| outer.is_held()).await,
+        "the acquisition holds the enclosing flock before it waits for its own"
+    );
+    drop(elsewhere);
+
+    let mut guard = tokio::time::timeout(Duration::from_secs(5), acquiring)
+        .await
+        .expect("takes the nested flock once that process lets go")
+        .expect("the acquisition does not panic")
+        .expect("acquires");
+    guard.note_refreshed();
+    assert!(inner.is_held() && outer.is_held());
+    drop(guard);
+    assert!(
+        !inner.is_held() && !outer.is_held(),
+        "the last guard releases both"
+    );
+}
+
+/// **A nested acquisition dropped while it waits for its own flock lets the enclosing one go.**
+#[tokio::test]
+async fn a_nested_acquisition_dropped_while_it_waits_lets_the_enclosing_flock_go() {
+    let (_outer_dir, inner_dir, outer, inner) = nested("dropped");
+    let elsewhere = FSLock::acquire_exact_path(&inner_dir.path().join("lock"))
+        .await
+        .expect("another process takes the nested flock");
+    let acquiring = lore_base::lore_spawn!({
+        let inner = Arc::clone(&inner);
+        async move { inner.acquire(Intent::Read).await.map(drop) }
+    });
+    assert!(eventually(|| outer.is_held()).await);
+    acquiring.abort();
+    assert!(acquiring.await.unwrap_err().is_cancelled());
+    assert!(
+        eventually(|| !outer.is_held()).await,
+        "the hold on the enclosing flock goes with the acquisition"
+    );
+    drop(elsewhere);
+}
+
+/// **Trying a nested lock leaves it for later, holding nothing, where another process holds either
+/// flock**: the enclosing one, or the nested one once the enclosing one has been taken.
+#[tokio::test]
+async fn trying_a_nested_lock_takes_nothing_where_either_flock_is_held_elsewhere() {
+    let (outer_dir, inner_dir, outer, inner) = nested("try");
+    for held in [outer_dir.path(), inner_dir.path()] {
+        let elsewhere = FSLock::acquire_exact_path(&held.join("lock"))
+            .await
+            .expect("another process locks a directory");
+        let refused = tokio::time::timeout(Duration::from_secs(5), inner.try_acquire(Intent::Read))
+            .await
+            .expect("does not wait for a flock")
+            .expect("attempts");
+        assert!(refused.is_none(), "the nested lock is left for later");
+        assert!(!inner.is_held() && !outer.is_held(), "and nothing is taken");
+        drop(elsewhere);
+    }
+}
+
+/// **Files in use that keep a nested flock past its last guard keep the enclosing flock with
+/// it**, and both go once the files do.
+#[tokio::test]
+async fn files_in_use_keep_the_enclosing_flock_with_the_nested_one() {
+    let (_outer_dir, _inner_dir, outer, inner) = nested("files");
+    let mut guard = inner.acquire(Intent::Read).await.expect("acquires");
+    guard.note_refreshed();
+    let files = Arc::new(tokio::sync::RwLock::new(()));
+    let _anchor = inner.anchor(Arc::downgrade(&files) as _);
+    let in_use = Arc::clone(&files).read_owned().await;
+    drop(guard);
+    assert!(
+        inner.is_held() && outer.is_held(),
+        "files in use keep both flocks past the last guard"
+    );
+    drop(in_use);
+    assert!(
+        eventually(|| !inner.is_held() && !outer.is_held()).await,
+        "and both go once the files do"
+    );
+}
+
+/// **A nested epoch advance dropped part way keeps the enclosing flock until it lands**, as it
+/// keeps the nested one.
+#[tokio::test]
+async fn a_nested_epoch_advance_dropped_part_way_keeps_the_enclosing_flock_until_it_lands() {
+    let (outer_dir, _inner_dir, _outer, inner) = nested("epoch-in-flight");
+    let in_flight = lore_storage::test_util::hold_store_write();
+    let landed = lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Advanced);
+    let advancing = {
+        let inner = Arc::clone(&inner);
+        lore_base::lore_spawn!(async move { inner.acquire(Intent::Write).await.map(drop) })
+    };
+    in_flight.issued.notified().await;
+    advancing.abort();
+    assert!(advancing.await.unwrap_err().is_cancelled());
+
+    let path = outer_dir.path().join("lock");
+    assert!(
+        FSLock::try_acquire_exact_path(&path)
+            .await
+            .expect("looks at the flock")
+            .is_none(),
+        "the epoch write in flight keeps the enclosing flock"
+    );
+    in_flight.complete();
+    tokio::time::timeout(Duration::from_secs(5), landed.reached.notified())
+        .await
+        .expect("the advance lands");
+    assert!(
+        FSLock::try_acquire_exact_path(&path)
+            .await
+            .expect("looks at the flock")
+            .is_some(),
+        "until it lands"
+    );
+    landed.resume.notify_one();
+}
+
+/// **The hold a nested lock keeps on the enclosing flock never holds back the enclosing lock's
+/// own acquisitions**, whether the enclosing directory was recreated or not. The hold reloads
+/// nothing, so it keeps no gate for a reload, where a stale guard would keep it for as long as
+/// the nested flock lives.
+#[tokio::test]
+async fn a_nested_hold_never_holds_back_the_enclosing_lock() {
+    let (outer_dir, _inner_dir, outer, inner) = nested("holds-no-state");
+    for recreated in [false, true] {
+        if recreated {
+            std::fs::remove_dir_all(outer_dir.path()).expect("removes the enclosing directory");
+        }
+        let mut guard = inner.acquire(Intent::Read).await.expect("acquires");
+        guard.note_refreshed();
+        let mut joined = tokio::time::timeout(Duration::from_secs(5), outer.acquire(Intent::Read))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("recreated {recreated}: the enclosing lock is acquired under the hold")
+            })
+            .expect("acquires");
+        joined.note_refreshed();
+        drop((joined, guard));
+        assert!(
+            !inner.is_held() && !outer.is_held(),
+            "recreated {recreated}: and both flocks go"
+        );
+    }
+}
+
+/// **A nested write advances its own epoch and not the enclosing one's**: the hold on the
+/// enclosing flock reads, so a store on the enclosing directory keeps its state.
+#[tokio::test]
+async fn a_nested_write_advances_only_its_own_epoch() {
+    let (outer_dir, inner_dir, _outer, inner) = nested("write");
+    let mut guard = inner.acquire(Intent::Write).await.expect("acquires");
+    guard.note_refreshed();
+    drop(guard);
+    assert_eq!(epoch_count(inner_dir.path()).await, Some(1));
+    assert_eq!(epoch_count(outer_dir.path()).await, None);
+}

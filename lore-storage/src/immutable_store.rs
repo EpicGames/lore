@@ -515,6 +515,14 @@ pub trait ImmutableStore: Any + Send + Sync {
         None
     }
 
+    /// The lock of the store directory this store keeps its files in, which a store opened beside
+    /// it nests its own lock in, see [`crate::local::store_lock::StoreLock::new_within`]: `None`
+    /// for a store with nothing on disk. A wrapper delegates it as it delegates
+    /// [`Self::hold_for_command`].
+    fn store_lock(&self) -> Option<Arc<crate::local::store_lock::StoreLock>> {
+        None
+    }
+
     /// Claims this store for work spawned to outlive the operation that started it, where the
     /// operation could not join its claim: as [`Self::hold_for_command`], but the guard keeps the
     /// flock for that work and covers no operation, see [`claim_for_task`]. The default is

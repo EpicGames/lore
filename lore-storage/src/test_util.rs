@@ -559,6 +559,10 @@ impl crate::immutable_store::ImmutableStore for HoldingStore {
         self.inner.clone().hold_for_command().await
     }
 
+    fn store_lock(&self) -> Option<Arc<crate::local::store_lock::StoreLock>> {
+        self.inner.store_lock()
+    }
+
     /// Joins the task claim of the store this one wraps.
     async fn hold_for_task(
         self: Arc<Self>,

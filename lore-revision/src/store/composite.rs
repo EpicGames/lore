@@ -1092,6 +1092,10 @@ impl ImmutableStore for CompositeStore {
         self.local.target.try_join_claim()
     }
 
+    fn store_lock(&self) -> Option<Arc<lore_storage::local::store_lock::StoreLock>> {
+        self.local.target.store_lock()
+    }
+
     async fn hold_for_task(
         self: Arc<Self>,
     ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, lore_storage::StoreError> {

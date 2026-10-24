@@ -189,13 +189,7 @@ fn across_processes(test: &str, script: impl FnOnce(&mut Client, &mut Client, &m
 
     let sandbox = TempDir::new("lore-store-retention-processes-");
     let stores = sandbox.path().join("stores");
-    // The harness knows a test by its path within the crate.
-    let test = format!(
-        "{}::{test}",
-        module_path!()
-            .split_once("::")
-            .map_or("", |(_, module)| module)
-    );
+    let test = super::harness_name(module_path!(), test);
     let [mut a, mut b, mut c] = [("A", true), ("B", true), ("C", false)]
         .map(|(name, keeps)| Client::spawn(&test, name, keeps, &stores, sandbox.path()));
     for client in [&mut a, &mut b, &mut c] {

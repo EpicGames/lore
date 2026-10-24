@@ -2366,18 +2366,6 @@ impl LocalImmutableStore {
         Ok((store, opening.map(StoreGuard::into_span)))
     }
 
-    /// The lock of `store`, where it is a local store over a directory: `None` for one in memory
-    /// or of another kind.
-    pub(crate) fn lock_of(
-        store: &Arc<dyn crate::immutable_store::ImmutableStore>,
-    ) -> Option<Arc<StoreLock>> {
-        (Arc::clone(store) as Arc<dyn std::any::Any + Send + Sync>)
-            .downcast::<Self>()
-            .ok()?
-            .lock
-            .clone()
-    }
-
     pub fn packstore(&self, group_index: usize) -> &crate::PackStore {
         &self.group[group_index].packstore
     }
@@ -5205,6 +5193,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 
     fn try_join_claim(&self) -> Option<StoreGuard> {
         self.lock.as_ref()?.try_join(Intent::Read)
+    }
+
+    fn store_lock(&self) -> Option<Arc<StoreLock>> {
+        self.lock.clone()
     }
 
     async fn hold_for_task(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
