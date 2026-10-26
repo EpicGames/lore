@@ -7,6 +7,7 @@ pub mod device;
 pub mod discovery;
 pub mod exchange;
 pub mod refresh;
+pub mod revocation;
 pub mod token;
 
 use std::future::Future;
@@ -241,7 +242,8 @@ pub fn issuer(endpoint: &str) -> &str {
 /// external credential the token exchange (RFC 8693), a login as a registered confidential
 /// client the client credentials grant (RFC 6749 §4.4), a new access token for a login the
 /// refresh token grant (RFC 6749 §6), and authorization for a partition the token exchange
-/// when the server advertises a template.
+/// when the server advertises a template. A logout revokes the refresh token (RFC 7009) where
+/// the provider advertises a revocation endpoint.
 pub struct OidcAuthentication {
     oidc: Oidc,
 }
@@ -359,6 +361,16 @@ impl Authentication for OidcAuthentication {
             ProtocolError::from(Disconnected)
         })?;
         refresh::refresh(&self.oidc, &document, refresh_token).await
+    }
+
+    async fn revoke_refresh_token(
+        &self,
+        auth_url: &str,
+        refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        let document = self.discover(auth_url).await?;
+        revocation::revoke(&self.oidc, &document, refresh_token).await
     }
 
     async fn exchange_for_repository(

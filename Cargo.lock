@@ -2396,6 +2396,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 name = "lore"
 version = "0.11.1-nightly"
 dependencies = [
+ "async-trait",
  "bitcode",
  "bytes",
  "chrono",

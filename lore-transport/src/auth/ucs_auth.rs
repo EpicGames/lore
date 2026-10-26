@@ -240,6 +240,17 @@ impl Authentication for UcsAuthentication {
         }))
     }
 
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::from(NotSupported {
+            operation: "token revocation at the gRPC auth service".to_string(),
+        }))
+    }
+
     async fn exchange_for_repository(
         &self,
         auth_url: &str,

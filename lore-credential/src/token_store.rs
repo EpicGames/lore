@@ -729,7 +729,13 @@ fn is_entry_for_auth_url(remote: &str, auth_url: &str) -> bool {
     false
 }
 
-/// Remove a user's tokens from the given auth URL and all its resource-scoped entries.
+pub struct RemovedRefreshToken {
+    pub user_id: String,
+    pub refresh_token: String,
+}
+
+/// Remove a user's tokens from the given auth URL and all its resource-scoped entries, and
+/// return the refresh token removed from the base entry.
 ///
 /// Removes the identity from both the base `auth_url` entry (authentication token)
 /// and all resource-scoped entries (authorization tokens), matching both new
@@ -737,7 +743,7 @@ fn is_entry_for_auth_url(remote: &str, auth_url: &str) -> bool {
 pub async fn remove_user_tokens_for_auth_url(
     auth_url: &str,
     identity: &str,
-) -> Result<(), TokenStoreError> {
+) -> Result<Vec<RemovedRefreshToken>, TokenStoreError> {
     let auth_url = auth_url.trim_end_matches('/');
 
     let mut store = cached_token_map().await;
@@ -745,6 +751,7 @@ pub async fn remove_user_tokens_for_auth_url(
     reload_token_map(&guard, &mut store);
 
     let mut modified = false;
+    let mut removed = Vec::new();
 
     if let Some(map) = store.as_mut() {
         let mut indices_to_process: Vec<usize> = map
@@ -760,6 +767,15 @@ pub async fn remove_user_tokens_for_auth_url(
 
         for idx in indices_to_process {
             let before_len = map.remotes[idx].token.len();
+            if map.remotes[idx].remote == auth_url {
+                removed.extend(
+                    map.remotes[idx]
+                        .token
+                        .iter()
+                        .filter(|t| t.user_id == identity)
+                        .cloned(),
+                );
+            }
             map.remotes[idx].token.retain(|t| t.user_id != identity);
 
             if map.remotes[idx].token.len() < before_len {
@@ -783,15 +799,20 @@ pub async fn remove_user_tokens_for_auth_url(
     if modified && let Some(store) = store.as_ref() {
         store_token_map(&guard, store)?;
     }
+    drop(guard);
+    drop(store);
 
-    Ok(())
+    Ok(open_removed_refresh_tokens(removed).await)
 }
 
-/// Remove all tokens for the given auth URL and all its resource-scoped entries.
+/// Remove all tokens for the given auth URL and all its resource-scoped entries, and return
+/// the refresh tokens removed from the base entry.
 ///
 /// Removes all identities from both the base `auth_url` entry and all
 /// resource-scoped entries (both new and legacy key formats).
-pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenStoreError> {
+pub async fn remove_all_tokens_for_auth_url(
+    auth_url: &str,
+) -> Result<Vec<RemovedRefreshToken>, TokenStoreError> {
     let auth_url = auth_url.trim_end_matches('/');
 
     let mut store = cached_token_map().await;
@@ -799,9 +820,14 @@ pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenS
     reload_token_map(&guard, &mut store);
 
     let mut modified = false;
+    let mut removed = Vec::new();
 
     if let Some(map) = store.as_mut() {
         let before_len = map.remotes.len();
+
+        if let Some(entry) = map.remotes.iter().find(|entry| entry.remote == auth_url) {
+            removed.extend(entry.token.iter().cloned());
+        }
 
         map.remotes
             .retain(|entry| !is_entry_for_auth_url(&entry.remote, auth_url));
@@ -815,8 +841,39 @@ pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenS
     if modified && let Some(store) = store.as_ref() {
         store_token_map(&guard, store)?;
     }
+    drop(guard);
+    drop(store);
 
-    Ok(())
+    Ok(open_removed_refresh_tokens(removed).await)
+}
+
+/// The refresh tokens of the entries in `removed`, opened. One that does not open is left out,
+/// as there is nothing to do with it. The caller holds no lock on the store: reading the
+/// encryption key may reset the store.
+async fn open_removed_refresh_tokens(removed: Vec<IdentityToken>) -> Vec<RemovedRefreshToken> {
+    let sealed: Vec<_> = removed
+        .into_iter()
+        .filter_map(|entry| Some((entry.user_id, entry.refresh_token?)))
+        .collect();
+    if sealed.is_empty() {
+        return Vec::new();
+    }
+    let key = match get_token_encryption_key().await {
+        Ok(key) => key,
+        Err(err) => {
+            lore_warn!("Failed to read the token encryption key: {err}");
+            return Vec::new();
+        }
+    };
+    sealed
+        .into_iter()
+        .filter_map(|(user_id, sealed)| {
+            Some(RemovedRefreshToken {
+                user_id,
+                refresh_token: open_token(&key, &sealed).ok()?,
+            })
+        })
+        .collect()
 }
 
 /// Remove every token `identity` holds for `endpoint`.

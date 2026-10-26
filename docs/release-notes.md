@@ -18,6 +18,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   §6) on the next operation, without a new `lore auth login`. The provider's rotated refresh token replaces the used
   one, and a refresh token the provider refuses is dropped, so the next operation asks for a new login. A client
   credentials login stores no refresh token
+- `lore auth logout` (C API: `lore_auth_logout`) revokes an OIDC login's refresh token at the provider (OAuth 2.0
+  token revocation, RFC 7009) if the provider advertises a revocation endpoint. A failed revocation, such as at an
+  unreachable provider, now fails the logout, after the login is removed from this machine
 
 ### Fixes & Improvements
 

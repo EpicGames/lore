@@ -18,6 +18,7 @@ same login against a real provider is the fixture repository's job.
 
 import logging
 import os
+import socket
 import stat
 import sys
 import time
@@ -646,3 +647,120 @@ def test_a_dry_run_logout_removes_no_token(oidc_env, make_repo, command):
 
     repo.run(urc_args=args)
     assert KEY_USER.user_id not in repo.run(urc_args=["auth", "list"])
+
+
+def logged_in_repo(oidc_env, make_repo) -> Lore:
+    """A repository on the remote, after a device-grant login that brought a
+    refresh token."""
+    repo = make_repo()
+    repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+    repo.repository_create()
+    return repo
+
+
+@pytest.mark.smoke
+def test_logout_revokes_the_refresh_token(oidc_env, make_repo):
+    """`auth logout` revokes the login's refresh token at the revocation
+    endpoint the provider advertises (RFC 7009), as the public client, and
+    removes the login."""
+    provider = oidc_env.provider
+    provider.revocation_endpoint = f"{provider.issuer}/revoke"
+    repo = logged_in_repo(oidc_env, make_repo)
+    [refresh_token] = provider.valid_refresh_tokens()
+
+    assert "Logged out" in repo.run(urc_args=["auth", "logout"])
+
+    assert [r.form for r in provider.requests_to("/revoke")] == [
+        {
+            "token": refresh_token,
+            "token_type_hint": "refresh_token",
+            "client_id": provider.client_id,
+        }
+    ]
+    assert provider.valid_refresh_tokens() == []
+    assert provider.user.user_id not in repo.run(urc_args=["auth", "list"])
+
+
+@pytest.mark.smoke
+def test_logout_without_a_revocation_endpoint_is_local(oidc_env, make_repo):
+    """A provider advertising no revocation endpoint is asked nothing: the
+    logout only removes the login, as before."""
+    provider = oidc_env.provider
+    repo = logged_in_repo(oidc_env, make_repo)
+    provider.reset_requests()
+
+    output = repo.run(urc_args=["auth", "logout"])
+
+    assert "Logged out" in output
+    assert "revoke" not in output.lower()
+    assert [r.path for r in provider.requests if r.method == "POST"] == []
+    assert len(provider.valid_refresh_tokens()) == 1
+    assert provider.user.user_id not in repo.run(urc_args=["auth", "list"])
+
+
+@pytest.mark.smoke
+def test_a_login_without_a_refresh_token_is_not_revoked(oidc_env, make_repo):
+    """A client credentials login stores no refresh token, so its logout asks
+    the provider nothing: the access token belongs to the confidential client,
+    which only that client could revoke."""
+    provider = oidc_env.provider
+    provider.revocation_endpoint = f"{provider.issuer}/revoke"
+    provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    repo = make_repo(LORE_CLIENT_SECRET=CLIENT_SECRET)
+    login_as_client(repo, oidc_env.remote_url)
+    repo.repository_create()
+
+    output = repo.run(urc_args=["auth", "logout"])
+
+    assert "Logged out" in output
+    assert "[Warn]" not in output, output
+    assert provider.requests_to("/revoke") == []
+    assert SERVICE_ACCOUNT.user_id not in repo.run(urc_args=["auth", "list"])
+
+
+@pytest.mark.smoke
+def test_removing_one_authorization_revokes_nothing(oidc_env, make_repo):
+    """`auth logout --resource` removes one authorization token and keeps the
+    login, so its refresh token is not revoked."""
+    provider = oidc_env.provider
+    provider.revocation_endpoint = f"{provider.issuer}/revoke"
+    repo = logged_in_repo(oidc_env, make_repo)
+
+    repo.run(
+        urc_args=[
+            "auth",
+            "logout",
+            "--user-id",
+            provider.user.user_id,
+            "--resource",
+            "00112233445566778899aabbccddeeff",
+        ]
+    )
+
+    assert provider.requests_to("/revoke") == []
+    assert len(provider.valid_refresh_tokens()) == 1
+    assert provider.user.user_id in repo.run(urc_args=["auth", "list"])
+
+
+def closed_port() -> int:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+@pytest.mark.smoke
+def test_logout_at_an_unreachable_provider_still_removes_the_login(oidc_env, make_repo):
+    """A revocation endpoint that cannot be reached fails the logout, which
+    says so, and the login is removed all the same."""
+    provider = oidc_env.provider
+    provider.revocation_endpoint = f"http://127.0.0.1:{closed_port()}/revoke"
+    repo = logged_in_repo(oidc_env, make_repo)
+
+    with pytest.raises(LoreException) as failed:
+        repo.run(urc_args=["auth", "logout"])
+
+    message = str(failed.value)
+    assert "removed from this machine, but was not revoked" in message, message
+    assert "Logged out" not in message
+    assert len(provider.valid_refresh_tokens()) == 1
+    assert provider.user.user_id not in repo.run(urc_args=["auth", "list"])

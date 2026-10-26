@@ -31,6 +31,12 @@ as UCS Auth does. `token_lifetime` sets the lifetime of the access tokens the
 two grants and the partition exchange mint, negative for one that has expired
 already.
 
+With `revocation_endpoint` set, the discovery document advertises it. The
+stub serves revocation (RFC 7009) at `/revoke`: a refresh token revoked there
+revokes every refresh token of its login. Pointing `revocation_endpoint`
+elsewhere, such as at a closed port, makes the provider unreachable for
+revocation alone.
+
 The token endpoint answers from a script the test sets: a list of RFC 8628
 §3.5 error codes answered in order, then the token. An empty script hands out
 the token on the first poll.
@@ -123,6 +129,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(*provider.device_authorization(form))
         elif self.path == "/token":
             self._json(*provider.token(form, self.headers.get("Authorization")))
+        elif self.path == "/revoke":
+            status, payload = provider.revoke(form)
+            if payload is None:
+                self._respond(status, b"")
+            else:
+                self._json(status, payload)
         else:
             self._respond(404, b"not found")
 
@@ -215,6 +227,8 @@ class MockOidcProvider:
         # Whether the refresh grant consumes the token and then answers HTTP 500, as a
         # provider whose answer is lost on the way back.
         self.lose_refresh_answers = False
+        # The advertised `revocation_endpoint`; `None` leaves it out.
+        self.revocation_endpoint: str | None = None
         self._logins = 0
         self._minted: set[str] = set()
         self._server: _Server | None = None
@@ -252,6 +266,7 @@ class MockOidcProvider:
             self._device_scope = ""
             self.refresh_tokens.clear()
             self.lose_refresh_answers = False
+            self.revocation_endpoint = None
 
     def reset_requests(self) -> None:
         with self._lock:
@@ -305,6 +320,8 @@ class MockOidcProvider:
             document["token_endpoint_auth_methods_supported"] = (
                 self.token_endpoint_auth_methods
             )
+        if self.revocation_endpoint is not None:
+            document["revocation_endpoint"] = self.revocation_endpoint
         return document
 
     def device_authorization(self, form: dict[str, str]) -> tuple[int, dict]:
@@ -381,6 +398,21 @@ class MockOidcProvider:
             "expires_in": max(self.token_lifetime, 0),
             "refresh_token": refresh_token,
         }
+
+    def revoke(self, form: dict[str, str]) -> tuple[int, dict | None]:
+        """RFC 7009 §2.2: a token this stub does not know is answered as one
+        revoked, with HTTP 200 and no body."""
+        if form.get("client_id") != self.client_id:
+            return 401, {"error": "invalid_client"}
+        token = form.get("token", "")
+        with self._lock:
+            revoked = self.refresh_tokens.get(token)
+            if revoked is not None:
+                login, _ = revoked
+                for other, (other_login, _) in self.refresh_tokens.items():
+                    if other_login == login:
+                        self.refresh_tokens[other] = (login, False)
+        return 200, None
 
     def _issue_refresh_token(self, login: int) -> str:
         """A new refresh token for `login`. The caller holds the lock."""

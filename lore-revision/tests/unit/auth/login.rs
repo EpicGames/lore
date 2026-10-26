@@ -154,6 +154,15 @@ impl Authentication for ScriptedAuth {
         Err(ProtocolError::internal("the stub only serves polls"))
     }
 
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::internal("the stub only serves polls"))
+    }
+
     async fn exchange_for_repository(
         &self,
         _auth_url: &str,

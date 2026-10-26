@@ -172,6 +172,17 @@ impl Authentication for StubAuthentication {
         }
     }
 
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::internal(
+            "the stub only serves authorization exchanges",
+        ))
+    }
+
     async fn exchange_for_custom_resource(
         &self,
         auth_url: &str,

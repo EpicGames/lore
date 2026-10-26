@@ -47,6 +47,7 @@ swfs = ["lore-revision/swfs"]
 test-util = []
 
 [dev-dependencies]
+async-trait = { workspace = true }
 # The unit-test binary's process sandbox, set up before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }

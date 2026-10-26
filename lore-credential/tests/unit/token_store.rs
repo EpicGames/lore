@@ -5,11 +5,14 @@ use base64::prelude::Engine as _;
 use lore_credential::IdentityToken;
 use lore_credential::token_store::Refreshed;
 use lore_credential::token_store::RemoteIdentity;
+use lore_credential::token_store::RemovedRefreshToken;
 use lore_credential::token_store::TokenMap;
 use lore_credential::token_store::load_user_token;
 use lore_credential::token_store::load_user_token_from_store;
 use lore_credential::token_store::refresh_user_token;
+use lore_credential::token_store::remove_all_tokens_for_auth_url;
 use lore_credential::token_store::remove_user_token_if;
+use lore_credential::token_store::remove_user_tokens_for_auth_url;
 use lore_credential::token_store::store_user_token;
 use lore_credential::token_store::store_user_token_and_refresh_token;
 use lore_credential::token_store::test_util::encryption_key_from_stored;
@@ -684,4 +687,69 @@ async fn storing_a_refresh_token_replaces_it_and_storing_a_token_alone_keeps_it(
 
     logged_in(ENDPOINT, &jwt("alice", VALID, 3), None, None).await;
     assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+}
+
+fn removed_refresh_tokens(removed: Vec<RemovedRefreshToken>) -> Vec<(String, String)> {
+    let mut removed: Vec<_> = removed
+        .into_iter()
+        .map(|removed| (removed.user_id, removed.refresh_token))
+        .collect();
+    removed.sort();
+    removed
+}
+
+/// Removing a user's tokens returns their refresh token, for the caller to revoke. Their
+/// authorization tokens are removed but not returned, and other users' tokens are kept.
+#[tokio::test]
+async fn removing_a_users_tokens_returns_their_refresh_token() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://remove-user.test.invalid";
+    let resource = format!("{ENDPOINT}/00112233445566778899aabbccddeeff");
+    logged_in(ENDPOINT, "alice-token", Some("refresh-1"), None).await;
+    store_user_token(&resource, "alice", "alice-partition-token", Vec::new())
+        .await
+        .expect("store the authorization token");
+    store_user_token(ENDPOINT, "bob", "bob-token", Vec::new())
+        .await
+        .expect("store bob's token");
+
+    let removed = remove_user_tokens_for_auth_url(ENDPOINT, "alice")
+        .await
+        .expect("remove alice's tokens");
+
+    assert_eq!(
+        removed_refresh_tokens(removed),
+        [("alice".to_owned(), "refresh-1".to_owned())]
+    );
+    let partition = load_user_token_from_store(&resource, "alice", vulnerable_all_tokens()).await;
+    assert!(partition.is_err(), "the authorization token was kept");
+    let bob = load_user_token_from_store(ENDPOINT, "bob", vulnerable_all_tokens()).await;
+    assert_eq!(bob.ok().as_deref(), Some("bob-token"));
+}
+
+/// Removing every token for an endpoint returns every refresh token there. A login without one
+/// is removed and returns nothing, and so does a second removal.
+#[tokio::test]
+async fn removing_all_tokens_returns_every_refresh_token() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://remove-all.test.invalid";
+    logged_in(ENDPOINT, "alice-token", Some("refresh-1"), None).await;
+    store_user_token(ENDPOINT, "bob", "bob-token", Vec::new())
+        .await
+        .expect("store bob's token");
+
+    let removed = remove_all_tokens_for_auth_url(ENDPOINT)
+        .await
+        .expect("remove every token");
+
+    assert_eq!(
+        removed_refresh_tokens(removed),
+        [("alice".to_owned(), "refresh-1".to_owned())]
+    );
+    let bob = load_user_token_from_store(ENDPOINT, "bob", vulnerable_all_tokens()).await;
+    assert!(bob.is_err(), "bob's token was kept");
+    let again = remove_all_tokens_for_auth_url(ENDPOINT)
+        .await
+        .expect("remove every token again");
+    assert!(again.is_empty());
 }

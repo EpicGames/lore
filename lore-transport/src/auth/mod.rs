@@ -146,6 +146,15 @@ impl Authentication for NoAuthentication {
         Err(Self::refused())
     }
 
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        Err(Self::refused())
+    }
+
     async fn exchange_for_repository(
         &self,
         _auth_url: &str,

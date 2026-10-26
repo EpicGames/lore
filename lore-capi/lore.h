@@ -6449,6 +6449,10 @@ void lore_auth_list_async(const struct lore_global_args_t *globals,
 
 // Remove stored authentication and authorization tokens.
 //
+// Each login removed with its refresh token is then revoked if the auth service offers
+// revocation. A failed revocation fails the call after the tokens are removed, so a non-zero
+// return value or `LORE_EVENT_COMPLETE` status does not mean the tokens are still stored.
+//
 // # Events
 //
 // Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.

@@ -447,6 +447,17 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
 
+    /// Revokes the refresh token of a login at the auth backend.
+    ///
+    /// Fails with [`NotSupported`](lore_base::error::NotSupported) when the backend offers no
+    /// revocation.
+    async fn revoke_refresh_token(
+        &self,
+        auth_url: &str,
+        refresh_token: &str,
+        correlation_id: &str,
+    ) -> Result<(), ProtocolError>;
+
     /// Exchanges an authentication token for an authorization token scoped
     /// to the given repository.
     async fn exchange_for_repository(

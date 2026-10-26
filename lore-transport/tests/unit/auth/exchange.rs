@@ -608,6 +608,15 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
         ) -> Result<AuthenticationToken, ProtocolError> {
             Err(unused())
         }
+
+        async fn revoke_refresh_token(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(unused())
+        }
     }
 
     async fn assert_refused_as(
