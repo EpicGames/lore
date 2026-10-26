@@ -535,11 +535,16 @@ impl DynamoDbImpl {
     #[tracing::instrument(name = "DynamoDbImpl::transact_write_items", skip_all)]
     pub async fn transact_write_items(
         &self,
+        table_name: &Arc<str>,
         items: Vec<TransactWriteItem>,
     ) -> Result<Vec<TransactWriteItemsOutput>, AwsError<SdkError<TransactWriteItemsError>>> {
-        let base_labels = self
-            .instruments
-            .get_labels_for_operation_context("transact_write_items");
+        let base_labels = {
+            let mut labels = self
+                .instruments
+                .get_labels_for_operation_context("transact_write_items");
+            labels.push(KeyValue::new(METRICS_TABLE_NAME_KEY, table_name.clone()));
+            labels
+        };
 
         self.instruments
             .batch_size_histogram
@@ -867,6 +872,7 @@ mock! {
         #[tracing::instrument(name = "DynamoDbImpl::transact_write_items", skip_all)]
         pub async fn transact_write_items(
             &self,
+            table_name: &Arc<str>,
             items: Vec<TransactWriteItem>,
         ) -> Result<TransactWriteItemsOutput, AwsError<SdkError<TransactWriteItemsError>>>;
 

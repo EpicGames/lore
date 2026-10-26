@@ -403,7 +403,9 @@ mod dynamo_tests {
             items.push(TransactWriteItem::builder().put(put_item).build());
         }
 
-        dynamo.transact_write_items(items).await?;
+        dynamo
+            .transact_write_items(&Arc::from(LOCKS_TABLE_NAME), items)
+            .await?;
 
         // Try and fetch all of the items back to ensure they were written
         let keys: Vec<HashMap<String, AttributeValue>> = hashes
