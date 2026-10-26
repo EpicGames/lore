@@ -1540,7 +1540,7 @@ async fn create_shared_untracked_ancestors(
         &ancestors,
         |ancestor, nodes| {
             let (start, below) = match fan_out::longest_ancestor(ancestor, nodes) {
-                Some((prefix, node)) => (node, &ancestor[prefix.len() + 1..]),
+                Some((prefix, node)) => (*node, &ancestor[prefix.len() + 1..]),
                 None => (ROOT_NODE, ancestor),
             };
             state::os_diff::ensure_scan_dir_chain(

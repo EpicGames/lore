@@ -1091,21 +1091,6 @@ mod tests {
 
                 // Keep puts the file system back to what the tree holds, for the
                 // directory and for everything that was under it.
-                for entry in std::fs::read_dir(path.as_path()).expect("read root") {
-                    let entry = entry.expect("entry");
-                    println!(
-                        "ROOT: {:?} dir={}",
-                        entry.file_name(),
-                        entry.path().is_dir()
-                    );
-                    if entry.path().is_dir()
-                        && entry.file_name().to_string_lossy().to_lowercase() == "assets"
-                    {
-                        for sub in std::fs::read_dir(entry.path()).expect("read sub") {
-                            println!("   SUB: {:?}", sub.expect("sub").file_name());
-                        }
-                    }
-                }
                 assert_eq!(
                     vec!["Assets".to_string()],
                     names_folding_to(path.as_path(), "assets")
@@ -1152,6 +1137,118 @@ mod tests {
                     child = block.node(index).sibling();
                 }
                 assert_eq!(children, vec!["Assets".to_string()]);
+                for name in ["first.file", "second.file"] {
+                    let node_link = state
+                        .find_node_link(repository.clone(), &format!("Assets/{name}"))
+                        .await
+                        .expect("Failed to find the node");
+                    let node = state
+                        .node(repository.clone(), node_link.node)
+                        .await
+                        .expect("Failed to load the node");
+                    assert!(node.is_staged_add(), "{name} must stay staged as an add");
+                    assert_eq!(
+                        state
+                            .node_path(repository.clone(), node_link.node)
+                            .await
+                            .expect("Failed to read the node path"),
+                        format!("Assets/{name}")
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Whether the file system under `dir` holds one case variation of a name and answers
+    /// lookups in any other. A mount can be either on any platform, so a test that needs two
+    /// spellings to be two paths asks rather than assumes.
+    fn case_insensitive(dir: &std::path::Path) -> bool {
+        let probe = dir.join("CaseProbe");
+        std::fs::write(&probe, b"").expect("write probe");
+        let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
+        std::fs::remove_file(&probe).expect("remove probe");
+        insensitive
+    }
+
+    /// Committed files under a directory the file system now spells in another case, staged
+    /// together under `Keep`: the shared directory is renamed back to the tree's case while it is
+    /// pre-created, so the walk of each file has to start from that name and not from the one it
+    /// was given. Only a case-sensitive file system can tell the two apart.
+    #[tokio::test]
+    #[allow(clippy::large_futures)]
+    async fn stage_keep_case_of_a_committed_directory_two_targets_share() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                if case_insensitive(&fixture.path) {
+                    return;
+                }
+                let committed = fixture.path.join("Game").join("Fyre");
+                std::fs::create_dir_all(&committed).expect("Create directory failed");
+                for name in ["a.txt", "b.txt", "c.txt"] {
+                    test_file_write(&committed.join(name), name.as_bytes());
+                }
+                test_commit_tree(&fixture, "Initial").await;
+
+                let lowered = fixture.path.join("Game").join("fyre");
+                std::fs::rename(&committed, &lowered).expect("rename to lowercase");
+                test_file_write(&lowered.join("a.txt"), b"a changed");
+                test_file_write(&lowered.join("b.txt"), b"b changed");
+
+                let signature = file::stage::stage(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![
+                        LoreString::from(&lowered.join("a.txt")),
+                        LoreString::from(&lowered.join("b.txt")),
+                    ]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Keep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Failed to stage the case variation");
+
+                assert_eq!(
+                    vec!["Fyre".to_string()],
+                    names_folding_to(&fixture.path.join("Game"), "fyre"),
+                    "Keep puts the directory back in the tree's case"
+                );
+
+                let repository = fixture.repository.clone();
+                let state = state::State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize the staged state");
+                for (name, staged) in [("a.txt", true), ("b.txt", true), ("c.txt", false)] {
+                    let node_link = state
+                        .find_node_link(repository.clone(), &format!("Game/Fyre/{name}"))
+                        .await
+                        .expect("Failed to find the node");
+                    let node = state
+                        .node(repository.clone(), node_link.node)
+                        .await
+                        .expect("Failed to load the node");
+                    assert_eq!(
+                        (node.is_staged_modify(), node.is_staged_delete()),
+                        (staged, false),
+                        "{name} must be staged modified only where it was given"
+                    );
+                    assert_eq!(
+                        state
+                            .node_path(repository.clone(), node_link.node)
+                            .await
+                            .expect("Failed to read the node path"),
+                        format!("Game/Fyre/{name}")
+                    );
+                }
             }))
             .await
             .expect("Test task failed");

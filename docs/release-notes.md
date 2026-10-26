@@ -67,6 +67,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   (RUSTSEC-2026-0285). A forged ServerHello no longer makes later connections to the same server offer only a classical
   key share, which a server could accept without post-quantum key exchange (RUSTSEC-2026-0349). Debug output of a
   client session leaves out its secrets (RUSTSEC-2026-0346)
+- `lore stage --case keep` of several paths under a directory spelled in another case than the repository's stages them
+  as modified under the repository's case, where on a case-sensitive file system it staged them as deleted
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

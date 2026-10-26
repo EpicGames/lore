@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::task::JoinSet;
@@ -63,11 +62,19 @@ struct TreeWalkPath {
     prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
 }
 
+/// A shared ancestor once created: its node, and the path it was found at, which the walks below
+/// it start from rather than the spelling they were given.
+#[lore_macro::test_pub]
+struct CreatedAncestor {
+    node: crate::node::NodeID,
+    path: RelativePath,
+}
+
 /// Where the walk for a target starts. Neither answer is a failure: a target with no created
 /// ancestor is walked whole from the repository root.
 #[lore_macro::test_pub]
 enum WalkStart {
-    /// The deepest ancestor that already has a node, spelled as the case resolved it, and what is
+    /// The deepest ancestor that already has a node, at the path it was created at, and what is
     /// left of the target below it.
     BelowAncestor {
         path: RelativePath,
@@ -90,29 +97,13 @@ enum WalkStart {
 #[lore_macro::test_pub]
 fn walk_start(
     mut target: RelativePath,
-    ancestor_nodes: &AncestorNodes<'_>,
-    prefixes: Option<&Arc<crate::util::fs::ResolvedPrefixes>>,
+    ancestor_nodes: &AncestorNodes<'_, CreatedAncestor>,
 ) -> WalkStart {
-    let (path, node, prefix_depth) = {
-        let Some((prefix, node)) = longest_ancestor(target.as_str(), ancestor_nodes) else {
-            return WalkStart::FromRoot(target);
-        };
-        let prefix_depth = path_depth(prefix);
-        // The case the prefix resolved to, and only when it resolved as a whole:
-        // a shorter match answers for a shorter path and would drop components.
-        let variation = prefixes
-            .and_then(|resolved| resolved.longest_prefix_of(prefix))
-            .filter(|(depth, _)| *depth == prefix_depth)
-            .map_or(prefix, |(_, variation)| variation);
-        // Already clean: a map value built from cleaned parts, so it needs no
-        // validating or rewriting.
-        (
-            RelativePath::new_from_clean_parts(variation, ""),
-            node,
-            prefix_depth,
-        )
+    let Some((prefix, created)) = longest_ancestor(target.as_str(), ancestor_nodes) else {
+        return WalkStart::FromRoot(target);
     };
-    target.pop_root_repeat(prefix_depth);
+    let (path, node) = (created.path.clone(), created.node);
+    target.pop_root_repeat(path_depth(prefix));
     WalkStart::BelowAncestor {
         path,
         node,
@@ -210,8 +201,12 @@ impl StageWalk {
 
     /// Where a walk of `target` starts, and what it covers below that point, mapped into the
     /// trees this walk writes.
-    fn walk(&self, target: RelativePath, ancestors: &AncestorNodes<'_>) -> TreeWalkPath {
-        match walk_start(target, ancestors, self.prefixes.as_ref()) {
+    fn walk(
+        &self,
+        target: RelativePath,
+        ancestors: &AncestorNodes<'_, CreatedAncestor>,
+    ) -> TreeWalkPath {
+        match walk_start(target, ancestors) {
             WalkStart::BelowAncestor {
                 path,
                 node,
@@ -264,14 +259,17 @@ async fn precreate_shared_ancestors<'a>(
     walk: &StageWalk,
     shared_ancestors: &'a [DepthPath],
     discards: &Arc<stage::DiscardQueue>,
-) -> Result<AncestorNodes<'a>, StageError> {
+) -> Result<AncestorNodes<'a, CreatedAncestor>, StageError> {
     let mut options = walk.options;
     options.no_children = true;
     fan_out::create_shared_ancestors(
         shared_ancestors,
         |ancestor, nodes| {
-            let walk_path = walk.walk(RelativePath::new_from_clean_parts(ancestor, ""), nodes);
-            stage::stage_filesystem_path(
+            let given = RelativePath::new_from_clean_parts(ancestor, "");
+            let resolved = resolved_or_given(&given, walk.prefixes.as_deref());
+            let walk_path = walk.walk(given, nodes);
+            let start = walk_path.at.clone();
+            let staged = stage::stage_filesystem_path(
                 walk.operation.clone(),
                 walk_path.at,
                 walk_path.remainder,
@@ -281,12 +279,66 @@ async fn precreate_shared_ancestors<'a>(
                 walk.global_mask.clone(),
                 walk_path.prefixes,
                 Some(discards.clone()),
-            )
-            .map(|staged| staged.map(|link| link.is_valid().then_some(link.node)))
+            );
+            async move {
+                let link = staged.await?;
+                if !link.is_valid() {
+                    return Ok(None);
+                }
+                let path = created_path(&start, &link).await?.unwrap_or(resolved);
+                Ok(Some(CreatedAncestor {
+                    node: link.node,
+                    path,
+                }))
+            }
         },
         |err| StageError::internal_with_context(err, "Failed to join pre-create task"),
     )
     .await
+}
+
+/// `given` in the case `prefixes` resolved it to, where it resolved as a whole: a shorter match
+/// answers for a shorter path and would drop components.
+#[lore_macro::test_pub]
+fn resolved_or_given(
+    given: &RelativePath,
+    prefixes: Option<&crate::util::fs::ResolvedPrefixes>,
+) -> RelativePath {
+    prefixes
+        .and_then(|resolved| resolved.longest_prefix_of(given.as_str()))
+        .filter(|(depth, _)| *depth == path_depth(given.as_str()))
+        .map_or_else(
+            || given.clone(),
+            |(_, variation)| RelativePath::new_from_clean_parts(variation, ""),
+        )
+}
+
+/// The path `created` stands at, spelled by the tree below `start`, the point its walk started
+/// from.
+///
+/// Staging the ancestor made the tree and the file system agree on that spelling: `Keep` renames
+/// the file system to the tree, `Rename` the tree to the file system. `None` where the walk crossed
+/// into a linked repository, whose nodes `start`'s state does not hold, which leaves the caller
+/// the spelling it resolved before staging.
+async fn created_path(
+    start: &NodeMapping,
+    created: &crate::node::NodeLink,
+) -> Result<Option<RelativePath>, StageError> {
+    if created.repository != start.repository.id {
+        return Ok(None);
+    }
+    let below = start
+        .state
+        .node_path_below(start.repository.clone(), created.node, start.node)
+        .await
+        .forward::<StageError>("Failed to resolve the path of a shared ancestor")?;
+    Ok(below.map(|below| {
+        if start.path.is_empty() {
+            below
+        } else {
+            RelativePath::new_from_clean_parts(start.path.as_str(), below.as_str())
+        }
+    }))
 }
 
 /// Spawn a walk per target into `tasks`.
@@ -298,7 +350,7 @@ async fn precreate_shared_ancestors<'a>(
 async fn spawn_target_walks(
     walk: &StageWalk,
     antichain: Vec<RelativePath>,
-    ancestors: &AncestorNodes<'_>,
+    ancestors: &AncestorNodes<'_, CreatedAncestor>,
     discards: &Arc<stage::DiscardQueue>,
     tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
 ) -> Option<StageError> {

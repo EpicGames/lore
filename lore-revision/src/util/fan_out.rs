@@ -13,25 +13,26 @@ use super::path::shared_component_depth;
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::node::NodeID;
 
-/// The node of each shared ancestor already created, borrowed from the list they
-/// are created from.
+/// What the creation of each shared ancestor already created answered, its node by
+/// default, keyed by the path borrowed from the list they are created from.
 #[lore_macro::test_pub]
-pub(crate) type AncestorNodes<'a> = HashMap<&'a str, NodeID>;
+pub(crate) type AncestorNodes<'a, T = NodeID> = HashMap<&'a str, T>;
 
-/// The deepest strict ancestor of `path` that has a node, and that node.
+/// The deepest strict ancestor of `path` that has a node, and what its creation
+/// answered.
 ///
 /// Starts at the parent, never at `path` itself: the caller is about to create or
 /// walk `path`, and starting on top of it would skip it.
 #[lore_macro::test_pub]
-pub(crate) fn longest_ancestor<'a>(
+pub(crate) fn longest_ancestor<'a, 'n, T>(
     path: &'a str,
-    nodes: &AncestorNodes<'_>,
-) -> Option<(&'a str, NodeID)> {
+    nodes: &'n AncestorNodes<'_, T>,
+) -> Option<(&'a str, &'n T)> {
     let mut end = path.rfind('/')?;
     loop {
         let candidate = &path[..end];
         if let Some(node) = nodes.get(candidate) {
-            return Some((candidate, *node));
+            return Some((candidate, node));
         }
         end = candidate.rfind('/')?;
     }
@@ -82,20 +83,22 @@ pub(crate) fn shared_ancestors<P: AsRef<str>>(targets: &[P]) -> Vec<DepthPath> {
 /// level's parents: each level is drained before the next starts, and `create` is
 /// handed the nodes of the levels above to start from. At most
 /// [`MAX_CONCURRENT_TREE_TASKS`] creations of a level run at once. A creation
-/// answers the node it created or found, or `None` where it has none.
+/// answers the node it created or found, with whatever else a walk below it starts
+/// from, or `None` where it has none.
 ///
 /// A creation in flight is allocating nodes and is drained even where an earlier
 /// one failed, rather than cancelled part way through. No creation starts after
 /// the first failure, which is the one returned.
 #[lore_macro::test_pub]
-pub(crate) async fn create_shared_ancestors<'a, E, Fut>(
+pub(crate) async fn create_shared_ancestors<'a, T, E, Fut>(
     ancestors: &'a [DepthPath],
-    mut create: impl FnMut(&'a str, &AncestorNodes<'a>) -> Fut,
+    mut create: impl FnMut(&'a str, &AncestorNodes<'a, T>) -> Fut,
     join_failure: impl Fn(JoinError) -> E,
-) -> Result<AncestorNodes<'a>, E>
+) -> Result<AncestorNodes<'a, T>, E>
 where
+    T: Send + 'static,
     E: Send + 'static,
-    Fut: Future<Output = Result<Option<NodeID>, E>> + Send + 'static,
+    Fut: Future<Output = Result<Option<T>, E>> + Send + 'static,
 {
     let mut nodes = AncestorNodes::with_capacity(ancestors.len());
     let mut failure: Option<E> = None;
@@ -137,11 +140,11 @@ where
 }
 
 /// Record the node the creation of `level[index]` answered, passing on its failure.
-fn record_created<'a, E>(
+fn record_created<'a, T, E>(
     level: &'a [DepthPath],
     index: usize,
-    created: Result<Option<NodeID>, E>,
-    nodes: &mut AncestorNodes<'a>,
+    created: Result<Option<T>, E>,
+    nodes: &mut AncestorNodes<'a, T>,
 ) -> Result<(), E> {
     if let Some(node) = created? {
         nodes.insert(level[index].path(), node);

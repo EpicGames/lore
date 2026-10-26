@@ -20,8 +20,8 @@ NAMED = ["Game/Modules/ModuleA/a1.txt", "Game/Modules/ModuleA/a2.txt"]
 @pytest.mark.regression
 @pytest.mark.parametrize("working_copy", ["removed", "bare"])
 def test_stage_paths_under_missing_ancestor(new_lore_repo, working_copy):
-    """UCS-24703: staging two paths whose common ancestor is missing from the
-    working directory must stage only those two paths, not the whole ancestor.
+    """Staging two paths whose common ancestor is missing from the working
+    directory must stage only those two paths, not the whole ancestor.
 
     "bare" is the P4 mirror case, where the files were never fetched rather
     than deleted.

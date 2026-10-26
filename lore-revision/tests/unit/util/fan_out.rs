@@ -149,10 +149,10 @@ fn created<'a>(entries: &[(&'a str, NodeID)]) -> AncestorNodes<'a> {
 #[test]
 fn longest_ancestor_takes_the_deepest_one_created() {
     let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
-    assert_eq!(longest_ancestor("a/b/c/d", &nodes), Some(("a/b", NODE_AB)));
+    assert_eq!(longest_ancestor("a/b/c/d", &nodes), Some(("a/b", &NODE_AB)));
     assert_eq!(
         longest_ancestor("a/b", &nodes),
-        Some(("a", NODE_A)),
+        Some(("a", &NODE_A)),
         "a path in the map starts above itself"
     );
     assert_eq!(longest_ancestor("a", &nodes), None);
@@ -180,7 +180,7 @@ type Started = Vec<(String, Option<String>)>;
 fn started(path: &str, nodes: &AncestorNodes<'_>, record: &mut Started) {
     let parent = longest_ancestor(path, nodes).map(|(parent, node)| {
         assert_eq!(
-            node,
+            *node,
             node_for(parent),
             "the node handed over is the parent's"
         );
@@ -354,7 +354,7 @@ async fn a_creation_that_panics_is_reported_through_the_join_failure() {
             let ancestors = shared_ancestors(&antichain(&["a/x", "a/y"]));
             let result = create_shared_ancestors(
                 &ancestors,
-                |_, _| async { panic!("the creation panicked") }.boxed(),
+                |_, _| -> Creation { async { panic!("the creation panicked") }.boxed() },
                 |_| CreateError::Joined,
             )
             .await;
