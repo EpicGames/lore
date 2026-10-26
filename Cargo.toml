@@ -24,7 +24,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 
 [workspace.lints.rust]
 future_incompatible = { level = "warn", priority = -1 }

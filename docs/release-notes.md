@@ -9,6 +9,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+### Fixes & Improvements
+
+## v0.12.0 (Oct 26th 2026) [#1966]
+
+### Breaking changes
+
+### Features
+
 - `lore service run` runs the Lore service in the current process, returning once it stops, whether by
   `lore service stop` or by `lore::service::quit` from within the same process. `lore::service::quit` asks a service
   that `lore::service::run` started in this process to shut down cleanly, and does nothing when none runs there. Neither

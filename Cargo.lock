@@ -2394,7 +2394,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "lore"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "async-trait",
  "bitcode",
@@ -2429,7 +2429,7 @@ dependencies = [
 
 [[package]]
 name = "lore-aws"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2471,7 +2471,7 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "backtrace",
  "bitcode",
@@ -2502,7 +2502,7 @@ dependencies = [
 
 [[package]]
 name = "lore-capi"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "blake3",
  "cbindgen",
@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "lore-chaos-client"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "anyhow",
  "clap",
@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "lore-client"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "anstream",
  "anstyle",
@@ -2556,7 +2556,7 @@ dependencies = [
 
 [[package]]
 name = "lore-credential"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "apple-native-keyring-store",
  "base64 0.22.1",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "lore-hashicorp"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2657,7 +2657,7 @@ dependencies = [
 
 [[package]]
 name = "lore-io"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "bytes",
  "futures",
@@ -2673,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2682,7 +2682,7 @@ dependencies = [
 
 [[package]]
 name = "lore-notification"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2774,7 +2774,7 @@ dependencies = [
 
 [[package]]
 name = "lore-server"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2855,7 +2855,7 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "async-trait",
  "bitcode",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "axum",
  "bytes",
@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.11.1-nightly"
+version = "0.12.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
