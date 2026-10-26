@@ -229,6 +229,173 @@ mod direct_handling {
     }
 
     #[tokio::test]
+    async fn unreadable_latest_preserves_other_branches_and_defaults_to_zero() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+            let main_latest = seed_revision(&repository_context, main).await;
+            let feature =
+                create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+
+            // Fail only the branch-latest lookup that emit_branch makes
+            // for `feature`. Listing the branch ids and reading its
+            // metadata still succeed, so the request reaches emit_branch.
+            let (latest_key, _key_type) = branch::mutable_key(
+                lore_revision::repository::SALT_LORE,
+                branch::LATEST,
+                repository,
+                feature,
+            );
+            let failing = crate::store::test_support::FailingLoadStore::for_key(
+                mutable_store,
+                latest_key,
+                lore_storage::StoreError::internal("injected latest failure"),
+            );
+
+            let response = handler(
+                make_request(repository, None, false),
+                immutable_store,
+                failing,
+                &None, /* no forwarded requests */
+            )
+            .await
+            .expect("handler returns a stream");
+
+            let items = collect_response(response).await;
+            let branches: Vec<_> = items
+                .into_iter()
+                .map(|item| {
+                    item.expect("an unreadable latest must not terminate listing")
+                        .branch
+                        .expect("branch response")
+                })
+                .collect();
+            assert_eq!(branches.len(), 2);
+            let main = branches
+                .iter()
+                .find(|branch| branch.name == "main")
+                .expect("healthy branch remains available");
+            assert_eq!(Hash::from(main.latest.clone()), main_latest);
+            let feature = branches
+                .iter()
+                .find(|branch| branch.name == "feature")
+                .expect("branch metadata remains available despite unreadable latest");
+            assert_eq!(Hash::from(feature.latest.clone()), Hash::default());
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unreadable_metadata_hash_omits_only_the_broken_branch() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+            let main_latest = seed_revision(&repository_context, main).await;
+            let feature =
+                create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+
+            // The branch id is listed, but its metadata hash cannot be read.
+            let (metadata_key, _key_type) = branch::mutable_key(
+                lore_revision::repository::SALT_LORE,
+                branch::METADATA,
+                repository,
+                feature,
+            );
+            let failing = crate::store::test_support::FailingLoadStore::for_key(
+                mutable_store,
+                metadata_key,
+                lore_storage::StoreError::internal("injected metadata failure"),
+            );
+
+            let response = handler(
+                make_request(repository, None, false),
+                immutable_store,
+                failing,
+                &None, /* no forwarded requests */
+            )
+            .await
+            .expect("handler returns a stream");
+
+            let items = collect_response(response).await;
+            let branches: Vec<_> = items
+                .into_iter()
+                .map(|item| {
+                    item.expect("unreadable metadata must not terminate listing")
+                        .branch
+                        .expect("branch response")
+                })
+                .collect();
+            assert_eq!(branches.len(), 1);
+            assert_eq!(branches[0].name, "main");
+            assert_eq!(Hash::from(branches[0].latest.clone()), main_latest);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unreadable_metadata_payload_omits_only_the_broken_branch() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main", "alice").await;
+            let main_latest = seed_revision(&repository_context, main).await;
+            let feature =
+                create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+            // The pointer resolves, but its metadata payload is unavailable in either listing pass.
+            branch::mutable_store_metadata(repository_context, feature, random::<Hash>())
+                .await
+                .expect("replace metadata pointer");
+
+            for include_deleted in [false, true] {
+                let response = handler(
+                    make_request(repository, None, include_deleted),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None,
+                )
+                .await
+                .expect("handler returns a stream");
+                let branches: Vec<_> = collect_response(response)
+                    .await
+                    .into_iter()
+                    .map(|item| {
+                        item.expect("missing payload must not terminate listing")
+                            .branch
+                            .expect("branch response")
+                    })
+                    .collect();
+                assert_eq!(branches.len(), 1);
+                assert_eq!(branches[0].name, "main");
+                assert_eq!(Hash::from(branches[0].latest.clone()), main_latest);
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
     async fn list_excludes_deleted_by_default() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =

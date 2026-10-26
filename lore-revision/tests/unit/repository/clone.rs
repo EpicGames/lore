@@ -305,11 +305,10 @@ fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 's
     std::iter::successors(Some(error), |error| error.source()).any(|error| error.is::<T>())
 }
 
-/// A clone that fails to write a file reports that failure. Discovery is still walking the tree
-/// when writing stops, and then fails because it cannot pass on the files it finds next. The clone
-/// does not report that second failure.
+/// A clone with unavailable content reports the missing address even when discovery spans
+/// many blocks and more files than the work channel can hold.
 #[tokio::test]
-async fn a_clone_reports_a_failed_file_write_rather_than_the_stopped_discovery() {
+async fn a_clone_reports_missing_content_across_many_blocks() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             let temp = TempDir::new("lore-clone-unwritable-files-");
@@ -458,4 +457,59 @@ async fn a_tree_warm_up_told_to_stop_walks_nothing() {
     let stopped = warmed(test, nested_entries(), u32::MAX, Arc::new(|| true)).await;
 
     assert_eq!((stopped.directories, stopped.blocks), (0, 0));
+}
+
+/// The missing file finishes before discovery supplies more work. Files supplied after the
+/// consumer observes that error must still be written, and the original error must survive.
+#[tokio::test]
+async fn clone_continues_after_a_missing_file() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-continue-");
+            let repository = working_tree_repository(temp.path()).await;
+            let stats = Arc::new(CloneStats::default());
+            let ctx = CloneContext {
+                operation: repository.file_system().begin_operation().await.unwrap(),
+                repository: repository.clone(),
+                state: State::new(),
+                options: Arc::default(),
+                stats: stats.clone(),
+                modified_times: Arc::default(),
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(3);
+            tx.try_send(CloneWorkItem {
+                repository: repository.clone(),
+                node: file_node(b"obliterated"),
+                repository_path: relative_path("missing.txt"),
+            })
+            .unwrap();
+            let mut consumer = std::pin::pin!(clone_execute(rx, ctx));
+            assert!(futures::poll!(&mut consumer).is_pending());
+            // Only this test polls the consumer. Reacquiring every permit waits for the
+            // missing file's task to finish without letting the consumer accept another file.
+            let permits = stats.file_inflight.available_permits() as u32
+                + stats.file_inflight_count.load(Ordering::Relaxed) as u32;
+            drop(stats.file_inflight.acquire_many(permits).await.unwrap());
+            for name in ["first.txt", "last.txt"] {
+                tx.try_send(CloneWorkItem {
+                    repository: repository.clone(),
+                    node: Node {
+                        address: Default::default(),
+                        ..file_node(b"")
+                    },
+                    repository_path: relative_path(name),
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let error = consumer
+                .await
+                .expect_err("missing content must fail the operation");
+            assert!(caused_by::<AddressNotFound>(&error));
+            for name in ["first.txt", "last.txt"] {
+                assert_eq!(std::fs::read(temp.path().join(name)).unwrap(), b"");
+            }
+            assert_eq!(stats.complete.file_complete.load(Ordering::Relaxed), 2);
+        })
+        .await;
 }

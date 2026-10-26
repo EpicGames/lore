@@ -286,6 +286,17 @@ pub trait Revision: Send + Sync {
     /// List all branches
     async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError>;
 
+    /// List at most `limit` branches. `None` means enumeration exceeded the limit.
+    /// Implementations must stop consuming the stream when the limit is exceeded.
+    async fn branch_list_bounded(
+        &self,
+        _limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        Err(ProtocolError::from(lore_base::error::NotSupported {
+            operation: "bounded branch listing".to_string(),
+        }))
+    }
+
     async fn revision_list(
         &self,
         signature: RevisionListStart,

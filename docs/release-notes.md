@@ -24,6 +24,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- Clone and sync continue materializing available files after an individual write fails, restoring
+  the behavior established by UCS-14675. Failures are reported and the command still exits nonzero.
+
+- `lore file obliterate` warns before deleting content needed by an active branch’s latest revision, including
+  shared child fragments. Incomplete checks report unknown impact; the administrative deletion still proceeds.
+
 - `lore repository verify` fails where it can't read part of the local store, where it passed over it, and checks and
   heals every fragment a flush in the same process moves to other index buckets meanwhile
 - `lore stage` of several paths under a directory missing from the working directory stages a delete of only those

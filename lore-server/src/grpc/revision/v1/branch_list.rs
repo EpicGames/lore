@@ -274,10 +274,8 @@ async fn produce_branches(
 }
 
 /// Build and send one branch record. Returns `Ok(false)` if the receiver has
-/// been dropped (caller should stop producing); a per-branch build failure is
-/// logged and skipped, returning `Ok(true)`. A store asking the caller to back
-/// off is returned instead, so the stream ends with that signal rather than
-/// completing successfully with branches silently missing from it.
+/// been dropped. An unreadable latest revision defaults to zero; a store asking
+/// the caller to back off ends the stream with that signal instead.
 async fn emit_branch(
     repository: &Arc<RepositoryContext>,
     branch_id: BranchId,

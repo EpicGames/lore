@@ -735,3 +735,64 @@ async fn an_unresolvable_chunking_is_refused_until_a_recorded_time_answers() {
     }))
     .await;
 }
+
+/// A directory that cannot be materialized fails before the consumer can schedule the
+/// following files. That failure must not prevent independent additions from being written.
+#[tokio::test]
+async fn sync_continues_after_a_materialization_error() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-sync-continue-");
+        let repository = working_tree_repository(temp.path()).await;
+        let blocked = RelativePath::new_from_initial_path("blocked").unwrap();
+        write_working_file(&repository, &blocked, b"local file blocks directory").await;
+        let mut changes = Vec::new();
+        for (name, node) in [
+            ("blocked", Node::new_zeroed()),
+            (
+                "first.txt",
+                Node {
+                    address: Default::default(),
+                    ..file_node(b"")
+                },
+            ),
+            (
+                "last.txt",
+                Node {
+                    address: Default::default(),
+                    ..file_node(b"")
+                },
+            ),
+        ] {
+            let path = RelativePath::new_from_initial_path(name).unwrap();
+            let staged = state_holding(&repository, &path, node, 1).await;
+            changes.push(NodeChange {
+                action: FileAction::Add,
+                flags: change::Flags::None,
+                from: side(&repository, &staged, path.clone()),
+                to: side(&repository, &staged, path),
+            });
+        }
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        let result = realize_changes(
+            repository.clone(),
+            operation.clone(),
+            Arc::new(changes),
+            None,
+            false,
+            false,
+            Arc::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the obstructed directory must fail the operation"
+        );
+        for name in ["first.txt", "last.txt"] {
+            let path = RelativePath::new_from_initial_path(name).unwrap();
+            let info = operation.file_info(&path).await.unwrap();
+            assert!(info.exists(), "available file {name} was not materialized");
+            assert_eq!(info.size(), 0);
+        }
+    }))
+    .await;
+}

@@ -2122,6 +2122,23 @@ pub async fn list_remote(
     Ok(response.list)
 }
 
+/// Return `None` when remote enumeration exceeds the caller's branch budget.
+pub(crate) async fn list_remote_bounded(
+    remote: Arc<Connection>,
+    repository: RepositoryId,
+    limit: usize,
+) -> Result<Option<Vec<BranchMetadata>>, BranchError> {
+    let remote = remote
+        .revision(repository)
+        .await
+        .forward::<BranchError>("Failed to connect to remote revision service")?;
+    let response = remote
+        .branch_list_bounded(limit)
+        .await
+        .forward::<BranchError>("Failed to list branches on remote")?;
+    Ok(response.map(|response| response.list))
+}
+
 pub async fn list_output(
     repository: Arc<RepositoryContext>,
     local: bool,

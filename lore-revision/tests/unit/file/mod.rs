@@ -5,5 +5,6 @@ mod audit;
 mod diff;
 mod dirty;
 mod info;
+mod obliterate;
 mod stage;
 mod write;

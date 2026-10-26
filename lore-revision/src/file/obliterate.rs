@@ -22,6 +22,11 @@ use crate::state;
 use crate::store::StoreObliterateStats;
 use crate::util::path::RelativePath;
 
+#[cfg(not(feature = "test-util"))]
+mod impact;
+#[cfg(feature = "test-util")]
+pub mod impact;
+
 /// Data for the event emitted when file content is obliterated.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
@@ -202,6 +207,8 @@ pub(crate) async fn obliterate_address(
     repository: Arc<RepositoryContext>,
     address: Address,
 ) -> Result<(), ObliterateError> {
+    impact::warn(&repository, address).await;
+
     let stats = Arc::new(StoreObliterateStats::default());
 
     // Obliterating removes the content here and on the remote, for good. A dry run reports the

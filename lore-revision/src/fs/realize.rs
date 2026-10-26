@@ -1598,6 +1598,8 @@ async fn sync_execute_modify_add(
 ) -> Result<(), SyncError> {
     const MAX_TASK_COUNT: usize = 10000;
     let mut tasks = JoinSet::new();
+    // Finish independent changes even when one file cannot be written. The first
+    // failure remains the terminal result; warnings identify every failed attempt.
     let mut sync_error = None;
 
     while let Some(item) = rx.recv().await {
@@ -1613,13 +1615,20 @@ async fn sync_execute_modify_add(
             stats.clone(),
         )
         .await;
-        sync_error = sync_error.or(result.err());
+        sync_error = sync_error.or(result
+            .inspect_err(|err| {
+                lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
+            })
+            .err());
 
         while let Some(result) = tasks.try_join_next() {
             sync_error = sync_error.or(result
                 .internal("Recursion task failed")
                 .map_err(SyncError::from)
                 .flatten()
+                .inspect_err(|err| {
+                    lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
+                })
                 .err());
         }
         while tasks.len() > MAX_TASK_COUNT
@@ -1629,11 +1638,10 @@ async fn sync_execute_modify_add(
                 .internal("Recursion task failed")
                 .map_err(SyncError::from)
                 .flatten()
+                .inspect_err(|err| {
+                    lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
+                })
                 .err());
-        }
-
-        if sync_error.is_some() {
-            break;
         }
     }
 
@@ -1642,6 +1650,9 @@ async fn sync_execute_modify_add(
             .internal("Recursion task failed")
             .map_err(SyncError::from)
             .flatten()
+            .inspect_err(|err| {
+                lore_warn!("Sync could not materialize content: {err}\n{}", err.trace());
+            })
             .err());
     }
 

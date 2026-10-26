@@ -114,6 +114,26 @@ impl RevisionService {
     }
 
     pub async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+        self.branch_list_with_limit(None)
+            .await
+            .and_then(|response| {
+                response.ok_or_else(|| {
+                    ProtocolError::internal("unbounded branch listing exceeded a limit")
+                })
+            })
+    }
+
+    pub async fn branch_list_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        self.branch_list_with_limit(Some(limit)).await
+    }
+
+    async fn branch_list_with_limit(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
         lore_debug!("List branches");
         let _ = RequestScopedCounter::new(self.request_inflight.clone());
 
@@ -127,36 +147,19 @@ impl RevisionService {
             let mut client = self.client.clone();
 
             match client.branch_list(request).await {
-                Ok(response) => {
-                    let mut stream = response.into_inner();
-                    let mut entries: Vec<BranchMetadata> = Vec::new();
-                    let mut stream_err: Option<tonic::Status> = None;
-                    while let Some(item) = stream.next().await {
-                        match item {
-                            Ok(message) => {
-                                if let Some(branch) = message.branch {
-                                    entries.push(branch_metadata_from_v1(branch));
-                                }
-                            }
-                            Err(status) => {
-                                stream_err = Some(status);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(status) = stream_err {
+                Ok(response) => match collect_branch_list(response.into_inner(), limit).await {
+                    Ok(response) => break response,
+                    Err(status) => {
                         handle_error(&mut retry, status).await?;
-                        continue;
                     }
-                    break entries;
-                }
+                },
                 Err(status) => {
                     handle_error(&mut retry, status).await?;
                 }
             }
         };
 
-        Ok(BranchListResponse { list })
+        Ok(list)
     }
 
     pub async fn branch_query(
@@ -391,4 +394,22 @@ fn branch_metadata_from_v1(branch: model_v1::Branch) -> BranchMetadata {
         created: branch.created,
         stack: branch.stack.into_iter().map(BranchPoint::from).collect(),
     }
+}
+
+#[lore_macro::test_pub]
+async fn collect_branch_list(
+    mut stream: impl tokio_stream::Stream<Item = Result<revision_v1::BranchListResponse, tonic::Status>>
+    + Unpin,
+    limit: Option<usize>,
+) -> Result<Option<BranchListResponse>, tonic::Status> {
+    let mut entries = Vec::new();
+    while let Some(item) = stream.next().await {
+        if let Some(branch) = item?.branch {
+            if limit.is_some_and(|limit| entries.len() == limit) {
+                return Ok(None);
+            }
+            entries.push(branch_metadata_from_v1(branch));
+        }
+    }
+    Ok(Some(BranchListResponse { list: entries }))
 }

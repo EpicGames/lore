@@ -7,7 +7,10 @@ mod environment_client;
 pub mod environment_client;
 mod lock_client;
 mod repository_client;
+#[cfg(not(feature = "test-util"))]
 mod revision_client;
+#[cfg(feature = "test-util")]
+pub mod revision_client;
 #[cfg(not(feature = "test-util"))]
 mod storage_client;
 #[cfg(feature = "test-util")]
@@ -1498,6 +1501,18 @@ impl Revision for GRPCRevision {
         with_reconnect(
             &self.connection,
             || async { self.client.read().await.branch_list().await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
+    async fn branch_list_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_list_bounded(limit).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

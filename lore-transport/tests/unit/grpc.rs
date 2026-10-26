@@ -9,6 +9,7 @@ use tonic::Status;
 use tower::ServiceBuilder;
 
 mod environment_client;
+mod revision_client;
 mod storage_client;
 
 use std::sync::atomic::AtomicUsize;
