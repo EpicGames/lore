@@ -563,6 +563,10 @@ async fn logout_local(
                     resolve_auth_endpoint(args.auth_url.as_str(), &repository_path, &identity)
                         .await?;
 
+                if execution_context().globals().dry_run() {
+                    return Ok(());
+                }
+
                 if args.user_id.is_empty() {
                     lore_credential::token_store::remove_all_tokens_for_auth_url(&auth_url)
                         .await
@@ -631,9 +635,11 @@ async fn clear_local(
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                lore_credential::token_store::reset_tokens()
-                    .await
-                    .forward::<AuthStoreError>("accessing token store")?;
+                if !execution_context().globals().dry_run() {
+                    lore_credential::token_store::reset_tokens()
+                        .await
+                        .forward::<AuthStoreError>("accessing token store")?;
+                }
                 Ok::<(), AuthStoreError>(())
             }
             .await;

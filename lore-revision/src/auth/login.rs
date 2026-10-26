@@ -41,6 +41,7 @@ use crate::errors::TokenNotFound;
 use crate::event;
 use crate::event::EventError;
 use crate::interface::LoreError;
+use crate::lore::execution_context;
 use crate::lore_debug;
 
 #[error_set]
@@ -175,16 +176,18 @@ async fn store_authentication(
     )
     .forward::<LoginError>("verifying JWT usage for remote")?;
 
-    token_store::store_user_token_and_refresh_token(
-        auth_url,
-        user_info.id.as_str(),
-        &authn.token,
-        decoded_token.claims.acceptable_root_domains(),
-        authn.refresh_token.as_deref(),
-        authn.scope.as_deref(),
-    )
-    .await
-    .forward::<LoginError>("storing user token")?;
+    if !execution_context().globals().dry_run() {
+        token_store::store_user_token_and_refresh_token(
+            auth_url,
+            user_info.id.as_str(),
+            &authn.token,
+            decoded_token.claims.acceptable_root_domains(),
+            authn.refresh_token.as_deref(),
+            authn.scope.as_deref(),
+        )
+        .await
+        .forward::<LoginError>("storing user token")?;
+    }
 
     Ok(user_info)
 }
@@ -242,16 +245,18 @@ pub(crate) async fn with_token(
             .forward::<LoginError>("verifying JWT usage for remote")?;
 
         if let Some(user_info) = lore_credential::user_info_from_token(token.to_string()) {
-            token_store::store_user_token_and_refresh_token(
-                auth_url.as_str(),
-                user_info.id.as_str(),
-                token,
-                decoded_token.claims.acceptable_root_domains(),
-                None,
-                None,
-            )
-            .await
-            .forward::<LoginError>("storing user token")?;
+            if !execution_context().globals().dry_run() {
+                token_store::store_user_token_and_refresh_token(
+                    auth_url.as_str(),
+                    user_info.id.as_str(),
+                    token,
+                    decoded_token.claims.acceptable_root_domains(),
+                    None,
+                    None,
+                )
+                .await
+                .forward::<LoginError>("storing user token")?;
+            }
 
             user_info
         } else {
@@ -409,16 +414,18 @@ pub async fn interactive(
         .forward::<InteractiveLoginError>("verifying JWT usage for remote")?;
 
     lore_debug!("Auth successful");
-    token_store::store_user_token_and_refresh_token(
-        auth_url.as_str(),
-        authn.user_id.as_str(),
-        authn.token.as_str(),
-        decoded_token.claims.acceptable_root_domains(),
-        authn.refresh_token.as_deref(),
-        authn.scope.as_deref(),
-    )
-    .await
-    .forward::<InteractiveLoginError>("storing user token")?;
+    if !execution_context().globals().dry_run() {
+        token_store::store_user_token_and_refresh_token(
+            auth_url.as_str(),
+            authn.user_id.as_str(),
+            authn.token.as_str(),
+            decoded_token.claims.acceptable_root_domains(),
+            authn.refresh_token.as_deref(),
+            authn.scope.as_deref(),
+        )
+        .await
+        .forward::<InteractiveLoginError>("storing user token")?;
+    }
 
     let Some(mut user_info) = lore_credential::user_info(
         auth_url.as_str(),

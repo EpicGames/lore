@@ -52,6 +52,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   remote
 - `lore repository gc --dry-run` collects no garbage, where it evicted and compacted the local store, and
   `repository verify --heal --dry-run` heals nothing, reporting what it finds as `repository verify` does
+- `lore auth login --dry-run` authenticates and stores no token, and `auth logout --dry-run` and `auth clear --dry-run`
+  remove no token, where all three changed the token store
 - Processes running commands on one repository or shared store at once, such as several `lore history`, no longer wait
   on each other forever. A command whose process still had the immutable store open from the previous command, and not
   the mutable store, took the mutable store's lock before the immutable store's, against a process holding the immutable

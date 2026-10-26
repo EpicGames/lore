@@ -594,3 +594,55 @@ def test_login_with_an_empty_identity_claim_is_refused(oidc_env, make_repo):
 
     assert "identity" in str(refused.value)
     assert "empty-identity-sub" not in repo.run(urc_args=["auth", "list"])
+
+
+def dry_run_login_args(
+    provider: MockOidcProvider, path: str
+) -> tuple[list[str], OidcUser]:
+    if path == "device grant":
+        return ["--no-browser"], provider.user
+    if path == "lore token":
+        token = provider.mint_token(KEY_USER)
+        return ["--token-type", "lore", "--token", token], KEY_USER
+    if path == "api key":
+        provider.api_keys["oidc-api-key"] = KEY_USER
+        return ["--token-type", "api-key", "--token", "oidc-api-key"], KEY_USER
+    provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    return ["--client-id", CLIENT_ID], SERVICE_ACCOUNT
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "path", ["device grant", "lore token", "api key", "client credentials"]
+)
+def test_a_dry_run_login_stores_no_token(oidc_env, make_repo, path):
+    """`auth login --dry-run` authenticates and stores nothing, where the same
+    login without it stores the token."""
+    repo = make_repo(LORE_CLIENT_SECRET=CLIENT_SECRET)
+    login_args, user = dry_run_login_args(oidc_env.provider, path)
+    args = ["auth", "login", oidc_env.remote_url, *login_args]
+
+    assert "Authentication successful" in repo.run(urc_args=args, dry_run=True)
+    assert user.user_id not in repo.run(urc_args=["auth", "list"])
+
+    repo.run(urc_args=args)
+    assert user.user_id in repo.run(urc_args=["auth", "list"])
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("command", ["logout", "clear"])
+def test_a_dry_run_logout_removes_no_token(oidc_env, make_repo, command):
+    """`auth logout --dry-run` and `auth clear --dry-run` keep the stored
+    token, where the same commands without it remove it."""
+    provider = oidc_env.provider
+    repo = make_repo()
+    login_with_token(repo, oidc_env.remote_url, "lore", provider.mint_token(KEY_USER))
+    args = ["auth", command]
+    if command == "logout":
+        args += ["--auth-url", f"oidc+{provider.issuer}"]
+
+    repo.run(urc_args=args, dry_run=True)
+    assert KEY_USER.user_id in repo.run(urc_args=["auth", "list"])
+
+    repo.run(urc_args=args)
+    assert KEY_USER.user_id not in repo.run(urc_args=["auth", "list"])
