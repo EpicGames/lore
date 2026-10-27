@@ -4,5 +4,6 @@
 mod configuration;
 mod grpc_replica;
 mod replica;
+mod replica_factory;
 mod replicated_store;
 pub(crate) mod test_support;

@@ -9,6 +9,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
+  1 MiB initial congestion window, set with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A
+  periodically refreshed connection starts at no less than this window
+
 ### Fixes & Improvements
 
 ## v0.12.0 (Oct 26th 2026) [#1966]

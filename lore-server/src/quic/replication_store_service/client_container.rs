@@ -76,9 +76,10 @@ impl ClientFactory for QuicClientFactory {
 
     async fn make_client(&self, initial_cwnd: Option<u64>) -> Result<Self::Output, ProtocolError> {
         let mut transport_config = self.transport_config.clone();
-        if let Some(initial_cwnd) = initial_cwnd {
-            transport_config.initial_cwnd = Some(initial_cwnd);
-        }
+        // The configured window is a floor for the hint: a connection that sat idle can report a
+        // window far below it, and seeding from that would start the new connection slower than
+        // a fresh one.
+        transport_config.initial_cwnd = initial_cwnd.max(self.transport_config.initial_cwnd);
 
         let client = ReplicationStoreClient::connect(
             &self.remote_url,

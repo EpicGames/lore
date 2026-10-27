@@ -40,6 +40,13 @@ use crate::tls::CertificateSettings;
 pub static METRICS_PEER_ID_LABEL: &str = "peer_id";
 pub static METRICS_PEER_LOCALITY_LABEL: &str = "peer_locality";
 
+/// Initial congestion window, in bytes, for a new connection to a replication peer.
+pub const DEFAULT_REPLICA_INITIAL_CWND_BYTES: u64 = 1024 * 1024;
+
+/// Smallest accepted initial congestion window: two minimum-size QUIC datagrams. Cubic never lets
+/// its window fall below two datagrams once running, but adopts the initial window unchecked.
+pub const MIN_REPLICA_INITIAL_CWND_BYTES: u64 = 2 * 1200;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ReplicaFactoryTlsSettings {
     pub client_certs: CertificateSettings,
@@ -63,6 +70,13 @@ pub struct ReplicaFactorySettings {
     /// for peers with the `SameRegion` locality.
     #[serde(default = "default_enable_same_region_write")]
     pub enable_same_region_write: bool,
+    /// Initial congestion window, in bytes, for a new QUIC replica connection, and the floor for
+    /// the window a periodically refreshed connection carries over.
+    #[serde(
+        default = "default_initial_cwnd_bytes",
+        deserialize_with = "deserialize_initial_cwnd_bytes"
+    )]
+    pub initial_cwnd_bytes: u64,
 }
 
 fn default_read_replicas_enabled() -> bool {
@@ -77,6 +91,23 @@ fn default_enable_same_region_write() -> bool {
     true
 }
 
+fn default_initial_cwnd_bytes() -> u64 {
+    DEFAULT_REPLICA_INITIAL_CWND_BYTES
+}
+
+fn deserialize_initial_cwnd_bytes<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let bytes = u64::deserialize(deserializer)?;
+    if bytes < MIN_REPLICA_INITIAL_CWND_BYTES {
+        return Err(serde::de::Error::custom(format!(
+            "initial_cwnd_bytes must be at least {MIN_REPLICA_INITIAL_CWND_BYTES}, got {bytes}"
+        )));
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug)]
 pub struct ReplicationStoreTargetFactory {
     grpc_tls: Option<ClientTlsConfig>,
@@ -87,6 +118,7 @@ pub struct ReplicationStoreTargetFactory {
     use_grpc_write_replication: bool,
     pub quic_monitor_interval: Duration,
     pub enable_same_region_write: bool,
+    pub initial_cwnd_bytes: u64,
 }
 
 impl ReplicationStoreTargetFactory {
@@ -107,6 +139,7 @@ impl ReplicationStoreTargetFactory {
             use_grpc_write_replication,
             quic_monitor_interval: Duration::from_secs(default_quic_client_monitor_interval_secs()),
             enable_same_region_write: true,
+            initial_cwnd_bytes: default_initial_cwnd_bytes(),
         }
     }
 
@@ -192,6 +225,7 @@ impl ReplicationStoreTargetFactory {
         factory.sni_override = sni_override;
         factory.transport_config.expected_rtt_ms = rtt_ms;
         factory.transport_config.congestion_algorithm = congestion_algorithm;
+        factory.transport_config.initial_cwnd = Some(self.initial_cwnd_bytes);
         factory.user_agent = Some(make_user_agent_with_component(
             user_agent_product(),
             user_agent_component,
