@@ -746,3 +746,109 @@ def test_link_merge_of_divergent_history_keeps_the_remote_history_off_a_local_fi
     assert [(e["revision"], e["path"], e["action"]) for e in history] == [
         (local_pin, "local.txt", "add")
     ]
+
+
+# ---------------------------------------------------------------------------
+# A move merged through the parent.
+#
+# The merge stages a move by relinking the target's node under the new path.
+# For a linked repository nothing re-hashes the file from disk before the
+# commit, so the staged node must end up with the content the merge chose:
+# the incoming side's where the move carries an edit, the target's where the
+# move is a pure rename the target's edit is folded into.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "bare, edit_in_a_later_commit",
+    [(True, False), (True, True), (False, False)],
+    ids=["bare", "bare-edit-in-a-later-commit", "working-copy"],
+)
+def test_link_merge_of_a_moved_and_edited_file_keeps_the_edit(
+    new_lore_repo, bare, edit_in_a_later_commit
+):
+    """A branch that moves a folder in a linked repository and edits the file inside
+    lands both the move and the edit when merged through the parent."""
+    before = 'export const name = "chat";\n'
+    edited = 'export const name = "chatbox";\n'
+    link_path = "part"
+    parent, part = make_parent_with_link(
+        new_lore_repo, link_path, {"chat/a.ts": before}
+    )
+
+    # The branch exists in the parent and, through the link, in the linked repository.
+    branching = parent.clone()
+    branching.branch_create("feature")
+    branching.push()
+
+    part_work = part.clone()
+    part_work.branch_switch("feature")
+    part_work.move("chat", "chatbox")
+    part_work.stage_move("chat", "chatbox")
+    if edit_in_a_later_commit:
+        part_work.commit("Move chat to chatbox")
+    with part_work.open_file("chatbox/a.ts", "w+") as f:
+        f.write(edited)
+    part_work.stage(scan=True)
+    part_work.commit(
+        "Edit chatbox/a.ts"
+        if edit_in_a_later_commit
+        else "Move chat to chatbox and edit"
+    )
+    part_work.push()
+
+    merger = parent.clone(bare=bare)
+    merger.branch_merge_start("feature", no_commit=True)
+    if not bare:
+        with merger.open_file(f"{link_path}/chatbox/a.ts", "r") as f:
+            assert f.read() == edited, (
+                "the merge must write the branch's content in the working copy"
+            )
+    merger.commit("Merge feature")
+    merger.push()
+
+    after = part.clone()
+    assert not after.path_exists("chat"), "the move must land"
+    with after.open_file("chatbox/a.ts", "r") as f:
+        assert f.read() == edited, "the edit the move carries must land"
+
+
+@pytest.mark.smoke
+def test_link_merge_of_a_pure_rename_keeps_the_targets_edit(new_lore_repo):
+    """A branch that only renames a folder in a linked repository, merged through the
+    parent into a branch that edited the file inside, lands the rename with the edit."""
+    before = 'export const name = "chat";\n'
+    edited = 'export const name = "edited on main";\n'
+    link_path = "part"
+    parent, part = make_parent_with_link(
+        new_lore_repo, link_path, {"chat/a.ts": before}
+    )
+
+    branching = parent.clone()
+    branching.branch_create("feature")
+    branching.push()
+
+    part_feature = part.clone()
+    part_feature.branch_switch("feature")
+    part_feature.move("chat", "chatbox")
+    part_feature.stage_move("chat", "chatbox")
+    part_feature.commit("Move chat to chatbox")
+    part_feature.push()
+
+    # Edited through the mount, so the parent's pin on main moves with it.
+    with parent.open_file(f"{link_path}/chat/a.ts", "w+") as f:
+        f.write(edited)
+    parent.stage(f"{link_path}/chat/a.ts")
+    parent.commit("Edit chat/a.ts")
+    parent.push()
+
+    merger = parent.clone(bare=True)
+    merger.branch_merge_start("feature", no_commit=True)
+    merger.commit("Merge feature")
+    merger.push()
+
+    after = part.clone()
+    assert not after.path_exists("chat"), "the rename must land"
+    with after.open_file("chatbox/a.ts", "r") as f:
+        assert f.read() == edited, "the edit made on main must survive the rename"
