@@ -33,6 +33,7 @@ pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::branch::BranchError;
+use lore_revision::commit::CommitError;
 use lore_revision::diff::DiffError;
 use lore_revision::find::FindError;
 use lore_revision::immutable::ImmutableError;
@@ -528,6 +529,7 @@ macro_rules! impl_filter_slow_down {
 impl_filter_slow_down!(
     BranchError,
     BranchMetadataError,
+    CommitError,
     DiffError,
     FindError,
     ImmutableError,

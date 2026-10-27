@@ -4556,6 +4556,49 @@ pub async fn commit_in_memory_revision(
     Ok(signature)
 }
 
+/// Commit a merge the server built with [`crate::state::apply_tree_changes`]: freeze
+/// the staged tree, weave its history and serialize it, as [`commit_in_memory_revision`]
+/// does. Returns the new revision's signature.
+///
+/// Parents, revision number and metadata are the caller's, and so is publishing the
+/// tip: the server's fast-forward merge stores it with its own compare-and-swap.
+///
+/// The write tracker is drained on every path, including failure, since dropping it
+/// with leaders still running aborts them.
+pub async fn freeze_and_serialize(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    token: &RepositoryWriteToken,
+) -> Result<Hash, CommitError> {
+    let tracker = immutable::commit_write_tracker(false);
+    let work_tracker = tracker.clone();
+    let result: Result<Hash, CommitError> = async move {
+        freeze_in_memory_tree(
+            repository.clone(),
+            state.clone(),
+            CommitStats::new(),
+            work_tracker,
+        )
+        .await?;
+
+        weave_history(repository.clone(), state.clone(), BasedOn::FirstParent).await?;
+
+        state.reset_merge_conflict_flags();
+        state.clear_link_merge_state();
+
+        state
+            .serialize(repository, token)
+            .await
+            .forward::<CommitError>("Failed to serialize revision state")
+    }
+    .await;
+
+    let drained = tracker.await_all().await;
+    let signature = result?;
+    drained.forward::<CommitError>("Background fragment upload task failed during commit")?;
+    Ok(signature)
+}
+
 /// Why an in-memory commit failed, and whether it had begun freezing the tree.
 ///
 /// A failure before the freeze wrote nothing to the state, so it is still exactly

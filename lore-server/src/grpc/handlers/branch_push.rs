@@ -755,17 +755,19 @@ async fn try_fast_forward_merge(
             state_current.set_metadata_hash(metadata_hash);
         }
 
-        // Serialize the new merge state
+        // Freeze and serialize the new merge state. Without the freeze it keeps the current
+        // head's delta and never records what it merged in
         let write_token = get_write_token();
-        let new_revision = state_current
-            .serialize(repository.clone(), &write_token)
-            .await
-            .filter_slow_down()?
-            .warn_map_err(|err| {
-                Status::internal(format!(
-                    "Failed to serialize fast-forward merge state: {err}"
-                ))
-            })?;
+        let new_revision = lore_revision::commit::freeze_and_serialize(
+            repository.clone(),
+            state_current.clone(),
+            &write_token,
+        )
+        .await
+        .filter_slow_down()?
+        .warn_map_err(|err| {
+            Status::internal(format!("Failed to commit fast-forward merge state: {err}"))
+        })?;
 
         // CAS: attempt to set the new revision as branch head
         let previous_head =
