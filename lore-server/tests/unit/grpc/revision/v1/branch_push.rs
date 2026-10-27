@@ -794,6 +794,77 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
     .await;
 }
 
+/// A revision two commits ahead of an unmoved head is a fast-forward: its own parent is not
+/// the head, but the head is where the two histories meet, so it is stored as it is.
+#[tokio::test]
+async fn fast_forward_merge_stores_a_descendant_of_the_head_directly() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(2)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let hook_dispatcher = HookDispatcher::empty();
+
+        let r1 = build_revision(&repository_context, Hash::default(), 1).await;
+        handler(
+            make_request(repository, main, r1, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("seed push should succeed");
+
+        // Two commits on top of r1, neither pushed to main
+        let r2 = build_revision(&repository_context, r1, 2).await;
+        let r3 = build_revision(&repository_context, r2, 3).await;
+
+        let response = handler(
+            make_request(repository, main, r3, false, true),
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("pushing a descendant of the head should succeed");
+        let inner = response.into_inner();
+        assert!(!inner.fast_forward_merged, "a fast-forward builds no merge");
+        assert_eq!(inner.revision_signature, bytes::Bytes::from(r3));
+        assert_eq!(
+            branch::load_latest(repository_context.clone(), main)
+                .await
+                .expect("the branch tip must read back"),
+            r3,
+            "main must move to the pushed revision"
+        );
+    }))
+    .await;
+}
+
 /// Helper for fast-forward-merge tests: creates a child branch with
 /// `parent` at `parent_revision` in its stack so the parent
 /// validator inside `branch::create` accepts it.

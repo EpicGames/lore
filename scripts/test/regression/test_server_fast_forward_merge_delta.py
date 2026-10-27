@@ -2,7 +2,15 @@
 # SPDX-License-Identifier: MIT
 import os
 
+import grpc
 import pytest
+from protobuf_wire import (
+    encode_bytes_field,
+    encode_varint_field,
+    field_bool,
+    field_bytes,
+    parse_fields,
+)
 
 from lore import Lore
 
@@ -152,3 +160,153 @@ def test_server_fast_forward_merge_of_a_commit_records_its_own_delta(new_lore_re
         "docs/api",
         "docs/api/reference.txt",
     }
+
+
+def _branch_push(
+    grpc_target: str, repo: Lore, branch_id: str, revision: str
+) -> tuple[str, bool]:
+    """A direct `BranchPush` of `revision` onto `branch_id`, with `fast_forward_merge`, as a pull
+    request merge sends it. Returns the resulting tip, and whether the server merged."""
+    request = (
+        encode_bytes_field(1, bytes.fromhex(branch_id))
+        + encode_bytes_field(2, bytes.fromhex(revision))
+        + encode_varint_field(4, 1)
+    )
+    with grpc.insecure_channel(grpc_target) as channel:
+        call = channel.unary_unary(
+            "/lore.revision.v1.RevisionService/BranchPush",
+            request_serializer=lambda r: r,
+            response_deserializer=parse_fields,
+        )
+        fields = call(
+            request,
+            timeout=30,
+            metadata=(("urc-repository-id-bin", bytes.fromhex(repo.get_id())),),
+        )
+    return field_bytes(fields, 1).hex(), field_bool(fields, 3)
+
+
+def _files_on_main(repo: Lore) -> set[str]:
+    """Every file a fresh clone of main holds."""
+    clone = repo.clone()
+    files = set()
+    for root, dirs, names in os.walk(clone.path):
+        dirs[:] = [d for d in dirs if d != ".lore"]
+        for name in names:
+            files.add(
+                os.path.relpath(os.path.join(root, name), clone.path).replace(
+                    os.sep, "/"
+                )
+            )
+    return files
+
+
+def _commit(repo: Lore, path: str, message: str, offline: bool = True) -> None:
+    with repo.open_file(path, "w+") as f:
+        f.write(f"{path}\n")
+    repo.stage(scan=True, offline=offline)
+    repo.commit(message, offline=offline)
+
+
+def _two_commit_feature(repo: Lore) -> tuple[str, str]:
+    """Base on main, then `feature` with two commits. Returns main's id and feature's tip."""
+    _commit(repo, "readme.txt", "Base")
+    repo.push()
+    main = repo.branch_info().id
+    repo.branch_create("feature")
+    _commit(repo, "first.txt", "First")
+    _commit(repo, "second.txt", "Second")
+    repo.push()
+    return main, repo.branch_info().local_latest
+
+
+@pytest.mark.regression
+def test_server_push_of_several_commits_onto_an_unmoved_head_keeps_them_all(
+    new_lore_repo, lore_grpc_target
+):
+    """A push more than one commit ahead of an unmoved head is a fast-forward.
+
+    The server used to apply a push directly only when the pushed revision's direct parent
+    was the head, and otherwise to merge from that parent rather than from where the two
+    histories meet. So a branch of two commits, pushed onto an unmoved main, was merged from
+    its first commit: only the second commit's change was applied, and the first was lost.
+    """
+    repo: Lore = new_lore_repo()
+    main, tip = _two_commit_feature(repo)
+
+    result, merged = _branch_push(lore_grpc_target, repo, main, tip)
+
+    assert _files_on_main(repo) == {"readme.txt", "first.txt", "second.txt"}
+    assert (result, merged) == (tip.lower(), False), (
+        "the push should be a plain fast-forward"
+    )
+
+
+@pytest.mark.regression
+def test_server_push_of_several_commits_onto_a_moved_head_keeps_them_all(
+    new_lore_repo, lore_grpc_target
+):
+    """As above, with the head moved, so the server must build a merge.
+
+    The merge must apply both commits, from where the histories meet, and keep the head's own
+    change. Merged from the tip's parent instead, it applied only the second commit.
+    """
+    repo: Lore = new_lore_repo()
+    main, tip = _two_commit_feature(repo)
+
+    repo.branch_switch("main")
+    clone = repo.clone()
+    _commit(clone, "docs.txt", "Concurrent")
+    clone.push()
+
+    _, merged = _branch_push(lore_grpc_target, repo, main, tip)
+
+    assert _files_on_main(repo) == {"readme.txt", "first.txt", "second.txt", "docs.txt"}
+    assert merged, "the head moved, so the server should build a merge"
+
+
+@pytest.mark.regression
+def test_server_push_of_a_sync_merge_onto_an_unmoved_head_keeps_both_sides(
+    new_lore_repo, lore_grpc_target
+):
+    """A branch whose tip is a sync merge, pushed onto an unmoved head, is a fast-forward.
+
+    Merged from the sync merge's first parent instead, it lost the branch's earlier changes,
+    or failed with "Failed to apply tree changes for fast-forward merge: Node not found".
+    """
+    repo: Lore = new_lore_repo()
+    _commit(repo, "readme.txt", "Base")
+    repo.push()
+    main = repo.branch_info().id
+    repo.branch_create("feature")
+    _commit(repo, "feature.txt", "Feature")
+    repo.push()
+
+    other = repo.clone()
+    other.branch_switch("feature")
+    # Online: a fresh clone switched to feature has none of its metadata blocks cached
+    _commit(other, "remote.txt", "Remote", offline=False)
+    other.push()
+
+    with repo.open_file("local.txt", "w+") as f:
+        f.write("local.txt\n")
+    repo.stage("local.txt")
+    repo.commit("Local", local=True)
+    repo.sync()
+    repo.push()
+    tip = repo.branch_info().local_latest
+    assert len(repo.revision_info(tip).merge.split()) == 2, (
+        "the case needs a sync merge tip"
+    )
+
+    result, merged = _branch_push(lore_grpc_target, repo, main, tip)
+
+    assert _files_on_main(repo) == {
+        "readme.txt",
+        "feature.txt",
+        "remote.txt",
+        "local.txt",
+    }
+    assert (result, merged) == (tip.lower(), False), (
+        "the push should be a plain fast-forward"
+    )
