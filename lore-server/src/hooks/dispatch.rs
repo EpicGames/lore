@@ -5,7 +5,7 @@
 //! The [`HookDispatcher`] is responsible for:
 //!
 //! - Maintaining a mapping from [`HookPoint`] to registered hooks
-//! - Executing pre-handlers synchronously with timeout protection
+//! - Awaiting pre-handlers in the request, cancelled at their timeout
 //! - Spawning post-handlers asynchronously in separate tasks
 //! - Isolating hook errors and panics to prevent cascade failures
 //! - Logging hook execution with correlation IDs for audit trails
@@ -14,9 +14,10 @@
 //!
 //! The dispatcher provides three methods for hook execution:
 //!
-//! 1. **`dispatch_pre()`** - Synchronous pre-handler execution
-//!    - All hooks execute in registration order
-//!    - Each hook has a timeout (default 200ms)
+//! 1. **`dispatch_pre()`** - Asynchronous pre-handler execution, awaited
+//!    - All hooks execute in registration order, one at a time
+//!    - Each hook is cancelled at its timeout (default 1s, overridable
+//!      per hook)
 //!    - Panics are caught and isolated
 //!    - Returns first error to enable veto capability
 //!
@@ -57,8 +58,8 @@
 //!     .repository(RepositoryId::default())
 //!     .build();
 //!
-//! // Dispatch pre-handlers (synchronous, can veto):
-//! // dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)?;
+//! // Dispatch pre-handlers (awaited, can veto):
+//! // dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx).await?;
 //!
 //! // Spawn post-handlers (asynchronous, non-blocking):
 //! // dispatcher.spawn_post(HookPoint::BranchPush, ctx);
@@ -84,7 +85,7 @@ use crate::hooks::traits::HookPoint;
 use crate::hooks::traits::HookResponse;
 
 /// Default timeout for pre-handler execution.
-pub const DEFAULT_PRE_HANDLER_TIMEOUT: Duration = Duration::from_millis(200);
+pub const DEFAULT_PRE_HANDLER_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default timeout for post-handler execution.
 pub const DEFAULT_POST_HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -157,7 +158,7 @@ impl HookDispatcher {
     /// Creates a new dispatcher with the given hooks and default timeouts.
     ///
     /// Uses:
-    /// - 200ms for pre-handler timeout
+    /// - 1s for pre-handler timeout
     /// - 30s for post-handler timeout
     pub fn from_hooks_default(hooks: Vec<(String, Box<dyn Hook>)>) -> Self {
         Self::new(
@@ -203,11 +204,11 @@ impl HookDispatcher {
         self.post_handler_timeout
     }
 
-    /// Dispatches pre-handlers synchronously for all enabled hooks.
+    /// Dispatches pre-handlers for all enabled hooks, awaiting each in turn.
     ///
     /// # Execution Model
     ///
-    /// 1. Executes all pre-handlers in registration order
+    /// 1. Executes all pre-handlers in registration order, one at a time
     /// 2. Each pre-handler is wrapped with timeout and panic isolation
     /// 3. All pre-handlers execute even if earlier ones fail
     /// 4. Returns the first error encountered (enables veto)
@@ -217,10 +218,12 @@ impl HookDispatcher {
     /// - `Ok(())` if all pre-handlers succeed
     /// - `Err(HookError)` if any pre-handler fails (first error)
     ///
-    /// # Blocking Behavior
+    /// # Timeouts
     ///
-    /// This method blocks until all pre-handlers complete or timeout.
-    /// Use before the operation to enable rejection/veto capability.
+    /// A pre-handler still running at its timeout is dropped at its current
+    /// await and reported as [`HookError::Timeout`]. The timeout is the hook's
+    /// [`pre_handler_timeout`](Hook::pre_handler_timeout) when set, the
+    /// dispatcher's otherwise.
     ///
     /// # Logging
     ///
@@ -231,20 +234,22 @@ impl HookDispatcher {
     /// - `phase` = "pre"
     /// - `duration_ms`
     /// - `result` (ok/error)
-    pub fn dispatch_pre(&self, point: HookPoint, ctx: &HookContext) -> Result<(), HookError> {
+    pub async fn dispatch_pre(&self, point: HookPoint, ctx: &HookContext) -> Result<(), HookError> {
         let hooks = match self.hooks_by_point.get(&point) {
             Some(hooks) if !hooks.is_empty() => hooks,
             _ => return Ok(()),
         };
 
-        let correlation_id = ctx.correlation_id().to_string();
+        let correlation_id = ctx.correlation_id();
         let mut first_error: Option<HookError> = None;
 
         for hook in hooks {
             let hook_name = hook.name();
             let start = Instant::now();
 
-            let result = self.execute_pre_handler_with_isolation(hook.clone(), ctx);
+            let result = self
+                .execute_pre_handler_with_isolation(hook.as_ref(), ctx)
+                .await;
 
             let duration = start.elapsed();
 
@@ -284,46 +289,52 @@ impl HookDispatcher {
     }
 
     /// Executes a single pre-handler with timeout and panic isolation.
-    fn execute_pre_handler_with_isolation(
+    async fn execute_pre_handler_with_isolation(
         &self,
-        hook: Arc<dyn Hook>,
+        hook: &dyn Hook,
         ctx: &HookContext,
     ) -> Result<(), HookError> {
-        let hook_name = hook.name().to_string();
-        let timeout = self.pre_handler_timeout;
+        let timeout = self.timeout_for(hook);
 
-        let start = Instant::now();
-
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| hook.pre_handler(ctx)));
-
-        let elapsed = start.elapsed();
-
-        if elapsed > timeout {
-            warn!(
-                hook_name = %hook_name,
-                timeout_ms = timeout.as_millis(),
-                actual_ms = elapsed.as_millis(),
-                "Pre-handler exceeded timeout"
-            );
-            return Err(HookError::Timeout { hook_name, timeout });
-        }
+        let result = tokio::time::timeout(
+            timeout,
+            AssertUnwindSafe(hook.pre_handler(ctx)).catch_unwind(),
+        )
+        .await;
 
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(hook_error)) => Err(hook_error),
-            Err(panic_err) => {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(hook_error))) => Err(hook_error),
+            Ok(Err(panic_err)) => {
                 let panic_msg = extract_panic_message(panic_err);
                 error!(
-                    hook_name = %hook_name,
+                    hook_name = hook.name(),
                     panic_message = %panic_msg,
                     "Pre-handler panicked"
                 );
                 Err(HookError::Panic {
-                    hook_name,
+                    hook_name: hook.name().to_string(),
                     message: panic_msg,
                 })
             }
+            Err(_elapsed) => {
+                warn!(
+                    hook_name = hook.name(),
+                    timeout_ms = timeout.as_millis(),
+                    "Pre-handler timed out"
+                );
+                Err(HookError::Timeout {
+                    hook_name: hook.name().to_string(),
+                    timeout,
+                })
+            }
         }
+    }
+
+    /// The pre-handler and response-handler timeout for `hook`.
+    fn timeout_for(&self, hook: &dyn Hook) -> Duration {
+        hook.pre_handler_timeout()
+            .unwrap_or(self.pre_handler_timeout)
     }
 
     /// Dispatches response handlers synchronously for all enabled hooks.
@@ -401,7 +412,7 @@ impl HookDispatcher {
         ctx: &HookContext,
     ) -> Result<HookResponse, HookError> {
         let hook_name = hook.name().to_string();
-        let timeout = self.pre_handler_timeout;
+        let timeout = self.timeout_for(hook.as_ref());
 
         let start = Instant::now();
 

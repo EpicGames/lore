@@ -31,6 +31,7 @@ use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
@@ -64,12 +65,14 @@ pub async fn handler(
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let user_id = get_user_id(request.extensions());
+    let is_service_account = get_is_service_account(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // RepositoryCreate has no pre-existing repository
         user_id,
+        is_service_account,
         correlation_id,
         authorization,
     };
@@ -157,6 +160,7 @@ pub async fn repository_create_implementation(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::RepositoryCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             let (created_metadata, metadata_hash) = repository_create_inner(

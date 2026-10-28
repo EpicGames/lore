@@ -7,6 +7,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- Server hooks: `Hook::pre_handler` is now `async`, so a pre-handler can call other services without blocking a worker
+  thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout
+  (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of
+  `INTERNAL`
+
 ### Features
 
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a

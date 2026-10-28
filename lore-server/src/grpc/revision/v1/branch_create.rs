@@ -29,6 +29,8 @@ use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// Reject oversized string fields early to prevent resource exhaustion.
@@ -146,19 +148,25 @@ pub async fn branch_create_implementation(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            validate_create_input(&name, &category, &creator)?;
+
             let hook_ctx = HookContext::builder()
                 .correlation_id(&context.correlation_id)
                 .hook_point(HookPoint::BranchCreate)
                 .repository(context.repository_id)
                 .user(&context.user_id)
                 .branch(branch)
+                .metadata(METADATA_BRANCH_NAME, &name)
+                .metadata(
+                    METADATA_IS_SERVICE_ACCOUNT,
+                    context.is_service_account.to_string(),
+                )
                 .build();
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
-
-            validate_create_input(&name, &category, &creator)?;
 
             debug!({BRANCH_ID} = %branch, branch_name = %name, stack = ?stack, "Creating branch");
 

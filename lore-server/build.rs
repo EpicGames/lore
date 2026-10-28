@@ -518,10 +518,10 @@ const HOOKS_MOD_DOC: &str = r#"//! Hook infrastructure for Lore Server modulariz
 //!
 //! The hook system supports a two-phase execution model:
 //!
-//! 1. **Pre-handler** (synchronous): Called BEFORE the operation
-//!    - Can read/modify context
+//! 1. **Pre-handler** (asynchronous, awaited): Called BEFORE the operation
+//!    - Can read context
 //!    - Can veto/reject by returning `Err(HookError::Rejected)`
-//!    - Subject to timeout (default 200ms)
+//!    - Cancelled at its timeout (default 1s, overridable per hook)
 //!    - Panics are caught and isolated
 //!
 //! 2. **Post-handler** (asynchronous): Called AFTER the operation
@@ -619,8 +619,8 @@ const HOOKS_MOD_DOC: &str = r#"//! Hook infrastructure for Lore Server modulariz
 //! // Create dispatcher
 //! let dispatcher = HookDispatcher::empty();
 //!
-//! // Phase 1: Dispatch pre-handlers (synchronous, can veto)
-//! // dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)?;
+//! // Phase 1: Dispatch pre-handlers (awaited, can veto)
+//! // dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx).await?;
 //!
 //! // ... perform the actual operation ...
 //!
@@ -658,7 +658,7 @@ const HOOKS_MOD_DOC: &str = r#"//! Hook infrastructure for Lore Server modulariz
 //!         &[HookPoint::BranchPush]
 //!     }
 //!
-//!     fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+//!     async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
 //!         // Validate before operation (can reject)
 //!         if ctx.user().map_or(false, |u| u.starts_with("blocked_")) {
 //!             return Err(HookError::rejected(
@@ -714,7 +714,7 @@ const HOOKS_MOD_DOC: &str = r#"//! Hook infrastructure for Lore Server modulariz
 //!
 //! - [`HookError::Rejected`] - Hook explicitly rejected/vetoed the operation
 //! - [`HookError::ExecutionFailed`] - Hook returned an error (may veto operation)
-//! - [`HookError::Timeout`] - Hook exceeded timeout (default 200ms for pre, 30s for post)
+//! - [`HookError::Timeout`] - Hook exceeded timeout (default 1s for pre, 30s for post)
 //! - [`HookError::Panic`] - Hook panicked (caught and isolated)
 //! - [`HookError::ConfigError`] - Hook configuration is invalid
 //! - [`HookError::InitError`] - Hook initialization failed

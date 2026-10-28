@@ -25,6 +25,8 @@ use opentelemetry::KeyValue;
 use rand::random;
 use tonic::Request;
 
+use super::hook_recorder::Seen;
+use super::hook_recorder::recording_dispatcher;
 use crate::notification::testing::MockNotificationSender;
 use crate::store::test_support::test_store_create;
 
@@ -387,6 +389,94 @@ mod direct_handling {
             .await
             .expect_err("protected delete should fail");
             assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pre_hook_sees_branch_name_and_service_account() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_deleted()
+            .return_once(|_, _| ());
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context, branch_id).await;
+
+            let (hook_dispatcher, seen) = recording_dispatcher(false);
+            handler(
+                make_request(repository, branch_id),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &None, /* no forwarded requests */
+                &hook_dispatcher,
+                &instrument_provider,
+            )
+            .await
+            .expect("delete should succeed");
+
+            assert_eq!(
+                *seen.lock(),
+                vec![Seen {
+                    branch_name: Some("test-name".into()),
+                    is_service_account: Some("false".into()),
+                }]
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejected_delete_keeps_branch() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context.clone(), branch_id).await;
+
+            let (hook_dispatcher, _seen) = recording_dispatcher(true);
+            let err = handler(
+                make_request(repository, branch_id),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &None, /* no forwarded requests */
+                &hook_dispatcher,
+                &instrument_provider,
+            )
+            .await
+            .expect_err("a rejected delete should fail");
+
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            let mapped = branch::load_name_to_id_local(repository_context, "test-name")
+                .await
+                .expect("the branch name should still be mapped");
+            assert_eq!(BranchId::from(mapped), branch_id);
         }))
         .await;
     }

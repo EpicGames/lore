@@ -89,6 +89,7 @@ fn make_forwarded_request(
     CallerContext {
         repository_id: repository,
         user_id: "alice".into(),
+        is_service_account: false,
         correlation_id: String::new(),
         authorization: None,
     }

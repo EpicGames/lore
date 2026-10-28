@@ -75,6 +75,7 @@ pub async fn handler(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::RepositoryCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             let default_branch_id = req.default_branch_id.into();

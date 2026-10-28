@@ -54,7 +54,7 @@ impl Hook for SuccessHook {
         self.points
     }
 
-    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
         self.pre_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -96,7 +96,7 @@ impl Hook for RejectingHook {
         self.points
     }
 
-    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
         self.pre_count.fetch_add(1, Ordering::SeqCst);
         Err(HookError::rejected(
             self.name,
@@ -137,16 +137,20 @@ impl Hook for FailingHook {
         self.points
     }
 
-    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
         self.execute_count.fetch_add(1, Ordering::SeqCst);
         Err(HookError::execution_failed(self.name, "Hook failed"))
     }
 }
 
+/// Sleeps for `delay` in its pre-handler and counts the pre-handlers that ran
+/// to completion.
 struct SlowPreHook {
     name: &'static str,
     points: &'static [HookPoint],
     delay: Duration,
+    timeout: Option<Duration>,
+    completed: Arc<AtomicUsize>,
 }
 
 impl SlowPreHook {
@@ -155,7 +159,14 @@ impl SlowPreHook {
             name,
             points,
             delay,
+            timeout: None,
+            completed: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 }
 
@@ -169,9 +180,14 @@ impl Hook for SlowPreHook {
         self.points
     }
 
-    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
-        std::thread::sleep(self.delay);
+    async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+        tokio::time::sleep(self.delay).await;
+        self.completed.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn pre_handler_timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 }
 
@@ -236,7 +252,7 @@ impl Hook for PanicPreHook {
         self.points
     }
 
-    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
         panic!("Pre-handler panicked!");
     }
 }
@@ -294,7 +310,7 @@ impl Hook for ContextReadingHook {
         self.points
     }
 
-    fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
         // Read-only access to context
         *self.observed_user.lock() = ctx.user().map(|s| s.to_string());
         Ok(())
@@ -327,15 +343,8 @@ fn test_empty_dispatcher() {
 }
 
 /// A dispatcher whose handler timeouts are far longer than any handler here
-/// needs.
-///
-/// `dispatch_pre` measures a handler after it returns and reports
-/// `HookError::Timeout` if it took longer than the limit, discarding what
-/// the handler actually produced. With the 200 ms default that turns a
-/// loaded machine into a test failure: the handler's real result -- a
-/// panic, a rejection, a success -- is replaced by a timeout that says
-/// nothing about the behaviour under test. Tests that are about the timeout
-/// set a short one deliberately.
+/// needs, so a loaded machine cannot turn a handler's result into a timeout.
+/// Tests that are about the timeout set a short one deliberately.
 fn test_dispatcher(hooks: Vec<(String, Box<dyn Hook>)>) -> HookDispatcher {
     HookDispatcher::new(hooks, Duration::from_secs(60), Duration::from_secs(60))
 }
@@ -359,19 +368,22 @@ fn test_dispatcher_from_hooks_default() {
     );
 }
 
-#[test]
-fn test_dispatch_pre_no_hooks() {
+#[tokio::test]
+async fn test_dispatch_pre_no_hooks() {
     let dispatcher = HookDispatcher::empty();
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_dispatch_pre_success() {
+#[tokio::test]
+async fn test_dispatch_pre_success() {
     let pre_count = Arc::new(AtomicUsize::new(0));
     let post_count = Arc::new(AtomicUsize::new(0));
 
@@ -386,16 +398,19 @@ fn test_dispatch_pre_success() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
     assert!(result.is_ok());
     assert_eq!(pre_count.load(Ordering::SeqCst), 1);
     assert_eq!(post_count.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn test_dispatch_pre_multiple_hooks() {
+#[tokio::test]
+async fn test_dispatch_pre_multiple_hooks() {
     let pre_count1 = Arc::new(AtomicUsize::new(0));
     let pre_count2 = Arc::new(AtomicUsize::new(0));
 
@@ -419,16 +434,19 @@ fn test_dispatch_pre_multiple_hooks() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
     assert!(result.is_ok());
     assert_eq!(pre_count1.load(Ordering::SeqCst), 1);
     assert_eq!(pre_count2.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn test_dispatch_pre_wrong_hook_point() {
+#[tokio::test]
+async fn test_dispatch_pre_wrong_hook_point() {
     let pre_count = Arc::new(AtomicUsize::new(0));
 
     let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
@@ -442,15 +460,18 @@ fn test_dispatch_pre_wrong_hook_point() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchDelete, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchDelete, &ctx),
+        )
+        .await;
     assert!(result.is_ok());
     assert_eq!(pre_count.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn test_dispatch_pre_rejection() {
+#[tokio::test]
+async fn test_dispatch_pre_rejection() {
     let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
         "rejecting".to_string(),
         Box::new(RejectingHook::new("rejecting", &[HookPoint::BranchPush])),
@@ -459,9 +480,12 @@ fn test_dispatch_pre_rejection() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
     assert!(result.is_err());
 
     match result.unwrap_err() {
@@ -478,8 +502,8 @@ fn test_dispatch_pre_rejection() {
     }
 }
 
-#[test]
-fn test_dispatch_pre_error_isolation() {
+#[tokio::test]
+async fn test_dispatch_pre_error_isolation() {
     let counter1 = Arc::new(AtomicUsize::new(0));
     let counter2 = Arc::new(AtomicUsize::new(0));
 
@@ -503,9 +527,12 @@ fn test_dispatch_pre_error_isolation() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
 
     assert!(result.is_err());
 
@@ -513,8 +540,8 @@ fn test_dispatch_pre_error_isolation() {
     assert_eq!(counter2.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn test_dispatch_pre_returns_first_error() {
+#[tokio::test]
+async fn test_dispatch_pre_returns_first_error() {
     let counter1 = Arc::new(AtomicUsize::new(0));
     let counter2 = Arc::new(AtomicUsize::new(0));
 
@@ -538,9 +565,12 @@ fn test_dispatch_pre_returns_first_error() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
 
     match result.unwrap_err() {
         HookError::Rejected { hook_name, .. } => {
@@ -553,16 +583,12 @@ fn test_dispatch_pre_returns_first_error() {
     assert_eq!(counter2.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn test_dispatch_pre_timeout() {
-    let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
-        "slow".to_string(),
-        Box::new(SlowPreHook::new(
-            "slow",
-            &[HookPoint::BranchPush],
-            Duration::from_millis(500),
-        )),
-    )];
+#[tokio::test]
+async fn test_dispatch_pre_timeout_cancels_handler() {
+    let delay = Duration::from_millis(500);
+    let hook = SlowPreHook::new("slow", &[HookPoint::BranchPush], delay);
+    let completed = hook.completed.clone();
+    let hooks: Vec<(String, Box<dyn Hook>)> = vec![("slow".to_string(), Box::new(hook))];
 
     let dispatcher = HookDispatcher::new(
         hooks,
@@ -571,9 +597,14 @@ fn test_dispatch_pre_timeout() {
     );
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let start = Instant::now();
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
+    let elapsed = start.elapsed();
 
     match result.unwrap_err() {
         HookError::Timeout { hook_name, .. } => {
@@ -581,10 +612,68 @@ fn test_dispatch_pre_timeout() {
         }
         _ => panic!("Expected Timeout error"),
     }
+    assert!(
+        elapsed < delay,
+        "dispatch waited {elapsed:?} for a {delay:?} handler"
+    );
+
+    // Past the handler's own delay: a handler left running would have
+    // completed by now.
+    tokio::time::sleep(delay + Duration::from_millis(100)).await;
+    assert_eq!(completed.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn test_dispatch_pre_panic_isolation() {
+#[tokio::test]
+async fn test_dispatch_pre_hook_timeout_extends_default() {
+    let hook = SlowPreHook::new("slow", &[HookPoint::BranchPush], Duration::from_millis(100))
+        .with_timeout(Duration::from_secs(60));
+    let completed = hook.completed.clone();
+    let hooks: Vec<(String, Box<dyn Hook>)> = vec![("slow".to_string(), Box::new(hook))];
+
+    let dispatcher = HookDispatcher::new(
+        hooks,
+        Duration::from_millis(10),
+        DEFAULT_POST_HANDLER_TIMEOUT,
+    );
+    let ctx = create_test_context();
+
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
+
+    assert!(result.is_ok());
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_dispatch_pre_hook_timeout_shortens_default() {
+    let hook = SlowPreHook::new("slow", &[HookPoint::BranchPush], Duration::from_secs(60))
+        .with_timeout(Duration::from_millis(50));
+    let hooks: Vec<(String, Box<dyn Hook>)> = vec![("slow".to_string(), Box::new(hook))];
+
+    let dispatcher = test_dispatcher(hooks);
+    let ctx = create_test_context();
+
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
+
+    match result.unwrap_err() {
+        HookError::Timeout { timeout, .. } => {
+            assert_eq!(timeout, Duration::from_millis(50));
+        }
+        _ => panic!("Expected Timeout error"),
+    }
+}
+
+#[tokio::test]
+async fn test_dispatch_pre_panic_isolation() {
     // Temporarily set a silent panic hook to suppress the custom panic output
     // from urc-core's execution_initialize(). The panic is still caught by
     // catch_unwind, but we don't want it printing to stderr during tests.
@@ -601,9 +690,12 @@ fn test_dispatch_pre_panic_isolation() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
 
     // Restore previous panic hook before assertions (so assertion failures are visible)
     std::panic::set_hook(prev_hook);
@@ -617,8 +709,8 @@ fn test_dispatch_pre_panic_isolation() {
     }
 }
 
-#[test]
-fn test_dispatch_pre_panic_does_not_affect_other_hooks() {
+#[tokio::test]
+async fn test_dispatch_pre_panic_does_not_affect_other_hooks() {
     // Temporarily set a silent panic hook to suppress the custom panic output
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -642,9 +734,12 @@ fn test_dispatch_pre_panic_does_not_affect_other_hooks() {
     let dispatcher = test_dispatcher(hooks);
     let ctx = create_test_context();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
 
     // Restore previous panic hook before assertions
     std::panic::set_hook(prev_hook);
@@ -654,8 +749,8 @@ fn test_dispatch_pre_panic_does_not_affect_other_hooks() {
     assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
-#[test]
-fn test_dispatch_pre_context_read_only() {
+#[tokio::test]
+async fn test_dispatch_pre_context_read_only() {
     // Test that hooks can read context values
     let reader = ContextReadingHook::new("reader", &[HookPoint::BranchPush]);
     let observed = reader.observed_user.clone();
@@ -670,9 +765,12 @@ fn test_dispatch_pre_context_read_only() {
         .user("test_user")
         .build();
 
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
     assert!(result.is_ok());
 
     // Hook should have read the user value
@@ -896,8 +994,8 @@ async fn test_spawn_post_timeout_isolation() {
         .await;
 }
 
-#[test]
-fn test_dispatch_pre_performance_many_hooks() {
+#[tokio::test]
+async fn test_dispatch_pre_performance_many_hooks() {
     let mut hooks: Vec<(String, Box<dyn Hook>)> = Vec::new();
 
     for i in 0..100 {
@@ -914,9 +1012,12 @@ fn test_dispatch_pre_performance_many_hooks() {
     let ctx = create_test_context();
 
     let start = std::time::Instant::now();
-    let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
-        dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx)
-    });
+    let result = LORE_CONTEXT
+        .scope(
+            test_execution_context(),
+            dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
+        )
+        .await;
     let elapsed = start.elapsed();
 
     assert!(result.is_ok());

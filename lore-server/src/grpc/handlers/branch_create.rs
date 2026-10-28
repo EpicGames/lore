@@ -106,6 +106,7 @@ pub async fn handler(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             validate_create_input(&name, &category, &creator)?;

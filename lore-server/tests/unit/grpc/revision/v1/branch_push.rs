@@ -11,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::revision::v1::branch_push::*;
 use lore_server::hooks::HookDispatcher;
@@ -20,6 +21,8 @@ use opentelemetry::KeyValue;
 use rand::random;
 use tonic::Request;
 
+use super::hook_recorder::Seen;
+use super::hook_recorder::recording_dispatcher;
 use crate::grpc::push_protected::PUSH_PROTECTED;
 use crate::grpc::push_protected::TIERS;
 use crate::grpc::push_protected::Tier;
@@ -821,4 +824,127 @@ async fn create_child_branch(
     )
     .await
     .expect("Could not create child branch")
+}
+
+#[tokio::test]
+async fn pre_hook_sees_branch_name_and_service_account() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .return_once(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let mut request = make_request(repository, main, revision, false, false);
+        request.extensions_mut().insert(AuthorizationToken {
+            user_id: "ci-bot".into(),
+            is_service_account: Some(true),
+            ..AuthorizationToken::default()
+        });
+        let (hook_dispatcher, seen) = recording_dispatcher(false);
+        handler(
+            request,
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("push should succeed");
+
+        assert_eq!(
+            *seen.lock(),
+            vec![Seen {
+                branch_name: Some("main".into()),
+                is_service_account: Some("true".into()),
+            }]
+        );
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn rejected_push_to_deleted_branch_does_not_reinstate_name() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(1)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
+        handler(
+            make_request(repository, main, main_latest, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &HookDispatcher::empty(),
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("seed push should succeed");
+
+        let child = create_child_branch(&repository_context, "feature", main, main_latest).await;
+        branch::delete(repository_context.clone(), child)
+            .await
+            .expect("delete should succeed");
+
+        let (hook_dispatcher, seen) = recording_dispatcher(true);
+        let child_revision = build_revision(&repository_context, main_latest, 2).await;
+        let err = handler(
+            make_request(repository, child, child_revision, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("a rejected push should fail");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(seen.lock()[0].branch_name.as_deref(), Some("feature"));
+        assert!(
+            branch::load_name_to_id_local(repository_context.clone(), "feature")
+                .await
+                .is_err(),
+            "a rejected push must leave the deleted name unmapped",
+        );
+    }))
+    .await;
 }

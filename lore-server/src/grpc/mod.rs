@@ -257,6 +257,15 @@ pub fn get_user_id(extensions: &Extensions) -> String {
     get_user_id_from_token_ref(auth)
 }
 
+/// Whether the caller's verified token marks it as a service account. False
+/// without a token.
+pub fn get_is_service_account(extensions: &Extensions) -> bool {
+    extensions
+        .get::<AuthorizationToken>()
+        .and_then(|token| token.is_service_account)
+        .unwrap_or(false)
+}
+
 /// Marker that opts the gRPC server crate into [`RepositoryWriteToken::server`].
 ///
 /// Defined here (private) so the only path to mint a server token in this
@@ -462,8 +471,9 @@ where
 
 /// Converts a [`HookError`] into a [`tonic::Status`].
 ///
-/// Maps [`StatusCode`] variants to their corresponding gRPC status codes.
-/// Non-rejection errors (timeout, panic, execution failure) map to `INTERNAL`.
+/// Maps [`StatusCode`] variants to their corresponding gRPC status codes. A
+/// timeout maps to `UNAVAILABLE`, so the client may retry. Other non-rejection
+/// errors (panic, execution failure) map to `INTERNAL`.
 pub fn hook_error_to_status(error: HookError) -> Status {
     match &error {
         HookError::Rejected {
@@ -475,7 +485,9 @@ pub fn hook_error_to_status(error: HookError) -> Status {
             StatusCode::InvalidArgument => Status::invalid_argument(message),
             StatusCode::Aborted => Status::aborted(message),
             StatusCode::Internal => Status::internal(message),
+            StatusCode::Unavailable => Status::unavailable(message),
         },
+        HookError::Timeout { .. } => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),
     }
 }

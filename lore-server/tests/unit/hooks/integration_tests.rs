@@ -43,7 +43,7 @@ impl Hook for TestHook {
         self.points
     }
 
-    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
         self.pre_count.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -121,8 +121,8 @@ async fn test_end_to_end_two_phase_dispatch() {
                 .user("test_user")
                 .build();
 
-            // 5. Phase 1: Dispatch pre-handlers (synchronous)
-            let result = dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx);
+            // 5. Phase 1: Dispatch pre-handlers (awaited)
+            let result = dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx).await;
             assert!(result.is_ok());
 
             // 6. Phase 2: Spawn post-handlers (asynchronous)
@@ -150,7 +150,7 @@ async fn test_hook_veto_workflow() {
                     &[HookPoint::BranchPush]
                 }
 
-                fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+                async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
                     // Veto operations from blocked users
                     if let Some(user) = ctx.user()
                         && user.starts_with("blocked_")
@@ -201,7 +201,9 @@ async fn test_hook_veto_workflow() {
                 .user("normal_user")
                 .build();
 
-            let result = dispatcher.dispatch_pre(HookPoint::BranchPush, &allowed_ctx);
+            let result = dispatcher
+                .dispatch_pre(HookPoint::BranchPush, &allowed_ctx)
+                .await;
             assert!(result.is_ok());
 
             // Test: Blocked user
@@ -212,7 +214,9 @@ async fn test_hook_veto_workflow() {
                 .user("blocked_user")
                 .build();
 
-            let result = dispatcher.dispatch_pre(HookPoint::BranchPush, &blocked_ctx);
+            let result = dispatcher
+                .dispatch_pre(HookPoint::BranchPush, &blocked_ctx)
+                .await;
             assert!(result.is_err());
 
             match result.unwrap_err() {

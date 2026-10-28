@@ -595,6 +595,8 @@ Hooks fire at these points:
 - **`RepositoryCreate`** — before a new repository is created.
 - **`Obliterate`** — before content is obliterated.
 
+A hook's pre-handler runs before the operation, and the operation waits for it. A pre-handler still running after 1 second, or after the timeout the hook sets for itself, is cancelled and the operation fails with `UNAVAILABLE`, so the client can retry. On the v1 `BranchPush`, `BranchCreate`, and `BranchDelete` RPCs, a pre-handler sees the branch name and whether the caller is a service account.
+
 A hook can veto an operation by returning an error, log or audit it, or trigger an external notification. The example below sketches a compliance hook that denies pushes to protected branch patterns and posts to a webhook on failure. It is illustrative — `deny_patterns`, `allowed_users`, and `webhook_url` are fields a *custom* compliance hook would define; the stock `loreserver` ships no such hook (see note below):
 
 ```toml

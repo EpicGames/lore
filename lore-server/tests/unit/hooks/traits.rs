@@ -158,8 +158,8 @@ impl Hook for MinimalHook {
     }
 }
 
-#[test]
-fn test_hook_default_pre_handler() {
+#[tokio::test]
+async fn test_hook_default_pre_handler() {
     use lore_revision::lore::RepositoryId;
 
     let hook = MinimalHook;
@@ -169,7 +169,7 @@ fn test_hook_default_pre_handler() {
         .repository(RepositoryId::default())
         .build();
 
-    let result = hook.pre_handler(&ctx);
+    let result = hook.pre_handler(&ctx).await;
     assert!(result.is_ok());
 }
 
@@ -216,7 +216,7 @@ impl Hook for RejectingHook {
         &[HookPoint::BranchPush]
     }
 
-    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
         Err(HookError::rejected(
             self.name(),
             "Operation not allowed",
@@ -225,8 +225,8 @@ impl Hook for RejectingHook {
     }
 }
 
-#[test]
-fn test_hook_pre_handler_rejection() {
+#[tokio::test]
+async fn test_hook_pre_handler_rejection() {
     use lore_revision::lore::RepositoryId;
 
     let hook = RejectingHook;
@@ -236,7 +236,7 @@ fn test_hook_pre_handler_rejection() {
         .repository(RepositoryId::default())
         .build();
 
-    let result = hook.pre_handler(&ctx);
+    let result = hook.pre_handler(&ctx).await;
     assert!(result.is_err());
 
     let err = result.unwrap_err();

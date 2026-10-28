@@ -38,8 +38,24 @@ mod from_original_request {
         let ctx = CallerContext::from_original_request(&request).unwrap();
         assert_eq!(ctx.repository_id, repository);
         assert_eq!(ctx.user_id, "alice");
+        assert!(!ctx.is_service_account);
         assert_eq!(ctx.correlation_id, "corr-123");
         assert_eq!(ctx.authorization, None);
+    }
+
+    #[test]
+    fn service_account_claim_is_extracted() {
+        let repository = random::<RepositoryId>();
+        let mut request = Request::new(());
+        insert_repository(&mut request, repository);
+        request.extensions_mut().insert(AuthorizationToken {
+            user_id: "ci-bot".into(),
+            is_service_account: Some(true),
+            ..AuthorizationToken::default()
+        });
+
+        let ctx = CallerContext::from_original_request(&request).unwrap();
+        assert!(ctx.is_service_account);
     }
 
     #[test]
@@ -194,6 +210,7 @@ mod to_forwarded_request {
         CallerContext {
             repository_id: repository,
             user_id: "alice".into(),
+            is_service_account: false,
             correlation_id: "corr-789".into(),
             authorization: authorization.map(|s| s.to_string()),
         }
@@ -248,5 +265,19 @@ mod to_forwarded_request {
         let forwarded = ctx.to_forwarded_request(()).unwrap();
         let recovered = CallerContext::from_forwarded_request(&forwarded).unwrap();
         assert_eq!(recovered.authorization, None);
+    }
+
+    #[test]
+    fn round_trip_preserves_service_account() {
+        for is_service_account in [true, false] {
+            let ctx = CallerContext {
+                is_service_account,
+                ..make_context(random::<RepositoryId>(), None)
+            };
+
+            let forwarded = ctx.to_forwarded_request(()).unwrap();
+            let recovered = CallerContext::from_forwarded_request(&forwarded).unwrap();
+            assert_eq!(recovered.is_service_account, is_service_account);
+        }
     }
 }

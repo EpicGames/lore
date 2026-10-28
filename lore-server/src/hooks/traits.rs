@@ -20,10 +20,10 @@
 //!
 //! The hook system supports a three-phase execution model:
 //!
-//! 1. **Pre-handler** (synchronous): Called BEFORE the operation
+//! 1. **Pre-handler** (asynchronous, awaited): Called BEFORE the operation
 //!    - Read-only access to context
 //!    - Can veto/reject by returning `Err(HookError::Rejected)`
-//!    - Subject to timeout (default 200ms)
+//!    - Cancelled when it exceeds its timeout (default 1s, overridable per hook)
 //!    - Panics are caught and isolated
 //!
 //! 2. **Response handler** (synchronous): Called AFTER the operation succeeds
@@ -57,7 +57,7 @@
 //!         &[HookPoint::BranchPush, HookPoint::BranchCreate]
 //!     }
 //!
-//!     fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+//!     async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
 //!         // Check compliance rules before operation
 //!         if let Some(user) = ctx.user() {
 //!             if user.starts_with("blocked_") {
@@ -180,6 +180,10 @@ pub enum StatusCode {
 
     /// Internal failure → gRPC `INTERNAL`
     Internal,
+
+    /// A dependency the hook needs is temporarily unreachable, so the client
+    /// may retry → gRPC `UNAVAILABLE`
+    Unavailable,
 }
 
 impl std::fmt::Display for StatusCode {
@@ -191,6 +195,7 @@ impl std::fmt::Display for StatusCode {
             StatusCode::InvalidArgument => write!(f, "INVALID_ARGUMENT"),
             StatusCode::Aborted => write!(f, "ABORTED"),
             StatusCode::Internal => write!(f, "INTERNAL"),
+            StatusCode::Unavailable => write!(f, "UNAVAILABLE"),
         }
     }
 }
@@ -390,10 +395,11 @@ impl HookResponse {
 ///
 /// # Execution Model
 ///
-/// 1. **Pre-handler** (synchronous): Called BEFORE the operation
+/// 1. **Pre-handler** (asynchronous, awaited): Called BEFORE the operation
 ///    - Read-only access to context
 ///    - Can veto/reject by returning `Err(HookError::Rejected)`
-///    - Subject to timeout (default 200ms)
+///    - Cancelled when it exceeds its timeout (default 1s, see
+///      [`Hook::pre_handler_timeout`])
 ///    - Panics are caught and isolated
 ///
 /// 2. **Response handler** (synchronous): Called AFTER the operation succeeds
@@ -437,7 +443,7 @@ impl HookResponse {
 ///         &[HookPoint::BranchCreate, HookPoint::BranchPush]
 ///     }
 ///
-///     fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+///     async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
 ///         // Validate branch name in pre-handler (can veto)
 ///         if let Some(branch) = ctx.branch() {
 ///             let branch_str = format!("{:?}", branch);
@@ -487,12 +493,14 @@ pub trait Hook: Send + Sync {
     /// Return an empty slice to disable the hook for all points.
     fn hook_points(&self) -> &'static [HookPoint];
 
-    /// Synchronous pre-handler called BEFORE the operation executes.
+    /// Asynchronous pre-handler called BEFORE the operation executes.
     ///
     /// # Semantics
     ///
-    /// - Executes inline in the request handler thread
+    /// - Awaited by the request handler, so it may wait on I/O
     /// - All enabled hooks' pre-handlers complete before operation begins
+    /// - Cancelled at an await when it exceeds its timeout, which fails the
+    ///   operation with [`HookError::Timeout`]
     /// - Return `Ok(())` to allow the operation to proceed
     /// - Return `Err(HookError::Rejected { ... })` to veto the operation
     ///
@@ -508,9 +516,16 @@ pub trait Hook: Send + Sync {
     ///
     /// Return `HookError::Rejected` to veto the operation with a semantic
     /// status code that maps to gRPC status.
-    fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
+    async fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
         let _ = ctx;
         Ok(())
+    }
+
+    /// The time [`pre_handler`](Hook::pre_handler) may take before it is
+    /// cancelled. `None` uses the dispatcher's timeout, by default
+    /// [`DEFAULT_PRE_HANDLER_TIMEOUT`](crate::hooks::DEFAULT_PRE_HANDLER_TIMEOUT).
+    fn pre_handler_timeout(&self) -> Option<Duration> {
+        None
     }
 
     /// Synchronous response handler called AFTER the operation succeeds,
@@ -587,7 +602,7 @@ pub trait Hook: Send + Sync {
 ///         &[HookPoint::BranchPush]
 ///     }
 ///
-///     fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
+///     async fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
 ///         println!("{}", self.message);
 ///         Ok(())
 ///     }

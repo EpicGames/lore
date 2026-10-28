@@ -83,6 +83,7 @@ pub async fn handler(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::Obliterate, &hook_ctx)
+                .await
                 .map_err(|error| {
                     let source_error = error.clone();
                     let response = hook_error_to_status(error);

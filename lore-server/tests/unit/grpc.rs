@@ -920,3 +920,34 @@ mod map_message_handle_error_to_status {
         assert!(!is_code_considered_server_error(&status.code()));
     }
 }
+
+mod hook_error_to_status {
+    use std::time::Duration;
+
+    use lore_server::hooks::HookError;
+    use lore_server::hooks::StatusCode;
+
+    use super::*;
+
+    #[test]
+    fn unavailable_rejection_answers_unavailable() {
+        let error =
+            HookError::rejected("auth", "auth service unreachable", StatusCode::Unavailable);
+
+        assert_eq!(hook_error_to_status(error).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn timeout_answers_unavailable() {
+        let error = HookError::timeout("auth", Duration::from_millis(200));
+
+        assert_eq!(hook_error_to_status(error).code(), Code::Unavailable);
+    }
+
+    #[test]
+    fn panic_answers_internal() {
+        let error = HookError::panic("auth", "boom");
+
+        assert_eq!(hook_error_to_status(error).code(), Code::Internal);
+    }
+}

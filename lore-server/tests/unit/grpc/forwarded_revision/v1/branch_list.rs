@@ -21,6 +21,7 @@ fn make_forwarded_request(repository: RepositoryId) -> Request<BranchListRequest
     CallerContext {
         repository_id: repository,
         user_id: "lily".into(),
+        is_service_account: false,
         correlation_id: String::new(),
         authorization: None,
     }

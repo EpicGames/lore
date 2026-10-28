@@ -27,6 +27,8 @@ use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// `lore.revision.v1.RevisionService.BranchDelete` handler.
@@ -99,6 +101,7 @@ pub async fn branch_delete_implementation(
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let repository_id = caller_context.repository_id;
     let user_id = caller_context.user_id;
+    let is_service_account = caller_context.is_service_account;
     let correlation_id = caller_context.correlation_id;
     let branch_id = BranchId::from(req.id);
 
@@ -111,24 +114,30 @@ pub async fn branch_delete_implementation(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let hook_ctx = HookContext::builder()
-                .correlation_id(correlation_id)
-                .hook_point(HookPoint::BranchDelete)
-                .repository(repository_id)
-                .user(user_id)
-                .branch(branch_id)
-                .build();
-
-            hook_dispatcher
-                .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
-                .map_err(hook_error_to_status)?;
-
             // Load before delete so the idempotent already-deleted path
             // can still build the response from the preserved metadata.
             let pre_metadata = branch::metadata(repository.clone(), branch_id)
                 .await
                 .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
+
+            let hook_ctx = HookContext::builder()
+                .correlation_id(correlation_id)
+                .hook_point(HookPoint::BranchDelete)
+                .repository(repository_id)
+                .user(user_id)
+                .branch(branch_id)
+                .metadata(
+                    METADATA_BRANCH_NAME,
+                    branch::name(&pre_metadata).unwrap_or_default(),
+                )
+                .metadata(METADATA_IS_SERVICE_ACCOUNT, is_service_account.to_string())
+                .build();
+
+            hook_dispatcher
+                .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
+                .await
+                .map_err(hook_error_to_status)?;
 
             debug!({BRANCH_ID} = %branch_id, "Deleting branch");
 

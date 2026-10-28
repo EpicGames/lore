@@ -61,6 +61,7 @@ use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
 use crate::util::setup_execution;
 
 struct BranchPushInstrumentProvider;
@@ -230,6 +231,7 @@ pub async fn handler(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             let PushResult {
@@ -349,7 +351,7 @@ pub(crate) async fn dispatch_response_message(
         && let Ok(branch_meta) =
             branch::branch_metadata(repository.clone(), branch, &branch_meta).await
     {
-        builder = builder.metadata("branch_name", branch_meta.name);
+        builder = builder.metadata(METADATA_BRANCH_NAME, branch_meta.name);
     }
 
     let response_ctx = builder.build();

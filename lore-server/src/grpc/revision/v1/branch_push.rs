@@ -11,6 +11,7 @@ use lore_revision::branch;
 use lore_revision::branch::BranchError;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
+use lore_revision::metadata::Metadata;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryContext;
 use lore_telemetry::InstrumentProvider;
@@ -29,6 +30,7 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::branch_push::PushResult;
@@ -40,6 +42,8 @@ use crate::grpc::none_or_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// `lore.revision.v1.RevisionService.BranchPush` handler.
@@ -51,7 +55,8 @@ use crate::util::setup_execution;
 /// id whose metadata is missing returns `NotFound`. Pushing to a
 /// deleted branch reinstates the name → id mapping if the name is
 /// still free, or returns `AlreadyExists` if claimed by a different
-/// live branch.
+/// live branch. The pre-handlers run between reading the branch and
+/// reinstating its mapping, so a rejected push writes nothing.
 ///
 /// A fragment of the pushed revision the server does not hold is the
 /// other `FailedPrecondition`, and the only one carrying an address in
@@ -71,6 +76,7 @@ pub async fn handler(
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchPushResponse>, Status> {
     let user_id = get_user_id(request.extensions());
+    let is_service_account = get_is_service_account(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
 
@@ -112,13 +118,20 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            let branch_metadata = load_branch_metadata(repository.clone(), branch_id).await?;
+
             let mut ctx_builder = HookContext::builder()
                 .correlation_id(correlation_id.clone())
                 .hook_point(HookPoint::BranchPush)
                 .repository(repository_id)
                 .user(user_id.clone())
                 .branch(branch_id)
-                .revision(revision);
+                .revision(revision)
+                .metadata(
+                    METADATA_BRANCH_NAME,
+                    branch::name(&branch_metadata).unwrap_or_default(),
+                )
+                .metadata(METADATA_IS_SERVICE_ACCOUNT, is_service_account.to_string());
 
             if let Some(ip) = client_ip {
                 ctx_builder = ctx_builder.metadata("client_ip", ip);
@@ -128,9 +141,10 @@ pub async fn handler(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
-            ensure_branch_pushable(repository.clone(), branch_id).await?;
+            reinstate_branch_name(repository.clone(), branch_id, branch_metadata).await?;
 
             let PushResult {
                 success,
@@ -219,23 +233,30 @@ pub async fn handler(
         .await
 }
 
-/// Returns `NotFound` for branch ids without metadata, and reinstates
-/// the name → id mapping for deleted branches whose name is still
-/// free. If the name has been claimed by a different live branch,
-/// returns `AlreadyExists`.
-async fn ensure_branch_pushable(
+/// The metadata of `branch_id`, or `NotFound` for a branch id without
+/// metadata.
+async fn load_branch_metadata(
     repository: Arc<RepositoryContext>,
     branch_id: BranchId,
-) -> Result<(), Status> {
+) -> Result<Metadata, Status> {
     let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
         .await
         .filter_slow_down()?
         .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
-    let metadata = branch::load_metadata(repository.clone(), metadata_hash)
+    branch::load_metadata(repository, metadata_hash)
         .await
         .filter_slow_down()?
-        .warn_map_err(|err| Status::internal(err.to_string()))?;
+        .warn_map_err(|err| Status::internal(err.to_string()))
+}
 
+/// Reinstates the name → id mapping for a deleted branch whose name is
+/// still free. If the name has been claimed by a different live branch,
+/// returns `AlreadyExists`.
+async fn reinstate_branch_name(
+    repository: Arc<RepositoryContext>,
+    branch_id: BranchId,
+    metadata: Metadata,
+) -> Result<(), Status> {
     let Ok(name) = branch::name(&metadata) else {
         return Ok(());
     };

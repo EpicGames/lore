@@ -22,6 +22,14 @@ use lore_revision::lore::RepositoryId;
 
 use crate::hooks::traits::HookPoint;
 
+/// Metadata key for the target branch's name. The v1 branch push, create and
+/// delete handlers set it before their pre-handlers run.
+pub const METADATA_BRANCH_NAME: &str = "branch_name";
+
+/// Metadata key for whether the caller is a service account, `"true"` or
+/// `"false"`. Set wherever [`METADATA_BRANCH_NAME`] is.
+pub const METADATA_IS_SERVICE_ACCOUNT: &str = "is_service_account";
+
 /// Context data passed to hooks during execution.
 ///
 /// The context provides immutable operation details to hooks. All fields are
