@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_transport::RevisionListResponse;
 
 use crate::errors::*;
 use crate::find;
@@ -63,6 +64,27 @@ pub enum HistoryError {
 }
 
 impl crate::event::EventError for HistoryError {}
+
+/// Extend one side's history line with a remote page asked for at `anchor`, returning how
+/// many revisions it added and the cursor to the next older page.
+fn extend_line_from_page(
+    history: &mut Vec<Hash>,
+    response: &RevisionListResponse,
+    anchor: Hash,
+) -> (usize, Hash) {
+    let mut line = response.items_from(anchor);
+    // A page that does not hold its anchor is not on this line, and neither is the cursor to
+    // the page below it.
+    if line.is_empty() {
+        return (0, Hash::default());
+    }
+    // The local walk adds the revision it stops at before asking the remote for it.
+    if history.last() == Some(&anchor) {
+        line = &line[1..];
+    }
+    history.extend(line.iter().map(|item| item.signature));
+    (line.len(), response.next_revision)
+}
 
 pub async fn find_branch_point(
     repository: Arc<RepositoryContext>,
@@ -175,25 +197,28 @@ pub async fn find_branch_point(
                 // halt the walk early and falsely report divergence even though a
                 // common ancestor is still reachable.
                 if !local_left {
+                    let anchor = current_left;
                     current_left = Hash::default();
                     if let Some(Ok(left_response)) = left_response {
+                        let (added, older) =
+                            extend_line_from_page(&mut left_history, &left_response, anchor);
+                        left_fetch_count += added;
+                        current_left = older;
                         find::cache_revision_list_states(repository.clone(), &left_response.items)
                             .await;
-                        left_fetch_count += left_response.items.len();
-                        left_history.extend(left_response.items.iter().map(|item| item.signature));
-                        current_left = left_response.next_revision;
                     }
                 }
 
                 if !local_right {
+                    let anchor = current_right;
                     current_right = Hash::default();
                     if let Some(Ok(right_response)) = right_response {
+                        let (added, older) =
+                            extend_line_from_page(&mut right_history, &right_response, anchor);
+                        right_fetch_count += added;
+                        current_right = older;
                         find::cache_revision_list_states(repository.clone(), &right_response.items)
                             .await;
-                        right_fetch_count += right_response.items.len();
-                        right_history
-                            .extend(right_response.items.iter().map(|item| item.signature));
-                        current_right = right_response.next_revision;
                     }
                 }
             }

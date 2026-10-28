@@ -181,6 +181,20 @@ pub struct RevisionListResponse {
     pub previous_revision: Hash,
 }
 
+impl RevisionListResponse {
+    /// The items from the revision `anchor` down to the oldest in the page.
+    ///
+    /// A page holds the anchor it was asked for, but not necessarily first: a page aligned on
+    /// a wider boundary also holds revisions newer than the anchor, which are not its
+    /// ancestors. Empty when the page does not hold `anchor`.
+    pub fn items_from(&self, anchor: Hash) -> &[RevisionItem] {
+        self.items
+            .iter()
+            .position(|item| item.signature == anchor)
+            .map_or(&[], |first| &self.items[first..])
+    }
+}
+
 #[derive(Debug)]
 pub struct RevisionItem {
     pub number: u64,

@@ -13,15 +13,18 @@ logger = logging.getLogger(__name__)
 
 # Given a clone of repository with 25 commits and a history step size of 10
 # When
-#   - revision list is called for revision id 15
-#   - revision describe is called for a revision in the same segment in offline mode
-# Then revision describe succeeds as the revision list call cached the segment.
-# The lore.revision.v1 protocol returns segment-aligned pages, so the cache is
-# scoped to the segment containing the anchor (here, revisions 11..15 for a
-# history step size of 10 and anchor 15). That cache holds the states alone, so
-# the branch, date and message their metadata carries is not there to read, and
-# both revision info and revision history report the revision without those
-# rather than failing.
+#   - revision history is called from revision 15, which the server answers
+#     with the cached segment holding revisions 11..20
+#   - revision history is called for the 5 newest revisions, 25..21: the line
+#     from the latest revision down to the top of that segment
+#   - revision info is called for a revision in the segment in offline mode
+# Then revision info succeeds. An offline lookup by number walks the parent
+# chain from the local latest revision, one cached state at a time, so it
+# needs the line down to the segment as well as the segment's own states,
+# hence the caching of revision history 25..21. The segment's page holds the
+# states alone, so the branch, date and message their metadata carries is not
+# there to read, and both revision info and revision history report the
+# revision without those rather than failing.
 @pytest.mark.smoke
 def test_revision_list(new_lore_repo):
     repo: Lore = new_lore_repo()
@@ -47,6 +50,8 @@ def test_revision_list(new_lore_repo):
 
     output = clone.revision_history(1, revision="@15", debug=True)
     assert "Revision list strategy: full-iteration" not in output
+
+    clone.revision_history(5)
 
     output = clone.revision_info("@13", offline=True, local=True, json=True)
     logged = [entry["message"] for entry in parse_jsonl(output, "log")]

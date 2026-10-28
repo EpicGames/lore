@@ -374,86 +374,114 @@ async fn history_line_diverges_from_a_line_sharing_no_revision() {
     .await;
 }
 
-/// Two lines that split under a shared parent meet again at that parent.
-#[tokio::test]
-async fn history_lines_meet_where_they_split() {
-    Box::pin(with_execution(async {
-        let repository = null_repository().await;
-        let shared = write_line(&repository, Hash::default(), 1, 2).await;
-        let one = write_revision(&repository, shared[1], 13).await;
-        let other = write_revision(&repository, shared[1], 3).await;
+mod find_common_revision_in_history_lines {
+    use super::*;
 
-        let met = Box::pin(find_common_revision_in_history_lines(
-            repository, one, other,
-        ))
-        .await
-        .expect("the search must not fail on readable lines");
+    /// Two lines that split under a shared parent meet again at that parent.
+    #[tokio::test]
+    async fn history_lines_meet_where_they_split() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 2).await;
+            let one = write_revision(&repository, shared[1], 13).await;
+            let other = write_revision(&repository, shared[1], 3).await;
 
-        assert_eq!(
-            met,
-            Some(shared[1]),
-            "The revision the two lines split at is the newest they share"
-        );
-    }))
-    .await;
-}
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one, other,
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
 
-/// The newest shared revision wins, not the first one reached on either line.
-#[tokio::test]
-async fn history_lines_meet_at_the_newest_shared_revision() {
-    Box::pin(with_execution(async {
-        let repository = null_repository().await;
-        let shared = write_line(&repository, Hash::default(), 1, 3).await;
-        let one = write_revision(&repository, shared[2], 13).await;
-        let other = write_revision(&repository, shared[2], 4).await;
+            assert_eq!(
+                met,
+                Some(shared[1]),
+                "The revision the two lines split at is the newest they share"
+            );
+        }))
+        .await;
+    }
 
-        let met = Box::pin(find_common_revision_in_history_lines(
-            repository, one, other,
-        ))
-        .await
-        .expect("the search must not fail on readable lines");
+    /// The newest shared revision wins, not the first one reached on either line.
+    #[tokio::test]
+    async fn history_lines_meet_at_the_newest_shared_revision() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 3).await;
+            let one = write_revision(&repository, shared[2], 13).await;
+            let other = write_revision(&repository, shared[2], 4).await;
 
-        assert_eq!(met, Some(shared[2]));
-    }))
-    .await;
-}
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one, other,
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
 
-#[tokio::test]
-async fn history_lines_that_share_no_revision_meet_nowhere() {
-    Box::pin(with_execution(async {
-        let repository = null_repository().await;
-        let one = write_line(&repository, Hash::default(), 1, 3).await;
-        let other = write_line(&repository, Hash::default(), 11, 3).await;
+            assert_eq!(met, Some(shared[2]));
+        }))
+        .await;
+    }
 
-        let met = Box::pin(find_common_revision_in_history_lines(
-            repository,
-            *one.last().unwrap(),
-            *other.last().unwrap(),
-        ))
-        .await
-        .expect("running out of line is not a failure");
+    #[tokio::test]
+    async fn history_lines_that_share_no_revision_meet_nowhere() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let one = write_line(&repository, Hash::default(), 1, 3).await;
+            let other = write_line(&repository, Hash::default(), 11, 3).await;
 
-        assert_eq!(met, None);
-    }))
-    .await;
-}
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository,
+                *one.last().unwrap(),
+                *other.last().unwrap(),
+            ))
+            .await
+            .expect("running out of line is not a failure");
 
-#[tokio::test]
-async fn history_lines_that_cannot_be_read_meet_nowhere() {
-    Box::pin(with_execution(async {
-        let repository = null_repository().await;
+            assert_eq!(met, None);
+        }))
+        .await;
+    }
 
-        let met = Box::pin(find_common_revision_in_history_lines(
-            repository,
-            revision(200),
-            revision(201),
-        ))
-        .await
-        .expect("an unreadable line is not a failure of the search");
+    #[tokio::test]
+    async fn history_lines_that_cannot_be_read_meet_nowhere() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
 
-        assert_eq!(met, None);
-    }))
-    .await;
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository,
+                revision(200),
+                revision(201),
+            ))
+            .await
+            .expect("an unreadable line is not a failure of the search");
+
+            assert_eq!(met, None);
+        }))
+        .await;
+    }
+
+    /// A page the remote serves from a cached segment also holds revisions newer than the one it
+    /// was asked for. Those are not on the line below it, so they cannot be where the lines meet.
+    #[tokio::test]
+    async fn history_lines_meet_where_they_split_when_a_remote_page_starts_above_its_anchor() {
+        Box::pin(with_execution(async {
+            let branched = crate::paged_remote::branched_from_cached_segment().await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                branched.client,
+                branched.remote_line[5],
+                branched.local,
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(
+                met,
+                Some(branched.remote_line[2]),
+                "The local branch was created from revision 3"
+            );
+        }))
+        .await;
+    }
 }
 
 /// A branch that has not moved since it was created: its branch point is still

@@ -1056,6 +1056,16 @@ impl Connection {
         connection
     }
 
+    /// A [`detached`](Self::detached) connection reaching no storage, whose revision service
+    /// for `repository` is `revision`.
+    #[cfg(feature = "test-util")]
+    pub fn detached_revision(repository: RepositoryId, revision: Arc<dyn Revision>) -> Arc<Self> {
+        let connection = Self::detached(Vec::new());
+        connection.revision.insert(repository, revision);
+        connection.revision_ready.complete(Ok(()));
+        connection
+    }
+
     pub fn remote_url(&self) -> &str {
         self.remote_url.as_str()
     }

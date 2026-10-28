@@ -1666,12 +1666,14 @@ async fn resolve_revision_number(
             )
             .await
     {
-        if let Ok(item) = response
+        // A page the remote serves from a cached segment holds the number at any
+        // position, not first.
+        if let Some(item) = response
             .items
-            .as_slice()
-            .binary_search_by(|item| item.number.cmp(&revision_number))
+            .iter()
+            .find(|item| item.number == revision_number)
         {
-            revision = response.items[item].signature;
+            revision = item.signature;
             lore_debug!("response revision {}", revision);
         }
         find::cache_revision_list_states(repository.clone(), &response.items).await;

@@ -149,8 +149,10 @@ fn start_to_metric_value(value: &Start) -> &'static str {
 
 /// `lore.revision.v1.RevisionService.RevisionList` handler.
 ///
-/// Returns a page of revisions newer-to-older starting from the
-/// `start` anchor, plus optional cursors for the adjacent pages.
+/// Returns a page of revisions newer-to-older that holds the `start`
+/// anchor, plus optional cursors for the adjacent pages. A walked page
+/// starts at the anchor; a page served from a cached segment starts at
+/// the segment's top, so it also holds revisions newer than the anchor.
 /// `signature_backward` is items[N-1]'s parent — absent when items[N-1]
 /// is the root revision. `signature_forward` is the revision whose
 /// `parent_self` is items[0]'s signature — absent only when items[0]

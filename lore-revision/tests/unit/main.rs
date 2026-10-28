@@ -19,6 +19,7 @@ mod global;
 /// The fixtures the crate's process-isolated tests include, shared with these.
 #[path = "../helper.rs"]
 mod helper;
+mod history;
 mod immutable;
 mod infer;
 mod instance;
@@ -28,6 +29,7 @@ mod lock;
 mod merge;
 mod metadata;
 mod node;
+mod paged_remote;
 mod protocol;
 mod relay;
 mod repository;

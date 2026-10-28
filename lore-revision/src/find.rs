@@ -295,15 +295,15 @@ pub async fn batch_load_history(
 
     cache_revision_list_states(repository.clone(), &response.items).await;
 
-    let metadata_addresses: Vec<Address> = response
-        .items
+    let line = response.items_from(revision);
+
+    let metadata_addresses: Vec<Address> = line
         .iter()
         .map(|item| Address::zero_context_hash(item.metadata))
         .collect();
+    history.extend(line.iter().map(|item| item.signature));
 
     let _ = immutable::cache(repository, metadata_addresses, true).await;
-
-    history.append(&mut response.items.iter().map(|item| item.signature).collect());
 
     history
 }

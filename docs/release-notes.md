@@ -32,6 +32,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- A revision named by number, such as `<branch>@<number>`, resolves from the first page the remote returns for it,
+  rather than walking the branch's history back from its latest revision one page at a time
+- Following a branch's history through the remote no longer takes the revisions a page holds above the one it was
+  asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the
+  revision two branches share could answer with one of them, newer than the one they really share
+
 ## v0.12.0 (Oct 26th 2026) [#1966]
 
 ### Breaking changes
