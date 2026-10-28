@@ -491,19 +491,46 @@ async fn store_new_head(
                 });
             }
 
-            // Fast-forward merge: the incoming revision's parent_self no longer matches
-            // the branch head. Attempt to create a new merge revision with
-            // parent_self=current_head and parent_other=incoming_revision.
-            return try_fast_forward_merge(
+            // The incoming revision may be several commits ahead of where the two histories
+            // meet, or end in a merge, so its own parent is not the merge base. Resolve the
+            // real one. If it is the head, the push is a fast-forward, stored directly below.
+            // A revision that names no branch is taken to be on the one it is pushed to
+            let incoming_branch = state.branch(repository.clone()).await;
+            let incoming_branch = if incoming_branch == BranchId::default() {
+                branch
+            } else {
+                incoming_branch
+            };
+            let base = lore_revision::branch::resolve_diff3_base(
                 repository.clone(),
+                incoming_branch,
+                state.revision(),
                 branch,
-                state.clone(),
                 current_head,
-                history_step_size,
-                acceleration,
-                store_requests,
             )
-            .await;
+            .await
+            .filter_slow_down()?
+            .warn_map_err(|err| {
+                Status::internal(format!(
+                    "Failed to resolve the base for fast-forward merge: {err}"
+                ))
+            })?;
+
+            if base != current_head {
+                // Fast-forward merge: create a new merge revision with
+                // parent_self=current_head and parent_other=incoming_revision.
+                return try_fast_forward_merge(
+                    repository.clone(),
+                    branch,
+                    state.clone(),
+                    base,
+                    current_head,
+                    history_step_size,
+                    acceleration,
+                    store_requests,
+                )
+                .await;
+            }
         }
 
         let state_parent = State::deserialize(repository.clone(), state.parent_self())
@@ -544,6 +571,19 @@ async fn store_new_head(
                 })?;
         }
 
+        // A fast-forward may span several revisions, so seal the history from the head it
+        // replaces rather than from the incoming revision's parent
+        let state_replaced = if force || state.parent_self() == current_head {
+            state_parent
+        } else {
+            State::deserialize(repository.clone(), current_head)
+                .await
+                .filter_slow_down()?
+                .warn_map_err(|err| {
+                    Status::internal(format!("Failed to load current head state: {err}"))
+                })?
+        };
+
         let previous_head = try_store_latest(repository.clone(), branch, current_head, new_head)
             .await
             .filter_slow_down()?
@@ -562,7 +602,7 @@ async fn store_new_head(
                 branch,
                 history_step_size,
                 acceleration,
-                state_parent,
+                state_replaced,
                 state.clone(),
             )
             .await;
@@ -589,23 +629,25 @@ async fn store_new_head(
 /// - `parent_self` = current branch head (target branch)
 /// - `parent_other` = the incoming merge revision
 ///
-/// Uses a three-way diff between the original merge base, the incoming revision,
-/// and the current head. If conflicts are detected, returns failure so the client
-/// can resolve locally.
+/// Uses a three-way diff between `original_base`, the incoming revision, and the
+/// current head. `original_base` is where the incoming revision's history meets the
+/// head's, which is its own parent only when it is a single commit ahead. If conflicts
+/// are detected, returns failure so the client can resolve locally.
 ///
 /// Retries via CAS loop if the branch head moves again during processing.
+#[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all)]
 async fn try_fast_forward_merge(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     incoming_state: Arc<State>,
+    original_base: Hash,
     mut current_head: Hash,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     store_requests: &mut PushStoreRequests,
 ) -> Result<PushResult, Status> {
     let incoming_revision = incoming_state.revision();
-    let original_base = incoming_state.parent_self();
 
     debug!(
         %incoming_revision, %original_base, %current_head,
@@ -755,17 +797,19 @@ async fn try_fast_forward_merge(
             state_current.set_metadata_hash(metadata_hash);
         }
 
-        // Serialize the new merge state
+        // Freeze and serialize the new merge state. Without the freeze it keeps the current
+        // head's delta and never records what it merged in
         let write_token = get_write_token();
-        let new_revision = state_current
-            .serialize(repository.clone(), &write_token)
-            .await
-            .filter_slow_down()?
-            .warn_map_err(|err| {
-                Status::internal(format!(
-                    "Failed to serialize fast-forward merge state: {err}"
-                ))
-            })?;
+        let new_revision = lore_revision::commit::freeze_and_serialize(
+            repository.clone(),
+            state_current.clone(),
+            &write_token,
+        )
+        .await
+        .filter_slow_down()?
+        .warn_map_err(|err| {
+            Status::internal(format!("Failed to commit fast-forward merge state: {err}"))
+        })?;
 
         // CAS: attempt to set the new revision as branch head
         let previous_head =

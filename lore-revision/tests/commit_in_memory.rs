@@ -13,7 +13,10 @@ mod tests {
     use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_revision::branch;
+    use lore_revision::change;
+    use lore_revision::change::FileAction;
     use lore_revision::commit::commit_in_memory_revision;
+    use lore_revision::commit::freeze_and_serialize;
     use lore_revision::commit::resolve_commit_branch;
     use lore_revision::metadata::CREATED_BY;
     use lore_revision::metadata::Metadata;
@@ -1226,6 +1229,181 @@ mod tests {
                         "the branch must hold no revision"
                     );
                 }
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// Stages `path`'s file as modified to new content.
+    async fn modify(state: &State, repository: Arc<RepositoryContext>, path: &str, content: u64) {
+        let node_id = state
+            .find_node_link(repository.clone(), path)
+            .await
+            .expect("the file must resolve")
+            .node;
+        state
+            .node_modify(
+                repository.clone(),
+                node_id,
+                0o644,
+                20,
+                Address {
+                    hash: Hash::from_u64(content),
+                    context: Context::default(),
+                },
+            )
+            .await
+            .expect("modifying the file must succeed");
+        state
+            .node_mark_staged(
+                repository,
+                node_id,
+                NodeFlags::StagedModify,
+                NodeFlags::DirtyModify,
+            )
+            .await
+            .expect("marking the modification must succeed");
+    }
+
+    /// The server's fast-forward merge: the pushed revision's changes applied onto a moved
+    /// head, then committed. The merge must record what it merged in, marked as merged, and
+    /// none of the head's own changes, and must carry no change flags.
+    #[tokio::test]
+    async fn freeze_and_serialize_records_a_server_merge_as_merged_in() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let main = branch_id();
+                let base = State::new();
+                add(&base, repository.clone(), ROOT_NODE, file("a.bin"), "a.bin").await;
+                add(&base, repository.clone(), ROOT_NODE, file("b.bin"), "b.bin").await;
+                let r1 = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    base,
+                    metadata_on(main),
+                    Hash::default(),
+                    main,
+                )
+                .await
+                .expect("committing the base must succeed");
+
+                // The pushed side, on its own branch: modify a.bin, add c.bin
+                let feature = branch_id();
+                let pushed = State::deserialize(repository.clone(), r1)
+                    .await
+                    .expect("the base must deserialize");
+                modify(&pushed, repository.clone(), "a.bin", 0x61).await;
+                add(
+                    &pushed,
+                    repository.clone(),
+                    ROOT_NODE,
+                    file("c.bin"),
+                    "c.bin",
+                )
+                .await;
+                let incoming = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    pushed,
+                    metadata_on(feature),
+                    r1,
+                    feature,
+                )
+                .await
+                .expect("committing the pushed side must succeed");
+
+                // The moved head: modify b.bin
+                let moved = State::deserialize(repository.clone(), r1)
+                    .await
+                    .expect("the base must deserialize");
+                modify(&moved, repository.clone(), "b.bin", 0x62).await;
+                let head = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    moved,
+                    metadata_on(main),
+                    r1,
+                    main,
+                )
+                .await
+                .expect("committing the moved head must succeed");
+
+                // What `try_fast_forward_merge` does
+                let diff = lore_revision::revision::diff3_collect(
+                    repository.clone(),
+                    r1,
+                    incoming,
+                    head,
+                    None,
+                    false,
+                )
+                .await
+                .expect("the diff3 must succeed");
+                assert!(diff.conflicts.is_empty(), "the case needs a clean merge");
+                let merge = State::deserialize(repository.clone(), head)
+                    .await
+                    .expect("the head must deserialize");
+                lore_revision::state::apply_tree_changes(
+                    repository.clone(),
+                    merge.clone(),
+                    &diff.changes,
+                )
+                .await
+                .expect("applying the changes must succeed");
+                merge.set_parent_self(head);
+                merge.set_parent_other(incoming);
+
+                let signature = freeze_and_serialize(repository.clone(), merge, &token())
+                    .await
+                    .expect("committing the merge must succeed");
+
+                let committed = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("the merge must deserialize");
+                for (path, action) in [("a.bin", FileAction::Keep), ("c.bin", FileAction::Add)] {
+                    let node_id = committed
+                        .find_node_link(repository.clone(), path)
+                        .await
+                        .expect("the merge must hold the file")
+                        .node;
+                    let delta = committed
+                        .node_delta(repository.clone(), node_id)
+                        .await
+                        .expect("the delta must read back")
+                        .unwrap_or_else(|| panic!("{path} must be in the merge's delta"));
+                    assert_eq!(delta.action, action as u16, "{path}'s action");
+                    assert_ne!(
+                        delta.flags & change::Flags::Merge.bits(),
+                        0,
+                        "{path} must be recorded as merged in"
+                    );
+                    let node = committed
+                        .node(repository.clone(), node_id)
+                        .await
+                        .expect("the node must read back");
+                    assert!(
+                        !node.is_dirty_or_staged(),
+                        "{path} must carry no change flags, got 0x{:x}",
+                        node.flags
+                    );
+                }
+
+                let head_only = committed
+                    .find_node_link(repository.clone(), "b.bin")
+                    .await
+                    .expect("the merge must hold the head's file")
+                    .node;
+                assert!(
+                    committed
+                        .node_delta(repository.clone(), head_only)
+                        .await
+                        .expect("the delta must read back")
+                        .is_none(),
+                    "the head's own change must not be in the merge's delta"
+                );
             }))
             .await
             .expect("Task failed");

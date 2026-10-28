@@ -8879,7 +8879,8 @@ fn collect_new_addresses_recurse(
 ///
 /// This is used for server-side merge operations where there is no working directory.
 /// Changes are applied purely at the state tree level: nodes are added, modified, or
-/// deleted in the target state based on the diff result.
+/// deleted in the target state based on the diff result, and staged as merged. Commit
+/// the result with [`crate::commit::freeze_and_serialize`].
 ///
 /// The `target_state` is the state being modified (e.g., the current branch head).
 /// Each `NodeChange` carries source node data in its `to` field, which is copied into
@@ -8969,9 +8970,13 @@ pub async fn apply_tree_changes(
             continue;
         }
 
-        let node = source_state
+        let mut node = source_state
             .node(change.to.mapping.repository.clone(), source_node_id)
             .await?;
+
+        // Staged as merged, as a client merge stages it, so the commit records it as merged
+        // in. Set before staging, which keeps the merge flag alongside the add or modify
+        node.flags |= NodeFlags::StagedMerge.bits();
 
         // Stage the node into the target state at the change path
         crate::stage::stage_single_node(
