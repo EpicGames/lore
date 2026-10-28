@@ -588,6 +588,13 @@ mod forwarded_request {
 {
             unreachable!("forwarded_repository_service should not be called in branch_create tests")
         }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in branch_create tests")
+        }
     }
 
     fn make_request(repository: RepositoryId, branch_id: BranchId) -> Request<BranchCreateRequest> {

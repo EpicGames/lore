@@ -602,6 +602,7 @@ async fn launch_grpc_internal_server(
     user_agent_filter: Arc<UserAgentFilter>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     jwt_verifier: Option<JwtVerifier>,
@@ -638,6 +639,7 @@ async fn launch_grpc_internal_server(
             ))?,
             immutable_store,
             mutable_store,
+            lock_store,
             notification_sender,
             hook_dispatcher,
             settings.environment.clone().unwrap_or_default(),
@@ -2264,6 +2266,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let user_agent_filter = user_agent_filter.clone();
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();
+                let lock_store = lock_store.clone();
                 let notification_sender = notification.clone();
                 let hook_dispatcher = hook_dispatcher.clone();
                 let jwt_verifier = jwt_verifier.clone();
@@ -2274,6 +2277,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     user_agent_filter,
                     immutable_store,
                     mutable_store,
+                    lock_store,
                     notification_sender,
                     hook_dispatcher,
                     jwt_verifier,

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 mod environment;
+mod forwarded_lock_service;
 mod forwarded_repository;
 mod forwarded_requests;
 mod forwarded_revision;

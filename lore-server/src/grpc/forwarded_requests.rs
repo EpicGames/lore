@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+pub mod lock_service;
 pub mod repository_service;
 pub mod revision_service;
 
@@ -22,6 +23,8 @@ use tonic::Status;
 use tonic::transport::Channel;
 
 use crate::grpc::extract_correlation_id;
+use crate::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient;
+use crate::grpc::forwarded_requests::lock_service::GrpcForwardedLockServiceClient;
 use crate::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient;
 use crate::grpc::forwarded_requests::repository_service::GrpcForwardedRepositoryServiceClient;
 use crate::grpc::forwarded_requests::revision_service::ForwardedRevisionServiceClient;
@@ -191,12 +194,16 @@ pub struct RpcFlags {
     pub repository_create: bool,
     #[serde(default)]
     pub repository_get: bool,
+
+    #[serde(default)]
+    pub lock_query: bool,
 }
 
 pub trait ForwardedRequests: Send + Sync {
     fn rpc_flags(&self) -> &RpcFlags;
     fn forwarded_revision_service(&self) -> Box<dyn ForwardedRevisionServiceClient>;
     fn forwarded_repository_service(&self) -> Box<dyn ForwardedRepositoryServiceClient>;
+    fn forwarded_lock_service(&self) -> Box<dyn ForwardedLockServiceClient>;
 }
 
 async fn make_channel(settings: &GrpcInternalClientSettings) -> Result<Channel, UnhandledError> {
@@ -264,6 +271,11 @@ impl ForwardedRequests for GrpcForwardedRequests {
 
     fn forwarded_repository_service(&self) -> Box<dyn ForwardedRepositoryServiceClient> {
         let client = GrpcForwardedRepositoryServiceClient::new(self.channel.clone());
+        Box::new(client)
+    }
+
+    fn forwarded_lock_service(&self) -> Box<dyn ForwardedLockServiceClient> {
+        let client = GrpcForwardedLockServiceClient::new(self.channel.clone());
         Box::new(client)
     }
 }

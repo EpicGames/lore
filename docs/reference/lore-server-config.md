@@ -370,6 +370,10 @@ absent by default, and no RPC is forwarded until it is named under `enabled_rpcs
 per forwardable RPC, all `false` by default. Releases add to the set; an unknown
 key here is ignored, so a name that is not yet forwardable forwards nothing.
 
+`lock_query` forwards the lock service's `Query`. The peer answers it only if
+its own `[lock_store]` is at a mode other than `none`; otherwise it answers
+`UNIMPLEMENTED`, which the forwarding server relays to its client.
+
 `[server.grpc_public_services.forwarded_requests.client]` configures the channel to
 the peer. The defaults suit a long-lived connection that sits idle between
 forwards; tune them to the path the peer is actually reached over:

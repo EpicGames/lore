@@ -30,12 +30,15 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+use super::ServerResultExt;
 use super::extract_correlation_id;
 use super::get_repository;
 use super::get_user_id;
 use super::timeout_grpc;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::no_repository_access_status;
 use crate::grpc::require_action;
 use crate::util::setup_execution;
@@ -75,6 +78,56 @@ fn lock_query_from_request(
     }
 }
 
+/// Answers a lock query from this server's own lock store.
+pub async fn query_implementation(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    lock_store: &dyn LockStore,
+) -> Result<Response<QueryResponse>, Status> {
+    let query = lock_query_from_request(caller_context.repository_id, &request)
+        .map_err(handle_lock_error)?;
+
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id,
+    );
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            lock_store
+                .query_locks(query)
+                .await
+                .map(|result| {
+                    Response::new(QueryResponse {
+                        result: result.into_iter().map(Into::into).collect(),
+                    })
+                })
+                .map_err(handle_lock_error)
+        })
+        .await
+}
+
+/// Has the peer named by `forwarded_requests` answer the query, and relays its
+/// answer to the client.
+async fn forward_query(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<QueryResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_lock_service();
+    let request = caller_context.to_forwarded_request(request)?;
+
+    let query_result = client
+        .query(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = query_result?;
+    Ok(response)
+}
+
 fn handle_lock_error(error: LockError) -> Status {
     match error {
         LockError::LockNotFound(_) => Status::not_found(error.to_string()),
@@ -93,6 +146,7 @@ pub struct LoreLockService {
     lock_store: Arc<dyn LockStore>,
     notification: Arc<dyn NotificationSender>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
 
     instrument_provider: LoreLockServiceInstrumentProvider,
@@ -105,6 +159,7 @@ impl LoreLockService {
         lock_store: Arc<dyn LockStore>,
         notification: Arc<dyn NotificationSender>,
         authorizer: Arc<dyn RepositoryAuthorizer>,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
     ) -> Self {
         let instrument_provider = LoreLockServiceInstrumentProvider {};
@@ -113,6 +168,7 @@ impl LoreLockService {
             lock_store,
             notification,
             authorizer,
+            forwarded_requests,
             rpc_timeout,
             locking_histogram: instrument_provider.length_histogram(
                 "locking.request.resources.length",
@@ -221,29 +277,16 @@ impl LoreLockService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let user_id = get_user_id(request.extensions());
-        let repository = get_repository(request.metadata())?;
-        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let query_request = request.get_ref();
+        let caller_context = CallerContext::from_original_request(&request)?;
+        let query_request = request.into_inner();
 
-        let query =
-            lock_query_from_request(repository, query_request).map_err(handle_lock_error)?;
-
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                self.lock_store
-                    .query_locks(query)
-                    .await
-                    .map(|result| {
-                        Response::new(QueryResponse {
-                            result: result.into_iter().map(Into::into).collect(),
-                        })
-                    })
-                    .map_err(handle_lock_error)
-            })
-            .await
+        if let Some(forwarded_requests) = &self.forwarded_requests
+            && forwarded_requests.rpc_flags().lock_query
+        {
+            forward_query(query_request, caller_context, forwarded_requests).await
+        } else {
+            query_implementation(query_request, caller_context, self.lock_store.as_ref()).await
+        }
     }
 
     async fn handle_status(

@@ -784,6 +784,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 lock_store,
                 self.0.notification_sender.clone(),
                 repository_authorizer.clone(),
+                self.0.forwarded_requests.clone(),
                 rpc_timeout,
             )
         });

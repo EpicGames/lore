@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use lore_base::lore_spawn_net;
+use lore_proto::lock::forwarded_lock_service_server::ForwardedLockServiceServer;
 use lore_proto::lore::repository::v1::forwarded_repository_service_server::ForwardedRepositoryServiceServer;
 use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionServiceServer;
 use lore_proto::rpc::replication_service_server::ReplicationServiceServer;
 use lore_revision::environment::EnvironmentConfig;
+use lore_revision::lock::LockStore;
 use lore_revision::notification::NotificationSender;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -28,6 +30,7 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::grpc;
+use crate::grpc::forwarded_lock_service::LoreForwardedLockService;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
@@ -82,6 +85,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         local_immutable_store: Arc<dyn ImmutableStore>,
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
+        lock_store: Option<Arc<dyn LockStore>>,
         notification_sender: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         environment: EnvironmentConfig,
@@ -96,6 +100,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             local_immutable_store,
             immutable_store,
             mutable_store,
+            lock_store,
             notification_sender,
             hook_dispatcher,
             environment,
@@ -109,6 +114,7 @@ pub struct WantsTlsConfig {
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
@@ -160,6 +166,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             local_immutable_store: self.0.local_immutable_store,
             immutable_store: self.0.immutable_store,
             mutable_store: self.0.mutable_store,
+            lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
             hook_dispatcher: self.0.hook_dispatcher,
             environment: self.0.environment,
@@ -174,6 +181,7 @@ pub struct WantsHttp2Config {
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
@@ -236,6 +244,12 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 rpc_timeout,
             ),
         ));
+
+        if let Some(lock_store) = self.0.lock_store {
+            router = router.add_service(ForwardedLockServiceServer::new(
+                LoreForwardedLockService::new(lock_store, rpc_timeout),
+            ));
+        }
 
         Ok(GrpcInternalServerBuilder(WantsAddress { router }))
     }

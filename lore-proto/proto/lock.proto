@@ -51,6 +51,12 @@ service LockService {
   rpc AdminLock(AdminLockRequest) returns (AdminLockResponse);
 }
 
+// A service to receive requests forwarded on from another Lore Server,
+// to perform an RPC on behalf of a client
+service ForwardedLockService {
+  rpc Query(QueryRequest) returns (QueryResponse);
+}
+
 message LockRequest { repeated Resource resources = 1; }
 
 message LockResponse {

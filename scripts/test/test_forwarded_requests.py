@@ -9,7 +9,7 @@ from time import sleep
 
 import grpc
 import pytest
-from grpc_probe import call
+from grpc_probe import call, repository_metadata
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -26,6 +26,7 @@ from protobuf_wire import (
 logger = logging.getLogger(__name__)
 
 REPOSITORY_GET = "/lore.repository.v1.RepositoryService/RepositoryGet"
+LOCK_QUERY = "/urc.lock.LockService/Query"
 
 
 def allocate_server_ports() -> dict[str, int]:
@@ -104,6 +105,18 @@ def repository_name_in_response(body: bytes) -> str:
     `lore.model.v1.Repository`."""
     repository = field_message(parse_fields(body), 1)
     return field_string(repository, 2) if repository else ""
+
+
+def lock_descriptions_in_response(body: bytes) -> list[str]:
+    """The resource description of each `Lock` a `QueryResponse` carries.
+
+    `result` is repeated field 1 of the response, `resource` is field 1 of
+    `Lock`, and `description` is field 3 of `Resource`."""
+    descriptions = []
+    for lock in parse_fields(body).get(1, []):
+        resource = field_message(parse_fields(lock), 1)
+        descriptions.append(field_string(resource, 3) if resource else "")
+    return descriptions
 
 
 def log_contains(log_path: Path, expected: str, attempts: int = 30) -> bool:
@@ -621,6 +634,97 @@ class TestForwardedRepositoryGet:
         assert unknown_name in details, (
             "The peer's own message names the repository it could not find; "
             f"got '{details}'"
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("forwarded_requests")
+class TestForwardedLockQuery:
+    """
+    Smoke test for the forwarded-request delegation path for the lock service's
+    Query.
+
+    Each server keeps its own local lock store. A lock is acquired through
+    Server 1 only, for a repository Server 2's stores never held, so Server 2
+    can only report that lock by forwarding the query to Server 1.
+    """
+
+    @pytest.fixture(scope="class")
+    def server_1_config(self, request, tmp_path_factory):
+        return delegation_target_config(request, tmp_path_factory)
+
+    @pytest.fixture(scope="class")
+    def server_1(self, server_1_config, lore_server_executable_path):
+        server_root, server_env = server_1_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded lock query server 1"
+        )
+        log_fd.close()
+
+    @pytest.fixture(scope="class")
+    def server_2_config(self, request, tmp_path_factory, server_1_config):
+        return delegation_source_config(
+            request, tmp_path_factory, server_1_config, ["lock_query"]
+        )
+
+    @pytest.fixture(scope="class")
+    def server_2(self, server_2_config, server_1, lore_server_executable_path):
+        """
+        Depends on server_1 so the target's internal gRPC port is ready before
+        Server 2 starts. Server 2 connects to its peer while starting up and
+        fails to start if that connection is refused.
+        """
+        server_root, server_env = server_2_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded lock query server 2"
+        )
+        log_fd.close()
+
+    @pytest.mark.smoke
+    def test_lock_query_delegates_read_to_server_1(
+        self,
+        request,
+        server_1_config,
+        server_2_config,
+        server_1,
+        server_2,
+        new_lore_repo,
+    ):
+        """Verify delegation by finding a lock only Server 1's store holds."""
+        server_1_url = remote_url(request, server_1_config)
+        repo_id = uuid.uuid4().hex
+        repo_name = f"delegated-lock-{repo_id[:8]}"
+        repo = new_lore_repo(
+            remote_url=server_1_url,
+            remote_path=f"{server_1_url}/{repo_name}",
+            repo_id=repo_id,
+        )
+        repo.write_commit_push(None, {"locked.txt": "locked content"})
+        repo.lock_acquire("locked.txt")
+
+        # An empty QueryRequest asks for every lock in the repository the
+        # metadata names.
+        code, body, details = call(
+            grpc_target(request, server_2_config),
+            LOCK_QUERY,
+            b"",
+            metadata=repository_metadata(repo_id),
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"Lock Query via server 2 should succeed, got {code} '{details}'"
+        )
+        descriptions = lock_descriptions_in_response(body)
+        assert len(descriptions) == 1 and descriptions[0].endswith("locked.txt"), (
+            "The delegated response should carry the lock acquired on server 1, "
+            f"got {descriptions}"
         )
 
 

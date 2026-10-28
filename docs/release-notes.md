@@ -26,6 +26,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
+  `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
   1 MiB initial congestion window, set with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A
   periodically refreshed connection starts at no less than this window

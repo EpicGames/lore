@@ -26,6 +26,7 @@ mod replication_service_tests {
     use lore_proto::rpc::replication_service_client::ReplicationServiceClient;
     use lore_revision::fragment::generate_random;
     use lore_revision::util;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::grpc::GrpcInternalServerBuilder;
     use lore_server::store::grpc_replica::ReplicationClient;
     use lore_server::store::grpc_replica::ReplicationClientError;
@@ -154,9 +155,12 @@ mod replication_service_tests {
                 immutable.clone(),
                 immutable,
                 mutable,
+                None,
                 notification,
                 hooks,
                 lore_revision::environment::EnvironmentConfig::default(),
+                None,
+                Arc::new(AllowAllRepositoryAuthorizer),
             )?
             .with_tls_config(
                 Some(certs.server_cert_path.clone()),

@@ -164,6 +164,13 @@ mod forwarded_request {
                 response: Arc::clone(&self.response),
             })
         }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in repository_create tests")
+        }
     }
 
     fn make_request(repository_id: RepositoryId, name: &str) -> Request<RepositoryCreateRequest> {

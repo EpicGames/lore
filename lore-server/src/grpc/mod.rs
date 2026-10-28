@@ -6,6 +6,7 @@ use crate::authnz::repository_authorizer::Action;
 pub mod admin_service;
 pub mod environment;
 pub mod environment_service;
+pub mod forwarded_lock_service;
 pub mod forwarded_repository;
 pub mod forwarded_requests;
 pub mod forwarded_revision;
