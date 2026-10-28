@@ -28,6 +28,8 @@ All keys are snake_case. The config structs are plain serde with no case renamin
 
 Set at create or clone time from the URL you pass (for example `lore://127.0.0.1:41337/my-project`). It may be empty: a repository created with `--offline` (or `--local`) has no remote, and the argument you pass names the repository rather than locating it — `lore --offline repository create my-project`, or no argument at all to name it after the current directory.
 
+The scheme decides whether the client authenticates the server. `lores://` validates the server certificate, and is the scheme used when the URL has none. `lore://` doesn't: the client accepts any certificate on QUIC connections, and sends gRPC requests to the server, access tokens included, without TLS. Use `lore://` only for a server on the same machine, as in the examples on this page. With a `lores://` remote, the client refuses to connect if the server advertises a storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server.
+
 With no `remote_url`, commands that need the network fail with `NoRemote` rather than attempting a connection. That is a distinct error from `Disconnected`, which means a remote *is* configured but could not be reached.
 
 Treat the field as fixed once the repository exists. Pointing an established repository at a different remote is not generally safe — the shared store is keyed on this value, among other things — so create or clone against the remote you intend to use rather than editing this afterwards. See the [Quickstart](../tutorials/quickstart.md) for how the remote URL is introduced.

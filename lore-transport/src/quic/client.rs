@@ -55,6 +55,7 @@ use super::response_reader::ResponseReader;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
+use crate::connection::authenticates_server;
 use crate::error::ProtocolError;
 use crate::tls::load_certs;
 use crate::tls::load_private_key;
@@ -856,7 +857,7 @@ pub async fn connect(
     let remote_addrs = interleave_socket_addrs(remote_addrs);
     let server_name = config.sni_override.as_deref().unwrap_or(host.as_str());
 
-    let validate_certificate = url.scheme().ends_with("s");
+    let validate_certificate = authenticates_server(&url);
     let crypto_config = client_crypto_config(alpn, certificate_settings, validate_certificate)?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(

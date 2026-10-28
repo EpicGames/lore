@@ -344,6 +344,301 @@ mod refusal_is_final {
     }
 }
 
+/// The server names the endpoint of each service, and each connection takes its own URL's
+/// scheme. A remote whose scheme authenticates the server must not hand a service to an endpoint
+/// that does not, or the user's choice of scheme protects only the first connection.
+mod check_advertised_endpoints {
+    use std::sync::Weak;
+
+    use lore_transport::auth::AuthEndpoint;
+    use lore_transport::traits::Admin;
+    use lore_transport::traits::Environment;
+    use lore_transport::traits::Lock;
+    use lore_transport::traits::Protocol;
+    use lore_transport::traits::Repository;
+    use lore_transport::traits::Revision;
+    use lore_transport::traits::Storage;
+    use url::Url;
+
+    use super::*;
+
+    type Advertise = fn(&mut Endpoint, String);
+
+    /// Every service the client connects to at an advertised URL.
+    const SERVICES: [(&str, Advertise); 5] = [
+        ("storage", |endpoint, url| {
+            endpoint.storage_url = Some(url);
+        }),
+        ("revision", |endpoint, url| {
+            endpoint.revision_url = Some(url);
+        }),
+        ("lock", |endpoint, url| {
+            endpoint.lock_url = Some(url);
+        }),
+        ("repository", |endpoint, url| {
+            endpoint.repository_url = Some(url);
+        }),
+        ("notification", |endpoint, url| {
+            endpoint.notification_url = Some(url);
+        }),
+    ];
+
+    const SECURE_REMOTES: [&str; 3] = [
+        "lores://remote.invalid:41337",
+        "urcs://remote.invalid:41337",
+        "grpcs://remote.invalid:41337",
+    ];
+
+    fn check_endpoint(remote: &str, endpoint: Endpoint) -> Result<(), ProtocolError> {
+        let environment = EnvironmentConfig {
+            endpoint: Some(endpoint),
+            ..Default::default()
+        };
+        let remote = Url::parse(remote).expect("the test remote is a valid URL");
+        lore_transport::connection::check_advertised_endpoints(&remote, &environment)
+    }
+
+    fn check(remote: &str, advertise: Advertise, url: &str) -> Result<(), ProtocolError> {
+        let mut endpoint = Endpoint::default();
+        advertise(&mut endpoint, url.to_string());
+        check_endpoint(remote, endpoint)
+    }
+
+    #[test]
+    fn a_secure_remote_refuses_an_endpoint_that_skips_server_authentication() {
+        for (remote, advertised) in [
+            (
+                "lores://remote.invalid:41337",
+                "lore://service.invalid:41337",
+            ),
+            ("urcs://remote.invalid:41337", "urc://service.invalid:41337"),
+            (
+                "grpcs://remote.invalid:41337",
+                "grpc://service.invalid:41337",
+            ),
+            (
+                "lores://remote.invalid:41337",
+                "quic://service.invalid:7000",
+            ),
+            ("lores://remote.invalid:41337", "not a url"),
+        ] {
+            for (service, advertise) in SERVICES {
+                let err = check(remote, advertise, advertised).expect_err(service);
+                assert!(
+                    err.is_not_supported(),
+                    "{remote} advertising {service} at {advertised}: {err:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_secure_remote_refuses_an_insecure_endpoint_among_secure_ones() {
+        for (insecure, _) in SERVICES {
+            let mut endpoint = Endpoint::default();
+            for (service, advertise) in SERVICES {
+                let scheme = if service == insecure { "lore" } else { "lores" };
+                advertise(&mut endpoint, format!("{scheme}://service.invalid:41337"));
+            }
+            let err = check_endpoint("lores://remote.invalid:41337", endpoint).expect_err(insecure);
+            assert!(err.is_not_supported(), "{insecure}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_secure_remote_accepts_an_endpoint_that_authenticates_the_server() {
+        for remote in SECURE_REMOTES {
+            for advertised in [
+                "lores://service.invalid:41337",
+                "urcs://service.invalid:41337",
+                "grpcs://service.invalid:41337",
+                "https://service.invalid",
+            ] {
+                for (service, advertise) in SERVICES {
+                    if let Err(err) = check(remote, advertise, advertised) {
+                        panic!("{remote} advertising {service} at {advertised}: {err:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The auth and user directory endpoints follow a scheme policy of their own.
+    #[test]
+    fn a_secure_remote_accepts_auth_and_user_endpoints_of_any_scheme() {
+        check_endpoint(
+            "lores://remote.invalid:41337",
+            Endpoint {
+                auth_url: Some("ucs-auth://auth.invalid".into()),
+                user_url: Some("ucs-auth://directory.invalid".into()),
+                ..Default::default()
+            },
+        )
+        .expect("auth_url and user_url are not service endpoints");
+    }
+
+    /// An empty override falls back to the remote, as no override does.
+    #[test]
+    fn a_secure_remote_accepts_its_own_endpoints() {
+        let remote = Url::parse("lores://remote.invalid:41337").expect("valid URL");
+        for environment in [
+            EnvironmentConfig::default(),
+            EnvironmentConfig {
+                endpoint: Some(Endpoint::default()),
+                ..Default::default()
+            },
+        ] {
+            lore_transport::connection::check_advertised_endpoints(&remote, &environment)
+                .expect("no override leaves every service on the remote");
+        }
+        for (service, advertise) in SERVICES {
+            check("lores://remote.invalid:41337", advertise, "").expect(service);
+        }
+    }
+
+    /// A remote that skips server authentication has no guarantee to lose.
+    #[test]
+    fn an_insecure_remote_accepts_any_endpoint() {
+        for advertised in [
+            "lore://service.invalid:41337",
+            "lores://service.invalid:41337",
+        ] {
+            for (service, advertise) in SERVICES {
+                check("lore://remote.invalid:41337", advertise, advertised).expect(service);
+            }
+        }
+    }
+
+    /// A protocol whose server advertises the storage endpoint it holds, and whose services all
+    /// fail to connect.
+    struct AdvertisingProtocol(&'static str);
+
+    #[async_trait::async_trait]
+    impl Environment for AdvertisingProtocol {
+        async fn get(&self) -> Result<EnvironmentConfig, ProtocolError> {
+            Ok(EnvironmentConfig {
+                endpoint: Some(Endpoint {
+                    storage_url: Some(self.0.to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Protocol for AdvertisingProtocol {
+        async fn storage(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: Partition,
+            _: usize,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Storage>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn revision(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Revision>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn repository(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Repository>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn admin(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Admin>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn lock(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Lock>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn environment(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+        ) -> Result<Arc<dyn Environment>, ProtocolError> {
+            Ok(Arc::new(AdvertisingProtocol(self.0)))
+        }
+    }
+
+    /// Both schemes end in `s`, so both remotes authenticate the server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connect_refuses_a_remote_advertising_an_endpoint_that_skips_server_authentication() {
+        add(
+            "refuses",
+            Arc::new(AdvertisingProtocol("lore://service.invalid:41337")),
+        )
+        .expect("the scheme is not registered yet");
+        add(
+            "accepts",
+            Arc::new(AdvertisingProtocol("lores://service.invalid:41337")),
+        )
+        .expect("the scheme is not registered yet");
+
+        let refused = connect(
+            "refuses://remote.invalid:41337",
+            "",
+            RepositoryId::default(),
+            1,
+            "",
+            "",
+            AuthMode::Auto,
+        )
+        .await
+        .err()
+        .expect("an endpoint that skips server authentication is refused");
+        assert!(refused.is_not_supported(), "{refused:?}");
+
+        connect(
+            "accepts://remote.invalid:41337",
+            "",
+            RepositoryId::default(),
+            1,
+            "",
+            "",
+            AuthMode::Auto,
+        )
+        .await
+        .expect("an endpoint that authenticates the server is accepted");
+    }
+}
+
 /// The refusal is remembered so the round trip is paid once, and retired by the success that
 /// proves it no longer holds.
 #[test]

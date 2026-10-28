@@ -17,6 +17,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout
   (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of
   `INTERNAL`
+- A client connected to a `lores://` remote refuses to connect, failing with `NotSupported`, if the server advertises a
+  storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as
+  `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A
+  server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
 
 ### Features
 

@@ -97,12 +97,19 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | --- | --- | --- |
 | `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
 | `user_url` | none | A user directory served over `lore.user.v1.UserService`, which clients use to resolve user IDs to display names, and back. If not set, clients speak the `UrcAuthApi` `GetUserInfo` and `GetUserId` RPCs to `auth_url` instead. If neither is set, clients fall back to an offline resolver that returns user IDs as names. When set, the server's repository catalog also lists partitions there by default (see `repository_catalog`), and the server registers the repositories it creates and deletes there with `PartitionAdd` and `PartitionRemove` instead of the `RebacApi` `CreateResource` and `DeleteResource` calls to `auth_url`. A refused `PartitionAdd` fails the create, and a refused `PartitionRemove` the delete. |
+| `storage_url` | none | The endpoint advertised for the storage service. If not set, clients use the server they connected to. |
+| `repository_url` | none | The endpoint advertised for the repository service. If not set, clients use the server they connected to. |
+| `revision_url` | none | The endpoint advertised for the revision service. If not set, clients use the server they connected to. |
+| `lock_url` | none | The endpoint advertised for the lock service. If not set, clients use the server they connected to. |
+| `notification_url` | none | The endpoint advertised for the notification service. If not set, clients use the server they connected to. |
 
 ```toml
 [environment.endpoint]
 auth_url = "ucs-auth://auth.example.com"
 user_url = "ucs-auth://directory.example.com"
 ```
+
+A client connected over `lores://` refuses to connect if the server advertises a `storage_url`, `repository_url`, `revision_url`, `lock_url`, or `notification_url` whose scheme doesn't authenticate the server, such as `lore://`. Give these endpoints a scheme that does, such as `lores://`.
 
 ### Local store disk space
 

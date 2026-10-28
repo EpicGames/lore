@@ -63,6 +63,7 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
+use crate::connection::authenticates_server;
 use crate::error::ProtocolError;
 use crate::traits::*;
 use crate::types::*;
@@ -731,8 +732,7 @@ pub async fn connect(
         .host_str()
         .ok_or_else(|| ProtocolError::internal(format!("remote {remote_url} is invalid")))?;
 
-    // Possible HTTPS schemes: urcs, grpcs, lores
-    let (scheme, default_port) = if parsed_url.scheme().ends_with("s") {
+    let (scheme, default_port) = if authenticates_server(&parsed_url) {
         ("https", GRPCS_PORT_DEFAULT)
     } else {
         ("http", GRPC_PORT_DEFAULT)
