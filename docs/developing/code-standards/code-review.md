@@ -32,14 +32,18 @@ Review adversarially, from the code, not from assumptions, memory, or the change
 
 ## Irreversible changes
 
-Escalate these to a human reviewer. Once released, only a migration can undo them.
+Escalate only these to a human reviewer. Once released, only a migration can undo them.
 
-1. **Protocol.** Protobuf definitions (`*.proto`) and the QUIC protocol, client and server.
+1. **Protocol.** Protobuf definitions (`*.proto`) and the QUIC wire format: the bytes a client and server exchange. Server-internal QUIC handling, such as sockets, endpoints, and connection routing, isn't protocol.
 2. **Serialized and immutable data.** `StateData`, `NodeBlockData`, `Metadata`, and similar. Anything in the immutable store or in `.lore/` files.
 3. **Thresholds and limits.** Chunking parameters (`FRAGMENT_SIZE_MINIMUM` in `lore-storage`; `FRAGMENT_SIZE_EXPECTED` and `FRAGMENT_SIZE_THRESHOLD` in `lore-base`), the compression algorithm or default mode, and fragment flags.
 4. **Public C API.** The `extern "C"` surface, `lore-capi/lore.h`, the cbindgen config, the event contract, and FFI error codes.
 
-In the escalation comment, say which is missing: how old and new readers and writers handle each other's format, how existing data or peers migrate, the client and server ship order, and the rollback after new-format data is written.
+In the escalation comment, show how the change becomes irreversible. List the exact chain of events, from merge to the point where a revert no longer undoes it. Name the code, the data or peer it affects, and the step where the data is written or the peer depends on it. For example: a client built from this change writes `StateData` with the new field to the immutable store, a client built before it reads that `StateData` and fails, and reverting the change doesn't rewrite the stored data. If you can't name each step, don't escalate.
+
+Then say which is missing: how old and new readers and writers handle each other's format, how existing data or peers migrate, the client and server ship order, and the rollback after new-format data is written.
+
+Don't escalate for any other reason. Security, authentication, authorization, destructive commands, `--dry-run` behavior, change size, a missing LEP, and blocking findings are not reasons to escalate. Report them as findings. A revert can undo them.
 
 ## Performance
 
