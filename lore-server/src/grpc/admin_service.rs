@@ -23,6 +23,8 @@ use tracing::warn;
 use super::handlers::obliterate;
 use super::timeout_grpc;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::hooks::HookDispatcher;
 
 pub struct LoreAdminService {
@@ -30,6 +32,7 @@ pub struct LoreAdminService {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     rpc_timeout: Duration,
@@ -82,19 +85,28 @@ impl LoreAdminService {
             immutable_store,
             mutable_store,
             jwt_verifier: Arc::new(None),
+            repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
             notification,
             hook_dispatcher,
             rpc_timeout: Duration::from_secs(60),
         }
     }
 
-    pub fn set_jwt_verifier(&mut self, jwt_verifier: Option<JwtVerifier>) {
+    /// Set together so the verifier and the authorizer selected for it cannot
+    /// disagree: a verifier left beside the allow-all default would let any
+    /// authenticated caller obliterate.
+    pub fn set_auth(
+        &mut self,
+        jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) {
         if jwt_verifier.is_none() {
             warn!(
                 "No JWT verifier - Admin Service RPCs including obliterate will be unauthenticated"
             );
         }
         self.jwt_verifier = Arc::new(jwt_verifier);
+        self.repository_authorizer = repository_authorizer;
     }
 
     pub fn set_rpc_timeout(&mut self, rpc_timeout: Duration) {
@@ -122,6 +134,7 @@ impl AdminService for LoreAdminService {
             self.rpc_timeout,
             obliterate::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),

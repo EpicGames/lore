@@ -10,10 +10,13 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
+use crate::grpc::require_action;
 use crate::grpc::simple_map_message_handle_error;
 use crate::protocol::storage::mutable_store_handler::handle_mutable_store;
 use crate::util::setup_execution;
@@ -21,8 +24,10 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "StorageServiceV1::MutableStore", skip_all)]
 pub async fn handler(
     request: Request<storage_v1::MutableStoreRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();

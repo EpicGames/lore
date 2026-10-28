@@ -11,6 +11,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::grpc::forwarded_requests::ForwardedRequests;
@@ -289,7 +290,7 @@ mod forwarded_request {
                 &self,
                 _token: Option<&VerifiedToken<'_>>,
                 _repository_id: lore_base::types::RepositoryId,
-                _action: Option<&str>,
+                _action: Action,
             ) -> Result<(), Status> {
                 Err(Status::permission_denied("denied"))
             }

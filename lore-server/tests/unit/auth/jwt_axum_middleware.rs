@@ -23,6 +23,7 @@ use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::http::server::LoreHttpServerSettings;
@@ -159,6 +160,71 @@ async fn the_shared_authorizer_decides_the_repository_path() {
             // No bearer at all keeps answering 401, not 403.
             let response = server.get(&url).await;
             assert_eq!(response.status_code(), HttpStatusCode::UNAUTHORIZED);
+        })
+        .await;
+}
+
+/// Any grant on the repository reads its content; `PUT` also needs `write`.
+/// The legacy tier answers from the token's `resources` claim, so the
+/// authorizer's URL is never reached.
+#[tokio::test]
+async fn any_grant_reads_and_put_needs_write() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<Context>();
+            let (fragment, address, payload) = fragment::generate_random();
+            immutable_store
+                .clone()
+                .put(repository.into(), address, fragment, Some(payload), false)
+                .await
+                .expect("Failed to put data in immutable store");
+
+            let state = ServerState {
+                immutable_store,
+                mutable_store,
+                jwt_verifier: Some(verifier()),
+                repository_authorizer: Arc::new(AuthClientAuthorizer::new(
+                    "https://auth.invalid".to_string(),
+                )),
+                max_file_size: 100,
+                presign_config: None,
+            };
+            let health = ServerHealth::new_without_availability(state.immutable_store.clone());
+            let server = TestServer::new(create_router(
+                state,
+                health,
+                &LoreHttpServerSettings::test_default(),
+            ))
+            .unwrap();
+            let auth_header = HeaderName::from_static("authorization");
+            let holding = |action: Action| {
+                bearer(Some(vec![ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: vec![action.to_string()],
+                }]))
+            };
+
+            let get = format!("/v1/repository/{repository}/content/{address}");
+            let put = format!("/v1/repository/{repository}/content");
+            for (action, get_status, put_status) in [
+                (Action::Read, HttpStatusCode::OK, HttpStatusCode::FORBIDDEN),
+                (Action::Write, HttpStatusCode::OK, HttpStatusCode::OK),
+            ] {
+                let response = server
+                    .get(&get)
+                    .add_header(auth_header.clone(), holding(action))
+                    .await;
+                assert_eq!(response.status_code(), get_status, "GET with {action}");
+
+                let response = server
+                    .put(&put)
+                    .add_header(auth_header.clone(), holding(action))
+                    .bytes(bytes::Bytes::from_static(b"content"))
+                    .await;
+                assert_eq!(response.status_code(), put_status, "PUT with {action}");
+            }
         })
         .await;
 }

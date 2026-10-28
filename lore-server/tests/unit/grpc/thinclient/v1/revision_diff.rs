@@ -112,7 +112,7 @@ async fn push_revision(
         repository.clone(),
         branch_id,
         serialized,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,

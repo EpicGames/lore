@@ -116,6 +116,7 @@ mod direct_handling {
             let hook_dispatcher = HookDispatcher::empty();
             let response = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -172,6 +173,7 @@ mod direct_handling {
             let before = util::time::timestamp();
             let response = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -222,6 +224,7 @@ mod direct_handling {
             let hook_dispatcher = HookDispatcher::empty();
             let err = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -270,6 +273,7 @@ mod direct_handling {
             let hook_dispatcher = HookDispatcher::empty();
             let response = handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -322,6 +326,7 @@ mod direct_handling {
             let hook_dispatcher = HookDispatcher::empty();
             handler(
                 make_request(),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -334,6 +339,7 @@ mod direct_handling {
 
             let err = handler(
                 make_request(),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -387,6 +393,7 @@ mod direct_handling {
             let (hook_dispatcher, seen) = recording_dispatcher(false);
             handler(
                 request,
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -421,6 +428,7 @@ mod direct_handling {
             let (hook_dispatcher, _seen) = recording_dispatcher(true);
             let err = handler(
                 create_request(repository, "main"),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -461,6 +469,7 @@ mod direct_handling {
             let name = "x".repeat(branch::MAX_NAME_LEN + 1);
             let err = handler(
                 create_request(repository, &name),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -623,6 +632,7 @@ mod forwarded_request {
 
             let response = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,
@@ -662,6 +672,7 @@ mod forwarded_request {
 
             let err = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,
@@ -696,6 +707,7 @@ mod forwarded_request {
 
             let err = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,
@@ -736,6 +748,7 @@ mod forwarded_request {
 
             let response = handler(
                 make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
                 immutable_store,
                 mutable_store,
                 notification_sender,

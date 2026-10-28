@@ -8,6 +8,7 @@ use lore_base::types::Context;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use tonic::Request;
 use tonic::Status;
@@ -30,16 +31,16 @@ mod auth_guard {
             &self,
             _token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             Err(Status::permission_denied("denied"))
         }
     }
 
-    /// Permits, recording that the handler asked with `action: None`.
+    /// Permits, recording the action the handler asked.
     #[derive(Default)]
     struct RecordingPermitAuthorizer {
-        called_with_action_none: std::sync::atomic::AtomicBool,
+        asked: std::sync::Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -48,10 +49,9 @@ mod auth_guard {
             &self,
             _token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            action: Option<&str>,
+            action: Action,
         ) -> Result<(), Status> {
-            self.called_with_action_none
-                .store(action.is_none(), std::sync::atomic::Ordering::SeqCst);
+            self.asked.lock().unwrap().replace(action.to_string());
             Ok(())
         }
     }
@@ -138,11 +138,7 @@ mod auth_guard {
                 handler(request, authorizer.clone(), immutable, mutable)
                     .await
                     .unwrap();
-                assert!(
-                    authorizer
-                        .called_with_action_none
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                );
+                assert_eq!(authorizer.asked.lock().unwrap().as_deref(), Some("write"));
             })
             .await;
     }

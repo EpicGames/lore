@@ -33,6 +33,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_is_service_account;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::branch_push::PushAccess;
 use crate::grpc::handlers::branch_push::PushResult;
 use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
@@ -80,10 +81,7 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
 
-    // The `push-protected` action waives branch protection, which is how mirroring pushes.
-    let bypass_protection = authorizer
-        .permits(request.extensions(), repository_id, "push-protected")
-        .await;
+    let access = PushAccess::of(&authorizer, request.extensions(), repository_id).await?;
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
     let req = request.into_inner();
@@ -101,7 +99,7 @@ pub async fn handler(
 
     debug!(
         {REVISION} = %revision,
-        bypass_protection,
+        ?access,
         {BRANCH_ID} = %branch_id,
         force,
         fast_forward_merge,
@@ -155,7 +153,7 @@ pub async fn handler(
                 repository.clone(),
                 branch_id,
                 revision,
-                bypass_protection,
+                access,
                 force,
                 fast_forward_merge,
                 history_step_size,

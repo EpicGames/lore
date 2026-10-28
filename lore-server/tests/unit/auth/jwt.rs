@@ -11,6 +11,7 @@ use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::*;
+use lore_server::authnz::repository_authorizer::Action;
 use serde::Serialize;
 
 /// The in-place action check agrees with the merged set it stands in for:
@@ -30,19 +31,24 @@ fn permits_reads_only_matching_entries() {
         entry("urc-somewhere-else", &["obliterate"]),
         entry("urc-*", &["migrate"]),
     ];
-    for action in ["read", "migrate", "obliterate", "presign"] {
+    for action in [
+        Action::Read,
+        Action::Migrate,
+        Action::Obliterate,
+        Action::Presign,
+    ] {
         assert_eq!(
             matcher.permits(&resources, repository, action),
             matcher
                 .merged_permissions(&resources, repository)
                 .iter()
-                .any(|granted| granted == action),
+                .any(|granted| granted == action.as_str()),
             "{action}"
         );
     }
-    assert!(matcher.permits(&resources, repository, "migrate"));
-    assert!(!matcher.permits(&resources, repository, "obliterate"));
-    assert!(!matcher.permits(&[], repository, "read"));
+    assert!(matcher.permits(&resources, repository, Action::Migrate));
+    assert!(!matcher.permits(&resources, repository, Action::Obliterate));
+    assert!(!matcher.permits(&[], repository, Action::Read));
 }
 
 #[test]

@@ -22,6 +22,10 @@ use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+use lore_server::authnz::repository_authorizer::Action;
+use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::handlers::obliterate::*;
 use lore_server::hooks::HookDispatcher;
 use lore_storage::Fragment;
@@ -72,6 +76,14 @@ fn make_verifier(jwk_service: MockTestJWKService) -> JwtVerifier {
 }
 
 fn make_jwt(resources: Option<Vec<ResourcePermission>>) -> String {
+    signed_jwt(resources, None)
+}
+
+fn make_jwt_with_groups(groups: Vec<String>) -> String {
+    signed_jwt(None, Some(groups))
+}
+
+fn signed_jwt(resources: Option<Vec<ResourcePermission>>, groups: Option<Vec<String>>) -> String {
     let claims = AuthorizationToken {
         user_id: "test-user".to_string(),
         issuer: "test-issuer".to_string(),
@@ -87,7 +99,7 @@ fn make_jwt(resources: Option<Vec<ResourcePermission>>) -> String {
         preferred_username: Some("test".to_string()),
         client_id: None,
         resources,
-        groups: None,
+        groups,
         is_service_account: Some(false),
         idp: Some("test".to_string()),
         extra: Default::default(),
@@ -113,6 +125,14 @@ fn bad_key_service() -> MockTestJWKService {
         .expect_get_key()
         .returning(|_| Err(JWKServiceError::NotFound));
     service
+}
+
+/// The legacy tier answers an access token from its `resources` claim, so
+/// the URL is never reached.
+fn legacy_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+    Arc::new(AuthClientAuthorizer::new(
+        "https://auth.invalid".to_string(),
+    ))
 }
 
 fn make_request(
@@ -143,6 +163,7 @@ async fn proceeds_without_auth_when_no_verifier_configured() {
 
     let err = handler(
         make_request(repository, None),
+        &crate::util::test_support::allow_all_authorizer(),
         immutable_store,
         mutable_store,
         notification,
@@ -166,6 +187,7 @@ async fn returns_unauthenticated_when_authorization_header_absent() {
 
     let err = handler(
         make_request(repository, None),
+        &legacy_authorizer(),
         immutable_store,
         mutable_store,
         notification,
@@ -188,6 +210,7 @@ async fn returns_unauthenticated_for_unverifiable_token() {
 
     let err = handler(
         make_request(repository, Some(make_jwt(None))),
+        &legacy_authorizer(),
         immutable_store,
         mutable_store,
         notification,
@@ -215,6 +238,7 @@ async fn returns_permission_denied_when_user_lacks_obliterate_permission() {
 
     let err = handler(
         make_request(repository, Some(make_jwt(Some(resources)))),
+        &legacy_authorizer(),
         immutable_store,
         mutable_store,
         notification,
@@ -244,6 +268,7 @@ async fn returns_not_found_when_authorized_and_address_absent() {
 
     let err = handler(
         make_request(repository, Some(make_jwt(Some(resources)))),
+        &legacy_authorizer(),
         immutable_store,
         mutable_store,
         notification,
@@ -318,6 +343,7 @@ async fn succeeds_for_authorized_request_with_existing_address() {
 
     handler(
         request,
+        &legacy_authorizer(),
         immutable_store.clone(),
         mutable_store,
         notification,
@@ -334,4 +360,37 @@ async fn succeeds_for_authorized_request_with_existing_address() {
         get_err.is_address_not_found(),
         "payload should be obliterated; got: {get_err:?}"
     );
+}
+
+/// Tier 1 reads `obliterate` from a role claim.
+#[tokio::test]
+async fn a_tier_1_obliterate_role_permits() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, _) = test_store_create().await.unwrap();
+    let mut notification = MockNotificationSender::new();
+    notification.expect_obliterate().never();
+    let notification = Arc::new(notification);
+    let hook_dispatcher = HookDispatcher::empty();
+    let tier_1: Arc<dyn RepositoryAuthorizer> = Arc::new(GlobalGrantsAuthorizer::new(
+        Some("groups".to_string()),
+        vec![Action::Read, Action::Write],
+    ));
+
+    for (groups, code) in [
+        (vec!["obliterate".to_string()], Code::NotFound),
+        (vec![], Code::PermissionDenied),
+    ] {
+        let err = handler(
+            make_request(repository, Some(make_jwt_with_groups(groups))),
+            &tier_1,
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification.clone(),
+            &hook_dispatcher,
+            &Some(make_verifier(good_key_service())).into(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), code);
+    }
 }

@@ -18,12 +18,15 @@ use tonic::Response;
 use tonic::Status;
 use tracing::debug;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
@@ -61,12 +64,14 @@ fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<()
 #[tracing::instrument(name = "BranchCreate::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchCreateRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchCreateResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();

@@ -24,6 +24,7 @@ records reset between tests.
 """
 
 import logging
+import re
 import threading
 import time
 import uuid
@@ -784,6 +785,154 @@ def test_every_partition_scoped_service_enforces_partition_access(auth_env, make
         "every denial must be the online check's verdict: one CheckUserPermission "
         f"per probed service, got {len(denied_checks)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Every partition-scoped RPC asks one action
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The protos of the six partition-scoped services, and the service in each.
+PARTITION_SCOPED_SERVICES = (
+    ("lore-server/src/legacy/proto/storage.proto", "StorageService"),
+    ("lore-proto/proto/lore/storage/v1/storage.proto", "StorageService"),
+    ("lore-server/src/legacy/proto/revision.proto", "RevisionService"),
+    ("lore-proto/proto/lore/revision/v1/revision.proto", "RevisionService"),
+    ("lore-proto/proto/lore/thin_client/v1/thin_client.proto", "ThinClientService"),
+    ("lore-proto/proto/lock.proto", "LockService"),
+)
+
+# The actions that admit each RPC, any one of them sufficing. `("read",)`
+# means any grant on the repository admits it, since a grant implies `read`.
+# `None` for the two that act on no partition data: the liveness ping and the
+# unimplemented ContentDiff. Push takes `push-protected` for a protected branch and unlock
+# takes `owner` or `admin` for another user's locks; the empty probe body
+# names neither, so either passes the check. Protect and unprotect also admit
+# the creator with `write`, which the probe's caller is not.
+RPC_ACTIONS = {
+    "/urc.rpc.StorageService/Get": ("read",),
+    "/urc.rpc.StorageService/Ping": None,
+    "/urc.rpc.StorageService/Put": ("write",),
+    "/urc.rpc.StorageService/Query": ("read",),
+    "/urc.rpc.StorageService/Verify": ("read",),
+    "/urc.rpc.StorageService/Copy": ("write",),
+    "/urc.rpc.StorageService/MutableLoad": ("read",),
+    "/urc.rpc.StorageService/MutableStore": ("write",),
+    "/urc.rpc.StorageService/MutableCompareAndSwap": ("write",),
+    "/lore.storage.v1.StorageService/Get": ("read",),
+    "/lore.storage.v1.StorageService/GetMetadata": ("read",),
+    "/lore.storage.v1.StorageService/GetResolved": ("read",),
+    "/lore.storage.v1.StorageService/PutResolved": ("write",),
+    "/lore.storage.v1.StorageService/Put": ("write",),
+    "/lore.storage.v1.StorageService/Query": ("read",),
+    "/lore.storage.v1.StorageService/Verify": ("read",),
+    "/lore.storage.v1.StorageService/Copy": ("write",),
+    "/lore.storage.v1.StorageService/MutableLoad": ("read",),
+    "/lore.storage.v1.StorageService/MutableStore": ("write",),
+    "/lore.storage.v1.StorageService/MutableCompareAndSwap": ("write",),
+    "/urc.rpc.RevisionService/BranchCreate": ("write",),
+    "/urc.rpc.RevisionService/BranchDelete": ("write",),
+    "/urc.rpc.RevisionService/BranchQuery": ("read",),
+    "/urc.rpc.RevisionService/BranchGet": ("read",),
+    "/urc.rpc.RevisionService/BranchList": ("read",),
+    "/urc.rpc.RevisionService/BranchPush": ("write", "push-protected"),
+    "/urc.rpc.RevisionService/BranchProtect": ("owner", "admin"),
+    "/urc.rpc.RevisionService/BranchUnprotect": ("owner", "admin"),
+    "/urc.rpc.RevisionService/BranchDiff": ("read",),
+    "/urc.rpc.RevisionService/BranchRevisionList": ("read",),
+    "/urc.rpc.RevisionService/BranchMetadataGet": ("read",),
+    "/urc.rpc.RevisionService/BranchMetadataSet": ("write",),
+    "/urc.rpc.RevisionService/RevisionDescribe": ("read",),
+    "/urc.rpc.RevisionService/RevisionDiff": ("read",),
+    "/urc.rpc.RevisionService/RevisionStateHistory": ("read",),
+    "/urc.rpc.RevisionService/RevisionTree": ("read",),
+    "/urc.rpc.RevisionService/RevisionList": ("read",),
+    "/lore.revision.v1.RevisionService/BranchCreate": ("write",),
+    "/lore.revision.v1.RevisionService/BranchDelete": ("write",),
+    "/lore.revision.v1.RevisionService/BranchGet": ("read",),
+    "/lore.revision.v1.RevisionService/BranchList": ("read",),
+    "/lore.revision.v1.RevisionService/BranchPush": ("write", "push-protected"),
+    "/lore.revision.v1.RevisionService/BranchMetadataGet": ("read",),
+    "/lore.revision.v1.RevisionService/BranchMetadataSet": ("write",),
+    "/lore.revision.v1.RevisionService/RevisionList": ("read",),
+    "/lore.thin_client.v1.ThinClientService/ContentDiff": None,
+    "/lore.thin_client.v1.ThinClientService/RevisionInfo": ("read",),
+    "/lore.thin_client.v1.ThinClientService/RevisionDiff": ("read",),
+    "/lore.thin_client.v1.ThinClientService/RevisionTree": ("read",),
+    "/urc.lock.LockService/Lock": ("write",),
+    "/urc.lock.LockService/Query": ("read",),
+    "/urc.lock.LockService/Status": ("read",),
+    "/urc.lock.LockService/Unlock": ("write", "owner", "admin"),
+    "/urc.lock.LockService/AdminLock": ("migrate",),
+}
+
+
+def proto_rpc_paths(proto: Path, service: str) -> set[str]:
+    """`/<package>.<service>/<rpc>` for every rpc of `service` in `proto`."""
+    package = re.search(r"^package\s+([\w.]+);", proto.read_text(), re.M).group(1)
+    body = re.search(
+        rf"^service\s+{service}\s*\{{(.*?)^\}}", proto.read_text(), re.M | re.S
+    ).group(1)
+    return {
+        f"/{package}.{service}/{rpc}"
+        for rpc in re.findall(r"^\s*rpc\s+(\w+)", body, re.M)
+    }
+
+
+def test_every_partition_scoped_rpc_is_classified():
+    """A new RPC on a partition-scoped service fails here until someone
+    decides which action it asks, so none ships unchecked."""
+    declared = set().union(
+        *(
+            proto_rpc_paths(REPO_ROOT / proto, service)
+            for proto, service in PARTITION_SCOPED_SERVICES
+        )
+    )
+    assert declared == set(RPC_ACTIONS), (
+        f"unclassified: {sorted(declared - set(RPC_ACTIONS))}, "
+        f"stale: {sorted(set(RPC_ACTIONS) - declared)}"
+    )
+
+
+@pytest.mark.smoke
+def test_every_partition_scoped_rpc_asks_its_action(auth_env, make_actor):
+    """Each RPC, sent raw with an empty body, is refused for a token lacking
+    its action and passes the check for a token holding only that action.
+    Read RPCs pass for a token holding any grant on the repository.
+    The access tokens carry a `resources` claim, which the legacy authorizer
+    answers in place, so no stub rule is involved. The checks run before
+    the body is used: PERMISSION_DENIED is the check, anything else means
+    it passed and the handler answered for the empty body."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    target = grpc_target(auth_env.remote_url)
+    repo_id_hex = owner.resource_id.removeprefix("urc-")
+
+    def holding(*permissions: str) -> tuple[tuple[str, bytes], ...]:
+        # USER2 created nothing, so a privileged RPC cannot pass on the
+        # creator path.
+        token = mock.mint_token(
+            USER2, resources=authz_resources(owner.resource_id, permissions)
+        )
+        return repository_metadata(repo_id_hex) + (
+            ("authorization", f"Bearer {token}"),
+        )
+
+    tokens = {
+        action: holding(action)
+        for action in ("read", "write", "owner", "admin", "migrate", "push-protected")
+    }
+    failures = []
+    for method, accepted in RPC_ACTIONS.items():
+        if accepted is None:
+            continue
+        for held, metadata in tokens.items():
+            code, _body, details = call(target, method, metadata=metadata, timeout=5.0)
+            denied = code == grpc.StatusCode.PERMISSION_DENIED
+            if denied != (accepted != ("read",) and held not in accepted):
+                failures.append(f"{method} with only {held}: {code} '{details}'")
+    assert not failures, "\n".join(failures)
 
 
 STORAGE_COPY = "/lore.storage.v1.StorageService/Copy"

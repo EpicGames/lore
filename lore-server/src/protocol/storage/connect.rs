@@ -9,7 +9,9 @@ use lore_telemetry::tracing::fields::USER_ID;
 use tracing::debug;
 use tracing::warn;
 
+use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -126,6 +128,19 @@ impl Message for Connect {
                     return Err(MessageHandleError::MissingToken);
                 }
             }
+        } else if let Some(grants) = repository_authorizer
+            .granted_access(None, self.repository)
+            .await
+            .map_err(|status| {
+                MessageHandleError::AuthorizationFailure(status.message().to_string())
+            })?
+        {
+            // Enumerated without a token too, so each command is a set lookup
+            // rather than an authorizer call.
+            context.insert(PartitionGrants {
+                repository_id: self.repository,
+                grants,
+            });
         }
 
         // A first connect, or a reconnect to the same repository; the
@@ -142,4 +157,36 @@ impl Response for ConnectResponse {
     fn data(&self) -> Vec<Bytes> {
         vec![]
     }
+}
+
+/// [`RepositoryAuthorizer::permits`] for a urc/0.2 connection: answered from
+/// the grants connect stored, asked of the authorizer with the connection's
+/// token otherwise. `None` before connect, when no partition is named.
+pub async fn connection_permits(
+    context: &AttributeMap,
+    authorizer: &dyn RepositoryAuthorizer,
+    action: Action,
+) -> Option<bool> {
+    let repository = *context.get::<RepositoryId>()?;
+    if let Some(grants) = context
+        .get::<PartitionGrants>()
+        .filter(|grants| grants.repository_id == repository)
+    {
+        return Some(grants.grants.permits(action));
+    }
+    let raw = context.get::<RawToken>();
+    let claims = context.get::<AuthorizationToken>();
+    let token = match (raw.as_deref(), claims.as_deref()) {
+        (Some(raw), Some(claims)) => Some(VerifiedToken {
+            raw: &raw.0,
+            claims,
+        }),
+        _ => None,
+    };
+    Some(
+        authorizer
+            .check_repository_access(token.as_ref(), repository, action)
+            .await
+            .is_ok(),
+    )
 }

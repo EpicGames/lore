@@ -32,11 +32,14 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::map_message_handle_error_to_status;
+use crate::grpc::require_action;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::put::UnvalidatedPut;
 use crate::protocol::storage::put::handle_put;
@@ -107,9 +110,11 @@ async fn put_item(
 #[tracing::instrument(name = "StorageServiceV1::Put", skip_all)]
 pub async fn handler(
     request: Request<Streaming<storage_v1::PutRequest>>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<PutResponseStream>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();

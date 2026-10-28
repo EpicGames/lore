@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use futures::FutureExt;
+
+use crate::authnz::repository_authorizer::Action;
 pub mod admin_service;
 pub mod environment;
 pub mod environment_service;
@@ -68,17 +70,17 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::ResourceMatcher;
+use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::permits_with;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::util::get_user_id_from_token_ref;
-use crate::util::resources_from_token;
 
 /// Matches the Infrastructure alerting rule regex
 /// for what counts as an internal status code error
@@ -247,7 +249,7 @@ pub fn link_read_authorizer(
     Arc::new(move |repository_id| {
         let token = token.as_ref().map(VerifiedTokenOwned::as_token);
         authorizer
-            .check_repository_access_sync(token.as_ref(), repository_id, None)
+            .check_repository_access_sync(token.as_ref(), repository_id, Action::Read)
             .is_some_and(|verdict| verdict.is_ok())
     })
 }
@@ -337,54 +339,142 @@ pub(crate) fn log_server_error(status: &Status) {
     }
 }
 
-/// Whether `user_id` may delete `repository`, recorded as created by
-/// `creator`. The creator may while the authorizer still lets them reach the
-/// repository, and so may a caller holding `owner` or `admin` on it. Without
-/// a verifier the authorizer allows every action, so only the creator may.
-pub async fn may_delete_repository(
+/// What the caller's grants allow for administering a repository, before
+/// the recorded creator is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryAdministration {
+    /// `owner` or `admin`; also `write` without a verified token, where there
+    /// is no identity to compare with the creator: every caller is
+    /// `<unknown>` while the recorded creator is whatever identity the client
+    /// sent at create.
+    Permitted,
+    /// `write`: permitted only to the recorded creator.
+    CreatorOnly,
+    Denied,
+}
+
+impl RepositoryAdministration {
+    pub fn permits(self, creator: &str, user_id: &str) -> bool {
+        match self {
+            Self::Permitted => true,
+            Self::CreatorOnly => creator == user_id,
+            Self::Denied => false,
+        }
+    }
+}
+
+/// Answered from the grants the partition-access layer enumerated for
+/// `repository` when the request carries them, else from one enumeration,
+/// else per action.
+pub async fn repository_administration(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: RepositoryId,
+) -> RepositoryAdministration {
+    let token = get_verified_token(extensions);
+    let enumerated;
+    let grants = if let Some(grants) = extensions
+        .get::<PartitionGrants>()
+        .filter(|grants| grants.repository_id == repository)
+    {
+        Some(&grants.grants)
+    } else {
+        let Ok(grants) = authorizer.granted_actions(token.as_ref(), repository).await else {
+            return RepositoryAdministration::Denied;
+        };
+        enumerated = grants;
+        enumerated.as_ref()
+    };
+    let permits = async |action| {
+        permits_with(&**authorizer, grants, token.as_ref(), repository, action).await
+    };
+    if permits(Action::Owner).await || permits(Action::Admin).await {
+        RepositoryAdministration::Permitted
+    } else if !permits(Action::Write).await {
+        RepositoryAdministration::Denied
+    } else if token.is_none() {
+        RepositoryAdministration::Permitted
+    } else {
+        RepositoryAdministration::CreatorOnly
+    }
+}
+
+/// Whether `user_id` may administer `repository`, recorded as created by
+/// `creator`, per [`RepositoryAdministration`].
+pub async fn may_administer_repository(
     authorizer: &Arc<dyn RepositoryAuthorizer>,
     extensions: &Extensions,
     repository: RepositoryId,
     creator: &str,
     user_id: &str,
 ) -> bool {
-    let token = get_verified_token(extensions);
-    if creator == user_id {
-        return authorizer
-            .check_repository_access(token.as_ref(), repository, None)
-            .await
-            .is_ok();
-    }
-    let Some(token) = token else {
-        return false;
-    };
-    match authorizer.granted_actions(Some(&token), repository).await {
-        Ok(Some(grants)) => grants.permits("owner") || grants.permits("admin"),
-        Ok(None) => {
-            authorizer.permits(extensions, repository, "owner").await
-                || authorizer.permits(extensions, repository, "admin").await
+    repository_administration(authorizer, extensions, repository)
+        .await
+        .permits(creator, user_id)
+}
+
+/// The creator recorded in `repository`'s metadata. Reads only, so it does
+/// not repair the name mapping and may run before the caller is authorized.
+pub async fn repository_creator(
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+) -> Result<String, Status> {
+    let to_status = |err: &lore_revision::repository::RepositoryError| {
+        if err.is_not_found() || err.is_repository_not_found() || err.is_address_not_found() {
+            Status::not_found("Repository does not exist")
+        } else {
+            Status::internal(format!("Failed to read repository metadata: {err}"))
         }
-        Err(_) => false,
+    };
+    let metadata_hash = lore_revision::repository::metadata_hash(repository.clone())
+        .await
+        .filter_slow_down()?
+        .warn_map_err(to_status)?;
+    let metadata = lore_revision::repository::metadata(repository, metadata_hash)
+        .await
+        .filter_slow_down()?
+        .warn_map_err(to_status)?;
+    Ok(metadata.creator)
+}
+
+/// Refuses with `permission_denied` unless the caller may administer
+/// `repository`. The recorded creator is read only when the decision rests
+/// on it.
+pub async fn require_repository_administration(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+    user_id: &str,
+) -> Result<(), Status> {
+    let permitted = match repository_administration(authorizer, extensions, repository.id).await {
+        RepositoryAdministration::Permitted => true,
+        RepositoryAdministration::CreatorOnly => repository_creator(repository).await? == user_id,
+        RepositoryAdministration::Denied => false,
+    };
+    if permitted {
+        Ok(())
+    } else {
+        info!(user_id, "Repository administration refused");
+        Err(Status::permission_denied("Not repository owner"))
     }
 }
 
-pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> bool {
-    let user_permissions = user_permissions(extensions, repository);
-    user_permissions.contains(&"owner".to_string())
-        || user_permissions.contains(&"admin".to_string())
-}
-
-pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"obliterate".to_string())
-}
-
-pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"migrate".to_string())
-}
-
-pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    ResourceMatcher::default().merged_permissions(&user_resources, repository)
+/// Whether the caller may perform `action` on the partition the request's
+/// metadata names, answered from the partition-access layer's grants when
+/// present. Denial is the uniform [`no_repository_access_status`].
+pub async fn require_action<T>(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    request: &tonic::Request<T>,
+    action: Action,
+) -> Result<(), Status> {
+    let repository = get_repository(request.metadata())?;
+    if authorizer
+        .permits(request.extensions(), repository, action)
+        .await
+    {
+        Ok(())
+    } else {
+        Err(no_repository_access_status())
+    }
 }
 
 pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> {

@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-10-15
+updated: 2026-10-26
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -46,6 +46,9 @@ The most important changes from the current scheme:
 - **Uses the token permission claims for all authorization decisions.** The current ad-hoc
   authorization decisions, like granting branch protection bypass based on the
   `is_service_account` claim, are all replaced with explicit permissions like `push-protected`.
+  Any grant on a partition allows reading it, and every other operation checks an explicit
+  action, `write` or a privileged one, on every tier including a server with no auth configured,
+  so a read-only grant is enforceable.
 - **Migration is gradual and revertible.** The old and new paths run side by side through phased
   rollout, existing deployments keep working untouched, and the gRPC API retires only when its
   last client moves. While a server advertises both paths, a client-side flag picks which one a
@@ -682,6 +685,13 @@ role or group claim, ignoring which partition was asked about (D8). The action v
 common to both tiers. What differs is whether an action is scoped to a partition or held
 everywhere.
 
+The vocabulary starts with two ordinary actions, `read` and `write`, which `UrcAuthApi` grants
+already list. `read` is implied by any grant on a partition: a caller who reaches it may read
+it, so reads make no check beyond reaching the partition. `write` has to be granted. Every
+operation that changes partition state asks `write` (D9), and an operation that needs one of the
+privileged actions (`obliterate`, `owner`, `admin`, `migrate`, `push-protected`, `presign`)
+asks that action.
+
 `resources` is a list of `{resource_id, permission}` pairs, and the server reads the permission
 half. Both readers live in
 [`lore-server/src/grpc/mod.rs`](../../lore-server/src/grpc/mod.rs): `get_matching_permissions`
@@ -703,7 +713,7 @@ although both groups share a `bypass_protection` variable they waive different t
 
 A Tier 2 deployment grants these per partition in the resource claim. A Tier 1 deployment grants
 them globally through a role. One behavior to preserve: with no verifier configured the presign
-gate is open today, and the `AllowAllRepositoryAuthorizer` default keeps it that way.
+gate is open today, so `presign` is in `AllowAllRepositoryAuthorizer`'s fixed grant set (D8).
 
 ### D5. The domain check keeps its logic, and the issuer keeps the list
 
@@ -963,10 +973,10 @@ that. So when `jwt_issuer` holds an https URL the server fetches
 `iss` against the same value. `[server.auth.jwk].endpoint` stays as the override for providers with
 non-standard discovery.
 
-`[server.auth]` therefore gains `permission_claim`, `baseline_access`, `repository_catalog`,
-`repository_catalog_url`, `resource_claim`, `resource_id_claim`, `resource_id_template` and
-`resource_wildcard`.  `permission_claim` is
-exercised from phase 2 onwards, because it is what Tier 1 runs on. `baseline_access` steers only
+`[server.auth]` therefore gains `permission_claim`, `implicit_actions`, `baseline_access`,
+`repository_catalog`, `repository_catalog_url`, `resource_claim`, `resource_id_claim`,
+`resource_id_template` and `resource_wildcard`. `permission_claim` and `implicit_actions` are
+exercised from phase 2 onwards, because they are what Tier 1 runs on. `baseline_access` steers only
 what the default `RepositoryCatalog` lists (D7), never an access decision. The other four only
 matter once a per-partition claim is in play, so phase 4 for a new deployment and immediately for
 a `UrcAuthApi` one. There is no service-account setting, because D4 turned that check into two
@@ -981,7 +991,7 @@ needed because D1 made Tier 1 answer every partition question through this trait
 struct VerifiedToken<'a> { raw: &'a str, claims: &'a AuthorizationToken }
 
 check_repository_access(token: Option<&VerifiedToken>, repository: RepositoryId,
-                        action: Option<&str>) -> Result<(), Status>
+                        action: &str) -> Result<(), Status>
 ```
 
 Two changes from today's `check_repository_access(authorization: Option<String>, repository_id)`:
@@ -1001,10 +1011,9 @@ Two changes from today's `check_repository_access(authorization: Option<String>,
   `is_service_account` (D4). Under Tier 2 the answer comes from the resource claim. Under Tier 1
   there is no resource claim, but a Tier 1 token will carry these as global permissions in
   `permission_claim`. A Tier 1 token that carries none of those permissions is denied those
-  operations, and a token that carries one holds it across every partition. `None` is the plain
-  reachability question the existing call sites ask. `AllowAllRepositoryAuthorizer` ignores
-  the action and permits it, which is what keeps a server with no `[server.auth]` able to do
-  everything locally.
+  operations, and a token that carries one holds it across every partition. The action is
+  required: every operation names the one it performs (D4, D9).
+  `AllowAllRepositoryAuthorizer` answers from a fixed grant set, below.
 
 The two implementations:
 
@@ -1019,12 +1028,12 @@ Four implementations exist in total, and the deployment's configuration selects 
 
 ```mermaid
 flowchart TD
-    A{"[server.auth] configured?"} -- no --> AA["AllowAllRepositoryAuthorizer<br/>every check passes"]
+    A{"[server.auth] configured?"} -- no --> AA["AllowAllRepositoryAuthorizer<br/>fixed grants: read, write, obliterate, presign"]
     A -- yes --> B{"legacy UrcAuthApi deployment?"}
     B -- yes --> AC["AuthClientAuthorizer<br/>online CheckUserPermission call per check"]
     B -- no --> C{"resource_claim set?"}
     C -- "yes (Tier 2)" --> TC["ResourceGrantsAuthorizer<br/>per-partition grants read from the resource claim"]
-    C -- "no (Tier 1)" --> TR["GlobalGrantsAuthorizer<br/>global actions read from permission_claim"]
+    C -- "no (Tier 1)" --> TR["GlobalGrantsAuthorizer<br/>implicit_actions plus global actions from permission_claim"]
 ```
 
 #### Tier 2 authorizes from the resource claim
@@ -1033,8 +1042,9 @@ The decision rule is D4's claim model applied per call. `check_repository_access
 action)` reads the claim named by `resource_claim` and looks for an entry matching partition
 `p`. An entry matches when its resource — the entry field named by `resource_id_claim`,
 `resource_id` by default — equals what `resource_id_template` renders for `p`, or equals the
-configured `resource_wildcard`. No matching entry means denied. When the call names an action,
-the matching entries' `permission_claim` values, merged, must also include that action.
+configured `resource_wildcard`. No matching entry means denied. The matching entries'
+`permission_claim` values, merged, must also include the action asked, except `read`, which
+any matching entry grants.
 
 Under Tier 2 access to all partitions needs to be allowed explicitly. A token with no entry
 for a partition cannot touch it, plain reads included. A client that has not exchanged for a
@@ -1045,8 +1055,9 @@ See D4 for the claim shape and the wildcard semantics.
 #### Tier 1 grants actions globally, not per partition
 
 Tier 1 makes one decision per *action*, not per action-and-partition. Any principal that passes
-authentication reaches every partition the server holds, and a small number of principals hold
-extra actions that apply everywhere: `obliterate`, `owner`, `admin`, `migrate`, `push-protected`,
+authentication reads every partition the server holds and, unless the deployment moves `write`
+into the role claim (`implicit_actions`, below), writes it, and a small number of
+principals hold extra actions that apply everywhere: `obliterate`, `owner`, `admin`, `migrate`, `push-protected`,
 `presign`. There is
 no way to say "obliterate, but only in this partition." That is what distinguishes Tier 1 from
 Tier 2, and per-partition narrowing is exactly what P4 and Tier 2 exist to provide.
@@ -1057,24 +1068,35 @@ scope carrying a realm-roles mapper that writes `realm_access.roles` into every 
 no configuration at all, and Dex emits a flat `groups` claim. Role administration stays in the
 identity provider, which is where this migration is trying to move it.
 
-Two settings carry it, and `resource_claim` is what selects the tier. The third sits beside them
-in `[server.auth]` but touches listing only:
+Three settings carry it, and `resource_claim` is what selects the tier. The rest sit beside them
+in `[server.auth]` but touch listing only:
 
 | Setting | Meaning |
 | --- | --- |
 | `permission_claim` | Dotted path to the actions claim, for example `realm_access.roles` on Keycloak or `groups` on Dex. Claim values are action names. |
+| `implicit_actions` | Tier 1 only. Actions every token holder gets, added to whatever `permission_claim` carries and to `read`, which any token implies. Defaults to `["write"]`; `[]` makes write a role, or makes the server read-only without `permission_claim`. Any action may be listed, privileged ones included; an unknown name is a configuration error. The server refuses to start with it set beside `resource_claim` or `auth_url`, where it would do nothing. |
 | `resource_claim` | Present means Tier 2, and actions are scoped by the resource beside them. Absent means the `permission_claim` actions are global, which is Tier 1. |
 | `baseline_access` | What the default `RepositoryCatalog` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
 | `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`; `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`; or `user_service`, `PartitionList` at `user_url`. Absent, `user_service` when `user_url` is set, else `auth_service` when `auth_url` is set, and `baseline` otherwise. |
 | `repository_catalog_url` | The endpoint the `auth_service` catalog asks, `auth_url` by default. It receives the caller's token, so it must accept the tokens this server verifies. |
 
 A deployment that configures `[server.auth]` but no `permission_claim` leaves every authenticated
-principal with ordinary access and no admin actions at all. That fails closed on every privileged
-operation while leaving ordinary use working.
+principal with `implicit_actions` and no admin actions at all. That fails closed on every
+privileged operation while leaving ordinary use working.
 
-All the checks are disabled for servers that do not set `[server.auth]`.
-`AllowAllRepositoryAuthorizer` answers and permits everything, which is what keeps a deployment
-with no OIDC integration working as it does today.
+Servers that do not set `[server.auth]` verify no tokens, and `AllowAllRepositoryAuthorizer`
+answers every check, with or without a token, from a fixed grant set: `read`, `write`,
+`obliterate` and `presign`. That is what a server with no auth permits today, so it keeps working
+as it does, apart from the repository delete change below. `owner` is deliberately not in the set, so that actions later tied to it are not
+handed to anonymous callers. Repository administration, delete and branch protect and unprotect,
+admits `owner` or `admin`, or `write` for the repository's creator (D9), and without a token there
+is no identity to compare: every caller is `<unknown>`, while the recorded creator is whatever
+identity the client sent at create. So the creator path needs only `write` there, which keeps a
+local server protecting branches as it does today. It also lets any caller delete a repository
+created by a client with an `identity` configured, which no caller could delete before. `admin`, `migrate` and `push-protected` are not
+in the set either, so admin lock stays refused and protected branches stay protected. Stating the
+set in the authorizer replaces the call sites that currently special-case "no token" to get the
+same answer.
 
 The existing `AuthClientAuthorizer` stays for `UrcAuthApi` deployments.
 
@@ -1104,7 +1126,7 @@ existence by name. The Compatibility note about status codes covers the intercep
 | --- | --- | --- |
 | [`auth/jwt_interceptor.rs:71`](../../lore-server/src/auth/jwt_interceptor.rs) | gRPC interceptor | The partition check moves onto the configured authorizer, either inside the interceptor or in the handlers it covers. Synchronous call site. See below. |
 | [`repository_query.rs`](../../lore-server/src/grpc/handlers/repository_query.rs) | repository query and get, v0 and v1 | Move onto the configured authorizer, keeping `RepositoryNotFound` on denial. |
-| [`quic/storage_service_v4.rs:189`](../../lore-server/src/quic/storage_service_v4.rs) | QUIC storage authorize | `check_repository_access(token, repo, None)` at session start, once per session rather than per operation. |
+| [`quic/storage_service_v4.rs:189`](../../lore-server/src/quic/storage_service_v4.rs) | QUIC storage authorize | Enumerate the caller's grants at session start, once per session, and answer each command's action from them. |
 | [`protocol/storage/connect.rs:87`](../../lore-server/src/protocol/storage/connect.rs) | QUIC storage connect | Same, at connect. |
 | [`protocol/storage/copy.rs:143`](../../lore-server/src/protocol/storage/copy.rs) | QUIC cross-partition copy, source side | `check_repository_access` on the source partition. |
 | [`grpc/storage/v1/copy.rs:83`](../../lore-server/src/grpc/storage/v1/copy.rs) | gRPC cross-partition copy, source side | Same. |
@@ -1170,6 +1192,28 @@ request body stay in handlers. The generic handler requires the partition/reposi
 defined in the headers in a standardized way. The lock action checks, and notification
 subscribe are the current exceptions that authorize calls through a partition declared in the
 request body.
+
+**Every operation asks one action.** The entry-point check, whether the tower layer, the QUIC
+session start and connect, or the HTTP middleware, enumerates the caller's grants on the partition
+it names and admits the request unless the partition is unreachable. It asks no action itself. Each handler then asks the one action its
+operation needs. Operations that need a privileged action ask it instead of `write`: admin lock
+asks `migrate`, obliterate asks `obliterate`, presign asks `presign`. Repository administration,
+delete and branch protect and unprotect, admits `owner` or `admin`, or `write` for the
+repository's creator. Where a privileged action waives an ordinary check, as on unlocking another
+user's lock or pushing to a protected branch, the handler accepts the privileged action or falls
+back to `write` with the ordinary check applied. Other operations that change partition state ask `write`: storage put, put-resolved, copy
+destination, the mutable store and compare-and-swap, and a verify that heals, on gRPC and QUIC alike; branch create,
+delete, push and metadata set; lock; repository metadata set. Everything else is a read, which
+the entry point's reachability check already decided, so it makes no check of its own. The
+handler checks
+answer in memory from the grants the entry point enumerated, so they add no authorizer round trip
+on any tier. On the legacy path that means no extra `CheckUserPermission` call: an access token is
+answered from its `resources` claim with no call, and an identity token gets the one call the entry
+point already makes, whose response carries the full permission list. The privileged checks above
+stack on top of these. A test enumerates every RPC
+of the partition-scoped services and fails on one with no action assigned, so a new RPC cannot skip
+the decision. On a server with no `[server.auth]` the allow-all set (D8) answers these as such a
+server behaves today, apart from repository delete (D8).
 
 **Notification is the exception either way.** `NotificationService::subscribe`
 ([`notification_service.rs`](../../lore-server/src/grpc/notification_service.rs)) takes the
@@ -1238,7 +1282,14 @@ than requiring a claim for a partition that does not exist.
   output formats are unchanged. `lore-capi` gains no new entry points, but its existing
   `flag_service_account` field loses its meaning once deployments stop emitting the claim, and
   reads as `0` for everyone.
-- **Configuration** — `[server.auth]` gains the six fields in D8, all optional. Two existing
+- **Read-only grants start meaning what they say** — Today any entry naming a partition gives
+  full access to it. Once every operation that changes state asks `write` (D9), a grant without
+  `write` can no longer push, lock or edit metadata. Any grant still reads. Branch protect and unprotect, which any caller with access could use, need
+  `owner` or `admin`, or `write` for the repository's creator. `UrcAuthApi` already lists the two separately, so no grant has to change. Tier 1
+  read and write are unaffected by default, since `implicit_actions` grants both. A server with no
+  `[server.auth]` keeps its permissions, except that any caller can delete a repository created
+  by a client with an `identity` configured (D8).
+- **Configuration** — `[server.auth]` gains the fields listed in D8, all optional. Two existing
   fields stop being optional: with `[server.auth]` present, the server refuses to start unless both
   `jwt_issuer` and `jwt_audience` are set (see Security Considerations). That is the one breaking
   configuration change here. A deployment running today with `[server.auth]` and no `jwt_audience`
@@ -1275,8 +1326,9 @@ and `idp` stop being required. Tokens that verify today continue to verify ident
 **Phase 2, the server accepts standard tokens.** Discovery-based `jwks_uri`, the configurable
 resource claim, the [RFC 9068](https://www.rfc-editor.org/rfc/rfc9068) profile check, both new `RepositoryAuthorizer` implementations, and
 **all of D9**: the trait signature change and every enforcement point rewired, including the
-repository-query handlers and the services the interceptor covers.
-Servers keep their existing config and behave as before, and a new config selects the new path.
+repository-query handlers and the services the interceptor covers, each asking the one
+action its operation needs. Servers keep their existing config and behave as before, apart from
+the permission changes listed under Compatibility, and a new config selects the new path.
 
 This phase also owns the test infrastructure, including the two providers the Goals ask for. Testing
 against one proves Lore works with that provider, and the second proves more general compatibility.
@@ -1366,6 +1418,12 @@ authorizer instead. `RepositoryAuthorizer` (D8) allows online implementations, a
 The action parameter added to the interface also allows a hybrid approach, where reads
 are answered from the token with no network call, while writes, or only destructive actions such
 as `obliterate`, do online checks for every call.
+
+**Tier 1 gives every token holder write access by default.** `implicit_actions` defaults to
+`["write"]`, which matches what an authenticated principal can do on such a server today.
+Anyone the provider will issue a token to with the right `aud` can push to every partition. A
+deployment whose provider serves a wider population than its writers sets `implicit_actions` to
+`[]` and grants the rest through roles.
 
 **`baseline_access = "reachable"` discloses partition names to every authenticated caller.**
 With it set, `lore repo list` returns what the server holds rather than what the caller was

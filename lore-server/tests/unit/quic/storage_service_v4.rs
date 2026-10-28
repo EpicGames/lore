@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::protocol::attribute_map::AttributeMap;
@@ -318,12 +319,12 @@ mod authorized_session {
         assert_eq!(session.token.as_ref().unwrap().raw, token);
         assert!(
             session
-                .permits(&*service.repository_authorizer, "migrate")
+                .permits(&*service.repository_authorizer, Action::Migrate)
                 .await
         );
         assert!(
             !session
-                .permits(&*service.repository_authorizer, "obliterate")
+                .permits(&*service.repository_authorizer, Action::Obliterate)
                 .await
         );
     }
@@ -395,6 +396,75 @@ mod authorized_session {
         assert!(matches!(err, MessageHandleError::FragmentNotFound));
     }
 
+    /// Each command asks the action it performs, from the grants stored at
+    /// session start: an in-partition copy is a write, so a `read`-only
+    /// session is refused before the store, and a `write`-only one reaches
+    /// it, where the absent address is the only failure.
+    #[tokio::test]
+    async fn a_command_needs_its_own_action_on_the_session() {
+        let service = authenticated_service().await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let resource = format!("urc-{repository}");
+
+        let read_only = start_session(&service, repository, &signed_token(&[&resource], &["read"]))
+            .await
+            .unwrap();
+        let err = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                copy_command(read_only, repository),
+            )
+            .await
+            .expect_err("a copy needs `write`");
+        assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+
+        let write_only = start_session(
+            &service,
+            repository,
+            &signed_token(&[&resource], &["write"]),
+        )
+        .await
+        .unwrap();
+        let err = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                copy_command(write_only, repository),
+            )
+            .await
+            .expect_err("the absent address must be the only failure");
+        assert!(matches!(err, MessageHandleError::FragmentNotFound));
+    }
+
+    /// Any grant on the session's partition permits a read command.
+    #[tokio::test]
+    async fn any_grant_on_the_session_permits_a_read_command() {
+        let service = authenticated_service().await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let resource = format!("urc-{repository}");
+        let write_only = start_session(
+            &service,
+            repository,
+            &signed_token(&[&resource], &["write"]),
+        )
+        .await
+        .unwrap();
+
+        let result = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::StorageCommand {
+                    session_id: write_only,
+                    opcode: Command::Query as u8,
+                    payload: Bytes::from(vec![0u8; 48]),
+                },
+            )
+            .await;
+        assert!(
+            !matches!(result, Err(MessageHandleError::AuthorizationFailure(_))),
+            "{result:?}"
+        );
+    }
+
     /// A repeated cross-partition copy from a source the session's token
     /// already cleared reuses the cached decision instead of re-asking the
     /// authorizer — the per-session form of the retired connection-wide
@@ -417,7 +487,7 @@ mod authorized_session {
                 &self,
                 token: Option<&VerifiedToken<'_>>,
                 repository_id: lore_revision::lore::RepositoryId,
-                _action: Option<&str>,
+                _action: Action,
             ) -> Result<(), Status> {
                 if repository_id == self.watched {
                     self.source_checks.fetch_add(1, Ordering::Relaxed);
@@ -475,4 +545,37 @@ mod authorized_session {
             .expect_err("a token granting another partition must be refused");
         assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
     }
+}
+
+/// Without a verifier the session still stores the allow-all grants, so a
+/// command is a set lookup rather than an authorizer call.
+#[tokio::test]
+async fn session_start_without_a_verifier_stores_the_allow_all_grants() {
+    use lore_server::authnz::repository_authorizer::ALLOW_ALL_ACTIONS;
+    use lore_server::authnz::repository_authorizer::Grants;
+    use lore_server::protocol::attribute_map::AttributeMap;
+
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let service = make_service(immutable_store, mutable_store);
+    let response = service
+        .run_request_handler(
+            AttributeMap::default().into(),
+            ParsedStorageRequestV4::AuthorizeStart {
+                repository: random(),
+                correlation_id: "corr".to_string(),
+                auth_token: vec![],
+            },
+        )
+        .await
+        .expect("session start");
+    let session_id = u32::from_le_bytes(response[0][..4].try_into().unwrap());
+
+    let session = service.session_map.get(session_id).unwrap();
+    assert_eq!(
+        session.grants,
+        Some(Grants::Actions(
+            ALLOW_ALL_ACTIONS.iter().map(ToString::to_string).collect()
+        ))
+    );
 }

@@ -26,8 +26,9 @@ use crate::grpc::get_repository;
 use crate::grpc::get_verified_token;
 use crate::grpc::no_repository_access_status;
 
-/// Enforces partition access for every RPC at the service level, so no
-/// handler can forget the check.
+/// Refuses requests for a partition the caller cannot reach, before the
+/// handler runs. Reaching a partition is the whole `read` check; handlers
+/// that write or need a privileged action make their own check.
 ///
 /// The validator works with the JWT interceptor. The interceptor
 /// verifies the token and inserts it as extensions, this service reads them.
@@ -45,8 +46,7 @@ use crate::grpc::no_repository_access_status;
 /// ([`granted_actions`](RepositoryAuthorizer::granted_actions)): when it
 /// can, reachability is answered from the enumeration and the enumeration is
 /// exposed to the handler as a [`PartitionGrants`] extension. An authorizer
-/// that cannot enumerate is asked the plain reachability question
-/// (`action: None`) instead. Handlers make their checks through
+/// that cannot enumerate is asked `read` instead. Handlers make their checks through
 /// `RepositoryAuthorizer::permits`, which consumes the exposed grants and
 /// falls back to a per-action authorizer call when they are absent.
 ///
@@ -54,15 +54,6 @@ use crate::grpc::no_repository_access_status;
 /// only place the body is decoded. All such calls still use the common
 /// [`RepositoryAuthorizer`], so that all the authorization decisions are done
 /// using the same logic.
-///
-/// A caller with no verified token (the interceptor stands aside on a
-/// no-auth server) is still the authorizer's reachability question, but is
-/// exposed no grants even when the authorizer enumerates some: grants are the
-/// caller's, and `permits` grants nothing without a verified token. The QUIC
-/// connect and the HTTP middleware enumerate behind a verified token only,
-/// and this keeps the three entry points agreeing that an allow-all verdict
-/// opens a no-auth server's partitions without elevating anonymous callers
-/// to its privileged actions.
 ///
 /// The layer bounds its own authorization stage and nothing else. The inner
 /// service is entered unbounded, because tonic decodes the request body
@@ -164,7 +155,7 @@ where
                 tokio::time::timeout(authorization_timeout, async move {
                     let token = get_verified_token(extensions);
                     match authorizer.granted_access(token.as_ref(), repository).await {
-                        Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
+                        Ok(grants) => Access::Granted(grants),
                         Err(_denied) => Access::Denied,
                     }
                 })

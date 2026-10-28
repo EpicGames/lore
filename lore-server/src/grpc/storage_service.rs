@@ -46,8 +46,10 @@ use super::rpc_code_to_str;
 use super::send_err;
 use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::get_user_id;
+use crate::grpc::require_action;
 use crate::legacy::rpc::storage_service_server::StorageService;
 use crate::protocol::attribute_map::get_user_id_from_context;
 use crate::protocol::attribute_map::repository_id_from_context;
@@ -263,6 +265,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -478,6 +481,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -649,6 +653,10 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::VerifyRequest>,
     ) -> Result<Response<lore_proto::VerifyResponse>, Status> {
+        // Healing drops the server's index entries for a corrupt fragment.
+        if request.get_ref().heal {
+            require_action(&self.repository_authorizer, &request, Action::Write).await?;
+        }
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
@@ -747,6 +755,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableStoreRequest>,
     ) -> Result<Response<lore_proto::MutableStoreResponse>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());
@@ -785,6 +794,7 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<lore_proto::MutableCompareAndSwapRequest>,
     ) -> Result<Response<lore_proto::MutableCompareAndSwapResponse>, Status> {
+        require_action(&self.repository_authorizer, &request, Action::Write).await?;
         let mutable_store = self.mutable_store.clone();
 
         let user_id = get_user_id(request.extensions());

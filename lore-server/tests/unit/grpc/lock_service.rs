@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use lore_proto::LockService;
 use lore_revision::lore::RepositoryId;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::lock_service::LoreLockService;
@@ -203,8 +204,10 @@ mod unlock {
             .expect("Status did not return ok status");
     }
 
+    /// `migrate` is checked before an empty request short-circuits, so an
+    /// empty admin lock is refused without the action like any other.
     #[tokio::test]
-    async fn admin_unlock_zero_resources() {
+    async fn admin_lock_checks_migrate_before_the_empty_short_circuit() {
         let lock_store = super::store::MockMockLockStore::new();
 
         let lock_service = super::lock_service(lock_store);
@@ -219,10 +222,11 @@ mod unlock {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let _ = lock_service
+        let denied = lock_service
             .admin_lock(request)
             .await
-            .expect("Admin lock did not return ok status");
+            .expect_err("allow-all does not grant `migrate`");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -274,9 +278,10 @@ mod actions {
 
     /// Tier 1, reading the actions from a dotted global claim.
     fn tier1() -> Arc<dyn RepositoryAuthorizer> {
-        Arc::new(GlobalGrantsAuthorizer::new(Some(
-            "realm_access.roles".to_string(),
-        )))
+        Arc::new(GlobalGrantsAuthorizer::new(
+            Some("realm_access.roles".to_string()),
+            vec![Action::Read, Action::Write],
+        ))
     }
 
     /// Tier 2, reading per-repository grants from the legacy-shaped
@@ -376,11 +381,29 @@ mod actions {
                     resources: one_resource(),
                 },
                 repository,
-                // A perfectly good token that grants something else.
-                Some(token_granting(repository, &["push"])),
+                Some(token_granting(repository, &["write"])),
             );
             lock_service.unlock(request).await.unwrap();
         }
+    }
+
+    /// Neither elevated nor holding `write`: refused before the store is
+    /// touched. Tier 2 only, since Tier 1 grants `write` to every token.
+    #[tokio::test]
+    async fn unlock_without_write_or_elevation_is_refused() {
+        let repository = random::<RepositoryId>();
+        let lock_service = lock_service_with(store::MockMockLockStore::new(), tier2());
+        let denied = lock_service
+            .unlock(request_with_token(
+                UnlockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+                Some(token_granting(repository, &["read"])),
+            ))
+            .await
+            .expect_err("unlock without `write` is refused");
+        assert_eq!(denied.code(), Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -420,13 +443,27 @@ mod actions {
         }
     }
 
-    /// Always deny, if there is no token, whatever the authorizer would
-    /// say: on a no-auth server the allow-all authorizer must not
-    /// elevate anonymous callers without a token.
+    /// Without a token the authorizer decides. A token-reading tier grants
+    /// nothing, so unlock is refused. Allow-all grants `write` but neither
+    /// `owner` nor `migrate`: unlock releases the caller's own locks only,
+    /// and admin lock is denied.
     #[tokio::test]
-    async fn no_token_means_no_elevation_and_no_admin_lock() {
+    async fn no_token_unlocks_own_locks_only_under_allow_all_and_never_admin_locks() {
         let repository = random::<RepositoryId>();
-        let lock_service = lock_service_with(store_expecting_validate_user(true), tier1());
+        let lock_service = lock_service_with(store::MockMockLockStore::new(), tier1());
+        let denied = lock_service
+            .unlock(request_with_token(
+                UnlockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+                None,
+            ))
+            .await
+            .expect_err("a token-reading tier grants nothing without a token");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
+        let lock_service = super::lock_service(store_expecting_validate_user(true));
         lock_service
             .unlock(request_with_token(
                 UnlockRequest {

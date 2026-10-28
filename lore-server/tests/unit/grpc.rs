@@ -33,6 +33,7 @@ use lore_revision::repository::RepositoryError;
 use lore_revision::state::StateError;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -75,7 +76,7 @@ mod link_read {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             self.async_entered.store(true, Ordering::SeqCst);
             Ok(())
@@ -85,9 +86,9 @@ mod link_read {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             repository_id: RepositoryId,
-            action: Option<&str>,
+            action: Action,
         ) -> Option<Result<(), Status>> {
-            assert_eq!(action, None, "a link read asks reachability only");
+            assert_eq!(action, Action::Read, "a link read asks read");
             self.answers.then(|| {
                 if self.granted.contains(&repository_id) {
                     Ok(())
@@ -170,6 +171,17 @@ mod link_read {
         assert!(can_read(repository(GRANTED)));
         assert!(!can_read(repository(UNGRANTED)));
 
+        // Any entry naming the partition grants the link read, whatever it lists.
+        let write_only = AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: format!("urc-{}", repository(GRANTED)),
+                permission: vec!["write".to_string()],
+            }]),
+            ..Default::default()
+        };
+        let can_read = link_read_authorizer(&authorizer, &extensions_with_token(write_only));
+        assert!(can_read(repository(GRANTED)));
+
         // A verifier is configured but this request carries no token:
         // nothing is granted.
         let can_read = link_read_authorizer(&authorizer, &Extensions::new());
@@ -226,375 +238,7 @@ fn get_authorization_extracts_auth() {
     assert_eq!(authz_data, test_authz_token);
 }
 
-#[test]
-fn user_permissions_includes_matched_repo_permissions() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string()],
-    };
-
-    test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let matched_permissions = user_permissions(&extensions, test_repository_context);
-    let no_matched_permissions = user_permissions(&extensions, test_unrelated_repository_context);
-    assert_eq!(matched_permissions, vec!["test_permission".to_string()]);
-    assert_eq!(no_matched_permissions, Vec::<String>::new());
-}
-
-#[test]
-fn user_permissions_includes_wildcard_resource() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string()],
-    };
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string().clone(),
-        permission: vec!["test_wildcard_permission".to_string()],
-    };
-
-    test_authz_token.resources = Some(vec![
-        test_resource_permission.clone(),
-        test_wildcard_resource_permission.clone(),
-    ]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let matched_permissions = user_permissions(&extensions, test_repository_context);
-    let no_matched_permissions = user_permissions(&extensions, test_unrelated_repository_context);
-    assert_eq!(
-        matched_permissions,
-        vec![
-            "test_permission".to_string(),
-            "test_wildcard_permission".to_string()
-        ]
-    );
-    assert_eq!(
-        no_matched_permissions,
-        vec!["test_wildcard_permission".to_string()]
-    );
-}
-
-#[test]
-fn finds_existing_matching_permission_with_regular_repo() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec![
-            "test_permission".to_string(),
-            "other_permission".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // user has test_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-    // user has other_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"other_permission".to_string())
-    );
-    // user doesn't have test_permission2 for a given repo in their token
-    assert!(
-        !user_permissions(&extensions, test_repository_context)
-            .contains(&"test_permission2".to_string())
-    );
-    // user doesn't have test_permission for an unrelated repository
-    assert!(
-        !user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-    // user doesn't have other_permission for an unrelated repository
-    assert!(
-        !user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"other_permission".to_string())
-    );
-}
-
-#[test]
-fn finds_existing_matching_permission_with_wildcard_repo() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec![
-            "test_permission".to_string(),
-            "unique_permission".to_string(),
-        ],
-    };
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string().clone(),
-        permission: vec![
-            "test_permission".to_string(),
-            "test_wildcard_permission".to_string(),
-            "another_wildcard_permission".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![
-        test_resource_permission.clone(),
-        test_wildcard_resource_permission.clone(),
-    ]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // user has test_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-    // user has unique_permission for a given repo in their token
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"unique_permission".to_string())
-    );
-    // user has test_wildcard_permission for a given repo — through the wildcard resource
-    assert!(
-        user_permissions(&extensions, test_repository_context)
-            .contains(&"test_wildcard_permission".to_string())
-    );
-    // user also has test_permission for an unrelated repository — through the wildcard resource
-    assert!(
-        user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"test_permission".to_string())
-    );
-
-    // user doesn't have unique_permission for an unrelated repository
-    assert!(
-        !user_permissions(&extensions, test_unrelated_repository_context)
-            .contains(&"unique_permission".to_string())
-    );
-}
-
-#[test]
-fn can_admin_lock_with_direct_permission_claim() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string(), "migrate".to_string()],
-    };
-
-    test_authz_token.resources = Some(vec![test_resource_permission.clone()]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-    assert!(can_admin_lock(&extensions, test_repository_context));
-
-    // as user doesn't have "migrate" permission for an unrelated repo, they CAN'T admin lock that repo
-    assert!(!can_admin_lock(
-        &extensions,
-        test_unrelated_repository_context
-    ));
-}
-
-#[test]
-fn can_admin_lock_with_wildcard_permission_claim() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permission = ResourcePermission {
-        resource_id: test_repository_id.clone(),
-        permission: vec!["test_permission".to_string(), "migrate".to_string()],
-    };
-
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string().clone(),
-        permission: vec![
-            "migrate".to_string(),
-            "test_wildcard_permission".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![
-        test_resource_permission.clone(),
-        test_wildcard_resource_permission.clone(),
-    ]);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-    let test_unrelated_repository_context: RepositoryId =
-        Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-    assert!(can_admin_lock(&extensions, test_repository_context));
-
-    // user doesn't have direct "migrate" permission for an unrelated repo
-    // but they have a wildcard token with "migrate", so they should be able to admin lock arbitrary repo
-    assert!(can_admin_lock(
-        &extensions,
-        test_unrelated_repository_context
-    ));
-}
-
-/// Regression: two entries matching the same partition merge
-/// their permission lists. The old reader stopped at the first matching
-/// entry, so whichever permission sat in a later entry was lost.
-#[test]
-fn user_permissions_merge_across_matching_entries() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_resource_permissions = vec![
-        ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["push".to_string()],
-        },
-        ResourcePermission {
-            resource_id: "urc-*".to_string(),
-            permission: vec!["migrate".to_string()],
-        },
-        ResourcePermission {
-            resource_id: test_repository_id.clone(),
-            permission: vec!["obliterate".to_string()],
-        },
-    ];
-
-    test_authz_token.resources = Some(test_resource_permissions);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
-            .unwrap()
-            .into();
-
-    assert_eq!(
-        user_permissions(&extensions, test_repository_context),
-        vec![
-            "push".to_string(),
-            "migrate".to_string(),
-            "obliterate".to_string()
-        ]
-    );
-}
-
-/// Regression: a `urc-*` grant now satisfies `can_obliterate`
-/// and `is_owner_or_admin`, not just `can_admin_lock`. The old
-/// `user_permissions` reader never looked at the wildcard entry, so the
-/// three checks disagreed about one token.
-#[test]
-fn wildcard_grant_satisfies_every_action_check() {
-    let mut extensions = Extensions::new();
-    let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
-    let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
-    let mut test_authz_token = AuthorizationToken::default();
-
-    let test_wildcard_resource_permission = ResourcePermission {
-        resource_id: "urc-*".to_string(),
-        permission: vec![
-            "obliterate".to_string(),
-            "admin".to_string(),
-            "migrate".to_string(),
-        ],
-    };
-
-    test_authz_token.resources = Some(vec![test_wildcard_resource_permission]);
-    extensions.insert(test_authz_token.clone());
-
-    for repository_id in [test_repository_id, unrelated_repository_id] {
-        let repository_context: RepositoryId =
-            Context::from_str(repository_id.strip_prefix("urc-").unwrap())
-                .unwrap()
-                .into();
-        assert!(can_obliterate(&extensions, repository_context));
-        assert!(is_owner_or_admin(&extensions, repository_context));
-        assert!(can_admin_lock(&extensions, repository_context));
-    }
-}
-
-#[test]
-fn no_grant_denies_every_action_check() {
-    let mut extensions = Extensions::new();
-    let mut test_authz_token = AuthorizationToken::default();
-    let test_resource_permissions = Vec::new();
-    test_authz_token.resources = Some(test_resource_permissions);
-    extensions.insert(test_authz_token.clone());
-
-    let test_repository_context: RepositoryId =
-        Context::from_str("0194b726b34e72b0b45550b88a967076")
-            .unwrap()
-            .into();
-
-    assert!(!is_owner_or_admin(&extensions, test_repository_context));
-    assert!(!can_obliterate(&extensions, test_repository_context));
-    assert!(!can_admin_lock(&extensions, test_repository_context));
-}
-
-mod may_delete {
+mod may_administer {
     use std::collections::HashSet;
     use std::sync::Mutex;
 
@@ -609,7 +253,7 @@ mod may_delete {
     struct Recording {
         enumerates: bool,
         actions: HashSet<String>,
-        asked: Mutex<Vec<Option<String>>>,
+        asked: Mutex<Vec<String>>,
         enumerated: Mutex<usize>,
     }
 
@@ -630,14 +274,13 @@ mod may_delete {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            action: Option<&str>,
+            action: Action,
         ) -> Result<(), Status> {
-            self.asked.lock().unwrap().push(action.map(str::to_string));
-            match action {
-                Some(action) if !self.actions.contains(action) => {
-                    Err(Status::permission_denied("not granted"))
-                }
-                _ => Ok(()),
+            self.asked.lock().unwrap().push(action.to_string());
+            if self.actions.contains(action.as_str()) {
+                Ok(())
+            } else {
+                Err(Status::permission_denied("not granted"))
             }
         }
 
@@ -669,7 +312,7 @@ mod may_delete {
             let recording = Recording::new(true, actions);
             let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
             assert_eq!(
-                may_delete_repository(
+                may_administer_repository(
                     &authorizer,
                     &extensions_with_token(),
                     RepositoryId::default(),
@@ -690,7 +333,7 @@ mod may_delete {
         let recording = Recording::new(false, &["admin"]);
         let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
         assert!(
-            may_delete_repository(
+            may_administer_repository(
                 &authorizer,
                 &extensions_with_token(),
                 RepositoryId::default(),
@@ -701,8 +344,110 @@ mod may_delete {
         );
         assert_eq!(
             *recording.asked.lock().unwrap(),
-            [Some("owner".to_string()), Some("admin".to_string())]
+            ["owner".to_string(), "admin".to_string()]
         );
+    }
+
+    /// The creator needs `write`, answered from the same one enumeration.
+    #[tokio::test]
+    async fn the_creator_needs_write() {
+        for (actions, permitted) in [(&["write"][..], true), (&["read"][..], false)] {
+            let recording = Recording::new(true, actions);
+            let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+            assert_eq!(
+                may_administer_repository(
+                    &authorizer,
+                    &extensions_with_token(),
+                    RepositoryId::default(),
+                    "alice",
+                    "alice",
+                )
+                .await,
+                permitted,
+                "{actions:?}"
+            );
+            assert!(recording.asked.lock().unwrap().is_empty());
+            assert_eq!(*recording.enumerated.lock().unwrap(), 1);
+        }
+    }
+
+    /// A non-enumerating authorizer is asked `owner`, `admin` and then
+    /// `write`, and `write` permits only the recorded creator.
+    #[tokio::test]
+    async fn a_non_enumerating_authorizer_decides_the_creator_path_per_action() {
+        for (user, permitted) in [("alice", true), ("mallory", false)] {
+            let recording = Recording::new(false, &["write"]);
+            let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+            assert_eq!(
+                may_administer_repository(
+                    &authorizer,
+                    &extensions_with_token(),
+                    RepositoryId::default(),
+                    "alice",
+                    user,
+                )
+                .await,
+                permitted,
+                "{user}"
+            );
+            assert_eq!(
+                *recording.asked.lock().unwrap(),
+                [
+                    "owner".to_string(),
+                    "admin".to_string(),
+                    "write".to_string()
+                ]
+            );
+        }
+    }
+
+    /// The grants the partition-access layer already enumerated answer, so
+    /// the authorizer is not asked again.
+    #[tokio::test]
+    async fn the_layers_grants_answer_without_another_enumeration() {
+        let recording = Recording::new(true, &[]);
+        let authorizer: Arc<dyn RepositoryAuthorizer> = recording.clone();
+        let mut extensions = extensions_with_token();
+        extensions.insert(
+            lore_server::authnz::repository_authorizer::PartitionGrants {
+                repository_id: RepositoryId::default(),
+                grants: Grants::Actions(["admin".to_string()].into()),
+            },
+        );
+        assert!(
+            may_administer_repository(
+                &authorizer,
+                &extensions,
+                RepositoryId::default(),
+                "alice",
+                "mallory",
+            )
+            .await
+        );
+        assert_eq!(*recording.enumerated.lock().unwrap(), 0);
+        assert!(recording.asked.lock().unwrap().is_empty());
+    }
+
+    /// No verified token means no identity to compare, as on a server with
+    /// no `[server.auth]` where every caller is `<unknown>` and the recorded
+    /// creator is whatever the client sent: `write` alone decides.
+    #[tokio::test]
+    async fn without_a_token_write_alone_decides() {
+        for (actions, permitted) in [(&["write"][..], true), (&["read"][..], false)] {
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Recording::new(true, actions);
+            assert_eq!(
+                may_administer_repository(
+                    &authorizer,
+                    &Extensions::new(),
+                    RepositoryId::default(),
+                    "alice",
+                    "<unknown>",
+                )
+                .await,
+                permitted,
+                "{actions:?}"
+            );
+        }
     }
 }
 

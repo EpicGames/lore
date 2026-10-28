@@ -20,6 +20,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::instrument;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_user_id;
@@ -82,7 +83,11 @@ impl lore_notification::NotificationService for NotificationService {
         // thing the check reports.
         let permitted = tokio::time::timeout(self.authorization_timeout, async {
             self.authorizer
-                .check_repository_access(get_verified_token(&extensions).as_ref(), repository, None)
+                .check_repository_access(
+                    get_verified_token(&extensions).as_ref(),
+                    repository,
+                    Action::Read,
+                )
                 .await
                 .is_ok()
         })

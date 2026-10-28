@@ -225,7 +225,7 @@ async fn push_linear_revisions(
             repository.clone(),
             branch,
             state.revision(),
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
@@ -269,7 +269,7 @@ async fn push_jump_revision(
         repository.clone(),
         branch,
         state.revision(),
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
@@ -425,7 +425,7 @@ mod push {
                 repository_context,
                 branch_id,
                 nonexistent_revision,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -475,7 +475,7 @@ mod push {
                 repository,
                 branch,
                 state.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -537,7 +537,7 @@ mod push {
                 repository,
                 branch,
                 state.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -600,7 +600,7 @@ mod push {
                 repository,
                 branch,
                 merge.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -671,7 +671,7 @@ mod push {
                 repository,
                 branch,
                 merge.revision(),
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1041,6 +1041,15 @@ mod push_protected_action {
         actions: &'static [&'static str],
         service_account: bool,
     ) -> Result<(), tonic::Status> {
+        push_to_branch(tier, actions, service_account, true).await
+    }
+
+    async fn push_to_branch(
+        tier: Tier,
+        actions: &'static [&'static str],
+        service_account: bool,
+        protected: bool,
+    ) -> Result<(), tonic::Status> {
         let repository_id = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -1058,9 +1067,11 @@ mod push_protected_action {
                 repository_id,
             ));
             let main = create_test_branch(&repository).await;
-            branch::protect(repository.clone(), main)
-                .await
-                .expect("should protect");
+            if protected {
+                branch::protect(repository.clone(), main)
+                    .await
+                    .expect("should protect");
+            }
             let state =
                 serialize_revision(&repository, main, Hash::default(), Hash::default(), 1).await;
 
@@ -1130,6 +1141,24 @@ mod push_protected_action {
                 .await
                 .expect_err("the claim alone must not waive protection");
             assert_eq!(err.code(), Code::PermissionDenied, "{tier:?}");
+        }
+    }
+
+    /// An unprotected branch needs `write`, and only `write`: `push-protected`
+    /// answers for protected branches. Tier 1 is left out, since it grants
+    /// `write` to every token.
+    #[tokio::test]
+    async fn an_unprotected_branch_needs_write() {
+        for tier in [Tier::Resource, Tier::AuthClient] {
+            push_to_branch(tier, &["write"], false, false)
+                .await
+                .unwrap_or_else(|err| panic!("{tier:?}: `write` should push: {err}"));
+            for actions in [&["read"][..], &[PUSH_PROTECTED][..]] {
+                let err = push_to_branch(tier, actions, false, false)
+                    .await
+                    .expect_err("an unprotected push needs `write`");
+                assert_eq!(err.code(), Code::PermissionDenied, "{tier:?} {actions:?}");
+            }
         }
     }
 }

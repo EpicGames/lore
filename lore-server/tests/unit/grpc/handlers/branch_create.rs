@@ -113,6 +113,7 @@ async fn sends_created_notification_for_created_branch() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             request,
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -158,6 +159,7 @@ async fn no_created_notification_for_branch_create_errors() {
         let hook_dispatcher = HookDispatcher::empty();
         let response = handler(
             request,
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),

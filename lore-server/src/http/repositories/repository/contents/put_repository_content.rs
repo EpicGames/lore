@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::Path;
 use axum::extract::State;
+use axum::http::Extensions;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
@@ -24,6 +25,8 @@ use tracing::debug;
 use tracing::info;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt_axum_middleware::http_permits;
+use crate::authnz::repository_authorizer::Action;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -42,6 +45,7 @@ pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path(repository_id): Path<String>,
     Extension(user_info): Extension<Option<AuthorizationToken>>,
+    extensions: Extensions,
     headers: HeaderMap,
     data: Bytes,
 ) -> Response {
@@ -61,6 +65,22 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             let repository = match repository_id.parse::<Context>() {
+                Ok(repository_id)
+                    if !http_permits(
+                        state.repository_authorizer.as_ref(),
+                        &extensions,
+                        repository_id.into(),
+                        Action::Write,
+                    )
+                    .await =>
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        header_error,
+                        Body::from("Not permitted"),
+                    )
+                        .into_response();
+                }
                 Ok(repository_id) => Arc::new(RepositoryContext::new_server_context(
                     state.immutable_store.clone(),
                     state.mutable_store.clone(),

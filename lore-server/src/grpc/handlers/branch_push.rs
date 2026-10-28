@@ -48,6 +48,7 @@ use tracing::instrument;
 use tracing::span;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::cache::revision::store_history_step;
 use crate::grpc::FilterSlowDownExt;
@@ -57,6 +58,7 @@ use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -182,10 +184,7 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
 
-    // The `push-protected` action waives branch protection, which is how mirroring pushes.
-    let bypass_protection = authorizer
-        .permits(request.extensions(), repository, "push-protected")
-        .await;
+    let access = PushAccess::of(&authorizer, request.extensions(), repository).await?;
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
     let req = request.into_inner();
@@ -199,7 +198,7 @@ pub async fn handler(
         return Err(Status::invalid_argument("Invalid revision"));
     }
 
-    debug!({REVISION} = %revision, bypass_protection, {BRANCH_ID} = %branch, force, fast_forward_merge,
+    debug!({REVISION} = %revision, ?access, {BRANCH_ID} = %branch, force, fast_forward_merge,
         "Handling branch push request",
     );
 
@@ -243,7 +242,7 @@ pub async fn handler(
                 repository.clone(),
                 branch,
                 revision,
-                bypass_protection,
+                access,
                 force,
                 fast_forward_merge,
                 history_step_size,
@@ -367,13 +366,45 @@ pub struct PushResult {
     pub revision_number: u64,
 }
 
+/// Which pushes the caller may make: to an unprotected branch with `write`,
+/// to a protected one with `push-protected`.
+#[derive(Clone, Copy, Debug)]
+pub struct PushAccess {
+    pub write: bool,
+    pub push_protected: bool,
+}
+
+impl PushAccess {
+    /// Denies with [`no_repository_access_status`] when the caller may make
+    /// neither kind of push, before anything about the branch is read.
+    pub async fn of(
+        authorizer: &Arc<dyn RepositoryAuthorizer>,
+        extensions: &tonic::Extensions,
+        repository: RepositoryId,
+    ) -> Result<Self, Status> {
+        let access = Self {
+            write: authorizer
+                .permits(extensions, repository, Action::Write)
+                .await,
+            push_protected: authorizer
+                .permits(extensions, repository, Action::PushProtected)
+                .await,
+        };
+        if access.write || access.push_protected {
+            Ok(access)
+        } else {
+            Err(no_repository_access_status())
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn push(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     latest: Hash,
-    bypass_protection: bool,
+    access: PushAccess,
     force: bool,
     fast_forward_merge: bool,
     history_step_size: u64,
@@ -391,12 +422,13 @@ pub async fn push(
         .warn_map_err(|err| Status::internal(format!("Failed to load branch metadata: {err}")))?;
 
     if branch_metadata.get_bool(PROTECT).unwrap_or_default() {
-        if bypass_protection {
-            debug!("Bypass branch protection and push to protected branch");
-        } else {
+        if !access.push_protected {
             warn!("Branch push failed, branch is protected");
             return Err(Status::permission_denied("protected"));
         }
+        debug!("Push to protected branch");
+    } else if !access.write {
+        return Err(no_repository_access_status());
     }
 
     // Verify the branch has not been deleted by checking the name→id mapping

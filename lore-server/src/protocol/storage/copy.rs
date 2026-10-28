@@ -14,6 +14,7 @@ use lore_storage::immutable_store::CopyBehavior;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
@@ -148,7 +149,7 @@ impl Message for Copy {
                 _ => None,
             };
             repository_authorizer
-                .check_repository_access(token.as_ref(), self.source_repository, None)
+                .check_repository_access(token.as_ref(), self.source_repository, Action::Read)
                 .await
                 .map_err(|status| {
                     MessageHandleError::AuthorizationFailure(status.message().to_string())

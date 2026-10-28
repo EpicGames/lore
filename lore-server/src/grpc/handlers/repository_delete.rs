@@ -30,7 +30,7 @@ use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
-use crate::grpc::may_delete_repository;
+use crate::grpc::may_administer_repository;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]
@@ -96,7 +96,7 @@ async fn repository_delete(
 
     let user_id = execution_context().user_id().await;
 
-    if !may_delete_repository(
+    if !may_administer_repository(
         authorizer,
         extensions,
         repository.id,

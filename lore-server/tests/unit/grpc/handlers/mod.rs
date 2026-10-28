@@ -8,6 +8,7 @@ mod branch_get;
 mod branch_list;
 mod branch_metadata_get;
 mod branch_metadata_set;
+mod branch_protect;
 mod branch_push;
 mod branch_revision_list;
 mod obliterate;

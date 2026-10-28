@@ -27,6 +27,7 @@ use lore_proto::lore::user::v1::user_service_server::UserServiceServer;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::authnz::repository_catalog::*;
@@ -200,11 +201,11 @@ async fn denied_listing_does_not_deny_a_granted_partition() {
             .is_empty()
     );
     authorizer
-        .check_repository_access(Some(&token), granted, None)
+        .check_repository_access(Some(&token), granted, Action::Read)
         .await
         .unwrap();
     authorizer
-        .check_repository_access(Some(&token), granted, Some("write"))
+        .check_repository_access(Some(&token), granted, Action::Write)
         .await
         .unwrap();
 }

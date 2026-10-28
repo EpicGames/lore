@@ -68,6 +68,7 @@ impl StorageServiceV1 for LoreStorageService {
     ) -> Result<Response<Self::PutResolvedStream>, Status> {
         put_resolved::handler(
             request,
+            self.repository_authorizer(),
             self.mutable_store().clone(),
             self.immutable_store().clone(),
             self,
@@ -81,7 +82,13 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
-        put::handler(request, self.immutable_store().clone(), self).await
+        put::handler(
+            request,
+            self.repository_authorizer(),
+            self.immutable_store().clone(),
+            self,
+        )
+        .await
     }
 
     async fn query(
@@ -110,7 +117,12 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::VerifyRequest>,
     ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
-        verify::handler(request, self.local_immutable_store().clone()).await
+        verify::handler(
+            request,
+            self.repository_authorizer(),
+            self.local_immutable_store().clone(),
+        )
+        .await
     }
 
     async fn mutable_load(
@@ -124,13 +136,23 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::MutableStoreRequest>,
     ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
-        mutable_store::handler(request, self.mutable_store().clone()).await
+        mutable_store::handler(
+            request,
+            self.repository_authorizer(),
+            self.mutable_store().clone(),
+        )
+        .await
     }
 
     async fn mutable_compare_and_swap(
         &self,
         request: Request<storage_v1::MutableCompareAndSwapRequest>,
     ) -> Result<Response<storage_v1::MutableCompareAndSwapResponse>, Status> {
-        mutable_compare_and_swap::handler(request, self.mutable_store().clone()).await
+        mutable_compare_and_swap::handler(
+            request,
+            self.repository_authorizer(),
+            self.mutable_store().clone(),
+        )
+        .await
     }
 }

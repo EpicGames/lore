@@ -19,6 +19,7 @@ use tracing::Span;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
@@ -192,7 +193,7 @@ impl QuicService for StorageServiceV4 {
                 auth_token,
             } => {
                 let mut user_id = String::new();
-                let mut grants = None;
+                let grants;
                 let mut token = None;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
@@ -225,6 +226,16 @@ impl QuicService for StorageServiceV4 {
                     token = Some(Arc::new(verified.owned()));
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
+                } else {
+                    // Enumerated without a token too, so each command is a set
+                    // lookup rather than an authorizer call.
+                    grants = self
+                        .repository_authorizer
+                        .granted_access(None, repository)
+                        .await
+                        .map_err(|status| {
+                            MessageHandleError::AuthorizationFailure(status.message().to_string())
+                        })?;
                 }
 
                 let session_map = self.session_map.clone();
@@ -261,6 +272,13 @@ impl QuicService for StorageServiceV4 {
                 opcode,
                 payload,
             } => {
+                // Parse the storage command payload using v4-aware parsers — Copy carries an
+                // extra `target_context` field on the wire that the legacy parser cannot decode.
+                let parsed = parse_message_for_opcode_v4(opcode, payload).map_err(|err| {
+                    tracing::warn!("Failed to parse v4 storage command: {err}");
+                    MessageHandleError::InternalError
+                })?;
+
                 let session_map = self.session_map.clone();
                 let session = session_map
                     .get(session_id)
@@ -271,14 +289,30 @@ impl QuicService for StorageServiceV4 {
                 let user_id = session.user_id.clone();
                 let token = session.token.clone();
                 let authorized_sources = session.authorized_sources.clone();
-                drop(session);
 
-                // Parse the storage command payload using v4-aware parsers — Copy carries an
-                // extra `target_context` field on the wire that the legacy parser cannot decode.
-                let parsed = parse_message_for_opcode_v4(opcode, payload).map_err(|err| {
-                    tracing::warn!("Failed to parse v4 storage command: {err}");
-                    MessageHandleError::InternalError
-                })?;
+                // Answered from the session's grants while they are borrowed, so
+                // the per-command check copies nothing. `Some(None)`: the
+                // authorizer could not enumerate, so it is asked below.
+                let action = parsed.required_action();
+                let enumerated = action
+                    .map(|action| session.grants.as_ref().map(|grants| grants.permits(action)));
+                drop(session);
+                let permitted = match (action, enumerated) {
+                    (Some(action), Some(None)) => {
+                        let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
+                        self.repository_authorizer
+                            .check_repository_access(verified.as_ref(), repository, action)
+                            .await
+                            .is_ok()
+                    }
+                    (_, Some(Some(permitted))) => permitted,
+                    _ => true,
+                };
+                if !permitted {
+                    return Err(MessageHandleError::AuthorizationFailure(
+                        "Action not permitted".to_string(),
+                    ));
+                }
 
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {
@@ -346,7 +380,7 @@ impl QuicService for StorageServiceV4 {
                                 .check_repository_access(
                                     verified.as_ref(),
                                     copy.source_repository,
-                                    None,
+                                    Action::Read,
                                 )
                                 .await
                                 .map_err(|status| {

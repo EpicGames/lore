@@ -120,7 +120,7 @@ async fn returns_metadata_hash_for_deleted_branch() {
             repository.clone(),
             main_id,
             state_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,

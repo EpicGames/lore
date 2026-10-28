@@ -53,7 +53,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
         repository_context.clone(),
         main,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,

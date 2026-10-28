@@ -9,6 +9,7 @@ use lore_proto::lore::repository::v1::repository_get_request::Query;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_server::auth::jwt::JwtVerifier;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -170,7 +171,7 @@ mod base_repository_get_handler {
                 &self,
                 _token: Option<&VerifiedToken<'_>>,
                 _repository_id: lore_base::types::RepositoryId,
-                _action: Option<&str>,
+                _action: Action,
             ) -> Result<(), Status> {
                 Err(Status::permission_denied("denied"))
             }
@@ -299,7 +300,7 @@ mod token_verification {
             &self,
             token: Option<&VerifiedToken<'_>>,
             _repository_id: lore_base::types::RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             self.seen
                 .lock()

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use dashmap::DashSet;
 use lore_revision::lore::RepositoryId;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::Grants;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedTokenOwned;
@@ -30,9 +31,9 @@ mod entry_permits {
             &self,
             token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            action: Option<&str>,
+            action: Action,
         ) -> Result<(), Status> {
-            if token.is_some() && action == Some(self.0) {
+            if token.is_some() && action.as_str() == self.0 {
                 Ok(())
             } else {
                 Err(Status::permission_denied("Not permitted"))
@@ -66,10 +67,10 @@ mod entry_permits {
             Some(Grants::Actions(HashSet::from(["migrate".to_string()]))),
             Some(owned_token()),
         );
-        assert!(entry.permits(&PolicyOnly("other"), "migrate").await);
+        assert!(entry.permits(&PolicyOnly("other"), Action::Migrate).await);
         assert!(
             !entry
-                .permits(&AllowAllRepositoryAuthorizer, "obliterate")
+                .permits(&AllowAllRepositoryAuthorizer, Action::Obliterate)
                 .await
         );
     }
@@ -77,21 +78,31 @@ mod entry_permits {
     #[tokio::test]
     async fn non_enumerated_sessions_ask_the_authorizer_per_action() {
         let entry = entry(None, Some(owned_token()));
-        assert!(entry.permits(&PolicyOnly("migrate"), "migrate").await);
-        assert!(!entry.permits(&PolicyOnly("migrate"), "obliterate").await);
-    }
-
-    /// Without a verified token nothing is granted, whatever the
-    /// authorizer would say — the contract `RepositoryAuthorizer::permits`
-    /// keeps for request extensions.
-    #[tokio::test]
-    async fn no_token_grants_nothing_even_under_allow_all() {
-        let entry = entry(None, None);
+        assert!(entry.permits(&PolicyOnly("migrate"), Action::Migrate).await);
         assert!(
             !entry
-                .permits(&AllowAllRepositoryAuthorizer, "migrate")
+                .permits(&PolicyOnly("migrate"), Action::Obliterate)
                 .await
         );
+    }
+
+    /// Without a verified token the authorizer still decides — the
+    /// contract `RepositoryAuthorizer::permits` keeps for request
+    /// extensions. Allow-all answers from its fixed set.
+    #[tokio::test]
+    async fn no_token_is_asked_of_the_authorizer() {
+        let entry = entry(None, None);
+        assert!(
+            entry
+                .permits(&AllowAllRepositoryAuthorizer, Action::Write)
+                .await
+        );
+        assert!(
+            !entry
+                .permits(&AllowAllRepositoryAuthorizer, Action::Migrate)
+                .await
+        );
+        assert!(!entry.permits(&PolicyOnly("migrate"), Action::Migrate).await);
     }
 }
 

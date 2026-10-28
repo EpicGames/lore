@@ -14,27 +14,31 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::require_repository_administration;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "BranchUnprotect::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchUnprotectRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<BranchUnprotectResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let extensions = request.extensions().clone();
     let req = request.into_inner();
     let branch = BranchId::from(req.branch);
 
     info!("Handling branch unprotect in repository {repository_id}: branch {branch}");
 
-    let execution = setup_execution(module_path!(), correlation_id, user_id);
+    let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
 
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
@@ -44,6 +48,13 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            require_repository_administration(
+                authorizer,
+                &extensions,
+                repository.clone(),
+                &user_id,
+            )
+            .await?;
             match branch::unprotect(repository, branch)
                 .await
                 .filter_slow_down()?

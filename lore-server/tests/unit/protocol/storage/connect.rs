@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -270,8 +271,8 @@ mod authorized_connect {
             .get::<PartitionGrants>()
             .expect("enumerated grants must be exposed");
         assert_eq!(grants.repository_id, repository);
-        assert!(grants.grants.permits("migrate"));
-        assert!(!grants.grants.permits("obliterate"));
+        assert!(grants.grants.permits(Action::Migrate));
+        assert!(!grants.grants.permits(Action::Obliterate));
         assert_eq!(context.get::<RawToken>().unwrap().0, token);
         assert!(context.get::<AuthorizationToken>().is_some());
     }

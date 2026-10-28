@@ -6,6 +6,7 @@ use lore_base::types::Context;
 use lore_base::types::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::authnz::resource_grants_authorizer::*;
@@ -45,7 +46,7 @@ async fn check(
     authorizer: &ResourceGrantsAuthorizer,
     claims: &AuthorizationToken,
     repository_id: RepositoryId,
-    action: Option<&str>,
+    action: Action,
 ) -> Result<(), Status> {
     let token = VerifiedToken { raw: "raw", claims };
     authorizer
@@ -67,18 +68,23 @@ async fn default_template_reproduces_the_legacy_matching() {
         ..Default::default()
     };
 
-    check(&authorizer, &claims, repository(REPOSITORY_HEX), None)
-        .await
-        .unwrap();
     check(
         &authorizer,
         &claims,
         repository(REPOSITORY_HEX),
-        Some("obliterate"),
+        Action::Read,
     )
     .await
     .unwrap();
-    for action in [None, Some("obliterate")] {
+    check(
+        &authorizer,
+        &claims,
+        repository(REPOSITORY_HEX),
+        Action::Obliterate,
+    )
+    .await
+    .unwrap();
+    for action in [Action::Read, Action::Obliterate] {
         let err = check(&authorizer, &claims, repository(UNRELATED_HEX), action)
             .await
             .unwrap_err();
@@ -108,11 +114,13 @@ async fn wildcard_entry_matches_every_repository() {
     let claims = claims_with_resources(vec![entry("urc-*", &["migrate"])]);
 
     for repository in [repository(REPOSITORY_HEX), repository(UNRELATED_HEX)] {
-        check(&authorizer, &claims, repository, None).await.unwrap();
-        check(&authorizer, &claims, repository, Some("migrate"))
+        check(&authorizer, &claims, repository, Action::Read)
             .await
             .unwrap();
-        let err = check(&authorizer, &claims, repository, Some("obliterate"))
+        check(&authorizer, &claims, repository, Action::Migrate)
+            .await
+            .unwrap();
+        let err = check(&authorizer, &claims, repository, Action::Obliterate)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
@@ -123,27 +131,22 @@ async fn wildcard_entry_matches_every_repository() {
 async fn permissions_merge_across_matching_entries() {
     let authorizer = default_authorizer();
     let claims = claims_with_resources(vec![
-        entry(&format!("urc-{REPOSITORY_HEX}"), &["push"]),
+        entry(&format!("urc-{REPOSITORY_HEX}"), &["write"]),
         entry("urc-*", &["migrate"]),
         entry(&format!("urc-{REPOSITORY_HEX}"), &["obliterate"]),
     ]);
 
-    for action in ["push", "migrate", "obliterate"] {
-        check(
-            &authorizer,
-            &claims,
-            repository(REPOSITORY_HEX),
-            Some(action),
-        )
-        .await
-        .unwrap();
+    for action in [Action::Write, Action::Migrate, Action::Obliterate] {
+        check(&authorizer, &claims, repository(REPOSITORY_HEX), action)
+            .await
+            .unwrap();
     }
     // The unrelated repository sees only the wildcard entry's actions.
     check(
         &authorizer,
         &claims,
         repository(UNRELATED_HEX),
-        Some("migrate"),
+        Action::Migrate,
     )
     .await
     .unwrap();
@@ -151,7 +154,7 @@ async fn permissions_merge_across_matching_entries() {
         &authorizer,
         &claims,
         repository(UNRELATED_HEX),
-        Some("push"),
+        Action::Write,
     )
     .await
     .unwrap_err();
@@ -159,11 +162,43 @@ async fn permissions_merge_across_matching_entries() {
 }
 
 #[tokio::test]
-async fn no_resource_claim_denies_everything_including_plain_access() {
+async fn any_entry_grants_read_and_write_must_be_listed() {
+    let authorizer = default_authorizer();
+    let claims = claims_with_resources(vec![
+        entry(&format!("urc-{REPOSITORY_HEX}"), &["write"]),
+        entry(&format!("urc-{UNRELATED_HEX}"), &["migrate"]),
+    ]);
+
+    for action in [Action::Read, Action::Write] {
+        check(&authorizer, &claims, repository(REPOSITORY_HEX), action)
+            .await
+            .unwrap();
+    }
+    check(
+        &authorizer,
+        &claims,
+        repository(UNRELATED_HEX),
+        Action::Read,
+    )
+    .await
+    .unwrap();
+    let err = check(
+        &authorizer,
+        &claims,
+        repository(UNRELATED_HEX),
+        Action::Write,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+}
+
+#[tokio::test]
+async fn no_resource_claim_denies_everything_including_read() {
     let authorizer = default_authorizer();
     let claims = token_with_extra(json!({}));
 
-    for action in [None, Some("obliterate")] {
+    for action in [Action::Read, Action::Obliterate] {
         let err = check(&authorizer, &claims, repository(REPOSITORY_HEX), action)
             .await
             .unwrap_err();
@@ -192,13 +227,18 @@ async fn permission_claim_names_the_actions_field() {
         &authorizer,
         &claims,
         repository(REPOSITORY_HEX),
-        Some("obliterate"),
+        Action::Obliterate,
     )
     .await
     .unwrap();
-    let err = check(&authorizer, &claims, repository(UNRELATED_HEX), None)
-        .await
-        .unwrap_err();
+    let err = check(
+        &authorizer,
+        &claims,
+        repository(UNRELATED_HEX),
+        Action::Read,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
 }
 
@@ -230,13 +270,18 @@ async fn resource_id_claim_names_the_resource_field() {
         &authorizer,
         &claims,
         repository(REPOSITORY_HEX),
-        Some("obliterate"),
+        Action::Obliterate,
     )
     .await
     .unwrap();
-    let err = check(&authorizer, &claims, repository(UNRELATED_HEX), None)
-        .await
-        .unwrap_err();
+    let err = check(
+        &authorizer,
+        &claims,
+        repository(UNRELATED_HEX),
+        Action::Read,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
 }
 
@@ -258,20 +303,16 @@ async fn malformed_entries_are_skipped_rather_than_fatal() {
             { "no_resource_id": true },
             { "resource_id": 42 },
             { "resource_id": format!("urc-{REPOSITORY_HEX}"), "permission": "not an array" },
-            { "resource_id": format!("urc-{REPOSITORY_HEX}"), "permission": [1, null, "push"] },
+            { "resource_id": format!("urc-{REPOSITORY_HEX}"), "permission": [1, null, "write"] },
         ]
     }));
 
-    // The malformed-actions entries still name the resource, so
-    // reachability holds while their unreadable actions grant nothing.
-    check(&authorizer, &claims, repository(REPOSITORY_HEX), None)
-        .await
-        .unwrap();
+    // The unreadable actions grant nothing; the readable one still counts.
     check(
         &authorizer,
         &claims,
         repository(REPOSITORY_HEX),
-        Some("push"),
+        Action::Write,
     )
     .await
     .unwrap();
@@ -279,7 +320,7 @@ async fn malformed_entries_are_skipped_rather_than_fatal() {
         &authorizer,
         &claims,
         repository(REPOSITORY_HEX),
-        Some("obliterate"),
+        Action::Obliterate,
     )
     .await
     .unwrap_err();
@@ -287,9 +328,14 @@ async fn malformed_entries_are_skipped_rather_than_fatal() {
 
     // A claim that is not an array at all denies everything.
     let claims = token_with_extra(json!({ "grants": "not an array" }));
-    let err = check(&authorizer, &claims, repository(REPOSITORY_HEX), None)
-        .await
-        .unwrap_err();
+    let err = check(
+        &authorizer,
+        &claims,
+        repository(REPOSITORY_HEX),
+        Action::Read,
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
 }
 
@@ -308,7 +354,7 @@ async fn sync_check_answers_and_agrees_with_the_async_path() {
     };
     for token in [None, Some(&token)] {
         for repository in [repository(REPOSITORY_HEX), repository(UNRELATED_HEX)] {
-            for action in [None, Some("obliterate"), Some("admin")] {
+            for action in [Action::Read, Action::Obliterate, Action::Admin] {
                 let sync = authorizer
                     .check_repository_access_sync(token, repository, action)
                     .expect("the token holds the verdict");
@@ -326,9 +372,9 @@ async fn sync_check_answers_and_agrees_with_the_async_path() {
 }
 
 #[tokio::test]
-async fn no_token_denies_even_plain_access() {
+async fn no_token_denies_even_read() {
     let authorizer = default_authorizer();
-    for action in [None, Some("obliterate")] {
+    for action in [Action::Read, Action::Obliterate] {
         let err = authorizer
             .check_repository_access(None, repository(REPOSITORY_HEX), action)
             .await
@@ -353,7 +399,7 @@ async fn a_lookup_needs_a_verified_token_and_no_grant() {
             .check_repository_lookup(Some(&token), repository(id))
             .await
             .expect("any verified token may look a repository up");
-        let err = check(&authorizer, &login, repository(id), None)
+        let err = check(&authorizer, &login, repository(id), Action::Read)
             .await
             .unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);

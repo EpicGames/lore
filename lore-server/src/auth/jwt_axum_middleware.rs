@@ -6,19 +6,24 @@ use axum::body::Body;
 use axum::extract::Path;
 use axum::extract::Request;
 use axum::extract::State;
+use axum::http::Extensions;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
 use axum::response::Response;
 use lore_base::types::Context;
+use lore_revision::lore::RepositoryId;
 use lore_telemetry::tracing::fields::USER_ID;
 use serde::Deserialize;
 use tracing::Span;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::permits_with;
 use crate::http::server::ServerState;
 
 #[derive(Deserialize)]
@@ -91,4 +96,35 @@ fn extract_bearer_token(request: &Request) -> Option<String> {
                 None
             }
         })
+}
+
+/// [`permits_with`] over what [`jwt_axum_verify_authorization`] inserts into
+/// the request extensions, where the claims sit as `Option<AuthorizationToken>`.
+pub async fn http_permits(
+    authorizer: &dyn RepositoryAuthorizer,
+    extensions: &Extensions,
+    repository: RepositoryId,
+    action: Action,
+) -> bool {
+    let grants = extensions
+        .get::<PartitionGrants>()
+        .filter(|grants| grants.repository_id == repository);
+    let claims = extensions
+        .get::<Option<AuthorizationToken>>()
+        .and_then(Option::as_ref);
+    let token = match (extensions.get::<RawToken>(), claims) {
+        (Some(raw), Some(claims)) => Some(VerifiedToken {
+            raw: &raw.0,
+            claims,
+        }),
+        _ => None,
+    };
+    permits_with(
+        authorizer,
+        grants.map(|grants| &grants.grants),
+        token.as_ref(),
+        repository,
+        action,
+    )
+    .await
 }

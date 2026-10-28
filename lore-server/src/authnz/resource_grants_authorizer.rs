@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use lore_base::types::RepositoryId;
 use tonic::Status;
 
+use super::repository_authorizer::Action;
 use super::repository_authorizer::Grants;
 use super::repository_authorizer::RepositoryAuthorizer;
 use super::repository_authorizer::VerifiedToken;
@@ -17,8 +18,7 @@ use crate::auth::jwt::ResourcePermission;
 /// resource entries. An entry matches a repository when its resource name
 /// equals what `resource_id_template` renders for it, or equals
 /// `resource_wildcard`. Permissions are merged across all matching entries.
-/// A token with no matching resource entry is denied everything,
-/// `action: None` included.
+/// A token with no matching resource entry is denied everything.
 ///
 /// The two fields inside a resource entry follow the same rule: the resource
 /// name is read from the field named by `[server.auth].resource_id_claim`
@@ -113,7 +113,7 @@ impl ResourceGrantsAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
         let Some(token) = token else {
             return Err(Status::unauthenticated("No token"));
@@ -122,10 +122,10 @@ impl ResourceGrantsAuthorizer {
         if !self.matcher.any_match(&entries, repository_id) {
             return Err(Status::permission_denied("No grant for repository"));
         }
-        match action {
-            None => Ok(()),
-            Some(action) if self.matcher.permits(&entries, repository_id, action) => Ok(()),
-            Some(_) => Err(Status::permission_denied("Action not permitted")),
+        if self.matcher.permits(&entries, repository_id, action) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("Action not permitted"))
         }
     }
 }
@@ -136,7 +136,7 @@ impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
         self.check(token, repository_id, action)
     }
@@ -159,7 +159,7 @@ impl RepositoryAuthorizer for ResourceGrantsAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Option<Result<(), Status>> {
         Some(self.check(token, repository_id, action))
     }

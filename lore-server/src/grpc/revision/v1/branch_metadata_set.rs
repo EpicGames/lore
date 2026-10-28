@@ -20,13 +20,18 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::branch_metadata_set::changes_protection;
 use crate::grpc::handlers::branch_metadata_set::validate_binary_blobs;
 use crate::grpc::handlers::branch_metadata_set::validate_read_only_fields;
+use crate::grpc::require_action;
+use crate::grpc::require_repository_administration;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -40,16 +45,22 @@ use crate::util::setup_execution;
 ///
 /// `protect` remains writable through this RPC (it is not in the
 /// read-only key set) so clients can continue to toggle branch
-/// protection without dedicated protect/unprotect RPCs.
+/// protection without dedicated protect/unprotect RPCs. Changing it needs
+/// the same rights as those RPCs; comparing against the caller's `expected`
+/// is sound because the CAS succeeds only when `expected` is the stored
+/// pointer.
 #[tracing::instrument(name = "BranchMetadataSet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let extensions = request.extensions().clone();
     let req = request.into_inner();
 
     let branch_id = BranchId::from(req.id);
@@ -60,7 +71,7 @@ pub async fn handler(
     let expected: Hash = req.expected.into();
     let updated: Hash = req.updated.into();
 
-    let execution = setup_execution(module_path!(), correlation_id, user_id);
+    let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
@@ -119,6 +130,15 @@ pub async fn handler(
                 })?;
 
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
+            if changes_protection(&current_metadata, &proposed_metadata) {
+                require_repository_administration(
+                    authorizer,
+                    &extensions,
+                    repository.clone(),
+                    &user_id,
+                )
+                .await?;
+            }
             validate_binary_blobs(repository.clone(), &proposed_metadata).await?;
 
             let (metadata_key, key_type) = branch::mutable_key(

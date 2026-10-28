@@ -19,11 +19,14 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
@@ -39,9 +42,11 @@ use crate::util::setup_execution;
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -49,6 +54,7 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let caller_context = CallerContext::from_original_request(&request)?;
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests

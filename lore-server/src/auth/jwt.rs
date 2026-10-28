@@ -17,6 +17,7 @@ use tracing::warn;
 
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
+use crate::authnz::repository_authorizer::Action;
 
 /// From Lore protos, but cannot derive deserialize on external type
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -91,20 +92,27 @@ impl ResourceMatcher {
             .any(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
     }
 
-    /// Whether some entry matching `repository` grants `action`. The
-    /// per-question form of [`merged_permissions`](Self::merged_permissions):
-    /// it visits the entries in place rather than building the merged set.
+    /// Whether some entry matching `repository` grants `action`. Any matching
+    /// entry grants `read`. The per-question form of
+    /// [`merged_permissions`](Self::merged_permissions): it visits the entries
+    /// in place rather than building the merged set.
     pub fn permits(
         &self,
         resources: &[ResourcePermission],
         repository: lore_base::types::RepositoryId,
-        action: &str,
+        action: Action,
     ) -> bool {
         let resource_id = self.resource_for(repository);
         resources
             .iter()
             .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
-            .any(|entry| entry.permission.iter().any(|granted| granted == action))
+            .any(|entry| {
+                action == crate::authnz::repository_authorizer::Action::Read
+                    || entry
+                        .permission
+                        .iter()
+                        .any(|granted| granted == action.as_str())
+            })
     }
 
     /// The actions granted on `repository`, merged across every matching

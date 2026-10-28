@@ -83,7 +83,7 @@ async fn push_revision_on_branch(
         repository_context.clone(),
         branch,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,

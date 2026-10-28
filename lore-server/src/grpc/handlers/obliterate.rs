@@ -18,8 +18,10 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::extract_bearer_token;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
-use crate::grpc::can_obliterate;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -33,20 +35,22 @@ use crate::util::setup_execution;
 async fn authenticate_request(
     metadata: &MetadataMap,
     jwt_verifier: &JwtVerifier,
-) -> Result<AuthorizationToken, Status> {
+) -> Result<(AuthorizationToken, RawToken), Status> {
     let token = extract_bearer_token(metadata)
         .ok_or_else(|| Status::unauthenticated("authorization header required"))?;
 
-    jwt_verifier
+    let claims = jwt_verifier
         .verify_token(&token)
         .await
-        .map_err(|e| Status::unauthenticated(format!("invalid token ({e:?})")))
+        .map_err(|e| Status::unauthenticated(format!("invalid token ({e:?})")))?;
+    Ok((claims, RawToken(token)))
 }
 
 #[allow(clippy::todo)]
 #[tracing::instrument(name = "Obliterate::handle", skip_all)]
 pub async fn handler(
     mut request: Request<ObliterateRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     _mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
@@ -54,8 +58,11 @@ pub async fn handler(
     jwt_verifier: &Arc<Option<JwtVerifier>>,
 ) -> Result<Response<ObliterateResponse>, Status> {
     if let Some(verifier) = &**jwt_verifier {
-        let authorization = authenticate_request(request.metadata(), verifier).await?;
-        request.extensions_mut().insert(authorization);
+        // The admin service has no interceptor, so this handler verifies the
+        // token itself and stores both halves the authorizer reads.
+        let (claims, raw) = authenticate_request(request.metadata(), verifier).await?;
+        request.extensions_mut().insert(claims);
+        request.extensions_mut().insert(raw);
     }
 
     let repository = get_repository(request.metadata())?;
@@ -69,7 +76,10 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            if jwt_verifier.is_some() && !can_obliterate(&extensions, repository) {
+            if !authorizer
+                .permits(&extensions, repository, Action::Obliterate)
+                .await
+            {
                 warn!("Attempt to obliterate {address} in repository, but user does not have the correct permissions");
                 return Err(Status::permission_denied("Permission denied"));
             }

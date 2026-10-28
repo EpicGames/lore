@@ -9,3 +9,4 @@ mod put_resolved;
 mod query;
 mod service;
 mod test_utils;
+mod verify;

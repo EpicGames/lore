@@ -7,6 +7,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- `lore-server`: with authorization configured, operations that change a partition check for the `write` permission.
+  Any permission on a partition still allows reading it, but no longer allows writing. Servers without authorization
+  configured allow every caller to read, write and administer repositories
+- `lore-server`: changing branch protection, through branch protect and unprotect or by setting the `protect` key in
+  branch metadata, needs `owner` or `admin` on the repository, or `write` for its creator. Previously anyone with
+  access to the repository could set the branch protection rules
 - Server hooks: `Hook::pre_handler` is now `async`, so a pre-handler can call other services without blocking a worker
   thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout
   (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of

@@ -10,6 +10,7 @@ use lore_notification::NotificationService as _;
 use lore_proto::lore::notification::SubscribeRequest;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -32,7 +33,7 @@ impl RepositoryAuthorizer for DenyingAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         self.asked.lock().unwrap().push(repository_id);
         Err(Status::permission_denied("no grant"))
@@ -95,7 +96,7 @@ async fn a_stalled_authorizer_times_out_the_subscribe_check() {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             std::future::pending().await
         }

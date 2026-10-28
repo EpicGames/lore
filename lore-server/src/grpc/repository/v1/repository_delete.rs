@@ -29,7 +29,7 @@ use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
-use crate::grpc::may_delete_repository;
+use crate::grpc::may_administer_repository;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryDelete` handler.
@@ -68,7 +68,7 @@ pub async fn handler(
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            if !may_delete_repository(authorizer, &extensions, id, &metadata.creator, &user_id)
+            if !may_administer_repository(authorizer, &extensions, id, &metadata.creator, &user_id)
                 .await
             {
                 info!(

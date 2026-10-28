@@ -392,6 +392,12 @@ pub struct AuthSettings {
     pub jwt_typ: Option<Vec<String>>,
     /// Dotted path of the JWT claim carrying the caller's allowed actions.
     pub permission_claim: Option<String>,
+    /// Tier 1 only: the actions every token holder gets, added to whatever
+    /// `permission_claim` carries and to `read`, which any token implies.
+    /// Absent means `["write"]`. Read
+    /// through [`AuthSettings::implicit_actions`]; `None` is kept distinct so
+    /// startup can refuse an explicit value that would do nothing.
+    pub implicit_actions: Option<Vec<crate::authnz::repository_authorizer::Action>>,
     /// Dotted path of the claim carrying per-repository resource grants.
     /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
     pub resource_claim: Option<String>,
@@ -449,6 +455,12 @@ pub struct OidcSettings {
 }
 
 impl AuthSettings {
+    pub fn implicit_actions(&self) -> Vec<crate::authnz::repository_authorizer::Action> {
+        self.implicit_actions
+            .clone()
+            .unwrap_or_else(|| vec![crate::authnz::repository_authorizer::Action::Write])
+    }
+
     fn default_resource_id_template() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_ID_TEMPLATE.to_string()
     }

@@ -9,6 +9,7 @@ use lore_base::types::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
@@ -39,7 +40,10 @@ pub fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
 impl Tier {
     pub fn authorizer(self) -> Arc<dyn RepositoryAuthorizer> {
         match self {
-            Self::Global => Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            Self::Global => Arc::new(GlobalGrantsAuthorizer::new(
+                Some("groups".to_string()),
+                vec![Action::Read, Action::Write],
+            )),
             Self::Resource => Arc::new(resource_grants_authorizer()),
             Self::AuthClient => Arc::new(AuthClientAuthorizer::new(
                 "https://auth.invalid".to_string(),

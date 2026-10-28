@@ -8,9 +8,11 @@ use dashmap::DashMap;
 use dashmap::DashSet;
 use lore_revision::lore::RepositoryId;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::Grants;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::permits_with;
 
 #[lore_macro::test_pub]
 #[lore_macro::test_pub]
@@ -41,19 +43,17 @@ impl SessionEntry {
     /// repository — the per-operation check for an action-gated storage
     /// command. Same contract as `RepositoryAuthorizer::permits`: answered
     /// from the grants enumerated at session start, asked of the authorizer
-    /// when they were not enumerable, and without a verified token nothing
-    /// is granted.
-    pub async fn permits(&self, authorizer: &dyn RepositoryAuthorizer, action: &str) -> bool {
-        if let Some(grants) = &self.grants {
-            return grants.permits(action);
-        }
-        let Some(token) = &self.token else {
-            return false;
-        };
-        authorizer
-            .check_repository_access(Some(&token.as_token()), self.repository, Some(action))
-            .await
-            .is_ok()
+    /// when they were not enumerable, with or without a verified token.
+    pub async fn permits(&self, authorizer: &dyn RepositoryAuthorizer, action: Action) -> bool {
+        let token = self.token.as_deref().map(VerifiedTokenOwned::as_token);
+        permits_with(
+            authorizer,
+            self.grants.as_ref(),
+            token.as_ref(),
+            self.repository,
+            action,
+        )
+        .await
     }
 }
 

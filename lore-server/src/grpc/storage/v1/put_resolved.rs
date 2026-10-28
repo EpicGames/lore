@@ -42,12 +42,15 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::info_span;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::log_server_error;
 use crate::grpc::map_message_handle_error_to_status;
+use crate::grpc::require_action;
 use crate::grpc::rpc_code_to_str;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::put::Put;
@@ -165,10 +168,12 @@ fn error_response(request_id: u64, status: &Status) -> storage_v1::PutResolvedRe
 #[tracing::instrument(name = "StorageServiceV1::PutResolved", skip_all)]
 pub async fn handler(
     request: Request<Streaming<storage_v1::PutResolvedRequest>>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<PutResolvedResponseStream>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();

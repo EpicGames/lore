@@ -22,6 +22,50 @@ use crate::auth::jwt::ResourceMatcher;
 use crate::grpc::ServerResultExt;
 use crate::settings::AuthSettings;
 
+/// An action a caller may be asked to hold on a partition. Grants name
+/// actions by [`Action::as_str`], the form tokens and the auth service use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Action {
+    /// Implied by any grant on a partition: a caller who reaches it may read it.
+    Read,
+    Write,
+    Owner,
+    Admin,
+    Migrate,
+    PushProtected,
+    Obliterate,
+    Presign,
+}
+
+impl Action {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Migrate => "migrate",
+            Self::PushProtected => "push-protected",
+            Self::Obliterate => "obliterate",
+            Self::Presign => "presign",
+        }
+    }
+}
+
+impl fmt::Display for Action {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub const ALLOW_ALL_ACTIONS: [Action; 4] = [
+    Action::Read,
+    Action::Write,
+    Action::Obliterate,
+    Action::Presign,
+];
+
 /// The bearer token exactly as it arrived, without the `Bearer ` prefix.
 /// The interceptors insert it into request extensions beside the decoded
 /// [`AuthorizationToken`] so handlers can rebuild a [`VerifiedToken`].
@@ -69,8 +113,6 @@ pub enum Grants {
     Denied,
     /// Reachable, permitted exactly these actions.
     Actions(HashSet<String>),
-    /// Reachable, permitted every action.
-    All,
 }
 
 impl Grants {
@@ -78,11 +120,10 @@ impl Grants {
         !matches!(self, Grants::Denied)
     }
 
-    pub fn permits(&self, action: &str) -> bool {
+    pub fn permits(&self, action: Action) -> bool {
         match self {
             Grants::Denied => false,
-            Grants::All => true,
-            Grants::Actions(actions) => actions.contains(action),
+            Grants::Actions(actions) => action == Action::Read || actions.contains(action.as_str()),
         }
     }
 }
@@ -100,23 +141,26 @@ pub struct PartitionGrants {
 
 #[async_trait]
 pub trait RepositoryAuthorizer: Send + Sync {
-    /// Whether `token` may reach `repository_id` at all (`action: None`), or
-    /// may perform the named privileged action on it (`action: Some`).
+    /// Whether `token` may perform `action` on `repository_id`: [`Action::Read`],
+    /// [`Action::Write`], or a privileged action. `token` is `None` when no verifier
+    /// is configured. An implementation may answer different actions
+    /// differently, for example from the token for reads and with an online
+    /// call for [`Action::Obliterate`].
     async fn check_repository_access(
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status>;
 
     /// Whether `token` may look `repository_id` up and read its record: the id, the name
-    /// and the metadata hash, not the metadata or the contents. Reachability by default.
+    /// and the metadata hash, not the metadata or the contents. [`Action::Read`] by default.
     async fn check_repository_lookup(
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
     ) -> Result<(), Status> {
-        self.check_repository_access(token, repository_id, None)
+        self.check_repository_access(token, repository_id, Action::Read)
             .await
     }
 
@@ -126,7 +170,9 @@ pub trait RepositoryAuthorizer: Send + Sync {
     /// "may X do A?" without being able to list everything X may do.
     /// Callers fall back to
     /// [`check_repository_access`](Self::check_repository_access) per
-    /// question on `Ok(None)`.
+    /// question on `Ok(None)`. Those questions come from handlers, some of
+    /// which run under no timeout, so an implementation that returns
+    /// `Ok(None)` must bound its own calls.
     async fn granted_actions(
         &self,
         _token: Option<&VerifiedToken<'_>>,
@@ -149,7 +195,7 @@ pub trait RepositoryAuthorizer: Send + Sync {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Option<Result<(), Status>> {
         None
     }
@@ -158,8 +204,9 @@ pub trait RepositoryAuthorizer: Send + Sync {
 impl dyn RepositoryAuthorizer {
     /// Reachability of `repository_id`, with the caller's enumerated grants
     /// when this authorizer can enumerate them: `Ok(Some(grants))` also
-    /// answers later action checks in memory, `Ok(None)` means reachable but
-    /// per-action checks must ask the authorizer. Denials are flattened to
+    /// answers later action checks in memory. `Ok(None)` means reachable,
+    /// answered by asking [`Action::Read`] of an authorizer that cannot enumerate;
+    /// later action checks then ask it too. Denials are flattened to
     /// [`no_repository_access_status`] so an unauthorized caller learns
     /// nothing from the reason.
     ///
@@ -176,7 +223,7 @@ impl dyn RepositoryAuthorizer {
         match self.granted_actions(token, repository_id).await {
             Ok(Some(grants)) if grants.reachable() => Ok(Some(grants)),
             Ok(None) => self
-                .check_repository_access(token, repository_id, None)
+                .check_repository_access(token, repository_id, Action::Read)
                 .await
                 .map(|()| None)
                 .map_err(|_denied| crate::grpc::no_repository_access_status()),
@@ -191,31 +238,62 @@ impl dyn RepositoryAuthorizer {
     /// enumerated, when the request carries them for this partition. Asked
     /// of the authorizer otherwise, which is the fallback for authorizers
     /// that can only answer per-action policy questions (and for call sites
-    /// that are not behind the Tower middleware).
+    /// that are not behind the Tower middleware). A request with no verified
+    /// token is asked too: the authorizer decides what such a caller holds.
     pub async fn permits(
         &self,
         extensions: &tonic::Extensions,
         repository_id: RepositoryId,
-        action: &str,
+        action: Action,
     ) -> bool {
-        if let Some(grants) = extensions
+        let grants = extensions
             .get::<PartitionGrants>()
-            .filter(|grants| grants.repository_id == repository_id)
-        {
-            return grants.grants.permits(action);
-        }
-        let Some(token) = crate::grpc::get_verified_token(extensions) else {
-            return false;
-        };
-        self.check_repository_access(Some(&token), repository_id, Some(action))
-            .await
-            .is_ok()
+            .filter(|grants| grants.repository_id == repository_id);
+        let token = crate::grpc::get_verified_token(extensions);
+        permits_with(
+            self,
+            grants.map(|grants| &grants.grants),
+            token.as_ref(),
+            repository_id,
+            action,
+        )
+        .await
     }
 }
 
-/// Always allows access. Selected when no `[server.auth]` is configured:
-/// nothing verifies tokens, so a local server keeps working unchecked.
+/// Whether `action` on `repository_id` is permitted. `grants`, the caller's
+/// enumerated grants on it, answer when present; otherwise `authorizer` is
+/// asked with `token`, which is `None` when no verifier is configured.
+pub async fn permits_with(
+    authorizer: &dyn RepositoryAuthorizer,
+    grants: Option<&Grants>,
+    token: Option<&VerifiedToken<'_>>,
+    repository_id: RepositoryId,
+    action: Action,
+) -> bool {
+    if let Some(grants) = grants {
+        return grants.permits(action);
+    }
+    authorizer
+        .check_repository_access(token, repository_id, action)
+        .await
+        .is_ok()
+}
+
+/// Selected when no `[server.auth]` is configured: nothing verifies tokens,
+/// so every caller, with or without a token, holds [`ALLOW_ALL_ACTIONS`] on
+/// every repository.
 pub struct AllowAllRepositoryAuthorizer;
+
+impl AllowAllRepositoryAuthorizer {
+    fn check(action: Action) -> Result<(), Status> {
+        if ALLOW_ALL_ACTIONS.contains(&action) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("Action not permitted"))
+        }
+    }
+}
 
 #[async_trait]
 impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
@@ -223,9 +301,9 @@ impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
-        Ok(())
+        Self::check(action)
     }
 
     async fn granted_actions(
@@ -233,16 +311,18 @@ impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
     ) -> Result<Option<Grants>, Status> {
-        Ok(Some(Grants::All))
+        Ok(Some(Grants::Actions(
+            ALLOW_ALL_ACTIONS.iter().map(ToString::to_string).collect(),
+        )))
     }
 
     fn check_repository_access_sync(
         &self,
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        action: Action,
     ) -> Option<Result<(), Status>> {
-        Some(Ok(()))
+        Some(Self::check(action))
     }
 }
 
@@ -261,7 +341,7 @@ impl AuthClientAuthorizer {
         &self,
         authorization: Option<String>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
         let resource_id = format!("urc-{repository_id}");
         let permissions = self.fetch_permissions(authorization, &resource_id).await?;
@@ -354,44 +434,40 @@ fn grants_from_response(response: &CheckUserPermissionResponse, resource_id: &st
 }
 
 /// Answer an access question from the `resources` claim of an exchanged
-/// access token. `action: None` asks whether any entry names the partition.
-/// `action: Some` asks whether a matching entry grants the action. Answered
-/// in place rather than through [`grants_from_resources_claim`]: the
-/// link-read closure asks this per link, and the merged permission set is
-/// only worth building for an enumeration.
+/// access token: whether a matching entry grants `action`. Answered in
+/// place rather than through [`grants_from_resources_claim`]: the link-read
+/// closure asks this per link, and the merged permission set is only worth
+/// building for an enumeration.
 fn evaluate_resources_claim(
     resources: &[crate::auth::jwt::ResourcePermission],
     repository_id: RepositoryId,
-    action: Option<&str>,
+    action: Action,
 ) -> Result<(), Status> {
-    let matcher = ResourceMatcher::default();
-    let permitted = match action {
-        None => matcher.any_match(resources, repository_id),
-        Some(action) => matcher.permits(resources, repository_id, action),
-    };
-    if permitted {
+    if ResourceMatcher::default().permits(resources, repository_id, action) {
         Ok(())
     } else {
         Err(Status::permission_denied("Not permitted for resource"))
     }
 }
 
-/// Answer an access question from a `CheckUserPermission` response.
-///
-/// `action: None` checks whether an allowed entry contains the resource at all.
-/// `action: Some` also checks whether the entry grants the named action.
+/// Answer an access question from a `CheckUserPermission` response: whether
+/// an allowed entry for the resource grants `action`.
 #[lore_macro::test_pub]
 fn evaluate_check_user_permission(
     response: &CheckUserPermissionResponse,
     resource_id: &str,
-    action: Option<&str>,
+    action: Action,
 ) -> Result<(), Status> {
     let permitted = response
         .allowed_resource_permission
         .iter()
         .filter(|entry| entry.resource_id == resource_id)
         .any(|entry| {
-            action.is_none_or(|action| entry.permission.iter().any(|granted| granted == action))
+            action == Action::Read
+                || entry
+                    .permission
+                    .iter()
+                    .any(|granted| granted == action.as_str())
         });
     if permitted {
         Ok(())
@@ -406,8 +482,11 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
+        if token.is_none() {
+            return Err(Status::unauthenticated("No token"));
+        }
         // An exchanged access token carries the auth service's own signed
         // answer for the partition in its `resources` claim, and the auth
         // service refuses access tokens as `CheckUserPermission` credentials
@@ -430,7 +509,7 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Option<Result<(), Status>> {
         let resources = token.and_then(|token| token.claims.resources.as_deref())?;
         Some(evaluate_resources_claim(resources, repository_id, action))
@@ -442,8 +521,6 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         repository_id: RepositoryId,
     ) -> Result<Option<Grants>, Status> {
         let Some(token) = token else {
-            // Nothing to enumerate for. The per-question path answers this
-            // the same way it always has.
             return Ok(None);
         };
         if let Some(resources) = token.claims.resources.as_deref() {
@@ -505,6 +582,13 @@ pub fn select_repository_authorizer(
             ),
         };
     };
+    if auth.implicit_actions.is_some() && (auth_url.is_some() || auth.resource_claim.is_some()) {
+        bail!(
+            "[server.auth] implicit_actions is set together with [environment.endpoint] auth_url \
+             or [server.auth] resource_claim: implicit_actions applies to Tier 1 only, where \
+             neither is set, and does nothing otherwise. Remove implicit_actions."
+        );
+    }
     match (auth_url, auth.resource_claim.as_deref()) {
         (Some(_), Some(_)) => bail!(
             "[environment.endpoint] auth_url and [server.auth] resource_claim are both set: \
@@ -533,7 +617,10 @@ pub fn repository_authorizer(
         )),
         AuthorizerSelection::GlobalGrants => {
             let auth = auth.expect("GlobalGrants is only selected under [server.auth]");
-            Arc::new(GlobalGrantsAuthorizer::new(auth.permission_claim.clone()))
+            Arc::new(GlobalGrantsAuthorizer::new(
+                auth.permission_claim.clone(),
+                auth.implicit_actions(),
+            ))
         }
         AuthorizerSelection::ResourceGrants => {
             let auth = auth.expect("ResourceGrants is only selected under [server.auth]");

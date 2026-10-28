@@ -15,6 +15,7 @@ use lore_base::types::Partition;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -49,7 +50,7 @@ impl RepositoryAuthorizer for FixedPartitionsAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), tonic::Status> {
         if self.0.contains(&repository_id) {
             Ok(())

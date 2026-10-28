@@ -12,6 +12,7 @@ use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_registry::RepositoryRegistry;
@@ -71,7 +72,10 @@ fn delete_request(id: RepositoryId, token: AuthorizationToken) -> Request<Reposi
 
 /// A verifier configured with global grants read from `groups`.
 fn global_grants() -> Arc<dyn RepositoryAuthorizer> {
-    Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())))
+    Arc::new(GlobalGrantsAuthorizer::new(
+        Some("groups".to_string()),
+        vec![Action::Read, Action::Write],
+    ))
 }
 
 /// A Tier 2 verifier reading per-repository grants from `resources`.
@@ -97,7 +101,7 @@ fn creator_request(
             identity: Some("alice".to_string()),
             resources: Some(vec![ResourcePermission {
                 resource_id: format!("urc-{granted}"),
-                permission: vec!["read".to_string()],
+                permission: vec!["write".to_string()],
             }]),
             ..Default::default()
         },
@@ -165,9 +169,9 @@ async fn owner_not_service_account_lets_a_non_creator_delete() {
     .await;
 }
 
-/// The creator may delete only while the authorizer lets them reach the
-/// repository: on Tier 2 a creator whose token grants another repository
-/// only is refused, and `read` on this one restores the creator's right.
+/// The creator may delete only while they hold `write` on the repository:
+/// on Tier 2 a creator whose token grants another repository only is
+/// refused, and `write` on this one restores the creator's right.
 #[tokio::test]
 async fn the_creator_must_reach_the_repository_to_delete() {
     let (immutable_store, mutable_store, execution) =

@@ -13,6 +13,7 @@ use tonic::Response;
 use tonic::Status;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
@@ -50,7 +51,7 @@ pub async fn handler(
                 .check_repository_access(
                     get_verified_token(&extensions).as_ref(),
                     repository_id.into(),
-                    None,
+                    Action::Read,
                 )
                 .await
                 .map_err(|_err| no_repository_access_status())?;

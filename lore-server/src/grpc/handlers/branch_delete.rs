@@ -18,11 +18,14 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
@@ -31,12 +34,14 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "BranchDelete::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
+    require_action(authorizer, &request, Action::Write).await?;
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();

@@ -9,6 +9,7 @@ use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionResponse;
 use lore_proto::auth::ResourcePermission;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::*;
 use lore_server::settings::AuthSettings;
 use tonic::Code;
@@ -28,8 +29,10 @@ fn entry(resource_id: &str, permissions: &[&str]) -> ResourcePermission {
     }
 }
 
+/// No `owner`: repository administration without auth rests on `write`
+/// through the creator path, not on an action.
 #[tokio::test]
-async fn allow_all_permits_every_token_action_combination() {
+async fn allow_all_grants_its_fixed_set_with_or_without_a_token() {
     let claims = AuthorizationToken::default();
     let token = VerifiedToken {
         raw: "raw",
@@ -37,11 +40,28 @@ async fn allow_all_permits_every_token_action_combination() {
     };
     let repository: RepositoryId = Context::default().into();
     for token in [None, Some(&token)] {
-        for action in [None, Some("obliterate")] {
+        for action in [
+            Action::Read,
+            Action::Write,
+            Action::Obliterate,
+            Action::Presign,
+        ] {
             AllowAllRepositoryAuthorizer
                 .check_repository_access(token, repository, action)
                 .await
                 .unwrap();
+        }
+        for action in [
+            Action::Owner,
+            Action::Admin,
+            Action::Migrate,
+            Action::PushProtected,
+        ] {
+            let err = AllowAllRepositoryAuthorizer
+                .check_repository_access(token, repository, action)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), Code::PermissionDenied, "{action}");
         }
     }
 }
@@ -72,7 +92,7 @@ mod resources_claim {
         }
     }
 
-    async fn check(claims: &AuthorizationToken, action: Option<&str>) -> Result<(), Status> {
+    async fn check(claims: &AuthorizationToken, action: Action) -> Result<(), Status> {
         // A URL nothing listens on: reaching for the network here would
         // hang or error, so a verdict proves the claim answered in place.
         AuthClientAuthorizer::new("https://auth.invalid".to_string())
@@ -97,16 +117,17 @@ mod resources_claim {
             &format!("urc-{}", repository()),
             &["read", "write", "migrate"],
         );
-        check(&granted, None).await.unwrap();
-        check(&granted, Some("migrate")).await.unwrap();
-        check(&granted, Some("obliterate")).await.unwrap_err();
+        check(&granted, Action::Read).await.unwrap();
+        check(&granted, Action::Migrate).await.unwrap();
+        check(&granted, Action::Obliterate).await.unwrap_err();
 
         let other_partition = access_token_claims("urc-somewhere-else", &["read"]);
-        check(&other_partition, None).await.unwrap_err();
+        check(&other_partition, Action::Read).await.unwrap_err();
 
         // A wildcard grant reaches every partition, as everywhere else.
         let wildcard = access_token_claims("urc-*", &["read"]);
-        check(&wildcard, None).await.unwrap();
+        check(&wildcard, Action::Read).await.unwrap();
+        check(&wildcard, Action::Write).await.unwrap_err();
     }
 
     /// A `resources` claim scoped to no partition denies everything —
@@ -117,8 +138,7 @@ mod resources_claim {
             resources: Some(vec![]),
             ..Default::default()
         };
-        check(&empty, None).await.unwrap_err();
-        check(&empty, Some("read")).await.unwrap_err();
+        check(&empty, Action::Read).await.unwrap_err();
     }
 
     /// The enumeration and the per-question path answer from the same
@@ -145,15 +165,15 @@ mod resources_claim {
                 .await
                 .unwrap()
                 .expect("access tokens are enumerable");
-            assert_eq!(
-                grants.reachable(),
-                check(claims, None).await.is_ok(),
-                "reachability must agree for {claims:?}"
-            );
-            for action in ["read", "migrate", "obliterate"] {
+            for action in [
+                Action::Read,
+                Action::Write,
+                Action::Migrate,
+                Action::Obliterate,
+            ] {
                 assert_eq!(
                     grants.permits(action),
-                    check(claims, Some(action)).await.is_ok(),
+                    check(claims, action).await.is_ok(),
                     "verdict for {action} must agree for {claims:?}"
                 );
             }
@@ -184,7 +204,7 @@ mod sync_check {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             Ok(())
         }
@@ -194,24 +214,28 @@ mod sync_check {
     fn default_cannot_answer_without_io() {
         assert!(
             PolicyOnly
-                .check_repository_access_sync(None, repository(), None)
+                .check_repository_access_sync(None, repository(), Action::Read)
                 .is_none()
         );
     }
 
     #[test]
-    fn allow_all_answers_everything() {
+    fn allow_all_answers_from_its_fixed_set() {
         let claims = AuthorizationToken::default();
         let token = VerifiedToken {
             raw: "raw",
             claims: &claims,
         };
         for token in [None, Some(&token)] {
-            for action in [None, Some("obliterate")] {
-                AllowAllRepositoryAuthorizer
+            for (action, permitted) in [
+                (Action::Read, true),
+                (Action::Obliterate, true),
+                (Action::Migrate, false),
+            ] {
+                let verdict = AllowAllRepositoryAuthorizer
                     .check_repository_access_sync(token, repository(), action)
-                    .expect("allow-all needs no I/O")
-                    .unwrap();
+                    .expect("allow-all needs no I/O");
+                assert_eq!(verdict.is_ok(), permitted, "{action}");
             }
         }
     }
@@ -241,7 +265,7 @@ mod sync_check {
                 raw: "raw.jwt",
                 claims,
             };
-            for action in [None, Some("migrate"), Some("obliterate")] {
+            for action in [Action::Read, Action::Migrate, Action::Obliterate] {
                 let sync = authorizer
                     .check_repository_access_sync(Some(&token), repository(), action)
                     .expect("access tokens are answered in place");
@@ -263,14 +287,20 @@ mod sync_check {
         };
         assert!(
             authorizer
-                .check_repository_access_sync(Some(&token), repository(), None)
+                .check_repository_access_sync(Some(&token), repository(), Action::Read)
                 .is_none()
         );
-        assert!(
-            authorizer
-                .check_repository_access_sync(None, repository(), None)
-                .is_none()
-        );
+    }
+
+    /// No token is answered locally: nothing to forward upstream.
+    #[tokio::test]
+    async fn auth_client_denies_no_token_without_going_upstream() {
+        let authorizer = AuthClientAuthorizer::new("https://auth.invalid".to_string());
+        let err = authorizer
+            .check_repository_access(None, repository(), Action::Read)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unauthenticated);
     }
 }
 
@@ -298,9 +328,13 @@ mod granted_access {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: RepositoryId,
-            action: Option<&str>,
+            action: Action,
         ) -> Result<(), Status> {
-            assert_eq!(action, None, "granted_access asks reachability only");
+            assert_eq!(
+                action,
+                Action::Read,
+                "granted_access asks reachability only"
+            );
             if self.0 {
                 Ok(())
             } else {
@@ -313,7 +347,12 @@ mod granted_access {
     async fn enumerable_authorizer_yields_its_grants() {
         let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
         let grants = authorizer.granted_access(None, repository()).await.unwrap();
-        assert_eq!(grants, Some(Grants::All));
+        assert_eq!(
+            grants,
+            Some(Grants::Actions(
+                ALLOW_ALL_ACTIONS.iter().map(ToString::to_string).collect()
+            ))
+        );
     }
 
     #[tokio::test]
@@ -321,20 +360,16 @@ mod granted_access {
         let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(PolicyOnly(true));
         let grants = authorizer.granted_access(None, repository()).await.unwrap();
         assert_eq!(grants, None);
+
+        let denied: Arc<dyn RepositoryAuthorizer> = Arc::new(PolicyOnly(false));
+        let err = denied.granted_access(None, repository()).await.unwrap_err();
+        assert_eq!(err.message(), no_repository_access_status().message());
     }
 
-    /// Denials flatten to the uniform status whichever path produced
-    /// them, so an unauthorized caller learns nothing from the reason.
+    /// An enumerated denial flattens to the uniform status, so an
+    /// unauthorized caller learns nothing from the reason.
     #[tokio::test]
     async fn denials_flatten_to_the_uniform_status() {
-        let non_enumerable: Arc<dyn RepositoryAuthorizer> = Arc::new(PolicyOnly(false));
-        let err = non_enumerable
-            .granted_access(None, repository())
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), no_repository_access_status().code());
-        assert_eq!(err.message(), no_repository_access_status().message());
-
         let claims = AuthorizationToken {
             resources: Some(vec![lore_server::auth::jwt::ResourcePermission {
                 resource_id: "urc-somewhere-else".to_string(),
@@ -397,7 +432,7 @@ mod permits_helper {
         );
         assert!(
             !authorizer
-                .permits(&extensions, repository(), "migrate")
+                .permits(&extensions, repository(), Action::Migrate)
                 .await
         );
     }
@@ -419,20 +454,42 @@ mod permits_helper {
         );
         assert!(
             authorizer
-                .permits(&extensions, repository(), "migrate")
+                .permits(&extensions, repository(), Action::Write)
                 .await
         );
     }
 
-    /// Without a verified token nothing is granted, whatever the
-    /// authorizer would say.
+    /// Without a verified token the authorizer still decides: allow-all
+    /// answers from its fixed set, the token-reading authorizers deny.
     #[tokio::test]
-    async fn no_token_and_no_grants_deny_even_under_allow_all() {
-        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
+    async fn no_token_is_asked_of_the_authorizer() {
         let extensions = extensions_with(None, false);
+        let allow_all: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
         assert!(
-            !authorizer
-                .permits(&extensions, repository(), "migrate")
+            allow_all
+                .permits(&extensions, repository(), Action::Write)
+                .await
+        );
+        assert!(
+            !allow_all
+                .permits(&extensions, repository(), Action::Owner)
+                .await
+        );
+        assert!(
+            !allow_all
+                .permits(&extensions, repository(), Action::Migrate)
+                .await
+        );
+
+        let tier_1: Arc<dyn RepositoryAuthorizer> = Arc::new(
+            lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer::new(
+                None,
+                vec![Action::Read, Action::Write],
+            ),
+        );
+        assert!(
+            !tier_1
+                .permits(&extensions, repository(), Action::Read)
                 .await
         );
     }
@@ -443,22 +500,23 @@ mod grants {
 
     #[test]
     fn permits_and_reachable_follow_the_variant() {
-        assert!(Grants::All.reachable());
-        assert!(Grants::All.permits("anything"));
-
         assert!(!Grants::Denied.reachable());
-        assert!(!Grants::Denied.permits("anything"));
+        assert!(!Grants::Denied.permits(Action::Obliterate));
 
         let actions = Grants::Actions(["migrate".to_string()].into());
         assert!(actions.reachable());
-        assert!(actions.permits("migrate"));
-        assert!(!actions.permits("obliterate"));
+        assert!(actions.permits(Action::Migrate));
+        assert!(!actions.permits(Action::Obliterate));
 
         // Reachable with nothing granted: a matched entry with an empty
         // permission list, or Tier 1 without a permission claim.
         let none = Grants::Actions(HashSet::new());
         assert!(none.reachable());
-        assert!(!none.permits("read"));
+        assert!(
+            none.permits(Action::Read),
+            "reaching the partition grants read"
+        );
+        assert!(!none.permits(Action::Write));
     }
 
     /// The response-derived grants merge every entry naming the
@@ -472,9 +530,9 @@ mod grants {
         ]);
         let grants = grants_from_response(&response, "urc-abc");
         assert!(grants.reachable());
-        assert!(grants.permits("read"));
-        assert!(grants.permits("migrate"));
-        assert!(!grants.permits("obliterate"));
+        assert!(grants.permits(Action::Read));
+        assert!(grants.permits(Action::Migrate));
+        assert!(!grants.permits(Action::Obliterate));
 
         assert_eq!(
             grants_from_response(&response, "urc-absent"),
@@ -515,51 +573,55 @@ fn upstream_request_carries_resource_and_authorization() {
 }
 
 #[test]
-fn named_action_requires_membership_in_the_permission_list() {
-    let response = response(vec![entry("urc-abc", &["obliterate"])]);
-    evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap();
-    evaluate_check_user_permission(&response, "urc-abc", None).unwrap();
+fn action_requires_membership_in_the_permission_list() {
+    let response = response(vec![entry("urc-abc", &["read", "obliterate"])]);
+    evaluate_check_user_permission(&response, "urc-abc", Action::Obliterate).unwrap();
+    evaluate_check_user_permission(&response, "urc-abc", Action::Read).unwrap();
     // The fail-open case: an authorizer that ignores the action would
     // permit this.
-    let err = evaluate_check_user_permission(&response, "urc-abc", Some("presign")).unwrap_err();
+    let err = evaluate_check_user_permission(&response, "urc-abc", Action::Presign).unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied);
+    // `read` does not imply `write`.
+    let err = evaluate_check_user_permission(&response, "urc-abc", Action::Write).unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
 }
 
 #[test]
-fn empty_permission_list_denies_every_named_action() {
+fn an_entry_grants_read_and_only_its_listed_actions() {
     let response = response(vec![entry("urc-abc", &[])]);
-    let err = evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
-    assert_eq!(err.code(), Code::PermissionDenied);
-    // The resource still appears, which is all `None` asks.
-    evaluate_check_user_permission(&response, "urc-abc", None).unwrap();
+    evaluate_check_user_permission(&response, "urc-abc", Action::Read).unwrap();
+    for action in [Action::Write, Action::Obliterate] {
+        let err = evaluate_check_user_permission(&response, "urc-abc", action).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
 }
 
 #[test]
-fn absent_resource_denies_named_actions_and_plain_access() {
+fn absent_resource_denies_every_action() {
     let response = response(vec![]);
-    let err = evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
-    assert_eq!(err.code(), Code::PermissionDenied);
-    let err = evaluate_check_user_permission(&response, "urc-abc", None).unwrap_err();
-    assert_eq!(err.code(), Code::PermissionDenied);
+    for action in [Action::Read, Action::Obliterate] {
+        let err = evaluate_check_user_permission(&response, "urc-abc", action).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
 }
 
 #[test]
 fn mismatched_resource_denies() {
-    let response = response(vec![entry("urc-other", &["obliterate"])]);
-    let err = evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
-    assert_eq!(err.code(), Code::PermissionDenied);
-    let err = evaluate_check_user_permission(&response, "urc-abc", None).unwrap_err();
-    assert_eq!(err.code(), Code::PermissionDenied);
+    let response = response(vec![entry("urc-other", &["read", "obliterate"])]);
+    for action in [Action::Read, Action::Obliterate] {
+        let err = evaluate_check_user_permission(&response, "urc-abc", action).unwrap_err();
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
 }
 
 #[test]
-fn plain_access_finds_the_resource_past_the_first_entry() {
+fn the_resource_is_found_past_the_first_entry() {
     let response = response(vec![
         entry("urc-other", &["obliterate"]),
-        entry("urc-abc", &[]),
+        entry("urc-abc", &["read"]),
     ]);
-    evaluate_check_user_permission(&response, "urc-abc", None).unwrap();
-    let err = evaluate_check_user_permission(&response, "urc-abc", Some("obliterate")).unwrap_err();
+    evaluate_check_user_permission(&response, "urc-abc", Action::Read).unwrap();
+    let err = evaluate_check_user_permission(&response, "urc-abc", Action::Obliterate).unwrap_err();
     assert_eq!(err.code(), Code::PermissionDenied);
 }
 
@@ -635,6 +697,53 @@ fn auth_url_without_server_auth_refuses_startup_naming_both() {
         .to_string();
     assert!(message.contains("auth_url"), "{message}");
     assert!(message.contains("[server.auth]"), "{message}");
+}
+
+#[test]
+fn implicit_actions_reach_the_tier_1_authorizer() {
+    let auth = auth_settings("implicit_actions = [\"read\", \"obliterate\"]");
+    assert_eq!(
+        auth.implicit_actions(),
+        vec![Action::Read, Action::Obliterate]
+    );
+    assert_eq!(auth_settings("").implicit_actions(), vec![Action::Write]);
+    repository_authorizer(Some(&auth), None).unwrap();
+}
+
+/// Action names are checked when the config is parsed, so a misspelt or
+/// wrongly cased name is a configuration error rather than an action no
+/// check ever asks for.
+#[test]
+fn implicit_actions_refuses_unknown_action_names() {
+    for wrong in ["Read", "read-write", "push"] {
+        let parsed: Result<AuthSettings, _> = toml::from_str(&format!(
+            "jwt_issuer = \"https://auth.example.com\"\njwt_audience = [\"lore\"]\nimplicit_actions = [\"{wrong}\"]"
+        ));
+        let message = parsed.expect_err(wrong).to_string();
+        assert!(message.contains(wrong), "{message}");
+    }
+}
+
+/// `implicit_actions` is Tier 1's setting: alongside `auth_url` or
+/// `resource_claim` it would do nothing, so startup refuses it.
+#[test]
+fn implicit_actions_outside_tier_1_refuses_startup() {
+    let with_resource_claim =
+        auth_settings("implicit_actions = [\"read\"]\nresource_claim = \"resources\"");
+    let with_auth_url = auth_settings("implicit_actions = [\"read\"]");
+    for (auth, auth_url) in [(&with_resource_claim, None), (&with_auth_url, AUTH_URL)] {
+        let message = select_repository_authorizer(Some(auth), auth_url)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("implicit_actions"), "{message}");
+    }
+}
+
+/// `implicit_actions = []` with no `permission_claim` is a read-only server:
+/// any token reads, nobody writes.
+#[test]
+fn empty_implicit_actions_without_permission_claim_starts_read_only() {
+    select_repository_authorizer(Some(&auth_settings("implicit_actions = []")), None).unwrap();
 }
 
 /// The startup log prints the `Display` form, so an operator can tell

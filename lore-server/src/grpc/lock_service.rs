@@ -34,7 +34,10 @@ use super::extract_correlation_id;
 use super::get_repository;
 use super::get_user_id;
 use super::timeout_grpc;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::no_repository_access_status;
+use crate::grpc::require_action;
 use crate::util::setup_execution;
 
 const STATUS_MAX_RESOURCE_LEN: usize = 100;
@@ -170,11 +173,11 @@ impl LoreLockService {
     /// `owner` or `admin` on `repository` waives the lock-ownership check.
     async fn is_elevated(&self, extensions: &tonic::Extensions, repository: RepositoryId) -> bool {
         self.authorizer
-            .permits(extensions, repository, "owner")
+            .permits(extensions, repository, Action::Owner)
             .await
             || self
                 .authorizer
-                .permits(extensions, repository, "admin")
+                .permits(extensions, repository, Action::Admin)
                 .await
     }
 }
@@ -184,6 +187,7 @@ impl LoreLockService {
         &self,
         request: Request<LockRequest>,
     ) -> Result<Response<LockResponse>, Status> {
+        require_action(&self.authorizer, &request, Action::Write).await?;
         let repository = get_repository(request.metadata())?;
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -301,7 +305,16 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let validate_user = !self.is_elevated(request.extensions(), repository).await;
+        let elevated = self.is_elevated(request.extensions(), repository).await;
+        if !elevated
+            && !self
+                .authorizer
+                .permits(request.extensions(), repository, Action::Write)
+                .await
+        {
+            return Err(no_repository_access_status());
+        }
+        let validate_user = !elevated;
         let unlock_request = request.into_inner();
 
         self.locking_histogram.record(
@@ -349,7 +362,14 @@ impl LoreLockService {
     ) -> Result<Response<AdminLockResponse>, Status> {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let extensions = request.extensions().clone();
+        if !self
+            .authorizer
+            .permits(request.extensions(), repository, Action::Migrate)
+            .await
+        {
+            warn!("Attempt to apply admin locks, but user does not have the correct permissions");
+            return Err(Status::permission_denied("Permission denied"));
+        }
 
         let user_id = get_user_id(request.extensions());
         let lock_request = request.into_inner();
@@ -372,11 +392,6 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                if !self.authorizer.permits(&extensions, repository, "migrate").await {
-                    warn!("Attempt to apply admin locks, but user does not have the correct permissions");
-                    return Err(Status::permission_denied("Permission denied"));
-                }
-
                 self.lock_as_user(repository, resources, &owner)
                     .await
                     .map(|locks| Response::new(AdminLockResponse { locks }))

@@ -65,7 +65,7 @@ async fn seed_revision(repository_context: &Arc<RepositoryContext>, branch: Bran
         repository_context.clone(),
         branch,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,

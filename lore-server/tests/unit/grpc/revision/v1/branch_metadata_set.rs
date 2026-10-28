@@ -91,6 +91,7 @@ async fn cas_hit_swaps_pointer_and_returns_updated() {
 
         let response = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -137,6 +138,7 @@ async fn cas_miss_returns_current_pointer_in_band() {
 
         let response = handler(
             make_request(repository_id, branch_id, stale_expected, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -176,6 +178,7 @@ async fn rejects_modification_of_read_only_name() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -212,6 +215,7 @@ async fn rejects_modification_of_read_only_category() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -246,6 +250,7 @@ async fn rejects_removal_of_read_only_creator() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -282,6 +287,7 @@ async fn allows_protect_modification() {
 
         let response = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -302,6 +308,7 @@ async fn rejects_unknown_branch_with_not_found() {
     Box::pin(LORE_CONTEXT.scope(execution, async move {
         let err = handler(
             make_request(repository_id, branch_id, Hash::default(), Hash::default()),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -357,7 +364,7 @@ async fn cas_succeeds_on_deleted_branch() {
             repository.clone(),
             main_id,
             state_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE,
@@ -403,6 +410,7 @@ async fn cas_succeeds_on_deleted_branch() {
 
         let response = handler(
             make_request(repository_id, child_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -434,6 +442,7 @@ async fn rejects_garbage_updated_hash() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, garbage),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -471,6 +480,7 @@ async fn rejects_garbage_expected_hash() {
 
         let err = handler(
             make_request(repository_id, branch_id, garbage, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -510,6 +520,7 @@ async fn rejects_dangling_address_reference() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
         )
@@ -534,6 +545,7 @@ async fn rejects_zero_branch_id() {
             Hash::default(),
             Hash::default(),
         ),
+        &crate::util::test_support::allow_all_authorizer(),
         immutable_store,
         mutable_store,
     )
@@ -553,8 +565,13 @@ async fn rejects_missing_repository_id() {
         expected: Hash::default().into(),
         updated: Hash::default().into(),
     });
-    let err = handler(request, immutable_store, mutable_store)
-        .await
-        .expect_err("missing repository must fail");
+    let err = handler(
+        request,
+        &crate::util::test_support::allow_all_authorizer(),
+        immutable_store,
+        mutable_store,
+    )
+    .await
+    .expect_err("missing repository must fail");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
