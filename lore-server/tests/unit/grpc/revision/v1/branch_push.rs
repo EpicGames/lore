@@ -948,3 +948,265 @@ async fn rejected_push_to_deleted_branch_does_not_reinstate_name() {
     }))
     .await;
 }
+
+mod handler {
+    use std::collections::HashSet;
+
+    use async_trait::async_trait;
+    use lore_revision::repository::RepositoryMetadata;
+    use lore_server::hooks::HookContext;
+    use lore_server::hooks::HookError;
+    use lore_server::hooks::HookPoint;
+    use lore_server::hooks::traits::Hook;
+    use lore_server::hooks::traits::HookResponse;
+
+    use super::*;
+    use crate::store::test_support::RecordingLoadStore;
+
+    /// Answers a push with the response context keys it was given, joined by `|`.
+    struct EchoResponseContext;
+
+    #[async_trait]
+    impl Hook for EchoResponseContext {
+        fn name(&self) -> &'static str {
+            "echo_response_context"
+        }
+
+        fn hook_points(&self) -> &'static [HookPoint] {
+            &[HookPoint::BranchPush]
+        }
+
+        fn response_handler(&self, ctx: &HookContext) -> Result<HookResponse, HookError> {
+            let keys = [
+                "branch_name",
+                "repository_name",
+                "default_branch_name",
+                "is_default_branch",
+            ];
+            let message = keys
+                .map(|key| ctx.get_metadata(key).unwrap_or("<absent>"))
+                .join("|");
+            Ok(HookResponse::with_message(message))
+        }
+    }
+
+    fn echo_dispatcher() -> HookDispatcher {
+        HookDispatcher::from_hooks_default(vec![(
+            "echo_response_context".to_string(),
+            Box::new(EchoResponseContext),
+        )])
+    }
+
+    async fn store_repository_metadata(
+        repository_context: &Arc<RepositoryContext>,
+        default_branch: BranchId,
+    ) {
+        let hash = lore_revision::repository::metadata_store(
+            repository_context.clone(),
+            RepositoryMetadata {
+                name: "game".to_string(),
+                description: String::new(),
+                default_branch,
+                default_branch_name: "main".to_string(),
+                creator: "test-creator".to_string(),
+                created: 1,
+            },
+        )
+        .await
+        .expect("store repository metadata");
+        lore_revision::repository::metadata_store_hash(repository_context.clone(), hash)
+            .await
+            .expect("store repository metadata hash");
+    }
+
+    #[tokio::test]
+    async fn the_response_hooks_read_the_branch_and_repository_names() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .times(2)
+            .returning(|_, _, _, _, _| ());
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            store_repository_metadata(&repository_context, main).await;
+            let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
+            let feature =
+                create_child_branch(&repository_context, "feature", main, main_latest).await;
+            let feature_revision = build_revision(&repository_context, main_latest, 2).await;
+
+            let hook_dispatcher = echo_dispatcher();
+            let mut messages = Vec::new();
+            for (branch, revision) in [(main, main_latest), (feature, feature_revision)] {
+                let response = handler(
+                    make_request(repository, branch, revision, false, false),
+                    allow_all(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    notification_sender.clone(),
+                    &hook_dispatcher,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                    &instrument_provider,
+                )
+                .await
+                .expect("push should succeed");
+                messages.push(response.into_inner().message);
+            }
+
+            assert_eq!(
+                messages,
+                [
+                    Some("main|game|main|true".to_string()),
+                    Some("feature|game|main|false".to_string()),
+                ]
+            );
+        }))
+        .await;
+    }
+
+    /// A push reads each mutable-store key once, including the reads its response hooks need,
+    /// since every read is a store round trip. The first push to a branch has no latest
+    /// revision to read, and the next one does.
+    #[tokio::test]
+    async fn a_push_reads_each_mutable_store_key_once() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, inner_mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let recording = RecordingLoadStore::new(inner_mutable_store);
+        let mutable_store: Arc<dyn lore_storage::MutableStore> = recording.clone();
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .times(2)
+            .returning(|_, _, _, _, _| ());
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            store_repository_metadata(&repository_context, main).await;
+            let first = build_revision(&repository_context, Hash::default(), 1).await;
+            let second = build_revision(&repository_context, first, 2).await;
+
+            let hook_dispatcher = echo_dispatcher();
+            let push = |revision| {
+                handler(
+                    make_request(repository, main, revision, false, false),
+                    allow_all(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    notification_sender.clone(),
+                    &hook_dispatcher,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                    &instrument_provider,
+                )
+            };
+            for (revision, which) in [(first, "first"), (second, "second")] {
+                recording.take_loaded();
+                push(revision)
+                    .await
+                    .unwrap_or_else(|err| panic!("{which} push should succeed: {err}"));
+                let loaded = recording.take_loaded();
+
+                let distinct: HashSet<_> = loaded.iter().collect();
+                assert_eq!(
+                    distinct.len(),
+                    loaded.len(),
+                    "{which} push loaded keys: {loaded:?}"
+                );
+            }
+        }))
+        .await;
+    }
+
+    /// Protection is checked before the name of a deleted branch is mapped back, so a refused
+    /// push leaves the name unmapped.
+    #[tokio::test]
+    async fn a_push_refused_as_protected_leaves_a_deleted_name_unmapped() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .return_once(|_, _, _, _, _| ());
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
+
+            let hook_dispatcher = HookDispatcher::empty();
+            handler(
+                make_request(repository, main, main_latest, false, false),
+                allow_all(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                lore_server::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+            )
+            .await
+            .expect("seed push should succeed");
+
+            let feature =
+                create_child_branch(&repository_context, "feature", main, main_latest).await;
+            branch::delete(repository_context.clone(), feature)
+                .await
+                .expect("delete should succeed");
+            branch::protect(repository_context.clone(), feature)
+                .await
+                .expect("should protect");
+
+            let feature_revision = build_revision(&repository_context, main_latest, 2).await;
+            let err = handler(
+                make_request(repository, feature, feature_revision, false, false),
+                allow_all(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                lore_server::grpc::server::RevisionListAcceleration::default(),
+                &instrument_provider,
+            )
+            .await
+            .expect_err("a protected branch must not be pushed");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+            let err = branch::load_name_to_id_local(repository_context.clone(), "feature")
+                .await
+                .expect_err("the name must stay unmapped");
+            assert!(err.is_branch_not_found(), "{err:?}");
+        }))
+        .await;
+    }
+}

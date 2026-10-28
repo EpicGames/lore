@@ -16,14 +16,14 @@ use lore_revision::branch;
 use lore_revision::branch::BranchError;
 use lore_revision::branch::LATEST;
 use lore_revision::branch::PROTECT;
-use lore_revision::branch::load_latest;
-use lore_revision::branch::metadata;
 use lore_revision::branch::push;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
+use lore_revision::metadata::Metadata;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryMetadata;
 use lore_revision::state;
 use lore_revision::state::State;
 use lore_revision::util::request_tracker::StoreRequestTracker;
@@ -44,6 +44,7 @@ use tonic::Status;
 use tracing::Instrument;
 use tracing::Level;
 use tracing::debug;
+use tracing::info;
 use tracing::instrument;
 use tracing::span;
 use tracing::warn;
@@ -59,6 +60,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::no_repository_access_status;
+use crate::grpc::none_or_status;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -104,27 +106,25 @@ fn count_boundaries() -> Vec<f64> {
     ]
 }
 
-/// The store requests one push makes to verify its fragments, recorded once when dropped, so a
-/// push that fails or is cancelled part-way still reports what it made.
+/// The store requests one fragment verification makes, recorded once when dropped, so a
+/// verification that fails or is cancelled part-way still reports what it made.
 ///
-/// `lookups` counts the per-address fragment lookups the collection spawns, across every
-/// verification the push runs. The address and batch counts are those of its latest
-/// verification, since a push verifies again only for the same revision.
+/// `lookups` counts the per-address fragment lookups the collection spawns.
 #[derive(Default)]
 struct PushStoreRequests {
     lookups: Arc<StoreRequestTracker>,
     collected_addresses: Option<u64>,
     concurrent_query_batches: Option<u64>,
-    /// Whether the push returned, with success or an error, rather than being dropped part-way
-    /// as a cancelled request is.
+    /// Whether the verification returned, with success or an error, rather than being dropped
+    /// part-way as a cancelled request is.
     finished: bool,
 }
 
 impl Drop for PushStoreRequests {
     fn drop(&mut self) {
         let num_lookups = self.lookups.requests();
-        // A push that never walks its fragments, such as one rejected as not a fast-forward,
-        // would only skew the distributions.
+        // A verification that made no lookup, such as one for a revision that adds no
+        // fragment, would only skew the distributions.
         if num_lookups == 0 {
             return;
         }
@@ -233,22 +233,26 @@ pub async fn handler(
                 .await
                 .map_err(hook_error_to_status)?;
 
+            let (pushed, repository_metadata) = tokio::join!(
+                push(
+                    repository.clone(),
+                    branch,
+                    revision,
+                    access,
+                    force,
+                    fast_forward_merge,
+                    history_step_size,
+                    acceleration,
+                ),
+                load_response_repository_metadata(hook_dispatcher, repository.clone()),
+            );
             let PushResult {
                 success,
                 fast_forward_merged,
                 revision,
                 revision_number,
-            } = push(
-                repository.clone(),
-                branch,
-                revision,
-                access,
-                force,
-                fast_forward_merge,
-                history_step_size,
-                acceleration,
-            )
-            .await?;
+                branch_name,
+            } = pushed?;
 
             if success {
                 lore_spawn!({
@@ -283,10 +287,10 @@ pub async fn handler(
                     &user_id,
                     repository_id,
                     branch,
+                    &branch_name,
                     revision,
-                    repository.clone(),
+                    repository_metadata.as_ref(),
                 )
-                .await
             } else {
                 None
             };
@@ -302,19 +306,38 @@ pub async fn handler(
         .await
 }
 
-/// Pre-computes repository and branch metadata, then dispatches response hooks
-/// to generate an optional message for the client.
+/// The repository metadata the response hooks of a push read, or `None` when no hook is
+/// registered to read it.
 ///
-/// Metadata lookup failures are silently ignored — absent metadata keys cause
-/// response hooks to return an empty response.
-pub(crate) async fn dispatch_response_message(
+/// A read that fails is `None` as well: the metadata only decorates the hook context.
+pub(crate) async fn load_response_repository_metadata(
+    hook_dispatcher: &HookDispatcher,
+    repository: Arc<RepositoryContext>,
+) -> Option<RepositoryMetadata> {
+    if !hook_dispatcher.has_hooks(HookPoint::BranchPush) {
+        return None;
+    }
+
+    // no filter_slow_down()? usage here: a throttled read leaves the hook context
+    // without the repository fields rather than failing the push.
+    let metadata_hash = repository::metadata_hash(repository.clone()).await.ok()?;
+    repository::metadata(repository, metadata_hash).await.ok()
+}
+
+/// Dispatches the response hooks of a successful push to generate an optional message for the
+/// client.
+///
+/// Without `repository_metadata`, the hook context carries no repository keys.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_response_message(
     hook_dispatcher: &HookDispatcher,
     correlation_id: &str,
     user_id: &str,
     repository_id: RepositoryId,
     branch: BranchId,
+    branch_name: &str,
     revision: Hash,
-    repository: Arc<RepositoryContext>,
+    repository_metadata: Option<&RepositoryMetadata>,
 ) -> Option<String> {
     let mut builder = HookContext::builder()
         .correlation_id(correlation_id)
@@ -322,14 +345,10 @@ pub(crate) async fn dispatch_response_message(
         .repository(repository_id)
         .user(user_id)
         .branch(branch)
-        .revision(revision);
+        .revision(revision)
+        .metadata(METADATA_BRANCH_NAME, branch_name);
 
-    // no filter_slow_down()? usage here: these reads only decorate the hook
-    // context, and the push they describe has already succeeded.
-    if let Ok(metadata_hash) = repository::metadata_hash(repository.clone()).await
-        && let Ok(repository_metadata) =
-            repository::metadata(repository.clone(), metadata_hash).await
-    {
+    if let Some(repository_metadata) = repository_metadata {
         builder = builder
             .metadata("repository_name", repository_metadata.name.clone())
             .metadata(
@@ -346,13 +365,6 @@ pub(crate) async fn dispatch_response_message(
             );
     }
 
-    if let Ok(branch_meta) = branch::metadata(repository.clone(), branch).await
-        && let Ok(branch_meta) =
-            branch::branch_metadata(repository.clone(), branch, &branch_meta).await
-    {
-        builder = builder.metadata(METADATA_BRANCH_NAME, branch_meta.name);
-    }
-
     let response_ctx = builder.build();
     hook_dispatcher
         .dispatch_response(HookPoint::BranchPush, &response_ctx)
@@ -364,6 +376,28 @@ pub struct PushResult {
     pub fast_forward_merged: bool,
     pub revision: Hash,
     pub revision_number: u64,
+    /// The name the branch metadata held when the push checked it, empty when it holds none.
+    pub branch_name: String,
+}
+
+struct HeadUpdate {
+    success: bool,
+    fast_forward_merged: bool,
+    /// The latest revision of the branch when the push is answered.
+    revision: Hash,
+    revision_number: u64,
+}
+
+impl HeadUpdate {
+    /// A push that leaves the head at `current` for the client to resolve.
+    fn declined(current: Hash) -> Self {
+        Self {
+            success: false,
+            fast_forward_merged: false,
+            revision: current,
+            revision_number: 0,
+        }
+    }
 }
 
 /// Which pushes the caller may make: to an unprotected branch with `write`,
@@ -398,8 +432,33 @@ impl PushAccess {
     }
 }
 
+pub(crate) struct HeadAndIncoming {
+    /// The latest revision of the branch, zero when it has none.
+    head: Hash,
+    /// The state of the revision being pushed.
+    incoming: Arc<State>,
+}
+
+enum PreparedPush {
+    /// The push is answered without moving the head.
+    Done(HeadUpdate),
+    /// The fragments are verified, and the head moves as `head_move` says.
+    Move {
+        loaded: HeadAndIncoming,
+        head_move: HeadMove,
+        parents: VerifiedParents,
+    },
+}
+
+struct VerifiedParents {
+    parent: Arc<State>,
+    /// The second parent, set for a merge revision only.
+    other: Option<Arc<State>>,
+}
+
+/// Pushes `latest` as the latest revision of `branch`, mapping the name of a deleted branch
+/// back to it.
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn push(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -410,18 +469,144 @@ pub async fn push(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<PushResult, Status> {
+    let (metadata, loaded) = load_branch_and_head(repository.clone(), branch, latest).await;
+    push_loaded(
+        repository,
+        branch,
+        latest,
+        access,
+        force,
+        fast_forward_merge,
+        history_step_size,
+        acceleration,
+        metadata?,
+        loaded,
+    )
+    .await
+}
+
+/// Loads the metadata of `branch` beside its latest revision and the state of `latest`, the
+/// reads a push makes before it checks anything.
+pub(crate) async fn load_branch_and_head(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+) -> (Result<Metadata, Status>, Result<HeadAndIncoming, Status>) {
+    tokio::join!(
+        load_branch_metadata(repository.clone(), branch),
+        load_head_and_incoming(repository, branch, latest),
+    )
+}
+
+/// Pushes `latest` as the latest revision of `branch` from the branch `metadata` and the
+/// `loaded` head read for it, mapping the name of a deleted branch back to it.
+///
+/// The name check runs beside the fragment verification of the incoming revision. Both complete
+/// before the head moves, and a failed branch check is reported ahead of any failure of the
+/// incoming revision.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all, fields(branch))]
+pub(crate) async fn push_loaded(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    access: PushAccess,
+    force: bool,
+    fast_forward_merge: bool,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    metadata: Metadata,
+    loaded: Result<HeadAndIncoming, Status>,
+) -> Result<PushResult, Status> {
     // Zero hash is never valid to push as latest pointer
     if latest.is_zero() {
         return Err(Status::failed_precondition("invalid revision signature"));
     }
 
-    // Check if branch is protected
-    let branch_metadata = metadata(repository.clone(), branch)
+    check_push_access(&metadata, access)?;
+    let branch_name = branch::name(&metadata).unwrap_or_default().to_string();
+
+    // Fragment verification starts only once protection is checked, so a push refused as
+    // protected never walks its revision.
+    let (name_mapped, prepared) = tokio::join!(
+        ensure_name_maps_to_branch(repository.clone(), branch, &branch_name),
+        async {
+            prepare_push(
+                repository.clone(),
+                latest,
+                loaded?,
+                force,
+                fast_forward_merge,
+            )
+            .await
+        },
+    );
+    name_mapped?;
+
+    let update = match prepared? {
+        PreparedPush::Done(update) => update,
+        PreparedPush::Move {
+            loaded,
+            head_move: HeadMove::Store,
+            parents,
+        } => {
+            store_new_head(
+                repository,
+                branch,
+                latest,
+                loaded,
+                parents,
+                force,
+                fast_forward_merge,
+                history_step_size,
+                acceleration,
+            )
+            .await?
+        }
+        PreparedPush::Move {
+            loaded,
+            head_move: HeadMove::Merge,
+            ..
+        } => {
+            try_fast_forward_merge(
+                repository,
+                branch,
+                loaded.incoming,
+                loaded.head,
+                history_step_size,
+                acceleration,
+            )
+            .await?
+        }
+    };
+
+    Ok(PushResult {
+        success: update.success,
+        fast_forward_merged: update.fast_forward_merged,
+        revision: update.revision,
+        revision_number: update.revision_number,
+        branch_name,
+    })
+}
+
+async fn load_branch_metadata(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Metadata, Status> {
+    let metadata_hash = branch::metadata_hash(repository.clone(), branch)
         .await
         .filter_slow_down()?
-        .warn_map_err(|err| Status::internal(format!("Failed to load branch metadata: {err}")))?;
+        .map_err(|_err| Status::not_found(format!("Branch {branch} not found")))?;
+    branch::load_metadata(repository, metadata_hash)
+        .await
+        .filter_slow_down()?
+        .warn_map_err(|err| Status::internal(format!("Failed to load branch metadata: {err}")))
+}
 
-    if branch_metadata.get_bool(PROTECT).unwrap_or_default() {
+/// Refuses a push the caller's `access` does not cover: a protected branch needs
+/// `push-protected`, any other branch `write`.
+fn check_push_access(metadata: &Metadata, access: PushAccess) -> Result<(), Status> {
+    if metadata.get_bool(PROTECT).unwrap_or_default() {
         if !access.push_protected {
             warn!("Branch push failed, branch is protected");
             return Err(Status::permission_denied("protected"));
@@ -431,193 +616,306 @@ pub async fn push(
         return Err(no_repository_access_status());
     }
 
-    // Verify the branch has not been deleted by checking the name→id mapping
-    if let Ok(branch_name) = branch::name(&branch_metadata)
-        && !branch_name.is_empty()
-    {
-        let is_mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
-            .await
-            .filter_slow_down()?
-            .is_ok_and(|id| id == branch);
-        if !is_mapped {
-            debug!("Branch push rejected, name-to-id mapping missing for deleted branch");
-            return Err(Status::not_found("Branch not found"));
+    Ok(())
+}
+
+/// Ensures `name` maps to `branch`, mapping it back when no live branch claims it.
+async fn ensure_name_maps_to_branch(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    name: &str,
+) -> Result<(), Status> {
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    // The `None` arm reinstates the mapping, so an unreadable name key must
+    // not reach it: that would rebind the name away from whichever branch
+    // currently owns it.
+    match none_or_status(
+        branch::load_name_to_id_local(repository.clone(), name).await,
+        BranchError::is_branch_not_found,
+    )? {
+        Some(mapped) if BranchId::from(mapped) == branch => Ok(()),
+        Some(other) => {
+            let other_id = BranchId::from(other);
+            if other_branch_still_claims_name(&repository, other_id, name).await? {
+                info!(
+                    {BRANCH_ID} = %branch,
+                    %name,
+                    claimed_by = %other_id,
+                    "Cannot reinstate deleted branch: name claimed by another branch",
+                );
+                Err(Status::already_exists(format!(
+                    "Branch name '{name}' is in use by a different branch"
+                )))
+            } else {
+                debug!(
+                    {BRANCH_ID} = %branch,
+                    %name,
+                    stale = %other_id,
+                    "Stale name → id mapping, reinstating to current branch",
+                );
+                branch::store_name_to_id(repository, branch, name)
+                    .await
+                    .filter_slow_down()?
+                    .warn_map_err(|err| {
+                        Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
+                    })
+            }
+        }
+        None => {
+            // No mapping (deleted — the underlying store treats zero
+            // values as missing — or never written). Reinstate the
+            // mapping so the pushed branch is live again.
+            debug!({BRANCH_ID} = %branch, %name, "Reinstating name → id mapping for push");
+            branch::store_name_to_id(repository, branch, name)
+                .await
+                .filter_slow_down()?
+                .warn_map_err(|err| {
+                    Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
+                })
         }
     }
+}
 
-    let current_head = load_latest(repository.clone(), branch)
+/// True iff `other_id` exists and its metadata still names it `name`. A
+/// mismatch (dead branch, missing metadata, or a rename that left an
+/// orphan name pointer) is treated as a stale mapping the caller can
+/// safely overwrite. A store that cannot answer is reported rather than
+/// read as a mismatch, so an unreadable branch never has its name
+/// reassigned.
+async fn other_branch_still_claims_name(
+    repository: &Arc<RepositoryContext>,
+    other_id: BranchId,
+    name: &str,
+) -> Result<bool, Status> {
+    let Ok(metadata_hash) = branch::metadata_hash(repository.clone(), other_id)
         .await
         .filter_slow_down()?
-        .unwrap_or_default();
-
-    // Verify the validity of the revision to push to latest
-    let state = State::deserialize(repository.clone(), latest)
+    else {
+        return Ok(false);
+    };
+    let Ok(metadata) = branch::load_metadata(repository.clone(), metadata_hash)
         .await
         .filter_slow_down()?
-        .warn_map_err(|err| {
-            if err.is_not_found() {
-                Status::not_found(format!(
-                    "Revision '{latest}' to push to latest is not found"
-                ))
-            } else {
-                Status::internal(format!("failed to load current latest state: {err}"))
-            }
-        })?;
+    else {
+        return Ok(false);
+    };
+    Ok(branch::name(&metadata).unwrap_or("") == name)
+}
 
-    // If the incoming revision is already the latest revision the push is a no-op
-    if current_head == latest {
-        return Ok(PushResult {
-            success: true,
-            fast_forward_merged: false,
-            revision: current_head,
-            revision_number: state.revision_number(),
-        });
+/// The latest revision of `branch`, zero when it has none, and the state of `latest`.
+async fn load_head_and_incoming(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+) -> Result<HeadAndIncoming, Status> {
+    let (head, incoming) = tokio::join!(
+        branch::load_latest_local(repository.clone(), branch),
+        State::deserialize(repository, latest),
+    );
+    // Any failure to read the latest revision reads as none. The branch metadata check is what
+    // tells an empty branch from a missing one.
+    let head = head.filter_slow_down()?.unwrap_or_default();
+    let incoming = incoming.filter_slow_down()?.warn_map_err(|err| {
+        if err.is_not_found() {
+            Status::not_found(format!(
+                "Revision '{latest}' to push to latest is not found"
+            ))
+        } else {
+            Status::internal(format!("failed to load current latest state: {err}"))
+        }
+    })?;
+    Ok(HeadAndIncoming { head, incoming })
+}
+
+enum HeadMove {
+    /// The incoming revision descends from the head, or the push is forced.
+    Store,
+    /// The head moved past the parent of the incoming revision, and the push asked for a
+    /// fast-forward merge.
+    Merge,
+}
+
+/// How the head moves from `current` to the incoming revision `state`, or `None` when the head
+/// moved past its parent and the push did not ask for a fast-forward merge.
+fn decide_head_move(
+    current: Hash,
+    state: &State,
+    force: bool,
+    fast_forward_merge: bool,
+) -> Result<Option<HeadMove>, Status> {
+    if force || current == state.parent_self() {
+        return Ok(Some(HeadMove::Store));
     }
 
+    if current.is_zero() {
+        warn!("Branch push failed, branch does not exist");
+        return Err(Status::not_found("Branch not found"));
+    }
+
+    if !fast_forward_merge {
+        return Ok(None);
+    }
+
+    Ok(Some(HeadMove::Merge))
+}
+
+/// Decides how the head moves to `latest`, verifying the fragments of the incoming revision
+/// when it moves at all.
+async fn prepare_push(
+    repository: Arc<RepositoryContext>,
+    latest: Hash,
+    loaded: HeadAndIncoming,
+    force: bool,
+    fast_forward_merge: bool,
+) -> Result<PreparedPush, Status> {
+    // If the incoming revision is already the latest revision the push is a no-op
+    if loaded.head == latest {
+        return Ok(PreparedPush::Done(HeadUpdate {
+            success: true,
+            fast_forward_merged: false,
+            revision: loaded.head,
+            revision_number: loaded.incoming.revision_number(),
+        }));
+    }
+
+    let Some(head_move) =
+        decide_head_move(loaded.head, &loaded.incoming, force, fast_forward_merge)?
+    else {
+        return Ok(PreparedPush::Done(HeadUpdate::declined(loaded.head)));
+    };
+
+    // Both a plain push and a fast-forward merge verify the incoming revision against its own
+    // parents, which do not depend on the head. Without this check a client could reference
+    // fragments that were never fully uploaded.
+    let parents = verify_incoming_fragments(repository, loaded.incoming.clone()).await?;
+
+    Ok(PreparedPush::Move {
+        loaded,
+        head_move,
+        parents,
+    })
+}
+
+/// Loads the parent states of `state` and verifies that every fragment it introduces against
+/// them exists.
+async fn verify_incoming_fragments(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+) -> Result<VerifiedParents, Status> {
+    let parent = State::deserialize(repository.clone(), state.parent_self())
+        .await
+        .filter_slow_down()?
+        .warn_map_err(|err| Status::internal(format!("Failed to load incoming state: {err}")))?;
+
+    let other = load_other_parent_state(repository.clone(), &state).await?;
+
     let mut store_requests = PushStoreRequests::default();
-    let result = store_new_head(
+    let verified = verify_fragments(
         repository,
-        branch,
-        latest,
+        parent.clone(),
+        other.clone(),
         state,
-        current_head,
-        force,
-        fast_forward_merge,
-        history_step_size,
-        acceleration,
         &mut store_requests,
     )
     .await;
     store_requests.finished = true;
-    result
+    verified?;
+
+    Ok(VerifiedParents { parent, other })
 }
 
-/// Verifies the fragments `state` introduces and stores it as the latest revision of `branch`,
-/// retrying while the head moves underneath it.
+/// Stores the verified incoming revision as the latest revision of `branch`, retrying while
+/// the head moves underneath it.
 #[allow(clippy::too_many_arguments)]
 async fn store_new_head(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     latest: Hash,
-    state: Arc<State>,
-    mut current_head: Hash,
+    loaded: HeadAndIncoming,
+    parents: VerifiedParents,
     force: bool,
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
-    store_requests: &mut PushStoreRequests,
-) -> Result<PushResult, Status> {
+) -> Result<HeadUpdate, Status> {
+    let HeadAndIncoming {
+        head: mut current,
+        incoming,
+    } = loaded;
+
+    let revision_number = next_revision_number(
+        parents.parent.revision_number(),
+        parents.other.as_ref().map_or(0, |s| s.revision_number()),
+    );
+
     let mut new_head = latest;
-    loop {
-        // Verify the current latest revision is parent of the incoming revision unless the push is forced
-        if current_head != state.parent_self() && !force {
-            if current_head.is_zero() {
-                warn!("Branch push failed, branch does not exist");
-                return Err(Status::not_found("Branch not found"));
-            }
-
-            if !fast_forward_merge {
-                return Ok(PushResult {
-                    success: false,
-                    fast_forward_merged: false,
-                    revision: current_head,
-                    revision_number: 0,
-                });
-            }
-
-            // Fast-forward merge: the incoming revision's parent_self no longer matches
-            // the branch head. Attempt to create a new merge revision with
-            // parent_self=current_head and parent_other=incoming_revision.
-            return try_fast_forward_merge(
-                repository.clone(),
-                branch,
-                state.clone(),
-                current_head,
-                history_step_size,
-                acceleration,
-                store_requests,
-            )
-            .await;
-        }
-
-        let state_parent = State::deserialize(repository.clone(), state.parent_self())
+    if incoming.revision_number() != revision_number {
+        // Rewrite the revision with a correct revision number
+        incoming.set_revision_number(revision_number);
+        let write_token = get_write_token();
+        new_head = incoming
+            .serialize(repository.clone(), &write_token)
             .await
             .filter_slow_down()?
-            .warn_map_err(|err| {
-                Status::internal(format!("Failed to load incoming state: {err}"))
-            })?;
+            .warn_map_err(|err| Status::internal(format!("Failed to serialize state: {err}")))?;
+    }
 
-        let state_other = load_other_parent_state(repository.clone(), &state).await?;
-
-        // Verify that all new fragments exist
-        verify_fragments(
-            repository.clone(),
-            state_parent.clone(),
-            state_other.clone(),
-            state.clone(),
-            store_requests,
-        )
-        .await?;
-
-        // Verify that the revision number is valid
-        let revision_number = next_revision_number(
-            state_parent.revision_number(),
-            state_other.as_ref().map_or(0, |s| s.revision_number()),
-        );
-
-        if state.revision_number() != revision_number {
-            // Rewrite the revision with a correct revision number
-            state.set_revision_number(revision_number);
-            let write_token = get_write_token();
-            new_head = state
-                .serialize(repository.clone(), &write_token)
-                .await
-                .filter_slow_down()?
-                .warn_map_err(|err| {
-                    Status::internal(format!("Failed to serialize state: {err}"))
-                })?;
-        }
-
-        let previous_head = try_store_latest(repository.clone(), branch, current_head, new_head)
+    loop {
+        let previous_head = try_store_latest(repository.clone(), branch, current, new_head)
             .await
             .filter_slow_down()?
             .warn_map_err(|err| {
                 Status::internal(format!("Failed to store new latest pointer: {err}"))
             })?;
 
-        // Check if the compare-and-swap was successful by checking match with expected value
-        if previous_head == current_head {
-            // If equal it means the value was swapped, i.e the push was successful. Set the
-            // new latest revision signature and break out of the loop to return success
-            current_head = new_head;
-
+        if previous_head == current {
             store_history_step(
                 repository.clone(),
                 branch,
                 history_step_size,
                 acceleration,
-                state_parent,
-                state.clone(),
+                parents.parent,
+                incoming.clone(),
             )
             .await;
 
-            break;
+            return Ok(HeadUpdate {
+                success: true,
+                fast_forward_merged: false,
+                revision: new_head,
+                revision_number: incoming.revision_number(),
+            });
         }
 
-        // Latest pointer moved during the processing of this push call, loop and try again
-        current_head = previous_head;
-    }
+        // Latest pointer moved during the processing of this push call
+        current = previous_head;
 
-    Ok(PushResult {
-        success: true,
-        fast_forward_merged: false,
-        revision: current_head,
-        revision_number: state.revision_number(),
-    })
+        // The fragments were verified against the parents of the incoming revision, which do
+        // not depend on the head, so a retry does not verify them again.
+        match decide_head_move(current, &incoming, force, fast_forward_merge)? {
+            Some(HeadMove::Store) => {}
+            None => return Ok(HeadUpdate::declined(current)),
+            Some(HeadMove::Merge) => {
+                return try_fast_forward_merge(
+                    repository,
+                    branch,
+                    incoming,
+                    current,
+                    history_step_size,
+                    acceleration,
+                )
+                .await;
+            }
+        }
+    }
 }
 
 /// Attempts a server-side fast-forward merge when the target branch head has moved
-/// since the client created the merge revision.
+/// since the client created the merge revision. The fragments of the incoming revision
+/// must already be verified.
 ///
 /// Creates a new merge revision with:
 /// - `parent_self` = current branch head (target branch)
@@ -636,8 +934,7 @@ async fn try_fast_forward_merge(
     mut current_head: Hash,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
-    store_requests: &mut PushStoreRequests,
-) -> Result<PushResult, Status> {
+) -> Result<HeadUpdate, Status> {
     let incoming_revision = incoming_state.revision();
     let original_base = incoming_state.parent_self();
 
@@ -645,29 +942,6 @@ async fn try_fast_forward_merge(
         %incoming_revision, %original_base, %current_head,
         "Attempting fast-forward merge"
     );
-
-    // Verify that all new fragments from the incoming revision exist in the store,
-    // matching the verification done in the normal push path. Without this check a
-    // client could reference fragments that were never fully uploaded.
-    let base_state = State::deserialize(repository.clone(), original_base)
-        .await
-        .filter_slow_down()?
-        .warn_map_err(|err| {
-            Status::internal(format!(
-                "Failed to load base state for fragment verification: {err}"
-            ))
-        })?;
-
-    let other_parent_state = load_other_parent_state(repository.clone(), &incoming_state).await?;
-
-    verify_fragments(
-        repository.clone(),
-        base_state,
-        other_parent_state,
-        incoming_state.clone(),
-        store_requests,
-    )
-    .await?;
 
     loop {
         // Three-way diff: base=original merge target, source=incoming merge, target=current head
@@ -701,12 +975,7 @@ async fn try_fast_forward_merge(
                 conflicts = diff_result.conflicts.len(),
                 "Fast-forward merge has conflicts, rejecting"
             );
-            return Ok(PushResult {
-                success: false,
-                fast_forward_merged: false,
-                revision: current_head,
-                revision_number: 0,
-            });
+            return Ok(HeadUpdate::declined(current_head));
         }
 
         // Deserialize the current head state to use as base for the new merge revision
@@ -828,7 +1097,7 @@ async fn try_fast_forward_merge(
             )
             .await;
 
-            return Ok(PushResult {
+            return Ok(HeadUpdate {
                 success: true,
                 fast_forward_merged: true,
                 revision: new_revision,

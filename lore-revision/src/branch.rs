@@ -796,6 +796,15 @@ pub async fn load_latest(
     }
 }
 
+/// Reads the latest revision of `branch` from the mutable store alone, reporting an absent value
+/// as `BranchNotFound` even for a branch that exists.
+pub fn load_latest_local(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> impl Future<Output = Result<Hash, BranchError>> {
+    mutable_load(repository, LATEST, branch)
+}
+
 pub async fn load_latest_divergent(
     repository: Arc<RepositoryContext>,
     branch: BranchId,

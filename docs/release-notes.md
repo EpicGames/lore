@@ -39,6 +39,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Following a branch's history through the remote no longer takes the revisions a page holds above the one it was
   asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the
   revision two branches share could answer with one of them, newer than the one they really share
+- A branch push reads each mutable store key once, loads the branch alongside the pushed revision, and checks the
+  branch name while it verifies the revision's fragments rather than before, so a push spends fewer store round trips
+  before it moves the branch. A push the server refuses because the branch is protected no longer reinstates the name
+  of a deleted branch first
+- The deprecated `urc.rpc` `BranchPush` RPC treats a missing or deleted branch as `lore.revision.v1` `BranchPush`
+  does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch
+  reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with
+  `NOT_FOUND`
 
 ## v0.12.0 (Oct 26th 2026) [#1966]
 
