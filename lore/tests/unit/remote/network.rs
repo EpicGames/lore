@@ -21,8 +21,7 @@ const TEST_STRING: &str = "ABC";
 ///
 /// Kept short because the name joins the temporary directory into an address
 /// that holds 108 bytes. The process suffix keeps two concurrent runs off a
-/// single path, which the Windows listener unlinks without checking for a
-/// live peer.
+/// single path, where one would find the other's claim.
 fn socket_name(test: &str) -> String {
     format!("{test}-{}", std::process::id())
 }
@@ -73,8 +72,12 @@ fn remove_claim_lock(name: &str) {
         lock.push(".lock");
         let _ = std::fs::remove_file(lock);
     }
-    #[cfg(not(target_family = "unix"))]
-    let _ = name;
+    #[cfg(target_os = "windows")]
+    {
+        let mut lock = lore::remote::network::windows::uds_sock_file(name).into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
+    }
 }
 
 #[test]
@@ -87,7 +90,6 @@ fn test_both() {
 
 /// A second service must learn that it would lose the socket before it initializes, since
 /// initializing mounts every instance.
-#[cfg(target_family = "unix")]
 #[test]
 fn a_claimed_socket_name_refuses_a_second_claim_until_its_listener_drops() {
     let name = socket_name("uds-claim");

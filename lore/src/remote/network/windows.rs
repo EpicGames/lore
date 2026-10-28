@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::ffi::OsString;
 use std::net::TcpStream;
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::io::FromRawSocket;
 use std::os::windows::io::RawSocket;
+use std::path::PathBuf;
 
 use WinSock::WSADATA;
 use WinSock::WSAStartup;
+use lore_base::fs::lock::FSLock;
+use lore_error_set::prelude::*;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Networking::WinSock;
@@ -81,30 +86,76 @@ impl Drop for OwnedSocket {
 
 pub struct UdsListener {
     socket: OwnedSocket,
+    /// Released when the listener is dropped, after its socket is closed.
+    _claim: FSLock,
 }
 
-/// A socket name to bind, not claimed: nothing reserves the name here, and
-/// [`UdsListener::new`] unlinks a socket already bound to it, so a second service can take the
-/// name from a running one.
+/// The claim on a socket name, held by at most one process from [`UdsListener::claim`] until the
+/// listener it becomes is dropped. The same claim, taken the same way, as `unix.rs` takes, so that
+/// a service starts or refuses alike on every system.
+///
+/// A lock beside the socket rather than the socket itself: binding deletes the socket file first,
+/// and Windows lets that delete succeed under a service still listening on it, which keeps running
+/// unreachable. Without the claim, every service started at once binds in turn, and all but the
+/// last run on - each holding the mounts it made - with nothing able to reach them to stop them.
+/// The lock file outlives the listener, as on Unix.
 pub struct UdsListenerClaim {
     name: String,
+    lock: FSLock,
 }
 
 impl UdsListenerClaim {
+    /// Binds the claimed name, removing a stale socket file. Fails if a service answers on it, the
+    /// check `unix.rs` makes before it binds.
     pub fn listen(self) -> Result<UdsListener, UdsListenerError> {
-        UdsListener::new(&self.name)
+        let Self { name, lock } = self;
+        if UdsStream::connect(&name).is_ok() {
+            return Err(UdsListenerError::internal(format!(
+                "another Lore service is already listening on {}",
+                uds_sock_file(&name).display()
+            )));
+        }
+        let socket = UdsListener::bind_and_listen(&name)?;
+        Ok(UdsListener {
+            socket,
+            _claim: lock,
+        })
     }
 }
 
 impl UdsListener {
-    /// Always succeeds: see [`UdsListenerClaim`].
+    pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
+        Self::claim(name)?
+            .ok_or_else(|| {
+                UdsListenerError::internal(format!(
+                    "another Lore service has claimed {}",
+                    uds_sock_file(name).display()
+                ))
+            })?
+            .listen()
+    }
+
+    /// Claims `name` without binding it: `None` while another process holds the claim or a
+    /// service answers on the socket, the two conditions `unix.rs` refuses a claim on.
     pub fn claim(name: &str) -> Result<Option<UdsListenerClaim>, UdsListenerError> {
+        let path = uds_sock_file(name);
+        let Some(lock) = FSLock::try_acquire_file_lock(&path)
+            .internal_with(|| format!("locking the claim on {}", path.display()))?
+        else {
+            return Ok(None);
+        };
+        if UdsStream::connect(name).is_ok() {
+            return Ok(None);
+        }
         Ok(Some(UdsListenerClaim {
             name: name.to_string(),
+            lock,
         }))
     }
 
-    pub fn new(name: &str) -> Result<UdsListener, UdsListenerError> {
+    /// Binds `name` and listens on it, deleting the socket file already there. Only under the
+    /// claim: the delete succeeds under a service still listening on the file.
+    fn bind_and_listen(name: &str) -> Result<OwnedSocket, UdsListenerError> {
         let wide_file_name = uds_sock_path(name);
         // Ahead of the delete, so an address that cannot be built does not first
         // remove the socket a running service is listening on.
@@ -138,7 +189,7 @@ impl UdsListener {
         unsafe {
             if WinSock::bind(
                 sock.get(),
-                &addr as *const SOCKADDR_UN as *const SOCKADDR,
+                (&raw const addr).cast::<SOCKADDR>(),
                 std::mem::size_of_val(&addr) as i32,
             ) != 0
             {
@@ -155,7 +206,7 @@ impl UdsListener {
                 )));
             }
         }
-        Ok(Self { socket: sock })
+        Ok(sock)
     }
 
     pub fn accept(&self) -> Result<UdsStream, UdsAcceptError> {
@@ -168,7 +219,7 @@ impl UdsListener {
         unsafe {
             let res = WinSock::accept(
                 self.socket.get(),
-                &mut addr as *mut SOCKADDR_UN as *mut SOCKADDR,
+                (&raw mut addr).cast::<SOCKADDR>(),
                 &mut addr_size as *mut i32,
             );
             if res == INVALID_SOCKET {
@@ -220,7 +271,7 @@ impl UdsStream {
         unsafe {
             if WinSock::connect(
                 sock.get(),
-                &addr as *const SOCKADDR_UN as *const SOCKADDR,
+                (&raw const addr).cast::<SOCKADDR>(),
                 size_of_val(&addr) as i32,
             ) != 0
             {
@@ -253,6 +304,14 @@ fn wsa_startup() -> bool {
         let result = unsafe { WSAStartup(2 << 8 | 2, &mut data) };
         result == 0
     })
+}
+
+/// The socket file for `socket_name`, beside which its claim's lock file lies.
+#[lore_macro::test_pub]
+fn uds_sock_file(socket_name: &str) -> PathBuf {
+    let wide = uds_sock_path(socket_name);
+    // Without the terminator.
+    PathBuf::from(OsString::from_wide(&wide[..wide.len() - 1]))
 }
 
 fn uds_sock_path(socket_name: &str) -> Vec<u16> {

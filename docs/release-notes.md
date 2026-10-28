@@ -39,6 +39,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Following a branch's history through the remote no longer takes the revisions a page holds above the one it was
   asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the
   revision two branches share could answer with one of them, newer than the one they really share
+- On Windows, a Lore service started while another serves the same socket exits without serving, as it does on Linux
+  and macOS. It used to take the socket over and leave the first service running unreachable, holding its SWFS mounts
+  until killed, so commands that each started a service at the same moment could leave one behind per extra command
 - A branch push reads each mutable store key once, loads the branch alongside the pushed revision, and checks the
   branch name while it verifies the revision's fragments rather than before, so a push spends fewer store round trips
   before it moves the branch. A push the server refuses because the branch is protected no longer reinstates the name

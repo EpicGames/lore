@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import contextlib
+import csv
 import logging
 import os
 import platform
+import shutil
 import signal
 import subprocess
+import sys
+import uuid
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep
 
 import pytest
 
@@ -221,11 +225,16 @@ def test_turning_relaying_on_without_an_executable_reports_it(new_lore_repo):
 
 @pytest.mark.smoke
 def test_commands_run_at_once_all_reach_one_service(
-    new_lore_repo, stops_background_services
+    new_lore_repo, stops_background_services, tmp_path
 ):
     """Commands that all find no service all start one, and only one of those
     can hold the socket. The callers whose service lost it must run on the one
-    that won rather than fail."""
+    that won rather than fail, and the services that lost must exit rather than
+    run on where nothing can reach them to stop them.
+
+    The services run from a copy of the executable under a name of this test's
+    own, so that the ones left once the winner stops are found by name alone,
+    apart from any service another test or worker runs."""
     # Set the repository up without service mode, so that nothing is listening
     # when the commands below start.
     repo: Lore = new_lore_repo()
@@ -235,7 +244,18 @@ def test_commands_run_at_once_all_reach_one_service(
         output_file.write(os.urandom(30))
     repo.stage(scan=True)
 
-    environment = service_command_environment(repo)
+    # The services run from a copy under a name no other process has, because
+    # the check below finds them by that name and ends every process that has it.
+    # Run from the build under test, the same check would also find, and end,
+    # services that other tests, other xdist workers or the developer are running
+    # from that build.
+    service_executable = tmp_path / (
+        f"lore-at-once-{uuid.uuid4().hex[:8]}" + Path(repo.lore_executable_path).suffix
+    )
+    shutil.copy2(repo.lore_executable_path, service_executable)
+    environment = repo.sandboxed_env(
+        **LORE_SERVICE_ENVIRONMENT, LORE_SERVICE_EXECUTABLE=str(service_executable)
+    )
     command_args = [repo.lore_executable_path, "--repository", repo.path, "status"]
     logger.info(
         "Executing %d Lore commands at once: %s", CONCURRENT_COMMAND_COUNT, command_args
@@ -254,14 +274,37 @@ def test_commands_run_at_once_all_reach_one_service(
 
     outputs = [command.communicate()[0] for command in commands]
 
-    for index, command in enumerate(commands):
-        assert command.returncode == 0, (
-            f"Command {index} of {CONCURRENT_COMMAND_COUNT} failed with "
-            f"{command.returncode}: {outputs[index]}"
+    try:
+        for index, command in enumerate(commands):
+            assert command.returncode == 0, (
+                f"Command {index} of {CONCURRENT_COMMAND_COUNT} failed with "
+                f"{command.returncode}: {outputs[index]}"
+            )
+            assert "A " + file_name in map(
+                lambda line: line.strip(" "), outputs[index].splitlines()
+            ), f"Command {index} must have reached a service: {outputs[index]}"
+
+        stop = subprocess.run(
+            [repo.lore_executable_path, "service", "stop"],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
         )
-        assert "A " + file_name in map(
-            lambda line: line.strip(" "), outputs[index].splitlines()
-        ), f"Command {index} must have reached a service: {outputs[index]}"
+        deadline = monotonic() + 10
+        while (
+            left := processes_running(service_executable)
+        ) and monotonic() < deadline:
+            sleep(0.1)
+        assert not left, (
+            f"{len(left)} service(s) still run once the one that answered has "
+            f"stopped ({stop.stdout}{stop.stderr}): processes {left}"
+        )
+    finally:
+        # Ended either way, so that a failure leaves nothing running.
+        for pid in processes_running(service_executable):
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGTERM)
 
 
 @pytest.mark.smoke
@@ -675,6 +718,56 @@ def test_a_command_that_reaches_no_service_reports_service_unavailable(
     )
 
 
+@contextlib.contextmanager
+def held_claim(socket_name: str):
+    """Holds the claim on `socket_name` as a service would, for a test to see
+    what a service started meanwhile does: an exclusive lock on the file a
+    service locks, which conflicts with the one it takes on either system."""
+    claim = service_claim_path(socket_name)
+    claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(claim, "a") as held:
+        if sys.platform == "win32":
+            import msvcrt
+
+            held.seek(0)
+            msvcrt.locking(held.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def processes_running(executable: Path) -> list[int]:
+    """The processes running `executable`, by its file name on Windows, where
+    `tasklist` matches no more than that, and by its path elsewhere."""
+    if sys.platform == "win32":
+        listing = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH", "/FI", f"IMAGENAME eq {executable.name}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return [
+            int(row[1])
+            for row in csv.reader(listing.splitlines())
+            if len(row) > 1 and row[0].lower() == executable.name.lower()
+        ]
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pid=", "-o", "args="],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    return [
+        int(pid)
+        for pid, _, args in (
+            line.strip().partition(" ") for line in listing.splitlines()
+        )
+        if args.strip().split(" ", 1)[0] == str(executable)
+    ]
+
+
 def catches_sigterm(pid: int) -> bool:
     """Whether the process has a handler for SIGTERM, read from its status."""
     status = Path(f"/proc/{pid}/status").read_text()
@@ -691,12 +784,7 @@ def test_a_service_waiting_on_a_claimed_socket_stops_on_a_signal(
 ):
     """A service that finds the socket claimed waits for the holder to answer
     before it exits, and a termination signal ends that wait."""
-    import fcntl
-
-    claim = service_claim_path(lore_service_socket)
-    claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(claim, "a") as held:
-        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with held_claim(lore_service_socket):
         waiting, log_path = lore_service_runner.launch()
         deadline = monotonic() + 10
         while (
@@ -724,20 +812,12 @@ def test_a_service_waiting_on_a_claimed_socket_stops_on_a_signal(
     ), f"the signal ends the wait on the claim: {output}"
 
 
-@pytest.mark.skipif(
-    platform.system() == "Windows", reason="claims the socket with a lock file"
-)
 def test_a_service_waiting_on_a_claimed_socket_nobody_answers_on_gives_up(
     lore_service_runner, lore_service_socket
 ):
     """A service that finds the socket claimed, by a holder that never answers,
     exits once its wait runs out and says that nothing answered."""
-    import fcntl
-
-    claim = service_claim_path(lore_service_socket)
-    claim.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(claim, "a") as held:
-        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    with held_claim(lore_service_socket):
         waiting, log_path = lore_service_runner.launch()
         waiting.wait(timeout=60)
 
@@ -746,3 +826,36 @@ def test_a_service_waiting_on_a_claimed_socket_nobody_answers_on_gives_up(
         LORE_SERVICE_CLAIM_REFUSED_MESSAGE in output
         and "it did not answer in time" in output
     ), f"the refusal says nothing answered: {output}"
+
+
+@pytest.mark.smoke
+def test_a_second_service_exits_rather_than_take_the_socket(
+    lore_service_runner, tmp_path
+):
+    """A service started while another serves the socket exits without serving,
+    and the first keeps answering. Commands that find no service each start one,
+    so services started at once are the ordinary case. On Windows, binding
+    deletes the socket file even under a service listening on it, so without a
+    claim the second took the socket and the first ran on unreachable, holding
+    the mounts it made, with nothing able to stop it."""
+    first = lore_service_runner.start()
+    second, log_path = lore_service_runner.launch(str(tmp_path))
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        second.wait(timeout=60)
+
+    output = log_path.read_text(errors="replace")
+    assert second.poll() is not None, f"the second service still runs: {output}"
+    assert LORE_SERVICE_CLAIM_REFUSED_MESSAGE in output, (
+        f"the second service refuses the claimed socket: {output}"
+    )
+    status = subprocess.run(
+        [lore_service_runner.lore_executable_path, "service", "status"],
+        capture_output=True,
+        text=True,
+        env=lore_service_runner.lore_subprocess_env,
+        check=False,
+    )
+    assert first.poll() is None, "the first service still runs"
+    assert LORE_SERVICE_RUNNING_MESSAGE in status.stdout.splitlines(), (
+        f"the first service still answers: {status.stdout}{status.stderr}"
+    )

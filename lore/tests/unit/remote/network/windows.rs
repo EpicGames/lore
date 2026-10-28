@@ -59,3 +59,45 @@ fn a_path_that_exactly_fills_the_address_is_refused() {
         "one byte shorter must fit"
     );
 }
+
+/// A socket a service answers on refuses a claim even with no lock held, as on Unix: binding
+/// would delete the file it listens on and leave it running unreachable.
+#[test]
+fn a_socket_served_without_a_claim_refuses_a_claim() {
+    let name = super::socket_name("uds-unclaimed");
+    let socket = uds_sock_file(&name);
+    let addr = sockaddr_for_path(socket.to_str().expect("the path is text"))
+        .expect("the path fits the address");
+
+    // Safety: Winsock calls with an address built above and a socket closed below.
+    let served = unsafe {
+        let mut data = WinSock::WSADATA::default();
+        assert_eq!(
+            WinSock::WSAStartup(2 << 8 | 2, &mut data),
+            0,
+            "winsock starts"
+        );
+        let served = WinSock::socket(WinSock::AF_UNIX as i32, WinSock::SOCK_STREAM, 0);
+        assert_ne!(served, WinSock::INVALID_SOCKET, "a socket is created");
+        assert_eq!(
+            WinSock::bind(
+                served,
+                (&raw const addr).cast::<WinSock::SOCKADDR>(),
+                std::mem::size_of_val(&addr) as i32,
+            ),
+            0,
+            "binds"
+        );
+        assert_eq!(WinSock::listen(served, 1), 0, "listens");
+        served
+    };
+
+    let refused = UdsListener::claim(&name)
+        .expect("a claim is made")
+        .is_none();
+    // Safety: the socket created above, closed once.
+    unsafe { WinSock::closesocket(served) };
+    let _ = std::fs::remove_file(&socket);
+    super::remove_claim_lock(&name);
+    assert!(refused, "a served socket refuses a claim");
+}
