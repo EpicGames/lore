@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::BranchPoint;
 use lore_base::types::Hash;
 use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::revision::v1::RevisionListRequest;
@@ -2482,4 +2483,463 @@ async fn forward_cursor_list_cache_disabled_never_reads_a_wrong_cached_list() {
         assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 101]);
     }))
     .await;
+}
+
+/// Create a branch with the given stack (nearest ancestor first) and push
+/// `count` revisions onto it. Returns `(branch_id, (number, signature)
+/// newest-first)`.
+async fn create_child_branch_with_history(
+    repository: &Arc<RepositoryContext>,
+    stack: Vec<BranchPoint>,
+    count: u64,
+) -> (BranchId, Vec<(u64, Hash)>) {
+    let branch_point = stack[0].revision;
+    let write_token = get_write_token();
+    let branch_id = BranchId::from(uuid::Uuid::now_v7());
+    branch::create(
+        repository.clone(),
+        &write_token,
+        branch_id,
+        &format!("test-child-branch-{branch_id}"),
+        branch::default_category(),
+        "creator",
+        1,
+        stack,
+        false,
+        false,
+    )
+    .await
+    .expect("create child branch");
+
+    let mut revisions = Vec::with_capacity(count as usize);
+    let mut parent = branch_point;
+    for hint in 1..=count {
+        let (revision, number) =
+            push_chained_revision(repository, branch_id, parent, Hash::default(), hint).await;
+        revisions.push((number, revision));
+        parent = revision;
+    }
+    revisions.reverse();
+    (branch_id, revisions)
+}
+
+fn strategy_header(
+    response: &tonic::Response<lore_proto::lore::revision::v1::RevisionListResponse>,
+) -> Option<&str> {
+    response
+        .metadata()
+        .get(REVISION_LIST_STRATEGY_HEADER)
+        .map(|value| value.to_str().unwrap())
+}
+
+mod handler_on_child_branch {
+    use super::*;
+
+    /// Parent branch `main` holds revisions 1..=250. The child branches from
+    /// revision `branch_point` and gets `child_count` revisions of its own.
+    struct Fixture {
+        repository: RepositoryId,
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        child: BranchId,
+        parent_signatures: Vec<Hash>,
+        child_revisions: Vec<(u64, Hash)>,
+    }
+
+    impl Fixture {
+        async fn call(
+            &self,
+            number: u64,
+            acceleration: lore_server::grpc::server::RevisionListAcceleration,
+        ) -> tonic::Response<lore_proto::lore::revision::v1::RevisionListResponse> {
+            handler(
+                make_request_identifier(self.repository, self.child, number),
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                acceleration,
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+        }
+
+        fn parent_signature(&self, number: u64) -> Hash {
+            self.parent_signatures[250 - number as usize]
+        }
+    }
+
+    async fn with_fixture<F, Fut>(branch_point: u64, child_count: u64, body: F)
+    where
+        F: FnOnce(Fixture) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (parent, parent_signatures) =
+                create_branch_with_history(&repository_context, 250).await;
+            let (child, child_revisions) = create_child_branch_with_history(
+                &repository_context,
+                vec![BranchPoint {
+                    branch: parent,
+                    revision: parent_signatures[250 - branch_point as usize],
+                }],
+                child_count,
+            )
+            .await;
+            body(Fixture {
+                repository,
+                immutable_store,
+                mutable_store,
+                child,
+                parent_signatures,
+                child_revisions,
+            })
+            .await;
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn number_below_the_branch_point_is_served_from_the_ancestors_list_cache() {
+        with_fixture(220, 10, |fixture| async move {
+            let response = fixture
+                .call(
+                    50,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await;
+            assert_eq!(strategy_header(&response), Some("list-cache"));
+            let inner = response.into_inner();
+            assert_eq!(inner.items.len(), 100);
+            assert_eq!(inner.items[0].number, 100);
+            assert_eq!(
+                Hash::from(inner.items[0].signature.as_ref()),
+                fixture.parent_signature(100),
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn number_below_the_branch_point_uses_the_ancestors_step_key() {
+        with_fixture(220, 10, |fixture| async move {
+            let acceleration = lore_server::grpc::server::RevisionListAcceleration {
+                step_keys: true,
+                list_cache: false,
+            };
+            let response = fixture.call(120, acceleration).await;
+            assert_eq!(strategy_header(&response), Some("history-step"));
+            let inner = response.into_inner();
+            assert_eq!(inner.items[0].number, 120);
+            assert_eq!(
+                Hash::from(inner.items[0].signature.as_ref()),
+                fixture.parent_signature(120),
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cached_segment_is_cut_at_the_branch_point() {
+        with_fixture(150, 10, |fixture| async move {
+            let response = fixture
+                .call(
+                    120,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await;
+            assert_eq!(strategy_header(&response), Some("list-cache"));
+            let inner = response.into_inner();
+            let numbers: Vec<u64> = inner.items.iter().map(|item| item.number).collect();
+            assert_eq!(numbers, (101..=150).rev().collect::<Vec<u64>>());
+            assert_eq!(
+                Hash::from(inner.items[0].signature.as_ref()),
+                fixture.parent_signature(150),
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn page_ending_at_the_branch_point_points_forward_into_the_child() {
+        with_fixture(150, 10, |fixture| async move {
+            let response = fixture
+                .call(
+                    150,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await
+                .into_inner();
+            let (first_number, first_signature) =
+                *fixture.child_revisions.last().expect("child has revisions");
+            assert_eq!(first_number, 151);
+            assert_eq!(
+                Hash::from(response.signature_forward.expect("forward cursor").as_ref()),
+                first_signature,
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn page_below_the_branch_point_points_forward_along_shared_history() {
+        with_fixture(150, 10, |fixture| async move {
+            let response = fixture
+                .call(
+                    50,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await
+                .into_inner();
+            assert_eq!(
+                Hash::from(response.signature_forward.expect("forward cursor").as_ref()),
+                fixture.parent_signature(101),
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn number_covered_by_the_childs_own_cache_is_served_uncut() {
+        with_fixture(150, 60, |fixture| async move {
+            let response = fixture
+                .call(
+                    120,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await;
+            assert_eq!(strategy_header(&response), Some("list-cache"));
+            let inner = response.into_inner();
+            let numbers: Vec<u64> = inner.items.iter().map(|item| item.number).collect();
+            assert_eq!(numbers, (101..=200).rev().collect::<Vec<u64>>());
+            let child_200 = fixture
+                .child_revisions
+                .iter()
+                .find(|(number, _)| *number == 200)
+                .map(|(_, signature)| *signature)
+                .expect("child revision 200");
+            assert_eq!(Hash::from(inner.items[0].signature.as_ref()), child_200,);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn signature_of_a_child_revision_lists_across_the_branch_point() {
+        with_fixture(150, 10, |fixture| async move {
+            let (tip_number, tip_signature) = fixture.child_revisions[0];
+            let inner = handler(
+                make_request_signature(fixture.repository, tip_signature),
+                fixture.immutable_store.clone(),
+                fixture.mutable_store.clone(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                lore_server::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(tip_number, 160);
+            let numbers: Vec<u64> = inner.items.iter().map(|item| item.number).collect();
+            assert_eq!(numbers, (101..=160).rev().collect::<Vec<u64>>());
+            assert_eq!(Hash::from(inner.items[0].signature.as_ref()), tip_signature,);
+            assert!(inner.signature_forward.is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn child_without_revisions_has_no_forward_cursor_at_its_tip() {
+        with_fixture(150, 0, |fixture| async move {
+            let response = fixture
+                .call(
+                    0,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await
+                .into_inner();
+            assert_eq!(response.items[0].number, 150);
+            assert!(response.signature_forward.is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn number_above_the_branch_point_is_served_from_the_child() {
+        with_fixture(150, 10, |fixture| async move {
+            let response = fixture
+                .call(
+                    155,
+                    lore_server::grpc::server::RevisionListAcceleration::default(),
+                )
+                .await
+                .into_inner();
+            assert_eq!(response.items[0].number, 155);
+            let child_signature = fixture
+                .child_revisions
+                .iter()
+                .find(|(number, _)| *number == 155)
+                .map(|(_, signature)| *signature)
+                .expect("child revision 155");
+            assert_eq!(
+                Hash::from(response.items[0].signature.as_ref()),
+                child_signature,
+            );
+        })
+        .await;
+    }
+}
+
+mod handler_on_grandchild_branch {
+    use super::*;
+
+    /// `main` holds 1..=250, `child` branches at 150 and gets 60 revisions
+    /// (151..=210), and `grandchild` branches from the child's 155 and gets 5.
+    struct Fixture {
+        repository: RepositoryId,
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        grandchild: BranchId,
+        main_signatures: Vec<Hash>,
+        child_revisions: Vec<(u64, Hash)>,
+        grandchild_revisions: Vec<(u64, Hash)>,
+    }
+
+    impl Fixture {
+        async fn call(
+            &self,
+            number: u64,
+        ) -> tonic::Response<lore_proto::lore::revision::v1::RevisionListResponse> {
+            handler(
+                make_request_identifier(self.repository, self.grandchild, number),
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                lore_server::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+        }
+
+        fn child_signature(&self, number: u64) -> Hash {
+            self.child_revisions
+                .iter()
+                .find(|(candidate, _)| *candidate == number)
+                .map(|(_, signature)| *signature)
+                .expect("child revision")
+        }
+    }
+
+    async fn with_fixture<F, Fut>(body: F)
+    where
+        F: FnOnce(Fixture) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (main, main_signatures) =
+                create_branch_with_history(&repository_context, 250).await;
+            let main_point = BranchPoint {
+                branch: main,
+                revision: main_signatures[250 - 150],
+            };
+            let (child, child_revisions) =
+                create_child_branch_with_history(&repository_context, vec![main_point.clone()], 60)
+                    .await;
+            let child_point = BranchPoint {
+                branch: child,
+                revision: child_revisions
+                    .iter()
+                    .find(|(number, _)| *number == 155)
+                    .map(|(_, signature)| *signature)
+                    .expect("child revision 155"),
+            };
+            let (grandchild, grandchild_revisions) = create_child_branch_with_history(
+                &repository_context,
+                vec![child_point, main_point],
+                5,
+            )
+            .await;
+            body(Fixture {
+                repository,
+                immutable_store,
+                mutable_store,
+                grandchild,
+                main_signatures,
+                child_revisions,
+                grandchild_revisions,
+            })
+            .await;
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn number_between_the_branch_points_is_served_from_the_middle_branch() {
+        with_fixture(|fixture| async move {
+            let response = fixture.call(153).await;
+            assert_eq!(strategy_header(&response), Some("list-cache"));
+            let inner = response.into_inner();
+            let numbers: Vec<u64> = inner.items.iter().map(|item| item.number).collect();
+            assert_eq!(numbers, (101..=155).rev().collect::<Vec<u64>>());
+            assert_eq!(
+                Hash::from(inner.items[0].signature.as_ref()),
+                fixture.child_signature(155),
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn number_below_both_branch_points_is_served_from_the_root_branch() {
+        with_fixture(|fixture| async move {
+            let response = fixture.call(120).await;
+            assert_eq!(strategy_header(&response), Some("list-cache"));
+            let inner = response.into_inner();
+            let numbers: Vec<u64> = inner.items.iter().map(|item| item.number).collect();
+            assert_eq!(numbers, (101..=150).rev().collect::<Vec<u64>>());
+            assert_eq!(
+                Hash::from(inner.items[0].signature.as_ref()),
+                fixture.main_signatures[250 - 150],
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn number_above_both_branch_points_is_served_from_the_grandchild() {
+        with_fixture(|fixture| async move {
+            let response = fixture.call(158).await.into_inner();
+            assert_eq!(response.items[0].number, 158);
+            let grandchild_158 = fixture
+                .grandchild_revisions
+                .iter()
+                .find(|(number, _)| *number == 158)
+                .map(|(_, signature)| *signature)
+                .expect("grandchild revision 158");
+            assert_eq!(
+                Hash::from(response.items[0].signature.as_ref()),
+                grandchild_158,
+            );
+            assert_ne!(grandchild_158, fixture.child_signature(158));
+        })
+        .await;
+    }
 }

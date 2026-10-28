@@ -46,6 +46,8 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::none_or_status;
+use crate::grpc::revision::v1::branch_lineage::BranchLineage;
+use crate::grpc::revision::v1::branch_lineage::HistoryOwner;
 use crate::grpc::revision::v1::service::RevisionListInstruments;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
@@ -183,19 +185,34 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            // A signature names a revision and not a branch to view it from, so
+            // only an identifier start has a lineage.
+            let lineage = match &start {
+                Start::Identifier(identifier) => {
+                    Some(BranchLineage::new(BranchId::from(&identifier.branch_id)))
+                }
+                Start::Signature(_) => None,
+            };
+
             let resolved = {
                 let labels = smallvec![KeyValue::new(
                     METRICS_START_KEY,
                     start_to_metric_value(&start),
                 )];
-                resolve_start(start, &repository, history_step_size, acceleration)
-                    .observe(
-                        instruments.resolve_start_duration.clone(),
-                        labels,
-                        observe_resolve_start(),
-                    )
-                    .await
-                    .output?
+                resolve_start(
+                    start,
+                    lineage.as_ref(),
+                    &repository,
+                    history_step_size,
+                    acceleration,
+                )
+                .observe(
+                    instruments.resolve_start_duration.clone(),
+                    labels,
+                    observe_resolve_start(),
+                )
+                .await
+                .output?
             };
 
             let (walked, strategy) = match resolved {
@@ -237,8 +254,14 @@ pub async fn handler(
 
             debug!(walked_items = walked.items.len(), %strategy, "Finished walk");
 
-            let signature_forward =
-                forward_cursor(&repository, &walked, history_step_size, acceleration).await?;
+            let signature_forward = forward_cursor(
+                &repository,
+                &walked,
+                lineage.as_ref(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
             let signature_backward = walked.next_older;
 
             debug!(
@@ -268,6 +291,7 @@ pub async fn handler(
 /// the step-key dance would always miss for the zero block.
 async fn resolve_start(
     start: Start,
+    lineage: Option<&BranchLineage>,
     repository: &Arc<RepositoryContext>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
@@ -303,93 +327,127 @@ async fn resolve_start(
                 });
             }
 
-            if acceleration.list_cache {
-                if let Some(cached) = cache::revision::load_cached_list(
-                    repository,
-                    branch,
-                    identifier.number,
-                    history_step_size,
-                )
-                .await
-                .filter_slow_down()?
-                .unwrap_or_default()
-                    && cached
-                        .items()
-                        .iter()
-                        .any(|item| item.number == identifier.number)
-                {
-                    debug!(
-                        number = identifier.number,
-                        "Served revision list from cache"
-                    );
-                    return Ok(ResolveStart::Items {
-                        items: cached_to_proto(cached.items()),
-                        branch,
-                        next_older: cached_next_older(cached.items()),
-                        strategy: RevisionListStrategy::ListCache,
-                    });
-                }
-
-                if let Some(cached) = cache::revision::try_backfill_segment(
-                    repository,
-                    branch,
-                    identifier.number,
-                    history_step_size,
-                )
-                .await
-                .filter_slow_down()?
-                .unwrap_or_default()
-                    && cached
-                        .items()
-                        .iter()
-                        .any(|item| item.number == identifier.number)
-                {
-                    debug!(number = identifier.number, "Backfilled revision list cache");
-                    return Ok(ResolveStart::Items {
-                        items: cached_to_proto(cached.items()),
-                        branch,
-                        next_older: cached_next_older(cached.items()),
-                        strategy: RevisionListStrategy::ListCacheBackfill,
-                    });
-                }
+            let requested = HistoryOwner::requested(branch);
+            if let Some(accelerated) = accelerated_start(
+                repository,
+                &requested,
+                identifier.number,
+                history_step_size,
+                acceleration,
+            )
+            .await?
+            {
+                return Ok(accelerated);
             }
 
-            let step_key_hit = if acceleration.step_keys {
-                cache::revision::resolve_via_step_key(
+            // The requested branch's own data had nothing, so the number may
+            // be at or below a branch point and described by an ancestor.
+            if let Some(lineage) = lineage
+                && let Some(owner) = lineage.owner_of(repository, identifier.number).await?
+                && owner.branch != branch
+                && let Some(accelerated) = accelerated_start(
                     repository,
-                    branch,
+                    &owner,
                     identifier.number,
                     history_step_size,
+                    acceleration,
                 )
-                .await
-                .filter_slow_down()?
-                .unwrap_or_default()
-            } else {
-                None
-            };
-
-            if let Some(hash) = step_key_hit {
-                Ok(ResolveStart::Walk {
-                    start: hash,
-                    strategy: RevisionListStrategy::HistoryStep,
-                })
-            } else {
-                let signature = format!("{branch}@{}", identifier.number);
-                let hash = revision::resolve_boxed(
-                    repository.clone(),
-                    signature,
-                    ResolveSearchLocation::Local,
-                )
-                .await
-                .filter_slow_down()?
-                .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
-                Ok(ResolveStart::Walk {
-                    start: hash,
-                    strategy: RevisionListStrategy::FullIteration,
-                })
+                .await?
+            {
+                return Ok(accelerated);
             }
+
+            let signature = format!("{branch}@{}", identifier.number);
+            let hash = revision::resolve_boxed(
+                repository.clone(),
+                signature,
+                ResolveSearchLocation::Local,
+            )
+            .await
+            .filter_slow_down()?
+            .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
+            Ok(ResolveStart::Walk {
+                start: hash,
+                strategy: RevisionListStrategy::FullIteration,
+            })
         }
     }
+}
+
+/// Builds the page for a cached segment of `owner`.
+fn cached_start(
+    owner: &HistoryOwner,
+    segment: &[branch::CachedRevisionItem],
+    strategy: RevisionListStrategy,
+) -> ResolveStart {
+    // The segment is the owner's and can run past the branch point: a branch
+    // made at 150 does not contain the owner's 151..=200.
+    let visible = owner.visible(segment);
+    ResolveStart::Items {
+        items: cached_to_proto(visible),
+        branch: owner.branch,
+        next_older: cached_next_older(visible),
+        strategy,
+    }
+}
+
+/// Serves an identifier lookup from the acceleration data of `owner`, or
+/// `None` when that branch has none covering the number.
+async fn accelerated_start(
+    repository: &Arc<RepositoryContext>,
+    owner: &HistoryOwner,
+    number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<Option<ResolveStart>, Status> {
+    if acceleration.list_cache {
+        if let Some(cached) =
+            cache::revision::load_cached_list(repository, owner.branch, number, history_step_size)
+                .await
+                .filter_slow_down()?
+                .unwrap_or_default()
+            && cached.items().iter().any(|item| item.number == number)
+        {
+            debug!(number, "Served revision list from cache");
+            return Ok(Some(cached_start(
+                owner,
+                cached.items(),
+                RevisionListStrategy::ListCache,
+            )));
+        }
+
+        if let Some(cached) = cache::revision::try_backfill_segment(
+            repository,
+            owner.branch,
+            number,
+            history_step_size,
+        )
+        .await
+        .filter_slow_down()?
+        .unwrap_or_default()
+            && cached.items().iter().any(|item| item.number == number)
+        {
+            debug!(number, "Backfilled revision list cache");
+            return Ok(Some(cached_start(
+                owner,
+                cached.items(),
+                RevisionListStrategy::ListCacheBackfill,
+            )));
+        }
+    }
+
+    if !acceleration.step_keys {
+        return Ok(None);
+    }
+    let step_key_hit =
+        cache::revision::resolve_via_step_key(repository, owner.branch, number, history_step_size)
+            .await
+            .filter_slow_down()?
+            .unwrap_or_default();
+    Ok(step_key_hit.map(|hash| ResolveStart::Walk {
+        start: hash,
+        strategy: RevisionListStrategy::HistoryStep,
+    }))
 }
 
 /// Try to serve a signature-anchored request from the cache: deserialize
@@ -992,16 +1050,29 @@ async fn descend_unverified_gap(
 async fn forward_cursor(
     repository: &Arc<RepositoryContext>,
     walked: &Walked,
+    lineage: Option<&BranchLineage>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Option<Hash>, Status> {
     let Some(first) = walked.items.first() else {
         return Ok(None);
     };
-    let Some(branch) = walked.branch else {
+    let Some(page_branch) = walked.branch else {
         return Ok(None);
     };
     let first_number = first.number;
+    // A page created on the requested branch has its successor there too. A
+    // page from an ancestor ends at a branch point, whose successor sits on
+    // whichever branch holds the next number in the requested branch's history.
+    let owner = match lineage {
+        Some(lineage) if lineage.branch() != page_branch => {
+            lineage
+                .owner_of(repository, first_number.saturating_add(1))
+                .await?
+        }
+        _ => None,
+    };
+    let branch = owner.map_or(page_branch, |owner| owner.branch);
     let first_signature = Hash::from(first.signature.as_ref());
 
     let latest = branch::load_latest(repository.clone(), branch)
