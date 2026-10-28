@@ -178,7 +178,7 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 
 #### `presigned_url_hmac_key`
 
-This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment.
+This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment. Vending a presigned URL needs the `presign` permission on the repository. Without `[server.auth]`, every caller holds it.
 
 #### Presigned URL content types
 

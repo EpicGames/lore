@@ -5,9 +5,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-use lore_server::http::repositories::repository::contents::content::presign_repository_content::call_is_service_account;
 use lore_server::http::security_headers::ContentTypePolicy;
 use lore_server::http::server::LoreHttpServerSettings;
 use lore_server::http::server::ServerHealth;
@@ -19,39 +17,6 @@ use serde_json::json;
 use crate::http::test_utils::content_type_policy;
 use crate::http::test_utils::presign_config_with_policy;
 use crate::store::test_support::test_store_create;
-
-fn token_with_service_account(is_service_account: Option<bool>) -> AuthorizationToken {
-    AuthorizationToken {
-        is_service_account,
-        ..Default::default()
-    }
-}
-
-#[test]
-fn service_account_may_vend() {
-    assert!(call_is_service_account(&Some(token_with_service_account(
-        Some(true)
-    ))));
-}
-
-#[test]
-fn non_service_account_may_not_vend() {
-    assert!(!call_is_service_account(&Some(token_with_service_account(
-        Some(false)
-    ))));
-}
-
-#[test]
-fn missing_service_account_claim_may_not_vend() {
-    assert!(!call_is_service_account(&Some(token_with_service_account(
-        None
-    ))));
-}
-
-#[test]
-fn no_auth_configured_may_vend() {
-    assert!(call_is_service_account(&None));
-}
 
 async fn mint(body: serde_json::Value) -> axum_test::TestResponse {
     mint_with_policy(body, ContentTypePolicy::default()).await

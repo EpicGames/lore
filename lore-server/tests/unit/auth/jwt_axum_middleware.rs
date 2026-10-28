@@ -24,6 +24,7 @@ use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::repository_authorizer::Action;
+use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::http::server::LoreHttpServerSettings;
@@ -31,7 +32,9 @@ use lore_server::http::server::ServerHealth;
 use lore_server::http::server::ServerState;
 use lore_server::http::server::create_router;
 use rand::random;
+use serde_json::json;
 
+use crate::http::test_utils::presign_config;
 use crate::store::test_support::test_store_create;
 
 const ALGORITHM: Algorithm = Algorithm::HS256;
@@ -225,6 +228,70 @@ async fn any_grant_reads_and_put_needs_write() {
                     .await;
                 assert_eq!(response.status_code(), put_status, "PUT with {action}");
             }
+        })
+        .await;
+}
+
+/// Vending a presigned URL needs `presign`, which `write` does not imply.
+/// Without `[server.auth]` it stays open, since allow-all grants `presign`.
+#[tokio::test]
+async fn presign_needs_presign() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<Context>();
+            let (fragment, address, payload) = fragment::generate_random();
+            immutable_store
+                .clone()
+                .put(repository.into(), address, fragment, Some(payload), false)
+                .await
+                .expect("Failed to put data in immutable store");
+            let server = |jwt_verifier, repository_authorizer| {
+                let state = ServerState {
+                    immutable_store: immutable_store.clone(),
+                    mutable_store: mutable_store.clone(),
+                    jwt_verifier,
+                    repository_authorizer,
+                    max_file_size: 100,
+                    presign_config: Some(presign_config()),
+                };
+                let health = ServerHealth::new_without_availability(immutable_store.clone());
+                TestServer::new(create_router(
+                    state,
+                    health,
+                    &LoreHttpServerSettings::test_default(),
+                ))
+                .unwrap()
+            };
+            let url = format!("/v1/repository/{repository}/content/{address}/presign");
+
+            let legacy = server(
+                Some(verifier()),
+                Arc::new(AuthClientAuthorizer::new(
+                    "https://auth.invalid".to_string(),
+                )),
+            );
+            let auth_header = HeaderName::from_static("authorization");
+            for (action, status) in [
+                (Action::Write, HttpStatusCode::FORBIDDEN),
+                (Action::Presign, HttpStatusCode::OK),
+            ] {
+                let token = bearer(Some(vec![ResourcePermission {
+                    resource_id: format!("urc-{repository}"),
+                    permission: vec![action.to_string()],
+                }]));
+                let response = legacy
+                    .post(&url)
+                    .add_header(auth_header.clone(), token)
+                    .json(&json!({}))
+                    .await;
+                assert_eq!(response.status_code(), status, "presign with {action}");
+            }
+
+            let no_auth = server(None, Arc::new(AllowAllRepositoryAuthorizer));
+            let response = no_auth.post(&url).json(&json!({})).await;
+            assert_eq!(response.status_code(), HttpStatusCode::OK);
         })
         .await;
 }
