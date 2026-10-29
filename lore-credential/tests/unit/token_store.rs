@@ -7,10 +7,12 @@ use lore_credential::token_store::Refreshed;
 use lore_credential::token_store::RemoteIdentity;
 use lore_credential::token_store::RemovedRefreshToken;
 use lore_credential::token_store::TokenMap;
+use lore_credential::token_store::load_identities;
 use lore_credential::token_store::load_user_token;
 use lore_credential::token_store::load_user_token_from_store;
 use lore_credential::token_store::refresh_user_token;
 use lore_credential::token_store::remove_all_tokens_for_auth_url;
+use lore_credential::token_store::remove_user_token;
 use lore_credential::token_store::remove_user_token_if;
 use lore_credential::token_store::remove_user_tokens_for_auth_url;
 use lore_credential::token_store::store_user_token;
@@ -340,6 +342,29 @@ async fn a_conditional_removal_leaves_a_token_another_process_stored() {
         .expect("remove the newer token");
     let removed = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
     assert!(removed.is_err(), "the given token was left in the store");
+}
+
+/// An endpoint ending in a slash (e.g. authentik) finds the entry stored without it.
+#[tokio::test]
+async fn an_endpoint_ending_in_a_slash_finds_its_identities() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://auth.trailing-slash.test.invalid/application/o/lore/";
+    store_user_token(ENDPOINT, "alice", "a-token", Vec::new())
+        .await
+        .expect("store the login");
+
+    let identities = load_identities(ENDPOINT)
+        .await
+        .expect("load the identities");
+    assert_eq!(identities, ["alice"]);
+
+    remove_user_token(ENDPOINT, "alice")
+        .await
+        .expect("remove the login");
+    let identities = load_identities(ENDPOINT)
+        .await
+        .expect("load the identities");
+    assert!(identities.is_empty(), "the login was left in the store");
 }
 
 /// Held exclusively by a test that rewrites the store's file directly, which would undo what a

@@ -909,6 +909,7 @@ async fn remove_user_token_where(
     identity: &str,
     mut removes: impl FnMut(&str) -> bool,
 ) -> Result<(), TokenStoreError> {
+    let endpoint = endpoint.trim_end_matches('/');
     lore_trace!("Remove user {identity} token for auth_endpoint {endpoint}");
 
     let mut store = cached_token_map().await;
@@ -950,6 +951,7 @@ async fn remove_user_token_where(
 }
 
 pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
     lore_trace!("Load user identities for endpoint {auth_endpoint}");
 
     let mut identities = vec![];
