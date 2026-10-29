@@ -1913,7 +1913,15 @@ fn realize_change_modify_add(
             if change.action == change::FileAction::Move
                 && let Some(from_path) = change.move_source()
             {
-                relink_moved_node(&state_stage, &repository, &change, from_path, is_merge).await?;
+                relink_moved_node(
+                    &state_stage,
+                    &repository,
+                    &change,
+                    &node,
+                    from_path,
+                    is_merge,
+                )
+                .await?;
             } else {
                 let mut node = node;
                 if is_merge {
@@ -2008,6 +2016,7 @@ async fn relink_moved_node(
     state_stage: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     change: &NodeChange,
+    incoming: &Node,
     from_path: &RelativePath,
     is_merge: bool,
 ) -> Result<(), SyncError> {
@@ -2126,6 +2135,19 @@ async fn relink_moved_node(
             .write()
             .node_name_store(to_name, from_node.name_offset, from_node.name_length)
             .forward::<SyncError>("Failed to store node name")?;
+    }
+
+    // A move can carry an edit (Flags::Modify): the node keeps its identity, but takes the
+    // content or mode the move changed, or the edit is lost. What the move left alone stays as
+    // the target holds it, which may be an edit a merge folded into a pure rename.
+    if from_node.is_file() {
+        if change.from.address.hash != change.to.address.hash {
+            from_node.address = incoming.address;
+            from_node.size = incoming.size;
+        }
+        if crate::util::fs::mode_changed(change.from.mode, change.to.mode) {
+            from_node.mode = incoming.mode;
+        }
     }
 
     // Write back updated node data
