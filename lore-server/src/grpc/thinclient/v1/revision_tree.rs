@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use lore_proto::lore::thin_client::v1 as thin_client_v1;
 use lore_proto::lore::thin_client::v1::RevisionTreeRequest;
 use lore_proto::lore::thin_client::v1::RevisionTreeResponse;
 use lore_proto::lore::thin_client::v1::revision_tree_response::Payload;
+use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::tree;
 use lore_revision::util::path::RelativePath;
@@ -26,6 +28,7 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
 
+use super::helpers::load_revision_attribution;
 use super::helpers::node_flags_to_node_type;
 use super::helpers::resolve_to_identifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -75,6 +78,7 @@ pub async fn handler(
         _ => RelativePath::new(),
     };
     let max_depth = req.max_depth.map_or(usize::MAX, |d| d as usize);
+    let include_last_revision = req.include_last_revision;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(RepositoryContext::new_server_context(
@@ -105,7 +109,17 @@ pub async fn handler(
 
             lore_spawn!(
                 async move {
-                    stream_tree(repository, signature, path, max_depth, can_read, header, tx).await;
+                    stream_tree(
+                        repository,
+                        signature,
+                        path,
+                        max_depth,
+                        can_read,
+                        header,
+                        tx,
+                        include_last_revision,
+                    )
+                    .await;
                 }
                 .in_current_span()
             );
@@ -125,6 +139,7 @@ async fn stream_tree(
     can_read: lore_revision::state::CanReadRepository,
     header: thin_client_v1::RevisionTreeHeader,
     tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
+    include_last_revision: bool,
 ) {
     // Emit header first. If the client has already dropped, just bail.
     if tx
@@ -138,7 +153,16 @@ async fn stream_tree(
         return;
     }
 
-    let result = match tree(repository.clone(), signature, path, max_depth, can_read).await {
+    let result = match tree(
+        repository.clone(),
+        signature,
+        path,
+        max_depth,
+        can_read,
+        include_last_revision,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => {
             let status = if err.is_slow_down() {
@@ -159,8 +183,113 @@ async fn stream_tree(
         }
     };
 
-    let mut emitted: u64 = 0;
-    for tree_path in result.paths {
+    // Resolved up front so the emission loop does no storage I/O and the
+    // resolver is testable on its own.
+    let revisions = resolve_attributions(&repository, &result.paths).await;
+
+    emit_tree_stream(result.paths, revisions, tx).await;
+}
+
+/// Resolve every attribution the walk referenced, one load per distinct
+/// revision. A linked context is built only where the tree spans a link.
+///
+/// A revision that fails to load maps to `None` rather than being absent, so
+/// siblings sharing the key do not retry it.
+async fn resolve_attributions(
+    repository: &Arc<RepositoryContext>,
+    paths: &[lore_revision::state::TreePath],
+) -> HashMap<(RepositoryId, Hash), Option<thin_client_v1::Revision>> {
+    let mut resolved: HashMap<(RepositoryId, Hash), Option<thin_client_v1::Revision>> =
+        HashMap::new();
+    for tree_path in paths {
+        if tree_path.last_revision.is_zero() {
+            continue;
+        }
+        let key = (tree_path.last_revision_repository, tree_path.last_revision);
+        if resolved.contains_key(&key) {
+            continue;
+        }
+        let (repository_id, revision) = key;
+        let value = if repository_id == repository.id {
+            load_revision_attribution(repository, revision).await
+        } else {
+            let linked = repository.to_link_context(repository_id).await;
+            load_revision_attribution(&linked, revision).await
+        };
+        resolved.insert(key, value);
+    }
+    resolved
+}
+
+/// Streams `TreeRevision` payloads inline with `TreeNode`s, so a client can
+/// render rows as they arrive rather than waiting on the full revision set.
+/// Each revision is announced on first reference, before the `TreeNode`
+/// naming it.
+#[lore_macro::test_pub]
+async fn emit_tree_stream(
+    paths: Vec<lore_revision::state::TreePath>,
+    revisions: HashMap<(RepositoryId, Hash), Option<thin_client_v1::Revision>>,
+    tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
+) {
+    // `Some(index)`: Already announced. `None`: Unresolvable, do not retry.
+    let mut indices: HashMap<(RepositoryId, Hash), Option<u32>> = HashMap::new();
+    let mut next_index: u32 = 1;
+    let mut emitted_nodes: u64 = 0;
+    let mut emitted_revisions: u64 = 0;
+
+    for tree_path in paths {
+        let last_revision_index = if tree_path.last_revision.is_zero() {
+            None
+        } else {
+            let key = (tree_path.last_revision_repository, tree_path.last_revision);
+            if let Some(cached) = indices.get(&key).copied() {
+                cached
+            } else {
+                let allocated = match revisions.get(&key) {
+                    Some(Some(revision_msg)) => {
+                        let index = next_index;
+                        // A walk with 4 billion distinct revisions would
+                        // wrap past `u32::MAX`. Fail the stream instead.
+                        let Some(next) = next_index.checked_add(1) else {
+                            warn!("RevisionTree attribution index space exhausted");
+                            let _ = tx
+                                .send(Err(Status::internal(
+                                    "RevisionTree attribution index space exhausted",
+                                )))
+                                .await;
+                            return;
+                        };
+                        next_index = next;
+                        // Emit TreeRevision strictly before the referencing TreeNode.
+                        if tx
+                            .send(Ok(RevisionTreeResponse {
+                                payload: Some(Payload::Revision(thin_client_v1::TreeRevision {
+                                    index,
+                                    revision: Some(revision_msg.clone()),
+                                })),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            debug!(
+                                emitted_nodes,
+                                emitted_revisions,
+                                "RevisionTree receiver dropped before TreeRevision",
+                            );
+                            return;
+                        }
+                        emitted_revisions += 1;
+                        Some(index)
+                    }
+                    // Unresolvable, or absent because the walk attributed an
+                    // entry the resolver never saw. Both mean no index.
+                    Some(None) | None => None,
+                };
+                indices.insert(key, allocated);
+                allocated
+            }
+        };
+
         let node = thin_client_v1::TreeNode {
             path: tree_path.path.to_string(),
             node_type: node_flags_to_node_type(tree_path.flags) as i32,
@@ -168,6 +297,7 @@ async fn stream_tree(
             size: tree_path.size,
             mode: tree_path.mode,
             tracking: tree_path.tracking,
+            last_revision_index,
         };
         if tx
             .send(Ok(RevisionTreeResponse {
@@ -176,11 +306,14 @@ async fn stream_tree(
             .await
             .is_err()
         {
-            debug!(emitted, "RevisionTree receiver dropped mid-stream");
+            debug!(
+                emitted_nodes,
+                emitted_revisions, "RevisionTree receiver dropped mid-stream",
+            );
             return;
         }
-        emitted += 1;
+        emitted_nodes += 1;
     }
 
-    debug!(emitted, "RevisionTree complete");
+    debug!(emitted_nodes, emitted_revisions, "RevisionTree complete");
 }

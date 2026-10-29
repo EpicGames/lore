@@ -139,6 +139,9 @@ message TreeNode {
   // True when a link entry tracks its parent's branch; false for pinned links
   // and non-link entries.
   bool tracking = 6;
+  // Index of the TreeRevision that last modified this entry. Set only when
+  // the request asks for attribution. Absent if it can't be resolved.
+  optional uint32 last_revision_index = 7;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier

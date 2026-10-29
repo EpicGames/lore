@@ -3491,9 +3491,8 @@ async fn generate_delta_block(
 }
 
 /// The revision the tree of a revision was built from, which the tree shares node IDs with.
-#[lore_macro::test_pub]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BasedOn {
+pub enum BasedOn {
     /// The first parent, as for a revision committed on top of it.
     FirstParent,
     /// Another revision: the second parent of a merge reconciling divergent history, which is
@@ -3513,8 +3512,7 @@ pub(crate) enum BasedOn {
 /// [counterpart](find_counterpart_node) of each node, and a node the merge changed first takes
 /// the first parent's history of its counterpart. The second parent's history is recorded on the
 /// node at the same path.
-#[lore_macro::test_pub]
-pub(crate) async fn weave_history(
+pub async fn weave_history(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     based_on: BasedOn,

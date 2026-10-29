@@ -124,6 +124,10 @@ message RevisionTreeRequest {
   // emits only direct children of the prefix root; 2 emits direct
   // children plus grandchildren; etc. 0 or unset means unbounded.
   optional uint32 max_depth = 4;
+  // If true, populate `TreeNode.last_revision_index` and emit the revisions
+  // it names as `TreeRevision` payloads. Off by default. Attribution adds a
+  // block read per entry and one revision load per distinct revision.
+  bool include_last_revision = 5;
 }
 
 // Header for a RevisionTree stream. Echoes the resolved revision so
@@ -136,14 +140,29 @@ message RevisionTreeHeader {
   bytes signature = 2;
 }
 
+// A revision named by TreeNode.last_revision_index. Emitted once per
+// revision, in discovery order from index 1, and always before the first
+// TreeNode naming it. Index 0 is reserved.
+message TreeRevision {
+  // Per-stream index, assigned in discovery order.
+  uint32 index = 1;
+  // Carries only attribution-facing fields: `signature`, `identifier`,
+  // `number`, `commit_message`, `timestamp` and `committed_by`. Call
+  // RevisionInfo for the full record.
+  Revision revision = 2;
+}
+
 // Server-streamed response for RevisionTree. First message carries
 // `payload.header`; subsequent messages stream `TreeNode` items in
-// server-natural order.
+// server-natural order, interleaved with `TreeRevision` payloads when
+// attribution is requested.
 message RevisionTreeResponse {
   oneof payload {
     // Header echoing the resolved revision.
     RevisionTreeHeader header = 1;
     // A tree entry (directory, file, or link).
     TreeNode node = 2;
+    // A revision named by a later TreeNode.
+    TreeRevision revision = 3;
   }
 }

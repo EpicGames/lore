@@ -12,6 +12,7 @@ mod stream;
 pub mod stream;
 
 use core::str;
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write;
 use std::mem::size_of;
@@ -5126,6 +5127,89 @@ pub struct TreePath {
     /// True when a link node tracks its parent's branch; false for pinned
     /// links and all non-link nodes.
     pub tracking: bool,
+    /// Revision that last modified this entry. Set only when the walk is
+    /// asked for it. Zero if the entry has no history record.
+    pub last_revision: Hash,
+    /// Repository the `last_revision` lives in. Equals the walked repository
+    /// for top-level entries; for entries inside a linked subtree it is the
+    /// linked repository, since the walker crosses link boundaries and each
+    /// side's revisions belong to their own state. Zero when `last_revision`
+    /// is zero.
+    pub last_revision_repository: RepositoryId,
+}
+
+/// Per-state context for resolving [`TreePath::last_revision`].
+///
+/// Bound to one `(state, repository)` pair. The walker crosses link boundaries
+/// into repositories with their own state, so each side needs its own
+/// `TreeAttribution`. Mixing them attributes against the wrong state silently.
+/// `NodeID` is a plain `u32`, so a foreign one reads a valid-looking record
+/// and returns plausible garbage.
+struct TreeAttribution {
+    /// Nodes the walked revision itself changed.
+    changed: HashSet<NodeID>,
+    /// The walked revision.
+    revision: Hash,
+    /// Repository the walked revision belongs to.
+    repository_id: RepositoryId,
+}
+
+impl TreeAttribution {
+    async fn new(state: &State, repository: Arc<RepositoryContext>) -> Result<Self, StateError> {
+        let repository_id = repository.id;
+        let delta_block = state
+            .delta_block(repository)
+            .await?
+            .to_aligned::<NodeDelta>();
+        let changed = delta_block
+            .as_type_slice::<NodeDelta>()
+            .iter()
+            .map(|delta| delta.node)
+            .collect();
+        Ok(Self {
+            changed,
+            revision: state.revision(),
+            repository_id,
+        })
+    }
+
+    fn repository_id(&self) -> RepositoryId {
+        self.repository_id
+    }
+
+    /// Revision that last modified `node`, as the first entry `lore file
+    /// history` reports. That is the walked revision when it changed the node,
+    /// merges included, so a merge stands for what it merged in. Otherwise
+    /// slot 0, or slot 1 where slot 0 is zero.
+    async fn last_revision(
+        &self,
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Hash, StateError> {
+        if self.changed.contains(&node) {
+            return Ok(self.revision);
+        }
+        let metadata_node = node_to_file_metadata(node);
+        // Not `block_file_metadata`: it materialises a throwaway 64KB block
+        // when none exists. No block means no attribution (a zero revision).
+        let Some(block) = state
+            .try_block_file_metadata_existing(
+                repository,
+                NodeFileMetadataBlock::index(metadata_node),
+            )
+            .await?
+        else {
+            return Ok(Hash::default());
+        };
+        let reader = block.read();
+        let record = reader.node(NodeFileMetadata::index(metadata_node));
+        Ok(if record.revision[0].is_zero() {
+            record.revision[1]
+        } else {
+            record.revision[0]
+        })
+    }
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -5144,6 +5228,7 @@ pub async fn gather_tree_paths(
     path: RelativePath,
     max_depth: usize,
     can_read: CanReadRepository,
+    include_last_revision: bool,
 ) -> Result<Vec<TreePath>, StateError> {
     let (walk_state, walk_repository, parent_node_id) = if path.is_empty() {
         (state, repository, ROOT_NODE)
@@ -5181,6 +5266,7 @@ pub async fn gather_tree_paths(
         0,
         can_read,
         &mut paths,
+        include_last_revision,
     )
     .await?;
     Ok(paths)
@@ -5197,6 +5283,7 @@ async fn enumerate_children(
     link_depth: usize,
     can_read: CanReadRepository,
     result: &mut Vec<TreePath>,
+    include_last_revision: bool,
 ) -> Result<(), StateError> {
     let block_index = NodeBlock::index(parent_node_id);
     let node_index = Node::index(parent_node_id);
@@ -5208,6 +5295,17 @@ async fn enumerate_children(
         }
         .into());
     }
+    // Attribution is per-`enumerate_children` invocation so that each side
+    // of a link boundary gets its own context built from its own state. The
+    // walker calls `enumerate_children` at the top level and again on every
+    // link descent (see `gather_tree_paths_node` below).
+    let attribution = if include_last_revision {
+        Some(Arc::new(
+            TreeAttribution::new(&state, repository.clone()).await?,
+        ))
+    } else {
+        None
+    };
     let mut cycle = SiblingCycleGuard::new(parent_node_id);
     gather_tree_paths_node_recurse(
         state,
@@ -5221,6 +5319,8 @@ async fn enumerate_children(
         can_read,
         result,
         &mut cycle,
+        attribution,
+        include_last_revision,
     )
     .await
 }
@@ -5258,6 +5358,8 @@ async fn gather_tree_paths_node(
     can_read: CanReadRepository,
     result: &mut Vec<TreePath>,
     cycle: &mut SiblingCycleGuard,
+    attribution: Option<Arc<TreeAttribution>>,
+    include_last_revision: bool,
 ) -> Result<Option<NodeID>, StateError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -5302,6 +5404,23 @@ async fn gather_tree_paths_node(
     } else {
         false
     };
+    let (last_revision, last_revision_repository) = match attribution.as_ref() {
+        Some(attribution) => (
+            attribution
+                .last_revision(&state, repository.clone(), node_id)
+                .await?,
+            attribution.repository_id(),
+        ),
+        None => (Hash::default(), RepositoryId::default()),
+    };
+    // A zero last_revision has no meaningful repository. Keep the repository
+    // field zero in that case so downstream consumers do not have to remember
+    // the pairing rule.
+    let last_revision_repository = if last_revision.is_zero() {
+        RepositoryId::default()
+    } else {
+        last_revision_repository
+    };
     result.push(TreePath {
         path: node_path.clone(),
         address,
@@ -5309,6 +5428,8 @@ async fn gather_tree_paths_node(
         size: node.size,
         mode: node.mode as u64,
         tracking,
+        last_revision,
+        last_revision_repository,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;
@@ -5326,6 +5447,8 @@ async fn gather_tree_paths_node(
             can_read,
             result,
             &mut child_cycle,
+            attribution,
+            include_last_revision,
         )
         .await?;
     } else if node.is_link() && depth_remaining && link_depth < MAX_LINK_DEPTH {
@@ -5339,6 +5462,10 @@ async fn gather_tree_paths_node(
             let linked_repo = repository.to_link_context(link.repository).await;
             match State::deserialize(linked_repo.clone(), link.revision).await {
                 Ok(linked_state) => {
+                    // Attribution follows the walker across the link boundary.
+                    // `enumerate_children` builds a fresh `TreeAttribution` from
+                    // the linked state, so entries inside the subtree are
+                    // attributed against their own repository's revisions.
                     if let Err(err) = enumerate_children(
                         linked_state,
                         linked_repo,
@@ -5349,6 +5476,7 @@ async fn gather_tree_paths_node(
                         link_depth + 1,
                         can_read,
                         result,
+                        include_last_revision,
                     )
                     .await
                     {
@@ -5388,6 +5516,8 @@ fn gather_tree_paths_node_recurse<'a>(
     can_read: CanReadRepository,
     result: &'a mut Vec<TreePath>,
     cycle: &'a mut SiblingCycleGuard,
+    attribution: Option<Arc<TreeAttribution>>,
+    include_last_revision: bool,
 ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
     Box::pin(async move {
         let mut next = first_child;
@@ -5404,6 +5534,8 @@ fn gather_tree_paths_node_recurse<'a>(
                 can_read.clone(),
                 result,
                 cycle,
+                attribution.clone(),
+                include_last_revision,
             )
             .await?;
         }
