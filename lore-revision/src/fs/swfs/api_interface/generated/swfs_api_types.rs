@@ -26,24 +26,25 @@ pub const SWFSResult_Enum_SWFSResult_BufferNotAligned: SWFSResult_Enum = -214748
 pub const SWFSResult_Enum_SWFSResult_BufferTooSmall: SWFSResult_Enum = -2147483645;
 pub const SWFSResult_Enum_SWFSResult_VirtualFileReadFailed: SWFSResult_Enum = -2147483644;
 pub const SWFSResult_Enum_SWFSResult_ThawPathConflict: SWFSResult_Enum = -2147483643;
+pub const SWFSResult_Enum_SWFSResult_RangeNotAligned: SWFSResult_Enum = -2147483642;
 pub type SWFSResult_Enum = ::std::os::raw::c_int;
-pub const SWFSNodeModFlag_NewNode: swfs_u16 = 1;
-pub const SWFSNodeModFlag_ChangeFlags: swfs_u16 = 2;
-pub const SWFSNodeModFlag_ChangeTree: swfs_u16 = 4;
-pub const SWFSNodeModFlag_Deleted: swfs_u16 = 8;
-pub const SWFSNodeModFlag_UpdateTimeCreate: swfs_u16 = 16;
-pub const SWFSNodeModFlag_UpdateTimeRead: swfs_u16 = 32;
-pub const SWFSNodeModFlag_UpdateTimeWrite: swfs_u16 = 64;
-pub const SWFSNodeModFlag_UpdateTimeChange: swfs_u16 = 128;
-pub const SWFSNodeModFlag_UpdateSize: swfs_u16 = 256;
-pub const SWFSNodeModFlag_UpdateAttrs: swfs_u16 = 512;
-pub const SWFSNodeModFlag_UpdateName: swfs_u16 = 1024;
-pub const SWFSNodeModFlag_DeVirtualize: swfs_u16 = 2048;
-pub const SWFSNodeModFlag_Hydrate: swfs_u16 = 4096;
-pub const SWFSNodeModFlag_BlockReserve: swfs_u16 = 8192;
-pub const SWFSNodeModFlag_BlockAlloc: swfs_u16 = 16384;
-pub const SWFSNodeModFlag_ChangedWhileFrozen: swfs_u16 = 32768;
-pub const SWFSNodeModFlag_DontFreeze: swfs_u16 = 32768;
+pub const SWFSNodeModFlag_NewNode: swfs_u32 = 1;
+pub const SWFSNodeModFlag_ChangeFlags: swfs_u32 = 2;
+pub const SWFSNodeModFlag_ChangeTree: swfs_u32 = 4;
+pub const SWFSNodeModFlag_Deleted: swfs_u32 = 8;
+pub const SWFSNodeModFlag_UpdateTimeCreate: swfs_u32 = 16;
+pub const SWFSNodeModFlag_UpdateTimeRead: swfs_u32 = 32;
+pub const SWFSNodeModFlag_UpdateTimeWrite: swfs_u32 = 64;
+pub const SWFSNodeModFlag_UpdateTimeChange: swfs_u32 = 128;
+pub const SWFSNodeModFlag_UpdateSize: swfs_u32 = 256;
+pub const SWFSNodeModFlag_UpdateAttrs: swfs_u32 = 512;
+pub const SWFSNodeModFlag_UpdateName: swfs_u32 = 1024;
+pub const SWFSNodeModFlag_DeVirtualize: swfs_u32 = 2048;
+pub const SWFSNodeModFlag_Hydrate: swfs_u32 = 4096;
+pub const SWFSNodeModFlag_BlockReserve: swfs_u32 = 8192;
+pub const SWFSNodeModFlag_BlockAlloc: swfs_u32 = 16384;
+pub const SWFSNodeModFlag_ChangedWhileFrozen: swfs_u32 = 32768;
+pub const SWFSNodeModFlag_DontFreeze: swfs_u32 = 32768;
 pub const SWFSLogFlag_EventWrite: swfs_u32 = 1;
 pub const SWFSLogFlag_EventRead: swfs_u32 = 2;
 pub const SWFSLogFlag_ModifyNode: swfs_u32 = 4;
@@ -81,7 +82,7 @@ pub struct SWFSFile {
     pub path: *mut swfs_utf8,
     pub finfo: SWFSFInfo,
     pub file_index: swfs_u32,
-    pub mod_flags: swfs_u16,
+    pub mod_flags: swfs_u32,
     pub next: *mut SWFSFile,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -170,11 +171,10 @@ pub struct SWFSInit {
     pub num_write_threads: ::std::os::raw::c_int,
     pub callbacks: SWFSCallbacks,
     pub log_path: *const ::std::os::raw::c_char,
-    pub source_revision: *const swfs_utf8,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of SWFSInit"][::std::mem::size_of::<SWFSInit>() - 120usize];
+    ["Size of SWFSInit"][::std::mem::size_of::<SWFSInit>() - 112usize];
     ["Alignment of SWFSInit"][::std::mem::align_of::<SWFSInit>() - 8usize];
     ["Offset of field: SWFSInit::name"][::std::mem::offset_of!(SWFSInit, name) - 0usize];
     ["Offset of field: SWFSInit::write_dir"][::std::mem::offset_of!(SWFSInit, write_dir) - 8usize];
@@ -188,8 +188,6 @@ const _: () = {
         [::std::mem::offset_of!(SWFSInit, num_write_threads) - 40usize];
     ["Offset of field: SWFSInit::callbacks"][::std::mem::offset_of!(SWFSInit, callbacks) - 48usize];
     ["Offset of field: SWFSInit::log_path"][::std::mem::offset_of!(SWFSInit, log_path) - 104usize];
-    ["Offset of field: SWFSInit::source_revision"]
-        [::std::mem::offset_of!(SWFSInit, source_revision) - 112usize];
 };
 pub type SWFSDataCBFn = ::std::option::Option<
     unsafe extern "C" fn(

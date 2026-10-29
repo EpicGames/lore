@@ -4,7 +4,7 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::swfs::api_interface::SwfsInterfaceError;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFInfo;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
-use crate::fs::swfs::api_interface::swfs_api::swfs_u16;
+use crate::fs::swfs::api_interface::swfs_api::swfs_u32;
 use crate::fs::swfs::api_interface::swfs_api::swfs_u64;
 
 pub struct SwfsFileArray {
@@ -56,7 +56,7 @@ impl SwfsFile {
     pub fn new(
         name: CString,
         file_info: &FileInfo,
-        flags: Option<swfs_u16>,
+        flags: Option<swfs_u32>,
     ) -> Result<SwfsFile, SwfsInterfaceError> {
         let name = name.into_raw();
         Ok(Self {
