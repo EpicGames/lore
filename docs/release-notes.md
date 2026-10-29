@@ -358,6 +358,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   completes. `data_out` must stay valid until completion, and `lore_shutdown` is safe only once every call has
   completed, as `lore.h` now documents, correcting its earlier claim that argument memory could be freed once an
   asynchronous call returned
+- `lore-server`: server-to-server QUIC traffic uses Cubic congestion control throughout. The internal QUIC server,
+  the replicated immutable store's client and replication clients to peers in every region now use Cubic, where the
+  server and cross-region clients used BBR. Cubic only shrinks the congestion window on packet loss, so a connection
+  that sits quiet between bursts keeps its window rather than having it drained. The public QUIC server keeps BBR
 
 ## v0.10.1 (Oct 5th 2026) [#1475]
 

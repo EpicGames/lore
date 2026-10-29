@@ -14,7 +14,6 @@ use quinn::AckFrequencyConfig;
 use quinn::EndpointConfig;
 use quinn::ServerConfig;
 use quinn::VarInt;
-use quinn::congestion;
 use quinn::crypto::rustls::HandshakeData;
 use quinn::crypto::rustls::QuicServerConfig;
 use socket2::Domain;
@@ -100,11 +99,11 @@ impl QuinnServer {
                 .send_window(send_window as u64)
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);
-            let mut bbr = congestion::BbrConfig::default();
-            // quinn never has more than the send window unacknowledged, so a larger congestion
-            // window would only raise the pacing rate.
-            bbr.max_window(send_window as u64);
-            transport_config.congestion_controller_factory(Arc::new(bbr));
+            transport_config.congestion_controller_factory(
+                settings
+                    .congestion_algorithm
+                    .controller_factory(None, send_window as u64),
+            );
             transport_config
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);

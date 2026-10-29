@@ -530,3 +530,80 @@ async fn a_command_after_a_reset_frame_is_answered_over_a_new_connection() {
     assert!(answered.is_ok(), "{answered:?}");
     assert_eq!(server.accepted_connections(), 2);
 }
+
+mod controller_factory {
+    use std::time::Instant;
+
+    use quinn::congestion;
+
+    use super::*;
+
+    const MTU: u16 = 1200;
+    const SEEDED_WINDOW: u64 = 64 * 1024 * 1024;
+    const UNLIMITED_SEND_WINDOW: u64 = u64::MAX;
+    const SMALL_SEND_WINDOW: u64 = 4 * 1024 * 1024;
+
+    fn build(
+        algorithm: CongestionAlgorithm,
+        initial_window: Option<u64>,
+        send_window: u64,
+    ) -> Box<dyn congestion::Controller> {
+        algorithm
+            .controller_factory(initial_window, send_window)
+            .build(Instant::now(), MTU)
+    }
+
+    #[test]
+    fn cubic_builds_a_cubic_controller_seeded_with_the_initial_window() {
+        let controller = build(
+            CongestionAlgorithm::Cubic,
+            Some(SEEDED_WINDOW),
+            UNLIMITED_SEND_WINDOW,
+        );
+
+        assert_eq!(controller.initial_window(), SEEDED_WINDOW);
+        controller
+            .into_any()
+            .downcast::<congestion::Cubic>()
+            .expect("controller should be Cubic");
+    }
+
+    #[test]
+    fn bbr_builds_a_bbr_controller_seeded_with_the_initial_window() {
+        let controller = build(
+            CongestionAlgorithm::Bbr,
+            Some(SEEDED_WINDOW),
+            UNLIMITED_SEND_WINDOW,
+        );
+
+        assert_eq!(controller.initial_window(), SEEDED_WINDOW);
+        controller
+            .into_any()
+            .downcast::<congestion::Bbr>()
+            .expect("controller should be BBR");
+    }
+
+    #[test]
+    fn no_initial_window_keeps_the_algorithm_default() {
+        for algorithm in [CongestionAlgorithm::Cubic, CongestionAlgorithm::Bbr] {
+            let controller = build(algorithm, None, UNLIMITED_SEND_WINDOW);
+
+            assert!(
+                controller.initial_window() < SEEDED_WINDOW,
+                "{algorithm:?} initial window ({}) should be its small default",
+                controller.initial_window(),
+            );
+        }
+    }
+
+    #[test]
+    fn bbr_window_is_held_to_the_send_window() {
+        let controller = build(
+            CongestionAlgorithm::Bbr,
+            Some(SEEDED_WINDOW),
+            SMALL_SEND_WINDOW,
+        );
+
+        assert_eq!(controller.window(), SMALL_SEND_WINDOW);
+    }
+}

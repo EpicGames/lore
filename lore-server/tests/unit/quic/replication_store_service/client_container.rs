@@ -183,8 +183,8 @@ mod integration {
     use super::*;
     use crate::store::test_support::test_store_create;
 
-    /// BBR's default initial window is ~14 KB (10 × MTU).
-    /// 64 MB is large enough that it cannot be reached by BBR startup
+    /// The default initial window is ~12 KB (10 × 1,200-byte datagrams).
+    /// 64 MB is large enough that it cannot be reached by slow-start
     /// growth alone over the handful of packets exchanged during connection.
     const LARGE_CWND: u64 = 64 * 1024 * 1024;
 
@@ -260,9 +260,9 @@ mod integration {
         .expect("Test task failed");
     }
 
-    /// Connects without an `initial_cwnd` hint and verifies the resulting window
-    /// is smaller than `LARGE_CWND`, confirming that the previous test's large
-    /// value comes from the hint and not from BBR startup growth over loopback.
+    /// Without an `initial_cwnd` hint the window stays below `LARGE_CWND`, so a
+    /// window at or above it can only have come from the hint, not from slow-start
+    /// growth over loopback.
     #[tokio::test]
     async fn default_initial_cwnd_is_smaller_than_large_initial_cwnd() {
         let (immutable_store, mutable_store, execution) =
@@ -284,7 +284,7 @@ mod integration {
             assert!(
                 stats.path.cwnd < LARGE_CWND,
                 "default cwnd ({}) should be < large initial_cwnd ({}); \
-                         if flaky, BBR grew too fast — increase LARGE_CWND",
+                         if flaky, slow start grew too fast — increase LARGE_CWND",
                 stats.path.cwnd,
                 LARGE_CWND,
             );

@@ -231,10 +231,41 @@ impl From<quinn::ConnectionStats> for ConnectionStats {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub enum CongestionAlgorithm {
     Bbr,
     Cubic,
+}
+
+impl CongestionAlgorithm {
+    /// The quinn controller factory for this algorithm, seeding its congestion window with
+    /// `initial_window` when given. `send_window` is the connection's send window, which caps the
+    /// BBR window.
+    pub fn controller_factory(
+        self,
+        initial_window: Option<u64>,
+        send_window: u64,
+    ) -> Arc<dyn congestion::ControllerFactory + Send + Sync + 'static> {
+        match self {
+            CongestionAlgorithm::Bbr => {
+                let mut bbr = congestion::BbrConfig::default();
+                if let Some(cwnd) = initial_window {
+                    bbr.initial_window(cwnd);
+                }
+                // quinn never has more than the send window unacknowledged, so a larger
+                // congestion window would only raise the pacing rate.
+                bbr.max_window(send_window);
+                Arc::new(bbr)
+            }
+            CongestionAlgorithm::Cubic => {
+                let mut cubic = congestion::CubicConfig::default();
+                if let Some(cwnd) = initial_window {
+                    cubic.initial_window(cwnd);
+                }
+                Arc::new(cubic)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -901,28 +932,11 @@ pub async fn connect(
         .max_rtt(Duration::from_millis(MAX_RTT_MS))
         .ack_frequency_config(Some(ack_freq_config));
 
-    let congestion_controller: Arc<dyn congestion::ControllerFactory + Send + Sync + 'static> =
-        match transport.congestion_algorithm {
-            CongestionAlgorithm::Bbr => {
-                let mut bbr = congestion::BbrConfig::default();
-                if let Some(cwnd) = transport.initial_cwnd {
-                    bbr.initial_window(cwnd);
-                }
-                // quinn never has more than the send window unacknowledged, so a larger
-                // congestion window would only raise the pacing rate.
-                bbr.max_window(send_window);
-                Arc::new(bbr)
-            }
-            CongestionAlgorithm::Cubic => {
-                let mut cubic = congestion::CubicConfig::default();
-                if let Some(cwnd) = transport.initial_cwnd {
-                    cubic.initial_window(cwnd);
-                }
-
-                Arc::new(cubic)
-            }
-        };
-    transport_config.congestion_controller_factory(congestion_controller);
+    transport_config.congestion_controller_factory(
+        transport
+            .congestion_algorithm
+            .controller_factory(transport.initial_cwnd, send_window),
+    );
 
     lore_debug!("QUIC transport config: {transport_config:?}");
 

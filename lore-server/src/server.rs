@@ -49,6 +49,7 @@ use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
@@ -372,6 +373,7 @@ async fn launch_quinn_server(
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
     metrics_frequency: Duration,
     quic_settings: QuicSettings,
+    congestion_algorithm: CongestionAlgorithm,
     generate_ephemeral_cert: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -408,7 +410,8 @@ async fn launch_quinn_server(
             .pkey_file(cert_settings.pkey_file)
             .client_cert_verifier(client_verifier)
             .stream_handler_factory(stream_handler_factory)
-            .metrics_frequency(metrics_frequency);
+            .metrics_frequency(metrics_frequency)
+            .congestion_algorithm(congestion_algorithm);
 
         info!(address = %addr, "server starting");
         let server = QuinnServer::start(settings_builder.build()?)?;
@@ -2370,6 +2373,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
+                CongestionAlgorithm::Bbr,
                 // User-facing endpoint: generate an ephemeral certificate when
                 // none is configured so the server runs with zero config.
                 true,
@@ -2444,6 +2448,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
+                // Cubic only shrinks the window on packet loss, so a peer that goes quiet
+                // between replication bursts doesn't come back to a window BBR has drained
+                // and stall the next large get or put.
+                CongestionAlgorithm::Cubic,
                 generate_ephemeral_cert,
                 shutdown_rx,
             )

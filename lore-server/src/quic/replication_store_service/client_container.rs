@@ -56,7 +56,10 @@ impl QuicClientFactory {
             transport_config: TransportConfig {
                 max_bytes_bandwidth_per_second: DEFAULT_MAX_BYTES_BANDWIDTH_PER_SEC,
                 expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
-                congestion_algorithm: CongestionAlgorithm::Bbr,
+                // Cubic only shrinks the window on packet loss, so a peer that goes quiet
+                // between replication bursts doesn't come back to a window BBR has drained
+                // and stall the next large get or put.
+                congestion_algorithm: CongestionAlgorithm::Cubic,
                 initial_cwnd: None,
             },
             command_behavior: CommandBehavior {

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::tls;
 use rustls::server::NoClientAuth;
@@ -36,6 +37,7 @@ pub struct QuinnConfig {
     pub(crate) metrics_frequency: Duration,
     pub(crate) transport_bits_per_second: usize,
     pub(crate) transport_rtt: usize,
+    pub(crate) congestion_algorithm: CongestionAlgorithm,
 }
 
 impl fmt::Debug for QuinnConfig {
@@ -58,6 +60,7 @@ impl fmt::Debug for QuinnConfig {
             .field("metrics_frequency", &self.metrics_frequency)
             .field("transport_bits_per_second", &self.transport_bits_per_second)
             .field("transport_rtt", &self.transport_rtt)
+            .field("congestion_algorithm", &self.congestion_algorithm)
             .finish()
     }
 }
@@ -81,6 +84,7 @@ pub struct QuinnConfigBuilder {
     pub(crate) metrics_frequency: Option<Duration>,
     pub(crate) transport_bits_per_second: Option<usize>,
     pub(crate) transport_rtt: Option<usize>,
+    pub(crate) congestion_algorithm: Option<CongestionAlgorithm>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
@@ -185,6 +189,12 @@ impl QuinnConfigBuilder {
         self
     }
 
+    /// The congestion controller governing what this server sends. Defaults to BBR.
+    pub fn congestion_algorithm(mut self, congestion_algorithm: CongestionAlgorithm) -> Self {
+        self.congestion_algorithm = Some(congestion_algorithm);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<QuinnConfig> {
         let stream_handler_factory = self
             .stream_handler_factory
@@ -227,6 +237,9 @@ impl QuinnConfigBuilder {
                 .transport_bits_per_second
                 .unwrap_or(DEFAULT_TRANSPORT_BITS_PER_SECOND),
             transport_rtt: self.transport_rtt.unwrap_or(DEFAULT_TRANSPORT_RTT),
+            congestion_algorithm: self
+                .congestion_algorithm
+                .unwrap_or(CongestionAlgorithm::Bbr),
         })
     }
 }
