@@ -547,8 +547,13 @@ typedef struct lore_auth_user_token_event_data_t {
   struct lore_string_t preferred_username;
   // Non-zero if the identity is a service account
   uint8_t flag_service_account;
-  // Expiry time in milliseconds since UNIX epoch, or 0 if unavailable
+  // Expiry time of `token` in milliseconds since UNIX epoch, or 0 if unavailable
   uint64_t expires;
+  // When the stored refresh token stops working, in milliseconds since the UNIX epoch. 0
+  // if there is no refresh token, or if the provider did not give a deadline.
+  uint64_t refresh_expires;
+  // Non-zero if a refresh token is stored for the identity
+  uint8_t flag_refreshable;
 } lore_auth_user_token_event_data_t;
 
 // Event data describing a stored authentication identity.

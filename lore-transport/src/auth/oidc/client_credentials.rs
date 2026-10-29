@@ -90,6 +90,7 @@ pub async fn login(
     {
         Outcome::Token(response) => Ok(AuthenticationToken {
             refresh_token: None,
+            refresh_expires_ms: 0,
             ..token::authentication_token(response)?
         }),
         Outcome::Refused(refusal) if refusal.error == "invalid_client" => {

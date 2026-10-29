@@ -71,9 +71,17 @@ pub struct IdentityToken {
     /// lifecycle: consumed on use and replaced atomically.
     #[serde(default)]
     refresh_token: Option<String>,
+    /// When `refresh_token` stops working, in milliseconds since the UNIX epoch, or 0 when the
+    /// issuer named no deadline. Stored, removed and restored with `refresh_token`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    refresh_expires: u64,
     /// The scope the issuer granted, space-delimited as RFC 6749 §3.3 has it.
     #[serde(default)]
     scope: Option<String>,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -502,7 +510,8 @@ pub async fn store_user_token(
     store_identity_token(auth_endpoint, identity_token, RefreshToken::Keep).await
 }
 
-/// Stores `token` with `refresh_token` and the `scope` it was granted for. Unlike
+/// Stores `token` with `refresh_token`, the time in milliseconds since the UNIX epoch it
+/// `refresh_expires` at (0 for unknown), and the `scope` it was granted for. Unlike
 /// [`store_user_token`], it replaces the refresh token and the scope of the entry, so a
 /// `refresh_token` of `None` leaves none behind.
 pub async fn store_user_token_and_refresh_token(
@@ -511,12 +520,14 @@ pub async fn store_user_token_and_refresh_token(
     token: &str,
     acceptable_root_domains: Vec<String>,
     refresh_token: Option<&str>,
+    refresh_expires: u64,
     scope: Option<&str>,
 ) -> Result<(), TokenStoreError> {
     let mut identity_token =
         new_identity_token(auth_endpoint, identity, token, acceptable_root_domains).await?;
     if let Some(refresh_token) = refresh_token {
         identity_token.refresh_token = Some(encrypt_token(refresh_token).await?);
+        identity_token.refresh_expires = refresh_expires;
     }
     identity_token.scope = scope.map(str::to_owned);
     store_identity_token(auth_endpoint, identity_token, RefreshToken::Replace).await
@@ -545,6 +556,7 @@ async fn new_identity_token(
         token: encrypt_token(token).await?,
         acceptable_root_domains,
         refresh_token: None,
+        refresh_expires: 0,
         scope: None,
     })
 }
@@ -579,6 +591,7 @@ async fn store_identity_token(
                 if refresh_token == RefreshToken::Keep {
                     let existing = &mut remote.token[existing_index];
                     new_token.refresh_token = existing.refresh_token.take();
+                    new_token.refresh_expires = existing.refresh_expires;
                     new_token.scope = existing.scope.take();
                 }
                 remote.token[existing_index] = new_token;
@@ -982,14 +995,33 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
     Ok(identities)
 }
 
+/// When `identity`'s stored refresh token for `auth_endpoint` stops working, in milliseconds
+/// since the UNIX epoch, or `Some(0)` when the issuer named no deadline. `None` without a stored
+/// refresh token.
+pub async fn load_refresh_expires(auth_endpoint: &str, identity: &str) -> Option<u64> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
+    let mut store = cached_token_map().await;
+    if store.is_none()
+        && let Ok(guard) = lock_token_map().await
+        && let Ok(loaded_map) = load_token_map(&guard)
+    {
+        store.replace(loaded_map);
+    }
+    let entry = identity_entry(&mut store, auth_endpoint, identity)?;
+    entry.refresh_token.as_ref()?;
+    Some(entry.refresh_expires)
+}
+
 /// What a refresh grant answered with.
 pub enum Refreshed<E> {
     /// A new authentication token. A `refresh_token` of `None` keeps the one presented, as RFC
     /// 6749 §6 has a client do when the issuer rotates none, and a `scope` of `None` keeps the
-    /// stored scope.
+    /// stored scope. `refresh_expires` replaces the stored deadline either way, since a refresh
+    /// moves the idle deadline: milliseconds since the UNIX epoch, or 0 for unknown.
     Token {
         token: String,
         refresh_token: Option<String>,
+        refresh_expires: u64,
         scope: Option<String>,
     },
     /// The issuer refused the refresh token as spent, expired or revoked.
@@ -1041,12 +1073,14 @@ where
     let Some(sealed_refresh_token) = entry.refresh_token.take() else {
         return Err(TokenNotFound.into());
     };
+    let presented_refresh_expires = std::mem::take(&mut entry.refresh_expires);
     let refresh_token = open_token(&key, &sealed_refresh_token)?;
     if let Some(map) = store.as_ref()
         && let Err(err) = store_token_map(&guard, map)
     {
         if let Some(entry) = identity_entry(&mut store, auth_endpoint, identity) {
             entry.refresh_token = Some(sealed_refresh_token);
+            entry.refresh_expires = presented_refresh_expires;
         }
         return Err(err);
     }
@@ -1063,6 +1097,7 @@ where
         Refreshed::Token {
             token,
             refresh_token,
+            refresh_expires,
             scope,
         } => {
             let claims = crate::jwt::insecure_decode_token(&token).map(|decoded| decoded.claims);
@@ -1076,6 +1111,7 @@ where
                         Some(refresh_token) => Some(seal_token(&key, &refresh_token)?),
                         None => Some(sealed_refresh_token),
                     };
+                    entry.refresh_expires = refresh_expires;
                     if scope.is_some() {
                         entry.scope = scope;
                     }
@@ -1092,6 +1128,7 @@ where
         )),
         Refreshed::Unsent(source) => {
             entry.refresh_token = Some(sealed_refresh_token);
+            entry.refresh_expires = presented_refresh_expires;
             Err(TokenStoreError::internal_with_context(
                 source,
                 "Failed to send the refresh token grant",
@@ -1460,6 +1497,7 @@ pub mod test_util {
                 token: token.into(),
                 acceptable_root_domains,
                 refresh_token,
+                refresh_expires: 0,
                 scope,
             }
         }
@@ -1478,6 +1516,17 @@ pub mod test_util {
 
         pub fn scope(&self) -> Option<&str> {
             self.scope.as_deref()
+        }
+
+        pub fn refresh_expires(&self) -> u64 {
+            self.refresh_expires
+        }
+
+        pub fn with_refresh_expires(self, refresh_expires: u64) -> Self {
+            Self {
+                refresh_expires,
+                ..self
+            }
         }
     }
 

@@ -81,6 +81,10 @@ async fn supplied_token_describes_only_the_identity_the_call_acts_as() {
         Some(ALICE_TOKEN),
         "the identity the call acts as is described by the supplied token"
     );
+    assert_eq!(
+        resolved[0].refresh_expires, None,
+        "a supplied token is never refreshed"
+    );
     assert_eq!(resolved[1].id, "bob");
     assert!(
         resolved[1].local_user_info.is_none(),

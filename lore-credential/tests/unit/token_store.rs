@@ -7,6 +7,7 @@ use lore_credential::token_store::Refreshed;
 use lore_credential::token_store::RemoteIdentity;
 use lore_credential::token_store::RemovedRefreshToken;
 use lore_credential::token_store::TokenMap;
+use lore_credential::token_store::load_refresh_expires;
 use lore_credential::token_store::load_user_token;
 use lore_credential::token_store::load_user_token_from_store;
 use lore_credential::token_store::refresh_user_token;
@@ -89,6 +90,58 @@ fn an_older_client_reads_an_entry_with_a_scope() {
 
     let newer: IdentityToken = toml::from_str(&serialized).unwrap();
     assert_eq!(newer.scope(), Some("openid offline_access"));
+}
+
+/// An entry the new client writes with a refresh deadline, read by a client that predates the
+/// field, loses only that field.
+#[test]
+fn an_older_client_reads_an_entry_with_a_refresh_deadline() {
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct OlderIdentityToken {
+        user_id: String,
+        token: String,
+        #[serde(default)]
+        acceptable_root_domains: Vec<String>,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        scope: Option<String>,
+    }
+    let token = IdentityToken::new(
+        "user-1",
+        "encrypted-auth",
+        vec!["example.com".into()],
+        Some("encrypted-refresh".into()),
+        Some("openid offline_access".into()),
+    )
+    .with_refresh_expires(1_900_000_000_000);
+    let serialized = toml::to_string_pretty(&token).unwrap();
+
+    let older: OlderIdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(older.refresh_token.as_deref(), Some("encrypted-refresh"));
+    assert_eq!(older.scope.as_deref(), Some("openid offline_access"));
+
+    let newer: IdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(newer.refresh_expires(), 1_900_000_000_000);
+}
+
+/// An entry without a refresh deadline is written as before, so a store with none is unchanged.
+#[test]
+fn an_entry_without_a_refresh_deadline_is_written_without_the_field() {
+    let token = IdentityToken::new(
+        "user-1",
+        "encrypted-auth",
+        Vec::new(),
+        Some("encrypted-refresh".into()),
+        None,
+    );
+
+    let serialized = toml::to_string_pretty(&token).unwrap();
+
+    assert!(!serialized.contains("refresh_expires"), "{serialized}");
+    let read: IdentityToken = toml::from_str(&serialized).unwrap();
+    assert_eq!(read.refresh_expires(), 0);
 }
 
 #[test]
@@ -366,14 +419,37 @@ fn refused() -> std::io::Error {
     std::io::Error::other("as scripted")
 }
 
-/// Stores `token` for alice at `endpoint`, with `refresh_token` and `scope`.
+const LOGIN_REFRESH_EXPIRES: u64 = 1_900_000_000_000;
+const GRANT_REFRESH_EXPIRES: u64 = 1_950_000_000_000;
+
+/// Stores `token` for alice at `endpoint`, with `refresh_token`, expiring at
+/// [`LOGIN_REFRESH_EXPIRES`], and `scope`.
 async fn logged_in(endpoint: &str, token: &str, refresh_token: Option<&str>, scope: Option<&str>) {
-    store_user_token_and_refresh_token(endpoint, "alice", token, Vec::new(), refresh_token, scope)
-        .await
-        .expect("store the login");
+    logged_in_until(endpoint, token, refresh_token, LOGIN_REFRESH_EXPIRES, scope).await;
 }
 
-/// A grant that answers `token` with `refresh_token`, recording the refresh token presented.
+async fn logged_in_until(
+    endpoint: &str,
+    token: &str,
+    refresh_token: Option<&str>,
+    refresh_expires: u64,
+    scope: Option<&str>,
+) {
+    store_user_token_and_refresh_token(
+        endpoint,
+        "alice",
+        token,
+        Vec::new(),
+        refresh_token,
+        refresh_expires,
+        scope,
+    )
+    .await
+    .expect("store the login");
+}
+
+/// A grant that answers `token` with `refresh_token`, expiring at [`GRANT_REFRESH_EXPIRES`],
+/// recording the refresh token presented.
 fn grant(
     token: String,
     refresh_token: Option<&'static str>,
@@ -384,6 +460,7 @@ fn grant(
         std::future::ready(Refreshed::Token {
             token,
             refresh_token: refresh_token.map(str::to_owned),
+            refresh_expires: GRANT_REFRESH_EXPIRES,
             scope: None,
         })
     }
@@ -427,10 +504,14 @@ async fn a_refresh_stores_the_new_token_and_the_rotated_refresh_token() {
             Some("openid offline_access".to_owned())
         ))
     );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(GRANT_REFRESH_EXPIRES)
+    );
 }
 
 /// RFC 6749 §6: an issuer that rotates no refresh token leaves the presented one valid, so the
-/// store keeps it.
+/// store keeps it. Its deadline is the answer's, since the refresh moved the idle deadline.
 #[tokio::test]
 async fn a_refresh_without_a_rotated_refresh_token_keeps_the_presented_one() {
     let _shared = STORE_FILE.read().await;
@@ -447,6 +528,10 @@ async fn a_refresh_without_a_rotated_refresh_token_keeps_the_presented_one() {
     assert_eq!(
         stored_login(ENDPOINT, "alice").await,
         Some((Some("refresh-1".to_owned()), None))
+    );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(GRANT_REFRESH_EXPIRES)
     );
 }
 
@@ -511,6 +596,7 @@ async fn a_refused_refresh_token_is_dropped() {
 
     assert!(result.is_err_and(|err| err.is_internal()));
     assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
     let stored = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
     assert_eq!(stored.ok(), Some(expired));
 }
@@ -534,6 +620,10 @@ async fn an_unsent_refresh_keeps_the_refresh_token() {
         stored_login(ENDPOINT, "alice").await,
         Some((Some("refresh-1".to_owned()), None))
     );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(LOGIN_REFRESH_EXPIRES)
+    );
 }
 
 /// A grant that failed after it may have reached the issuer, such as one whose answer was lost,
@@ -553,6 +643,7 @@ async fn a_failed_refresh_drops_the_refresh_token() {
 
     assert!(result.is_err_and(|err| err.is_internal()));
     assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
 }
 
 /// The refresh token is removed from the store's file before the grant is sent, so a process
@@ -650,6 +741,7 @@ async fn concurrent_refreshes_present_the_refresh_token_once() {
             Refreshed::<std::io::Error>::Token {
                 token: fresh.clone(),
                 refresh_token: Some("refresh-2".to_owned()),
+                refresh_expires: GRANT_REFRESH_EXPIRES,
                 scope: None,
             }
         })
@@ -684,9 +776,42 @@ async fn storing_a_refresh_token_replaces_it_and_storing_a_token_alone_keeps_it(
         stored_login(ENDPOINT, "alice").await,
         Some((Some("refresh-1".to_owned()), Some("openid".to_owned())))
     );
+    assert_eq!(
+        load_refresh_expires(ENDPOINT, "alice").await,
+        Some(LOGIN_REFRESH_EXPIRES)
+    );
 
     logged_in(ENDPOINT, &jwt("alice", VALID, 3), None, None).await;
     assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
+}
+
+/// A refresh token stored without a deadline reads as refreshable with none, apart from no
+/// refresh token at all. A deadline given without a refresh token is not stored.
+#[tokio::test]
+async fn a_refresh_token_without_a_deadline_is_told_from_none() {
+    let _shared = STORE_FILE.read().await;
+    const ENDPOINT: &str = "oidc+https://login-no-deadline.test.invalid";
+
+    logged_in_until(
+        ENDPOINT,
+        &jwt("alice", VALID, 1),
+        Some("refresh-1"),
+        0,
+        None,
+    )
+    .await;
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, Some(0));
+
+    logged_in_until(
+        ENDPOINT,
+        &jwt("alice", VALID, 2),
+        None,
+        LOGIN_REFRESH_EXPIRES,
+        None,
+    )
+    .await;
+    assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
 }
 
 fn removed_refresh_tokens(removed: Vec<RemovedRefreshToken>) -> Vec<(String, String)> {

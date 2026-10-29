@@ -176,6 +176,7 @@ impl Authentication for UcsAuthentication {
                 // Populated by orchestration layer via JWT decode, not the proto response
                 acceptable_root_domains: Vec::new(),
                 refresh_token: None,
+                refresh_expires_ms: 0,
                 scope: None,
             })),
             None => Ok(AuthSessionPoll::Pending),
@@ -213,6 +214,7 @@ impl Authentication for UcsAuthentication {
             // Populated by orchestration layer via JWT decode, not the proto response
             acceptable_root_domains: Vec::new(),
             refresh_token: None,
+            refresh_expires_ms: 0,
             scope: None,
         })
     }

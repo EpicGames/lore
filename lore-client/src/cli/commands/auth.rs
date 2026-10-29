@@ -472,6 +472,19 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                         time.to_rfc2822()
                     );
                 }
+                if user_token.refresh_expires > 0
+                    && let Some(time) =
+                        DateTime::from_timestamp_millis(user_token.refresh_expires as i64)
+                {
+                    println!(
+                        "{}Refreshable until:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        time.to_rfc2822()
+                    );
+                } else if user_token.flag_refreshable != 0 {
+                    println!("Refreshable");
+                }
                 println!(
                     "{}Token:{} {}",
                     CommonStyles::HEADERS,

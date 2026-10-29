@@ -3,6 +3,9 @@
 //! The token endpoint (RFC 6749 §3.2): the request every grant POSTs to it, and the
 //! success and error responses it answers with (§5.1, §5.2).
 
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
 use lore_base::lore_warn;
 use serde::Deserialize;
 
@@ -22,6 +25,12 @@ pub struct TokenResponse {
     pub token_type: String,
     pub expires_in: Option<u64>,
     pub refresh_token: Option<String>,
+    /// Seconds until the refresh token stops working. No RFC or discovery metadata names
+    /// the field: GitHub, Azure AD and Google send `refresh_token_expires_in`, Keycloak
+    /// `refresh_expires_in`. Two fields rather than a serde alias, which would refuse a
+    /// response carrying both.
+    pub refresh_token_expires_in: Option<u64>,
+    pub refresh_expires_in: Option<u64>,
     pub scope: Option<String>,
     pub id_token: Option<String>,
 }
@@ -158,6 +167,8 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
         token_type,
         expires_in: _,
         refresh_token,
+        refresh_token_expires_in,
+        refresh_expires_in,
         scope,
         id_token,
     } = response;
@@ -193,7 +204,24 @@ pub fn authentication_token(response: TokenResponse) -> Result<AuthenticationTok
         expires_ms: access.expires,
         // Populated by the orchestration layer from the token's claims.
         acceptable_root_domains: Vec::new(),
+        refresh_expires_ms: refresh_token.as_ref().map_or(0, |_| {
+            refresh_deadline(refresh_token_expires_in.or(refresh_expires_in))
+        }),
         refresh_token,
         scope,
     })
+}
+
+/// The deadline `expires_in` seconds from now, in milliseconds since the UNIX epoch, or 0 for
+/// none. A `0` is none too: Keycloak sends it for offline tokens. The deadline is capped where
+/// the token store's TOML can still hold it.
+fn refresh_deadline(expires_in: Option<u64>) -> u64 {
+    let Some(expires_in) = expires_in.filter(|&seconds| seconds > 0) else {
+        return 0;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    now.saturating_add(expires_in.saturating_mul(1000))
+        .min(i64::MAX as u64)
 }

@@ -210,8 +210,8 @@ async fn other_refusals_carry_the_providers_description() {
     assert!(!message.contains(CLIENT_SECRET), "{message}");
 }
 
-/// A refresh token the provider sends is dropped: refreshing it would need the client's
-/// secret, which is not stored.
+/// A refresh token the provider sends is dropped with its deadline: refreshing it would need
+/// the client's secret, which is not stored.
 #[tokio::test]
 async fn a_refresh_token_in_the_answer_is_dropped() {
     let provider = provider(None, |issuer| {
@@ -219,6 +219,7 @@ async fn a_refresh_token_in_the_answer_is_dropped() {
             "access_token": access_token(issuer, SERVICE_ACCOUNT, "CI Bot"),
             "token_type": "Bearer",
             "refresh_token": "not-for-a-public-client",
+            "refresh_token_expires_in": 3600,
         }))
     })
     .await;
@@ -226,4 +227,5 @@ async fn a_refresh_token_in_the_answer_is_dropped() {
     let authn = login(&provider).await.expect("the login succeeds");
 
     assert!(authn.refresh_token.is_none());
+    assert_eq!(authn.refresh_expires_ms, 0);
 }

@@ -96,6 +96,64 @@ async fn the_refresh_token_is_traded_for_a_new_token_and_its_successor() {
     assert_eq!(authn.scope.as_deref(), Some("openid offline_access"));
 }
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_millis() as u64
+}
+
+/// The refresh token's deadline in an answer with `fields` beside the token response's.
+async fn refresh_expires_ms(fields: serde_json::Value) -> (u64, u64, u64) {
+    let provider = provider(move |issuer| {
+        let mut body = serde_json::json!({
+            "access_token": access_token(issuer, "alice", "Alice"),
+            "token_type": "Bearer",
+            "refresh_token": "refresh-2",
+        });
+        body.as_object_mut()
+            .expect("an object")
+            .extend(fields.as_object().expect("an object").clone());
+        json(&body)
+    })
+    .await;
+    let before = now_ms();
+    let authn = refresh(&provider).await.expect("the refresh succeeds");
+    (before, authn.refresh_expires_ms, now_ms())
+}
+
+/// The refresh token's lifetime is read from `refresh_token_expires_in` (GitHub, Azure AD,
+/// Google), else from `refresh_expires_in` (Keycloak), and made a deadline.
+#[tokio::test]
+async fn the_refresh_tokens_lifetime_is_read_under_either_name() {
+    for fields in [
+        serde_json::json!({"refresh_token_expires_in": 3600}),
+        serde_json::json!({"refresh_expires_in": 3600}),
+        serde_json::json!({"refresh_token_expires_in": 3600, "refresh_expires_in": 60}),
+    ] {
+        let (before, deadline, after) = refresh_expires_ms(fields.clone()).await;
+
+        assert!(
+            (before + 3_600_000..=after + 3_600_000).contains(&deadline),
+            "{fields}: {deadline}"
+        );
+    }
+}
+
+/// `0`, which Keycloak sends for offline tokens, and a missing field are no known deadline.
+#[tokio::test]
+async fn a_zero_or_missing_lifetime_is_no_deadline() {
+    for fields in [
+        serde_json::json!({"refresh_token_expires_in": 0}),
+        serde_json::json!({"refresh_expires_in": 0}),
+        serde_json::json!({}),
+    ] {
+        let (_, deadline, _) = refresh_expires_ms(fields.clone()).await;
+
+        assert_eq!(deadline, 0, "{fields}");
+    }
+}
+
 /// `invalid_grant` refuses the refresh token as spent, expired or revoked, so the caller holds
 /// no identity until it logs in again.
 #[tokio::test]

@@ -757,4 +757,52 @@ mod tests {
             .await
             .expect("Task failure");
     }
+
+    /// The stored refresh token's deadline is resolved beside the stored token: the deadline,
+    /// 0 for a refresh token without one, and none without a refresh token.
+    #[tokio::test]
+    async fn the_refresh_deadline_is_resolved_with_the_stored_token() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let users = ["alice".to_string()];
+                for (refresh_token, refresh_expires, resolved) in [
+                    (
+                        Some("refresh-1"),
+                        1_900_000_000_000,
+                        Some(1_900_000_000_000),
+                    ),
+                    (Some("refresh-1"), 0, Some(0)),
+                    (None, 1_900_000_000_000, None),
+                ] {
+                    token_store::store_user_token_and_refresh_token(
+                        AUTH_ENDPOINT,
+                        "alice",
+                        SUPPLIED_JWT,
+                        vec!["example.com".into()],
+                        refresh_token,
+                        refresh_expires,
+                        None,
+                    )
+                    .await
+                    .expect("Failed to store the login");
+
+                    let [identity] = lore_revision::auth::userinfo::resolve_local_user_info(
+                        AUTH_ENDPOINT,
+                        &users,
+                    )
+                    .await
+                    .try_into()
+                    .expect("one identity");
+                    assert!(identity.local_user_info.is_some());
+                    assert_eq!(identity.refresh_expires, resolved, "{refresh_token:?}");
+                }
+            }))
+            .await
+            .expect("Task failure");
+    }
 }

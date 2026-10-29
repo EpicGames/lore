@@ -183,6 +183,7 @@ async fn store_authentication(
             &authn.token,
             decoded_token.claims.acceptable_root_domains(),
             authn.refresh_token.as_deref(),
+            authn.refresh_expires_ms,
             authn.scope.as_deref(),
         )
         .await
@@ -252,6 +253,7 @@ pub(crate) async fn with_token(
                     token,
                     decoded_token.claims.acceptable_root_domains(),
                     None,
+                    0,
                     None,
                 )
                 .await
@@ -421,6 +423,7 @@ pub async fn interactive(
             authn.token.as_str(),
             decoded_token.claims.acceptable_root_domains(),
             authn.refresh_token.as_deref(),
+            authn.refresh_expires_ms,
             authn.scope.as_deref(),
         )
         .await

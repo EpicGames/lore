@@ -298,6 +298,9 @@ pub struct AuthenticationToken {
     /// without re-authenticating. `None` if the auth backend does not support
     /// refresh. Consumed on use -- the next refresh returns a new one.
     pub refresh_token: Option<String>,
+    /// When `refresh_token` stops working, in milliseconds since the UNIX epoch. 0
+    /// if there is no refresh token, or if the provider did not give a deadline.
+    pub refresh_expires_ms: u64,
     /// The scope the backend granted, space-delimited as RFC 6749 §3.3 has
     /// it. `None` when the backend reports no scope.
     pub scope: Option<String>,

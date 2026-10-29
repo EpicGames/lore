@@ -34,6 +34,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
   window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
   unless set. Values below 2400 bytes are rejected at startup
+- The `AuthUserToken` event (C API: `lore_auth_user_token_event_data_t`) reports when the stored OIDC refresh token
+  stops working, in `refresh_expires`, and whether one is stored, in `flag_refreshable`. The deadline comes from the
+  refresh token's lifetime in seconds in the token response: `refresh_token_expires_in` (GitHub, Azure AD, Google),
+  else `refresh_expires_in` (Keycloak). If the provider returns a refresh token, but does not return a refresh token
+  expiration time, the value is `0`, with `flag_refreshable` set.
 - On Linux, the server's QUIC endpoints serve on several UDP sockets bound to their port, so clients spread across
   their receive buffers: `num_sockets` in `[server.quic]` and `[server.quic_internal]`, by default 16, capped at the
   processor count, and 4 for the internal endpoint. `num_listeners` is now optional and defaults to 1 per socket

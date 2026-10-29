@@ -181,6 +181,7 @@ async fn refresh_if_expired(
                         Ok(authn) => Refreshed::Token {
                             token: authn.token,
                             refresh_token: authn.refresh_token,
+                            refresh_expires: authn.refresh_expires_ms,
                             scope: authn.scope,
                         },
                         Err(err) if err.is_not_authenticated() => Refreshed::Refused(err),

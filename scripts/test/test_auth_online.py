@@ -388,9 +388,14 @@ def test_unknown_api_key_is_rejected(auth_env, make_actor):
 @pytest.mark.smoke
 def test_repository_create_and_delete_manage_the_auth_resource(auth_env, make_actor):
     """Repository create registers the rebac resource under the creator's
-    credential; delete removes it. Asserted from the requests the stub saw."""
+    credential; delete removes it. Asserted from the requests the stub saw.
+    The auth service hands out no refresh token, so the login reports none."""
     mock = auth_env.mock
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
+
+    login = owner.repo.auth_user_token_event()
+    assert login["refreshExpires"] == 0
+    assert login["flagRefreshable"] is False
 
     creations = mock.requests_for("CreateResource")
     assert [c["resource_id"] for c in creations] == [owner.resource_id]

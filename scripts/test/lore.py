@@ -40,6 +40,7 @@ from lore_parsers import (
     parse_branch_info,
     parse_branch_list,
     parse_file_info,
+    parse_jsonl,
     parse_lock_acquire,
     parse_lock_query,
     parse_lock_release,
@@ -1795,6 +1796,13 @@ class Lore:
             ["auth", "info", "--with-token"],
             **kwargs,
         )
+
+    def auth_user_token_event(self) -> dict:
+        """The data of the one `authUserToken` event `auth info` emits for the
+        current user."""
+        output = self.run(["auth", "info", "--with-identity-token"], json=True)
+        [data] = parse_jsonl(output, "authUserToken")
+        return data
 
     def _capi_driver_output(
         self, library_path: str, command: str, *args: str

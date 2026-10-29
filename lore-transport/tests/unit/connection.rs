@@ -925,6 +925,7 @@ fn authentication_token_with_refresh() {
         expires_ms: 1700000000000,
         acceptable_root_domains: vec!["example.com".into()],
         refresh_token: Some("refresh-abc".into()),
+        refresh_expires_ms: 0,
         scope: Some("openid offline_access".into()),
     };
     assert_eq!(token.token, "jwt-token");
@@ -945,6 +946,7 @@ fn authentication_token_without_refresh() {
         expires_ms: 1700000000000,
         acceptable_root_domains: vec![],
         refresh_token: None,
+        refresh_expires_ms: 0,
         scope: None,
     };
     assert!(token.refresh_token.is_none());

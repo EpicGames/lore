@@ -925,6 +925,8 @@ async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), Au
                 preferred_username: user_info.preferred_username.clone().into(),
                 flag_service_account: user_info.is_service_account.into(),
                 expires: user_info.expires,
+                refresh_expires: entry.refresh_expires.unwrap_or_default(),
+                flag_refreshable: entry.refresh_expires.is_some().into(),
             })
             .send();
             continue;

@@ -682,6 +682,7 @@ fn jwt(subject: &str, audience: &str, exp: u64) -> String {
 }
 
 const EXPIRED: u64 = 1_000_000_000;
+const REFRESHED_REFRESH_EXPIRES: u64 = 1_950_000_000_000;
 
 fn refreshed(token: &str, refresh_token: &str) -> lore_transport::types::AuthenticationToken {
     lore_transport::types::AuthenticationToken {
@@ -691,13 +692,14 @@ fn refreshed(token: &str, refresh_token: &str) -> lore_transport::types::Authent
         expires_ms: 2_000_000_000_000,
         acceptable_root_domains: Vec::new(),
         refresh_token: Some(refresh_token.to_owned()),
+        refresh_expires_ms: REFRESHED_REFRESH_EXPIRES,
         scope: None,
     }
 }
 
 /// A stored login whose token has expired is refreshed while an identity is picked, so the
-/// identity is found and authenticated without a new login. The new token is stored, so the
-/// next derivation presents no refresh token.
+/// identity is found and authenticated without a new login. The new token is stored with the
+/// new refresh token's deadline, so the next derivation presents no refresh token.
 #[tokio::test]
 async fn an_expired_stored_login_is_refreshed() {
     const AUTH_URL: &str = "oidc+https://refresh.test.invalid";
@@ -707,6 +709,7 @@ async fn an_expired_stored_login_is_refreshed() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -728,6 +731,10 @@ async fn an_expired_stored_login_is_refreshed() {
         assert_eq!(identity, "alice");
     }
     assert_eq!(stub.presented(), ["refresh-1"]);
+    assert_eq!(
+        token_store::load_refresh_expires(AUTH_URL, "alice").await,
+        Some(REFRESHED_REFRESH_EXPIRES)
+    );
 }
 
 /// A refused refresh token skips the identity, as an expired login did before, and is not
@@ -741,6 +748,7 @@ async fn an_expired_stored_login_whose_refresh_is_refused_is_skipped() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -775,6 +783,7 @@ async fn a_refreshed_token_for_another_domain_is_not_handed_out() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -817,6 +826,7 @@ async fn an_expired_supplied_identity_token_is_not_refreshed() {
         &supplied,
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -849,6 +859,7 @@ async fn an_exchange_refreshes_an_expired_stored_login_first() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -908,6 +919,7 @@ async fn only_an_unsent_refresh_is_tried_again() {
             &jwt("alice", "example.com", EXPIRED),
             vec!["example.com".to_owned()],
             Some("refresh-1"),
+            0,
             None,
         )
         .await
@@ -943,6 +955,7 @@ async fn a_cancelled_caller_does_not_stop_the_refresh() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await

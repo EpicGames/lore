@@ -227,6 +227,9 @@ class MockOidcProvider:
         # Whether the refresh grant consumes the token and then answers HTTP 500, as a
         # provider whose answer is lost on the way back.
         self.lose_refresh_answers = False
+        # `refresh_token_expires_in` beside every refresh token; `None` leaves it
+        # out.
+        self.refresh_token_lifetime: int | None = None
         # The advertised `revocation_endpoint`; `None` leaves it out.
         self.revocation_endpoint: str | None = None
         self._logins = 0
@@ -371,6 +374,7 @@ class MockOidcProvider:
             with self._lock:
                 self._logins += 1
                 response["refresh_token"] = self._issue_refresh_token(self._logins)
+                response.update(self._refresh_token_lifetime())
         return 200, response
 
     def refresh(self, form: dict[str, str]) -> tuple[int, dict]:
@@ -397,7 +401,13 @@ class MockOidcProvider:
             "token_type": "Bearer",
             "expires_in": max(self.token_lifetime, 0),
             "refresh_token": refresh_token,
+            **self._refresh_token_lifetime(),
         }
+
+    def _refresh_token_lifetime(self) -> dict[str, int]:
+        if self.refresh_token_lifetime is None:
+            return {}
+        return {"refresh_token_expires_in": self.refresh_token_lifetime}
 
     def revoke(self, form: dict[str, str]) -> tuple[int, dict | None]:
         """RFC 7009 §2.2: a token this stub does not know is answered as one

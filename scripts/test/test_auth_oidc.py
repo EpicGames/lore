@@ -500,9 +500,11 @@ def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
     operation, with the refresh token the login brought. The provider rotates
     it, so the store holds the new one: the refresh after the next expiry
     presents that, and the provider, which revokes the login when a consumed
-    refresh token comes back, still answers."""
+    refresh token comes back, still answers. Each refresh token's deadline
+    replaces the one before, and `auth info` reports the last."""
     provider = oidc_env.provider
     provider.token_lifetime = -60
+    provider.refresh_token_lifetime = 86400
     repo = make_repo()
     repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
     [first] = provider.valid_refresh_tokens()
@@ -513,6 +515,7 @@ def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
     [second] = provider.valid_refresh_tokens()
     time.sleep(4)
     provider.token_lifetime = 3600
+    provider.refresh_token_lifetime = 172800
     seed_and_commit(repo)
     repo.push()
 
@@ -523,6 +526,9 @@ def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
     ]
     assert len(provider.valid_refresh_tokens()) == 1
     assert_user_logged_in(repo, provider)
+    login = repo.auth_user_token_event()
+    assert login["flagRefreshable"] is True
+    assert abs(login["refreshExpires"] - (time.time() + 172800) * 1000) < 60_000
 
 
 @pytest.mark.smoke

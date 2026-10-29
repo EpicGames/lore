@@ -76,6 +76,7 @@ fn complete() -> PollAnswer {
         expires_ms: 0,
         acceptable_root_domains: Vec::new(),
         refresh_token: None,
+        refresh_expires_ms: 0,
         scope: None,
     }))
 }
