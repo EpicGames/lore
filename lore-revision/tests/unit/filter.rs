@@ -34,6 +34,9 @@ fn the_depth_bounds_agree_on_every_glob_shape() {
         // A brace group expands to no more components than its text, so
         // counting the text stays an upper bound over both alternatives.
         ("/a{b,c/d}", "a{b,c/d}", false, 2, 2),
+        // Both cross a separator from inside one component of the text.
+        ("/a/b**", "a/b**", false, 2, u32::MAX),
+        ("/a[!x]b", "a[!x]b", false, 1, u32::MAX),
     ];
 
     for (rule, glob, filename, min, max) in cases {

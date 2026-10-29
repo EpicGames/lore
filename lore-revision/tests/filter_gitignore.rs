@@ -101,9 +101,22 @@ fn children(tree: &[&str], dir: &str) -> (Vec<String>, Vec<String>) {
 /// mean anything: descent decides what is ever asked about, and the state
 /// carried down decides the answer.
 fn walk_tree(filter: &FilterInstance, tree: &[&str]) -> BTreeSet<String> {
+    walk_tree_entering(filter, tree, true).0
+}
+
+/// [`walk_tree`], also returning the directories it looked inside, the root as
+/// `""`. With `prune` false it looks inside every directory, which gives the
+/// answer pruning must never change.
+fn walk_tree_entering(
+    filter: &FilterInstance,
+    tree: &[&str],
+    prune: bool,
+) -> (BTreeSet<String>, BTreeSet<String>) {
     let mut included = BTreeSet::new();
+    let mut entered = BTreeSet::new();
     let mut stack = vec![(String::new(), FilterState::ROOT)];
     while let Some((dir, state)) = stack.pop() {
+        entered.insert(dir.clone());
         let (subdirs, files) = children(tree, &dir);
         for file in files {
             if !filter
@@ -116,12 +129,12 @@ fn walk_tree(filter: &FilterInstance, tree: &[&str]) -> BTreeSet<String> {
         for subdir in subdirs {
             let child = path(&subdir);
             let next = filter.child_exclusion_state(state, &child, true);
-            if filter.should_descend(next, &child) {
+            if !prune || filter.should_descend(next, &child) {
                 stack.push((subdir, next));
             }
         }
     }
-    included
+    (included, entered)
 }
 
 /// Directories holding something included, which is what "should this directory
@@ -516,6 +529,121 @@ fn excluded_subtree_with_no_reinclusion_is_not_descended() {
     let l1 = path("l1");
     assert!(filter.should_descend(filter.exclusion_state(&l1, true), &l1));
     assert!(!filter.excludes_subtree(&l1));
+}
+
+/// A tree three levels deeper than the rules in [`SHALLOW`] can match, so a
+/// walk that honours their depth bound has directories left to prune.
+const DEEP: &[&str] = &[
+    "root.txt",
+    "a/top.xml",
+    "a/b/c/f",
+    "a/x/f",
+    "a/x/y.xml",
+    "a/x/y/z/f",
+    "ab/f",
+    "c/f",
+    "c/d/f",
+    "c/d/e/f",
+];
+
+/// Rule sets whose re-inclusions match only a few levels deep, the shape of a
+/// view written as "exclude everything, re-include the root files and a list
+/// of directories". Each one has a wildcard the index cannot follow, so only
+/// the depth bound can keep the walk out of what lies below it.
+const SHALLOW: &[&[&str]] = &[
+    &["*", "!/*", "!a/b/**"],
+    &["**", "!/*", "!a/b/**"],
+    &["*", "!/*", "!a/*"],
+    &["*", "!/*", "!a/*.xml"],
+    &["*", "!/*", "!/*/b"],
+    &["*", "!/*", "!/{a,c}/*"],
+    &["*", "!/a?"],
+    &["*", "!/a[!x]*"],
+    &["*", "!/a[/]*"],
+];
+
+/// Pruning only saves work: a walk that declines to descend reaches exactly the
+/// files a walk entering every directory includes.
+///
+/// [`gitignore_conformance`] holds the pruned walk against git, which prunes
+/// too, so a walk pruning where it must not can still agree with git there.
+/// This compares it with no pruning at all, across the ground truth and the
+/// shallow rule sets.
+#[test]
+fn pruning_changes_no_answer() {
+    let cases = CASES
+        .iter()
+        .map(|case| (case.patterns, FILES))
+        .chain(SHALLOW.iter().map(|patterns| (*patterns, DEEP)));
+    for (patterns, tree) in cases {
+        let Some(filter) = build(patterns) else {
+            continue;
+        };
+        assert_eq!(
+            walk_tree_entering(&filter, tree, true).0,
+            walk_tree_entering(&filter, tree, false).0
+        );
+    }
+}
+
+/// A re-inclusion that cannot match below a directory does not send a walk
+/// into it.
+///
+/// `!/*` compiles to `*`, which the index records as unanchored because its
+/// first component is a wildcard: no prefix bounds where it matches, only its
+/// depth of one component does. Ignoring that depth sent every walk under the
+/// view `*`, `!/*`, `!a/b/**` into every directory in the repository, and a
+/// whole-tree diff of a sparse instance fetched the entire revision tree. The
+/// files it includes were right all along, so only the directories entered
+/// show the regression.
+#[test]
+fn a_shallow_reinclusion_does_not_open_the_tree_below_it() {
+    let entered = |patterns: &[&str]| {
+        let filter = build(patterns).expect("filter builds");
+        walk_tree_entering(&filter, DEEP, true).1
+    };
+
+    // `a` and `c` are re-included by `!/*`, so both are entered, but only
+    // `a/b` leads to anything below them.
+    assert_eq!(
+        entered(&["*", "!/*", "!a/b/**"]),
+        set(&["", "a", "a/b", "a/b/c", "ab", "c"])
+    );
+    assert_eq!(
+        entered(&["**", "!/*", "!a/b/**"]),
+        set(&["", "a", "a/b", "a/b/c", "ab", "c"])
+    );
+
+    // An anchored rule ending in a wildcard is bounded the same way: `a/*`
+    // re-includes `a/b` and `a/x`, and reaches no deeper.
+    assert_eq!(
+        entered(&["*", "!/*", "!a/*"]),
+        set(&["", "a", "a/b", "a/x", "ab", "c"])
+    );
+
+    let filter = build(&["*", "!/*", "!a/b/**"]).expect("filter builds");
+    assert!(filter.excludes_subtree(&path("c/d")));
+    assert!(filter.excludes_subtree(&path("a/x")));
+    assert!(!filter.excludes_subtree(&path("a/b")));
+    assert_eq!(walk_tree(&filter, DEEP), set(&["root.txt", "a/b/c/f"]));
+}
+
+/// Directories the walk enters across the whole ground truth, pinned so that a
+/// change losing a prune is reviewed rather than absorbed.
+///
+/// Every other test here checks which files a walk includes, and losing a
+/// prune changes none of them: the walk only enters more directories to find
+/// nothing. The only symptom is the cost, so this count is what fails.
+#[test]
+fn the_walk_enters_no_more_directories_than_it_needs() {
+    let mut entered = 0usize;
+    for case in CASES {
+        let Some(filter) = build(case.patterns) else {
+            continue;
+        };
+        entered += walk_tree_entering(&filter, FILES, true).1.len();
+    }
+    assert_eq!(entered, 22497);
 }
 
 /// The ancestor memo changes no answer.

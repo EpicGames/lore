@@ -53,6 +53,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch
   reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with
   `NOT_FOUND`
+- View filters: a view rule that matches only a few levels deep, such as `!/*`, no longer makes `lore clone`, a
+  whole-tree `lore diff` or `lore status --scan` walk and fetch every directory outside the view, and no longer makes
+  `lore clone` create each of them as an empty directory, a regression in v0.10.0. `lore sync --view` no longer misses
+  files to add or remove below a directory where either view excludes content through a character class, such as
+  `[!x]`, or a `**` inside a name, such as `/a/b**`, both of which match across a `/`
 
 ## v0.12.0 (Oct 26th 2026) [#1966]
 

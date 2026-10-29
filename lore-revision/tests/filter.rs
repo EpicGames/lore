@@ -1374,7 +1374,8 @@ mod tests {
     /// Rule sets spanning the shapes that decide a covering answer: an open
     /// re-inclusion, one with an exclusion nested under it, one with the
     /// exclusion somewhere else entirely, a literal name rule, a suffix rule, a
-    /// `**` in the middle, and one of each at once.
+    /// `**` in the middle, a trailing `**` and a character class that each
+    /// reach deeper than their components, and one of each at once.
     const COVER_RULES: &[&[&str]] = &[
         &["/*", "!/engine"],
         &["/*", "!/engine", "/engine/intermediate"],
@@ -1382,6 +1383,8 @@ mod tests {
         &["Thumbs.db"],
         &["*.tmp"],
         &["/some/**/path"],
+        &["/engine/c**", "!/engine/c*"],
+        &["/*", "!/engine", "/engine[!x]content"],
         &["/engine/content"],
         &["**/node_modules"],
         &["/*", "!/alt", "/alt/{b,c/d}/keep/*"],

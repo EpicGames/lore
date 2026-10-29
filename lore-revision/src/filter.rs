@@ -382,8 +382,9 @@ fn component_count(path: &str) -> u32 {
 /// How deep a query about `path` stands, which bounds which rules can reach
 /// below it. The repository root arrives empty and names no component.
 ///
-/// This is the `depth` [`Filter::covers_subtree`] is asked with. A walk that
-/// descends a component at a time counts instead, and pays nothing for it.
+/// This is the `depth` [`Filter::covers_subtree`] is asked with, and the one
+/// [`FilterInstance::settles_subtree`] asks at. A walk that descends a
+/// component at a time counts instead, and pays nothing for it.
 pub(crate) fn query_depth(path: &str) -> u32 {
     if path.is_empty() {
         0
@@ -875,11 +876,14 @@ impl FilterInstance {
     /// `*` that a leading `/*` compiles to would reach every path. A `**`
     /// consumes one component or more, so a glob holding one is unbounded.
     ///
-    /// Sound because of the matcher's own arithmetic: every component other than
-    /// `**` consumes exactly one path component, since `*` and `?` do not cross
-    /// a separator. It is an over-estimate under every construct the matcher
-    /// supports, which is the direction that has to hold -- brace alternation
-    /// picks a subset of the glob's separators, and classes and escapes only
+    /// Sound because of the matcher's own arithmetic: every other component
+    /// consumes exactly one path component, since `*` and `?` do not cross a
+    /// separator. Two constructs do, and leave the glob unbounded too: a `**`
+    /// that shares its component with other text, since `a**` at the end of a
+    /// glob matches `ab/c`, and a character class, since `[!x]` and `[/]` both
+    /// match a `/` in the path. It is an over-estimate under every construct
+    /// the matcher supports, which is the direction that has to hold -- brace
+    /// alternation picks a subset of the glob's separators, and escapes only
     /// make a `/` stop separating, so no expansion has more components than the
     /// glob text. Over-estimating costs traversal; under-estimating drops
     /// content.
@@ -902,7 +906,7 @@ impl FilterInstance {
             optional += u32::from(previous_was_globstar);
             total += 1;
             previous_was_globstar = component == "**";
-            unbounded |= previous_was_globstar;
+            unbounded |= component.contains("**") || component.contains('[');
         }
         (
             (total - optional).max(1),
@@ -1157,11 +1161,16 @@ impl FilterInstance {
     /// [`excludes_subtree`](Self::excludes_subtree) reports it. `path` is the
     /// lowercase form `state` was produced for.
     ///
-    /// The query depth is `0`, so every indexed inclusion clears the depth
-    /// bound however shallow its own rule. This side is deliberately unbounded
-    /// in depth: tightening it would prune walks that reach content today.
+    /// The query stands at `path`'s own depth, so a re-inclusion that cannot
+    /// match below it does not hold the walk open. That bound is what stops
+    /// the `!/*` of a view written as "exclude everything, re-include the root
+    /// files", which no prefix bounds, from sending every walk into every
+    /// excluded directory in the repository.
     fn settles_subtree(&self, state: FilterState, path: &str) -> bool {
-        state.excluded && !self.reinclude.below(path, state.decided_at, 0)
+        state.excluded
+            && !self
+                .reinclude
+                .below(path, state.decided_at, query_depth(path))
     }
 
     /// Whether `state` includes `path` and no rule can exclude anything below
