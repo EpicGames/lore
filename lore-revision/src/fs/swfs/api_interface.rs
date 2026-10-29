@@ -168,6 +168,7 @@ mod swfs_impl {
     use crate::fs::swfs::mount_resources::SwfsWorkError;
     use crate::fs::swfs::paths::SwfsPath;
     use crate::fs::swfs::state::written_files;
+    use crate::lore_debug;
     use crate::service_state::ServiceStateImpl;
 
     impl SwfsInterface {
@@ -271,9 +272,14 @@ mod swfs_impl {
 
             let mut handle = SWFSHandle::default();
 
+            // Paired with the lines around `swfsClose` in `close`, which name the same handle and
+            // path, so that a mount's opening and closing can be matched in a debug log.
+            let mount_path = resources.mount_path_nul_terminated.to_string_lossy();
+            lore_debug!("swfsInit: mounting {mount_path}");
             unsafe {
                 swfsInit(&mut init, &mut handle);
             }
+            lore_debug!("swfsInit: mounted {mount_path} as SWFS handle {handle:?}");
 
             let this = Arc::new(Self {
                 handle: WrappedHandle(handle),
@@ -299,8 +305,15 @@ mod swfs_impl {
         /// end, however long they take, and every caller returns only after it is closed. Must
         /// not be called while holding a [`SwfsHandleGuard`].
         pub fn close(&self) {
-            self.gate.close(|| unsafe {
-                swfsClose(self.handle.handle());
+            self.gate.close(|| {
+                // Paired with the lines around `swfsInit` in `mount`.
+                let handle = self.handle.handle();
+                let mount_path = self.resources.mount_path_nul_terminated.to_string_lossy();
+                lore_debug!("swfsClose: closing SWFS handle {handle:?} at {mount_path}");
+                unsafe {
+                    swfsClose(handle);
+                }
+                lore_debug!("swfsClose: closed SWFS handle {handle:?} at {mount_path}");
             });
         }
 

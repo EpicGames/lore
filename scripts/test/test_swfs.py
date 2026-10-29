@@ -1,4 +1,5 @@
 import os
+import re
 import typing
 
 import pytest
@@ -185,6 +186,62 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
     lore_service_runner.start()
 
     _repositories_match_files(original_repo, swfs_repo, file_contents)
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+)
+def test_swfs_mount_is_closed_when_its_service_stops(
+    new_lore_repo, lore_service_runner, scratch_dir
+):
+    """A service closes its SWFS mounts when it stops. A mount left open stays with
+    the driver, which then cannot be stopped until the machine restarts.
+
+    Read from the debug lines around `swfsInit` and `swfsClose`, which name the
+    mount's path and SWFS handle: the clone command reports the mount it made, and
+    the stopped service the close of that same handle."""
+    lore_service_runner.start(debug=True)
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("test message", {"f.txt": os.urandom(1024)})
+    original_repo.shared_store_create(original_repo.remote)
+
+    target = scratch_dir("swfs_closed")
+    clone_output = original_repo.run(
+        [
+            "repository",
+            "clone",
+            original_repo.remote_path,
+            str(target),
+            "--vfs",
+            "swfs",
+            "--use-shared-store",
+        ],
+        debug=True,
+    )
+    mounted = _swfs_handles(clone_output, "swfsInit: mounted", target.name)
+    assert len(mounted) == 1, f"the clone mounts once: {clone_output}"
+
+    lore_service_runner.terminate()
+
+    service_output = lore_service_runner.output_paths[None].read_text(errors="replace")
+    closed = _swfs_handles(service_output, "swfsClose: closed", target.name)
+    assert closed == mounted, (
+        f"the stopped service closed the clone's mount, SWFS handle {mounted}: "
+        f"{service_output}"
+    )
+
+
+def _swfs_handles(output: str, event: str, mount_name: str) -> list[str]:
+    """The SWFS handles that `event` debug lines in `output` name for the mount
+    whose path ends in `mount_name`."""
+    handles = []
+    for line in output.splitlines():
+        if event in line and mount_name in line:
+            match = re.search(r"SWFS handle (0x[0-9a-fA-F]+)", line)
+            assert match, f"the debug line names its SWFS handle: {line}"
+            handles.append(match.group(1))
+    return handles
 
 
 @pytest.mark.smoke

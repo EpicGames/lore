@@ -17,6 +17,7 @@ mod repository;
 mod revision;
 mod revision_tree;
 mod sandbox_tests;
+mod service;
 mod storage;
 
 /// Points the unit tests at a global config, credential store and service socket of

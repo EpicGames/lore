@@ -328,10 +328,34 @@ impl MountManager {
     }
 
     /// Unmounts the mounts the service has to release before it stops, as the service does when
-    /// it stops, detaching a busy one lazily with `force`. SWFS mounts are left as they are, and
-    /// they are the only mounts, so this unmounts nothing.
+    /// it stops, detaching a busy one lazily with `force`. SWFS mounts are the only mounts, and are
+    /// closed by [`close_all`](Self::close_all) once the service has stopped taking commands rather
+    /// than here, where a command arriving after this could still use one, so this unmounts
+    /// nothing.
     #[allow(clippy::unused_async)]
     pub async fn unmount_all(&self, _force: bool) -> Result<(), MountManagerError> {
         Ok(())
+    }
+
+    /// Closes every SWFS mount, for the service to call as it exits, however it was stopped.
+    ///
+    /// The mount manager is a static, which is never dropped, so a mount not closed here outlives
+    /// the process only in the driver, which does not tear down a mount whose client went away
+    /// without closing it. On a blocking thread, because closing a mount waits for its uses in
+    /// progress (see [`SwfsInterface::close`]) and then on SWFS, which allows a client still
+    /// writing through the mount 10 seconds.
+    pub async fn close_all(&self) -> Result<(), MountManagerError> {
+        let mounts: Vec<Arc<SwfsInterface>> = self
+            .mounted_paths
+            .iter()
+            .map(|mount| Arc::clone(&mount.mount))
+            .collect();
+        lore_base::lore_spawn_blocking!(move || {
+            for mount in mounts {
+                mount.close();
+            }
+        })
+        .await
+        .map_err(|error| MountManagerError::internal(format!("Closing SWFS mounts: {error}")))
     }
 }

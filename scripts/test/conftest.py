@@ -332,17 +332,21 @@ class TrackedServices:
         self.lore_subprocess_env = lore_subprocess_env
         self.global_dir_name = global_dir_name
         self.service_processes: dict[str | None, subprocess.Popen | None] = {}
+        # The file each service's output goes to, kept after the service ends so
+        # that a test can read what it printed as it stopped.
+        self.output_paths: dict[str | None, Path] = {}
 
-    def start(self, directory: str | None = None):
-        """Starts the service, optionally with a chosen working directory. The service
-        shares the test's isolated global config so shared stores it creates land
-        where the client looks for them."""
-        process, log_path = self.launch(directory)
+    def start(self, directory: str | None = None, debug: bool = False):
+        """Starts the service, optionally with a chosen working directory, and with
+        its debug log lines in its output when `debug` is set. The service shares
+        the test's isolated global config so shared stores it creates land where
+        the client looks for them."""
+        process, log_path = self.launch(directory, debug)
         _wait_for_service_ready(process, log_path)
 
         return process
 
-    def launch(self, directory: str | None = None):
+    def launch(self, directory: str | None = None, debug: bool = False):
         """Starts the service as `start` does without waiting for it to accept
         connections, for a test that does not expect it to become ready. Returns
         the process and the file its output goes to."""
@@ -357,6 +361,8 @@ class TrackedServices:
             f"lore-service-{len(self.service_processes)}.log"
         )
         command_args = [self.lore_executable_path, "service", "run"]
+        if debug:
+            command_args.append("--debug")
         logger.info("Executing Lore service command: %s", command_args)
         with open(log_path, "w") as log_file:
             process = subprocess.Popen(
@@ -378,6 +384,7 @@ class TrackedServices:
         # Tracked before any wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.
         self.service_processes[directory] = process
+        self.output_paths[directory] = log_path
 
         return process, log_path
 
@@ -391,9 +398,32 @@ class TrackedServices:
         # ten seconds to end. Already-exited processes are handled by
         # send_signal, which polls first and does nothing if the process is
         # gone.
-        process.terminate()
+        #
+        # Asked to stop rather than ended outright, so that it closes its SWFS
+        # mounts on the way out: one ended without closing them leaves them to the
+        # driver, which keeps it from unloading. `lore service run` handles SIGTERM
+        # and SIGINT, and Ctrl-C and Ctrl-Break on Windows, by quitting the service,
+        # which then stops as `lore service stop` would have it: see
+        # `handle_service_run` in lore-client/src/cli/commands/service.rs. On
+        # Windows `terminate()` is TerminateProcess, so the request there is
+        # Ctrl-Break, which reaches the service alone because it runs in a process
+        # group of its own. Waited on for long enough to close a mount, which SWFS
+        # bounds at 10 seconds.
+        running = process.poll() is None
+        if sys.platform == "win32":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate()
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=30)
+            # A service that stopped exits 0. Anything else after the request
+            # means the signal ended it outright, before it closed its mounts.
+            if running and process.returncode != 0:
+                logger.error(
+                    "Lore service exited with %s when asked to stop, rather than "
+                    "stopping: its SWFS mounts were not closed",
+                    process.returncode,
+                )
         except subprocess.TimeoutExpired:
             logger.warning("Lore service did not exit on terminate, killing it")
             process.kill()

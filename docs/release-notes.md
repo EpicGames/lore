@@ -76,6 +76,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `lore clone` create each of them as an empty directory, a regression in v0.10.0. `lore sync --view` no longer misses
   files to add or remove below a directory where either view excludes content through a character class, such as
   `[!x]`, or a `**` inside a name, such as `/a/b**`, both of which match across a `/`
+- The Lore service closes its SWFS mounts when it exits, however it is stopped. It used to leave them to EpicVFS,
+  which kept a device for each one and could not be stopped afterwards: `sc stop EpicVFS` stayed in `STOP_PENDING`
+  until the machine restarted
 
 ## v0.12.0 (Oct 26th 2026) [#1966]
 
