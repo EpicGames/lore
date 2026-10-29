@@ -33,6 +33,9 @@ use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event::EventError;
+use crate::fs::swfs::mount_manager_state::MountManagerState;
+use crate::global::external_dir::check_for_external_lore_dir;
+use crate::global::external_dir::external_dir_for_instance;
 use crate::hash;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -961,6 +964,78 @@ pub struct LoreRepositoryInstanceEventData {
     pub stale: u8,
 }
 
+/// Event data for the start of an instance delete operation.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRepositoryInstanceDeleteBeginEventData {
+    /// Identifier of the instance being deleted
+    pub instance_id: InstanceId,
+    /// Filesystem path of the instance
+    pub path: LoreString,
+    /// Whether this is a SWFS-backed instance
+    pub is_swfs: u8,
+    /// Whether this is a dry-run (preview only)
+    pub dry_run: u8,
+}
+
+/// Phase of an instance delete operation.
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreInstanceDeletePhase {
+    /// Unmounting the SWFS instance
+    Unmounting = 0,
+    /// Removing instance keys from mutable store
+    Deregistering = 1,
+    /// Deleting external directories or repository directory
+    DeletingFiles = 2,
+}
+
+/// Event data for progress during an instance delete operation.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRepositoryInstanceDeleteProgressEventData {
+    /// Current phase of the delete operation
+    pub phase: LoreInstanceDeletePhase,
+}
+
+/// Event data for the completion of an instance delete operation.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRepositoryInstanceDeleteCompleteEventData {
+    /// Identifier of the deleted instance
+    pub instance_id: InstanceId,
+}
+
+/// Event data for the start of an instance move operation.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRepositoryInstanceMoveBeginEventData {
+    /// Identifier of the instance being moved
+    pub instance_id: InstanceId,
+    /// Original filesystem path of the instance
+    pub source_path: LoreString,
+    /// New filesystem path for the instance
+    pub target_path: LoreString,
+}
+
+/// Event data for the completion of an instance move operation.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRepositoryInstanceMoveCompleteEventData {
+    /// Identifier of the moved instance
+    pub instance_id: InstanceId,
+    /// New filesystem path of the instance
+    pub target_path: LoreString,
+}
+
 /// Emit a `RepositoryInstance` event describing one registration.
 fn send_instance_event(
     instance: &InstanceMetadata,
@@ -1046,6 +1121,512 @@ pub async fn update_path(repository: Arc<RepositoryContext>) -> Result<(), Insta
     let current_path = repository.path_for_display().to_string();
     register_instance(&repository, repository.instance_id, &current_path).await?;
     lore_debug!("Updated instance path to {current_path}");
+    Ok(())
+}
+
+/// Whether the instance's stores are shared, and so outside its directory.
+///
+/// Reads the instance's config and resolves the shared store it names, so a missing or
+/// mismatched shared store fails here rather than part way through the operation. Opens no
+/// store, takes no lock and makes no connection.
+async fn uses_shared_store(repository: &Arc<RepositoryContext>) -> Result<bool, InstanceError> {
+    let dot_path = repository.dot_dir_path().map_err(|e| {
+        InstanceError::internal(format!("failed to find the instance directory: {e}"))
+    })?;
+    let config = crate::repository::load_repository_config_from_dot_dir(dot_path)
+        .forward_any::<InstanceError>("failed to load the repository config")?;
+    Ok(crate::shared_store::get_shared_store_path_for_repo(&config)
+        .await
+        .forward_any::<InstanceError>("failed to find the shared store")?
+        .is_some())
+}
+
+/// Whether the instance at `path` can be acted on, given whether it `is_swfs`, whether a
+/// mount manager is `in_service`, and the instance the mount manager has `mounted` at `path`.
+///
+/// An instance counts as SWFS when an external directory exists for the instance id in its
+/// `.lore/instance` file, but a directory can name any id. Acting on that id alone would let a
+/// checkout that names another instance move or delete that instance's files, while the mount at
+/// `path` stayed with the instance it belongs to. A mount of `instance_id` itself at `path` is
+/// what ties the path to the id, so an SWFS instance needs one, and any other instance must not
+/// be on a mount at all.
+#[lore_macro::test_pub]
+fn check_mount(
+    instance_id: InstanceId,
+    is_swfs: bool,
+    in_service: bool,
+    mounted: Option<InstanceId>,
+    path: &str,
+    action: &str,
+) -> Result<(), InstanceError> {
+    match mounted {
+        Some(mounted) if mounted != instance_id => Err(InstanceError::internal(format!(
+            "{path} is the mount of instance {mounted}, but its instance file names instance \
+             {instance_id}, so it cannot be told which to {action}"
+        ))),
+        Some(_) if !is_swfs => Err(InstanceError::internal(format!(
+            "{path} is the mount of instance {instance_id}, which has no external directory, so \
+             it cannot be told how to {action} it"
+        ))),
+        Some(_) => Ok(()),
+        None if !is_swfs => Ok(()),
+        None if !in_service => Err(InstanceError::internal(format!(
+            "Instance {instance_id} is an SWFS instance, which only the service can {action}"
+        ))),
+        None => Err(InstanceError::internal(format!(
+            "Instance {instance_id} is not mounted at {path}, so it is not the SWFS instance \
+             that directory's instance id names"
+        ))),
+    }
+}
+
+/// The mount manager, if `path` is the mount of `instance_id`, after checking as
+/// [`check_mount`] does that the instance at `path` can be acted on.
+fn require_own_mount(
+    instance_id: InstanceId,
+    is_swfs: bool,
+    path: &str,
+    action: &str,
+) -> Result<Option<Arc<crate::fs::swfs::mount_manager::MountManager>>, InstanceError> {
+    let mount_manager = MountManagerState::mount_manager();
+    let mounted = match &mount_manager {
+        Some(mount_manager) => mount_manager
+            .mounted_instance(Path::new(path))
+            .forward_any::<InstanceError>("failed to look up the mount")?,
+        None => None,
+    };
+    check_mount(
+        instance_id,
+        is_swfs,
+        mount_manager.is_some(),
+        mounted,
+        path,
+        action,
+    )?;
+    Ok(mount_manager.filter(|_| mounted.is_some()))
+}
+
+/// Fail where Windows would refuse to rename or delete `instance_path` because a process has it
+/// as its working directory, before anything has been changed.
+fn require_working_directory_outside(
+    instance_path: &str,
+    action: &str,
+) -> Result<(), InstanceError> {
+    if !cfg!(target_family = "windows") {
+        return Ok(());
+    }
+    // The working directory the call carries, which for a call relayed to a service is the
+    // caller's rather than the service's, and this process's own only when the call names none.
+    let Ok(working_directory) = crate::util::path::make_absolute(".") else {
+        return Ok(());
+    };
+    let working_directory =
+        crate::util::path::clean(working_directory.to_string_lossy().into_owned()).to_lowercase();
+    let instance = crate::util::path::clean(instance_path.to_owned()).to_lowercase();
+    if working_directory == instance || working_directory.starts_with(&format!("{instance}/")) {
+        return Err(InstanceError::internal(format!(
+            "Cannot {action} the instance at {instance_path} while it is the working directory. \
+             Run the command from outside the instance, naming it with --repository"
+        )));
+    }
+    Ok(())
+}
+
+/// First wait before a move or delete reissues a file operation that failed because something
+/// had the instance's files in use, in milliseconds.
+#[lore_macro::test_pub]
+const IN_USE_RETRY_START_MILLIS: u64 = 50;
+
+/// Longest wait the backoff grows to, in milliseconds.
+#[lore_macro::test_pub]
+const IN_USE_RETRY_MAXIMUM_MILLIS: u64 = 2_000;
+
+/// Waits before an operation that keeps failing in use is reported. With the schedule above this
+/// waits about fifteen seconds, longer than the ten seconds a finished command in the same process
+/// keeps the instance's stores open by default.
+#[lore_macro::test_pub]
+const IN_USE_RETRY_LIMIT: usize = 12;
+
+/// Whether `error` says that something has the files in use, so the operation can succeed once
+/// it lets go: another Lore command reading the instance, in this process or another, or a
+/// program the user has open in it.
+#[lore_macro::test_pub]
+fn is_in_use(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ResourceBusy || is_in_use_for_platform(error)
+}
+
+/// Whether a failed rename of an instance to `to` is worth reissuing: the files were in use and
+/// the target is still free. Windows reports a rename onto a path that is taken as access denied,
+/// the same error a file open in the directory gives, and no wait frees that path.
+#[lore_macro::test_pub]
+fn rename_is_retryable(error: &io::Error, to: &Path) -> bool {
+    is_in_use(error) && !to.exists()
+}
+
+/// Whether a failed delete of an instance directory is worth reissuing: the files were in use, or
+/// the directory was left non-empty, as a delete that races a reader creating a file leaves it,
+/// and on Windows a delete of a file whose removal waits on a handle still open.
+#[lore_macro::test_pub]
+fn delete_is_retryable(error: &io::Error) -> bool {
+    is_in_use(error) || error.kind() == io::ErrorKind::DirectoryNotEmpty
+}
+
+/// Windows refuses to rename a directory with a file open in it as access denied, and to delete
+/// a file another handle shares no deletion with as a sharing violation.
+#[cfg(target_family = "windows")]
+fn is_in_use_for_platform(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(code)
+            if code == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32
+                || code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
+                || code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
+    )
+}
+
+/// No other kernel refuses a rename or delete because a file is open.
+#[cfg(not(target_family = "windows"))]
+fn is_in_use_for_platform(_error: &io::Error) -> bool {
+    false
+}
+
+/// Runs `operation`, reissuing it with backoff for as long as it fails with an error `retryable`
+/// accepts, up to [`IN_USE_RETRY_LIMIT`] times. Any other failure is reported at once.
+///
+/// Takes a plain closure returning a future rather than an `AsyncFnMut`, whose higher-ranked
+/// lifetime defeats `Send` inference for the callers that spawn these commands.
+#[lore_macro::test_pub]
+async fn retry_while_in_use<T, F, O>(
+    action: &str,
+    retryable: impl Fn(&io::Error) -> bool,
+    mut operation: F,
+) -> io::Result<T>
+where
+    F: FnMut() -> O,
+    O: Future<Output = io::Result<T>>,
+{
+    let mut retry = crate::util::time::retry(
+        IN_USE_RETRY_START_MILLIS,
+        IN_USE_RETRY_MAXIMUM_MILLIS,
+        IN_USE_RETRY_LIMIT,
+    );
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) if retryable(&error) && retry.wait().await => {
+                lore_debug!("Retrying to {action}, which failed in use: {error}");
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Delete the directory at `path` and everything in it, retrying while its files are in use. A
+/// directory that is already gone counts as deleted.
+async fn remove_instance_directory(path: &Path) -> io::Result<()> {
+    let action = format!("delete {}", path.display());
+    retry_while_in_use(&action, delete_is_retryable, || async {
+        match lore_io::IoDriver::global().remove_dir_all(path).await {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            result => result,
+        }
+    })
+    .await
+}
+
+/// Remove the registration of the instance at `path`: open it as a repository, as a command run
+/// from there would, and remove its keys from the registry.
+async fn deregister_instance_at(path: &Path, instance_id: InstanceId) -> Result<(), InstanceError> {
+    let token = crate::repository::RepositoryWriteToken::acquire(path).await;
+    let repository = crate::repository::load_and_connect_with_token(
+        path,
+        crate::repository::RepositoryAccess::ReadWrite,
+        Some(token),
+    )
+    .await
+    .forward_any::<InstanceError>("failed to open the instance")?;
+    if !remove_instance_keys(&repository, instance_id).await {
+        return Err(WriteRequired.into());
+    }
+    repository
+        .flush(false)
+        .await
+        .forward_any::<InstanceError>("failed to flush the instance removal")
+}
+
+/// Delete the current instance: remove its registration, unmount it (if SWFS and in service), and
+/// delete its directories.
+///
+/// The registration goes first, and the repository is closed again before anything is deleted, as
+/// Windows cannot delete files that are open. Nothing is destroyed if the instance cannot be
+/// opened to deregister it. A delete that then fails leaves files behind, and says where, for the
+/// user to remove.
+///
+/// In a dry run (the global `dry_run` flag), checks everything a delete would need and emits
+/// events describing what would be deleted, without performing any changes.
+///
+/// The caller opens the repository without its stores or directory lock, so that this function
+/// controls when they are held.
+pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), InstanceError> {
+    let dry_run = crate::lore::execution_context().globals().dry_run();
+    let instance_id = repository.instance_id;
+    let path = repository.path_for_display().to_string();
+    // Detect SWFS by checking for external lore directory
+    let is_swfs = check_for_external_lore_dir(instance_id).is_ok_and(|opt| opt.is_some());
+
+    // Emit begin event
+    LoreEvent::InstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData {
+        instance_id,
+        path: LoreString::from_str(&path),
+        is_swfs: if is_swfs { 1 } else { 0 },
+        dry_run: if dry_run { 1 } else { 0 },
+    })
+    .send();
+
+    // Everything that can fail on a bad configuration is checked before anything is changed, and
+    // by a dry run too.
+    require_own_mount(instance_id, is_swfs, &path, "delete")?;
+    require_working_directory_outside(&path, "delete")?;
+    let shared_store = uses_shared_store(&repository).await?;
+
+    if dry_run {
+        // Dry run: report what would happen
+        let unmounting = is_swfs.then_some(LoreInstanceDeletePhase::Unmounting);
+        for phase in [LoreInstanceDeletePhase::Deregistering]
+            .into_iter()
+            .chain(unmounting)
+            .chain([LoreInstanceDeletePhase::DeletingFiles])
+        {
+            LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
+                phase,
+            })
+            .send();
+        }
+        LoreEvent::InstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData {
+            instance_id,
+        })
+        .send();
+        return Ok(());
+    }
+
+    LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
+        phase: LoreInstanceDeletePhase::Deregistering,
+    })
+    .send();
+    // A registry inside the instance directory goes with it.
+    if shared_store {
+        deregister_instance_at(Path::new(&path), instance_id).await?;
+    }
+
+    if is_swfs {
+        LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
+            phase: LoreInstanceDeletePhase::Unmounting,
+        })
+        .send();
+        if let Some(mm) = MountManagerState::mount_manager() {
+            let _ = mm.remove_mount(Path::new(&path));
+        }
+    }
+
+    LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
+        phase: LoreInstanceDeletePhase::DeletingFiles,
+    })
+    .send();
+    if is_swfs {
+        let external = external_dir_for_instance(instance_id)
+            .forward_any::<InstanceError>("failed to find the external directory")?;
+        remove_instance_directory(&external).await.map_err(|e| {
+            InstanceError::internal(format!(
+                "Failed to delete external directory {}: {e}. The instance is already \
+                 deregistered and unmounted; delete that directory manually",
+                external.display()
+            ))
+        })?;
+    } else {
+        remove_instance_directory(Path::new(&path))
+            .await
+            .map_err(|e| {
+                InstanceError::internal(format!(
+                    "Failed to delete repository directory {path}: {e}. Delete the directory \
+                     manually"
+                ))
+            })?;
+    }
+
+    LoreEvent::InstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData {
+        instance_id,
+    })
+    .send();
+    lore_debug!("Deleted instance {instance_id} at {path}");
+    Ok(())
+}
+
+/// Record where the instance at `path` now is: open it as a repository, as a command run from
+/// there would, and update its registered path as `lore repository update-path` does.
+async fn register_instance_at(path: &Path) -> Result<(), InstanceError> {
+    let token = crate::repository::RepositoryWriteToken::acquire(path).await;
+    let repository = crate::repository::load_and_connect_with_token(
+        path,
+        crate::repository::RepositoryAccess::ReadWrite,
+        Some(token),
+    )
+    .await
+    .forward_any::<InstanceError>("failed to open the instance")?;
+    update_path(repository.clone()).await?;
+    repository
+        .flush(false)
+        .await
+        .forward_any::<InstanceError>("failed to flush the instance registration")
+}
+
+/// Move an instance's directory, or its mount for an SWFS instance in a service.
+async fn move_instance(
+    is_swfs: bool,
+    instance_id: InstanceId,
+    from: &str,
+    to: &str,
+) -> Result<(), InstanceError> {
+    if !is_swfs {
+        let action = format!("move {from} to {to}");
+        let retryable = |error: &io::Error| rename_is_retryable(error, Path::new(to));
+        return retry_while_in_use(&action, retryable, || {
+            lore_io::IoDriver::global().rename(from, to)
+        })
+        .await
+        .map_err(|e| {
+            InstanceError::internal(format!(
+                "Failed to move directory from {from} to {to}: {e}. Move the directory \
+                     manually, then run `lore repository update-path` in it at its new location"
+            ))
+        });
+    }
+    let Some(mm) = MountManagerState::mount_manager() else {
+        return Err(InstanceError::internal(format!(
+            "Instance {instance_id} is an SWFS instance, which only the service can move"
+        )));
+    };
+    mm.remount(Path::new(from), Path::new(to))
+        .await
+        .map_err(|e| InstanceError::internal(format!("Failed to remount instance at {to}: {e}")))
+}
+
+/// Move the current instance to a new path: move its directory (or its mount for an SWFS
+/// instance in a service), and then record the new path.
+///
+/// The registration is written last so a move that fails leaves the instance registered where it
+/// is, and a registration that cannot be written undoes the move.
+///
+/// In a dry run (the global `dry_run` flag), checks everything a move would need and reports it
+/// without moving or registering anything.
+///
+/// The caller opens the repository without its stores or directory lock. Windows cannot rename a
+/// directory that has files open in it, and the stores and lock are files in the instance
+/// directory.
+pub async fn instance_move(
+    repository: Arc<RepositoryContext>,
+    target_path: &str,
+) -> Result<(), InstanceError> {
+    instance_move_with(repository, target_path, register_instance_at).await
+}
+
+/// [`instance_move`] with the step that records an instance's path supplied by the caller, so a
+/// failure of that step, and the rollback it triggers, can be tested.
+///
+/// `register` records the instance at the path it is given, as [`register_instance_at`] does.
+#[lore_macro::test_pub]
+async fn instance_move_with(
+    repository: Arc<RepositoryContext>,
+    target_path: &str,
+    register: impl AsyncFn(&Path) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
+    let dry_run = crate::lore::execution_context().globals().dry_run();
+    let instance_id = repository.instance_id;
+    let source_path = repository.path_for_display().to_string();
+    // Detect SWFS by checking for external lore directory
+    let is_swfs = check_for_external_lore_dir(instance_id).is_ok_and(|opt| opt.is_some());
+    let target = Path::new(target_path);
+
+    // Validate target path
+    if target.exists() {
+        return Err(InstanceError::internal(format!(
+            "Target path already exists: {target_path}"
+        )));
+    }
+
+    if let Some(parent) = target.parent() {
+        if !parent.exists() || !parent.is_dir() {
+            return Err(InstanceError::internal(format!(
+                "Target path parent does not exist: {target_path}"
+            )));
+        }
+    } else {
+        return Err(InstanceError::internal(format!(
+            "Target path parent does not exist: {target_path}"
+        )));
+    }
+
+    if let Some(mm) = require_own_mount(instance_id, is_swfs, &source_path, "move")? {
+        // check target isn't already an instance mount
+        if mm.is_mounted(target).unwrap_or(false) {
+            return Err(InstanceError::internal(format!(
+                "Target path is already an instance mount: {target_path}"
+            )));
+        }
+    }
+    require_working_directory_outside(&source_path, "move")?;
+    // The new path is recorded through the instance's config and, if it has one, its shared
+    // store, so a problem with either is found before anything is moved.
+    uses_shared_store(&repository).await?;
+
+    // Emit begin event
+    LoreEvent::InstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData {
+        instance_id,
+        source_path: LoreString::from_str(&source_path),
+        target_path: LoreString::from_str(target_path),
+    })
+    .send();
+
+    if dry_run {
+        LoreEvent::InstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData {
+            instance_id,
+            target_path: LoreString::from_str(target_path),
+        })
+        .send();
+        return Ok(());
+    }
+
+    move_instance(is_swfs, instance_id, &source_path, target_path).await?;
+
+    if let Err(error) = register(target).await {
+        // A failed write can still have left part of the new record behind, so moving the
+        // instance back is not enough: its registration has to name the source again.
+        let mut message = format!("Failed to record the new path {target_path}: {error}");
+        match move_instance(is_swfs, instance_id, target_path, &source_path).await {
+            Ok(()) => {
+                if let Err(restore_error) = register(Path::new(&source_path)).await {
+                    message.push_str(&format!(
+                        ". The instance is back at {source_path}, but its registration could not \
+                         be restored: {restore_error}. Run `lore repository update-path` in it"
+                    ));
+                }
+            }
+            Err(undo_error) => {
+                message.push_str(&format!(
+                    ". Moving the instance back to {source_path} also failed: {undo_error}. It \
+                     is at {target_path}; run `lore repository update-path` in it"
+                ));
+            }
+        }
+        lore_warn!("{message}");
+        return Err(InstanceError::internal(message));
+    }
+
+    LoreEvent::InstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData {
+        instance_id,
+        target_path: LoreString::from_str(target_path),
+    })
+    .send();
+    lore_debug!("Moved instance {instance_id} from {source_path} to {target_path}");
     Ok(())
 }
 

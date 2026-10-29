@@ -1447,6 +1447,78 @@ fn update_path_local(
     )
 }
 
+/// Arguments for deleting the current repository instance.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(instance_delete_local)]
+pub struct LoreRepositoryInstanceDeleteArgs {}
+
+pub async fn instance_delete(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, instance_delete_local).await
+}
+
+async fn instance_delete_local(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    repository_call_no_store(
+        globals,
+        callback,
+        args,
+        instance_delete,
+        move |repository, _args| lore_revision::instance::instance_delete(repository),
+    )
+    .await
+}
+
+/// Arguments for moving the current repository instance to a new path.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(instance_move_local)]
+pub struct LoreRepositoryInstanceMoveArgs {
+    /// Target path for the instance.
+    pub target_path: LoreString,
+}
+
+pub async fn instance_move(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, instance_move_local).await
+}
+
+async fn instance_move_local(
+    globals: LoreGlobalArgs,
+    mut args: LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    // A relative target is relative to the caller's working directory, which for a call relayed
+    // to a service is not this process's. Left as given when it cannot be resolved.
+    if let Ok(target) = util::path::make_absolute_from(
+        args.target_path.as_str(),
+        globals.working_directory().map(std::path::Path::new),
+    ) {
+        args.target_path = target.display().to_string().into();
+    }
+    repository_call_no_store(
+        globals,
+        callback,
+        args,
+        instance_move,
+        move |repository, args| {
+            let target = args.target_path.as_str().to_string();
+            async move { lore_revision::instance::instance_move(repository, &target).await }
+        },
+    )
+    .await
+}
+
 /// Arguments for reading a value from the repository config.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]

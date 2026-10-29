@@ -8138,6 +8138,56 @@ pub extern "C" fn lore_repository_instance_prune_async(
     run_asynchronously(globals, args, callback, dispatch_command);
 }
 
+pub type LoreRepositoryInstanceDeleteArgs = crate::repository::LoreRepositoryInstanceDeleteArgs;
+
+/// Delete the current repository instance: unmount (if SWFS and in service),
+/// deregister from the mutable store, and delete associated directories.
+/// With `dry_run` set in `globals`, emits events describing what would be deleted
+/// without performing any changes.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_delete(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_delete`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_delete_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRepositoryInstanceMoveArgs = crate::repository::LoreRepositoryInstanceMoveArgs;
+
+/// Move the current repository instance to a new path: update registry metadata
+/// and remap mount (for SWFS in service context) or move directory (for regular
+/// instances).
+/// With `dry_run` set in `globals`, checks that the move can be made without performing it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_move(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_move`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_move_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
 pub type LoreRepositoryUpdatePathArgs = crate::repository::LoreRepositoryUpdatePathArgs;
 
 /// Update the recorded path of the current repository instance to its present

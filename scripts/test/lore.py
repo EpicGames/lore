@@ -542,6 +542,32 @@ class Lore:
     def repository_gc(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "gc"], **kwargs)
 
+    def repository_instance_list(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["repository", "instance", "list"], **kwargs)
+
+    def repository_instance_prune(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["repository", "instance", "prune"], **kwargs)
+
+    def repository_instance_delete(
+        self, dry_run: bool = False, **kwargs: Unpack[GlobalOptions]
+    ):
+        return self.run(
+            ["repository", "instance", "delete"] + (["--dry-run"] if dry_run else []),
+            **kwargs,
+        )
+
+    def repository_instance_move(
+        self,
+        target_path: str,
+        dry_run: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["repository", "instance", "move", target_path]
+            + (["--dry-run"] if dry_run else []),
+            **kwargs,
+        )
+
     def repository_store(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "store"], **kwargs)
 

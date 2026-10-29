@@ -23,6 +23,8 @@ mod history;
 mod immutable;
 mod infer;
 mod instance;
+mod instance_in_use_retry;
+mod instance_move_rollback;
 mod interface;
 mod link;
 mod lock;

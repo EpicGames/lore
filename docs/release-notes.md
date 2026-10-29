@@ -146,6 +146,18 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   client session leaves out its secrets (RUSTSEC-2026-0346)
 - `lore stage --case keep` of several paths under a directory spelled in another case than the repository's stages them
   as modified under the repository's case, where on a case-sensitive file system it staged them as deleted
+- `lore`: `lore repository instance move` and `lore repository instance delete` open the repository without its stores
+  or directory lock, so they can rename or delete the instance directory on Windows. A move records the new path only
+  after the directory or mount has been moved, so a move that fails leaves the instance registered where it was, and a
+  move whose registration cannot be written is undone. A move that cannot rename the directory says to move it manually
+  and run `lore repository update-path` in it. A delete removes the registration first and then the files, and a delete
+  that cannot remove them says which directory to delete manually. On Windows, run them from outside the instance,
+  naming it with `--repository`: a working directory inside the instance fails the command with an explanation before
+  anything is changed. When another Lore command or program has the instance's files open, a move or delete retries
+  the rename or delete with backoff for about fifteen seconds before it fails
+- `lore`: `lore repository instance move` on a SWFS instance unmounts the virtual filesystem from the source path and
+  mounts it at the target, where it previously updated only the service's record of the mount path and left SWFS
+  mounted at the source. If the target cannot be mounted, the instance is mounted at the source again
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 

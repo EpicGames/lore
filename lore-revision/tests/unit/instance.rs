@@ -128,3 +128,58 @@ fn display_is_hex() {
     assert_eq!(s.len(), 32); // 16 bytes = 32 hex chars
     assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
 }
+
+const PATH: &str = "/checkout";
+
+#[test]
+fn an_swfs_instance_on_its_own_mount_can_be_acted_on() {
+    let id = InstanceId::generate();
+    check_mount(id, true, true, Some(id), PATH, "delete").expect("its own mount");
+}
+
+#[test]
+fn a_regular_instance_on_no_mount_can_be_acted_on() {
+    let id = InstanceId::generate();
+    check_mount(id, false, true, None, PATH, "delete").expect("in the service");
+    check_mount(id, false, false, None, PATH, "delete").expect("outside it");
+}
+
+#[test]
+fn an_instance_file_naming_another_instance_than_the_mount_is_refused() {
+    let named = InstanceId::generate();
+    let mounted = InstanceId::generate();
+    for is_swfs in [true, false] {
+        let error = check_mount(named, is_swfs, true, Some(mounted), PATH, "move")
+            .expect_err("another instance's mount")
+            .to_string();
+        assert!(error.contains(&mounted.to_string()), "{error}");
+        assert!(error.contains(&named.to_string()), "{error}");
+    }
+}
+
+#[test]
+fn an_swfs_instance_that_is_not_mounted_at_its_path_is_refused() {
+    let id = InstanceId::generate();
+    let error = check_mount(id, true, true, None, PATH, "delete")
+        .expect_err("not mounted")
+        .to_string();
+    assert!(error.contains("not mounted"), "{error}");
+}
+
+#[test]
+fn an_swfs_instance_outside_the_service_is_refused() {
+    let id = InstanceId::generate();
+    let error = check_mount(id, true, false, None, PATH, "move")
+        .expect_err("no service")
+        .to_string();
+    assert!(error.contains("only the service"), "{error}");
+}
+
+#[test]
+fn a_mount_of_an_instance_with_no_external_directory_is_refused() {
+    let id = InstanceId::generate();
+    let error = check_mount(id, false, true, Some(id), PATH, "delete")
+        .expect_err("a mount it cannot unmount")
+        .to_string();
+    assert!(error.contains("no external directory"), "{error}");
+}

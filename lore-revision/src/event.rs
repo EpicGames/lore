@@ -119,7 +119,12 @@ use crate::filter::LoreFilterExcludeEventData;
 use crate::find::LoreRevisionFindEventData;
 use crate::immutable::LoreFragmentWriteEventData;
 use crate::instance::LoreBranchMultipleInstanceEventData;
+use crate::instance::LoreRepositoryInstanceDeleteBeginEventData;
+use crate::instance::LoreRepositoryInstanceDeleteCompleteEventData;
+use crate::instance::LoreRepositoryInstanceDeleteProgressEventData;
 use crate::instance::LoreRepositoryInstanceEventData;
+use crate::instance::LoreRepositoryInstanceMoveBeginEventData;
+use crate::instance::LoreRepositoryInstanceMoveCompleteEventData;
 use crate::interface::LoreArray;
 use crate::interface::LoreBinary;
 use crate::interface::LoreError;
@@ -1322,6 +1327,16 @@ pub enum LoreEvent {
     StorageGetFragment(LoreStorageGetFragmentEventData),
     /// One range of a file's lines, attributed to the revision that last changed them.
     FileAudit(LoreFileAuditEventData),
+    /// The start of an instance delete operation.
+    InstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData),
+    /// Progress during an instance delete operation.
+    InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData),
+    /// The completion of an instance delete operation.
+    InstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData),
+    /// The start of an instance move operation.
+    InstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData),
+    /// The completion of an instance move operation.
+    InstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

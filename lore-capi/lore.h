@@ -216,6 +216,16 @@ typedef enum lore_file_audit_outcome_t {
   LORE_FILE_AUDIT_OUTCOME_UNRESOLVED = 7,
 } lore_file_audit_outcome_t;
 
+// Phase of an instance delete operation.
+typedef enum lore_instance_delete_phase_t {
+  // Unmounting the SWFS instance
+  LORE_INSTANCE_DELETE_PHASE_UNMOUNTING = 0,
+  // Removing instance keys from mutable store
+  LORE_INSTANCE_DELETE_PHASE_DEREGISTERING = 1,
+  // Deleting external directories or repository directory
+  LORE_INSTANCE_DELETE_PHASE_DELETING_FILES = 2,
+} lore_instance_delete_phase_t;
+
 // Which authentication path a client takes if a server advertises both its
 // gRPC auth service and an OIDC issuer. A path the server does not
 // advertise cannot be taken.
@@ -3397,6 +3407,48 @@ typedef struct lore_file_audit_event_data_t {
   enum lore_file_audit_outcome_t outcome;
 } lore_file_audit_event_data_t;
 
+// Event data for the start of an instance delete operation.
+typedef struct lore_repository_instance_delete_begin_event_data_t {
+  // Identifier of the instance being deleted
+  struct lore_instance_id_t instance_id;
+  // Filesystem path of the instance
+  struct lore_string_t path;
+  // Whether this is a SWFS-backed instance
+  uint8_t is_swfs;
+  // Whether this is a dry-run (preview only)
+  uint8_t dry_run;
+} lore_repository_instance_delete_begin_event_data_t;
+
+// Event data for progress during an instance delete operation.
+typedef struct lore_repository_instance_delete_progress_event_data_t {
+  // Current phase of the delete operation
+  enum lore_instance_delete_phase_t phase;
+} lore_repository_instance_delete_progress_event_data_t;
+
+// Event data for the completion of an instance delete operation.
+typedef struct lore_repository_instance_delete_complete_event_data_t {
+  // Identifier of the deleted instance
+  struct lore_instance_id_t instance_id;
+} lore_repository_instance_delete_complete_event_data_t;
+
+// Event data for the start of an instance move operation.
+typedef struct lore_repository_instance_move_begin_event_data_t {
+  // Identifier of the instance being moved
+  struct lore_instance_id_t instance_id;
+  // Original filesystem path of the instance
+  struct lore_string_t source_path;
+  // New filesystem path for the instance
+  struct lore_string_t target_path;
+} lore_repository_instance_move_begin_event_data_t;
+
+// Event data for the completion of an instance move operation.
+typedef struct lore_repository_instance_move_complete_event_data_t {
+  // Identifier of the moved instance
+  struct lore_instance_id_t instance_id;
+  // New filesystem path of the instance
+  struct lore_string_t target_path;
+} lore_repository_instance_move_complete_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -3878,6 +3930,16 @@ enum lore_event_id_t {
   LORE_EVENT_STORAGE_GET_FRAGMENT,
   // One range of a file's lines, attributed to the revision that last changed them.
   LORE_EVENT_FILE_AUDIT,
+  // The start of an instance delete operation.
+  LORE_EVENT_INSTANCE_DELETE_BEGIN,
+  // Progress during an instance delete operation.
+  LORE_EVENT_INSTANCE_DELETE_PROGRESS,
+  // The completion of an instance delete operation.
+  LORE_EVENT_INSTANCE_DELETE_COMPLETE,
+  // The start of an instance move operation.
+  LORE_EVENT_INSTANCE_MOVE_BEGIN,
+  // The completion of an instance move operation.
+  LORE_EVENT_INSTANCE_MOVE_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4122,6 +4184,11 @@ typedef struct lore_event_t {
     struct lore_auth_pending_event_data_t auth_pending;
     struct lore_storage_get_fragment_event_data_t storage_get_fragment;
     struct lore_file_audit_event_data_t file_audit;
+    struct lore_repository_instance_delete_begin_event_data_t instance_delete_begin;
+    struct lore_repository_instance_delete_progress_event_data_t instance_delete_progress;
+    struct lore_repository_instance_delete_complete_event_data_t instance_delete_complete;
+    struct lore_repository_instance_move_begin_event_data_t instance_move_begin;
+    struct lore_repository_instance_move_complete_event_data_t instance_move_complete;
   };
 } lore_event_t;
 
@@ -6027,6 +6094,17 @@ typedef struct lore_repository_instance_list_args_t {
 typedef struct lore_repository_instance_prune_args_t {
   int _unused;
 } lore_repository_instance_prune_args_t;
+
+// Arguments for deleting the current repository instance.
+typedef struct lore_repository_instance_delete_args_t {
+  int _unused;
+} lore_repository_instance_delete_args_t;
+
+// Arguments for moving the current repository instance to a new path.
+typedef struct lore_repository_instance_move_args_t {
+  // Target path for the instance.
+  struct lore_string_t target_path;
+} lore_repository_instance_move_args_t;
 
 // Arguments for updating the recorded path of the current repository instance.
 typedef struct lore_repository_update_path_args_t {
@@ -12702,6 +12780,32 @@ int32_t lore_repository_instance_prune(const struct lore_global_args_t *globals,
 void lore_repository_instance_prune_async(const struct lore_global_args_t *globals,
                                           const struct lore_repository_instance_prune_args_t *args,
                                           struct lore_event_callback_config_t callback);
+
+// Delete the current repository instance: unmount (if SWFS and in service),
+// deregister from the mutable store, and delete associated directories.
+// With `dry_run` set in `globals`, emits events describing what would be deleted
+// without performing any changes.
+int32_t lore_repository_instance_delete(const struct lore_global_args_t *globals,
+                                        const struct lore_repository_instance_delete_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_instance_delete`.
+void lore_repository_instance_delete_async(const struct lore_global_args_t *globals,
+                                           const struct lore_repository_instance_delete_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Move the current repository instance to a new path: update registry metadata
+// and remap mount (for SWFS in service context) or move directory (for regular
+// instances).
+// With `dry_run` set in `globals`, checks that the move can be made without performing it.
+int32_t lore_repository_instance_move(const struct lore_global_args_t *globals,
+                                      const struct lore_repository_instance_move_args_t *args,
+                                      struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_instance_move`.
+void lore_repository_instance_move_async(const struct lore_global_args_t *globals,
+                                         const struct lore_repository_instance_move_args_t *args,
+                                         struct lore_event_callback_config_t callback);
 
 // Update the recorded path of the current repository instance to its present
 // location.

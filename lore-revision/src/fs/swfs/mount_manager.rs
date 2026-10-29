@@ -125,11 +125,7 @@ impl MountManager {
                 .wait_for_ready()
                 .await
                 .forward::<MountManagerError>("Failed waiting for mount to be ready")?;
-            let handle = mount
-                .mount
-                .handle()
-                .forward::<MountManagerError>("Error getting mount handle after being readier")?;
-            lookup.insert(handle, mount.mount.clone());
+            lookup.insert(mount.mount.lookup_key(), mount.mount.clone());
         }
         Ok(Arc::new(MountManager {
             mounted_paths,
@@ -179,51 +175,28 @@ impl MountManager {
     ) -> Result<PathBuf, MountManagerError> {
         let mount_path = MountPath::new(repository_path)
             .forward::<MountManagerError>("Failed to make mount path")?;
-        if let Some(_mount) = self.mounted_paths.get(&mount_path) {
-            Err(MountManagerError::internal(format!(
+        if self.mounted_paths.contains_key(&mount_path) {
+            return Err(MountManagerError::internal(format!(
                 "Mount already exists for path {}",
                 repository_path.display()
-            )))
-        } else {
-            let dot_lore = external_dir_for_instance(instance_id)
-                .forward::<MountManagerError>("Unable to get external directory")?
-                .join(DOT_LORE);
-            let mount = SwfsInterface::mount(
-                MountResources::premount_instance_with_config(
-                    repository_id,
-                    instance_id,
-                    mount_path.clone(),
-                    repository_config,
-                )
-                .await
-                .forward::<MountManagerError>("Failed gathering premount resources")?,
-            )
-            .forward::<MountManagerError>("Failed to mount")?;
-            let existing = self.mounted_paths.insert(
-                mount_path,
-                Mount {
-                    instance_id,
-                    mount: mount.clone(),
-                },
-            );
-            if let Some(_existing) = existing {
-                return Err(MountManagerError::internal(format!(
-                    "Mount double created for path {}",
-                    repository_path.display()
-                )));
-            }
-            self.swfs_id_lookup.insert(
-                mount
-                    .handle()
-                    .forward::<MountManagerError>("Unable to get handle for fresh mount")?,
-                mount.clone(),
-            );
-            mount
-                .wait_for_ready()
-                .await
-                .forward::<MountManagerError>("Failed waiting for mount to be ready")?;
-            Ok(dot_lore)
+            )));
         }
+        let dot_lore = external_dir_for_instance(instance_id)
+            .forward::<MountManagerError>("Unable to get external directory")?
+            .join(DOT_LORE);
+        let mount = SwfsInterface::mount(
+            MountResources::premount_instance_with_config(
+                repository_id,
+                instance_id,
+                mount_path.clone(),
+                repository_config,
+            )
+            .await
+            .forward::<MountManagerError>("Failed gathering premount resources")?,
+        )
+        .forward::<MountManagerError>("Failed to mount")?;
+        self.attach(mount_path, instance_id, mount).await?;
+        Ok(dot_lore)
     }
 
     pub fn get_interface_from_swfs_handle(&self, handle: SWFSHandle) -> Option<Arc<SwfsInterface>> {
@@ -235,6 +208,123 @@ impl MountManager {
     /// Returns the number of currently mounted SWFS paths.
     pub fn mount_count(&self) -> usize {
         self.mounted_paths.len()
+    }
+
+    /// Check if a path is currently mounted.
+    pub fn is_mounted(&self, path: &Path) -> Result<bool, MountManagerError> {
+        let mount_path =
+            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
+        Ok(self.mounted_paths.contains_key(&mount_path))
+    }
+
+    /// The instance mounted at `path`, if any.
+    pub fn mounted_instance(&self, path: &Path) -> Result<Option<InstanceId>, MountManagerError> {
+        let mount_path =
+            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
+        Ok(self
+            .mounted_paths
+            .get(&mount_path)
+            .map(|mount| mount.instance_id))
+    }
+
+    /// Remove a mount, triggering cleanup/swfsClose when Arc drops.
+    /// Returns the `instance_id` if a mount existed at the path.
+    pub fn remove_mount(&self, path: &Path) -> Result<Option<InstanceId>, MountManagerError> {
+        let mount_path =
+            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
+        if let Some((_, mount)) = self.mounted_paths.remove(&mount_path) {
+            self.swfs_id_lookup.remove(&mount.mount.lookup_key());
+            // Closed explicitly: other holders of the interface would keep the path mounted.
+            mount.mount.close();
+            Ok(Some(mount.instance_id))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Mount `instance_id` at `mount_path`, record it, and wait for SWFS to be ready.
+    async fn mount_instance(
+        &self,
+        instance_id: InstanceId,
+        mount_path: MountPath,
+    ) -> Result<(), MountManagerError> {
+        let mount = SwfsInterface::mount(
+            MountResources::premount_instance(instance_id, mount_path.clone())
+                .await
+                .forward::<MountManagerError>("Failed gathering premount resources")?,
+        )
+        .forward::<MountManagerError>("Failed to mount")?;
+        self.attach(mount_path, instance_id, mount).await
+    }
+
+    /// Record a fresh `mount` of `instance_id` at `mount_path` and wait for SWFS to be ready. If
+    /// SWFS does not become ready the mount is closed and no longer recorded.
+    async fn attach(
+        &self,
+        mount_path: MountPath,
+        instance_id: InstanceId,
+        mount: Arc<SwfsInterface>,
+    ) -> Result<(), MountManagerError> {
+        let handle = mount.lookup_key();
+        // Recorded before SWFS is ready, as it can call back as soon as it is mounted.
+        self.swfs_id_lookup.insert(handle.clone(), mount.clone());
+        let displaced = self.mounted_paths.insert(
+            mount_path.clone(),
+            Mount {
+                instance_id,
+                mount: mount.clone(),
+            },
+        );
+        if displaced.is_some() {
+            return Err(MountManagerError::internal(format!(
+                "Mount double created for path {}",
+                mount_path.as_ref().display()
+            )));
+        }
+        if let Err(error) = mount.wait_for_ready().await {
+            self.mounted_paths.remove(&mount_path);
+            self.swfs_id_lookup.remove(&handle);
+            mount.close();
+            return Err(MountManagerError::internal(format!(
+                "Failed waiting for mount to be ready: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Move a mount from one path to another by unmounting it from `from_path` and mounting the
+    /// same instance at `to_path`. SWFS is given the mount path when a mount is created, so it
+    /// cannot be pointed at a new one in place.
+    ///
+    /// If the target cannot be mounted, the instance is mounted at `from_path` again.
+    pub async fn remount(&self, from_path: &Path, to_path: &Path) -> Result<(), MountManagerError> {
+        let from_mount_path = MountPath::new(from_path)
+            .forward::<MountManagerError>("Failed to make from mount path")?;
+        let to_mount_path =
+            MountPath::new(to_path).forward::<MountManagerError>("Failed to make to mount path")?;
+
+        // The mount is closed, not just dropped: callers still hold references to the interface,
+        // and the source path stays mounted until it is closed.
+        let Some(instance_id) = self.remove_mount(from_path)? else {
+            return Err(MountManagerError::internal(format!(
+                "Mount not found at path {}",
+                from_path.display()
+            )));
+        };
+
+        let Err(error) = self.mount_instance(instance_id, to_mount_path).await else {
+            return Ok(());
+        };
+        self.mount_instance(instance_id, from_mount_path)
+            .await
+            .map_err(|restore_error| {
+                MountManagerError::internal(format!(
+                    "Failed to mount at {}: {error}; restoring the mount at {} also failed: {restore_error}",
+                    to_path.display(),
+                    from_path.display()
+                ))
+            })?;
+        Err(error)
     }
 
     /// Unmounts the mounts the service has to release before it stops, as the service does when

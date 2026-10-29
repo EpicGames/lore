@@ -414,6 +414,17 @@ pub enum RepositoryInstanceCommands {
     /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
     /// in the global data directory, even when it is not mounted.
     Prune,
+    /// Delete the current instance: unmount (if SWFS), deregister from mutable store, and delete associated directories
+    Delete,
+    /// Move the current instance to a new path
+    Move(RepositoryInstanceMoveArgs),
+}
+
+#[derive(Args)]
+pub struct RepositoryInstanceMoveArgs {
+    /// Target path to move the instance to
+    #[arg(value_name = "target-path")]
+    pub target_path: String,
 }
 
 #[derive(Args)]
@@ -1711,6 +1722,10 @@ pub fn handle_repository_commands(cmd: &RepositoryCommands, globals: LoreGlobalA
         RepositoryCommands::Instance(args) => match &args.command {
             RepositoryInstanceCommands::List => handle_repository_instance_list(globals),
             RepositoryInstanceCommands::Prune => handle_repository_instance_prune(globals),
+            RepositoryInstanceCommands::Delete => handle_repository_instance_delete(globals),
+            RepositoryInstanceCommands::Move(move_args) => {
+                handle_repository_instance_move(globals, &move_args.target_path)
+            }
         },
         RepositoryCommands::Config(args) => match &args.command {
             RepositoryConfigCommands::Get(get_args) => {
@@ -1823,6 +1838,72 @@ fn handle_repository_update_path(globals: LoreGlobalArgs) -> u8 {
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(|event: &LoreEvent| match event {
             LoreEvent::Complete(_) => {}
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    return run_command(globals, args.into(), callback) as u8;
+}
+
+fn handle_repository_instance_delete(globals: LoreGlobalArgs) -> u8 {
+    let args = lore::repository::LoreRepositoryInstanceDeleteArgs {};
+    let dry_run = globals.dry_run();
+
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::Complete(_) => {}
+            LoreEvent::InstanceDeleteBegin(data) => {
+                let mode = if data.dry_run != 0 { " (dry run)" } else { "" };
+                println!(
+                    "Deleting instance {} at {}{}",
+                    data.instance_id, data.path, mode
+                );
+            }
+            LoreEvent::InstanceDeleteProgress(data) => {
+                println!("  {:?}", data.phase);
+            }
+            LoreEvent::InstanceDeleteComplete(data) => {
+                let outcome = if dry_run { "can be deleted" } else { "deleted" };
+                println!("Instance {} {}", data.instance_id, outcome);
+            }
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    return run_command(globals, args.into(), callback) as u8;
+}
+
+fn handle_repository_instance_move(globals: LoreGlobalArgs, target_path: &str) -> u8 {
+    let args = lore::repository::LoreRepositoryInstanceMoveArgs {
+        target_path: LoreString::from(target_path),
+    };
+    let dry_run = globals.dry_run();
+
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::Complete(_) => {}
+            LoreEvent::InstanceMoveBegin(data) => {
+                let mode = if dry_run { " (dry run)" } else { "" };
+                println!(
+                    "Moving instance {} from {} to {}{}",
+                    data.instance_id, data.source_path, data.target_path, mode
+                );
+            }
+            LoreEvent::InstanceMoveComplete(data) => {
+                let outcome = if dry_run { "can be moved" } else { "moved" };
+                println!(
+                    "Instance {} {} to {}",
+                    data.instance_id, outcome, data.target_path
+                );
+            }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
             }
