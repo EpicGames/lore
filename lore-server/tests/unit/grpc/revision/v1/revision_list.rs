@@ -20,6 +20,8 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::revision_list::*;
 use lore_server::grpc::revision::v1::service::RevisionListInstruments;
 use lore_storage::StoreError;
@@ -138,6 +140,7 @@ async fn create_branch_with_history(
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push revision")
@@ -211,6 +214,7 @@ async fn push_chained_revision(
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("push revision");

@@ -71,13 +71,24 @@ pub trait InstrumentProvider {
     }
 
     fn latency_histogram_ms(&self, name: impl Into<Cow<'static, str>>) -> Histogram<f64> {
+        self.latency_histogram_ms_with_boundaries(
+            name,
+            vec![
+                10., 30., 50., 100., 200., 300., 400., 500., 1200., 2000., 5000., 10000., 15000.,
+                20000., 30000., 60000.,
+            ],
+        )
+    }
+
+    fn latency_histogram_ms_with_boundaries(
+        &self,
+        name: impl Into<Cow<'static, str>>,
+        boundaries: Vec<f64>,
+    ) -> Histogram<f64> {
         self.meter()
             .f64_histogram(self.scope_name(name))
             .with_unit("milliseconds")
-            .with_boundaries(vec![
-                10., 30., 50., 100., 200., 300., 400., 500., 1200., 2000., 5000., 10000., 15000.,
-                20000., 30000., 60000.,
-            ])
+            .with_boundaries(boundaries)
             .build()
     }
 

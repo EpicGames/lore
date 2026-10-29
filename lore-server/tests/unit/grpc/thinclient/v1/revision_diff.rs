@@ -26,6 +26,8 @@ use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::server::RevisionListAcceleration;
 use lore_server::grpc::thinclient::v1::revision_diff::*;
 use lore_storage::hash::hash_string;
@@ -117,6 +119,7 @@ async fn push_revision(
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("push")

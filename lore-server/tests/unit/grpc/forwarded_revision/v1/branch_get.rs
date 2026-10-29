@@ -16,6 +16,8 @@ use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::forwarded_revision::v1::branch_get::*;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
 use tonic::Request;
@@ -56,6 +58,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push latest revision")

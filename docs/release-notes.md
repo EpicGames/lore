@@ -37,6 +37,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-server` times each branch push in five phases: prepare, verify, fast-forward merge, commit and respond
+  (`lore.branch_push.phase_duration`). A push dropped before it returns, such as by the handler timeout or a server
+  shutting down, counts the phase it was in (`lore.branch_push.cancelled_phase`). Fragment verification also times its
+  tree walk and existence checks (`lore.branch_push.verify_collect_duration`,
+  `lore.branch_push.verify_exist_duration`). Each push also records its compare-and-swap attempts to store the new
+  head (`lore.branch_push.store_latest_attempts`) and the size of its fast-forward merge
+  (`lore.branch_push.fast_forward_merge_changes`), and logs the breakdown of a push that is cut off, fails or takes
+  10s or more at info
 - A revision named by number, such as `<branch>@<number>`, resolves from the first page the remote returns for it,
   rather than walking the branch's history back from its latest revision one page at a time
 - Following a branch's history through the remote no longer takes the revisions a page holds above the one it was

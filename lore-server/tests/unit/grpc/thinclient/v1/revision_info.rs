@@ -16,6 +16,8 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::server::RevisionListAcceleration;
 use lore_server::grpc::thinclient::v1::revision_info::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -85,6 +87,7 @@ async fn create_branch_with_history(
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push revision")
@@ -276,6 +279,7 @@ async fn merge_revision_includes_parent_other() {
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push merge")
@@ -369,6 +373,7 @@ async fn metadata_fields_are_extracted() {
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push")

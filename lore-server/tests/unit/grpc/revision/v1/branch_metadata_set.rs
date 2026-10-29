@@ -11,6 +11,8 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
 use lore_server::grpc::get_write_token;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::branch_metadata_set::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
@@ -369,6 +371,7 @@ async fn cas_succeeds_on_deleted_branch() {
             false,
             lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("seed main")

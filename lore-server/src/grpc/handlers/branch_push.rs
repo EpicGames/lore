@@ -3,6 +3,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use lore_base::error::AddressNotFound;
 use lore_base::lore_drain_tasks;
@@ -17,6 +18,7 @@ use lore_revision::branch::BranchError;
 use lore_revision::branch::LATEST;
 use lore_revision::branch::PROTECT;
 use lore_revision::branch::push;
+use lore_revision::interface::ExecutionContext;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
@@ -33,11 +35,15 @@ use lore_storage::StoreMatchResult;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::BRANCH_ID;
+use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::address_not_found_status;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -93,6 +99,50 @@ static COLLECTED_ADDRESSES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     BranchPushInstrumentProvider.length_histogram("collected_addresses", count_boundaries())
 });
 
+static PHASE_DURATION: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("phase_duration"));
+
+static CANCELLED_PHASE: LazyLock<Counter<u64>> =
+    LazyLock::new(|| BranchPushInstrumentProvider.counter("cancelled_phase"));
+
+static STORE_LATEST_ATTEMPTS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram(
+        "store_latest_attempts",
+        vec![1., 2., 3., 5., 10., 25., 50., 100.],
+    )
+});
+
+static VERIFY_COLLECT_DURATION: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("verify_collect_duration"));
+
+static VERIFY_EXIST_DURATION: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("verify_exist_duration"));
+
+static FAST_FORWARD_MERGE_CHANGES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram(
+        "fast_forward_merge_changes",
+        vec![
+            0., 1., 2., 5., 10., 50., 100., 1_000., 10_000., 100_000., 1_000_000.,
+        ],
+    )
+});
+
+/// A push that takes at least this long is logged at info with its breakdown, as is every
+/// cancelled or failed push.
+const SLOW_PUSH_LOG_THRESHOLD: Duration = Duration::from_secs(10);
+
+/// A millisecond histogram for a part of a push. Its buckets are dense from 30 s up so that, for
+/// a push near the handler timeout, each part's share of the time stays visible.
+fn push_duration_histogram(name: &'static str) -> Histogram<f64> {
+    BranchPushInstrumentProvider.latency_histogram_ms_with_boundaries(
+        name,
+        vec![
+            10., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 20_000., 30_000., 40_000.,
+            45_000., 50_000., 55_000., 60_000., 90_000., 120_000., 150_000., 180_000.,
+        ],
+    )
+}
+
 fn peak_boundaries() -> Vec<f64> {
     vec![
         1., 10., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 25_000., 50_000.,
@@ -106,46 +156,399 @@ fn count_boundaries() -> Vec<f64> {
     ]
 }
 
-/// The store requests one fragment verification makes, recorded once when dropped, so a
-/// verification that fails or is cancelled part-way still reports what it made.
-///
-/// `lookups` counts the per-address fragment lookups the collection spawns.
-#[derive(Default)]
-struct PushStoreRequests {
+/// The service a push arrived through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushHandler {
+    Legacy,
+    V1,
+}
+
+impl PushHandler {
+    fn label(self) -> &'static str {
+        match self {
+            PushHandler::Legacy => "legacy",
+            PushHandler::V1 => "v1",
+        }
+    }
+}
+
+/// A stage of a push timed by [`PushReport`]. Steps a push runs concurrently stay within one
+/// phase. The response hooks' repository metadata, read beside the whole push, is not a phase
+/// of its own: a wait for it once the push returns falls in `Respond`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushPhase {
+    /// Authorization, loading the branch, its head and the incoming revision, the pre-hooks,
+    /// and the protection check.
+    Prepare,
+    /// The branch name check beside deciding how the head moves and, when it moves, loading the
+    /// incoming revision's parents and verifying the fragments it adds.
+    Verify,
+    /// Building a merge revision onto a head that moved since the client branched.
+    FastForwardMerge,
+    /// Rewriting the incoming revision when its number is wrong, storing the new head, and its
+    /// history step.
+    Commit,
+    /// From the push returning, with success or an error, to the response: the wait for the
+    /// response hooks' repository metadata and the hooks themselves.
+    Respond,
+}
+
+impl PushPhase {
+    /// Every phase, in the order a push can pass through them.
+    pub const ALL: [PushPhase; 5] = [
+        PushPhase::Prepare,
+        PushPhase::Verify,
+        PushPhase::FastForwardMerge,
+        PushPhase::Commit,
+        PushPhase::Respond,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            PushPhase::Prepare => 0,
+            PushPhase::Verify => 1,
+            PushPhase::FastForwardMerge => 2,
+            PushPhase::Commit => 3,
+            PushPhase::Respond => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PushPhase::Prepare => "prepare",
+            PushPhase::Verify => "verify",
+            PushPhase::FastForwardMerge => "fast_forward_merge",
+            PushPhase::Commit => "commit",
+            PushPhase::Respond => "respond",
+        }
+    }
+}
+
+// Each phase's `index` is its position in `ALL`, which orders the per-phase durations.
+const _: () = {
+    let mut i = 0;
+    while i < PushPhase::ALL.len() {
+        assert!(PushPhase::ALL[i].index() == i);
+        i += 1;
+    }
+};
+
+/// How a push timed by [`PushReport`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The handler returned a response.
+    Completed,
+    /// The push left the head where it was for the client to resolve: not a fast-forward and
+    /// not forced, or a fast-forward merge with conflicts.
+    Declined,
+    /// The handler returned an error status for anything else, including a request rejected by
+    /// authorization or for a zero revision, or it panicked. A request without a valid repository
+    /// header is rejected before its report exists and is not recorded.
+    Error,
+    /// The handler future was dropped before it returned, such as by the handler timeout or a
+    /// server shutting down. A client that disconnects does not drop it: the handler runs on to
+    /// completion on the core runtime.
+    Cancelled,
+}
+
+impl PushOutcome {
+    /// How something that returned, or was dropped before it returned, ended. A push declined
+    /// and answered with an error status is declined.
+    #[lore_macro::test_pub]
+    fn of(finished: bool, declined: bool, errored: bool) -> Self {
+        match (finished, declined, errored) {
+            // Dropped while unwinding: it failed, rather than being cut off from outside.
+            (false, _, _) if std::thread::panicking() => PushOutcome::Error,
+            (false, _, _) => PushOutcome::Cancelled,
+            (true, true, _) => PushOutcome::Declined,
+            (true, false, true) => PushOutcome::Error,
+            (true, false, false) => PushOutcome::Completed,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PushOutcome::Completed => "completed",
+            PushOutcome::Declined => "declined",
+            PushOutcome::Error => "error",
+            PushOutcome::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The time one push spends in each [`PushPhase`] and the store requests its fragment
+/// verification makes, recorded once when dropped, so a push cancelled part-way still reports
+/// what it did and the phase it was in.
+pub struct PushReport {
+    handler: PushHandler,
+    repository: RepositoryId,
+    target: Option<(BranchId, Hash)>,
+    started: Instant,
+    phase: PushPhase,
+    phase_started: Instant,
+    /// When the push returned, `None` while it runs or once it is dropped part-way.
+    finished_at: Option<Instant>,
+    phase_durations: [Option<Duration>; PushPhase::ALL.len()],
+    store_latest_attempts: u64,
+    fast_forward_merge_changes: Option<u64>,
+    /// Counts the per-address fragment lookups the verification's tree walk spawns.
     lookups: Arc<StoreRequestTracker>,
     collected_addresses: Option<u64>,
     concurrent_query_batches: Option<u64>,
-    /// Whether the verification returned, with success or an error, rather than being dropped
-    /// part-way as a cancelled request is.
-    finished: bool,
+    /// When the verification's tree walk started. It runs until the existence checks start.
+    collect_started: Option<Instant>,
+    /// When the verification's existence checks, slow-down retries included, started.
+    exist_started: Option<Instant>,
+    /// When the verification returned, with success or an error.
+    verified_at: Option<Instant>,
+    verification_failed: bool,
+    errored: bool,
+    /// Whether the push left the head where it was for the client to resolve.
+    declined: bool,
 }
 
-impl Drop for PushStoreRequests {
+/// A snapshot of a [`PushReport`], with the running phase counted up to the moment it was taken.
+pub struct PushSummary {
+    pub outcome: PushOutcome,
+    pub elapsed: Duration,
+    /// The phase the push was in when the snapshot was taken, or ended in.
+    pub phase: PushPhase,
+    phase_durations: [Option<Duration>; PushPhase::ALL.len()],
+    pub store_latest_attempts: u64,
+    /// The changes in the latest fast-forward merge diff computed without conflicts, whether or
+    /// not that merge reaches the branch head. `None` without one, or once a later diff finds
+    /// conflicts.
+    pub fast_forward_merge_changes: Option<u64>,
+    pub num_lookups: u64,
+    pub peak_lookups_in_flight: u64,
+    /// The time the verification's tree walk took, counted up to the snapshot while it runs.
+    /// `None` if it never started.
+    pub verify_collect: Option<Duration>,
+    /// The time the verification's existence checks took, counted up to the snapshot while they
+    /// run. `None` if they never started.
+    pub verify_exist: Option<Duration>,
+}
+
+impl PushSummary {
+    /// The time spent in `phase`, `None` if the push never entered it.
+    pub fn phase_duration(&self, phase: PushPhase) -> Option<Duration> {
+        self.phase_durations[phase.index()]
+    }
+}
+
+impl PushReport {
+    /// Starts timing a push to `repository` in [`PushPhase::Prepare`].
+    pub fn new(handler: PushHandler, repository: RepositoryId) -> Self {
+        let now = Instant::now();
+        Self {
+            handler,
+            repository,
+            target: None,
+            started: now,
+            phase: PushPhase::Prepare,
+            phase_started: now,
+            finished_at: None,
+            phase_durations: [None; PushPhase::ALL.len()],
+            store_latest_attempts: 0,
+            fast_forward_merge_changes: None,
+            lookups: Arc::default(),
+            collected_addresses: None,
+            concurrent_query_batches: None,
+            collect_started: None,
+            exist_started: None,
+            verified_at: None,
+            verification_failed: false,
+            errored: false,
+            declined: false,
+        }
+    }
+
+    /// Names the branch and revision pushed in the slow or cancelled push log.
+    pub fn set_target(&mut self, branch: BranchId, revision: Hash) {
+        self.target = Some((branch, revision));
+    }
+
+    /// Closes the running phase and starts `phase`.
+    pub fn enter(&mut self, phase: PushPhase) {
+        let now = Instant::now();
+        self.close_phase(now);
+        self.phase = phase;
+        self.phase_started = now;
+    }
+
+    /// Runs `body` in `execution` with the report, and marks the push completed or errored by
+    /// what `body` returns. A future dropped before then drops the report unfinished, which
+    /// records the push as cancelled.
+    pub async fn run<T, E>(
+        mut self,
+        execution: Arc<ExecutionContext>,
+        body: impl AsyncFnOnce(&mut PushReport) -> Result<T, E>,
+    ) -> Result<T, E> {
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let result = body(&mut self).await;
+                self.errored = result.is_err();
+                self.finish();
+                result
+            })
+            .await
+    }
+
+    /// Closes the running phase and marks the push as returned rather than cancelled.
+    pub fn finish(&mut self) {
+        let now = Instant::now();
+        self.close_phase(now);
+        self.finished_at = Some(now);
+    }
+
+    /// What the report holds now, as the drop records it.
+    pub fn summary(&self) -> PushSummary {
+        let mut phase_durations = self.phase_durations;
+        let end = if let Some(finished_at) = self.finished_at {
+            finished_at
+        } else {
+            let now = Instant::now();
+            add_phase_time(&mut phase_durations, self.phase, now - self.phase_started);
+            now
+        };
+        let outcome = PushOutcome::of(self.finished_at.is_some(), self.declined, self.errored);
+        let verify_end = self.verified_at.unwrap_or(end);
+        let verify_collect = self
+            .collect_started
+            .map(|started| self.exist_started.unwrap_or(verify_end) - started);
+        let verify_exist = self.exist_started.map(|started| verify_end - started);
+        PushSummary {
+            outcome,
+            elapsed: end - self.started,
+            phase: self.phase,
+            phase_durations,
+            store_latest_attempts: self.store_latest_attempts,
+            fast_forward_merge_changes: self.fast_forward_merge_changes,
+            num_lookups: self.lookups.requests(),
+            peak_lookups_in_flight: self.lookups.peak_in_flight(),
+            verify_collect,
+            verify_exist,
+        }
+    }
+
+    fn close_phase(&mut self, now: Instant) {
+        if self.finished_at.is_none() {
+            add_phase_time(
+                &mut self.phase_durations,
+                self.phase,
+                now - self.phase_started,
+            );
+        }
+    }
+}
+
+fn add_phase_time(
+    durations: &mut [Option<Duration>; PushPhase::ALL.len()],
+    phase: PushPhase,
+    time: Duration,
+) {
+    let duration = &mut durations[phase.index()];
+    *duration = Some(duration.unwrap_or_default() + time);
+}
+
+impl Drop for PushReport {
     fn drop(&mut self) {
-        let num_lookups = self.lookups.requests();
-        // A verification that made no lookup, such as one for a revision that adds no
-        // fragment, would only skew the distributions.
-        if num_lookups == 0 {
-            return;
+        let summary = self.summary();
+        let outcome = summary.outcome.label();
+        let handler = KeyValue::new("handler", self.handler.label());
+        let handler_and_outcome = [handler.clone(), KeyValue::new("outcome", outcome)];
+        self.record_verification(&summary, &handler);
+
+        for phase in PushPhase::ALL {
+            if let Some(duration) = summary.phase_duration(phase) {
+                let [handler, outcome] = handler_and_outcome.clone();
+                PHASE_DURATION.record(
+                    duration.as_secs_f64() * 1000.,
+                    &[KeyValue::new("phase", phase.label()), handler, outcome],
+                );
+            }
+        }
+        let cancelled = summary.outcome == PushOutcome::Cancelled;
+        if cancelled {
+            CANCELLED_PHASE.add(1, &[KeyValue::new("phase", summary.phase.label()), handler]);
+        }
+        if summary.store_latest_attempts != 0 {
+            STORE_LATEST_ATTEMPTS.record(summary.store_latest_attempts, &handler_and_outcome);
+        }
+        if let Some(changes) = summary.fast_forward_merge_changes {
+            FAST_FORWARD_MERGE_CHANGES.record(changes, &handler_and_outcome);
         }
 
-        let peak_lookups_in_flight = self.lookups.peak_in_flight();
-        PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT.record(peak_lookups_in_flight, &[]);
-        FRAGMENT_LOOKUPS.record(num_lookups, &[]);
+        if cancelled
+            || summary.outcome == PushOutcome::Error
+            || summary.elapsed >= SLOW_PUSH_LOG_THRESHOLD
+        {
+            let (branch, revision) = self.target.unzip();
+            let millis = |phase| summary.phase_duration(phase).map(|d| d.as_millis());
+            info!(
+                handler = self.handler.label(),
+                {REPOSITORY_ID} = %self.repository,
+                {BRANCH_ID} = branch.map(tracing::field::display),
+                {REVISION} = revision.map(tracing::field::display),
+                outcome,
+                cancelled_in = cancelled.then(|| summary.phase.label()),
+                elapsed_ms = summary.elapsed.as_millis(),
+                prepare_ms = millis(PushPhase::Prepare),
+                verify_ms = millis(PushPhase::Verify),
+                verify_collect_ms = summary.verify_collect.map(|d| d.as_millis()),
+                verify_exist_ms = summary.verify_exist.map(|d| d.as_millis()),
+                fast_forward_merge_ms = millis(PushPhase::FastForwardMerge),
+                commit_ms = millis(PushPhase::Commit),
+                respond_ms = millis(PushPhase::Respond),
+                store_latest_attempts = summary.store_latest_attempts,
+                fast_forward_merge_changes = summary.fast_forward_merge_changes,
+                num_lookups = summary.num_lookups,
+                peak_lookups_in_flight = summary.peak_lookups_in_flight,
+                num_collected_addresses = self.collected_addresses,
+                num_concurrent_query_batches = self.concurrent_query_batches,
+                "Slow, cancelled or failed branch push"
+            );
+        }
+    }
+}
+
+impl PushReport {
+    /// Records the verification's timings, labelled with how the verification itself ended, and
+    /// its store requests.
+    fn record_verification(&self, summary: &PushSummary, handler: &KeyValue) {
+        let outcome = PushOutcome::of(self.verified_at.is_some(), false, self.verification_failed);
+        let completed_with_nothing_collected =
+            outcome == PushOutcome::Completed && self.collected_addresses.unwrap_or(0) == 0;
+        let attributes = [handler.clone(), KeyValue::new("outcome", outcome.label())];
+
+        // A verification that completed having collected and looked up nothing had nothing to
+        // verify, and would only skew the timings. One that failed or was cut off is recorded
+        // whatever it reached, since its time is what explains the push's end.
+        if !(completed_with_nothing_collected && summary.num_lookups == 0) {
+            if let Some(collect) = summary.verify_collect {
+                VERIFY_COLLECT_DURATION.record(collect.as_secs_f64() * 1000., &attributes);
+            }
+            // A verification that completed without collecting an address asked the store nothing.
+            if let Some(exist) = summary.verify_exist
+                && !completed_with_nothing_collected
+            {
+                VERIFY_EXIST_DURATION.record(exist.as_secs_f64() * 1000., &attributes);
+            }
+        }
+
+        // A verification that made no lookup, such as one for a revision that adds no fragment,
+        // would only skew the lookup distributions, which carry no outcome to filter on.
+        if summary.num_lookups == 0 {
+            return;
+        }
+        PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT.record(summary.peak_lookups_in_flight, &[]);
+        FRAGMENT_LOOKUPS.record(summary.num_lookups, &[]);
         if let Some(collected_addresses) = self.collected_addresses {
             COLLECTED_ADDRESSES.record(collected_addresses, &[]);
         }
         if let Some(concurrent_query_batches) = self.concurrent_query_batches {
             CONCURRENT_QUERY_BATCHES.record(concurrent_query_batches, &[]);
         }
-        debug!(
-            peak_lookups_in_flight,
-            num_lookups,
-            num_collected_addresses = self.collected_addresses,
-            num_concurrent_query_batches = self.concurrent_query_batches,
-            finished = self.finished,
-            "Branch push store requests"
-        );
     }
 }
 
@@ -183,37 +586,43 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
-
-    let access = PushAccess::of(&authorizer, request.extensions(), repository).await?;
-
-    let client_ip: Option<String> = extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
-    let req = request.into_inner();
-    let branch = BranchId::from(req.branch);
-    let revision = Hash::from(req.revision);
-    let force = req.force;
-    let fast_forward_merge = req.fast_forward_merge;
-
-    if revision.is_zero() {
-        warn!("Invalid branch push request, revision is zero");
-        return Err(Status::invalid_argument("Invalid revision"));
-    }
-
-    debug!({REVISION} = %revision, ?access, {BRANCH_ID} = %branch, force, fast_forward_merge,
-        "Handling branch push request",
-    );
-
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository,
-    ));
-
-    let repository_id: RepositoryId = repository.id;
-
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
-    LORE_CONTEXT
-        .scope(execution, async move {
+    PushReport::new(PushHandler::Legacy, repository)
+        .run(execution, async move |report| {
+            let access = PushAccess::of(&authorizer, request.extensions(), repository).await?;
+
+            let client_ip: Option<String> =
+                extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
+            let req = request.into_inner();
+            let branch = BranchId::from(req.branch);
+            let revision = Hash::from(req.revision);
+            let force = req.force;
+            let fast_forward_merge = req.fast_forward_merge;
+            report.set_target(branch, revision);
+
+            if revision.is_zero() {
+                warn!("Invalid branch push request, revision is zero");
+                return Err(Status::invalid_argument("Invalid revision"));
+            }
+
+            debug!(
+                {REVISION} = %revision,
+                ?access,
+                {BRANCH_ID} = %branch,
+                force,
+                fast_forward_merge,
+                "Handling branch push request",
+            );
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository,
+            ));
+
+            let repository_id: RepositoryId = repository.id;
+
             let mut ctx_builder = HookContext::builder()
                 .correlation_id(correlation_id.clone())
                 .hook_point(HookPoint::BranchPush)
@@ -234,16 +643,22 @@ pub async fn handler(
                 .map_err(hook_error_to_status)?;
 
             let (pushed, repository_metadata) = tokio::join!(
-                push(
-                    repository.clone(),
-                    branch,
-                    revision,
-                    access,
-                    force,
-                    fast_forward_merge,
-                    history_step_size,
-                    acceleration,
-                ),
+                async {
+                    let pushed = push(
+                        repository.clone(),
+                        branch,
+                        revision,
+                        access,
+                        force,
+                        fast_forward_merge,
+                        history_step_size,
+                        acceleration,
+                        &mut *report,
+                    )
+                    .await;
+                    report.enter(PushPhase::Respond);
+                    pushed
+                },
                 load_response_repository_metadata(hook_dispatcher, repository.clone()),
             );
             let PushResult {
@@ -468,6 +883,7 @@ pub async fn push(
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    report: &mut PushReport,
 ) -> Result<PushResult, Status> {
     let (metadata, loaded) = load_branch_and_head(repository.clone(), branch, latest).await;
     push_loaded(
@@ -481,6 +897,7 @@ pub async fn push(
         acceleration,
         metadata?,
         loaded,
+        report,
     )
     .await
 }
@@ -517,6 +934,7 @@ pub(crate) async fn push_loaded(
     acceleration: crate::grpc::server::RevisionListAcceleration,
     metadata: Metadata,
     loaded: Result<HeadAndIncoming, Status>,
+    report: &mut PushReport,
 ) -> Result<PushResult, Status> {
     // Zero hash is never valid to push as latest pointer
     if latest.is_zero() {
@@ -528,6 +946,7 @@ pub(crate) async fn push_loaded(
 
     // Fragment verification starts only once protection is checked, so a push refused as
     // protected never walks its revision.
+    report.enter(PushPhase::Verify);
     let (name_mapped, prepared) = tokio::join!(
         ensure_name_maps_to_branch(repository.clone(), branch, &branch_name),
         async {
@@ -537,6 +956,7 @@ pub(crate) async fn push_loaded(
                 loaded?,
                 force,
                 fast_forward_merge,
+                &mut *report,
             )
             .await
         },
@@ -560,6 +980,7 @@ pub(crate) async fn push_loaded(
                 fast_forward_merge,
                 history_step_size,
                 acceleration,
+                report,
             )
             .await?
         }
@@ -575,10 +996,12 @@ pub(crate) async fn push_loaded(
                 loaded.head,
                 history_step_size,
                 acceleration,
+                report,
             )
             .await?
         }
     };
+    report.declined = !update.success;
 
     Ok(PushResult {
         success: update.success,
@@ -770,6 +1193,7 @@ async fn prepare_push(
     loaded: HeadAndIncoming,
     force: bool,
     fast_forward_merge: bool,
+    report: &mut PushReport,
 ) -> Result<PreparedPush, Status> {
     // If the incoming revision is already the latest revision the push is a no-op
     if loaded.head == latest {
@@ -790,7 +1214,7 @@ async fn prepare_push(
     // Both a plain push and a fast-forward merge verify the incoming revision against its own
     // parents, which do not depend on the head. Without this check a client could reference
     // fragments that were never fully uploaded.
-    let parents = verify_incoming_fragments(repository, loaded.incoming.clone()).await?;
+    let parents = verify_incoming_fragments(repository, loaded.incoming.clone(), report).await?;
 
     Ok(PreparedPush::Move {
         loaded,
@@ -804,6 +1228,7 @@ async fn prepare_push(
 async fn verify_incoming_fragments(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    report: &mut PushReport,
 ) -> Result<VerifiedParents, Status> {
     let parent = State::deserialize(repository.clone(), state.parent_self())
         .await
@@ -812,16 +1237,9 @@ async fn verify_incoming_fragments(
 
     let other = load_other_parent_state(repository.clone(), &state).await?;
 
-    let mut store_requests = PushStoreRequests::default();
-    let verified = verify_fragments(
-        repository,
-        parent.clone(),
-        other.clone(),
-        state,
-        &mut store_requests,
-    )
-    .await;
-    store_requests.finished = true;
+    let verified = verify_fragments(repository, parent.clone(), other.clone(), state, report).await;
+    report.verified_at = Some(Instant::now());
+    report.verification_failed = verified.is_err();
     verified?;
 
     Ok(VerifiedParents { parent, other })
@@ -840,7 +1258,9 @@ async fn store_new_head(
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    report: &mut PushReport,
 ) -> Result<HeadUpdate, Status> {
+    report.enter(PushPhase::Commit);
     let HeadAndIncoming {
         head: mut current,
         incoming,
@@ -864,6 +1284,7 @@ async fn store_new_head(
     }
 
     loop {
+        report.store_latest_attempts += 1;
         let previous_head = try_store_latest(repository.clone(), branch, current, new_head)
             .await
             .filter_slow_down()?
@@ -906,6 +1327,7 @@ async fn store_new_head(
                     current,
                     history_step_size,
                     acceleration,
+                    report,
                 )
                 .await;
             }
@@ -934,6 +1356,7 @@ async fn try_fast_forward_merge(
     mut current_head: Hash,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    report: &mut PushReport,
 ) -> Result<HeadUpdate, Status> {
     let incoming_revision = incoming_state.revision();
     let original_base = incoming_state.parent_self();
@@ -944,6 +1367,8 @@ async fn try_fast_forward_merge(
     );
 
     loop {
+        report.enter(PushPhase::FastForwardMerge);
+
         // Three-way diff: base=original merge target, source=incoming merge, target=current head
         debug!(
             %original_base, %incoming_revision, %current_head,
@@ -975,8 +1400,12 @@ async fn try_fast_forward_merge(
                 conflicts = diff_result.conflicts.len(),
                 "Fast-forward merge has conflicts, rejecting"
             );
+            report.fast_forward_merge_changes = None;
             return Ok(HeadUpdate::declined(current_head));
         }
+        // Recorded before the merge is applied, so a push cancelled while applying or storing it
+        // still reports the size of the merge it was working on.
+        report.fast_forward_merge_changes = Some(diff_result.changes.len() as u64);
 
         // Deserialize the current head state to use as base for the new merge revision
         let state_current = State::deserialize(repository.clone(), current_head)
@@ -1071,6 +1500,8 @@ async fn try_fast_forward_merge(
             })?;
 
         // CAS: attempt to set the new revision as branch head
+        report.enter(PushPhase::Commit);
+        report.store_latest_attempts += 1;
         let previous_head =
             try_store_latest(repository.clone(), branch, current_head, new_revision)
                 .await
@@ -1279,18 +1710,19 @@ async fn verify_fragments(
     parent_state: Arc<State>,
     other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
-    store_requests: &mut PushStoreRequests,
+    report: &mut PushReport,
 ) -> Result<(), Status> {
+    report.collect_started = Some(Instant::now());
     let mut new_fragments = collect_new_addresses(
         repository.clone(),
         parent_state,
         other_parent_state,
         state,
-        store_requests.lookups.clone(),
+        report.lookups.clone(),
     )
     .await?;
-    store_requests.collected_addresses = Some(new_fragments.len() as u64);
-    store_requests.concurrent_query_batches = None;
+    report.exist_started = Some(Instant::now());
+    report.collected_addresses = Some(new_fragments.len() as u64);
 
     let mut retry = lore_revision::util::time::retry(
         push::RETRY_START_DURATION,
@@ -1336,7 +1768,7 @@ async fn verify_fragments(
         });
         // A wave after a slow-down resends only the throttled batches, so the first wave is
         // the one that holds the peak.
-        store_requests
+        report
             .concurrent_query_batches
             .get_or_insert(tasks.len() as u64);
         debug!(

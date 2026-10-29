@@ -91,6 +91,8 @@ indexmap = { workspace = true }
 mockall = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
+# `start_paused` for the tests that time push phases on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true, features = ["test-util"] }
 
 [features]

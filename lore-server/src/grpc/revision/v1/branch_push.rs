@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
-use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_proto::lore::revision::v1::BranchPushRequest;
 use lore_proto::lore::revision::v1::BranchPushResponse;
@@ -30,6 +29,9 @@ use crate::grpc::get_is_service_account;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::branch_push::PushAccess;
+use crate::grpc::handlers::branch_push::PushHandler;
+use crate::grpc::handlers::branch_push::PushPhase;
+use crate::grpc::handlers::branch_push::PushReport;
 use crate::grpc::handlers::branch_push::PushResult;
 use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
@@ -77,42 +79,43 @@ pub async fn handler(
     let is_service_account = get_is_service_account(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
-
-    let access = PushAccess::of(&authorizer, request.extensions(), repository_id).await?;
-
-    let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
-    let req = request.into_inner();
-    let branch_id = BranchId::from(req.id);
-    let revision = Hash::from(req.revision_signature);
-    let force = req.force;
-    let fast_forward_merge = req.fast_forward_merge;
-
-    if revision.is_zero() {
-        info!("Invalid branch push request, revision_signature is zero");
-        return Err(Status::invalid_argument(
-            "revision_signature must be non-zero",
-        ));
-    }
-
-    debug!(
-        {REVISION} = %revision,
-        ?access,
-        {BRANCH_ID} = %branch_id,
-        force,
-        fast_forward_merge,
-        "Handling branch push request",
-    );
-
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository_id,
-    ));
-    let repository_id: RepositoryId = repository.id;
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
-    LORE_CONTEXT
-        .scope(execution, async move {
+    PushReport::new(PushHandler::V1, repository_id)
+        .run(execution, async move |report| {
+            let access = PushAccess::of(&authorizer, request.extensions(), repository_id).await?;
+
+            let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
+            let req = request.into_inner();
+            let branch_id = BranchId::from(req.id);
+            let revision = Hash::from(req.revision_signature);
+            let force = req.force;
+            let fast_forward_merge = req.fast_forward_merge;
+            report.set_target(branch_id, revision);
+
+            if revision.is_zero() {
+                info!("Invalid branch push request, revision_signature is zero");
+                return Err(Status::invalid_argument(
+                    "revision_signature must be non-zero",
+                ));
+            }
+
+            debug!(
+                {REVISION} = %revision,
+                ?access,
+                {BRANCH_ID} = %branch_id,
+                force,
+                fast_forward_merge,
+                "Handling branch push request",
+            );
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository_id,
+            ));
+            let repository_id: RepositoryId = repository.id;
+
             let (branch_metadata, loaded) =
                 load_branch_and_head(repository.clone(), branch_id, revision).await;
             let branch_metadata = branch_metadata?;
@@ -142,18 +145,24 @@ pub async fn handler(
                 .map_err(hook_error_to_status)?;
 
             let (pushed, repository_metadata) = tokio::join!(
-                push_loaded(
-                    repository.clone(),
-                    branch_id,
-                    revision,
-                    access,
-                    force,
-                    fast_forward_merge,
-                    history_step_size,
-                    acceleration,
-                    branch_metadata,
-                    loaded,
-                ),
+                async {
+                    let pushed = push_loaded(
+                        repository.clone(),
+                        branch_id,
+                        revision,
+                        access,
+                        force,
+                        fast_forward_merge,
+                        history_step_size,
+                        acceleration,
+                        branch_metadata,
+                        loaded,
+                        &mut *report,
+                    )
+                    .await;
+                    report.enter(PushPhase::Respond);
+                    pushed
+                },
                 load_response_repository_metadata(hook_dispatcher, repository.clone()),
             );
             let PushResult {
