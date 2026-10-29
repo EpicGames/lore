@@ -41,6 +41,9 @@ max_bidi_streams = 8
 num_listeners = 10
 transport_bits_per_second = 1_073_741_824  # 1 gbit/s
 transport_rtt = 100  # 100 ms
+# Window each connection starts sending responses with. Unset, the congestion controller's own
+# default applies.
+# initial_cwnd_bytes = 262_144
 handler_timeout_seconds = 50
 # Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
 # read loop, so it delays requests queued behind it on that stream.
@@ -60,6 +63,8 @@ max_bidi_streams = 8
 num_listeners = 10
 transport_bits_per_second = 10_737_418_240  # 10 gbit/s
 transport_rtt = 100  # 100 ms
+# Window each connection starts sending responses with. Defaults to 1 MiB.
+# initial_cwnd_bytes = 1_048_576
 handler_timeout_seconds = 50
 # Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
 # read loop, so it delays requests queued behind it on that stream.

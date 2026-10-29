@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_server::quic::initial_cwnd::InitialCwndBytes;
 use lore_server::store::replica_factory::*;
 
 fn parse(initial_cwnd: &str) -> Result<ReplicaFactorySettings, toml::de::Error> {
@@ -13,24 +14,22 @@ mod replica_factory_settings {
     fn omitted_initial_cwnd_is_one_mebibyte() {
         let settings = parse("").expect("valid settings");
 
-        assert_eq!(settings.initial_cwnd_bytes, 1024 * 1024);
+        assert_eq!(settings.initial_cwnd_bytes.get(), 1024 * 1024);
     }
 
     #[test]
     fn minimum_initial_cwnd_is_accepted() {
-        let settings = parse(&format!(
-            "initial_cwnd_bytes = {MIN_REPLICA_INITIAL_CWND_BYTES}"
-        ))
-        .expect("valid settings");
+        let settings = parse(&format!("initial_cwnd_bytes = {}", InitialCwndBytes::MIN))
+            .expect("valid settings");
 
-        assert_eq!(settings.initial_cwnd_bytes, MIN_REPLICA_INITIAL_CWND_BYTES);
+        assert_eq!(settings.initial_cwnd_bytes.get(), InitialCwndBytes::MIN);
     }
 
     #[test]
     fn initial_cwnd_below_minimum_is_rejected() {
         parse(&format!(
             "initial_cwnd_bytes = {}",
-            MIN_REPLICA_INITIAL_CWND_BYTES - 1
+            InitialCwndBytes::MIN - 1
         ))
         .expect_err("below the minimum");
     }

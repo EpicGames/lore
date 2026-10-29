@@ -26,6 +26,8 @@ use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
+use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::store::replica_factory::ReplicaFactorySettings;
 use crate::tls::CertificateSettings;
 use crate::topology::TopologySettings;
@@ -602,6 +604,10 @@ pub struct QuicSettings {
     pub port: i32,
     pub transport_bits_per_second: Option<usize>,
     pub transport_rtt: Option<usize>,
+    /// Congestion window each accepted connection starts with: how much the server sends before
+    /// the peer's first acknowledgements arrive. When unset, the internal endpoint uses 1 MiB and
+    /// the public endpoint its congestion controller's own default.
+    pub initial_cwnd_bytes: Option<InitialCwndBytes>,
     /// Keep below a threshold for whatever Load Balancer sits infront of the server
     /// or is expecting responses. If request handlers exceed this reasonable threshold
     /// then assume something has gone wrong and return a timeout response so we can get metrics
@@ -620,6 +626,21 @@ pub struct QuicSettings {
     pub permit_timeout_ms: Option<u64>,
 }
 
+/// Only Lore servers connect to the internal endpoint, so its connections start with the window
+/// known to suit the path between peers rather than the controller's default.
+fn deserialize_quic_internal<'de, D>(deserializer: D) -> Result<Option<QuicSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut settings = Option::<QuicSettings>::deserialize(deserializer)?;
+    if let Some(settings) = settings.as_mut() {
+        settings
+            .initial_cwnd_bytes
+            .get_or_insert(DEFAULT_PEER_INITIAL_CWND_BYTES);
+    }
+    Ok(settings)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
@@ -634,6 +655,7 @@ pub struct ServerSettings {
     // the public facing QUIC server settings
     pub quic: Option<QuicSettings>,
     // the internal-only QUIC server settings
+    #[serde(default, deserialize_with = "deserialize_quic_internal")]
     pub quic_internal: Option<QuicSettings>,
     /// Seconds to wait for existing connections to close gracefully after shutdown signal.
     #[serde(default = "default_connection_close_timeout")]

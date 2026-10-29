@@ -140,6 +140,7 @@ At startup the server also reports where each local store lands, warning when th
 | `num_listeners` | `10` | Number of listener tasks. |
 | `transport_bits_per_second` | `1073741824` (`quic`), `10737418240` (`quic_internal`) | Transport bandwidth estimate in bits per second. |
 | `transport_rtt` | `100` | Expected round-trip time in milliseconds. |
+| `initial_cwnd_bytes` | none (`quic`), `1048576` (`quic_internal`) | Congestion window, in bytes, that each accepted connection starts with: how much the server sends before the peer's first acknowledgements arrive. The congestion controller may cap it at the send window derived from `transport_bits_per_second` and `transport_rtt`. When unset, `quic` uses the congestion controller's own default and `quic_internal` always uses `1048576`. At least `2400`. |
 | `handler_timeout_seconds` | `50` | Per-request handler timeout. Guards against handlers that hang indefinitely. |
 | `connection_message_limit` | none | Maximum in-flight messages per connection. When unset, the server falls back to `500` for the public endpoint and `50000` for the internal endpoint. |
 

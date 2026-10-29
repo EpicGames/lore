@@ -16,6 +16,7 @@ use rustls::server::danger::ClientCertVerifier;
 use tracing::info;
 
 use crate::quic::StreamHandlerFactory;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 
 pub struct QuinnConfig {
     // In observability, what is the label that distinguishes this Quinn
@@ -38,6 +39,8 @@ pub struct QuinnConfig {
     pub(crate) transport_bits_per_second: usize,
     pub(crate) transport_rtt: usize,
     pub(crate) congestion_algorithm: CongestionAlgorithm,
+    /// `None` leaves the window at quinn's own default.
+    pub(crate) initial_cwnd: Option<InitialCwndBytes>,
 }
 
 impl fmt::Debug for QuinnConfig {
@@ -61,6 +64,7 @@ impl fmt::Debug for QuinnConfig {
             .field("transport_bits_per_second", &self.transport_bits_per_second)
             .field("transport_rtt", &self.transport_rtt)
             .field("congestion_algorithm", &self.congestion_algorithm)
+            .field("initial_cwnd", &self.initial_cwnd)
             .finish()
     }
 }
@@ -85,6 +89,7 @@ pub struct QuinnConfigBuilder {
     pub(crate) transport_bits_per_second: Option<usize>,
     pub(crate) transport_rtt: Option<usize>,
     pub(crate) congestion_algorithm: Option<CongestionAlgorithm>,
+    pub(crate) initial_cwnd: Option<InitialCwndBytes>,
 }
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
@@ -195,6 +200,13 @@ impl QuinnConfigBuilder {
         self
     }
 
+    /// The congestion window each accepted connection starts with. Defaults to quinn's own
+    /// initial window.
+    pub fn initial_cwnd(mut self, initial_cwnd: InitialCwndBytes) -> Self {
+        self.initial_cwnd = Some(initial_cwnd);
+        self
+    }
+
     pub fn build(self) -> anyhow::Result<QuinnConfig> {
         let stream_handler_factory = self
             .stream_handler_factory
@@ -240,6 +252,7 @@ impl QuinnConfigBuilder {
             congestion_algorithm: self
                 .congestion_algorithm
                 .unwrap_or(CongestionAlgorithm::Bbr),
+            initial_cwnd: self.initial_cwnd,
         })
     }
 }

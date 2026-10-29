@@ -30,6 +30,7 @@ use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::quic::StreamDataHandler;
 use crate::quic::StreamHandlerFactory;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::quic::quinn::config::QuinnConfig;
 use crate::quic::quinn::config::crypto_config;
 use crate::quic::quinn::metrics::track_connection_stats;
@@ -100,9 +101,10 @@ impl QuinnServer {
                 .datagram_receive_buffer_size(None)
                 .datagram_send_buffer_size(0);
             transport_config.congestion_controller_factory(
-                settings
-                    .congestion_algorithm
-                    .controller_factory(None, send_window as u64),
+                settings.congestion_algorithm.controller_factory(
+                    settings.initial_cwnd.map(InitialCwndBytes::get),
+                    send_window as u64,
+                ),
             );
             transport_config
                 .datagram_receive_buffer_size(None)

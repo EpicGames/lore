@@ -2085,3 +2085,63 @@ fn http_health_only_is_opt_in() {
     assert!(!http_settings("health_only = false").health_only);
     assert!(http_settings("health_only = true").health_only);
 }
+
+mod deserialize_quic_internal {
+    use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+
+    use super::*;
+
+    const ENDPOINT_KEYS: &str = "host = \"0.0.0.0\"\nport = 41337\nnum_listeners = 10";
+
+    fn parse(extra_keys: &str) -> ServerSettings {
+        toml::from_str(&format!(
+            "[quic]\n{ENDPOINT_KEYS}\n[quic_internal]\n{ENDPOINT_KEYS}\n{extra_keys}"
+        ))
+        .expect("[server] should deserialize")
+    }
+
+    #[test]
+    fn internal_endpoint_defaults_to_the_peer_window() {
+        let quic_internal = parse("")
+            .quic_internal
+            .expect("[server.quic_internal] present");
+
+        assert_eq!(
+            quic_internal.initial_cwnd_bytes,
+            Some(DEFAULT_PEER_INITIAL_CWND_BYTES)
+        );
+    }
+
+    #[test]
+    fn internal_endpoint_keeps_a_configured_window() {
+        let quic_internal = parse("initial_cwnd_bytes = 65536")
+            .quic_internal
+            .expect("[server.quic_internal] present");
+
+        let initial_cwnd = quic_internal
+            .initial_cwnd_bytes
+            .expect("initial_cwnd_bytes set");
+        assert_eq!(initial_cwnd.get(), 65_536);
+    }
+
+    #[test]
+    fn absent_internal_endpoint_stays_absent() {
+        let server: ServerSettings =
+            toml::from_str("").expect("[server] with no tables should deserialize");
+
+        assert!(server.quic_internal.is_none());
+    }
+}
+
+mod quic_settings_initial_cwnd_bytes {
+    use super::*;
+
+    #[test]
+    fn omitted_initial_cwnd_is_left_to_the_controller() {
+        let quic: QuicSettings =
+            toml::from_str("host = \"0.0.0.0\"\nport = 41337\nnum_listeners = 10")
+                .expect("[server.quic] should deserialize");
+
+        assert_eq!(quic.initial_cwnd_bytes, None);
+    }
+}

@@ -31,6 +31,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
   1 MiB initial congestion window, set with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A
   periodically refreshed connection starts at no less than this window
+- `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
+  window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
+  unless set. Values below 2400 bytes are rejected at startup
 
 ### Fixes & Improvements
 

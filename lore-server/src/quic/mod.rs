@@ -21,6 +21,7 @@ use crate::protocol::attribute_map::AttributeMap;
 use crate::quic::quinn::service_store::StreamDataHandlerBuilder;
 
 pub mod client_monitor;
+pub mod initial_cwnd;
 pub mod quinn;
 pub mod replication_store_service;
 pub mod storage_service;

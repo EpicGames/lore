@@ -356,6 +356,10 @@ impl From<QuicSettings> for QuinnConfigBuilder {
             builder = builder.transport_rtt(v);
         }
 
+        if let Some(v) = settings.initial_cwnd_bytes {
+            builder = builder.initial_cwnd(v);
+        }
+
         builder
     }
 }
