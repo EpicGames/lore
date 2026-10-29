@@ -82,7 +82,7 @@ async fn layer_add_impl(
     token: &RepositoryWriteToken,
     args: LoreLayerAddArgs,
 ) -> Result<(), LayerError> {
-    let target_path =
+    let mount_path =
         RelativePath::new_from_user_path(repository.require_path()?, args.target_path.as_str())
             .forward_with::<LayerError, _>(|| format!("Invalid path {}", args.target_path))?;
     let source_path = RelativePath::new_from_initial_path(args.source_path.as_str())
@@ -91,7 +91,7 @@ async fn layer_add_impl(
     add::add(
         repository,
         token,
-        target_path,
+        mount_path,
         args.source_repository.as_str(),
         source_path,
         args.metadata.into(),
@@ -166,14 +166,14 @@ async fn layer_remove_impl(
     token: &RepositoryWriteToken,
     args: LoreLayerRemoveArgs,
 ) -> Result<(), LayerError> {
-    let target_path =
+    let mount_path =
         RelativePath::new_from_user_path(repository.require_path()?, args.target_path.as_str())
             .forward_with::<LayerError, _>(|| format!("Invalid path {}", args.target_path))?;
 
     remove::remove(
         repository,
         token,
-        target_path,
+        mount_path,
         args.source_repository.as_str(),
         args.purge != 0,
     )

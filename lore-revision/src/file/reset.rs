@@ -410,7 +410,7 @@ async fn resolve_layer_walks(
     for (layer_index, remains) in layer_jobs {
         let layer = &layers[*layer_index];
 
-        let target_path = RelativePath::new_from_initial_path(&layer.target_path)
+        let mount_path = RelativePath::new_from_initial_path(&layer.target_path)
             .forward_with::<ResetError, _>(|| {
                 format!("Invalid layer target path {}", layer.target_path)
             })?;
@@ -431,7 +431,7 @@ async fn resolve_layer_walks(
                 .iter()
                 .map(|remain| {
                     (
-                        target_path.join(remain.as_str()),
+                        mount_path.join(remain.as_str()),
                         source_path.join(remain.as_str()),
                     )
                 })

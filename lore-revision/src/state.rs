@@ -6237,14 +6237,14 @@ impl FilesystemDiffStats {
 /// switch comparison context when the filesystem walk crosses into a layer.
 ///
 /// When the parent's filesystem walker encounters a directory whose
-/// parent-relative path equals `target_path`, it stops treating the directory
+/// parent-relative path equals `mount_path`, it stops treating the directory
 /// as a "new" entry and instead recurses into it using `repository` and
 /// `state` — i.e., compares the on-disk content against the layer's tree
 /// rather than the parent's.
 #[derive(Clone, Debug)]
 pub struct LayerMountInfo {
     /// Parent-relative mount path (e.g. `"external/lib"`).
-    pub target_path: String,
+    pub mount_path: String,
     /// The layer's repository context — node lookups during the recursion
     /// resolve in this repo.
     pub repository: Arc<RepositoryContext>,
@@ -6259,14 +6259,14 @@ pub struct LayerMountInfo {
 /// can detect "this filesystem directory is a link, not a fresh add" with a single
 /// linear `find` instead of an async block-walk per directory.
 ///
-/// Only `target_path` is needed today because the link-mount handling skips
+/// Only `mount_path` is needed today because the link-mount handling skips
 /// recursion entirely (the link is the parent-tree change; its content is
 /// owned by the linked repository). If we later want the walker to recurse
 /// into a linked state for some operation, extend this struct rather than
 /// re-introducing the per-directory `find_node_link` lookup.
 pub struct LinkMountInfo {
     /// Parent-relative mount path of the link node (e.g. `"libs/shared"`).
-    pub target_path: RelativePath,
+    pub mount_path: RelativePath,
 }
 
 impl LinkMountInfo {
@@ -6280,7 +6280,7 @@ impl LinkMountInfo {
         }
         mounts
             .iter()
-            .any(|mount| path.covers_ignore_case(&mount.target_path))
+            .any(|mount| path.covers_ignore_case(&mount.mount_path))
     }
 }
 
@@ -6315,7 +6315,7 @@ pub(crate) async fn collect_link_mounts_below(
         };
         if let Some(below) = below.filter(|below| !below.is_empty()) {
             mounts.push(LinkMountInfo {
-                target_path: mount_path.join(below.as_str()),
+                mount_path: mount_path.join(below.as_str()),
             });
         }
     }
@@ -6338,7 +6338,7 @@ pub(crate) async fn collect_link_mounts(
         for mount in collect_link_mounts_below(state, repository, *source_node, mount_path).await? {
             if !mounts
                 .iter()
-                .any(|seen| seen.target_path.as_str() == mount.target_path.as_str())
+                .any(|seen| seen.mount_path.as_str() == mount.mount_path.as_str())
             {
                 mounts.push(mount);
             }

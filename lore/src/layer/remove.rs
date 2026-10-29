@@ -14,13 +14,13 @@ use lore_revision::util::path::RelativePath;
 pub async fn remove(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    target_path: RelativePath,
+    mount_path: RelativePath,
     source_repository: &str,
     purge: bool,
 ) -> Result<(), LayerError> {
     let source_repository_id = if source_repository.is_empty() {
         // Caller did not specify a source repository; core will resolve the
-        // layer by target_path alone (and error if multiple layers share it).
+        // layer by mount_path alone (and error if multiple layers share it).
         RepositoryId::default()
     } else {
         let mut id = RepositoryId::from_str(source_repository).unwrap_or_default();
@@ -42,5 +42,5 @@ pub async fn remove(
         id
     };
 
-    layer::remove(repository, token, target_path, source_repository_id, purge).await
+    layer::remove(repository, token, mount_path, source_repository_id, purge).await
 }

@@ -2093,7 +2093,7 @@ async fn diff_filesystem_new_entries(
             if ctx
                 .link_mounts
                 .iter()
-                .any(|m| m.target_path.as_str() == child_file_path.as_str())
+                .any(|m| m.mount_path.as_str() == child_file_path.as_str())
             {
                 lore_trace!(
                     "Filesystem path {child_file_path} matches a link in the current state, skipping link-internal content"
@@ -2108,7 +2108,7 @@ async fn diff_filesystem_new_entries(
             if let Some(mount) = ctx
                 .layer_mounts
                 .iter()
-                .find(|m| m.target_path.as_str() == child_file_path.as_str())
+                .find(|m| m.mount_path.as_str() == child_file_path.as_str())
             {
                 // A staging walk leaves the mount alone: the layer's own tree is staged by
                 // its own walk against its own state, and staging it from here as well

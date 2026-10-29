@@ -3736,7 +3736,7 @@ async fn layer_branch_switch(
 
         // Sync layer files from current to target revision
         if layer_revision != layer.current {
-            let target_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
+            let mount_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
                 .forward::<RepositoryError>("Failed to switch branch in layer")?;
             let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
                 .forward::<RepositoryError>("Failed to switch branch in layer")?;
@@ -3758,7 +3758,7 @@ async fn layer_branch_switch(
                 layer_repository,
                 layer_current,
                 layer_target,
-                target_path.clone(),
+                mount_path.clone(),
                 source_path,
                 sync_options,
             ))

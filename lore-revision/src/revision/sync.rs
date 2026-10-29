@@ -1154,7 +1154,7 @@ async fn sync_layers(
     } in layers
     {
         lore_debug!("Synchronizing layer {layer:?}");
-        let target_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
+        let mount_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
         let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
@@ -1165,7 +1165,7 @@ async fn sync_layers(
         lore_info!(
             "Sync layer {} in {}",
             layer_repository_target.id,
-            target_path
+            mount_path
         );
 
         let layer_current =
@@ -1198,7 +1198,7 @@ async fn sync_layers(
             layer_repository_target.clone(),
             layer_current,
             layer_target,
-            target_path.clone(),
+            mount_path.clone(),
             source_path.clone(),
             options.clone(),
         ))
@@ -1229,7 +1229,7 @@ async fn sync_layers(
         layer::store_layer_current(
             repository_target.clone(),
             token,
-            target_path.as_str(),
+            mount_path.as_str(),
             layer.repository,
             layer_revision,
             staged,

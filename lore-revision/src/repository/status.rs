@@ -939,15 +939,15 @@ struct LayerSelection {
 /// layer draws. One naming a path below the mount selects what lies at the same offset below the
 /// layer's source.
 fn layer_selection(layer: &layer::Layer, path: Option<&RelativePath>) -> Option<LayerSelection> {
-    let target_path = RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
-    let selected = path.cloned().unwrap_or_else(|| target_path.clone());
+    let mount_path = RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
+    let selected = path.cloned().unwrap_or_else(|| mount_path.clone());
     if !selected.is_empty() && !selected.overlaps(&layer.target_path) {
         return None;
     }
 
     let sub_path = selected
         .as_str()
-        .get(target_path.len()..)
+        .get(mount_path.len()..)
         .unwrap_or_default();
     Some(LayerSelection {
         mount_path: RelativePath::new_from_clean_parts(&layer.target_path, sub_path),
@@ -1021,9 +1021,9 @@ async fn report_staged_diffs(
 }
 
 /// Resolve `source_path` to the work needed to count its subtree, labelling
-/// descendant paths under `target_path` for view filtering. The two differ for
+/// descendant paths under `mount_path` for view filtering. The two differ for
 /// a layer: the node is resolved at the layer's `source_path` while paths are
-/// labelled with the mount `target_path`, so the local view filter matches the
+/// labelled with the `mount_path`, so the local view filter matches the
 /// working-tree layout. Returns the node's own `(directories, files)`
 /// contribution plus an optional root [`CountWork`] for its descendants. A file
 /// yields `(0, 1, None)`; a directory or link `(1, 0, Some(work))`. An empty
@@ -1034,12 +1034,12 @@ async fn count_at_path_root(
     state: Arc<state::State>,
     repository: Arc<RepositoryContext>,
     source_path: &RelativePath,
-    target_path: &RelativePath,
+    mount_path: &RelativePath,
 ) -> Result<(u64, u64, Option<CountWork>), StatusError> {
-    // Every work item below is rooted at `target_path`, so its ancestors are
+    // Every work item below is rooted at `mount_path`, so its ancestors are
     // folded once here and the walk steps from there. Link resolution keeps the
     // filter, so the verdict holds for the resolved repository too.
-    let states = repository.filter.exclusion_states(target_path);
+    let states = repository.filter.exclusion_states(mount_path);
 
     if source_path.is_empty() {
         return Ok((
@@ -1049,7 +1049,7 @@ async fn count_at_path_root(
                 state,
                 repository,
                 node_id: ROOT_NODE,
-                path: target_path.clone(),
+                path: mount_path.clone(),
                 states,
             }),
         ));
@@ -1091,7 +1091,7 @@ async fn count_at_path_root(
                 state,
                 repository,
                 node_id: inner.node,
-                path: target_path.clone(),
+                path: mount_path.clone(),
                 states,
             }),
         ));
@@ -1104,7 +1104,7 @@ async fn count_at_path_root(
             state,
             repository,
             node_id: link.node,
-            path: target_path.clone(),
+            path: mount_path.clone(),
             states,
         }),
     ))

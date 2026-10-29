@@ -46,6 +46,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-revision`: links and layers name both sides of a mount the same way, `mount_path` and `source_path`. No behaviour change
 - `lore-server` times each branch push in five phases: prepare, verify, fast-forward merge, commit and respond
   (`lore.branch_push.phase_duration`). A push dropped before it returns, such as by the handler timeout or a server
   shutting down, counts the phase it was in (`lore.branch_push.cancelled_phase`). Fragment verification also times its

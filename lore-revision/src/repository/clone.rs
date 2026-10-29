@@ -962,21 +962,21 @@ async fn process_block_item_dependency(
 #[derive(Default, Debug)]
 pub struct CloneLayer {
     /// Repository name or ID
-    pub module: String,
-    /// Path in module
-    pub module_path: String,
+    pub repository: String,
+    /// Path in the layer repository
+    pub source_path: String,
     /// Path in current repository
-    pub layer_path: String,
+    pub mount_path: String,
     /// Metadata to use to link layer revisions
     pub metadata: Option<String>,
 }
 
 pub struct VirtualLayer {
-    pub module: Arc<RepositoryContext>,
-    /// Path in module
-    pub module_path: RelativePath,
+    pub repository: Arc<RepositoryContext>,
+    /// Path in the layer repository
+    pub source_path: RelativePath,
     /// Path in current repository
-    pub layer_path: RelativePath,
+    pub mount_path: RelativePath,
     /// Revision
     pub state: Arc<State>,
 }
@@ -1311,20 +1311,20 @@ async fn clone_into(
                 .await
                 .forward::<CloneError>("Failed to resolve given layer repository")?;
             let response = repository_service
-                .query(None, Some(layer.module.as_str()))
+                .query(None, Some(layer.repository.as_str()))
                 .await
                 .forward::<CloneError>("Failed to resolve given layer repository")?;
             response.id
         };
         lore_info!(
             "Resolved layer repository: {} -> {}",
-            layer.module,
+            layer.repository,
             repository_id
         );
 
         lore_info!("Resolving layer revisions");
-        let module = repository.to_layer_context(repository_id).await;
-        let layer_latest = layer::latest_revision(module.clone(), branch_id)
+        let layer_repository = repository.to_layer_context(repository_id).await;
+        let layer_latest = layer::latest_revision(layer_repository.clone(), branch_id)
             .await
             .forward::<CloneError>("Failed to get layer latest revision")?;
         let state_target = state::State::deserialize(repository.clone(), revision)
@@ -1332,7 +1332,7 @@ async fn clone_into(
             .forward::<CloneError>("Failed to load revision state")?;
         let (layer_revision, main_revision) = layer::find_revision_match(
             repository.clone(),
-            module.clone(),
+            layer_repository.clone(),
             branch_id,
             state_target.clone(),
             layer_latest,

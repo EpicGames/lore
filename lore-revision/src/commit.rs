@@ -1638,9 +1638,9 @@ async fn layer_commit_root(
     repository: &Arc<RepositoryContext>,
     state_staged: &Arc<State>,
     source_path: &str,
-    target_path: &str,
+    mount_path: &str,
 ) -> Result<(NodeID, RelativePath), CommitError> {
-    let relative_path = RelativePath::new_from_initial_path(target_path)
+    let relative_path = RelativePath::new_from_initial_path(mount_path)
         .forward::<CommitError>("Invalid layer target path")?;
     if source_path.is_empty() {
         return Ok((ROOT_NODE, relative_path));

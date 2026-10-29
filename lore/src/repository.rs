@@ -264,9 +264,9 @@ async fn clone_impl(
 
     let layer = if !args.layer.is_empty() {
         Some(CloneLayer {
-            module: args.layer.to_string(),
-            module_path: String::default(),
-            layer_path: String::default(),
+            repository: args.layer.to_string(),
+            source_path: String::default(),
+            mount_path: String::default(),
             metadata: args.layer_metadata.clone().into(),
         })
     } else {

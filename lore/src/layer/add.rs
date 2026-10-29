@@ -14,7 +14,7 @@ use lore_revision::util::path::RelativePath;
 pub async fn add(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    target_path: RelativePath,
+    mount_path: RelativePath,
     source_repository: &str,
     source_path: RelativePath,
     metadata: Option<String>,
@@ -40,7 +40,7 @@ pub async fn add(
     layer::add(
         repository,
         token,
-        target_path,
+        mount_path,
         source_repository_id,
         source_path,
         metadata.as_deref(),

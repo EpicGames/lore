@@ -314,9 +314,9 @@ pub fn serve(
     };
 
     let mut layers = vec![VirtualLayer {
-        module: repository.clone(),
-        module_path: RelativePath::default(),
-        layer_path: RelativePath::default(),
+        repository: repository.clone(),
+        source_path: RelativePath::default(),
+        mount_path: RelativePath::default(),
         state: state.clone(),
     }];
     if let Some(layer) = layer {
@@ -426,7 +426,7 @@ unsafe extern "system" fn start_directory_enumeration(
 
             if let Ok(metadata) = instance_context.layers[0]
                 .state
-                .revision_metadata(instance_context.layers[0].module.clone())
+                .revision_metadata(instance_context.layers[0].repository.clone())
                 .await
             {
                 metadata.timestamp
@@ -547,19 +547,19 @@ async unsafe fn get_directory_enumeration_async(
 
         // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
         let relative_path = RelativePath::new_from_mount_path(
-            instance_context.layers[0].module.path.as_path(),
+            instance_context.layers[0].repository.path.as_path(),
             file_path.as_str(),
         )
         .unwrap_or_default();
 
         for (layer_index, layer) in instance_context.layers.iter().enumerate() {
             if !file_path.is_empty() {
-                if layer.layer_path.is_empty()
-                    || layer.layer_path.as_str().starts_with(file_path.as_str())
+                if layer.mount_path.is_empty()
+                    || layer.mount_path.as_str().starts_with(file_path.as_str())
                 {
                     let Ok(node_link) = layer
                         .state
-                        .find_node_link(layer.module.clone(), relative_path.as_str())
+                        .find_node_link(layer.repository.clone(), relative_path.as_str())
                         .await
                     else {
                         lore_debug!(
@@ -567,7 +567,7 @@ async unsafe fn get_directory_enumeration_async(
                         );
                         continue;
                     };
-                    if node_link.repository != layer.module.id {
+                    if node_link.repository != layer.repository.id {
                         lore_debug!("Layer {layer_index} modules not yet supported");
                         continue;
                     }
@@ -577,7 +577,7 @@ async unsafe fn get_directory_enumeration_async(
                         node_link.node
                     );
                 }
-            } else if layer.layer_path.is_empty() {
+            } else if layer.mount_path.is_empty() {
                 base_nodes[layer_index] = Some(ROOT_NODE);
             }
         }
@@ -595,19 +595,19 @@ async unsafe fn get_directory_enumeration_async(
                 let (directory_path, search) = enum_instance.search.split_at(sep);
 
                 let relative_path = RelativePath::new_from_mount_path(
-                    instance_context.layers[0].module.path.as_path(),
+                    instance_context.layers[0].repository.path.as_path(),
                     directory_path,
                 )
                 .unwrap_or_default();
 
                 // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
                 for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-                    if layer.layer_path.is_empty()
-                        || layer.layer_path.as_str().starts_with(directory_path)
+                    if layer.mount_path.is_empty()
+                        || layer.mount_path.as_str().starts_with(directory_path)
                     {
                         if let Ok(base_link) = layer
                             .state
-                            .find_node_link(layer.module.clone(), relative_path.as_str())
+                            .find_node_link(layer.repository.clone(), relative_path.as_str())
                             .await
                         {
                             base_nodes[layer_index] = Some(base_link.node);
@@ -650,7 +650,12 @@ async unsafe fn get_directory_enumeration_async(
                 // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
                 let Ok(child_nodes) = layer
                     .state
-                    .collect_named_children_unsorted(layer.module.clone(), base_node, false, false)
+                    .collect_named_children_unsorted(
+                        layer.repository.clone(),
+                        base_node,
+                        false,
+                        false,
+                    )
                     .await
                 else {
                     lore_debug!(
@@ -663,7 +668,7 @@ async unsafe fn get_directory_enumeration_async(
                 for child_node in child_nodes.iter() {
                     if let Ok(node) = layer
                         .state
-                        .node(layer.module.clone(), child_node.node)
+                        .node(layer.repository.clone(), child_node.node)
                         .await
                     {
                         lore_debug!(
@@ -832,7 +837,7 @@ async unsafe fn get_placeholder_info_async(
     path: String,
 ) -> Result<(), i32> {
     for (layer_index, layer) in instance_context.layers.iter().enumerate() {
-        let repository = layer.module.clone();
+        let repository = layer.repository.clone();
         let state = layer.state.clone();
 
         let relative_path =
@@ -928,7 +933,7 @@ unsafe extern "system" fn query_file_name(
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
     let relative_path = RelativePath::new_from_mount_path(
-        instance_context.layers[0].module.path.as_path(),
+        instance_context.layers[0].repository.path.as_path(),
         path.as_str(),
     )
     .unwrap_or_default();
@@ -952,7 +957,7 @@ async fn query_file_name_async(
     for layer in instance_context.layers.iter() {
         if let Ok(node_link) = layer
             .state
-            .find_node_link(layer.module.clone(), relative_path.as_str())
+            .find_node_link(layer.repository.clone(), relative_path.as_str())
             .await
         {
             return Ok(node_link);
@@ -974,7 +979,7 @@ unsafe extern "system" fn get_file_data(
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
     let relative_path = RelativePath::new_from_mount_path(
-        instance_context.layers[0].module.path.as_path(),
+        instance_context.layers[0].repository.path.as_path(),
         path.as_str(),
     )
     .unwrap_or_default();
@@ -1006,7 +1011,7 @@ async fn get_file_data_async(
     for layer in instance_context.layers.iter() {
         let Ok(node_link) = layer
             .state
-            .find_node_link(layer.module.clone(), path.as_str())
+            .find_node_link(layer.repository.clone(), path.as_str())
             .await
         else {
             continue;
@@ -1017,7 +1022,7 @@ async fn get_file_data_async(
         }
 
         let Ok((repository, state)) = node_link
-            .resolve(layer.module.clone(), layer.state.clone())
+            .resolve(layer.repository.clone(), layer.state.clone())
             .await
         else {
             continue;

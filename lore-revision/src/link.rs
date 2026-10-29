@@ -416,7 +416,7 @@ pub(crate) fn report_branch_outcome(
 /// A linked repository a branch cascade acts on, with a mount path for
 /// reporting.
 pub struct LinkTarget {
-    pub path: String,
+    pub mount_path: String,
     pub repository: RepositoryId,
     pub context: Arc<RepositoryContext>,
 }
@@ -513,7 +513,7 @@ async fn collect_with_context(
                 format!("{path_prefix}/{local_path}")
             };
             let target = LinkTarget {
-                path: full_path,
+                mount_path: full_path,
                 repository: link_id,
                 context: repository.to_link_context(link_id).await,
             };
@@ -534,7 +534,7 @@ async fn collect_with_context(
             Box::pin(collect_with_context(
                 context,
                 nested_state,
-                target.path.clone(),
+                target.mount_path.clone(),
                 link_depth + 1,
                 seen,
             ))
@@ -570,7 +570,7 @@ pub async fn find_with_context(
     }
 
     Ok(LinkTarget {
-        path: path.to_string(),
+        mount_path: path.to_string(),
         repository: resolved.link_context.id,
         context: resolved.link_context,
     })

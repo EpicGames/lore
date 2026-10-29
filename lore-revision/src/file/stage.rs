@@ -584,7 +584,7 @@ pub async fn stage(
     // masking every layer subtree on every main-repo walk is correct: an entry
     // not under a given target is never reached anyway.
     let global_mask: Option<Arc<Vec<String>>> = (!layers.is_empty())
-        .then(|| Arc::new(layer::target_paths(layers.iter().map(|(layer, _)| layer))));
+        .then(|| Arc::new(layer::mount_paths(layers.iter().map(|(layer, _)| layer))));
     let layer_target_refs: Vec<&str> = global_mask
         .as_deref()
         .map(|paths| paths.iter().map(String::as_str).collect())
@@ -1545,7 +1545,7 @@ pub async fn stage_move(
 ///
 /// `Inside` routes exclusively to one layer with a possibly-empty `remain` suffix.
 /// `AncestorOf` routes to the parent (with the listed layer subtrees masked) AND
-/// to every layer whose `target_path` is under the input path. `Disjoint` routes
+/// to every layer whose `mount_path` is under the input path. `Disjoint` routes
 /// to the parent only.
 ///
 /// Layer indices refer into the slice passed to [`classify_stage_path`].
@@ -1562,22 +1562,22 @@ pub(crate) enum LayerRoute {
     Disjoint,
 }
 
-/// Classifies a stage path against a list of layer mount paths (`target_path`s).
+/// Classifies a stage path against a list of layer mount paths.
 ///
-/// Assumes non-overlapping layers (no layer's `target_path` is a prefix of another's).
+/// Assumes non-overlapping layers (no layer's mount path is a prefix of another's).
 #[lore_macro::test_pub]
-pub(crate) fn classify_stage_path(relative_path: &str, layer_target_paths: &[&str]) -> LayerRoute {
+pub(crate) fn classify_stage_path(relative_path: &str, layer_mount_paths: &[&str]) -> LayerRoute {
     if relative_path.is_empty() {
-        return if layer_target_paths.is_empty() {
+        return if layer_mount_paths.is_empty() {
             LayerRoute::Disjoint
         } else {
             LayerRoute::AncestorOf {
-                layer_indices: (0..layer_target_paths.len()).collect(),
+                layer_indices: (0..layer_mount_paths.len()).collect(),
             }
         };
     }
 
-    for (i, target) in layer_target_paths.iter().enumerate() {
+    for (i, target) in layer_mount_paths.iter().enumerate() {
         if target.is_empty() {
             continue;
         }
@@ -1598,7 +1598,7 @@ pub(crate) fn classify_stage_path(relative_path: &str, layer_target_paths: &[&st
     }
 
     let mut ancestor_indices = Vec::new();
-    for (i, target) in layer_target_paths.iter().enumerate() {
+    for (i, target) in layer_mount_paths.iter().enumerate() {
         if target.is_empty() {
             continue;
         }

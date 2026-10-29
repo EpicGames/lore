@@ -176,7 +176,7 @@ pub(crate) async fn dirty_relative_paths_in_operation(
         .forward::<DirtyError>("Failed to list layers")?;
     let (parent_paths, layer_jobs) = route_layer_paths(&layers, paths);
 
-    let mask = (!layers.is_empty()).then(|| Arc::new(layer::target_paths(&layers)));
+    let mask = (!layers.is_empty()).then(|| Arc::new(layer::mount_paths(&layers)));
 
     let signature = dirty_relative_paths_in_masked(
         operation,
