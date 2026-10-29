@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::net::SocketAddr;
 use std::net::UdpSocket;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +23,7 @@ use lore_server::quic::StreamDataHandler;
 use lore_server::quic::StreamHandlerFactory;
 use lore_server::quic::quinn::QuinnConfigBuilder;
 use lore_server::quic::quinn::QuinnServer;
+use lore_server::quic::quinn::SocketConnectionIdGenerator;
 use lore_server::quic::quinn::build_cert_verifier;
 use lore_server::quic::quinn::service_store::ServiceStore;
 use lore_server::quic::quinn::service_store::StreamDataHandlerBuilder;
@@ -56,6 +58,8 @@ use quinn::ReadExactError;
 use quinn::RecvStream;
 use quinn::SendStream;
 use quinn::crypto::rustls::QuicClientConfig;
+use quinn_proto::ConnectionIdGenerator;
+use quinn_proto::HashedConnectionIdGenerator;
 use rand::random;
 use tokio::io::AsyncWriteExt;
 use zerocopy::IntoBytes;
@@ -1532,6 +1536,255 @@ async fn test_v4_authorize_put_get_query_stop() {
         assert!(!resp.error, "Authorize stop session 2 failed: {resp:?}");
 
         send.finish().expect("Failed to finish stream");
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// Whether this platform spreads the datagrams arriving at one port across sockets bound to it.
+const SPREADS_ACROSS_SOCKETS: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// Sockets the multi-socket server binds.
+const SOCKETS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
+/// Clients, or rebinds of one client, a test tries for the hash to reach every socket, or another
+/// one: enough that it fails to by chance one time in ten million.
+const MAX_ATTEMPTS: u32 = 64;
+
+/// Time a loopback exchange is allowed to take, with room for a loaded host.
+const LOOPBACK_BUDGET: Duration = Duration::from_secs(5);
+
+/// Serve [`MockService`] as `builder` configures, with the test certificate.
+fn serve_mock(builder: QuinnConfigBuilder) -> QuinnServer {
+    let (cert_path, key_path, _) = server_certs().expect("Bad cert paths");
+    QuinnServer::start(
+        builder
+            .cert_file(cert_path)
+            .pkey_file(key_path)
+            .stream_handler_factory(Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )))
+            .build()
+            .unwrap(),
+    )
+    .expect("Failed Quinn server start")
+}
+
+/// Serve [`MockService`] on [`SOCKETS`] sockets sharing one free loopback port.
+fn serve_on_sockets() -> QuinnServer {
+    serve_mock(
+        QuinnConfigBuilder::new()
+            .address("127.0.0.1:0".parse().unwrap())
+            .num_sockets(SOCKETS),
+    )
+}
+
+/// Connect to `server_addr` from a client endpoint of its own, so from a source port of its own.
+async fn connect_new_client(server_addr: SocketAddr) -> (Endpoint, quinn::Connection) {
+    let mut crypto_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(insecure_client_auth::SkipServerVerification::new())
+        .with_no_client_auth();
+    crypto_config.alpn_protocols = vec![MOCK_PROTOCOL.as_bytes().into()];
+    let client_config = ClientConfig::new(Arc::new(
+        QuicClientConfig::try_from(crypto_config).expect("Failed client config"),
+    ));
+
+    let mut endpoint =
+        Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("Failed to create client endpoint");
+    endpoint.set_default_client_config(client_config);
+    let connection = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("Failed to connect");
+    (endpoint, connection)
+}
+
+/// Ask `connection` for an echo of `command_id` and wait for it.
+async fn echo(connection: &quinn::Connection, command_id: u32) -> anyhow::Result<()> {
+    let (mut send, mut recv) = connection.open_bi().await?;
+    send.write_all(&CommandHeader::new(MockBehaviour::Echo.opcode(), command_id, 0).to_bytes())
+        .await?;
+    let mut buffer = [0u8; 8];
+    recv.read_exact(&mut buffer).await?;
+    let served = CommandHeader::from_bytes(&buffer);
+    anyhow::ensure!(
+        served.command_id == command_id && !served.error,
+        "got: {served:?}"
+    );
+    Ok(())
+}
+
+/// Connect clients, each from a source port of its own and each served an echo, until every
+/// socket of `server` has accepted one or [`MAX_ATTEMPTS`] have connected.
+async fn connect_to_every_socket(server: &QuinnServer) -> Vec<(Endpoint, quinn::Connection)> {
+    let server_addr = server
+        .socket_addrs()
+        .expect("Failed to read the socket addresses")[0];
+    let mut clients = Vec::new();
+    for command_id in 0..MAX_ATTEMPTS {
+        let (endpoint, connection) = connect_new_client(server_addr).await;
+        echo(&connection, command_id)
+            .await
+            .expect("Client was not served");
+        clients.push((endpoint, connection));
+        if server.socket_handshakes().iter().all(|count| *count > 0) {
+            break;
+        }
+    }
+    clients
+}
+
+/// Clients the kernel spreads across the sockets are each served, whichever socket's endpoint
+/// their datagrams reach.
+#[tokio::test]
+async fn clients_spread_across_the_sockets_are_all_served() {
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let server = serve_on_sockets();
+        let clients = connect_to_every_socket(&server).await;
+
+        let handshakes = server.socket_handshakes();
+        let expected = if SPREADS_ACROSS_SOCKETS {
+            SOCKETS.get()
+        } else {
+            1
+        };
+        assert_eq!(handshakes.len(), expected, "got: {handshakes:?}");
+        assert_eq!(
+            handshakes.iter().sum::<u64>(),
+            clients.len() as u64,
+            "got: {handshakes:?}"
+        );
+        assert!(
+            handshakes.iter().all(|count| *count > 0),
+            "a socket served no client, so the kernel did not spread them: {handshakes:?}"
+        );
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+#[tokio::test]
+async fn closing_the_server_closes_the_connections_on_every_socket() {
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let server = serve_on_sockets();
+        let clients = connect_to_every_socket(&server).await;
+
+        tokio::time::timeout(LOOPBACK_BUDGET, server.close())
+            .await
+            .expect("The server did not close in time");
+        for (_, connection) in &clients {
+            let closed = tokio::time::timeout(LOOPBACK_BUDGET, connection.closed())
+                .await
+                .expect("A connection was not closed in time");
+            assert!(
+                matches!(closed, ConnectionError::ApplicationClosed(_)),
+                "got: {closed:?}"
+            );
+        }
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// A client whose address changes reaches another socket's endpoint, which resets the connection
+/// rather than leaving it to time out.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn a_client_reaching_another_socket_is_reset() {
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let server = serve_on_sockets();
+        let server_addr = server
+            .socket_addrs()
+            .expect("Failed to read the socket addresses")[0];
+        let (endpoint, connection) = connect_new_client(server_addr).await;
+
+        for command_id in 0..MAX_ATTEMPTS {
+            endpoint
+                .rebind(UdpSocket::bind("127.0.0.1:0").unwrap())
+                .expect("Failed to rebind");
+            let served = tokio::time::timeout(LOOPBACK_BUDGET, echo(&connection, command_id))
+                .await
+                .expect("The connection was neither served nor reset in time");
+            if served.is_err() {
+                let reason = connection.close_reason();
+                assert!(
+                    matches!(reason, Some(ConnectionError::Reset)),
+                    "got: {reason:?}"
+                );
+                return;
+            }
+        }
+        panic!("No rebind reached another socket");
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+#[test]
+fn a_socket_recognises_the_connection_ids_of_its_siblings_and_no_others() {
+    const IDS: u32 = 1000;
+
+    let keys: Arc<[u64]> = Arc::new([random(), random()]);
+    let own = SocketConnectionIdGenerator::new(keys[0], keys.clone());
+    let mut sibling = SocketConnectionIdGenerator::new(keys[1], keys.clone());
+    let mut stranger = HashedConnectionIdGenerator::from_key(random());
+    for _ in 0..IDS {
+        let issued = sibling.generate_cid();
+        assert!(own.validate(&issued).is_ok(), "rejected {issued:?}");
+        let foreign = stranger.generate_cid();
+        assert!(own.validate(&foreign).is_err(), "accepted {foreign:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_socket_the_caller_bound_is_served_alone() {
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().expect("Failed socket setup");
+
+        let server = serve_mock(
+            QuinnConfigBuilder::new()
+                .socket(socket)
+                .num_sockets(SOCKETS),
+        );
+
+        let addrs = server
+            .socket_addrs()
+            .expect("Failed to read the socket addresses");
+        assert_eq!(addrs, vec![addr]);
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn the_default_is_16_sockets_or_one_per_processor_if_fewer() {
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let server = serve_mock(QuinnConfigBuilder::new().address("127.0.0.1:0".parse().unwrap()));
+
+        let addrs = server
+            .socket_addrs()
+            .expect("Failed to read the socket addresses");
+        assert_eq!(
+            addrs.len(),
+            lore_base::runtime::processor_count().min(16),
+            "got: {addrs:?}"
+        );
     }))
     .await
     .expect("Test task failed");

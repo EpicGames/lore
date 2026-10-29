@@ -2819,6 +2819,7 @@ dependencies = [
  "pin-project",
  "prost-types",
  "quinn",
+ "quinn-proto",
  "rand 0.9.5",
  "rcgen",
  "reqwest",

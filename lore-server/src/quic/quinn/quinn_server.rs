@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +9,8 @@ use lore_base::lore_spawn_core;
 use lore_base::lore_spawn_net;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::runtime::execution_context;
+use lore_transport::quic::client::RECEIVE_BUFFER_BYTES;
+use lore_transport::quic::client::raise_receive_buffer;
 use lore_transport::quic::net_runtime::NetRuntime;
 use opentelemetry::KeyValue;
 use quinn::AckFrequencyConfig;
@@ -16,6 +19,9 @@ use quinn::ServerConfig;
 use quinn::VarInt;
 use quinn::crypto::rustls::HandshakeData;
 use quinn::crypto::rustls::QuicServerConfig;
+use quinn_proto::ConnectionIdGenerator;
+use quinn_proto::HashedConnectionIdGenerator;
+use quinn_proto::InvalidCid;
 use socket2::Domain;
 use socket2::Protocol;
 use socket2::Type;
@@ -40,8 +46,17 @@ use crate::util::cert_metrics::start_certificate_metrics;
 
 const METRICS_QUINN_SERVER_LABEL: &str = "quinn_server_name";
 
+/// Connection attempts the server holds waiting to be accepted or refused, across its sockets:
+/// quinn's default for one endpoint.
+const MAX_INCOMING: usize = 1 << 16;
+
+/// Bytes the server buffers for connections not yet accepted, across its sockets: quinn's default
+/// for one endpoint.
+const INCOMING_BUFFER_SIZE_TOTAL: u64 = 100 << 20;
+
 pub struct QuinnServer {
-    endpoint: quinn::Endpoint,
+    /// One per socket, all serving the same port.
+    endpoints: Vec<quinn::Endpoint>,
 }
 
 impl QuinnServer {
@@ -120,59 +135,168 @@ impl QuinnServer {
                 .ack_frequency_config(Some(ack_freq_config));
         }
 
-        // A caller that needs this port on TCP as well binds both itself and hands the UDP half
-        // over, because there is no way to reserve a number across two binds. Its socket carries
-        // its own options, so the reuse flags below are deliberately not applied to it.
-        let socket: std::net::UdpSocket = if let Some(socket) = settings.socket.take() {
-            socket
-        } else {
-            let socket = socket2::Socket::new(
-                Domain::for_address(settings.address),
-                Type::DGRAM,
-                Some(Protocol::UDP),
-            )?;
-
-            // Reuse must be configured before bind.
-            socket.reuse_address()?;
-
-            // set_reuse_port is not implemented on Windows
-            #[cfg(target_family = "unix")]
-            socket.set_reuse_port(true)?;
-
-            socket.bind(&socket2::SockAddr::from(settings.address))?;
-            socket.into()
-        };
+        let sockets = bind_sockets(&mut settings)?;
+        split_incoming_limits(&mut server_config, sockets.len());
+        let connection_id_keys: Arc<[u64]> = sockets.iter().map(|_| rand::random()).collect();
 
         // `NetRuntime` places every task quinn spawns on net, including the connection driver
         // created when an `Incoming` is awaited. The guard covers what it cannot: the socket is
         // handed to `tokio::net::UdpSocket::from_std`, which registers with whichever reactor is
         // current here. Removing it would register net's socket on core's reactor.
-        let endpoint = {
+        let endpoints = {
             let _guard = lore_base::runtime::net_runtime().enter();
-            quinn::Endpoint::new(
-                endpoint_config,
-                Some(server_config),
-                socket,
-                Arc::new(NetRuntime),
-            )?
+            sockets
+                .into_iter()
+                .zip(connection_id_keys.iter())
+                .map(|(socket, &key)| {
+                    raise_receive_buffer(&socket, RECEIVE_BUFFER_BYTES);
+                    quinn::Endpoint::new(
+                        socket_endpoint_config(&endpoint_config, key, &connection_id_keys),
+                        Some(server_config.clone()),
+                        socket,
+                        Arc::new(NetRuntime),
+                    )
+                })
+                .collect::<std::io::Result<Vec<_>>>()?
         };
 
-        run_loop(endpoint.clone(), settings)?;
+        run_loop(&endpoints, settings)?;
 
-        Ok(Self { endpoint })
+        Ok(Self { endpoints })
     }
 
-    /// Gracefully close all connections on this endpoint. Sends `CONNECTION_CLOSE`
+    /// Gracefully close all connections on every endpoint. Sends `CONNECTION_CLOSE`
     /// frames to all peers (causing accept loops to return `None`) and waits for
     /// the frames to be delivered.
     pub async fn close(&self) {
-        self.endpoint
-            .close(VarInt::from_u32(0), b"server shutting down");
-        self.endpoint.wait_idle().await;
+        for endpoint in &self.endpoints {
+            endpoint.close(VarInt::from_u32(0), b"server shutting down");
+        }
+        for endpoint in &self.endpoints {
+            endpoint.wait_idle().await;
+        }
     }
 }
 
-fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<()> {
+/// `shared`, whose stateless reset key every endpoint on the port holds, for the endpoint issuing
+/// connection IDs under `key` and recognising those issued under any of `keys`; see
+/// [`SocketConnectionIdGenerator`].
+fn socket_endpoint_config(shared: &EndpointConfig, key: u64, keys: &Arc<[u64]>) -> EndpointConfig {
+    let keys = keys.clone();
+    let mut config = shared.clone();
+    config.cid_generator(move || Box::new(SocketConnectionIdGenerator::new(key, keys.clone())));
+    config
+}
+
+/// Issues quinn's hashed connection IDs under its socket's key and recognises those issued under
+/// the key of any socket on the port. The keys differ, so sockets, whose endpoints track their IDs
+/// apart, do not issue the same ID. Recognising a sibling's ID lets an endpoint answer a datagram
+/// that reached the wrong socket, as after the client's address changes, with a stateless reset the
+/// client accepts rather than drop it.
+#[lore_macro::test_pub]
+struct SocketConnectionIdGenerator {
+    issuer: HashedConnectionIdGenerator,
+    keys: Arc<[u64]>,
+}
+
+impl SocketConnectionIdGenerator {
+    /// Issues IDs under `key` and recognises those issued under any of `keys`.
+    #[lore_macro::test_pub]
+    fn new(key: u64, keys: Arc<[u64]>) -> Self {
+        Self {
+            issuer: HashedConnectionIdGenerator::from_key(key),
+            keys,
+        }
+    }
+}
+
+impl ConnectionIdGenerator for SocketConnectionIdGenerator {
+    fn generate_cid(&mut self) -> quinn_proto::ConnectionId {
+        self.issuer.generate_cid()
+    }
+
+    fn validate(&self, cid: &quinn_proto::ConnectionId) -> Result<(), InvalidCid> {
+        if self.keys.iter().any(|&key| {
+            HashedConnectionIdGenerator::from_key(key)
+                .validate(cid)
+                .is_ok()
+        }) {
+            Ok(())
+        } else {
+            Err(InvalidCid)
+        }
+    }
+
+    fn cid_len(&self) -> usize {
+        self.issuer.cid_len()
+    }
+
+    fn cid_lifetime(&self) -> Option<Duration> {
+        self.issuer.cid_lifetime()
+    }
+}
+
+/// Splits quinn's per-endpoint limits on connections not yet accepted across `endpoints`, so the
+/// server as a whole holds no more of them than one endpoint with quinn's defaults.
+fn split_incoming_limits(server_config: &mut ServerConfig, endpoints: usize) {
+    server_config
+        .max_incoming(MAX_INCOMING / endpoints)
+        .incoming_buffer_size_total(INCOMING_BUFFER_SIZE_TOTAL / endpoints as u64);
+}
+
+/// The UDP sockets to serve on: the one the caller bound, or `num_sockets` bound to `address`
+/// with `SO_REUSEPORT`, of which the first settles the port when `address` asks for any free one.
+/// Only Linux spreads the datagrams arriving at a port across sockets, so other platforms bind one.
+fn bind_sockets(settings: &mut QuinnConfig) -> anyhow::Result<Vec<std::net::UdpSocket>> {
+    if let Some(socket) = settings.socket.take() {
+        return Ok(vec![socket]);
+    }
+
+    let count = if cfg!(any(target_os = "linux", target_os = "android")) {
+        settings.num_sockets.get()
+    } else {
+        1
+    };
+    if count < settings.num_sockets.get() {
+        debug!(
+            num_sockets = settings.num_sockets.get(),
+            "Binding one socket: this platform does not spread datagrams across sockets"
+        );
+    }
+
+    let mut address = settings.address;
+    let mut sockets = Vec::with_capacity(count);
+    for _ in 0..count {
+        let socket = bind_socket(address)?;
+        address = socket.local_addr()?;
+        sockets.push(socket);
+    }
+    Ok(sockets)
+}
+
+/// Binds a UDP socket to `address` with `SO_REUSEPORT`, so that sockets bound to its port later
+/// share it. Port 0 is bound before the option is set, as Linux otherwise may pick a port another
+/// socket of the same user holds with the option and join it.
+fn bind_socket(address: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        Domain::for_address(address),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
+
+    // set_reuse_port is not implemented on Windows
+    #[cfg(target_family = "unix")]
+    if address.port() != 0 {
+        socket.set_reuse_port(true)?;
+    }
+    socket.bind(&socket2::SockAddr::from(address))?;
+    #[cfg(target_family = "unix")]
+    socket.set_reuse_port(true)?;
+
+    Ok(socket.into())
+}
+
+fn run_loop(endpoints: &[quinn::Endpoint], settings: QuinnConfig) -> anyhow::Result<()> {
     let stream_handler_factory = Arc::new(settings.stream_handler_factory);
     let metrics_interval = settings.metrics_frequency;
 
@@ -204,52 +328,74 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         );
     }
 
-    info!("Creating {} listener(s)", &settings.num_listeners);
-    for i in 0..settings.num_listeners {
-        // The `instrument` function from `tracing` conflicts with the `instrument` function from
-        // the `TaskMonitor` so we need to use a scoped import.
-        use tracing::instrument::Instrument;
-        let endpoint = endpoint.clone();
-        let monitor = monitor.clone();
-        let stream_handler_factory = stream_handler_factory.clone();
-
-        lore_spawn_net!(
-            LORE_CONTEXT.scope(
-                execution_context(),
-                async move {
-                    debug!("Spawned task {i} is waiting to accept connections");
-                    while let Some(connection) = endpoint.accept().await {
-                        debug!("Spawned task {i} received a connection: {connection:?}");
-
-                        let monitor = monitor.clone();
-                        let stream_handler_factory = stream_handler_factory.clone();
-
-                        lore_spawn_net!(
-                            LORE_CONTEXT.scope(
-                                execution_context(),
-                                async move {
-                                    if let Err(error) = handle_conn(
-                                        connection,
-                                        monitor.clone(),
-                                        metrics_interval,
-                                        stream_handler_factory.clone(),
-                                    )
-                                    .await
-                                    {
-                                        warn!("Error handling connection: {error}");
-                                    }
-                                }
-                                .in_current_span(),
-                            )
-                        );
-                    }
-                }
-                .in_current_span(),
-            )
-        );
+    info!(
+        sockets = endpoints.len(),
+        listeners_per_socket = settings.num_listeners.get(),
+        "Creating listeners"
+    );
+    for (socket, endpoint) in endpoints.iter().enumerate() {
+        for listener in 0..settings.num_listeners.get() {
+            spawn_listener(
+                endpoint.clone(),
+                socket,
+                listener,
+                monitor.clone(),
+                metrics_interval,
+                stream_handler_factory.clone(),
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Accepts connections on `endpoint` until it closes, each handled by a task of its own.
+fn spawn_listener(
+    endpoint: quinn::Endpoint,
+    socket: usize,
+    listener: u8,
+    monitor: TaskMonitor,
+    metrics_interval: Duration,
+    stream_handler_factory: Arc<Box<dyn StreamHandlerFactory>>,
+) {
+    // The `instrument` function from `tracing` conflicts with the `instrument` function from
+    // the `TaskMonitor` so we need to use a scoped import.
+    use tracing::instrument::Instrument;
+
+    lore_spawn_net!(
+        LORE_CONTEXT.scope(
+            execution_context(),
+            async move {
+                debug!(socket, listener, "Waiting to accept connections");
+                while let Some(connection) = endpoint.accept().await {
+                    debug!(socket, listener, "Received a connection: {connection:?}");
+
+                    let monitor = monitor.clone();
+                    let stream_handler_factory = stream_handler_factory.clone();
+
+                    lore_spawn_net!(
+                        LORE_CONTEXT.scope(
+                            execution_context(),
+                            async move {
+                                if let Err(error) = handle_conn(
+                                    connection,
+                                    monitor,
+                                    metrics_interval,
+                                    stream_handler_factory,
+                                )
+                                .await
+                                {
+                                    warn!("Error handling connection: {error}");
+                                }
+                            }
+                            .in_current_span(),
+                        )
+                    );
+                }
+            }
+            .in_current_span(),
+        )
+    );
 }
 
 fn get_protocol(connection: &quinn::Connection) -> Result<String, anyhow::Error> {
@@ -371,5 +517,30 @@ async fn handle_conn(
         // Transport read only: `handle_stream` lifts the request off the wire and
         // hands processing to core from inside the stream handler.
         lore_spawn_net!(monitor.instrument(LORE_CONTEXT.scope(execution.clone(), handle_future)));
+    }
+}
+
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use std::net::SocketAddr;
+
+    use super::QuinnServer;
+
+    impl QuinnServer {
+        /// The local address of each socket the server serves on.
+        pub fn socket_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+            self.endpoints
+                .iter()
+                .map(|endpoint| endpoint.local_addr())
+                .collect()
+        }
+
+        /// The handshakes accepted on each socket the server serves on.
+        pub fn socket_handshakes(&self) -> Vec<u64> {
+            self.endpoints
+                .iter()
+                .map(|endpoint| endpoint.stats().accepted_handshakes)
+                .collect()
+        }
     }
 }

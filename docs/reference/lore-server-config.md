@@ -137,7 +137,8 @@ At startup the server also reports where each local store lands, warning when th
 | `idle_timeout` | `30000` | Connection idle timeout in milliseconds. |
 | `keep_alive` | `500` | Keep-alive interval in milliseconds. |
 | `max_bidi_streams` | `8` | Maximum concurrent bidirectional streams per connection. |
-| `num_listeners` | `10` | Number of listener tasks. |
+| `num_listeners` | `1` | Accept tasks per socket. One keeps up, as an accept task only hands each connection to a task of its own. |
+| `num_sockets` | `16`, or one per processor on a machine with fewer (`quic`); `4` (`quic_internal`) | UDP sockets bound to `port` with `SO_REUSEPORT`, each with its own QUIC endpoint and receive buffer of about 2.9 MiB. Linux hands each datagram to one socket by a hash of its source and destination, which spreads the clients across the sockets; other platforms bind one. Each socket asks the kernel for a 512 KiB receive buffer, which Linux caps at `net.core.rmem_max`. The sockets share the limits on connections not yet accepted, 65,536 attempts and 100 MiB of buffered datagrams. A client whose address changes mid-connection can reach another socket, whose endpoint resets the connection; the client reconnects. |
 | `transport_bits_per_second` | `1073741824` (`quic`), `10737418240` (`quic_internal`) | Transport bandwidth estimate in bits per second. |
 | `transport_rtt` | `100` | Expected round-trip time in milliseconds. |
 | `initial_cwnd_bytes` | none (`quic`), `1048576` (`quic_internal`) | Congestion window, in bytes, that each accepted connection starts with: how much the server sends before the peer's first acknowledgements arrive. The congestion controller may cap it at the send window derived from `transport_bits_per_second` and `transport_rtt`. When unset, `quic` uses the congestion controller's own default and `quic_internal` always uses `1048576`. At least `2400`. |

@@ -38,7 +38,12 @@ verify_client_certs = false
 idle_timeout = 30_000
 keep_alive = 500
 max_bidi_streams = 8
-num_listeners = 10
+# Accept tasks per socket. Unset: 1.
+# num_listeners = 1
+# UDP sockets on the port, each with its own QUIC endpoint; Linux spreads clients across them.
+# Used on Linux and Android only; other platforms bind one socket.
+# Unset: 16, or one per processor on a machine with fewer.
+# num_sockets = 16
 transport_bits_per_second = 1_073_741_824  # 1 gbit/s
 transport_rtt = 100  # 100 ms
 # Window each connection starts sending responses with. Unset, the congestion controller's own
@@ -60,7 +65,9 @@ port = 41340
 idle_timeout = 30_000
 keep_alive = 500
 max_bidi_streams = 8
-num_listeners = 10
+# Few peers, and each peer's traffic stays on one socket, so a handful is enough.
+# Used on Linux and Android only; other platforms bind one socket.
+num_sockets = 4
 transport_bits_per_second = 10_737_418_240  # 10 gbit/s
 transport_rtt = 100  # 100 ms
 # Window each connection starts sending responses with. Defaults to 1 MiB.

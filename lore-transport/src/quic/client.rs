@@ -105,11 +105,10 @@ const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
 #[lore_macro::test_pub]
 const HAPPY_EYEBALLS_MAX_IN_FLIGHT: usize = 10;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
-/// The UDP receive buffer a client socket asks for. Linux allocates twice the request, 1 MiB, which is
-/// intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s transfer, and every
-/// datagram that arrives while it is full is lost.
-#[lore_macro::test_pub]
-const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
+/// The UDP receive buffer a QUIC socket asks for, client or server. Linux allocates twice the request,
+/// 1 MiB, which is intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s
+/// transfer, and every datagram that arrives while it is full is lost.
+pub const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientCerts {
@@ -1055,8 +1054,7 @@ where
 /// Raises `socket`'s receive buffer to `bytes` when it is smaller, and leaves a buffer of at least
 /// that size alone. The OS may grant less than asked: Linux caps the request at
 /// `net.core.rmem_max`, and allocates and reports twice what it grants.
-#[lore_macro::test_pub]
-fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
+pub fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
     let socket = socket2::SockRef::from(socket);
     if socket.recv_buffer_size().is_ok_and(|size| size >= bytes) {
         return;

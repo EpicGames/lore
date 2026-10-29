@@ -3,6 +3,8 @@
 use std::fmt;
 use std::fmt::Formatter;
 use std::net::SocketAddr;
+use std::num::NonZeroU8;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,7 +36,10 @@ pub struct QuinnConfig {
     pub(crate) idle_timeout: Duration,
     pub(crate) keep_alive: Duration,
     pub(crate) max_bidi_streams: u64,
-    pub(crate) num_listeners: u8,
+    /// Accept tasks per socket.
+    pub(crate) num_listeners: NonZeroU8,
+    /// Sockets to bind to `address`; see [`QuinnConfigBuilder::num_sockets`].
+    pub(crate) num_sockets: NonZeroUsize,
     pub(crate) metrics_frequency: Duration,
     pub(crate) transport_bits_per_second: usize,
     pub(crate) transport_rtt: usize,
@@ -60,6 +65,7 @@ impl fmt::Debug for QuinnConfig {
             .field("keep_alive", &self.keep_alive)
             .field("max_bidi_streams", &self.max_bidi_streams)
             .field("num_listeners", &self.num_listeners)
+            .field("num_sockets", &self.num_sockets)
             .field("metrics_frequency", &self.metrics_frequency)
             .field("transport_bits_per_second", &self.transport_bits_per_second)
             .field("transport_rtt", &self.transport_rtt)
@@ -84,7 +90,8 @@ pub struct QuinnConfigBuilder {
     pub(crate) idle_timeout: Option<Duration>,
     pub(crate) keep_alive: Option<Duration>,
     pub(crate) max_bidi_streams: Option<u64>,
-    pub(crate) num_listeners: Option<u8>,
+    pub(crate) num_listeners: Option<NonZeroU8>,
+    pub(crate) num_sockets: Option<NonZeroUsize>,
     pub(crate) metrics_frequency: Option<Duration>,
     pub(crate) transport_bits_per_second: Option<usize>,
     pub(crate) transport_rtt: Option<usize>,
@@ -94,7 +101,9 @@ pub struct QuinnConfigBuilder {
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
 const DEFAULT_KEEP_ALIVE_MILLS: u64 = 500;
-const DEFAULT_LISTENERS_COUNT: u8 = 10;
+const DEFAULT_LISTENERS_COUNT: NonZeroU8 = NonZeroU8::MIN;
+/// Sockets bound when none are configured, on a machine with at least as many processors.
+const DEFAULT_SOCKETS_COUNT: usize = 16;
 const DEFAULT_METRICS_FREQUENCY: Duration = Duration::from_millis(60_000);
 const DEFAULT_TRANSPORT_BITS_PER_SECOND: usize = 1_073_741_824; // 1gbit/s
 const DEFAULT_TRANSPORT_RTT: usize = 100; // 100ms
@@ -119,8 +128,8 @@ impl QuinnConfigBuilder {
     /// what makes the pair atomic as far as the servers are concerned.
     ///
     /// Note that a socket bound by the caller carries whatever options the caller set, not the
-    /// `SO_REUSEADDR`/`SO_REUSEPORT` this applies to sockets it binds itself. A caller that wants a
-    /// port exclusively should set neither, so that a clash fails instead of silently sharing.
+    /// `SO_REUSEPORT` this applies to sockets it binds itself. A caller that wants a port
+    /// exclusively should not set it, so that a clash fails instead of silently sharing.
     pub fn socket(mut self, socket: std::net::UdpSocket) -> Self {
         self.socket = Some(socket);
         self
@@ -174,8 +183,20 @@ impl QuinnConfigBuilder {
         self
     }
 
-    pub fn num_listeners(mut self, num_listeners: u8) -> Self {
+    /// Accept tasks per socket. Defaults to 1, which keeps up, as an accept task only hands each
+    /// connection to a task of its own.
+    pub fn num_listeners(mut self, num_listeners: NonZeroU8) -> Self {
         self.num_listeners = Some(num_listeners);
+        self
+    }
+
+    /// UDP sockets to bind to the address with `SO_REUSEPORT`, each with a QUIC endpoint of its
+    /// own. Linux hands each datagram to one socket by a hash of its source and destination, which
+    /// spreads the clients across the sockets; a client whose address changes can reach another
+    /// socket, whose endpoint resets the connection. Defaults to 16, or one per processor on a machine
+    /// with fewer. Other platforms, and a socket the caller bound (see [`Self::socket`]), get one.
+    pub fn num_sockets(mut self, num_sockets: NonZeroUsize) -> Self {
+        self.num_sockets = Some(num_sockets);
         self
     }
 
@@ -244,6 +265,10 @@ impl QuinnConfigBuilder {
                 .unwrap_or(Duration::from_millis(DEFAULT_KEEP_ALIVE_MILLS)),
             max_bidi_streams: self.max_bidi_streams.unwrap_or(STREAM_COUNT as u64),
             num_listeners: self.num_listeners.unwrap_or(DEFAULT_LISTENERS_COUNT),
+            num_sockets: self.num_sockets.unwrap_or_else(|| {
+                NonZeroUsize::new(lore_base::runtime::processor_count().min(DEFAULT_SOCKETS_COUNT))
+                    .unwrap_or(NonZeroUsize::MIN)
+            }),
             metrics_frequency: self.metrics_frequency.unwrap_or(DEFAULT_METRICS_FREQUENCY),
             transport_bits_per_second: self
                 .transport_bits_per_second

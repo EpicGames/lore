@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
+use std::num::NonZeroU8;
+use std::num::NonZeroUsize;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -600,7 +602,12 @@ pub struct QuicSettings {
     pub idle_timeout: Option<u64>,
     pub keep_alive: Option<u64>,
     pub max_bidi_streams: Option<u64>,
-    pub num_listeners: u8,
+    /// Accept tasks per socket; see
+    /// [`QuinnConfigBuilder::num_listeners`](crate::quic::quinn::QuinnConfigBuilder::num_listeners).
+    pub num_listeners: Option<NonZeroU8>,
+    /// UDP sockets bound to `port`, used on Linux and Android only; see
+    /// [`QuinnConfigBuilder::num_sockets`](crate::quic::quinn::QuinnConfigBuilder::num_sockets).
+    pub num_sockets: Option<NonZeroUsize>,
     pub port: i32,
     pub transport_bits_per_second: Option<usize>,
     pub transport_rtt: Option<usize>,

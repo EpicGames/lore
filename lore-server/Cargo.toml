@@ -30,6 +30,7 @@ parking_lot = { workspace = true }
 pin-project = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
+quinn-proto = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }

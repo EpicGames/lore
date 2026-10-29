@@ -34,6 +34,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
   window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
   unless set. Values below 2400 bytes are rejected at startup
+- On Linux, the server's QUIC endpoints serve on several UDP sockets bound to their port, so clients spread across
+  their receive buffers: `num_sockets` in `[server.quic]` and `[server.quic_internal]`, by default 16, capped at the
+  processor count, and 4 for the internal endpoint. `num_listeners` is now optional and defaults to 1 per socket
+- Server QUIC sockets ask for a 512 KiB receive buffer, as client sockets do
 
 ### Fixes & Improvements
 
