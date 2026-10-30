@@ -303,6 +303,9 @@ impl UserServiceRepositoryCatalog {
 
 #[async_trait]
 impl RepositoryCatalog for UserServiceRepositoryCatalog {
+    // TODO: call `RepositoryRegistryService`, which replaces the deprecated
+    // partition RPCs.
+    #[allow(deprecated)]
     async fn list_repositories(
         &self,
         token: Option<&VerifiedToken<'_>>,

@@ -2,26 +2,57 @@ syntax = "proto3";
 
 package lore.user.v1;
 
-// User directory. Clients call this service to resolve user names/ids and
-// user partition lists.
+// User directory. Clients call this service to resolve user names and ids.
+// Every RPC is called with the caller's token in the gRPC metadata as
+// `authorization: Bearer <token>`. The partition RPCs are deprecated:
+// `RepositoryRegistryService` replaces them.
 service UserService {
   // Resolve user IDs to users. IDs the directory does not know are omitted
   // from the answer rather than reported as errors.
   rpc UserGet(UserGetRequest) returns (UserGetResponse);
   // Find the users whose username or display name equals a given name.
   rpc UserFind(UserFindRequest) returns (UserFindResponse);
+  // Deprecated: use `RepositoryRegistryService.RepositoryList`.
   // Stream the partitions the bearer holds permissions on, one per message,
   // with the permissions held on each. The Lore server drives
   // `RepositoryList` from this.
-  rpc PartitionList(PartitionListRequest) returns (stream PartitionListResponse);
+  rpc PartitionList(PartitionListRequest) returns (stream PartitionListResponse) {
+    option deprecated = true;
+  }
+  // Deprecated: use `RepositoryRegistryService.RepositoryRegister`.
   // Add an entry for a partition the Lore server has created, so that
   // `PartitionList` can name it. The Lore server calls this before it stores
   // the partition and refuses the create when this fails.
-  rpc PartitionAdd(PartitionAddRequest) returns (PartitionAddResponse);
+  rpc PartitionAdd(PartitionAddRequest) returns (PartitionAddResponse) {
+    option deprecated = true;
+  }
+  // Deprecated: use `RepositoryRegistryService.RepositoryUnregister`.
   // Remove the entry for a partition the Lore server is deleting. The Lore
   // server refuses the delete when this fails, so the directory authorizes
   // the delete.
-  rpc PartitionRemove(PartitionRemoveRequest) returns (PartitionRemoveResponse);
+  rpc PartitionRemove(PartitionRemoveRequest) returns (PartitionRemoveResponse) {
+    option deprecated = true;
+  }
+}
+
+// A 3rd party registry of the repositories and the users' permissions
+// on them. The Lore server calls it with the caller's token: it registers a
+// repository on create, unregisters it on delete, and asks it which
+// repositories a caller may list. Every RPC is called with the token in the
+// gRPC metadata as `authorization: Bearer <token>`.
+service RepositoryRegistryService {
+  // Stream the repositories the bearer holds permissions on, one per
+  // message, with the permissions held on each. Repositories the bearer
+  // holds no permission on are not listed.
+  rpc RepositoryList(RepositoryListRequest) returns (stream RepositoryListResponse);
+  // Register a repository the Lore server is creating, with the caller as
+  // its owner, so that `RepositoryList` lists it. The Lore server calls this
+  // before it stores the repository and refuses the create when this fails.
+  rpc RepositoryRegister(RepositoryRegisterRequest) returns (RepositoryRegisterResponse);
+  // Unregister a repository the Lore server is deleting. The Lore server
+  // refuses the delete when this fails, so the registry authorizes the
+  // delete.
+  rpc RepositoryUnregister(RepositoryUnregisterRequest) returns (RepositoryUnregisterResponse);
 }
 
 // A user as the directory knows them.
@@ -114,3 +145,49 @@ message PartitionRemoveRequest {
 // Response to a partition remove. Removing a partition that is not listed
 // succeeds.
 message PartitionRemoveResponse {}
+
+// Request to stream the caller's repositories. The caller ID is read from
+// the token.
+message RepositoryListRequest {}
+
+// One-per-stream-message response carrying a single repository the bearer
+// holds permissions on.
+message RepositoryListResponse {
+  // The repository id.
+  bytes id = 1;
+  // The permission names the bearer holds on the repository.
+  repeated string permission = 2;
+}
+
+// Request to register a repository. The credential is the token of the
+// caller creating the repository, forwarded by the Lore server. It cannot be
+// scoped to the repository, which does not exist yet, so the registry must
+// accept the authn token.
+message RepositoryRegisterRequest {
+  // The repository id.
+  bytes id = 1;
+  // The repository name.
+  string name = 2;
+}
+
+// Response to a repository register. Registering a repository already
+// registered under the same name succeeds for any caller allowed to
+// register it, so a retried create does too. A repository registered under
+// another name answers `ALREADY_EXISTS`, and the Lore server refuses the
+// create.
+message RepositoryRegisterResponse {}
+
+// Request to unregister a repository. The credential is the token the caller
+// sent with the delete, forwarded by the Lore server: a token scoped to the
+// repository when the client signed in over OIDC, and the login token
+// otherwise, so the registry must accept either. The registry must refuse a
+// caller without permission to delete the repository with
+// `PERMISSION_DENIED`.
+message RepositoryUnregisterRequest {
+  // The repository id.
+  bytes id = 1;
+}
+
+// Response to a repository unregister. Unregistering a repository that is
+// not registered succeeds.
+message RepositoryUnregisterResponse {}

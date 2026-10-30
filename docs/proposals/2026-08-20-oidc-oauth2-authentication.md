@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-10-26
+updated: 2026-10-30
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -855,18 +855,25 @@ of it. So the server advertises the directory on the endpoint, and the client pi
 
 The directory's host must be under a domain that is found in one of the token's `aud` names.
 
-The directory operations outlive the auth service, so they get a gRPC API of their own,
-`lore.user.v1.UserService`. It has `UserGet` (IDs to users), `UserFind` (a username or a display
-name to users) and `PartitionList` (the partitions the caller holds permissions on), in the
-vocabulary of the other `lore.*.v1` APIs. `PartitionAdd` and `PartitionRemove` let the Lore server
-register the repositories it creates and deletes, which `RebacApi`'s `CreateResource` and
-`DeleteResource` at `auth_url` do on a `UrcAuthApi` deployment. The server picks the registry by
-the same rule: `user_url`, else `auth_url`, else no registration. On every path the
-server authorizes the delete before calling the registry: the creator while they can still reach
-the partition, or a caller holding `owner` or `admin` on it. The registry may refuse it too, as `DeleteResource` does for a caller
-without `admin`. A repeated `PartitionAdd` under the same name succeeds, so
-`ALREADY_EXISTS` means the partition is listed under another name, and the server refuses the
-create.
+The directory operations outlive the auth service, so they get gRPC APIs of their own, in the
+vocabulary of the other `lore.*.v1` APIs. `lore.user.v1.UserService` has `UserGet` (IDs to users)
+and `UserFind` (a username or a display name to users), which the client calls.
+`lore.user.v1.RepositoryRegistryService`, served at the same `user_url`, is called by the Lore
+server with the caller's token. It has `RepositoryList` (the repositories the caller holds
+permissions on), and `RepositoryRegister` and `RepositoryUnregister`, which register the
+repositories the server creates and deletes and record the creator as the owner, as `RebacApi`'s
+`CreateResource` and `DeleteResource` at `auth_url` do on a `UrcAuthApi` deployment. The server
+picks the registry by the same rule: `user_url`, else `auth_url`, else no registration. On every
+path the server authorizes the delete before calling the registry: the creator while they can
+still reach the repository, or a caller holding `owner` or `admin` on it. The registry may refuse
+it too, as `DeleteResource` does for a caller without `admin`. A repeated `RepositoryRegister`
+under the same name succeeds, so `ALREADY_EXISTS` means the repository is registered under another
+name, and the server refuses the create.
+
+The registry RPCs first shipped on `UserService` as `PartitionList`, `PartitionAdd` and
+`PartitionRemove`. Partitions have no names, only repositories do, and the client never calls
+them, so they moved to their own service. The old RPCs stay, deprecated, until no Lore server
+calls them.
 
 **The user identity is read from the token.** Lore records a user as one string, in `created_by`
 and wherever else an identity is compared. Client and server take that string from the token's
@@ -906,8 +913,8 @@ listing everything it holds, as a local server does today. That setting exists f
 alone and gates no access decision. A `UrcAuthApi` deployment gets an implementation that calls
 `LookupUserPermissions` and behaves exactly as today.
 
-A deployment advertising `user_url` gets an implementation that calls `PartitionList` on the
-`lore.user.v1.UserService` there. The answer is a stream of repository ids, which the catalog
+A deployment advertising `user_url` gets an implementation that calls `RepositoryList` on the
+`lore.user.v1.RepositoryRegistryService` there. The answer is a stream of repository ids, which the catalog
 collects and pages itself as the baseline catalog pages the store.
 
 The choice is not bound to the authorizer. `repository_catalog` in `[server.auth]` names the
@@ -1077,7 +1084,7 @@ in `[server.auth]` but touch listing only:
 | `implicit_actions` | Tier 1 only. Actions every token holder gets, added to whatever `permission_claim` carries and to `read`, which any token implies. Defaults to `["write"]`; `[]` makes write a role, or makes the server read-only without `permission_claim`. Any action may be listed, privileged ones included; an unknown name is a configuration error. The server refuses to start with it set beside `resource_claim` or `auth_url`, where it would do nothing. |
 | `resource_claim` | Present means Tier 2, and actions are scoped by the resource beside them. Absent means the `permission_claim` actions are global, which is Tier 1. |
 | `baseline_access` | What the default `RepositoryCatalog` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
-| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`; `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`; or `user_service`, `PartitionList` at `user_url`. Absent, `user_service` when `user_url` is set, else `auth_service` when `auth_url` is set, and `baseline` otherwise. |
+| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`; `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`; or `user_service`, `RepositoryList` at `user_url`. Absent, `user_service` when `user_url` is set, else `auth_service` when `auth_url` is set, and `baseline` otherwise. |
 | `repository_catalog_url` | The endpoint the `auth_service` catalog asks, `auth_url` by default. It receives the caller's token, so it must accept the tokens this server verifies. |
 
 A deployment that configures `[server.auth]` but no `permission_claim` leaves every authenticated

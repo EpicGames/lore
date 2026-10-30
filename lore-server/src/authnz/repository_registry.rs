@@ -54,6 +54,9 @@ impl RepositoryRegistry {
 
     /// Registers a repository the server is about to create. Called before
     /// the repository is stored, so a refusal leaves no repository behind.
+    // TODO: call `RepositoryRegistryService`, which replaces the deprecated
+    // partition RPCs.
+    #[allow(deprecated)]
     pub async fn add(
         &self,
         authorization: Option<String>,
@@ -98,6 +101,9 @@ impl RepositoryRegistry {
 
     /// Unregisters a repository the server is deleting. Called before the
     /// repository's records are removed.
+    // TODO: call `RepositoryRegistryService`, which replaces the deprecated
+    // partition RPCs.
+    #[allow(deprecated)]
     pub async fn remove(
         &self,
         authorization: Option<String>,

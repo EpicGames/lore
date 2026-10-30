@@ -29,6 +29,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `lore.user.v1` gains `RepositoryRegistryService` (`RepositoryList`, `RepositoryRegister`, `RepositoryUnregister`),
+  served at `user_url`. It replaces `PartitionList`, `PartitionAdd` and `PartitionRemove` on `UserService`, which are
+  now deprecated.
 - `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
   `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a

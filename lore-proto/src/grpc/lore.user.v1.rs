@@ -222,6 +222,117 @@ impl ::prost::Name for PartitionRemoveResponse {
         "/lore.user.v1.PartitionRemoveResponse".into()
     }
 }
+/// Request to stream the caller's repositories. The caller ID is read from
+/// the token.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryListRequest {}
+impl ::prost::Name for RepositoryListRequest {
+    const NAME: &'static str = "RepositoryListRequest";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryListRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryListRequest".into()
+    }
+}
+/// One-per-stream-message response carrying a single repository the bearer
+/// holds permissions on.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryListResponse {
+    /// The repository id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    /// The permission names the bearer holds on the repository.
+    #[prost(string, repeated, tag = "2")]
+    pub permission: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+impl ::prost::Name for RepositoryListResponse {
+    const NAME: &'static str = "RepositoryListResponse";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryListResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryListResponse".into()
+    }
+}
+/// Request to register a repository. The credential is the token of the
+/// caller creating the repository, forwarded by the Lore server. It cannot be
+/// scoped to the repository, which does not exist yet, so the registry must
+/// accept the authn token.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryRegisterRequest {
+    /// The repository id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+    /// The repository name.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+}
+impl ::prost::Name for RepositoryRegisterRequest {
+    const NAME: &'static str = "RepositoryRegisterRequest";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryRegisterRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryRegisterRequest".into()
+    }
+}
+/// Response to a repository register. Registering a repository already
+/// registered under the same name succeeds for any caller allowed to
+/// register it, so a retried create does too. A repository registered under
+/// another name answers `ALREADY_EXISTS`, and the Lore server refuses the
+/// create.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryRegisterResponse {}
+impl ::prost::Name for RepositoryRegisterResponse {
+    const NAME: &'static str = "RepositoryRegisterResponse";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryRegisterResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryRegisterResponse".into()
+    }
+}
+/// Request to unregister a repository. The credential is the token the caller
+/// sent with the delete, forwarded by the Lore server: a token scoped to the
+/// repository when the client signed in over OIDC, and the login token
+/// otherwise, so the registry must accept either. The registry must refuse a
+/// caller without permission to delete the repository with
+/// `PERMISSION_DENIED`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryUnregisterRequest {
+    /// The repository id.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub id: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for RepositoryUnregisterRequest {
+    const NAME: &'static str = "RepositoryUnregisterRequest";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryUnregisterRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryUnregisterRequest".into()
+    }
+}
+/// Response to a repository unregister. Unregistering a repository that is
+/// not registered succeeds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RepositoryUnregisterResponse {}
+impl ::prost::Name for RepositoryUnregisterResponse {
+    const NAME: &'static str = "RepositoryUnregisterResponse";
+    const PACKAGE: &'static str = "lore.user.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.user.v1.RepositoryUnregisterResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.user.v1.RepositoryUnregisterResponse".into()
+    }
+}
 /// Generated client implementations.
 pub mod user_service_client {
     #![allow(
@@ -233,8 +344,10 @@ pub mod user_service_client {
     )]
     use tonic::codegen::*;
     use tonic::codegen::http::Uri;
-    /// User directory. Clients call this service to resolve user names/ids and
-    /// user partition lists.
+    /// User directory. Clients call this service to resolve user names and ids.
+    /// Every RPC is called with the caller's token in the gRPC metadata as
+    /// `authorization: Bearer <token>`. The partition RPCs are deprecated:
+    /// `RepositoryRegistryService` replaces them.
     #[derive(Debug, Clone)]
     pub struct UserServiceClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -366,9 +479,11 @@ pub mod user_service_client {
                 .insert(GrpcMethod::new("lore.user.v1.UserService", "UserFind"));
             self.inner.unary(req, path, codec).await
         }
+        /// Deprecated: use `RepositoryRegistryService.RepositoryList`.
         /// Stream the partitions the bearer holds permissions on, one per message,
         /// with the permissions held on each. The Lore server drives
         /// `RepositoryList` from this.
+        #[deprecated]
         pub async fn partition_list(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionListRequest>,
@@ -393,9 +508,11 @@ pub mod user_service_client {
                 .insert(GrpcMethod::new("lore.user.v1.UserService", "PartitionList"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Deprecated: use `RepositoryRegistryService.RepositoryRegister`.
         /// Add an entry for a partition the Lore server has created, so that
         /// `PartitionList` can name it. The Lore server calls this before it stores
         /// the partition and refuses the create when this fails.
+        #[deprecated]
         pub async fn partition_add(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionAddRequest>,
@@ -420,9 +537,11 @@ pub mod user_service_client {
                 .insert(GrpcMethod::new("lore.user.v1.UserService", "PartitionAdd"));
             self.inner.unary(req, path, codec).await
         }
+        /// Deprecated: use `RepositoryRegistryService.RepositoryUnregister`.
         /// Remove the entry for a partition the Lore server is deleting. The Lore
         /// server refuses the delete when this fails, so the directory authorizes
         /// the delete.
+        #[deprecated]
         pub async fn partition_remove(
             &mut self,
             request: impl tonic::IntoRequest<super::PartitionRemoveRequest>,
@@ -482,6 +601,7 @@ pub mod user_service_server {
             >
             + std::marker::Send
             + 'static;
+        /// Deprecated: use `RepositoryRegistryService.RepositoryList`.
         /// Stream the partitions the bearer holds permissions on, one per message,
         /// with the permissions held on each. The Lore server drives
         /// `RepositoryList` from this.
@@ -492,6 +612,7 @@ pub mod user_service_server {
             tonic::Response<Self::PartitionListStream>,
             tonic::Status,
         >;
+        /// Deprecated: use `RepositoryRegistryService.RepositoryRegister`.
         /// Add an entry for a partition the Lore server has created, so that
         /// `PartitionList` can name it. The Lore server calls this before it stores
         /// the partition and refuses the create when this fails.
@@ -502,6 +623,7 @@ pub mod user_service_server {
             tonic::Response<super::PartitionAddResponse>,
             tonic::Status,
         >;
+        /// Deprecated: use `RepositoryRegistryService.RepositoryUnregister`.
         /// Remove the entry for a partition the Lore server is deleting. The Lore
         /// server refuses the delete when this fails, so the directory authorizes
         /// the delete.
@@ -513,8 +635,10 @@ pub mod user_service_server {
             tonic::Status,
         >;
     }
-    /// User directory. Clients call this service to resolve user names/ids and
-    /// user partition lists.
+    /// User directory. Clients call this service to resolve user names and ids.
+    /// Every RPC is called with the caller's token in the gRPC metadata as
+    /// `authorization: Bearer <token>`. The partition RPCs are deprecated:
+    /// `RepositoryRegistryService` replaces them.
     #[derive(Debug)]
     pub struct UserServiceServer<T> {
         inner: Arc<T>,
@@ -854,6 +978,526 @@ pub mod user_service_server {
     /// Generated gRPC service name
     pub const SERVICE_NAME: &str = "lore.user.v1.UserService";
     impl<T> tonic::server::NamedService for UserServiceServer<T> {
+        const NAME: &'static str = SERVICE_NAME;
+    }
+}
+/// Generated client implementations.
+pub mod repository_registry_service_client {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    use tonic::codegen::http::Uri;
+    /// A 3rd party registry of the repositories and the users' permissions
+    /// on them. The Lore server calls it with the caller's token: it registers a
+    /// repository on create, unregisters it on delete, and asks it which
+    /// repositories a caller may list. Every RPC is called with the token in the
+    /// gRPC metadata as `authorization: Bearer <token>`.
+    #[derive(Debug, Clone)]
+    pub struct RepositoryRegistryServiceClient<T> {
+        inner: tonic::client::Grpc<T>,
+    }
+    impl RepositoryRegistryServiceClient<tonic::transport::Channel> {
+        /// Attempt to create a new client by connecting to a given endpoint.
+        pub async fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
+        where
+            D: TryInto<tonic::transport::Endpoint>,
+            D::Error: Into<StdError>,
+        {
+            let conn = tonic::transport::Endpoint::new(dst)?.connect().await?;
+            Ok(Self::new(conn))
+        }
+    }
+    impl<T> RepositoryRegistryServiceClient<T>
+    where
+        T: tonic::client::GrpcService<tonic::body::Body>,
+        T::Error: Into<StdError>,
+        T::ResponseBody: Body<Data = Bytes> + std::marker::Send + 'static,
+        <T::ResponseBody as Body>::Error: Into<StdError> + std::marker::Send,
+    {
+        pub fn new(inner: T) -> Self {
+            let inner = tonic::client::Grpc::new(inner);
+            Self { inner }
+        }
+        pub fn with_origin(inner: T, origin: Uri) -> Self {
+            let inner = tonic::client::Grpc::with_origin(inner, origin);
+            Self { inner }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> RepositoryRegistryServiceClient<InterceptedService<T, F>>
+        where
+            F: tonic::service::Interceptor,
+            T::ResponseBody: Default,
+            T: tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+                Response = http::Response<
+                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                >,
+            >,
+            <T as tonic::codegen::Service<
+                http::Request<tonic::body::Body>,
+            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+        {
+            RepositoryRegistryServiceClient::new(
+                InterceptedService::new(inner, interceptor),
+            )
+        }
+        /// Compress requests with the given encoding.
+        ///
+        /// This requires the server to support it otherwise it might respond with an
+        /// error.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.send_compressed(encoding);
+            self
+        }
+        /// Enable decompressing responses.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.inner = self.inner.accept_compressed(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_decoding_message_size(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.inner = self.inner.max_encoding_message_size(limit);
+            self
+        }
+        /// Stream the repositories the bearer holds permissions on, one per
+        /// message, with the permissions held on each. Repositories the bearer
+        /// holds no permission on are not listed.
+        pub async fn repository_list(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryListRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::RepositoryListResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.user.v1.RepositoryRegistryService/RepositoryList",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.user.v1.RepositoryRegistryService",
+                        "RepositoryList",
+                    ),
+                );
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// Register a repository the Lore server is creating, with the caller as
+        /// its owner, so that `RepositoryList` lists it. The Lore server calls this
+        /// before it stores the repository and refuses the create when this fails.
+        pub async fn repository_register(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryRegisterRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryRegisterResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.user.v1.RepositoryRegistryService/RepositoryRegister",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.user.v1.RepositoryRegistryService",
+                        "RepositoryRegister",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        /// Unregister a repository the Lore server is deleting. The Lore server
+        /// refuses the delete when this fails, so the registry authorizes the
+        /// delete.
+        pub async fn repository_unregister(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RepositoryUnregisterRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryUnregisterResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.user.v1.RepositoryRegistryService/RepositoryUnregister",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.user.v1.RepositoryRegistryService",
+                        "RepositoryUnregister",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+    }
+}
+/// Generated server implementations.
+pub mod repository_registry_service_server {
+    #![allow(
+        unused_variables,
+        dead_code,
+        missing_docs,
+        clippy::wildcard_imports,
+        clippy::let_unit_value,
+    )]
+    use tonic::codegen::*;
+    /// Generated trait containing gRPC methods that should be implemented for use with RepositoryRegistryServiceServer.
+    #[async_trait]
+    pub trait RepositoryRegistryService: std::marker::Send + std::marker::Sync + 'static {
+        /// Server streaming response type for the RepositoryList method.
+        type RepositoryListStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::RepositoryListResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Stream the repositories the bearer holds permissions on, one per
+        /// message, with the permissions held on each. Repositories the bearer
+        /// holds no permission on are not listed.
+        async fn repository_list(
+            &self,
+            request: tonic::Request<super::RepositoryListRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::RepositoryListStream>,
+            tonic::Status,
+        >;
+        /// Register a repository the Lore server is creating, with the caller as
+        /// its owner, so that `RepositoryList` lists it. The Lore server calls this
+        /// before it stores the repository and refuses the create when this fails.
+        async fn repository_register(
+            &self,
+            request: tonic::Request<super::RepositoryRegisterRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryRegisterResponse>,
+            tonic::Status,
+        >;
+        /// Unregister a repository the Lore server is deleting. The Lore server
+        /// refuses the delete when this fails, so the registry authorizes the
+        /// delete.
+        async fn repository_unregister(
+            &self,
+            request: tonic::Request<super::RepositoryUnregisterRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RepositoryUnregisterResponse>,
+            tonic::Status,
+        >;
+    }
+    /// A 3rd party registry of the repositories and the users' permissions
+    /// on them. The Lore server calls it with the caller's token: it registers a
+    /// repository on create, unregisters it on delete, and asks it which
+    /// repositories a caller may list. Every RPC is called with the token in the
+    /// gRPC metadata as `authorization: Bearer <token>`.
+    #[derive(Debug)]
+    pub struct RepositoryRegistryServiceServer<T> {
+        inner: Arc<T>,
+        accept_compression_encodings: EnabledCompressionEncodings,
+        send_compression_encodings: EnabledCompressionEncodings,
+        max_decoding_message_size: Option<usize>,
+        max_encoding_message_size: Option<usize>,
+    }
+    impl<T> RepositoryRegistryServiceServer<T> {
+        pub fn new(inner: T) -> Self {
+            Self::from_arc(Arc::new(inner))
+        }
+        pub fn from_arc(inner: Arc<T>) -> Self {
+            Self {
+                inner,
+                accept_compression_encodings: Default::default(),
+                send_compression_encodings: Default::default(),
+                max_decoding_message_size: None,
+                max_encoding_message_size: None,
+            }
+        }
+        pub fn with_interceptor<F>(
+            inner: T,
+            interceptor: F,
+        ) -> InterceptedService<Self, F>
+        where
+            F: tonic::service::Interceptor,
+        {
+            InterceptedService::new(Self::new(inner), interceptor)
+        }
+        /// Enable decompressing requests with the given encoding.
+        #[must_use]
+        pub fn accept_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.accept_compression_encodings.enable(encoding);
+            self
+        }
+        /// Compress responses with the given encoding, if the client supports it.
+        #[must_use]
+        pub fn send_compressed(mut self, encoding: CompressionEncoding) -> Self {
+            self.send_compression_encodings.enable(encoding);
+            self
+        }
+        /// Limits the maximum size of a decoded message.
+        ///
+        /// Default: `4MB`
+        #[must_use]
+        pub fn max_decoding_message_size(mut self, limit: usize) -> Self {
+            self.max_decoding_message_size = Some(limit);
+            self
+        }
+        /// Limits the maximum size of an encoded message.
+        ///
+        /// Default: `usize::MAX`
+        #[must_use]
+        pub fn max_encoding_message_size(mut self, limit: usize) -> Self {
+            self.max_encoding_message_size = Some(limit);
+            self
+        }
+    }
+    impl<T, B> tonic::codegen::Service<http::Request<B>>
+    for RepositoryRegistryServiceServer<T>
+    where
+        T: RepositoryRegistryService,
+        B: Body + std::marker::Send + 'static,
+        B::Error: Into<StdError> + std::marker::Send + 'static,
+    {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = BoxFuture<Self::Response, Self::Error>;
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+        fn call(&mut self, req: http::Request<B>) -> Self::Future {
+            match req.uri().path() {
+                "/lore.user.v1.RepositoryRegistryService/RepositoryList" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryListSvc<T: RepositoryRegistryService>(pub Arc<T>);
+                    impl<
+                        T: RepositoryRegistryService,
+                    > tonic::server::ServerStreamingService<super::RepositoryListRequest>
+                    for RepositoryListSvc<T> {
+                        type Response = super::RepositoryListResponse;
+                        type ResponseStream = T::RepositoryListStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryListRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryRegistryService>::repository_list(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryListSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.user.v1.RepositoryRegistryService/RepositoryRegister" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryRegisterSvc<T: RepositoryRegistryService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: RepositoryRegistryService,
+                    > tonic::server::UnaryService<super::RepositoryRegisterRequest>
+                    for RepositoryRegisterSvc<T> {
+                        type Response = super::RepositoryRegisterResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryRegisterRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryRegistryService>::repository_register(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryRegisterSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.user.v1.RepositoryRegistryService/RepositoryUnregister" => {
+                    #[allow(non_camel_case_types)]
+                    struct RepositoryUnregisterSvc<T: RepositoryRegistryService>(
+                        pub Arc<T>,
+                    );
+                    impl<
+                        T: RepositoryRegistryService,
+                    > tonic::server::UnaryService<super::RepositoryUnregisterRequest>
+                    for RepositoryUnregisterSvc<T> {
+                        type Response = super::RepositoryUnregisterResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RepositoryUnregisterRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RepositoryRegistryService>::repository_unregister(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RepositoryUnregisterSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                _ => {
+                    Box::pin(async move {
+                        let mut response = http::Response::new(
+                            tonic::body::Body::default(),
+                        );
+                        let headers = response.headers_mut();
+                        headers
+                            .insert(
+                                tonic::Status::GRPC_STATUS,
+                                (tonic::Code::Unimplemented as i32).into(),
+                            );
+                        headers
+                            .insert(
+                                http::header::CONTENT_TYPE,
+                                tonic::metadata::GRPC_CONTENT_TYPE,
+                            );
+                        Ok(response)
+                    })
+                }
+            }
+        }
+    }
+    impl<T> Clone for RepositoryRegistryServiceServer<T> {
+        fn clone(&self) -> Self {
+            let inner = self.inner.clone();
+            Self {
+                inner,
+                accept_compression_encodings: self.accept_compression_encodings,
+                send_compression_encodings: self.send_compression_encodings,
+                max_decoding_message_size: self.max_decoding_message_size,
+                max_encoding_message_size: self.max_encoding_message_size,
+            }
+        }
+    }
+    /// Generated gRPC service name
+    pub const SERVICE_NAME: &str = "lore.user.v1.RepositoryRegistryService";
+    impl<T> tonic::server::NamedService for RepositoryRegistryServiceServer<T> {
         const NAME: &'static str = SERVICE_NAME;
     }
 }
