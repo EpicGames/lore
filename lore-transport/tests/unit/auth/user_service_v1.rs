@@ -6,12 +6,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use lore_base::types::RepositoryId;
-use lore_proto::lore::user::v1::PartitionAddRequest;
-use lore_proto::lore::user::v1::PartitionAddResponse;
-use lore_proto::lore::user::v1::PartitionListRequest;
-use lore_proto::lore::user::v1::PartitionListResponse;
-use lore_proto::lore::user::v1::PartitionRemoveRequest;
-use lore_proto::lore::user::v1::PartitionRemoveResponse;
 use lore_proto::lore::user::v1::User;
 use lore_proto::lore::user::v1::UserFindRequest;
 use lore_proto::lore::user::v1::UserFindResponse;
@@ -71,29 +65,6 @@ impl Service for Directory {
             None => Vec::new(),
         };
         Ok(tonic::Response::new(UserFindResponse { user }))
-    }
-
-    type PartitionListStream = tokio_stream::Empty<Result<PartitionListResponse, tonic::Status>>;
-
-    async fn partition_list(
-        &self,
-        _request: tonic::Request<PartitionListRequest>,
-    ) -> Result<tonic::Response<Self::PartitionListStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not under test"))
-    }
-
-    async fn partition_add(
-        &self,
-        _request: tonic::Request<PartitionAddRequest>,
-    ) -> Result<tonic::Response<PartitionAddResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not under test"))
-    }
-
-    async fn partition_remove(
-        &self,
-        _request: tonic::Request<PartitionRemoveRequest>,
-    ) -> Result<tonic::Response<PartitionRemoveResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not under test"))
     }
 }
 

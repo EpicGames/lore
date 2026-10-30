@@ -4,35 +4,13 @@ package lore.user.v1;
 
 // User directory. Clients call this service to resolve user names and ids.
 // Every RPC is called with the caller's token in the gRPC metadata as
-// `authorization: Bearer <token>`. The partition RPCs are deprecated:
-// `RepositoryRegistryService` replaces them.
+// `authorization: Bearer <token>`.
 service UserService {
   // Resolve user IDs to users. IDs the directory does not know are omitted
   // from the answer rather than reported as errors.
   rpc UserGet(UserGetRequest) returns (UserGetResponse);
   // Find the users whose username or display name equals a given name.
   rpc UserFind(UserFindRequest) returns (UserFindResponse);
-  // Deprecated: use `RepositoryRegistryService.RepositoryList`.
-  // Stream the partitions the bearer holds permissions on, one per message,
-  // with the permissions held on each. The Lore server drives
-  // `RepositoryList` from this.
-  rpc PartitionList(PartitionListRequest) returns (stream PartitionListResponse) {
-    option deprecated = true;
-  }
-  // Deprecated: use `RepositoryRegistryService.RepositoryRegister`.
-  // Add an entry for a partition the Lore server has created, so that
-  // `PartitionList` can name it. The Lore server calls this before it stores
-  // the partition and refuses the create when this fails.
-  rpc PartitionAdd(PartitionAddRequest) returns (PartitionAddResponse) {
-    option deprecated = true;
-  }
-  // Deprecated: use `RepositoryRegistryService.RepositoryUnregister`.
-  // Remove the entry for a partition the Lore server is deleting. The Lore
-  // server refuses the delete when this fails, so the directory authorizes
-  // the delete.
-  rpc PartitionRemove(PartitionRemoveRequest) returns (PartitionRemoveResponse) {
-    option deprecated = true;
-  }
 }
 
 // A 3rd party registry of the repositories and the users' permissions
@@ -102,49 +80,6 @@ message UserFindResponse {
   // The matching users. Empty when none matches.
   repeated User user = 1;
 }
-
-// Request to stream the caller's partitions. The caller ID is read from
-// the token.
-message PartitionListRequest {}
-
-// One-per-stream-message response carrying a single partition the bearer
-// holds permissions on.
-message PartitionListResponse {
-  // The partition id.
-  bytes partition = 1;
-  // The permission names the bearer holds on the partition.
-  repeated string permission = 2;
-}
-
-// Request to add a partition. The credential is the token of the caller
-// creating the partition, forwarded by the Lore server. It cannot be scoped
-// to the partition, which does not exist yet, so the directory must accept
-// a token that is not.
-message PartitionAddRequest {
-  // The partition id.
-  bytes partition = 1;
-  // The repository name the partition is created under.
-  string name = 2;
-}
-
-// Response to a partition add. Adding a partition already listed under the
-// same name succeeds, so a retried create does too. A partition listed under
-// another name answers `ALREADY_EXISTS`, and the Lore server refuses the
-// create.
-message PartitionAddResponse {}
-
-// Request to remove a partition. The credential is the token of the caller
-// deleting the partition, forwarded by the Lore server. The directory must
-// refuse a caller without permission to delete the partition with
-// `PERMISSION_DENIED`.
-message PartitionRemoveRequest {
-  // The partition id.
-  bytes partition = 1;
-}
-
-// Response to a partition remove. Removing a partition that is not listed
-// succeeds.
-message PartitionRemoveResponse {}
 
 // Request to stream the caller's repositories. The caller ID is read from
 // the token.

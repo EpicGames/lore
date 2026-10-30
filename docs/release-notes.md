@@ -7,8 +7,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- `lore.user.v1`: `PartitionList`, `PartitionAdd` and `PartitionRemove` are removed from `UserService`.
+  `RepositoryRegistryService` replaces them
 - `lore-server`: with `user_url` set, the server lists, registers and unregisters repositories through
-  `lore.user.v1.RepositoryRegistryService` at `user_url` instead of the deprecated `UserService` partition RPCs. The
+  `lore.user.v1.RepositoryRegistryService` at `user_url` instead of the `UserService` partition RPCs. The
   directory at `user_url` must serve `RepositoryRegistryService` before the server is upgraded. Servers without
   `user_url` are not affected
 - `lore-server`: with authorization configured, operations that change a partition check for the `write` permission.
@@ -34,8 +36,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 ### Features
 
 - `lore.user.v1` gains `RepositoryRegistryService` (`RepositoryList`, `RepositoryRegister`, `RepositoryUnregister`),
-  served at `user_url`. It replaces `PartitionList`, `PartitionAdd` and `PartitionRemove` on `UserService`, which are
-  now deprecated.
+  served at `user_url`.
 - `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
   `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a

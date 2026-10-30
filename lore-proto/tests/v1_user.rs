@@ -2,14 +2,8 @@
 // SPDX-License-Identifier: MIT
 //! Smoke test verifying `lore.user.v1` carries the request / response
 //! messages of `UserService` and `RepositoryRegistryService`, with the
-//! partition and repository listings as server streams.
+//! repository listing as a server stream.
 
-use lore_proto::lore::user::v1::PartitionAddRequest;
-use lore_proto::lore::user::v1::PartitionAddResponse;
-use lore_proto::lore::user::v1::PartitionListRequest;
-use lore_proto::lore::user::v1::PartitionListResponse;
-use lore_proto::lore::user::v1::PartitionRemoveRequest;
-use lore_proto::lore::user::v1::PartitionRemoveResponse;
 use lore_proto::lore::user::v1::RepositoryListRequest;
 use lore_proto::lore::user::v1::RepositoryListResponse;
 use lore_proto::lore::user::v1::RepositoryRegisterRequest;
@@ -37,12 +31,6 @@ fn v1_user_request_response_types_default() {
     let _ = UserGetResponse::default();
     let _ = UserFindRequest::default();
     let _ = UserFindResponse::default();
-    let _ = PartitionListRequest::default();
-    let _ = PartitionListResponse::default();
-    let _ = PartitionAddRequest::default();
-    let _ = PartitionAddResponse::default();
-    let _ = PartitionRemoveRequest::default();
-    let _ = PartitionRemoveResponse::default();
     let _ = RepositoryListRequest::default();
     let _ = RepositoryListResponse::default();
     let _ = RepositoryRegisterRequest::default();
@@ -73,18 +61,6 @@ fn v1_user_field_shapes() {
     let _ = UserFindQuery::Username(Default::default());
     let _ = UserFindQuery::DisplayName(Default::default());
     let UserFindResponse { user: _ } = UserFindResponse::default();
-    let PartitionListRequest {} = PartitionListRequest::default();
-    let PartitionListResponse {
-        partition: _,
-        permission: _,
-    } = PartitionListResponse::default();
-    let PartitionAddRequest {
-        partition: _,
-        name: _,
-    } = PartitionAddRequest::default();
-    let PartitionAddResponse {} = PartitionAddResponse::default();
-    let PartitionRemoveRequest { partition: _ } = PartitionRemoveRequest::default();
-    let PartitionRemoveResponse {} = PartitionRemoveResponse::default();
     let RepositoryListRequest {} = RepositoryListRequest::default();
     let RepositoryListResponse {
         id: _,
@@ -142,14 +118,12 @@ fn v1_repository_registry_service_stubs_exist() {
 
 /// A `UserService` and `RepositoryRegistryService` that answers nothing; it
 /// only lends the server types a concrete implementation for the
-/// service-name checks, and pins that `PartitionList` and `RepositoryList`
-/// are server streams by having to name their stream types.
+/// service-name checks, and pins that `RepositoryList` is a server stream by
+/// having to name its stream type.
 struct Unserved;
 
 #[tonic::async_trait]
 impl UserService for Unserved {
-    type PartitionListStream = Empty<Result<PartitionListResponse, tonic::Status>>;
-
     async fn user_get(
         &self,
         _: tonic::Request<UserGetRequest>,
@@ -161,27 +135,6 @@ impl UserService for Unserved {
         &self,
         _: tonic::Request<UserFindRequest>,
     ) -> Result<tonic::Response<UserFindResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not served"))
-    }
-
-    async fn partition_list(
-        &self,
-        _: tonic::Request<PartitionListRequest>,
-    ) -> Result<tonic::Response<Self::PartitionListStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not served"))
-    }
-
-    async fn partition_add(
-        &self,
-        _: tonic::Request<PartitionAddRequest>,
-    ) -> Result<tonic::Response<PartitionAddResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not served"))
-    }
-
-    async fn partition_remove(
-        &self,
-        _: tonic::Request<PartitionRemoveRequest>,
-    ) -> Result<tonic::Response<PartitionRemoveResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("not served"))
     }
 }

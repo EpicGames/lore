@@ -872,8 +872,7 @@ name, and the server refuses the create.
 
 The registry RPCs first shipped on `UserService` as `PartitionList`, `PartitionAdd` and
 `PartitionRemove`. Partitions have no names, only repositories do, and the client never calls
-them, so they moved to their own service. The old RPCs stay, deprecated, until no Lore server
-calls them.
+them, so they moved to their own service. The old RPCs were deprecated and then removed.
 
 **The user identity is read from the token.** Lore records a user as one string, in `created_by`
 and wherever else an identity is compared. Client and server take that string from the token's
