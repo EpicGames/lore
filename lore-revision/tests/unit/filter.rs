@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! The arithmetic behind a [`RuleIndex`] answer, which nothing outside the
-//! module can reach. The behaviour it produces is asserted in `tests/filter.rs`.
+//! module can reach, and the rules [`FilterInstance::add_path_inclusion`]
+//! produces. The behaviour of authored rules is asserted in `tests/filter.rs`,
+//! except the subtree companion an escaped trailing `*` does not get.
 
 use lore_revision::filter::*;
+use lore_revision::util::path::RelativePath;
 
 /// Both bounds over every construct the compiler can hand the index.
 ///
@@ -115,5 +118,93 @@ fn an_empty_reach_reaches_nothing() {
     assert!(
         RuleReach::rule(0, 1).reaches(0, 0),
         "the first line of a filter has to clear a floor of zero"
+    );
+}
+
+fn path(text: &str) -> RelativePath {
+    RelativePath::new_from_initial_path(text).expect("a path")
+}
+
+/// A filter that excludes every path and re-includes `added` through
+/// [`FilterInstance::add_path_inclusion`].
+fn path_inclusion(added: &RelativePath) -> FilterInstance {
+    let mut filter = FilterInstance::default();
+    filter.add_exclusion("**").expect("exclude");
+    filter.add_path_inclusion(added);
+    filter
+}
+
+/// A path inclusion re-includes the path and everything below it, and no other
+/// path its text matches as a glob or as a name, whatever its case and
+/// characters, and at the top level too.
+#[test]
+fn a_path_inclusion_reincludes_its_path_alone() {
+    for (added, others) in [
+        ("dir/[x].txt", &["dir/x.txt"][..]),
+        ("{guid}/[x].txt", &["guid/x.txt"][..]),
+        ("**/f.txt", &["f.txt", "a/f.txt"][..]),
+        ("dir/notes*", &["dir/notes", "dir/notesx"][..]),
+        ("[x].txt", &["x.txt", "d/[x].txt"][..]),
+        ("a{b,c}.txt", &["ab.txt", "d/a{b,c}.txt"][..]),
+        ("Dir/\u{c4}[X].txt", &["dir/\u{e4}x.txt"][..]),
+        ("!x/f.txt", &["x/f.txt"][..]),
+        ("#x.txt", &["x.txt"][..]),
+        (" x/f.txt", &["x/f.txt"][..]),
+    ] {
+        let filter = path_inclusion(&path(added));
+        for kept in [added.to_lowercase(), format!("{added}/x")] {
+            assert!(
+                !filter.excludes(&path(&kept), false),
+                "{added} does not re-include {kept}"
+            );
+        }
+        for other in others {
+            assert!(
+                filter.excludes(&path(other), false),
+                "{added} re-includes {other}"
+            );
+        }
+    }
+}
+
+/// A path inclusion sends a walk towards its path and nowhere else, whatever
+/// its first component holds: the index records every component as text.
+#[test]
+fn a_path_inclusion_bounds_the_walk_whatever_its_first_component_holds() {
+    for first in ["{guid}", "[x]", "x]", "*", "?", "**", "a\\b"] {
+        let filter = path_inclusion(&RelativePath::new_from_clean_parts(first, "f.txt"));
+        let descends = |directory: &RelativePath| {
+            let state = filter.child_exclusion_state(FilterState::ROOT, directory, true);
+            filter.should_descend(state, directory)
+        };
+        assert!(
+            descends(&RelativePath::new_from_clean_parts(first, "")),
+            "the walk never reaches {first}/f.txt"
+        );
+        assert!(
+            !descends(&path("engine")),
+            "{first}/f.txt sends the walk into engine"
+        );
+        assert!(
+            filter.excludes_subtree(&path("engine")),
+            "{first}/f.txt holds engine open"
+        );
+    }
+}
+
+/// An authored rule ending in `*` gets no subtree companion, escaped or not:
+/// with `**` and `!art/foo\*`, `art/foo*` comes back and nothing below it does.
+#[test]
+fn an_authored_rule_ending_in_an_escaped_star_gets_no_companion() {
+    let mut filter = FilterInstance::default();
+    filter.add_exclusion("**").expect("exclude");
+    filter.add_inclusion("art/foo\\*").expect("include");
+    assert!(
+        !filter.excludes(&path("art/foo*"), false),
+        "art/foo\\* does not re-include art/foo*"
+    );
+    assert!(
+        filter.excludes(&path("art/foo*/x.png"), false),
+        "art/foo\\* re-includes art/foo*/x.png"
     );
 }

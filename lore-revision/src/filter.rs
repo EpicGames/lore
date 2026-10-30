@@ -43,6 +43,8 @@ pub struct FilterInstance {
     /// Match lines in authored order. Every authored rule contributes exactly
     /// one line, except a path-form inclusion, which also contributes the
     /// subtree companion described on [`add_inclusion`](Self::add_inclusion).
+    /// A path added by [`add_path_inclusion`](Self::add_path_inclusion)
+    /// contributes a line and its companion.
     pub lines: Vec<FilterLine>,
     /// Answers whether any inclusion can land below a directory, which is what
     /// decides descent into an excluded one. Built as the lines are added.
@@ -76,9 +78,9 @@ pub struct FilterLine {
     /// is skipped without running the glob. A whole-path query folds over every
     /// ancestor, and most lines cannot possibly match the shallow ones.
     min_depth: u32,
-    /// The glob holds no metacharacter, so matching it is a string comparison
-    /// rather than a glob evaluation. Most lines in a real filter are literal
-    /// paths or names, and this runs for every line on every path a walk visits.
+    /// The glob is compared to the path as text rather than evaluated as a
+    /// glob. Most lines in a real filter are literal paths or names, and this
+    /// runs for every line on every path a walk visits.
     literal: bool,
 }
 
@@ -332,7 +334,26 @@ pub(crate) fn query_depth(path: &str) -> u32 {
 /// path.
 #[lore_macro::test_pub]
 fn is_literal(glob: &str) -> bool {
-    !glob.contains(['*', '?', '[', ']', '\\'])
+    !glob
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+}
+
+/// The glob `<text>/**`, with a backslash before every character of `text`
+/// the matcher reads as syntax, so it matches everything below `text` alone.
+fn escaped_subtree(text: &str) -> String {
+    let mut subtree = String::with_capacity(text.len() + 3);
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b',' | b'\\') {
+            subtree.push_str(&text[start..index]);
+            subtree.push('\\');
+            start = index;
+        }
+    }
+    subtree.push_str(&text[start..]);
+    subtree.push_str("/**");
+    subtree
 }
 
 /// Whether `stars` is two or more `*` and nothing else, which git reads as one
@@ -564,6 +585,24 @@ struct RuleNode {
     wildcard_tail: RuleReach,
 }
 
+impl RuleNode {
+    /// Records `reach` as below this node, and returns the child named
+    /// `component`, added if it is not there.
+    fn child(&mut self, component: &str, reach: RuleReach) -> &mut RuleNode {
+        self.below.widen(reach);
+        let position = self
+            .children
+            .iter()
+            .position(|(name, _)| name == component)
+            .unwrap_or_else(|| {
+                self.children
+                    .push((component.to_owned(), RuleNode::default()));
+                self.children.len() - 1
+            });
+        &mut self.children[position].1
+    }
+}
+
 /// Passes a `u64` key straight through.
 ///
 /// The key is already an xxh3 digest of a path, so hashing it again would be a
@@ -653,12 +692,12 @@ impl RuleIndex {
     /// [`MAX_ALTERNATIVES`], beyond which the rule is recorded at its group
     /// instead and reaches everything below that point.
     ///
-    /// A caller passes `false` for a rule holding no group, and for one
-    /// [`FilterInstance::step`] compares as text rather than evaluating as a
-    /// glob: that rule's own text is the only thing it matches, so enumerating
-    /// would record paths it never names and leave out the one it does.
+    /// A caller passes `false` for a rule [`FilterInstance::step`] compares as
+    /// text rather than evaluating as a glob: that rule's own text is the only
+    /// thing it matches, so enumerating would record paths it never names and
+    /// leave out the one it does.
     fn insert(&mut self, glob: &str, expand: bool, line: usize, depth: u32) {
-        if !expand {
+        if !expand || first_brace_group(glob).is_none() {
             self.insert_form(glob, line, depth);
             return;
         }
@@ -708,18 +747,20 @@ impl RuleIndex {
                 node.wildcard_tail.widen(reach);
                 return;
             }
-            node.below.widen(reach);
-            let position = node
-                .children
-                .iter()
-                .position(|(name, _)| name == component)
-                .unwrap_or_else(|| {
-                    node.children
-                        .push((component.to_owned(), RuleNode::default()));
-                    node.children.len() - 1
-                });
-            node = &mut node.children[position].1;
+            node = node.child(component, reach);
         }
+    }
+
+    /// Records the rule on line `line`, which matches everything strictly below
+    /// `path` at any depth. Every component of `path` is text, whatever it
+    /// holds.
+    fn insert_subtree(&mut self, path: &str, line: usize) {
+        let reach = RuleReach::rule(line, u32::MAX);
+        let mut node = &mut self.root;
+        for component in path.split('/') {
+            node = node.child(component, reach);
+        }
+        node.wildcard_tail.widen(reach);
     }
 
     /// Records the rule on line `line` as one no prefix bounds, so it reaches any
@@ -862,10 +903,7 @@ impl FilterInstance {
     /// that has to hold: over-estimating costs traversal, under-estimating drops
     /// content.
     ///
-    /// Both bounds come from one pass because both callers want both, and
-    /// `filter_from_source_changes` builds a filter per three-way diff with up
-    /// to `SOURCE_FILTER_THRESHOLD` rules in it, so a second scan per rule is
-    /// paid there.
+    /// Both bounds come from one pass because both callers want both.
     #[lore_macro::test_pub]
     fn depth_range(glob: &str, filename: bool, braced: bool) -> (u32, u32) {
         if filename {
@@ -989,15 +1027,7 @@ impl FilterInstance {
         let expand = braced && !literal;
         let subtree = (!filename && !glob.ends_with('*')).then(|| {
             if braced && literal {
-                let mut subtree = String::with_capacity(glob.len() + 8);
-                for c in glob.chars() {
-                    if matches!(c, '{' | '}' | ',') {
-                        subtree.push('\\');
-                    }
-                    subtree.push(c);
-                }
-                subtree.push_str("/**");
-                subtree
+                escaped_subtree(&glob)
             } else {
                 format!("{glob}/**")
             }
@@ -1032,6 +1062,37 @@ impl FilterInstance {
         }
 
         Ok(())
+    }
+
+    /// Appends a re-inclusion of `path` and everything below it, whatever
+    /// characters it holds.
+    ///
+    /// `path` is compared as text against the whole path, never evaluated as a
+    /// glob nor matched as a name, so a top-level path names itself alone. It
+    /// gets a subtree companion, as a path rule does on
+    /// [`add_inclusion`](Self::add_inclusion), with every character of `path`
+    /// the matcher reads as syntax escaped.
+    ///
+    /// The re-inclusion index records the companion alone, with every component
+    /// of `path` as text. It reaches every node the line for `path` itself
+    /// does, so a walk descends towards `path` and below it, and nowhere else.
+    pub fn add_path_inclusion(&mut self, path: &RelativePath) {
+        let glob = path.as_lowercase_str();
+        let depth = component_count(glob);
+        self.reinclude.insert_subtree(glob, self.lines.len() + 1);
+        self.lines.push(FilterLine {
+            glob: glob.to_owned(),
+            negated: true,
+            min_depth: depth,
+            literal: true,
+            ..FilterLine::default()
+        });
+        self.lines.push(FilterLine {
+            glob: escaped_subtree(glob),
+            negated: true,
+            min_depth: depth + 1,
+            ..FilterLine::default()
+        });
     }
 
     /// Advances the walk one level: the verdict for `path`, given the verdict

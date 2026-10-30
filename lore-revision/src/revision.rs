@@ -192,10 +192,6 @@ pub struct Diff3Summary {
     pub target: Hash,
 }
 
-/// Returns `None` when any `Filter` builder call fails, signalling
-/// the caller to fall back to the unfiltered walk. The pre-streaming
-/// implementation absorbed these errors silently into a boolean —
-/// the explicit `Option` keeps that fallback path observable.
 /// The metadata `metadata_hash` names, or `None` where there is none to read.
 ///
 /// That blob carries the branch, date and message of the revision naming it, so a report
@@ -223,25 +219,25 @@ pub(crate) async fn reported_metadata(
     }
 }
 
-fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
+/// A filter whose view scopes target's walk to what `source_changes` touch:
+/// every path excluded, then each changed path and move source re-included
+/// with everything below it, through
+/// [`FilterInstance::add_path_inclusion`](crate::filter::FilterInstance::add_path_inclusion).
+/// Were the blanket exclusion refused, the filter would be empty, and target's
+/// walk would run unscoped and without the repository's view and ignore rules.
+fn filter_from_source_changes(source_changes: &[NodeChange]) -> Filter {
     let mut filter = Filter::default();
     if let Err(err) = filter.view.add_exclusion("**") {
         lore_warn!("Failed to add target filter global exclusion: {err}");
-        return None;
+        return filter;
     }
-    for change in source_changes.iter() {
-        if let Err(err) = filter.view.add_inclusion(change.path().as_str()) {
-            lore_warn!("Failed to add target filter re-inclusion: {err}");
-            return None;
-        }
-        if let Some(from_path) = change.move_source()
-            && let Err(err) = filter.view.add_inclusion(from_path.as_str())
-        {
-            lore_warn!("Failed to add target filter re-inclusion of from path: {err}");
-            return None;
+    for change in source_changes {
+        filter.view.add_path_inclusion(change.path());
+        if let Some(from_path) = change.move_source() {
+            filter.view.add_path_inclusion(from_path);
         }
     }
-    Some(filter)
+    filter
 }
 
 /// Threshold above which `diff3_collect` skips building a source-derived
@@ -429,10 +425,8 @@ pub async fn diff3_with_source_cap(
     let mut target_mounts: Vec<RelativePath> = Vec::new();
     let mut conflicting_mounts: Vec<RelativePath> = Vec::new();
 
-    let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD
-        && let Some(filter) = filter_from_source_changes(&source_changes)
-    {
-        Arc::new(filter)
+    let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD {
+        Arc::new(filter_from_source_changes(&source_changes))
     } else {
         repository.filter.clone()
     };

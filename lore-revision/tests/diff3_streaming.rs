@@ -428,6 +428,97 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A path both sides change differently is a conflict when it holds glob
+    /// syntax, as it is in a walk no source path filter scopes. So is a path the
+    /// source renames and changes while the target changes it.
+    ///
+    /// `dir/plain.txt` and `dir/old.txt` hold none and stand for every ordinary
+    /// path.
+    #[tokio::test]
+    async fn both_sides_changing_a_path_with_glob_syntax_conflict() {
+        const GUID: &str = "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}";
+        const MOVES: [(&str, &str); 2] =
+            [("dir/old.txt", "dir/new.txt"), ("dir/[y].txt", "dir/y.txt")];
+        let mut paths = vec![
+            "dir/plain.txt".to_owned(),
+            "dir/[x].txt".to_owned(),
+            "a{b,c}.txt".to_owned(),
+            format!("{GUID}/f.txt"),
+            format!("{GUID}/[x].txt"),
+        ];
+        if cfg!(unix) {
+            paths.push("**/f.txt".to_owned());
+        }
+
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+                let write_all = |content: &[u8]| {
+                    let moved = MOVES.iter().map(|(from, _)| *from);
+                    for path in paths.iter().map(String::as_str).chain(moved) {
+                        fixture.write_file(path, content);
+                    }
+                };
+
+                write_all(b"base\n");
+                let base_revision = fixture.stage_and_commit("base").await;
+
+                let source_branch = fixture.create_branch("source").await;
+                write_all(b"source\n");
+                for (from, to) in MOVES {
+                    fixture.stage_move(from, to).await;
+                }
+                let source_revision = fixture.stage_and_commit("source change").await;
+
+                fixture
+                    .switch_to(fixture.main_branch_id, base_revision)
+                    .await;
+                for (_, to) in MOVES {
+                    fixture.delete_file(to);
+                }
+                let target_branch = fixture.create_branch("target").await;
+                write_all(b"target\n");
+                let target_revision = fixture.stage_and_commit("target change").await;
+
+                let diff = Box::pin(branch::diff3_collect(
+                    fixture.repository.clone(),
+                    source_branch,
+                    source_revision,
+                    target_branch,
+                    target_revision,
+                    None,
+                    false, // include_same
+                    false, // auto_resolve
+                ))
+                .await
+                .expect("diff3_collect failed");
+
+                let mut conflicts: Vec<(&str, &str)> = diff
+                    .conflicts
+                    .iter()
+                    .map(|(source, target)| (source.path().as_str(), target.path().as_str()))
+                    .collect();
+                conflicts.sort_unstable();
+                let mut expected: Vec<(&str, &str)> = paths
+                    .iter()
+                    .map(|path| (path.as_str(), path.as_str()))
+                    .chain(MOVES.iter().map(|&(from, to)| (to, from)))
+                    .collect();
+                expected.sort_unstable();
+                assert_eq!(
+                    conflicts,
+                    expected,
+                    "changes {:?}",
+                    changes_as_summary(&diff.changes)
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// A `branch merge` run under a sparse view filter must still merge
     /// changes at out-of-view paths into the tree.
     ///
