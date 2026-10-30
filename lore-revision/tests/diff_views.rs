@@ -16,6 +16,7 @@
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -23,7 +24,9 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_revision::change::sort_by_path;
+    use lore_revision::filter::Filter;
     use lore_revision::filter::FilterMode;
+    use lore_revision::filter::FilterState;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreGlobalArgs;
@@ -103,6 +106,47 @@ mod tests {
         format!("{TREE}/dir{index:02}")
     }
 
+    /// The directory [`LAYERS`] stand under, which the walks held against each file's verdicts are
+    /// rooted at.
+    const LAYERED: &str = "layered";
+    /// Each file under [`LAYERED`] with its content in the older and in the newer revision, `None`
+    /// where that revision does not hold it. Changes stand at several depths, beside directories
+    /// whose content both revisions share.
+    const LAYERS: &[(&str, Option<&str>, Option<&str>)] = &[
+        ("layered/top.txt", Some("top"), Some("top v2")),
+        ("layered/a/one.txt", Some("one"), Some("one")),
+        ("layered/a/two.txt", Some("two"), Some("two v2")),
+        ("layered/a/gone.txt", Some("gone"), None),
+        ("layered/a/b/three.txt", Some("three"), Some("three")),
+        ("layered/a/b/c/four.txt", Some("four"), Some("four v2")),
+        ("layered/a/b/c/arriving.txt", None, Some("arriving")),
+        ("layered/a/b/d/five.txt", Some("five"), Some("five")),
+        ("layered/x/one.txt", Some("one"), Some("one")),
+        ("layered/x/y/two.txt", Some("two"), Some("two")),
+        ("layered/x/y/z/three.tmp", Some("three"), Some("three")),
+        ("layered/x/y/z/four.txt", Some("four"), Some("four")),
+    ];
+    /// View rules, each run against every one of them by a walk over [`LAYERED`]. They span anchored
+    /// literals, the `/*` family, `dir/*`, brace groups, `/**` and `**/`, name rules, re-inclusions
+    /// nested under exclusions, and rules whose depth bound stops short of the deepest changes.
+    const LAYERED_VIEWS: &[&[&str]] = &[
+        &[],
+        &["/layered/a"],
+        &["/layered/x/y/z/four.txt"],
+        &["/*", "!/layered"],
+        &["*", "!/*", "!/layered/a/**"],
+        &["/layered/*", "!/layered/x"],
+        &["/layered/{a/b,x}/*"],
+        &["/layered", "!/layered/{a,x}/*"],
+        &["/layered/x/**"],
+        &["**/y/z"],
+        &["**/b/d"],
+        &["four.txt"],
+        &["*.tmp"],
+        &["/layered/a", "!/layered/a/b", "/layered/a/b/d"],
+        &["/layered/x", "!/layered/x/y/z/four.txt"],
+    ];
+
     /// What the newer revision does beyond rewriting [`FILE`].
     #[derive(Clone, Copy)]
     enum Shape {
@@ -111,6 +155,7 @@ mod tests {
         Rename,
         Reshape,
         Wide,
+        Layered,
     }
 
     /// A repository holding [`FILE`] in two revisions, over the stores its contexts are built on.
@@ -168,6 +213,14 @@ mod tests {
             Self::build(immutable_store, mutable_store, Shape::Wide).await
         }
 
+        /// [`Fixture::create`] beside [`LAYERS`] under [`LAYERED`].
+        async fn create_layered(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> Self {
+            Self::build(immutable_store, mutable_store, Shape::Layered).await
+        }
+
         async fn build(
             immutable_store: Arc<dyn lore_storage::ImmutableStore>,
             mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -188,6 +241,12 @@ mod tests {
             let retyped = instance.path.join(RETYPED);
             let moved = instance.path.join(MOVED);
             let held = instance.path.join(HELD);
+            let write_layer = |path: &str, content: &str| {
+                let file = instance.path.join(path);
+                std::fs::create_dir_all(file.parent().expect("A file has a parent"))
+                    .expect("Create directory failed");
+                test_file_write(file.as_path(), content.as_bytes());
+            };
             match shape {
                 Shape::Plain => {}
                 Shape::Retype => test_file_write(retyped.as_path(), b"was a file"),
@@ -209,6 +268,13 @@ mod tests {
                             directory.join(DROPPED).as_path(),
                             format!("dropped {index}").as_bytes(),
                         );
+                    }
+                }
+                Shape::Layered => {
+                    for (path, older, _) in LAYERS {
+                        if let Some(content) = older {
+                            write_layer(path, content);
+                        }
                     }
                 }
             }
@@ -240,6 +306,15 @@ mod tests {
                     instance.path.join(sibling(CHANGED)).join(DROPPED).as_path(),
                     b"rewritten",
                 ),
+                Shape::Layered => {
+                    for (path, _, newer) in LAYERS {
+                        match newer {
+                            Some(content) => write_layer(path, content),
+                            None => std::fs::remove_file(instance.path.join(path))
+                                .expect("Remove file failed"),
+                        }
+                    }
+                }
             }
             let newer = test_commit_tree(&instance, "Second").await;
 
@@ -369,6 +444,72 @@ mod tests {
     fn by_path_and_action(mut changes: Vec<(String, String)>) -> Vec<(String, String)> {
         changes.sort_by(|left, right| (&left.1, &left.0).cmp(&(&right.1, &right.0)));
         changes
+    }
+
+    /// The paths below [`LAYERED`] that `filter`'s view holds of a revision holding `files`: each
+    /// file and directory its own verdict admits, and each directory holding a path held.
+    ///
+    /// Each verdict is stepped from the root through every ancestor with nothing pruned or covered.
+    fn held<'a>(filter: &Filter, files: impl Iterator<Item = &'a str>) -> BTreeSet<&'a str> {
+        let mut held = BTreeSet::new();
+        for file in files {
+            let paths: Vec<(&str, bool)> = file
+                .match_indices('/')
+                .map(|(end, _)| (&file[..end], true))
+                .chain([(file, false)])
+                .collect();
+            let admitted: Vec<bool> = paths
+                .iter()
+                .scan(FilterState::ROOT, |state, (path, is_directory)| {
+                    let path = RelativePath::new_from_initial_path(path).expect("Valid path");
+                    *state = filter
+                        .view
+                        .child_exclusion_state(*state, &path, *is_directory);
+                    Some(!state.excluded())
+                })
+                .collect();
+            if let Some(deepest) = admitted.iter().rposition(|admits| *admits) {
+                held.extend(
+                    paths[..=deepest]
+                        .iter()
+                        .map(|(path, _)| *path)
+                        .filter(|path| *path != LAYERED),
+                );
+            }
+        }
+        held
+    }
+
+    /// The changes a walk from `from` to `to` has to report below [`LAYERED`]: a path one side
+    /// alone has [`held`] is added or deleted, and a file both hold is modified where its content
+    /// differs.
+    fn predicted(from: &Filter, to: &Filter) -> Vec<(String, String)> {
+        let older = held(
+            from,
+            LAYERS
+                .iter()
+                .filter(|(_, older, _)| older.is_some())
+                .map(|(path, ..)| *path),
+        );
+        let newer = held(
+            to,
+            LAYERS
+                .iter()
+                .filter(|(.., newer)| newer.is_some())
+                .map(|(path, ..)| *path),
+        );
+        let modified = LAYERS
+            .iter()
+            .filter(|(path, older_content, newer_content)| {
+                older_content != newer_content && older.contains(path) && newer.contains(path)
+            })
+            .map(|(path, ..)| ("M", *path));
+        older
+            .symmetric_difference(&newer)
+            .map(|path| (if older.contains(path) { "D" } else { "A" }, *path))
+            .chain(modified)
+            .map(|(action, path)| (action.to_string(), path.to_string()))
+            .collect()
     }
 
     /// An execution that counts the filter-exclude events sent under it.
@@ -770,6 +911,9 @@ mod tests {
 
     /// Two views that cover a content-equal subtree agree about everything in it, so the walk
     /// takes it whole -- the prune the whole design exists to keep.
+    ///
+    /// An exclusion leaves a subtree covered where it is anchored elsewhere, as `/sub` is, or where
+    /// its depth bound stops above the subtree, as the one component of `/*` does.
     #[tokio::test]
     async fn views_that_cover_a_content_equal_subtree_do_not_enter_it() {
         let (immutable_store, mutable_store, execution) =
@@ -778,25 +922,62 @@ mod tests {
         runtime()
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let fixture = Fixture::create_wide(immutable_store, mutable_store).await;
+                let reinclude_tree = format!("!/{TREE}");
 
-                let (changes, stats) = fixture
-                    .walk(
-                        fixture.view(&[EXCLUDE_SUBDIRECTORY]),
-                        fixture.view(&[EXCLUDE_SUBDIRECTORY]),
-                        TREE,
-                    )
-                    .await;
+                for rules in [
+                    &[EXCLUDE_SUBDIRECTORY][..],
+                    &["/*", reinclude_tree.as_str()][..],
+                ] {
+                    let (changes, stats) = fixture
+                        .walk(fixture.view(rules), fixture.view(rules), TREE)
+                        .await;
 
-                assert_eq!(
-                    changes,
-                    vec![("M".to_string(), format!("{}/{DROPPED}", sibling(CHANGED)))],
-                    "rules that reach nothing under the tree change nothing in it"
-                );
-                assert_eq!(
-                    stats.directories_entered.load(Ordering::Relaxed),
-                    2,
-                    "the root and the one sibling whose content differs, of {SIBLINGS}"
-                );
+                    assert_eq!(
+                        changes,
+                        vec![("M".to_string(), format!("{}/{DROPPED}", sibling(CHANGED)))],
+                        "{rules:?} exclude nothing under the tree, so they change nothing in it"
+                    );
+                    assert_eq!(
+                        stats.directories_entered.load(Ordering::Relaxed),
+                        2,
+                        "under {rules:?}, the root and the one sibling whose content differs, of \
+                         {SIBLINGS}"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A walk between any two of [`LAYERED_VIEWS`] reports exactly the file and directory changes
+    /// [`predicted`] from each path's verdicts.
+    ///
+    /// A subtree the walk takes whole is not entered, so a wrong prune loses the changes in it
+    /// silently. The verdicts the prediction rests on are taken with no prune.
+    #[tokio::test]
+    async fn a_walk_between_any_two_views_reports_what_the_verdicts_predict() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create_layered(immutable_store, mutable_store).await;
+
+                for from_rules in LAYERED_VIEWS {
+                    for to_rules in LAYERED_VIEWS {
+                        let from = fixture.view(from_rules);
+                        let to = fixture.view(to_rules);
+                        let expected = predicted(&from.filter, &to.filter);
+
+                        let (changes, _) = fixture.walk(from, to, LAYERED).await;
+
+                        assert_eq!(
+                            by_path_and_action(changes),
+                            by_path_and_action(expected),
+                            "from {from_rules:?} to {to_rules:?}"
+                        );
+                    }
+                }
             }))
             .await
             .expect("Test task failed");

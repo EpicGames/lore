@@ -208,6 +208,19 @@ pub fn test_filter_context(
     ignore: &[&str],
     view: &[&str],
 ) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
+    std::sync::Arc::new(lore_revision::repository::RepositoryContext::new(
+        default_repository_creation_args(immutable_store, mutable_store)
+            .with_path(&instance.path)
+            .with_id(instance.repository.id)
+            .with_instance_id(instance.repository.instance_id)
+            .with_filter(std::sync::Arc::new(test_filter(ignore, view))),
+    ))
+}
+
+/// A filter whose ignore slot holds `ignore` and whose view holds `view`, a leading `!`
+/// re-including as it does in a filter file.
+#[allow(dead_code)]
+pub fn test_filter(ignore: &[&str], view: &[&str]) -> lore_revision::filter::Filter {
     let mut filter = lore_revision::filter::Filter::default();
     for (slot, globs) in [(&mut filter.ignore, ignore), (&mut filter.view, view)] {
         for glob in globs {
@@ -217,13 +230,7 @@ pub fn test_filter_context(
             }
         }
     }
-    std::sync::Arc::new(lore_revision::repository::RepositoryContext::new(
-        default_repository_creation_args(immutable_store, mutable_store)
-            .with_path(&instance.path)
-            .with_id(instance.repository.id)
-            .with_instance_id(instance.repository.instance_id)
-            .with_filter(std::sync::Arc::new(filter)),
-    ))
+    filter
 }
 
 /// An OS filesystem that holds its state in a `State` as far as a command asks it
