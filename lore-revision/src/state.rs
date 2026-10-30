@@ -12,6 +12,8 @@ mod stream;
 pub mod stream;
 
 use core::str;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::io::Write;
 use std::mem::size_of;
@@ -5892,77 +5894,74 @@ fn add_change(
 ///
 /// A file is identified by the context in its node address, so an add and a delete sharing a
 /// non-zero context are the two halves of a move. A change offering no identity, which
-/// `NodeChange::move_identity` reports as a zero context, is left as it is.
+/// `NodeChange::move_identity` reports as a zero context for a directory or a link, is left as
+/// it is.
+///
+/// The changes waiting for a partner are kept by identity, in a map sized to the candidates, so
+/// the pairing is linear in the changes. Where several adds, or several deletes, share an
+/// identity, they pair in the order they stand.
 ///
 /// The vector is modified in place: the add becomes the move, taking the delete's `from` as its
 /// source, and the delete is dropped. Changes that are not coalesced keep their order.
 pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
-    let mut adds: Vec<(usize, Context)> = Vec::new();
-    let mut deletes: Vec<(usize, Context)> = Vec::new();
-    let mut coalesced: Vec<usize> = Vec::new();
+    let is_candidate = |change: &NodeChange| {
+        matches!(change.action, FileAction::Add | FileAction::Delete)
+            && !change.move_identity().is_zero()
+    };
+    let candidates = changes.iter().filter(|change| is_candidate(change)).count();
+    if candidates < 2 {
+        return;
+    }
 
+    // The first and the last change waiting on each identity, all adds or all deletes. Where
+    // more than one waits, `queued` links each to the next.
+    let mut waiting: HashMap<Context, (usize, usize)> = HashMap::with_capacity(candidates);
+    let mut queued: HashMap<usize, usize> = HashMap::new();
+    let mut coalesced: Vec<usize> = Vec::new();
     for index in 0..changes.len() {
-        let context = changes[index].move_identity();
-        if context.is_zero() {
+        if !is_candidate(&changes[index]) {
             continue;
         }
-
-        match changes[index].action {
-            FileAction::Add => {
-                let matching_delete_pos = deletes
-                    .iter()
-                    .position(|(_, delete_context)| *delete_context == context);
-
-                if let Some(delete_vec_index) = matching_delete_pos {
-                    let (delete_index, _) = deletes.remove(delete_vec_index);
-                    let from_state = changes[delete_index].from.clone();
-
-                    lore_trace!(
-                        "Detected move: {} -> {}",
-                        from_state.mapping.path.as_str(),
-                        changes[index].path().as_str()
-                    );
-
-                    changes[index].action = FileAction::Move;
-                    changes[index].from = from_state;
-                    if changes[index].from.differs_from(&changes[index].to) {
-                        changes[index].flags |= change::Flags::Modify;
-                    }
-
-                    coalesced.push(delete_index);
-                } else {
-                    adds.push((index, context));
-                }
+        let partner = match waiting.entry(changes[index].move_identity()) {
+            Entry::Vacant(entry) => {
+                entry.insert((index, index));
+                continue;
             }
-            FileAction::Delete => {
-                let matching_add_pos = adds
-                    .iter()
-                    .position(|(_, add_context)| *add_context == context);
-
-                if let Some(add_vec_index) = matching_add_pos {
-                    let (add_index, _) = adds.remove(add_vec_index);
-
-                    let from_state = changes[index].from.clone();
-
-                    lore_trace!(
-                        "Detected move: {} -> {}",
-                        from_state.mapping.path.as_str(),
-                        changes[add_index].path().as_str()
-                    );
-
-                    changes[add_index].action = FileAction::Move;
-                    changes[add_index].from = from_state;
-                    if changes[add_index].from.differs_from(&changes[add_index].to) {
-                        changes[add_index].flags |= change::Flags::Modify;
-                    }
-
-                    coalesced.push(index);
-                } else {
-                    deletes.push((index, context));
+            Entry::Occupied(mut entry) => {
+                let (first, last) = *entry.get();
+                if changes[first].action == changes[index].action {
+                    queued.insert(last, index);
+                    entry.get_mut().1 = index;
+                    continue;
                 }
+                match queued.remove(&first) {
+                    Some(next) => entry.get_mut().0 = next,
+                    None => {
+                        entry.remove();
+                    }
+                }
+                first
             }
-            _ => {}
+        };
+        let (add, delete) = if changes[index].action == FileAction::Add {
+            (index, partner)
+        } else {
+            (partner, index)
+        };
+
+        let from_state = changes[delete].from.clone();
+        lore_trace!(
+            "Detected move: {} -> {}",
+            from_state.mapping.path.as_str(),
+            changes[add].path().as_str()
+        );
+        let moved = &mut changes[add];
+        moved.action = FileAction::Move;
+        moved.from = from_state;
+        if moved.from.differs_from(&moved.to) {
+            moved.flags |= change::Flags::Modify;
         }
+        coalesced.push(delete);
     }
 
     if coalesced.is_empty() {

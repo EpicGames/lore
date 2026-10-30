@@ -98,6 +98,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore push --fast-forward-merge` keeps a rename that changes only case where the push also changes content in the
   directory holding it. A renamed directory keeps its files, and a renamed file keeps edits made to it on the target
   branch
+- After a merge under a sparse view, diffs and file history list the files it adds, moves and deletes in out-of-view
+  directories, and `lore link list` reflects the links it adds, moves and removes there
+- `lore revision info --delta` lists a directory a merge brings in as added, with or without a view
 
 ## v0.12.0 (Oct 26th 2026) [#1966]
 

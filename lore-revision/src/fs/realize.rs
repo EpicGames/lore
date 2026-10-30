@@ -1777,7 +1777,7 @@ pub(crate) async fn stage_link_registry_entry(
 
 /// Drop a deleted link node's [`LinkReference`](crate::state::LinkReference)
 /// from the staged state's link registry.
-async fn remove_link_registry_entry(
+pub(crate) async fn remove_link_registry_entry(
     repository: &Arc<RepositoryContext>,
     state_stage: &Arc<State>,
     link_id: RepositoryId,
@@ -2028,11 +2028,29 @@ fn realize_change_modify_add(
             if change.action == change::FileAction::Move
                 && let Some(from_path) = change.move_source()
             {
-                relink_moved_node(&state_stage, &repository, &change, from_path, is_merge).await?;
+                let from_node_id = state_stage
+                    .find_node_link(repository.clone(), from_path.as_str())
+                    .await
+                    .forward::<SyncError>("Failed to stage change")?
+                    .node;
+                relink_moved_node(
+                    &state_stage,
+                    &repository,
+                    &change,
+                    from_path,
+                    from_node_id,
+                    is_merge,
+                )
+                .await?;
             } else {
                 let mut node = node;
                 if is_merge {
                     node.flags |= NodeFlags::StagedMerge;
+                    // A directory the incoming side adds is staged as an add, including one
+                    // that already stands in the staged tree as the parent of an add below it.
+                    if change.action == change::FileAction::Add && node.is_directory() {
+                        node.flags |= NodeFlags::StagedAdd;
+                    }
                 }
                 if change.action == change::FileAction::Move {
                     node.flags &= !NodeFlags::StagedAdd;
@@ -2114,26 +2132,23 @@ async fn clone_added_link(
     .forward::<SyncError>("Failed to sync link")
 }
 
-/// Stages a realized move by relinking the node at `from_path` under the path the change moves
-/// it to, keeping its identity, and marks it staged as a move.
+/// Stages a realized move by relinking `from_node_id`, the staged node at `from_path`, under
+/// the path the change moves it to, keeping its identity, and marks it staged as a move.
+/// Answers with the node's new parent.
 ///
 /// A function of its own because its locals live across several awaits: kept in
 /// [`realize_change_modify_add`] they would take space in the future of every change realized.
-async fn relink_moved_node(
+pub(crate) async fn relink_moved_node(
     state_stage: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     change: &NodeChange,
     from_path: &RelativePath,
+    from_node_id: NodeID,
     is_merge: bool,
-) -> Result<(), SyncError> {
-    // For move actions, relink the existing node instead of creating a new one to preserve node identity and from_path tracking.
-    // Find the node at the original path in the staged state
-    let from_node_link = state_stage
-        .find_node_link(repository.clone(), from_path.as_str())
-        .await
-        .forward::<SyncError>("Failed to stage change")?;
-    let block_index = NodeBlock::index(from_node_link.node);
-    let node_index = Node::index(from_node_link.node);
+) -> Result<NodeID, SyncError> {
+    // Relinking keeps the existing node, which preserves its identity and from_path tracking.
+    let block_index = NodeBlock::index(from_node_id);
+    let node_index = Node::index(from_node_id);
     let block = state_stage
         .block(repository.clone(), block_index)
         .await
@@ -2159,7 +2174,7 @@ async fn relink_moved_node(
             .forward::<SyncError>("Failed deserializing state node block")?;
         let old_parent_node = old_parent_block.node(old_parent_node_index);
 
-        if old_parent_node.child == from_node_link.node {
+        if old_parent_node.child == from_node_id {
             let dirtied = {
                 let mut block = old_parent_block.write();
                 block.node(old_parent_node_index).child = from_node.sibling;
@@ -2183,7 +2198,7 @@ async fn relink_moved_node(
                     .forward::<SyncError>("Invalid node hierarchy in revision state")?;
                 child.sibling()
             } {
-                if sibling == from_node_link.node {
+                if sibling == from_node_id {
                     let child_block_index = NodeBlock::index(child_id);
                     let child_node_index = Node::index(child_id);
                     let child_block = state_stage
@@ -2217,7 +2232,7 @@ async fn relink_moved_node(
             let mut block = new_parent_block.write();
             let parent_node = block.node(new_parent_node_index);
             sibling_node_id = parent_node.child;
-            parent_node.child = from_node_link.node;
+            parent_node.child = from_node_id;
             block.mark_dirty()
         };
         if dirtied {
@@ -2260,11 +2275,11 @@ async fn relink_moved_node(
         mark_flags |= NodeFlags::StagedMerge;
     }
     state_stage
-        .node_mark(repository.clone(), from_node_link.node, mark_flags, true)
+        .node_mark(repository.clone(), from_node_id, mark_flags, true)
         .await
         .forward::<SyncError>("Failed to stage change")?;
 
-    Ok(())
+    Ok(new_parent_id)
 }
 
 #[allow(clippy::too_many_arguments)]

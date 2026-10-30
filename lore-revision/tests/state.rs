@@ -1824,6 +1824,60 @@ mod single_file_compare_result_tests {
         assert!(changes.iter().all(|c| c.move_source().is_some()));
     }
 
+    /// Deletes and adds sharing one identity pair in the order they stand, each pair once, and
+    /// one left without a partner is left as it is.
+    #[tokio::test]
+    async fn changes_sharing_an_identity_pair_in_order() {
+        let repo = new_test_context().await;
+        let file_id = context_from_u128(7);
+        let delete = |path: &str| {
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                path,
+                file_id,
+                Context::default(),
+            )
+        };
+        let add = |path: &str| {
+            make_change(
+                repo.clone(),
+                FileAction::Add,
+                path,
+                Context::default(),
+                file_id,
+            )
+        };
+        let mut changes = vec![
+            delete("a/first.txt"),
+            delete("a/second.txt"),
+            add("b/first.txt"),
+            delete("a/third.txt"),
+            add("b/second.txt"),
+        ];
+
+        detect_and_coalesce_moves(&mut changes);
+
+        let summary: Vec<(FileAction, &str, Option<&str>)> = changes
+            .iter()
+            .map(|change| {
+                (
+                    change.action,
+                    change.path().as_str(),
+                    change.move_source().map(RelativePath::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (FileAction::Move, "b/first.txt", Some("a/first.txt")),
+                (FileAction::Delete, "a/third.txt", None),
+                (FileAction::Move, "b/second.txt", Some("a/second.txt")),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn unmatched_add_and_delete_remain_unchanged() {
         let repo = new_test_context().await;

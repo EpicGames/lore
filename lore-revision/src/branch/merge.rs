@@ -1746,12 +1746,13 @@ fn full_tree_context(repository: &Arc<RepositoryContext>) -> Arc<RepositoryConte
 struct GraftCounts {
     overwritten: usize,
     added: usize,
+    moved: usize,
     deleted: usize,
 }
 
 impl GraftCounts {
     fn touched(&self) -> usize {
-        self.overwritten + self.added + self.deleted
+        self.overwritten + self.added + self.moved + self.deleted
     }
 }
 
@@ -1843,13 +1844,37 @@ async fn graft_overwrite_node(
     Ok(())
 }
 
-/// Adopt source's version of an out-of-view subtree.
-///
-/// Only valid for a subtree the view excludes. Realization skips those paths
-/// (`fs/realize.rs`) and commit adopts their staged hash (`commit.rs`), so the
-/// merge is a tree operation only and the files inside need no three-way
-/// merge.
-/// Create a node at `path` in the staged tree, under an existing parent.
+/// Stage `directory` and the directories above it `StagedMerge`, up to the first
+/// that already carries it, as a per-file merge stages the ancestors of an add or
+/// a move. The root takes `Staged` only, as there.
+async fn graft_stage_ancestors(
+    repository: Arc<RepositoryContext>,
+    state_staged: Arc<State>,
+    mut directory: NodeID,
+) -> Result<(), MergeError> {
+    while directory != ROOT_NODE {
+        let node = state_staged
+            .node(repository.clone(), directory)
+            .await
+            .forward::<MergeError>("resolving adopted node ancestor")?;
+        if node.is_staged_merge() {
+            return Ok(());
+        }
+        state_staged
+            .node_mark(repository.clone(), directory, NodeFlags::StagedMerge, false)
+            .await
+            .forward::<MergeError>("staging adopted node ancestor")?;
+        directory = node.parent;
+    }
+    state_staged
+        .node_mark(repository, ROOT_NODE, NodeFlags::Staged, false)
+        .await
+        .forward::<MergeError>("staging adopted node ancestor")
+}
+
+/// Create a node at `path` in the staged tree, under an existing parent, staged
+/// as a per-file merge stages an add: `StagedAdd` and `StagedMerge` for a file, a
+/// link or a directory, and the ancestors staged by [`graft_stage_ancestors`].
 ///
 /// Adds arrive in path order, so the parent is already there.
 async fn graft_add_node(
@@ -1879,13 +1904,90 @@ async fn graft_add_node(
     node.take_mount_source(source_node);
     // Source's nodes are committed, so they bring no staged or dirty state.
     node.clear_all_change_flags();
+    node.flags |= (NodeFlags::StagedAdd | NodeFlags::StagedMerge).bits();
 
-    state_staged
-        .node_add(repository, parent.node, node, path.name())
+    let node_id = state_staged
+        .node_add(repository.clone(), parent.node, node, path.name())
         .await
-        .forward::<MergeError>("adding adopted node")
+        .forward::<MergeError>("adding adopted node")?;
+    graft_stage_ancestors(repository, state_staged, parent.node).await?;
+    Ok(node_id)
 }
 
+/// Move the staged node at `from_path` to the path `change` adopts and point it at
+/// source's content, staged as a per-file merge stages a move: relinked with
+/// `StagedMove` and `StagedMerge`, and the new ancestors staged by
+/// [`graft_stage_ancestors`]. The overwrite before the relink marks the old
+/// ancestors staged, so the commit recomputes them too.
+async fn graft_move_node(
+    repository: Arc<RepositoryContext>,
+    state_staged: Arc<State>,
+    change: &NodeChange,
+    from_path: &RelativePath,
+    source_node: &Node,
+) -> Result<NodeID, MergeError> {
+    let from = state_staged
+        .find_node_link(repository.clone(), from_path.as_str())
+        .await
+        .forward::<MergeError>("resolving adopted move source")?;
+    graft_overwrite_node(
+        repository.clone(),
+        state_staged.clone(),
+        from.node,
+        source_node,
+    )
+    .await?;
+    let parent = crate::fs::realize::relink_moved_node(
+        &state_staged,
+        &repository,
+        change,
+        from_path,
+        from.node,
+        true,
+    )
+    .await
+    .forward::<MergeError>("relinking adopted move")?;
+    graft_stage_ancestors(repository, state_staged, parent).await?;
+    Ok(from.node)
+}
+
+/// Drop each link the reconcile deletes from the staged link registry, as a
+/// per-file merge does. This runs before the adds, so a link the subtree moves
+/// to a new path and a new pin can be recorded at the new path.
+async fn graft_unregister_deleted_links(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    changes: &[NodeChange],
+) -> Result<(), MergeError> {
+    for deleted in changes
+        .iter()
+        .filter(|change| change.action == FileAction::Delete && change.from.is_link())
+    {
+        crate::fs::realize::remove_link_registry_entry(
+            repository,
+            state_staged,
+            deleted.from.address.context.into(),
+            deleted.from.mapping.node,
+        )
+        .await
+        .forward::<MergeError>("removing adopted link")?;
+    }
+    Ok(())
+}
+
+/// Adopt source's version of an out-of-view subtree.
+///
+/// Only valid for a subtree the view excludes. Realization skips those paths
+/// (`fs/realize.rs`) and commit adopts their staged hash (`commit.rs`), so the
+/// merge is a tree operation only and the files inside need no three-way
+/// merge. Each add, move, overwrite and delete takes the staged flags a per-file
+/// merge gives it, which mark its parent directories, so the commit discards the
+/// deletes, recomputes every directory the reconcile changed, and records the
+/// changes in the revision delta as a merge with no view does.
+///
+/// An add and a delete of one file pair into a move by
+/// [`state::detect_and_coalesce_moves`], as the diff of a merge with no view pairs
+/// them.
 async fn apply_graft_copy(
     repository: Arc<RepositoryContext>,
     state_staged: Arc<State>,
@@ -1898,7 +2000,6 @@ async fn apply_graft_copy(
     if !link.is_valid_or_root() {
         return Err(MergeError::internal("Invalid graft path"));
     }
-    let staged_node_id = link.node;
 
     // Diff the staged subtree against source's to find what differs. The walk
     // pairs children by name and stops at a directory whose address already
@@ -1926,10 +2027,13 @@ async fn apply_graft_copy(
     .await
     .forward::<MergeError>("diffing the adopted subtree")?;
     change::sort_by_path(&mut changes);
+    state::detect_and_coalesce_moves(&mut changes);
+    graft_unregister_deleted_links(&repository, &state_staged, &changes).await?;
 
     let mut counts = GraftCounts::default();
 
-    // Adds and overwrites in path order, so a parent exists before its children.
+    // Adds, moves and overwrites in path order, so a parent exists before its
+    // children.
     for adopted in changes.iter() {
         if adopted.action == FileAction::Delete {
             continue;
@@ -1945,29 +2049,41 @@ async fn apply_graft_copy(
             .await
             .forward::<MergeError>("resolving adopted node")?;
 
-        let staged = state_staged
-            .find_node_link(repository.clone(), adopted.path().as_str())
-            .await
-            .unwrap_or(NodeLink::invalid());
-        let staged_id = if staged.is_valid_or_root() {
-            graft_overwrite_node(
+        let staged_id = if let Some(from_path) = adopted.move_source() {
+            counts.moved += 1;
+            graft_move_node(
                 repository.clone(),
                 state_staged.clone(),
-                staged.node,
-                &source_node,
-            )
-            .await?;
-            counts.overwritten += 1;
-            staged.node
-        } else {
-            counts.added += 1;
-            graft_add_node(
-                repository.clone(),
-                state_staged.clone(),
-                adopted.path(),
+                adopted,
+                from_path,
                 &source_node,
             )
             .await?
+        } else {
+            let staged = state_staged
+                .find_node_link(repository.clone(), adopted.path().as_str())
+                .await
+                .unwrap_or(NodeLink::invalid());
+            if staged.is_valid_or_root() {
+                graft_overwrite_node(
+                    repository.clone(),
+                    state_staged.clone(),
+                    staged.node,
+                    &source_node,
+                )
+                .await?;
+                counts.overwritten += 1;
+                staged.node
+            } else {
+                counts.added += 1;
+                graft_add_node(
+                    repository.clone(),
+                    state_staged.clone(),
+                    adopted.path(),
+                    &source_node,
+                )
+                .await?
+            }
         };
 
         if source_node.is_link() {
@@ -1993,8 +2109,7 @@ async fn apply_graft_copy(
         .await?;
     }
 
-    // Deletes in reverse path order, so children go before their directory.
-    for adopted in changes.iter().rev() {
+    for adopted in changes.iter() {
         if adopted.action != FileAction::Delete {
             continue;
         }
@@ -2005,23 +2120,17 @@ async fn apply_graft_copy(
         if !staged.is_valid_or_root() {
             continue;
         }
-        state::node_discard_patch(
-            state_staged.clone(),
-            repository.clone(),
-            staged.node,
-            |_node_id, _flags| {},
-        )
-        .await
-        .forward::<MergeError>("discarding adopted node")?;
+        state_staged
+            .node_mark(
+                repository.clone(),
+                staged.node,
+                NodeFlags::StagedDelete | NodeFlags::StagedMerge,
+                true,
+            )
+            .await
+            .forward::<MergeError>("staging adopted delete")?;
         counts.deleted += 1;
     }
-
-    // Mark the directory staged so the commit recomputes it and its parent
-    // directories from the updated children.
-    state_staged
-        .node_mark(repository.clone(), staged_node_id, NodeFlags::Staged, false)
-        .await
-        .forward::<MergeError>("marking grafted directory")?;
 
     Ok(counts.touched())
 }
