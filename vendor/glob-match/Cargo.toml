@@ -7,7 +7,12 @@
 # gitignore documents these forms and the ignore/view filters accept them
 # verbatim; the defect made lore silently fail to exclude matching paths.
 #
-# The fix is in src/lib.rs, marked with a `LORE:` comment. Upstream this.
+# The matcher also reads a glob as git reads a gitignore pattern, where upstream
+# does not: a bracket expression never matches a separator, `**` is a globstar
+# only as a whole component, and a leading `!` is a literal.
+#
+# The changes are in src/lib.rs, marked with `LORE:` notes. Upstream the `**`
+# backtracking fix.
 #
 # Benches and their dev-dependencies are dropped; only the library is used.
 [package]

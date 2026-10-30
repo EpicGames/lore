@@ -1374,8 +1374,8 @@ mod tests {
     /// Rule sets spanning the shapes that decide a covering answer: an open
     /// re-inclusion, one with an exclusion nested under it, one with the
     /// exclusion somewhere else entirely, a literal name rule, a suffix rule, a
-    /// `**` in the middle, a trailing `**` and a character class that each
-    /// reach deeper than their components, and one of each at once.
+    /// `**` in the middle, a `**` and a bracket expression that each share a
+    /// component with other text and match inside it, and one of each at once.
     const COVER_RULES: &[&[&str]] = &[
         &["/*", "!/engine"],
         &["/*", "!/engine", "/engine/intermediate"],
@@ -1438,18 +1438,16 @@ mod tests {
         );
     }
 
-    /// A rule compared as text keeps its braces, and its subtree companion does
-    /// not.
+    /// A rule compared as text keeps its braces, and so does its subtree
+    /// companion.
     ///
     /// A glob carrying no `*?[]\\` is compared to the path rather than
     /// evaluated, so its braces are part of the name it matches and enumerating
     /// them would record paths it never names. The companion
-    /// [`FilterInstance::add_inclusion`] generates is evaluated as a glob
-    /// whatever the rule it carries was, so the same braces do alternate there
-    /// and the index has to enumerate them or the walk loses the subtree.
-    ///
-    /// The two together are why the filter re-includes `alt/b/x` without
-    /// re-including `alt/b`.
+    /// [`FilterInstance::add_inclusion`] generates is evaluated as a glob, so it
+    /// escapes those braces and re-includes only what lies below the rule's own
+    /// text: `!alt/{b,c}` re-includes `alt/{b,c}/x` and neither `alt/b` nor
+    /// `alt/b/x`, and `!/a{b,c/d}` re-includes nothing below `ab` or `ac/d`.
     #[test]
     fn a_literal_braced_rule_matches_its_own_text() {
         let mut exclusion = FilterInstance::default();
@@ -1462,18 +1460,72 @@ mod tests {
             );
         }
 
-        let mut inclusion = FilterInstance::default();
-        inclusion.add_exclusion("**").expect("exclude");
-        inclusion.add_inclusion("alt/{b,c}").expect("include");
-        let alt = probe_path("alt");
-        let state = inclusion.child_exclusion_state(FilterState::ROOT, &alt, true);
-        assert!(
-            inclusion.should_descend(state, &alt),
-            "the walk never reaches what the companion re-includes"
-        );
-        assert!(!inclusion.excludes(&probe_path("alt/{b,c}"), true));
-        assert!(!inclusion.excludes(&probe_path("alt/b/x"), false));
-        assert!(inclusion.excludes(&probe_path("alt/b"), true));
+        for (rule, below, expansions) in [
+            ("alt/{b,c}", "alt/{b,c}/x", &["alt/b/x", "alt/c/x"][..]),
+            ("/a{b,c/d}", "a{b,c/d}/x", &["ab/w", "ab/x/y", "ac/d/x"][..]),
+        ] {
+            let mut inclusion = FilterInstance::default();
+            inclusion.add_exclusion("**").expect("exclude");
+            inclusion.add_inclusion(rule).expect("include");
+            let top = probe_path(below.split('/').next().expect("a component"));
+            let state = inclusion.child_exclusion_state(FilterState::ROOT, &top, true);
+            assert!(
+                inclusion.should_descend(state, &top),
+                "the walk never reaches what the companion of {rule} re-includes"
+            );
+            assert!(
+                !inclusion.excludes(&probe_path(below), false),
+                "{rule} does not re-include {below}"
+            );
+            for expansion in expansions {
+                assert!(
+                    inclusion.excludes(&probe_path(expansion), false),
+                    "{rule} re-includes {expansion}"
+                );
+            }
+        }
+    }
+
+    /// A rule the matcher evaluates matches paths with fewer components than
+    /// its text where a `/` in it may match no separator: in a brace group, whose
+    /// alternative may hold fewer, and in a bracket expression, which matches
+    /// none. `/{a,b/c}*` names `ax` as well as `b/cx`, `/a{b,c/d}*` names `ab`,
+    /// `/x[a/b]y` names `xay` and `/a[b/c]/d` names `ab/d`, as exclusions and as
+    /// re-inclusions. A brace group in a rule compared as text is text, as in
+    /// git, so `/a{b,c/d}` names `a{b,c/d}` alone.
+    #[test]
+    fn a_rule_matches_fewer_components_than_its_text() {
+        for (rule, named) in [
+            ("/{a,b/c}*", &["ax", "b/cx"][..]),
+            ("/a{b,c/d}*", &["ab", "ac/dx"][..]),
+            ("/x[a/b]y", &["xay", "xby"][..]),
+            ("/a[b/c]/d", &["ab/d"][..]),
+        ] {
+            let mut exclusion = FilterInstance::default();
+            exclusion.add_exclusion(rule).expect("exclude");
+            let mut inclusion = FilterInstance::default();
+            inclusion.add_exclusion("**").expect("exclude");
+            inclusion.add_inclusion(rule).expect("include");
+            for path in named {
+                assert!(
+                    exclusion.excludes(&probe_path(path), false),
+                    "{rule} does not exclude {path}"
+                );
+                assert!(
+                    !inclusion.excludes(&probe_path(path), false),
+                    "{rule} does not re-include {path}"
+                );
+            }
+            assert!(
+                !exclusion.excludes(&probe_path("bx"), false),
+                "{rule} excludes bx"
+            );
+        }
+
+        let mut literal = FilterInstance::default();
+        literal.add_exclusion("/a{b,c/d}").expect("exclude");
+        assert!(literal.excludes(&probe_path("a{b,c/d}"), false));
+        assert!(!literal.excludes(&probe_path("ab"), false));
     }
 
     /// A filter holding `rules` in its view slot, built through the file they
@@ -1574,11 +1626,21 @@ mod tests {
         // subtree holding `game/thumbs.db` as untouched.
         assert!(!covers(&view_filter(&dir, "name", &["Thumbs.db"]), "game"));
 
-        // A `**` anywhere in a rule leaves its depth unbounded.
+        // A `**` component leaves a rule's depth unbounded.
         assert!(!covers(
             &view_filter(&dir, "globstar", &["/some/**/path"]),
             "some"
         ));
+
+        let class = view_filter(&dir, "class", &["/*", "!/engine", "/engine/[bb]inaries"]);
+        assert!(
+            !covers(&class, "engine"),
+            "engine is covered while engine/binaries is excluded"
+        );
+        assert!(
+            covers(&class, "engine/source"),
+            "a bracket expression reaches below engine/source"
+        );
 
         // A brace alternative can hold a separator, so the group's text names no
         // component and the trie cannot follow it. Each alternative is indexed

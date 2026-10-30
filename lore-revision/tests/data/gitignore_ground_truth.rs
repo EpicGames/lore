@@ -29,8 +29,8 @@ pub struct Case {
 
 /// Every file in the probe tree, in bitmask order. Names are chosen so
 /// prefix, infix, suffix and extension wildcards all bite, at depths one
-/// through four, with two sibling subdirectories under `d` and an `e` at
-/// two different depths.
+/// through four, with two sibling subdirectories under `d`, an `e` at two
+/// different depths, and a name starting with `!` at two depths.
 pub const FILES: &[&str] = &[
     "a",
     "ab",
@@ -53,6 +53,8 @@ pub const FILES: &[&str] = &[
     "dd/e/a",
     "e/a",
     "e/a.tmp",
+    "!a",
+    "d/!a",
 ];
 
 /// Every directory in the probe tree.
@@ -67,7 +69,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
@@ -77,12 +79,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
         patterns: &["**/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -97,7 +99,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
@@ -107,12 +109,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
         patterns: &["**/**/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -127,7 +129,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!**/**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
@@ -137,7 +139,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!**/**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
@@ -147,12 +149,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!**/**/*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "single",
         patterns: &["**/**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "single_neg",
@@ -162,7 +164,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -172,7 +174,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/**/e"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -182,7 +184,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -192,7 +194,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -202,7 +204,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*/**"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -212,7 +214,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*/*a"],
-        included: 0x115b5f,
+        included: 0x315b5f,
     },
     Case {
         kind: "single_neg",
@@ -222,7 +224,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*/a"],
-        included: 0x115bdf,
+        included: 0x715bdf,
     },
     Case {
         kind: "single_neg",
@@ -232,7 +234,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -242,7 +244,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*/e"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -257,12 +259,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!**/*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "single",
         patterns: &["**/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -272,7 +274,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -282,7 +284,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -292,7 +294,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -302,7 +304,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -312,7 +314,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -322,7 +324,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -332,7 +334,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "single_neg",
@@ -342,7 +344,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -352,7 +354,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -362,7 +364,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -372,7 +374,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -382,7 +384,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -392,7 +394,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -402,7 +404,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -412,7 +414,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -422,7 +424,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -432,7 +434,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -442,7 +444,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -452,7 +454,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d/*a"],
-        included: 0x1fff5f,
+        included: 0x3fff5f,
     },
     Case {
         kind: "single_neg",
@@ -462,7 +464,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d/a"],
-        included: 0x1fffdf,
+        included: 0x7fffdf,
     },
     Case {
         kind: "single_neg",
@@ -472,7 +474,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -482,7 +484,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -492,7 +494,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -502,7 +504,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e/"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -512,7 +514,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e/*"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -522,7 +524,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e/**"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -532,7 +534,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e/*a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "single_neg",
@@ -542,7 +544,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "single_neg",
@@ -552,7 +554,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -562,7 +564,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["**/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -571,8 +573,28 @@ pub const CASES: &[Case] = &[
     },
     Case {
         kind: "single",
+        patterns: &["**a"],
+        included: 0x115b5a,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!**a"],
+        included: 0x200005,
+    },
+    Case {
+        kind: "single",
+        patterns: &["**a/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!**a/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
         patterns: &["*/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -582,7 +604,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -592,7 +614,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -602,7 +624,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**/"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -612,7 +634,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -622,7 +644,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**/**"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -632,7 +654,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**/*a"],
-        included: 0x115b5f,
+        included: 0x315b5f,
     },
     Case {
         kind: "single_neg",
@@ -642,7 +664,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**/a"],
-        included: 0x115bdf,
+        included: 0x715bdf,
     },
     Case {
         kind: "single_neg",
@@ -652,7 +674,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -662,7 +684,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/**/e"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -672,7 +694,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*/"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -682,7 +704,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*/*"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -692,7 +714,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*/**"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -702,7 +724,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*/*a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "single_neg",
@@ -712,7 +734,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "single_neg",
@@ -722,7 +744,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -732,7 +754,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -742,7 +764,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a"],
-        included: 0x15ff5f,
+        included: 0x35ff5f,
     },
     Case {
         kind: "single_neg",
@@ -752,7 +774,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -762,7 +784,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -772,7 +794,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -782,7 +804,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -792,7 +814,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -802,7 +824,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -812,7 +834,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -822,7 +844,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a"],
-        included: 0x15ffdf,
+        included: 0x75ffdf,
     },
     Case {
         kind: "single_neg",
@@ -832,7 +854,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -842,7 +864,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -852,7 +874,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -862,7 +884,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -872,7 +894,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -882,7 +904,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -892,7 +914,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -902,7 +924,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -912,7 +934,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -922,7 +944,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -932,7 +954,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -942,7 +964,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -952,7 +974,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -962,7 +984,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -972,7 +994,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -982,7 +1004,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -992,7 +1014,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e/"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -1002,7 +1024,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e/*"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -1012,7 +1034,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e/**"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -1022,7 +1044,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e/*a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "single_neg",
@@ -1032,7 +1054,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "single_neg",
@@ -1042,7 +1064,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1052,7 +1074,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1067,7 +1089,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "single",
@@ -1077,12 +1099,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!*a*"],
-        included: 0xf,
+        included: 0x20000f,
     },
     Case {
         kind: "single",
         patterns: &["*a*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1092,7 +1114,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1102,7 +1124,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1112,7 +1134,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1122,7 +1144,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1132,7 +1154,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1142,7 +1164,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1152,7 +1174,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1162,7 +1184,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1172,7 +1194,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1182,7 +1204,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/**/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1192,7 +1214,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1202,7 +1224,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1212,7 +1234,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1222,7 +1244,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1232,7 +1254,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1242,7 +1264,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1252,7 +1274,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1262,7 +1284,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1272,7 +1294,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1282,7 +1304,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1292,7 +1314,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1302,7 +1324,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1312,7 +1334,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1322,7 +1344,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1332,7 +1354,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1342,7 +1364,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1352,7 +1374,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1362,7 +1384,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1372,7 +1394,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1382,7 +1404,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1392,7 +1414,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1402,7 +1424,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1412,7 +1434,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1422,7 +1444,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1432,7 +1454,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1442,7 +1464,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1452,7 +1474,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1462,7 +1484,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1472,7 +1494,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1482,7 +1504,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1492,7 +1514,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1502,7 +1524,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1512,7 +1534,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1522,7 +1544,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1532,7 +1554,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1542,7 +1564,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1552,7 +1574,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1562,7 +1584,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1572,7 +1594,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["*a/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1587,7 +1609,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single",
@@ -1597,12 +1619,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
         patterns: &["/**/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -1617,7 +1639,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
@@ -1627,12 +1649,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
         patterns: &["/**/**/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -1647,7 +1669,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/**/**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
@@ -1657,7 +1679,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/**/**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single",
@@ -1667,12 +1689,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/**/**/*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "single",
         patterns: &["/**/**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "single_neg",
@@ -1682,7 +1704,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -1692,7 +1714,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/**/e"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -1702,7 +1724,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -1712,7 +1734,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -1722,7 +1744,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*/**"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -1732,7 +1754,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*/*a"],
-        included: 0x115b5f,
+        included: 0x315b5f,
     },
     Case {
         kind: "single_neg",
@@ -1742,7 +1764,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*/a"],
-        included: 0x115bdf,
+        included: 0x715bdf,
     },
     Case {
         kind: "single_neg",
@@ -1752,7 +1774,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1762,7 +1784,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*/e"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -1777,12 +1799,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!/**/*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "single",
         patterns: &["/**/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1792,7 +1814,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1802,7 +1824,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1812,7 +1834,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1822,7 +1844,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1832,7 +1854,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1842,7 +1864,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1852,7 +1874,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "single_neg",
@@ -1862,7 +1884,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1872,7 +1894,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1882,7 +1904,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1892,7 +1914,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1902,7 +1924,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1912,7 +1934,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1922,7 +1944,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -1932,7 +1954,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -1942,7 +1964,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -1952,7 +1974,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -1962,7 +1984,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -1972,7 +1994,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d/*a"],
-        included: 0x1fff5f,
+        included: 0x3fff5f,
     },
     Case {
         kind: "single_neg",
@@ -1982,7 +2004,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d/a"],
-        included: 0x1fffdf,
+        included: 0x7fffdf,
     },
     Case {
         kind: "single_neg",
@@ -1992,7 +2014,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2002,7 +2024,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -2012,7 +2034,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -2022,7 +2044,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e/"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -2032,7 +2054,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e/*"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -2042,7 +2064,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e/**"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -2052,7 +2074,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e/*a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "single_neg",
@@ -2062,7 +2084,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "single_neg",
@@ -2072,7 +2094,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2082,7 +2104,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/**/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2091,8 +2113,28 @@ pub const CASES: &[Case] = &[
     },
     Case {
         kind: "single",
+        patterns: &["/**a"],
+        included: 0x5ffffa,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/**a"],
+        included: 0x200005,
+    },
+    Case {
+        kind: "single",
+        patterns: &["/**a/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/**a/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
         patterns: &["/*/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -2102,7 +2144,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -2112,7 +2154,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -2122,7 +2164,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**/"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -2132,7 +2174,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -2142,7 +2184,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**/**"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "single_neg",
@@ -2152,7 +2194,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**/*a"],
-        included: 0x115b5f,
+        included: 0x315b5f,
     },
     Case {
         kind: "single_neg",
@@ -2162,7 +2204,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**/a"],
-        included: 0x115bdf,
+        included: 0x715bdf,
     },
     Case {
         kind: "single_neg",
@@ -2172,7 +2214,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2182,7 +2224,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/**/e"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -2192,7 +2234,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*/"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -2202,7 +2244,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*/*"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -2212,7 +2254,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*/**"],
-        included: 0x1a03ff,
+        included: 0x7a03ff,
     },
     Case {
         kind: "single_neg",
@@ -2222,7 +2264,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*/*a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "single_neg",
@@ -2232,7 +2274,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "single_neg",
@@ -2242,7 +2284,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2252,7 +2294,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2262,7 +2304,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a"],
-        included: 0x15ff5f,
+        included: 0x35ff5f,
     },
     Case {
         kind: "single_neg",
@@ -2272,7 +2314,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2282,7 +2324,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2292,7 +2334,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2302,7 +2344,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2312,7 +2354,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2322,7 +2364,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2332,7 +2374,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2342,7 +2384,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a"],
-        included: 0x15ffdf,
+        included: 0x75ffdf,
     },
     Case {
         kind: "single_neg",
@@ -2352,7 +2394,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2362,7 +2404,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2372,7 +2414,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2382,7 +2424,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2392,7 +2434,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2402,7 +2444,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2412,7 +2454,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2422,7 +2464,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2432,7 +2474,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2442,7 +2484,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2452,7 +2494,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2462,7 +2504,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2472,7 +2514,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2482,7 +2524,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2492,7 +2534,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2502,7 +2544,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -2512,7 +2554,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e/"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -2522,7 +2564,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e/*"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -2532,7 +2574,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e/**"],
-        included: 0x1b83ff,
+        included: 0x7b83ff,
     },
     Case {
         kind: "single_neg",
@@ -2542,7 +2584,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e/*a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "single_neg",
@@ -2552,7 +2594,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "single_neg",
@@ -2562,7 +2604,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2572,7 +2614,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2582,27 +2624,27 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a"],
-        included: 0x1ffffa,
+        included: 0x5ffffa,
     },
     Case {
         kind: "single_neg",
         patterns: &["**", "!/*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "single",
         patterns: &["/*a*"],
-        included: 0x1ffff0,
+        included: 0x5ffff0,
     },
     Case {
         kind: "single_neg",
         patterns: &["**", "!/*a*"],
-        included: 0xf,
+        included: 0x20000f,
     },
     Case {
         kind: "single",
         patterns: &["/*a*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2612,7 +2654,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2622,7 +2664,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2632,7 +2674,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2642,7 +2684,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2652,7 +2694,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2662,7 +2704,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2672,7 +2714,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2682,7 +2724,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2692,7 +2734,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2702,7 +2744,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/**/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2712,7 +2754,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2722,7 +2764,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2732,7 +2774,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2742,7 +2784,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2752,7 +2794,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2762,7 +2804,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2772,7 +2814,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2782,7 +2824,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2792,7 +2834,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2802,7 +2844,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2812,7 +2854,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2822,7 +2864,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2832,7 +2874,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2842,7 +2884,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2852,7 +2894,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2862,7 +2904,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2872,7 +2914,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2882,7 +2924,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2892,7 +2934,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2902,7 +2944,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2912,7 +2954,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2922,7 +2964,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2932,7 +2974,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2942,7 +2984,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2952,7 +2994,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2962,7 +3004,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2972,7 +3014,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2982,7 +3024,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -2992,7 +3034,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3002,7 +3044,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3012,7 +3054,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3022,7 +3064,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3032,7 +3074,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3042,7 +3084,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3052,7 +3094,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3062,7 +3104,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3072,7 +3114,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3082,7 +3124,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3092,7 +3134,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/*a/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3102,17 +3144,17 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/?a"],
-        included: 0x1ffffb,
+        included: 0x5ffffb,
     },
     Case {
         kind: "single_neg",
         patterns: &["**", "!/?a"],
-        included: 0x4,
+        included: 0x200004,
     },
     Case {
         kind: "single",
         patterns: &["/?a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3122,7 +3164,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/[ad]"],
-        included: 0x1e001e,
+        included: 0x3e001e,
     },
     Case {
         kind: "single_neg",
@@ -3132,7 +3174,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/[ad]/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -3142,7 +3184,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a"],
-        included: 0x1ffffe,
+        included: 0x7ffffe,
     },
     Case {
         kind: "single_neg",
@@ -3152,7 +3194,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a*"],
-        included: 0x1ffff4,
+        included: 0x7ffff4,
     },
     Case {
         kind: "single_neg",
@@ -3162,7 +3204,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3172,7 +3214,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3182,7 +3224,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3192,7 +3234,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3202,7 +3244,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3212,7 +3254,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3222,7 +3264,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3232,7 +3274,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3242,7 +3284,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3252,7 +3294,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3262,7 +3304,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/**/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3272,7 +3314,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3282,7 +3324,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3292,7 +3334,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3302,7 +3344,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3312,7 +3354,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3322,7 +3364,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3332,7 +3374,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3342,7 +3384,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3352,7 +3394,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3362,7 +3404,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3372,7 +3414,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3382,7 +3424,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3392,7 +3434,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3402,7 +3444,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3412,7 +3454,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3422,7 +3464,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3432,7 +3474,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3442,7 +3484,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3452,7 +3494,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3462,7 +3504,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3472,7 +3514,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3482,7 +3524,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3492,7 +3534,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3502,7 +3544,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3512,7 +3554,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3522,7 +3564,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3532,7 +3574,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3542,7 +3584,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3552,7 +3594,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3562,7 +3604,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3572,7 +3614,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3582,7 +3624,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3592,7 +3634,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3602,7 +3644,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3612,7 +3654,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3622,7 +3664,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3632,7 +3674,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3642,7 +3684,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3652,7 +3694,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/a/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3662,7 +3704,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -3671,8 +3713,28 @@ pub const CASES: &[Case] = &[
     },
     Case {
         kind: "single",
+        patterns: &["/d**a"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/d**a"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["/d**a/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/d**a/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
         patterns: &["/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -3682,7 +3744,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -3692,7 +3754,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -3702,7 +3764,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -3712,7 +3774,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -3722,7 +3784,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -3732,7 +3794,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**/*a"],
-        included: 0x1f5b5f,
+        included: 0x3f5b5f,
     },
     Case {
         kind: "single_neg",
@@ -3742,7 +3804,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "single_neg",
@@ -3752,7 +3814,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3762,7 +3824,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/**/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -3772,7 +3834,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -3782,7 +3844,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -3792,7 +3854,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*/**"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -3802,7 +3864,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*/*a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "single_neg",
@@ -3812,7 +3874,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "single_neg",
@@ -3822,7 +3884,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3832,7 +3894,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3842,7 +3904,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a"],
-        included: 0x1fff5f,
+        included: 0x3fff5f,
     },
     Case {
         kind: "single_neg",
@@ -3852,7 +3914,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3862,7 +3924,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3872,7 +3934,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3882,7 +3944,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3892,7 +3954,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3902,7 +3964,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3912,7 +3974,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3922,7 +3984,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a"],
-        included: 0x1fffdf,
+        included: 0x7fffdf,
     },
     Case {
         kind: "single_neg",
@@ -3932,7 +3994,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3942,7 +4004,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3952,7 +4014,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3962,7 +4024,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3972,7 +4034,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3982,7 +4044,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -3992,7 +4054,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4002,7 +4064,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4012,7 +4074,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4022,7 +4084,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4032,7 +4094,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4042,7 +4104,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4052,7 +4114,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4062,7 +4124,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4072,7 +4134,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4082,7 +4144,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -4092,7 +4154,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -4102,7 +4164,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -4112,7 +4174,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -4122,7 +4184,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e/*a"],
-        included: 0x1ffbff,
+        included: 0x7ffbff,
     },
     Case {
         kind: "single_neg",
@@ -4132,7 +4194,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e/a"],
-        included: 0x1ffbff,
+        included: 0x7ffbff,
     },
     Case {
         kind: "single_neg",
@@ -4142,7 +4204,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4152,7 +4214,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/d/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4161,8 +4223,48 @@ pub const CASES: &[Case] = &[
     },
     Case {
         kind: "single",
+        patterns: &["/d[!x]e"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/d[!x]e"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["/d[!x]e/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/d[!x]e/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["/d[--0]e"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/d[--0]e"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["/d[--0]e/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!/d[--0]e/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
         patterns: &["/e"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -4172,7 +4274,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -4182,7 +4284,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -4192,7 +4294,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -4202,7 +4304,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4212,7 +4314,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**/*"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -4222,7 +4324,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**/**"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -4232,7 +4334,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**/*a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -4242,7 +4344,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**/a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -4252,7 +4354,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4262,7 +4364,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/**/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4272,7 +4374,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4282,7 +4384,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4292,7 +4394,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4302,7 +4404,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4312,7 +4414,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4322,7 +4424,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4332,7 +4434,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4342,7 +4444,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -4352,7 +4454,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4362,7 +4464,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4372,7 +4474,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4382,7 +4484,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4392,7 +4494,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4402,7 +4504,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4412,7 +4514,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4422,7 +4524,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -4432,7 +4534,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4442,7 +4544,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4452,7 +4554,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4462,7 +4564,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4472,7 +4574,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4482,7 +4584,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4492,7 +4594,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4502,7 +4604,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4512,7 +4614,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4522,7 +4624,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4532,7 +4634,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4542,7 +4644,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4552,7 +4654,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4562,7 +4664,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4572,7 +4674,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4582,7 +4684,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4592,7 +4694,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4602,7 +4704,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4612,7 +4714,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4622,7 +4724,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4632,7 +4734,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4642,7 +4744,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4652,7 +4754,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["/e/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4667,12 +4769,12 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single_neg",
         patterns: &["**", "!?a"],
-        included: 0x4,
+        included: 0x200004,
     },
     Case {
         kind: "single",
         patterns: &["?a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4682,7 +4784,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "single_neg",
@@ -4692,7 +4794,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["[ad]/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -4702,7 +4804,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "single_neg",
@@ -4712,7 +4814,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "single_neg",
@@ -4722,7 +4824,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4732,7 +4834,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4742,7 +4844,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4752,7 +4854,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4762,7 +4864,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4772,7 +4874,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4782,7 +4884,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4792,7 +4894,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4802,7 +4904,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4812,7 +4914,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4822,7 +4924,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/**/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4832,7 +4934,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4842,7 +4944,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4852,7 +4954,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4862,7 +4964,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4872,7 +4974,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4882,7 +4984,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4892,7 +4994,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4902,7 +5004,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4912,7 +5014,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4922,7 +5024,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4932,7 +5034,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4942,7 +5044,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4952,7 +5054,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4962,7 +5064,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4972,7 +5074,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4982,7 +5084,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -4992,7 +5094,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5002,7 +5104,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5012,7 +5114,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5022,7 +5124,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5032,7 +5134,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5042,7 +5144,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5052,7 +5154,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5062,7 +5164,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5072,7 +5174,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5082,7 +5184,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5092,7 +5194,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5102,7 +5204,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5112,7 +5214,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5122,7 +5224,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5132,7 +5234,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5142,7 +5244,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5152,7 +5254,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5162,7 +5264,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5172,7 +5274,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5182,7 +5284,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5192,7 +5294,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5202,7 +5304,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5212,7 +5314,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["a/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5222,7 +5324,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -5231,8 +5333,28 @@ pub const CASES: &[Case] = &[
     },
     Case {
         kind: "single",
+        patterns: &["d**a"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!d**a"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["d**a/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!d**a/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
         patterns: &["d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -5242,7 +5364,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -5252,7 +5374,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -5262,7 +5384,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -5272,7 +5394,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -5282,7 +5404,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "single_neg",
@@ -5292,7 +5414,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**/*a"],
-        included: 0x1f5b5f,
+        included: 0x3f5b5f,
     },
     Case {
         kind: "single_neg",
@@ -5302,7 +5424,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "single_neg",
@@ -5312,7 +5434,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5322,7 +5444,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/**/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -5332,7 +5454,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -5342,7 +5464,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -5352,7 +5474,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*/**"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "single_neg",
@@ -5362,7 +5484,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*/*a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "single_neg",
@@ -5372,7 +5494,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "single_neg",
@@ -5382,7 +5504,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5392,7 +5514,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5402,7 +5524,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a"],
-        included: 0x1fff5f,
+        included: 0x3fff5f,
     },
     Case {
         kind: "single_neg",
@@ -5412,7 +5534,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5422,7 +5544,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5432,7 +5554,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5442,7 +5564,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5452,7 +5574,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5462,7 +5584,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5472,7 +5594,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5482,7 +5604,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a"],
-        included: 0x1fffdf,
+        included: 0x7fffdf,
     },
     Case {
         kind: "single_neg",
@@ -5492,7 +5614,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5502,7 +5624,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5512,7 +5634,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5522,7 +5644,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5532,7 +5654,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5542,7 +5664,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5552,7 +5674,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5562,7 +5684,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5572,7 +5694,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5582,7 +5704,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5592,7 +5714,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5602,7 +5724,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5612,7 +5734,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5622,7 +5744,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5632,7 +5754,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5642,7 +5764,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -5652,7 +5774,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -5662,7 +5784,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -5672,7 +5794,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "single_neg",
@@ -5682,7 +5804,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e/*a"],
-        included: 0x1ffbff,
+        included: 0x7ffbff,
     },
     Case {
         kind: "single_neg",
@@ -5692,7 +5814,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e/a"],
-        included: 0x1ffbff,
+        included: 0x7ffbff,
     },
     Case {
         kind: "single_neg",
@@ -5702,7 +5824,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5712,7 +5834,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["d/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5721,8 +5843,48 @@ pub const CASES: &[Case] = &[
     },
     Case {
         kind: "single",
+        patterns: &["d[!x]e"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!d[!x]e"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["d[!x]e/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!d[!x]e/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["d[--0]e"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!d[--0]e"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
+        patterns: &["d[--0]e/"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "single_neg",
+        patterns: &["**", "!d[--0]e/"],
+        included: 0x0,
+    },
+    Case {
+        kind: "single",
         patterns: &["e"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -5732,7 +5894,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/"],
-        included: 0x383ff,
+        included: 0x6383ff,
     },
     Case {
         kind: "single_neg",
@@ -5742,7 +5904,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -5752,7 +5914,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -5762,7 +5924,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5772,7 +5934,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**/*"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -5782,7 +5944,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**/**"],
-        included: 0x7ffff,
+        included: 0x67ffff,
     },
     Case {
         kind: "single_neg",
@@ -5792,7 +5954,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**/*a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -5802,7 +5964,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**/a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -5812,7 +5974,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5822,7 +5984,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/**/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5832,7 +5994,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5842,7 +6004,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5852,7 +6014,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5862,7 +6024,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5872,7 +6034,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5882,7 +6044,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5892,7 +6054,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5902,7 +6064,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -5912,7 +6074,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5922,7 +6084,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5932,7 +6094,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5942,7 +6104,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5952,7 +6114,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5962,7 +6124,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5972,7 +6134,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/*a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -5982,7 +6144,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "single_neg",
@@ -5992,7 +6154,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6002,7 +6164,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6012,7 +6174,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6022,7 +6184,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6032,7 +6194,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6042,7 +6204,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6052,7 +6214,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/a/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6062,7 +6224,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6072,7 +6234,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6082,7 +6244,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6092,7 +6254,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6102,7 +6264,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6112,7 +6274,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6122,7 +6284,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6132,7 +6294,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6142,7 +6304,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6152,7 +6314,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6162,7 +6324,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6172,7 +6334,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6182,7 +6344,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e/*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6192,7 +6354,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6202,7 +6364,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6212,7 +6374,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "single",
         patterns: &["e/e/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "single_neg",
@@ -6407,7 +6569,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -6417,7 +6579,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -6427,7 +6589,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*", "!/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
@@ -6477,7 +6639,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*", "!*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "pair_rev",
@@ -6497,7 +6659,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*", "!*a*"],
-        included: 0xf,
+        included: 0x20000f,
     },
     Case {
         kind: "pair_rev",
@@ -6517,7 +6679,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*", "!?a"],
-        included: 0x4,
+        included: 0x200004,
     },
     Case {
         kind: "pair_rev",
@@ -6737,7 +6899,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -6747,7 +6909,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -6757,7 +6919,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -6767,7 +6929,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!d"],
-        included: 0x1ffe0,
+        included: 0x41ffe0,
     },
     Case {
         kind: "pair_rev",
@@ -6777,7 +6939,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!/d"],
-        included: 0x1ffe0,
+        included: 0x41ffe0,
     },
     Case {
         kind: "pair_rev",
@@ -6787,7 +6949,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!d/"],
-        included: 0x1ffe0,
+        included: 0x41ffe0,
     },
     Case {
         kind: "pair_rev",
@@ -6797,7 +6959,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!/d/"],
-        included: 0x1ffe0,
+        included: 0x41ffe0,
     },
     Case {
         kind: "pair_rev",
@@ -6807,7 +6969,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!*a"],
-        included: 0x5,
+        included: 0x200005,
     },
     Case {
         kind: "pair_rev",
@@ -6827,7 +6989,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!*a*"],
-        included: 0xf,
+        included: 0x20000f,
     },
     Case {
         kind: "pair_rev",
@@ -6847,7 +7009,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!?a"],
-        included: 0x4,
+        included: 0x200004,
     },
     Case {
         kind: "pair_rev",
@@ -6857,7 +7019,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "![ad]"],
-        included: 0x1ffe1,
+        included: 0x41ffe1,
     },
     Case {
         kind: "pair_rev",
@@ -6907,7 +7069,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["/*", "!**/d"],
-        included: 0x1ffe0,
+        included: 0x41ffe0,
     },
     Case {
         kind: "pair_rev",
@@ -7067,1327 +7229,1327 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["d", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!?a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/*/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!/d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/e/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!**/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/e/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!*/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d", "!d/**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!?a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/*/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!/d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/e/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!**/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/e/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!*/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d", "!d/**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!?a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/*/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!/d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/e/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!**/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/e/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!*/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/", "!d/**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!?a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/*/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!/d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/e/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!**/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/e/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!*/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["/d/", "!d/**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["*a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -8397,7 +8559,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -8407,7 +8569,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!/*"],
-        included: 0x115b5f,
+        included: 0x315b5f,
     },
     Case {
         kind: "pair_rev",
@@ -8457,7 +8619,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -8477,7 +8639,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -8497,7 +8659,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!?a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
@@ -8517,7 +8679,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!d/*"],
-        included: 0x115bfa,
+        included: 0x515bfa,
     },
     Case {
         kind: "pair_rev",
@@ -8527,7 +8689,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!d/**"],
-        included: 0x11fffa,
+        included: 0x51fffa,
     },
     Case {
         kind: "pair_rev",
@@ -8567,7 +8729,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a", "!*/*"],
-        included: 0x1b5bfa,
+        included: 0x5b5bfa,
     },
     Case {
         kind: "pair_rev",
@@ -8717,337 +8879,337 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["a*", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!/*"],
-        included: 0x29f,
+        included: 0x60029f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!/d"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!/d/"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*a"],
-        included: 0xea6b5,
+        included: 0x6ea6b5,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*.tmp"],
-        included: 0x11539c,
+        included: 0x71539c,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!?a"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "![ad]"],
-        included: 0xea6b5,
+        included: 0x6ea6b5,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/*"],
-        included: 0x3f4,
+        included: 0x6003f4,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/**"],
-        included: 0x1fff4,
+        included: 0x61fff4,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/*/"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*/d"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!**/d"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*/*"],
-        included: 0x1a03f4,
+        included: 0x7a03f4,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/e"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!/d/e"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/e/"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/*/a"],
-        included: 0x8694,
+        included: 0x608694,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/**/a"],
-        included: 0xa6b4,
+        included: 0x60a6b4,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!**/a"],
-        included: 0xea6b5,
+        included: 0x6ea6b5,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!**/e/a"],
-        included: 0xc0694,
+        included: 0x6c0694,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*/e/a"],
-        included: 0x40694,
+        included: 0x640694,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/e/*"],
-        included: 0x1e94,
+        included: 0x601e94,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/e/**"],
-        included: 0x7e94,
+        included: 0x607e94,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/e/f"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!*/*/a"],
-        included: 0x48694,
+        included: 0x648694,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!**/*.tmp"],
-        included: 0x11539c,
+        included: 0x71539c,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["a*", "!d/**/*.tmp"],
-        included: 0x15394,
+        included: 0x615394,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "a*"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair",
         patterns: &["*a*", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9057,7 +9219,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9067,7 +9229,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!/*"],
-        included: 0x21f,
+        included: 0x20021f,
     },
     Case {
         kind: "pair_rev",
@@ -9117,7 +9279,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!*a"],
-        included: 0xea6b5,
+        included: 0x6ea6b5,
     },
     Case {
         kind: "pair_rev",
@@ -9137,7 +9299,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9157,7 +9319,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!?a"],
-        included: 0x294,
+        included: 0x600294,
     },
     Case {
         kind: "pair_rev",
@@ -9177,7 +9339,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!d/*"],
-        included: 0x3f0,
+        included: 0x4003f0,
     },
     Case {
         kind: "pair_rev",
@@ -9187,7 +9349,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!d/**"],
-        included: 0x1fff0,
+        included: 0x41fff0,
     },
     Case {
         kind: "pair_rev",
@@ -9227,7 +9389,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*a*", "!*/*"],
-        included: 0x1a03f0,
+        included: 0x5a03f0,
     },
     Case {
         kind: "pair_rev",
@@ -9377,337 +9539,337 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!/*"],
-        included: 0xeaeff,
+        included: 0x6eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!/d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!/d/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!?a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "![ad]"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/*"],
-        included: 0xeaff7,
+        included: 0x6eaff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/**"],
-        included: 0xffff7,
+        included: 0x6ffff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/*/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*/d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!**/d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*/*"],
-        included: 0x1eaff7,
+        included: 0x7eaff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/e"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!/d/e"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/e/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/*/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/**/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!**/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!**/e/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*/e/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/e/*"],
-        included: 0xebef7,
+        included: 0x6ebef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/e/**"],
-        included: 0xefef7,
+        included: 0x6efef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/e/f"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!*/*/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!**/*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["*.tmp", "!d/**/*.tmp"],
-        included: 0xffff7,
+        included: 0x6ffff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["?a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9717,7 +9879,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9727,7 +9889,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!/*"],
-        included: 0x1fff7f,
+        included: 0x3fff7f,
     },
     Case {
         kind: "pair_rev",
@@ -9777,7 +9939,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9797,7 +9959,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9817,7 +9979,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!?a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
@@ -9837,7 +9999,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!d/*"],
-        included: 0x1ffffb,
+        included: 0x5ffffb,
     },
     Case {
         kind: "pair_rev",
@@ -9847,7 +10009,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!d/**"],
-        included: 0x1ffffb,
+        included: 0x5ffffb,
     },
     Case {
         kind: "pair_rev",
@@ -9887,7 +10049,7 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["?a", "!*/*"],
-        included: 0x1ffffb,
+        included: 0x5ffffb,
     },
     Case {
         kind: "pair_rev",
@@ -10037,6932 +10199,6932 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "pair",
         patterns: &["[ad]", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!/*"],
-        included: 0x115bdf,
+        included: 0x715bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!/d"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!/d/"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*.tmp"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!?a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/*"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/**"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/*/"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*/d"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!**/d"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*/*"],
-        included: 0x1a001e,
+        included: 0x3a001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/e"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!/d/e"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/e/"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/*/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!**/e/a"],
-        included: 0x1c001e,
+        included: 0x3c001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*/e/a"],
-        included: 0x14001e,
+        included: 0x34001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/e/*"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/e/**"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/e/f"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!*/*/a"],
-        included: 0x14001e,
+        included: 0x34001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!**/*.tmp"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["[ad]", "!d/**/*.tmp"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "[ad]"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*a"],
-        included: 0x1e00bf,
+        included: 0x7e00bf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!a*"],
-        included: 0x1e017f,
+        included: 0x3e017f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*a*"],
-        included: 0x1e01ff,
+        included: 0x7e01ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*.tmp"],
-        included: 0x1e011f,
+        included: 0x3e011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!?a"],
-        included: 0x1e009f,
+        included: 0x7e009f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "![ad]"],
-        included: 0x1e003f,
+        included: 0x3e003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/*/"],
-        included: 0x1ffc1f,
+        included: 0x3ffc1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/e"],
-        included: 0x1e7c1f,
+        included: 0x3e7c1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!/d/e"],
-        included: 0x1e7c1f,
+        included: 0x3e7c1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/e/"],
-        included: 0x1e7c1f,
+        included: 0x3e7c1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/**/a"],
-        included: 0x1e003f,
+        included: 0x3e003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!**/a"],
-        included: 0x1e003f,
+        included: 0x3e003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!**/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/e/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!*/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!**/*.tmp"],
-        included: 0x1e011f,
+        included: 0x3e011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*", "!d/**/*.tmp"],
-        included: 0x1e011f,
+        included: 0x3e011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!/d/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*a"],
-        included: 0x1e00bf,
+        included: 0x7e00bf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!a*"],
-        included: 0x1e017f,
+        included: 0x3e017f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*a*"],
-        included: 0x1e01ff,
+        included: 0x7e01ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*.tmp"],
-        included: 0x1e011f,
+        included: 0x3e011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!?a"],
-        included: 0x1e009f,
+        included: 0x7e009f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "![ad]"],
-        included: 0x1e003f,
+        included: 0x3e003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/*/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!/d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/e/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/**/a"],
-        included: 0x1e003f,
+        included: 0x3e003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!**/a"],
-        included: 0x1e003f,
+        included: 0x3e003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!**/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/e/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!*/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!**/*.tmp"],
-        included: 0x1e011f,
+        included: 0x3e011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/**", "!d/**/*.tmp"],
-        included: 0x1e011f,
+        included: 0x3e011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!/d"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!/d/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!a*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*a*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*.tmp"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!?a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "![ad]"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*/d"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!**/d"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/e"],
-        included: 0x1e7fff,
+        included: 0x7e7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!/d/e"],
-        included: 0x1e7fff,
+        included: 0x7e7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/e/"],
-        included: 0x1e7fff,
+        included: 0x7e7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/*/a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/**/a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!**/a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!**/e/a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*/e/a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/e/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/e/**"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/e/f"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!*/*/a"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!**/*.tmp"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/", "!d/**/*.tmp"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/*/"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!?a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!**/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/e/f"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!*/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!**/*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["*/d", "!d/**/*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "*/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!/d/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*a*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!?a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/*/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!**/d"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!/d/e"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/e/"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!**/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!**/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*/e/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/e/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!*/*/a"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["**/d", "!d/**/*.tmp"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "**/d"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!/d"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!/d/"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*a"],
-        included: 0xa00bf,
+        included: 0x6a00bf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!a*"],
-        included: 0x1a017f,
+        included: 0x3a017f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*a*"],
-        included: 0x1a01ff,
+        included: 0x7a01ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*.tmp"],
-        included: 0x10011f,
+        included: 0x30011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!?a"],
-        included: 0x9f,
+        included: 0x60009f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "![ad]"],
-        included: 0xa003f,
+        included: 0x2a003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/*"],
-        included: 0x1ffff,
+        included: 0x61ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/**"],
-        included: 0x1ffff,
+        included: 0x61ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/*/"],
-        included: 0x1fc1f,
+        included: 0x21fc1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*/d"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!**/d"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/e"],
-        included: 0x7c1f,
+        included: 0x207c1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!/d/e"],
-        included: 0x7c1f,
+        included: 0x207c1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/e/"],
-        included: 0x7c1f,
+        included: 0x207c1f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/*/a"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/**/a"],
-        included: 0x3f,
+        included: 0x20003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!**/a"],
-        included: 0xa003f,
+        included: 0x2a003f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!**/e/a"],
-        included: 0x8001f,
+        included: 0x28001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*/e/a"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/e/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/e/**"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/e/f"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!*/*/a"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!**/*.tmp"],
-        included: 0x10011f,
+        included: 0x30011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["*/*", "!d/**/*.tmp"],
-        included: 0x11f,
+        included: 0x20011f,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "*/*"],
-        included: 0x1f,
+        included: 0x20001f,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!/d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!a*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*a*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!?a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "![ad]"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!**/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/*/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/**/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!**/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!**/e/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*/e/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/e/f"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!*/*/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!**/*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e", "!d/**/*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!/d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!a*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*a*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!?a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "![ad]"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!**/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/*/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/**/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!**/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!**/e/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*/e/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/e/f"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!*/*/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!**/*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["/d/e", "!d/**/*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!/d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!a*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*a*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!?a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "![ad]"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/*/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!**/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!/d/e"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/e/"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/*/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/**/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!**/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!**/e/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*/e/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/e/f"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!*/*/a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!**/*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/", "!d/**/*.tmp"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!/*"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!/d"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!/d/"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*.tmp"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!?a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/*"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/*/"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*/d"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!**/d"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*/*"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/e"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!/d/e"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/e/"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!**/e/a"],
-        included: 0x1f7fff,
+        included: 0x7f7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*/e/a"],
-        included: 0x1f7fff,
+        included: 0x7f7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/e/*"],
-        included: 0x1f7fff,
+        included: 0x7f7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/e/**"],
-        included: 0x1f7fff,
+        included: 0x7f7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/e/f"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!*/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!**/*.tmp"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/*/a", "!d/**/*.tmp"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/*/a"],
-        included: 0x1f7bff,
+        included: 0x7f7bff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!/*"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!/d"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!/d/"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*.tmp"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!?a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/*"],
-        included: 0x1f5bff,
+        included: 0x7f5bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/*/"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*/d"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!**/d"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*/*"],
-        included: 0x1f5bff,
+        included: 0x7f5bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/e"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!/d/e"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/e/"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/*/a"],
-        included: 0x1fdfdf,
+        included: 0x7fdfdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!**/e/a"],
-        included: 0x1f5fdf,
+        included: 0x7f5fdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*/e/a"],
-        included: 0x1f5fdf,
+        included: 0x7f5fdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/e/*"],
-        included: 0x1f5fdf,
+        included: 0x7f5fdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/e/**"],
-        included: 0x1f7fdf,
+        included: 0x7f7fdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/e/f"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!*/*/a"],
-        included: 0x1fdfdf,
+        included: 0x7fdfdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!**/*.tmp"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/a", "!d/**/*.tmp"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/**/a"],
-        included: 0x1f5bdf,
+        included: 0x7f5bdf,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!/*"],
-        included: 0x115bdf,
+        included: 0x715bdf,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!/d"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!/d/"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*.tmp"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!?a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/*"],
-        included: 0x115bfe,
+        included: 0x715bfe,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/**"],
-        included: 0x11fffe,
+        included: 0x71fffe,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/*/"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*/d"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!**/d"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*/*"],
-        included: 0x1b5bfe,
+        included: 0x7b5bfe,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/e"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!/d/e"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/e/"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/*/a"],
-        included: 0x11dfde,
+        included: 0x71dfde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/**/a"],
-        included: 0x11fffe,
+        included: 0x71fffe,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!**/e/a"],
-        included: 0x1d5fde,
+        included: 0x7d5fde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*/e/a"],
-        included: 0x155fde,
+        included: 0x755fde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/e/*"],
-        included: 0x115fde,
+        included: 0x715fde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/e/**"],
-        included: 0x117fde,
+        included: 0x717fde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/e/f"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!*/*/a"],
-        included: 0x15dfde,
+        included: 0x75dfde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!**/*.tmp"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/a", "!d/**/*.tmp"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!/*"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!/d"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!/d/"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*.tmp"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!?a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/*"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/**"],
-        included: 0x13ffff,
+        included: 0x73ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/*/"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*/d"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!**/d"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*/*"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/e"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!/d/e"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/e/"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/*/a"],
-        included: 0x13ffff,
+        included: 0x73ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/**/a"],
-        included: 0x13ffff,
+        included: 0x73ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!**/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*/e/a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/e/*"],
-        included: 0x13ffff,
+        included: 0x73ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/e/**"],
-        included: 0x13ffff,
+        included: 0x73ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/e/f"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!*/*/a"],
-        included: 0x17ffff,
+        included: 0x77ffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!**/*.tmp"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["**/e/a", "!d/**/*.tmp"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "**/e/a"],
-        included: 0x13fbff,
+        included: 0x73fbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!/*"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!/d"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!/d/"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*.tmp"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!?a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/*"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/**"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/*/"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*/d"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!**/d"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*/*"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/e"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!/d/e"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/e/"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/*/a"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/**/a"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!**/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*/e/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/e/*"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/e/**"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/e/f"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!*/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!**/*.tmp"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["*/e/a", "!d/**/*.tmp"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "*/e/a"],
-        included: 0x1bfbff,
+        included: 0x7bfbff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!/d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!a*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*a*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*.tmp"],
-        included: 0x1f93ff,
+        included: 0x7f93ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!?a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "![ad]"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/*/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!**/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/*/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/**/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!**/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!**/e/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*/e/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/e/f"],
-        included: 0x1fe3ff,
+        included: 0x7fe3ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!*/*/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!**/*.tmp"],
-        included: 0x1f93ff,
+        included: 0x7f93ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/*", "!d/**/*.tmp"],
-        included: 0x1f93ff,
+        included: 0x7f93ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!/d/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!a*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*a*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*.tmp"],
-        included: 0x1f93ff,
+        included: 0x7f93ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!?a"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "![ad]"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/*/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!**/d"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!/d/e"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/e/"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/*/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/**/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!**/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!**/e/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*/e/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/e/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/e/f"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!*/*/a"],
-        included: 0x1f87ff,
+        included: 0x7f87ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!**/*.tmp"],
-        included: 0x1f93ff,
+        included: 0x7f93ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/**", "!d/**/*.tmp"],
-        included: 0x1f93ff,
+        included: 0x7f93ff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/e/**"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!/d"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!/d/"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!a*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*a*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*.tmp"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!?a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "![ad]"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/*/"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*/d"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!**/d"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/e"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!/d/e"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/e/"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/*/a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/**/a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!**/a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!**/e/a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*/e/a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/e/*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/e/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/e/f"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!*/*/a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!**/*.tmp"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["d/e/f", "!d/**/*.tmp"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!/*"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!/d"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!/d/"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*.tmp"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!?a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "![ad]"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/*"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/**"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/*/"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*/d"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!**/d"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*/*"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/e"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!/d/e"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/e/"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/*/a"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/**/a"],
-        included: 0x1bffff,
+        included: 0x7bffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!**/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!**/e/a"],
-        included: 0x1f7fff,
+        included: 0x7f7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*/e/a"],
-        included: 0x1f7fff,
+        included: 0x7f7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/e/*"],
-        included: 0x1b7fff,
+        included: 0x7b7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/e/**"],
-        included: 0x1b7fff,
+        included: 0x7b7fff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/e/f"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!*/*/a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!**/*.tmp"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["*/*/a", "!d/**/*.tmp"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "*/*/a"],
-        included: 0x1b7bff,
+        included: 0x7b7bff,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!/*"],
-        included: 0xeaeff,
+        included: 0x6eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!/d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!/d/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!?a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "![ad]"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/*"],
-        included: 0xeaff7,
+        included: 0x6eaff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/**"],
-        included: 0xffff7,
+        included: 0x6ffff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/*/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*/d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!**/d"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*/*"],
-        included: 0x1eaff7,
+        included: 0x7eaff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/e"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!/d/e"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/e/"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/*/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/**/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!**/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!**/e/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*/e/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/e/*"],
-        included: 0xebef7,
+        included: 0x6ebef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/e/**"],
-        included: 0xefef7,
+        included: 0x6efef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/e/f"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!*/*/a"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!**/*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["**/*.tmp", "!d/**/*.tmp"],
-        included: 0xffff7,
+        included: 0x6ffff7,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "**/*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!/*"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/*", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!/d"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!/d/"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!a*", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*a*"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*a*", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*.tmp", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!?a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!?a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "![ad]"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["![ad]", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/*"],
-        included: 0x1eafff,
+        included: 0x7eafff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/**"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/*/"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*/d"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/d", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!**/d"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/d", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*/*"],
-        included: 0x1eafff,
+        included: 0x7eafff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/e"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!/d/e"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!/d/e", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/e/"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/*/a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/*/a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/**/a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!**/a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!**/e/a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/e/a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*/e/a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/e/a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/e/*"],
-        included: 0x1ebeff,
+        included: 0x7ebeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/*", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/e/**"],
-        included: 0x1efeff,
+        included: 0x7efeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/**", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/e/f"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/e/f", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!*/*/a"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!*/*/a", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!**/*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!**/*.tmp", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "pair",
         patterns: &["d/**/*.tmp", "!d/**/*.tmp"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "pair_rev",
         patterns: &["!d/**/*.tmp", "d/**/*.tmp"],
-        included: 0x1eaeff,
+        included: 0x7eaeff,
     },
     Case {
         kind: "triple",
@@ -17177,32 +17339,32 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "triple",
         patterns: &["/*", "!d", "d/e/*"],
-        included: 0x183e0,
+        included: 0x4183e0,
     },
     Case {
         kind: "triple",
         patterns: &["/*", "!d", "d/e/f"],
-        included: 0x19fe0,
+        included: 0x419fe0,
     },
     Case {
         kind: "triple",
         patterns: &["/*", "!d", "**/a"],
-        included: 0x15bc0,
+        included: 0x415bc0,
     },
     Case {
         kind: "triple",
         patterns: &["/*", "!d", "*.tmp"],
-        included: 0xaee0,
+        included: 0x40aee0,
     },
     Case {
         kind: "triple",
         patterns: &["/*", "!d", "d/e/f/*"],
-        included: 0x19fe0,
+        included: 0x419fe0,
     },
     Case {
         kind: "triple",
         patterns: &["/*", "!d", "d/g"],
-        included: 0x7fe0,
+        included: 0x407fe0,
     },
     Case {
         kind: "triple",
@@ -17387,1052 +17549,1182 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "triple",
         patterns: &["d", "!d", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d", "d/e/f/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d", "d/g"],
-        included: 0x1e7fff,
+        included: 0x7e7fff,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/**", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/**", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/**", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/**", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/**", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/**", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/*", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/*", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/*", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/*", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/*", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/*", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/*", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/*", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/*", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/*", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/*", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/*", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/f", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/f", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/f", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/f", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/f", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!d/e/f", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!*/e", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!*/e", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!*/e", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!*/e", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!*/e", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d", "!*/e", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e", "d/e/f"],
-        included: 0x1e1c1f,
+        included: 0x3e1c1f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e", "**/a"],
-        included: 0x10581e,
+        included: 0x30581e,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e", "*.tmp"],
-        included: 0xe2c17,
+        included: 0x2e2c17,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e", "d/e/f/*"],
-        included: 0x1e1c1f,
+        included: 0x3e1c1f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e", "d/g"],
-        included: 0x1e7c1f,
+        included: 0x3e7c1f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/**", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/**", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/**", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/**", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/**", "d/e/f/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/**", "d/g"],
-        included: 0x1e7fff,
+        included: 0x7e7fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/*", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/*", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/*", "d/e/f/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/*", "d/g"],
-        included: 0x1e7fff,
+        included: 0x7e7fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/*", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/*", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/*", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/*", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/*", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/*", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/f", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/f", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/f", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/f", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/f", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!d/e/f", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!*/e", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!*/e", "d/e/f"],
-        included: 0x1e1c1f,
+        included: 0x3e1c1f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!*/e", "**/a"],
-        included: 0x10581e,
+        included: 0x30581e,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!*/e", "*.tmp"],
-        included: 0xe2c17,
+        included: 0x2e2c17,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!*/e", "d/e/f/*"],
-        included: 0x1e1c1f,
+        included: 0x3e1c1f,
     },
     Case {
         kind: "triple",
         patterns: &["d/*", "!*/e", "d/g"],
-        included: 0x1e7c1f,
+        included: 0x3e7c1f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/**", "d/e/*"],
-        included: 0x1f83ff,
+        included: 0x7f83ff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/**", "d/e/f"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/**", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/**", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/**", "d/e/f/*"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/**", "d/g"],
-        included: 0x1e7fff,
+        included: 0x7e7fff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/*", "d/e/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/*", "d/e/f"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/*", "**/a"],
-        included: 0x1003de,
+        included: 0x7003de,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/*", "*.tmp"],
-        included: 0xe02f7,
+        included: 0x6e02f7,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/*", "d/e/f/*"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/*", "d/g"],
-        included: 0x1e03ff,
+        included: 0x7e03ff,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/*", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/*", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/*", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/*", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/*", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/*", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/f", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/f", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/f", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/f", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/f", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!d/e/f", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!*/e", "d/e/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!*/e", "d/e/f"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!*/e", "**/a"],
-        included: 0x10001e,
+        included: 0x30001e,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!*/e", "*.tmp"],
-        included: 0xe0017,
+        included: 0x2e0017,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!*/e", "d/e/f/*"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["d/**", "!*/e", "d/g"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d", "d/e/*"],
-        included: 0x1103de,
+        included: 0x7103de,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d", "d/e/f"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d", "*.tmp"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d", "d/e/f/*"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d", "d/g"],
-        included: 0x105bde,
+        included: 0x705bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e", "d/e/*"],
-        included: 0x1103de,
+        included: 0x7103de,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e", "d/e/f"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e", "*.tmp"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e", "d/e/f/*"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e", "d/g"],
-        included: 0x105bde,
+        included: 0x705bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/**", "d/e/*"],
-        included: 0x1183fe,
+        included: 0x7183fe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/**", "d/e/f"],
-        included: 0x119ffe,
+        included: 0x719ffe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/**", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/**", "*.tmp"],
-        included: 0xaef6,
+        included: 0x60aef6,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/**", "d/e/f/*"],
-        included: 0x119ffe,
+        included: 0x719ffe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/**", "d/g"],
-        included: 0x107ffe,
+        included: 0x707ffe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/*", "d/e/*"],
-        included: 0x1103fe,
+        included: 0x7103fe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/*", "d/e/f"],
-        included: 0x111bfe,
+        included: 0x711bfe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/*", "*.tmp"],
-        included: 0xaf6,
+        included: 0x600af6,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/*", "d/e/f/*"],
-        included: 0x111bfe,
+        included: 0x711bfe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/*", "d/g"],
-        included: 0x105bfe,
+        included: 0x705bfe,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/*", "d/e/*"],
-        included: 0x1103de,
+        included: 0x7103de,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/*", "d/e/f"],
-        included: 0x111fde,
+        included: 0x711fde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/*", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/*", "*.tmp"],
-        included: 0xed6,
+        included: 0x600ed6,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/*", "d/e/f/*"],
-        included: 0x111fde,
+        included: 0x711fde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/*", "d/g"],
-        included: 0x105fde,
+        included: 0x705fde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/f", "d/e/*"],
-        included: 0x1103de,
+        included: 0x7103de,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/f", "d/e/f"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/f", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/f", "*.tmp"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/f", "d/e/f/*"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!d/e/f", "d/g"],
-        included: 0x105bde,
+        included: 0x705bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!*/e", "d/e/*"],
-        included: 0x1103de,
+        included: 0x7103de,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!*/e", "d/e/f"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!*/e", "**/a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!*/e", "*.tmp"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!*/e", "d/e/f/*"],
-        included: 0x111bde,
+        included: 0x711bde,
     },
     Case {
         kind: "triple",
         patterns: &["**/a", "!*/e", "d/g"],
-        included: 0x105bde,
+        included: 0x705bde,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d", "d/e/*"],
-        included: 0xe82f7,
+        included: 0x6e82f7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d", "d/e/f"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d", "**/a"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d", "d/e/f/*"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d", "d/g"],
-        included: 0xe2ef7,
+        included: 0x6e2ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e", "d/e/*"],
-        included: 0xe82f7,
+        included: 0x6e82f7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e", "d/e/f"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e", "**/a"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e", "d/e/f/*"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e", "d/g"],
-        included: 0xe2ef7,
+        included: 0x6e2ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/**", "d/e/*"],
-        included: 0xf83f7,
+        included: 0x6f83f7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/**", "d/e/f"],
-        included: 0xf9ff7,
+        included: 0x6f9ff7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/**", "**/a"],
-        included: 0x15bd6,
+        included: 0x615bd6,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/**", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/**", "d/e/f/*"],
-        included: 0xf9ff7,
+        included: 0x6f9ff7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/**", "d/g"],
-        included: 0xe7ff7,
+        included: 0x6e7ff7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/*", "d/e/*"],
-        included: 0xe83f7,
+        included: 0x6e83f7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/*", "d/e/f"],
-        included: 0xe8ff7,
+        included: 0x6e8ff7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/*", "**/a"],
-        included: 0xbd6,
+        included: 0x600bd6,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/*", "d/e/f/*"],
-        included: 0xe8ff7,
+        included: 0x6e8ff7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/*", "d/g"],
-        included: 0xe2ff7,
+        included: 0x6e2ff7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/*", "d/e/*"],
-        included: 0xe82f7,
+        included: 0x6e82f7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/*", "d/e/f"],
-        included: 0xe9ef7,
+        included: 0x6e9ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/*", "**/a"],
-        included: 0x1ad6,
+        included: 0x601ad6,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/*", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/*", "d/e/f/*"],
-        included: 0xe9ef7,
+        included: 0x6e9ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/*", "d/g"],
-        included: 0xe3ef7,
+        included: 0x6e3ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/f", "d/e/*"],
-        included: 0xe82f7,
+        included: 0x6e82f7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/f", "d/e/f"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/f", "**/a"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/f", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/f", "d/e/f/*"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!d/e/f", "d/g"],
-        included: 0xe2ef7,
+        included: 0x6e2ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!*/e", "d/e/*"],
-        included: 0xe82f7,
+        included: 0x6e82f7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!*/e", "d/e/f"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!*/e", "**/a"],
-        included: 0xad6,
+        included: 0x600ad6,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!*/e", "*.tmp"],
-        included: 0xeaef7,
+        included: 0x6eaef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!*/e", "d/e/f/*"],
-        included: 0xe8ef7,
+        included: 0x6e8ef7,
     },
     Case {
         kind: "triple",
         patterns: &["*.tmp", "!*/e", "d/g"],
-        included: 0xe2ef7,
+        included: 0x6e2ef7,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["/d**", "!/d*"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["/d/e**", "!/d/e*"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["\\!*"],
+        included: 0x1fffff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["/!*"],
+        included: 0x5fffff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["*", "!/!*"],
+        included: 0x200000,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["**", "!\\!a"],
+        included: 0x200000,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["*", "!*/", "!\\!a"],
+        included: 0x600000,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["!!a"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["**", "!!a"],
+        included: 0x200000,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["*", "!*/", "!!a"],
+        included: 0x600000,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["***/a"],
+        included: 0x715bde,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["/d/***/a"],
+        included: 0x7f5bdf,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["d/***"],
+        included: 0x3e001f,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["/d***", "!/d*"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["**", "!/d/***"],
+        included: 0x0,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["d/**\\/a"],
+        included: 0x7f5bff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["**\\/a"],
+        included: 0x715bdf,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["d\\/**/a"],
+        included: 0x7f5bdf,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["d**\\/a"],
+        included: 0x7dffdf,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["*", "!*/", "!d/**\\/a"],
+        included: 0xa400,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["d\\/**\\/a"],
+        included: 0x7f5bff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["d/**\\/e\\/a"],
+        included: 0x7fffff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["d/**\\/f\\/a"],
+        included: 0x7fdfff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["**\\/e\\/a"],
+        included: 0x7bfbff,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["*", "!*/", "!d\\/**\\/a"],
+        included: 0xa400,
+    },
+    Case {
+        kind: "shape",
+        patterns: &["*", "!*/", "!**d/a"],
+        included: 0x20020,
     },
     Case {
         kind: "chain",
@@ -18511,32 +18803,32 @@ pub const CASES: &[Case] = &[
     Case {
         kind: "chain",
         patterns: &["d/**", "!d/e/**", "d/e/f/**"],
-        included: 0x1e001f,
+        included: 0x3e001f,
     },
     Case {
         kind: "chain",
         patterns: &["*.tmp", "!d/**", "d/e/*.tmp"],
-        included: 0xfeff7,
+        included: 0x6feff7,
     },
     Case {
         kind: "chain",
         patterns: &["d/e/f", "!d/e/f/a", "d/e/f/a"],
-        included: 0x1f9fff,
+        included: 0x7f9fff,
     },
     Case {
         kind: "chain",
         patterns: &["a", "!a", "a", "!a"],
-        included: 0x1fffff,
+        included: 0x7fffff,
     },
     Case {
         kind: "chain",
         patterns: &["!a", "a", "!a", "a"],
-        included: 0x115bde,
+        included: 0x715bde,
     },
     Case {
         kind: "chain",
         patterns: &["d/*", "!d/e", "d/e/*", "!d/e/f", "d/e/f/*", "!d/e/f/a.tmp"],
-        included: 0x1e401f,
+        included: 0x3e401f,
     },
     Case {
         kind: "chain",

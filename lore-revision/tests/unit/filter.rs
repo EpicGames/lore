@@ -32,11 +32,51 @@ fn the_depth_bounds_agree_on_every_glob_shape() {
         ("/engine/**", "engine/**", false, 2, u32::MAX),
         ("**", "**", false, 1, u32::MAX),
         // A brace group expands to no more components than its text, so
-        // counting the text stays an upper bound over both alternatives.
+        // counting the text stays an upper bound over both alternatives. In a
+        // glob compared as text it is text; in one the matcher evaluates, a
+        // group holding a `/` may expand to fewer, so the lower bound is 1.
         ("/a{b,c/d}", "a{b,c/d}", false, 2, 2),
-        // Both cross a separator from inside one component of the text.
-        ("/a/b**", "a/b**", false, 2, u32::MAX),
-        ("/a[!x]b", "a[!x]b", false, 1, u32::MAX),
+        ("/a{b,c/d}*", "a{b,c/d}*", false, 1, 2),
+        ("/{a,b/c}*", "{a,b/c}*", false, 1, 2),
+        ("/{a,b}/c*", "{a,b}/c*", false, 2, 2),
+        // Two or more `*` as a whole component compile to `**`, and to `*/**`
+        // before an escaped `/`, where they match at least one component.
+        ("/a/***/b", "a/**/b", false, 2, u32::MAX),
+        ("/a/***", "a/**", false, 2, u32::MAX),
+        ("***/a", "a", true, 1, u32::MAX),
+        ("/**/a", "a", true, 1, u32::MAX),
+        ("/***/a", "a", true, 1, u32::MAX),
+        ("/**/a/b", "**/a/b", false, 2, u32::MAX),
+        ("/a/**\\/b", "a/*/**/b", false, 3, u32::MAX),
+        ("/a/***\\/b", "a/*/**/b", false, 3, u32::MAX),
+        ("**\\/b", "*/**/b", false, 2, u32::MAX),
+        ("/a\\/**\\/b\\/c", "a\\/*/**/b\\/c", false, 4, u32::MAX),
+        ("/a\\/**/b", "a\\/**/b", false, 2, u32::MAX),
+        ("/a**\\/b", "a**\\/b", false, 2, 2),
+        // A bracket expression matches one character other than a separator,
+        // whatever it holds, and an escaped or unclosed `[` opens none. A `/`
+        // between the first `[` and the last `]` may match no separator, so the
+        // lower bound is 1.
+        ("/x[a/b]y", "x[a/b]y", false, 1, 2),
+        ("/a[b/c]/d", "a[b/c]/d", false, 1, 3),
+        ("/[a]/[b]", "[a]/[b]", false, 1, 2),
+        ("/a[!x]b", "a[!x]b", false, 1, 1),
+        ("/a[^x]b", "a[^x]b", false, 1, 1),
+        ("/a[--0]b", "a[--0]b", false, 1, 1),
+        ("/src/*.[ch]", "src/*.[ch]", false, 2, 2),
+        ("/a/\\[b\\]", "a/\\[b\\]", false, 2, 2),
+        ("/a/[b", "a/[b", false, 2, 2),
+        // Two or more `*` sharing their component with other text are `*`.
+        ("/a**", "a**", false, 1, 1),
+        ("/a***", "a***", false, 1, 1),
+        ("/**b", "**b", false, 1, 1),
+        ("/a**b", "a**b", false, 1, 1),
+        ("/a/b**", "a/b**", false, 2, 2),
+        ("/a/**b/c", "a/**b/c", false, 3, 3),
+        // A leading `!` that reaches the glob is a literal character, not a
+        // negation that would match at any depth.
+        ("/!Temp*", "!temp*", false, 1, 1),
+        ("/!a/b", "!a/b", false, 2, 2),
     ];
 
     for (rule, glob, filename, min, max) in cases {
@@ -46,8 +86,9 @@ fn the_depth_bounds_agree_on_every_glob_shape() {
             (*glob, *filename),
             "{rule} compiled to something else"
         );
+        let braced = glob.contains('{') && !is_literal(glob);
         assert_eq!(
-            FilterInstance::depth_range(glob, *filename),
+            FilterInstance::depth_range(glob, *filename, braced),
             (*min, *max),
             "{rule} has different bounds"
         );

@@ -47,36 +47,42 @@ pub fn glob_match(glob: &str, path: &str) -> bool {
 /// Component-wise dynamic programming, so it is polynomial where a naive
 /// recursive `**` search is exponential: `**` may absorb any number of
 /// components, and each `(glob component, path component)` pair is decided once.
+///
+/// It reads a glob that `may_be_missed` admits as `glob_match_internal` does.
+/// Splitting at `/` first keeps `*`, `?` and a bracket expression inside one
+/// component and makes two or more `*` a globstar only as a whole component. A
+/// bracket expression closes at the first `]` after its first member, and `!`
+/// means nothing outside one.
 mod doublestar {
   /// Whether `glob` can trip the fast path's `**` defect: a `**` component with a
   /// later component holding a wildcard.
   ///
-  /// Also refuses the constructs this matcher does not implement -- brace
-  /// alternation, leading negation and escapes -- so a glob using them is never
-  /// answered from here. Those cannot combine with the defect in lore's filters,
-  /// which emit neither, and gitignore has no brace syntax at all.
+  /// Also refuses the constructs this matcher does not implement, brace
+  /// alternation and escapes, so a glob using them is answered by the fast path
+  /// alone.
   pub fn may_be_missed(glob: &[u8]) -> bool {
     // Rejected cheaply first, because this runs on every failed match and most
     // globs hold no `**` at all: a byte scan with no splitting or allocation.
-    if !glob.windows(2).any(|pair| pair == b"**") {
-      return false;
-    }
-    if glob.first() == Some(&b'!') {
+    if !glob.windows(2).any(|pair| pair == b"**")
+      || glob.iter().any(|c| matches!(c, b'{' | b'}' | b'\\'))
+    {
       return false;
     }
     let mut seen_globstar = false;
     for component in glob.split(|&c| c == b'/') {
-      if component.iter().any(|c| matches!(c, b'{' | b'}' | b'\\')) {
-        return false;
-      }
       if seen_globstar && component.iter().any(|c| matches!(c, b'*' | b'?' | b'[')) {
         return true;
       }
-      if component == b"**" {
+      if is_globstar(component) {
         seen_globstar = true;
       }
     }
     false
+  }
+
+  /// Whether a glob component is a globstar: two or more `*` and nothing else.
+  fn is_globstar(component: &[u8]) -> bool {
+    component.len() > 1 && component.iter().all(|&c| c == b'*')
   }
 
   /// Whether `path` has no empty component, i.e. no leading, trailing or
@@ -112,7 +118,7 @@ mod doublestar {
     let mut reachable = vec![false; n + 1];
     reachable[n] = true;
     for i in (0..m).rev() {
-      if pattern[i] == b"**" {
+      if is_globstar(pattern[i]) {
         if i + 1 == m {
           // A trailing `**` needs at least one component of its own.
           for j in 0..=n {
@@ -137,6 +143,9 @@ mod doublestar {
 
   /// Whether one path component matches one glob component. `*` and `?` do not
   /// cross a separator, and there is none inside a component.
+  ///
+  /// A bracket expression closes at the first `]` after its first member, so
+  /// `[]a]` and `[!]]` each hold a `]`.
   fn component(pattern: &[u8], name: &[u8]) -> bool {
     // Linear two-pointer star matching: on a mismatch, resume after the last
     // `*` with one more character consumed.
@@ -153,7 +162,12 @@ mod doublestar {
           s += 1;
         }
         Some(b'[') => {
-          let Some(end) = pattern[p..].iter().position(|&c| c == b']').map(|e| p + e) else {
+          let first = p + 1 + usize::from(matches!(pattern.get(p + 1), Some(b'!' | b'^')));
+          let Some(end) = pattern
+            .get(first + 1..)
+            .and_then(|members| members.iter().position(|&c| c == b']'))
+            .map(|e| first + 1 + e)
+          else {
             return false;
           };
           if class(&pattern[p + 1..end], name[s]) {
@@ -219,6 +233,20 @@ pub fn glob_match_with_captures<'a>(glob: &str, path: &'a str) -> Option<Vec<Cap
   None
 }
 
+/// LORE: matches a glob against a path as git matches a gitignore pattern, in
+/// three ways upstream does not:
+///
+/// - A bracket expression never matches a separator, as `?` and `*` do not, so
+///   `a[!x]b` and `a[--0]b` do not match `a/b`.
+/// - Two or more `*` are a globstar only as a whole component, opening the glob
+///   or following a `/`, and closing it or preceding one, so `***` reads as
+///   `**`. Anywhere else they are `*`, so a trailing `a**` does not match
+///   `ab/c`. Git also reads such a run before an escaped `/` as a globstar
+///   matching at least one component; this matcher reads it as `*`, and a caller
+///   spells `**\/` as `*/**/` before matching, as lore's filter compiler does.
+/// - A leading `!` is a literal character, so `!temp*` matches only names that
+///   start with `!temp`. A filter line carries its own negation and needs none
+///   from the glob.
 fn glob_match_internal<'a>(
   glob: &str,
   path: &'a str,
@@ -234,19 +262,19 @@ fn glob_match_internal<'a>(
   // Up to 10 nested braces are supported.
   let mut brace_stack = BraceStack::default();
 
-  // First, check if the pattern is negated with a leading '!' character.
-  // Multiple negations can occur.
-  let mut negated = false;
-  while state.glob_index < glob.len() && glob[state.glob_index] == b'!' {
-    negated = !negated;
-    state.glob_index += 1;
-  }
-
   while state.glob_index < glob.len() || state.path_index < path.len() {
     if state.glob_index < glob.len() {
       match glob[state.glob_index] {
         b'*' => {
-          let is_globstar = state.glob_index + 1 < glob.len() && glob[state.glob_index + 1] == b'*';
+          let is_globstar = state.glob_index + 1 < glob.len()
+            && glob[state.glob_index + 1] == b'*'
+            && (state.glob_index == 0
+              || glob[state.glob_index - 1] == b'/'
+              || (glob[state.glob_index - 1] == b'*'
+                && matches!(
+                  glob[..state.glob_index].iter().rev().find(|&&c| c != b'*'),
+                  None | Some(b'/')
+                )));
           if is_globstar {
             // Coalesce multiple ** segments into one.
             state.glob_index = skip_globstars(glob, state.glob_index + 2) - 2;
@@ -275,9 +303,7 @@ fn glob_match_internal<'a>(
             if glob.len() == state.glob_index {
               // A trailing ** segment without a following separator.
               state.globstar = state.wildcard;
-            } else if (state.glob_index < 3 || glob[state.glob_index - 3] == b'/')
-              && glob[state.glob_index] == b'/'
-            {
+            } else if glob[state.glob_index] == b'/' {
               // Matched a full /**/ segment. If the last character in the path was a separator,
               // skip the separator in the glob so we search for the next character.
               // In effect, this makes the whole segment optional so that a/**/b matches a/b.
@@ -385,7 +411,7 @@ fn glob_match_internal<'a>(
             return false;
           }
           state.glob_index += 1;
-          if is_match != negated {
+          if is_match != negated && !is_separator(c as char) {
             state.add_char_capture(&mut captures);
             state.path_index += 1;
             continue;
@@ -499,7 +525,7 @@ fn glob_match_internal<'a>(
       }
     }
 
-    return negated;
+    return false;
   }
 
   if brace_stack.length > 0 && state.glob_index > 0 && glob[state.glob_index - 1] == b'}' {
@@ -507,7 +533,7 @@ fn glob_match_internal<'a>(
     brace_stack.pop(&state, &mut captures);
   }
 
-  !negated
+  true
 }
 
 #[inline(always)]
@@ -635,15 +661,22 @@ impl State {
   }
 }
 
+/// The index past a run of globstars that starts at `glob_index`, just after
+/// its first `**`.
+///
+/// LORE: a run holds the further `*` of each globstar as well as the `/**` that
+/// follow it, since git reads two or more `*` as one.
 #[inline(always)]
 fn skip_globstars(glob: &[u8], mut glob_index: usize) -> usize {
-  // Coalesce multiple ** segments into one.
-  while glob_index + 3 <= glob.len()
-    && unsafe { glob.get_unchecked(glob_index..glob_index + 3) } == b"/**"
-  {
+  loop {
+    while glob.get(glob_index) == Some(&b'*') {
+      glob_index += 1;
+    }
+    if !glob[glob_index..].starts_with(b"/**") {
+      return glob_index;
+    }
     glob_index += 3;
   }
-  glob_index
 }
 
 struct BraceStack {
@@ -987,6 +1020,8 @@ mod tests {
     assert!(!glob_match("\\**", "de"));
   }
 
+  /// LORE: `[a-y]*[^c]` does not match `bdir/`, since `[^c]` does not match the
+  /// separator.
   #[test]
   fn bash_classes() {
     assert!(!glob_match("a*[^c]", "*"));
@@ -1033,7 +1068,7 @@ mod tests {
     assert!(glob_match("[a-y]*[^c]", "bd"));
     assert!(glob_match("[a-y]*[^c]", "bb"));
     assert!(glob_match("[a-y]*[^c]", "bcd"));
-    assert!(glob_match("[a-y]*[^c]", "bdir/"));
+    assert!(!glob_match("[a-y]*[^c]", "bdir/"));
     assert!(!glob_match("[a-y]*[^c]", "Beware"));
     assert!(!glob_match("[a-y]*[^c]", "c"));
     assert!(glob_match("[a-y]*[^c]", "ca"));
@@ -1245,10 +1280,12 @@ mod tests {
     assert!(glob_match("t[^a-g]n", "ton"));
   }
 
+  /// LORE: a bracket expression never matches a separator, as in git, where
+  /// Bash lets `foo[/]bar` match `foo/bar`.
   #[test]
   fn bash_slashmatch() {
-    // assert!(!glob_match("f[^eiu][^eiu][^eiu][^eiu][^eiu]r", "foo/bar"));
-    assert!(glob_match("foo[/]bar", "foo/bar"));
+    assert!(!glob_match("f[^eiu][^eiu][^eiu][^eiu][^eiu]r", "foo/bar"));
+    assert!(!glob_match("foo[/]bar", "foo/bar"));
     assert!(glob_match("f[^eiu][^eiu][^eiu][^eiu][^eiu]r", "foo-bar"));
   }
 
@@ -1394,7 +1431,7 @@ mod tests {
     assert!(!glob_match("*/*/*", "aaa"));
     assert!(!glob_match("*/*/*", "aaa/bb/aa/rr"));
     assert!(!glob_match("aaa*", "aaa/bba/ccc"));
-    // assert!(!glob_match("aaa**", "aaa/bba/ccc"));
+    assert!(!glob_match("aaa**", "aaa/bba/ccc"));
     assert!(!glob_match("aaa/*", "aaa/bba/ccc"));
     assert!(!glob_match("aaa/*ccc", "aaa/bba/ccc"));
     assert!(!glob_match("aaa/*z", "aaa/bba/ccc"));
@@ -1557,7 +1594,7 @@ mod tests {
     assert!(!glob_match("/*", "ef"));
     assert!(!glob_match("foo?bar", "foo/bar"));
     assert!(!glob_match("**/bar*", "foo/bar/baz"));
-    // assert!(!glob_match("**/bar**", "foo/bar/baz"));
+    assert!(!glob_match("**/bar**", "foo/bar/baz"));
     assert!(!glob_match("foo**bar", "foo/baz/bar"));
     assert!(!glob_match("foo*bar", "foo/baz/bar"));
     // assert!(glob_match("foo/**", "foo"));
@@ -1799,19 +1836,16 @@ mod tests {
     assert!(glob_match("フォルダ/**/*", "フォルダ/aaa.js"));
   }
 
+  /// LORE: a leading `!` is a literal, as it is anywhere else in a glob, so a
+  /// glob starting with one matches only a name starting with one.
   #[test]
-  fn negation() {
-    assert!(!glob_match("!*", "abc"));
-    assert!(!glob_match("!abc", "abc"));
+  fn exclamation_mark() {
     assert!(!glob_match("*!.md", "bar.md"));
     assert!(!glob_match("foo!.md", "bar.md"));
     assert!(!glob_match("\\!*!*.md", "foo!.md"));
     assert!(!glob_match("\\!*!*.md", "foo!bar.md"));
     assert!(glob_match("*!*.md", "!foo!.md"));
     assert!(glob_match("\\!*!*.md", "!foo!.md"));
-    assert!(glob_match("!*foo", "abc"));
-    assert!(glob_match("!foo*", "abc"));
-    assert!(glob_match("!xyz", "abc"));
     assert!(glob_match("*!*.*", "ba!r.js"));
     assert!(glob_match("*.md", "bar.md"));
     assert!(glob_match("*!*.*", "foo!.md"));
@@ -1829,173 +1863,96 @@ mod tests {
     assert!(glob_match("a!!b", "a!!b"));
     assert!(!glob_match("a!!b", "a/!!/b"));
 
-    assert!(!glob_match("!a/b", "a/b"));
-    assert!(glob_match("!a/b", "a"));
-    assert!(glob_match("!a/b", "a.b"));
-    assert!(glob_match("!a/b", "a/a"));
-    assert!(glob_match("!a/b", "a/c"));
-    assert!(glob_match("!a/b", "b/a"));
-    assert!(glob_match("!a/b", "b/b"));
-    assert!(glob_match("!a/b", "b/c"));
-
+    assert!(!glob_match("!*", "abc"));
+    assert!(glob_match("!*", "!abc"));
+    assert!(!glob_match("!*", "a/!b"));
     assert!(!glob_match("!abc", "abc"));
-    assert!(glob_match("!!abc", "abc"));
-    assert!(!glob_match("!!!abc", "abc"));
-    assert!(glob_match("!!!!abc", "abc"));
-    assert!(!glob_match("!!!!!abc", "abc"));
-    assert!(glob_match("!!!!!!abc", "abc"));
-    assert!(!glob_match("!!!!!!!abc", "abc"));
-    assert!(glob_match("!!!!!!!!abc", "abc"));
+    assert!(glob_match("!abc", "!abc"));
+    assert!(!glob_match("!!abc", "abc"));
+    assert!(!glob_match("!!abc", "!abc"));
+    assert!(glob_match("!!abc", "!!abc"));
+    assert!(!glob_match("!*.md", "a.js"));
+    assert!(!glob_match("!*.md", "a.md"));
+    assert!(glob_match("!*.md", "!a.md"));
+    assert!(!glob_match("!a/*", "b/a"));
+    assert!(glob_match("!a/*", "!a/b"));
+    assert!(!glob_match("!**/*.md", "a.js"));
+    assert!(!glob_match("!**/*.md", "!a/b/c.md"));
+    assert!(glob_match("!**/*.md", "!a/c.md"));
 
-    // assert!(!glob_match("!(*/*)", "a/a"));
-    // assert!(!glob_match("!(*/*)", "a/b"));
-    // assert!(!glob_match("!(*/*)", "a/c"));
-    // assert!(!glob_match("!(*/*)", "b/a"));
-    // assert!(!glob_match("!(*/*)", "b/b"));
-    // assert!(!glob_match("!(*/*)", "b/c"));
-    // assert!(!glob_match("!(*/b)", "a/b"));
-    // assert!(!glob_match("!(*/b)", "b/b"));
-    // assert!(!glob_match("!(a/b)", "a/b"));
-    assert!(!glob_match("!*", "a"));
-    assert!(!glob_match("!*", "a.b"));
-    assert!(!glob_match("!*/*", "a/a"));
-    assert!(!glob_match("!*/*", "a/b"));
-    assert!(!glob_match("!*/*", "a/c"));
-    assert!(!glob_match("!*/*", "b/a"));
-    assert!(!glob_match("!*/*", "b/b"));
-    assert!(!glob_match("!*/*", "b/c"));
-    assert!(!glob_match("!*/b", "a/b"));
-    assert!(!glob_match("!*/b", "b/b"));
-    assert!(!glob_match("!*/c", "a/c"));
-    assert!(!glob_match("!*/c", "a/c"));
-    assert!(!glob_match("!*/c", "b/c"));
-    assert!(!glob_match("!*/c", "b/c"));
-    assert!(!glob_match("!*a*", "bar"));
-    assert!(!glob_match("!*a*", "fab"));
-    // assert!(!glob_match("!a/(*)", "a/a"));
-    // assert!(!glob_match("!a/(*)", "a/b"));
-    // assert!(!glob_match("!a/(*)", "a/c"));
-    // assert!(!glob_match("!a/(b)", "a/b"));
-    assert!(!glob_match("!a/*", "a/a"));
-    assert!(!glob_match("!a/*", "a/b"));
-    assert!(!glob_match("!a/*", "a/c"));
-    assert!(!glob_match("!f*b", "fab"));
-    // assert!(glob_match("!(*/*)", "a"));
-    // assert!(glob_match("!(*/*)", "a.b"));
-    // assert!(glob_match("!(*/b)", "a"));
-    // assert!(glob_match("!(*/b)", "a.b"));
-    // assert!(glob_match("!(*/b)", "a/a"));
-    // assert!(glob_match("!(*/b)", "a/c"));
-    // assert!(glob_match("!(*/b)", "b/a"));
-    // assert!(glob_match("!(*/b)", "b/c"));
-    // assert!(glob_match("!(a/b)", "a"));
-    // assert!(glob_match("!(a/b)", "a.b"));
-    // assert!(glob_match("!(a/b)", "a/a"));
-    // assert!(glob_match("!(a/b)", "a/c"));
-    // assert!(glob_match("!(a/b)", "b/a"));
-    // assert!(glob_match("!(a/b)", "b/b"));
-    // assert!(glob_match("!(a/b)", "b/c"));
-    assert!(glob_match("!*", "a/a"));
-    assert!(glob_match("!*", "a/b"));
-    assert!(glob_match("!*", "a/c"));
-    assert!(glob_match("!*", "b/a"));
-    assert!(glob_match("!*", "b/b"));
-    assert!(glob_match("!*", "b/c"));
-    assert!(glob_match("!*/*", "a"));
-    assert!(glob_match("!*/*", "a.b"));
-    assert!(glob_match("!*/b", "a"));
-    assert!(glob_match("!*/b", "a.b"));
-    assert!(glob_match("!*/b", "a/a"));
-    assert!(glob_match("!*/b", "a/c"));
-    assert!(glob_match("!*/b", "b/a"));
-    assert!(glob_match("!*/b", "b/c"));
-    assert!(glob_match("!*/c", "a"));
-    assert!(glob_match("!*/c", "a.b"));
-    assert!(glob_match("!*/c", "a/a"));
-    assert!(glob_match("!*/c", "a/b"));
-    assert!(glob_match("!*/c", "b/a"));
-    assert!(glob_match("!*/c", "b/b"));
-    assert!(glob_match("!*a*", "foo"));
-    // assert!(glob_match("!a/(*)", "a"));
-    // assert!(glob_match("!a/(*)", "a.b"));
-    // assert!(glob_match("!a/(*)", "b/a"));
-    // assert!(glob_match("!a/(*)", "b/b"));
-    // assert!(glob_match("!a/(*)", "b/c"));
-    // assert!(glob_match("!a/(b)", "a"));
-    // assert!(glob_match("!a/(b)", "a.b"));
-    // assert!(glob_match("!a/(b)", "a/a"));
-    // assert!(glob_match("!a/(b)", "a/c"));
-    // assert!(glob_match("!a/(b)", "b/a"));
-    // assert!(glob_match("!a/(b)", "b/b"));
-    // assert!(glob_match("!a/(b)", "b/c"));
-    assert!(glob_match("!a/*", "a"));
-    assert!(glob_match("!a/*", "a.b"));
-    assert!(glob_match("!a/*", "b/a"));
-    assert!(glob_match("!a/*", "b/b"));
-    assert!(glob_match("!a/*", "b/c"));
-    assert!(glob_match("!f*b", "bar"));
-    assert!(glob_match("!f*b", "foo"));
-
-    assert!(!glob_match("!.md", ".md"));
-    assert!(glob_match("!**/*.md", "a.js"));
-    // assert!(!glob_match("!**/*.md", "b.md"));
-    assert!(glob_match("!**/*.md", "c.txt"));
-    assert!(glob_match("!*.md", "a.js"));
-    assert!(!glob_match("!*.md", "b.md"));
-    assert!(glob_match("!*.md", "c.txt"));
-    assert!(!glob_match("!*.md", "abc.md"));
-    assert!(glob_match("!*.md", "abc.txt"));
-    assert!(!glob_match("!*.md", "foo.md"));
-    assert!(glob_match("!.md", "foo.md"));
-
-    assert!(glob_match("!*.md", "a.js"));
-    assert!(glob_match("!*.md", "b.txt"));
-    assert!(!glob_match("!*.md", "c.md"));
-    assert!(!glob_match("!a/*/a.js", "a/a/a.js"));
-    assert!(!glob_match("!a/*/a.js", "a/b/a.js"));
-    assert!(!glob_match("!a/*/a.js", "a/c/a.js"));
-    assert!(!glob_match("!a/*/*/a.js", "a/a/a/a.js"));
-    assert!(glob_match("!a/*/*/a.js", "b/a/b/a.js"));
-    assert!(glob_match("!a/*/*/a.js", "c/a/c/a.js"));
-    assert!(!glob_match("!a/a*.txt", "a/a.txt"));
-    assert!(glob_match("!a/a*.txt", "a/b.txt"));
-    assert!(glob_match("!a/a*.txt", "a/c.txt"));
-    assert!(!glob_match("!a.a*.txt", "a.a.txt"));
-    assert!(glob_match("!a.a*.txt", "a.b.txt"));
-    assert!(glob_match("!a.a*.txt", "a.c.txt"));
-    assert!(!glob_match("!a/*.txt", "a/a.txt"));
-    assert!(!glob_match("!a/*.txt", "a/b.txt"));
-    assert!(!glob_match("!a/*.txt", "a/c.txt"));
-
-    assert!(glob_match("!*.md", "a.js"));
-    assert!(glob_match("!*.md", "b.txt"));
-    assert!(!glob_match("!*.md", "c.md"));
-    // assert!(!glob_match("!**/a.js", "a/a/a.js"));
-    // assert!(!glob_match("!**/a.js", "a/b/a.js"));
-    // assert!(!glob_match("!**/a.js", "a/c/a.js"));
-    assert!(glob_match("!**/a.js", "a/a/b.js"));
-    assert!(!glob_match("!a/**/a.js", "a/a/a/a.js"));
-    assert!(glob_match("!a/**/a.js", "b/a/b/a.js"));
-    assert!(glob_match("!a/**/a.js", "c/a/c/a.js"));
-    assert!(glob_match("!**/*.md", "a/b.js"));
-    assert!(glob_match("!**/*.md", "a.js"));
-    assert!(!glob_match("!**/*.md", "a/b.md"));
-    // assert!(!glob_match("!**/*.md", "a.md"));
     assert!(!glob_match("**/*.md", "a/b.js"));
     assert!(!glob_match("**/*.md", "a.js"));
     assert!(glob_match("**/*.md", "a/b.md"));
     assert!(glob_match("**/*.md", "a.md"));
-    assert!(glob_match("!**/*.md", "a/b.js"));
-    assert!(glob_match("!**/*.md", "a.js"));
-    assert!(!glob_match("!**/*.md", "a/b.md"));
-    // assert!(!glob_match("!**/*.md", "a.md"));
-    assert!(glob_match("!*.md", "a/b.js"));
-    assert!(glob_match("!*.md", "a.js"));
-    assert!(glob_match("!*.md", "a/b.md"));
-    assert!(!glob_match("!*.md", "a.md"));
-    assert!(glob_match("!**/*.md", "a.js"));
-    // assert!(!glob_match("!**/*.md", "b.md"));
-    assert!(glob_match("!**/*.md", "c.txt"));
+  }
+
+  /// LORE: the three departures from upstream on `glob_match_internal`, with
+  /// git's answer for each, held against the confirming matcher as well since
+  /// the two must agree. A row with a `**` component followed by one holding a
+  /// wildcard is one the confirming matcher is consulted for when the fast path
+  /// answers `false`. The confirming matcher declines a glob holding an escape,
+  /// so such a row is the fast path's alone.
+  #[test]
+  fn matches_as_git_does() {
+    let cases: &[(&str, &str, bool)] = &[
+      ("a[!x]b", "a/b", false),
+      ("a[^x]b", "a/b", false),
+      ("a[/]b", "a/b", false),
+      ("a[--0]b", "a/b", false),
+      ("a[!x]b", "ayb", true),
+      ("a[^x]b", "axb", false),
+      ("a[--0]b", "a.b", true),
+      ("**/a[!x]b", "q/a/b", false),
+      ("**/*[!x]", "b/b", true),
+      ("**/[!]]", "x/b]", false),
+      ("a**", "ab", true),
+      ("a**", "ab/c", false),
+      ("a/b**", "a/bc/d", false),
+      ("**b", "a/b", false),
+      ("a**b", "a/b", false),
+      ("a**/**", "ab", false),
+      ("a**/**", "ab/c", true),
+      ("a/**", "a/b/c", true),
+      ("**/a**", "x/ab/c", false),
+      ("!a*", "abc", false),
+      ("!a*", "!abc", true),
+      ("!*.tmp", "keep.txt", false),
+      ("!*.tmp", "!x.tmp", true),
+      ("**/!*", "a/b", false),
+      ("**/!*", "a/!b", true),
+      ("!a/**/*b", "!a/b/b", true),
+      ("***", "a/b", true),
+      ("a/***", "a/b/c", true),
+      ("a/***/b", "a/b", true),
+      ("a/***/b", "a/x/y/b", true),
+      ("***/*b", "b/b", true),
+      ("a***", "ab", true),
+      ("a***", "ab/c", false),
+      ("a/***b", "a/x/b", false),
+      ("a\\/**/b", "a/b", true),
+      ("a**\\/b", "ab/b", true),
+      ("a**\\/b", "a/x/b", false),
+      ("a/**/*/b\\/c", "a/x/b\\/c", false),
+    ];
+    for (glob, path, matched) in cases {
+      assert_eq!(glob_match(glob, path), *matched, "{glob} against {path}");
+      if !glob.contains('\\') {
+        assert_eq!(
+          doublestar::matches(glob.as_bytes(), path.as_bytes()),
+          *matched,
+          "the confirming matcher on {glob} against {path}"
+        );
+      }
+    }
+  }
+
+  /// LORE: a run of `*` before an escaped `/` reads as `*`, so a caller that
+  /// means git's globstar spells it `*/**/` first.
+  #[test]
+  fn stars_before_an_escaped_separator_are_one_star() {
+    assert!(glob_match("a/**\\/b", "a/x/b"));
+    assert!(!glob_match("a/**\\/b", "a/x/y/b"));
+    assert!(glob_match("a/*/**/b", "a/x/y/b"));
   }
 
   #[test]

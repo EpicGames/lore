@@ -31,8 +31,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 # ---------------------------------------------------------------- probe tree
 # Names are chosen so prefix (`*a`), infix (`*a*`), suffix (`a*`) and extension
-# (`*.tmp`) wildcards all bite, and so that `d` has two subdirectories, `e`
-# exists at two different depths, and the tree reaches four levels.
+# (`*.tmp`) wildcards all bite, so that `d` has two subdirectories, `e` exists at
+# two different depths, and the tree reaches four levels, and so that a name
+# starts with `!` at two depths.
 FILES = [
     "a",
     "ab",
@@ -55,13 +56,32 @@ FILES = [
     "dd/e/a",
     "e/a",
     "e/a.tmp",
+    "!a",
+    "d/!a",
 ]
 DIRS = ["d", "d/e", "d/e/f", "d/g", "dd", "dd/e", "e"]
 
 # ------------------------------------------------------------ pattern atoms
-# One path component each: literals, whole-component wildcards, and partial
-# wildcards in leading / trailing / surrounding position.
-COMPONENTS = ["d", "e", "a", "*", "**", "*a", "a*", "*a*", "?a", "[ad]"]
+# One path component each: literals, whole-component wildcards, partial
+# wildcards in leading / trailing / surrounding position, a `**` sharing its
+# component with other text, and a negated bracket expression and a range that
+# would match `d/e` if a bracket expression matched a separator.
+COMPONENTS = [
+    "d",
+    "e",
+    "a",
+    "*",
+    "**",
+    "*a",
+    "a*",
+    "*a*",
+    "?a",
+    "[ad]",
+    "**a",
+    "d**a",
+    "d[!x]e",
+    "d[--0]e",
+]
 
 # Components used when building multi-level patterns, kept smaller so the
 # product stays bounded.
@@ -161,6 +181,40 @@ CHAINS = [
     ["**/*", "!d/**", "d/g/**"],
 ]
 
+# Hand-written cases for forms a glob matcher can read differently from git: a
+# trailing `x**` re-included by a rule with no subtree companion, a leading `!`
+# that is escaped, follows the anchoring `/` or follows the negating `!`, a run
+# of three `*`, a globstar before an escaped `/`, alone and beside a second
+# escaped `/`, and a re-inclusion led by a `**` that is no globstar.
+SHAPES = [
+    ["/d**", "!/d*"],
+    ["/d/e**", "!/d/e*"],
+    ["\\!*"],
+    ["/!*"],
+    ["*", "!/!*"],
+    ["**", "!\\!a"],
+    ["*", "!*/", "!\\!a"],
+    ["!!a"],
+    ["**", "!!a"],
+    ["*", "!*/", "!!a"],
+    ["***/a"],
+    ["/d/***/a"],
+    ["d/***"],
+    ["/d***", "!/d*"],
+    ["**", "!/d/***"],
+    ["d/**\\/a"],
+    ["**\\/a"],
+    ["d\\/**/a"],
+    ["d**\\/a"],
+    ["*", "!*/", "!d/**\\/a"],
+    ["d\\/**\\/a"],
+    ["d/**\\/e\\/a"],
+    ["d/**\\/f\\/a"],
+    ["**\\/e\\/a"],
+    ["*", "!*/", "!d\\/**\\/a"],
+    ["*", "!*/", "!**d/a"],
+]
+
 
 def build_cases():
     cases = []
@@ -174,6 +228,8 @@ def build_cases():
         TRIPLE_EXCLUDE, TRIPLE_INCLUDE, TRIPLE_TAIL
     ):
         cases.append(("triple", [exc, "!" + inc, tail]))
+    for shape in SHAPES:
+        cases.append(("shape", shape))
     for chain in CHAINS:
         cases.append(("chain", chain))
     # Deduplicate while preserving order.
@@ -261,8 +317,8 @@ def emit(results):
     w("}\n\n")
     w("/// Every file in the probe tree, in bitmask order. Names are chosen so\n")
     w("/// prefix, infix, suffix and extension wildcards all bite, at depths one\n")
-    w("/// through four, with two sibling subdirectories under `d` and an `e` at\n")
-    w("/// two different depths.\n")
+    w("/// through four, with two sibling subdirectories under `d`, an `e` at two\n")
+    w("/// different depths, and a name starting with `!` at two depths.\n")
     w(f"pub const FILES: &[&str] = {rs_list(FILES)};\n\n")
     w("/// Every directory in the probe tree.\n")
     w(f"pub const DIRS: &[&str] = {rs_list(DIRS)};\n\n")

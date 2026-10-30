@@ -264,6 +264,9 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
 /// Parses the authored rules in `bytes`, one per line. `path` names the file
 /// they came from, for the error message.
 ///
+/// One leading `!` makes a rule a re-inclusion, as in git, and the rest of the
+/// rule is its glob: `!!a` re-includes the name `!a`.
+///
 /// A file that can be read but not understood is an error, and the whole file is
 /// refused rather than the offending line skipped — a filter missing a rule
 /// excludes less than the file asks for, and the caller has no way to tell that
@@ -285,11 +288,8 @@ pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterE
             continue;
         }
 
-        let mut negated = false;
-        while glob.starts_with('!') {
-            negated = !negated;
-            glob = &glob[1..];
-        }
+        let negated = glob.starts_with('!');
+        glob = &glob[usize::from(negated)..];
 
         // Allow exclamation marks in path/file names through escape backslash
         if glob.starts_with("\\!") {
@@ -397,8 +397,15 @@ pub(crate) fn query_depth(path: &str) -> u32 {
 /// would not. So does an unpaired `]`, which the engine treats as a literal:
 /// pairing it with its `[` costs more than letting the glob take the slower
 /// path.
+#[lore_macro::test_pub]
 fn is_literal(glob: &str) -> bool {
     !glob.contains(['*', '?', '[', ']', '\\'])
+}
+
+/// Whether `stars` is two or more `*` and nothing else, which git reads as one
+/// globstar.
+fn is_globstar(stars: &str) -> bool {
+    stars.len() > 1 && stars.bytes().all(|byte| byte == b'*')
 }
 
 /// Whether a single path component holds a glob metacharacter, so no literal
@@ -409,8 +416,12 @@ fn is_literal(glob: &str) -> bool {
 /// [`RuleIndex`] enumerates the alternatives rather than stop here, and this is
 /// what answers for the forms it declines to enumerate: a rule compared as text,
 /// an escaped brace, and one with more alternatives than the cap.
+///
+/// So does a backslash. The matcher unescapes it, so the component's text is not
+/// the name it matches, and an escaped `/` matches a separator inside what the
+/// text splits into two components: `a\/b` names `a/b`, not a component `a\`.
 fn has_wildcard(component: &str) -> bool {
-    component.contains(['*', '?', '[', '{'])
+    component.contains(['*', '?', '[', '{', '\\'])
 }
 
 /// The first brace group in `glob`, as the offsets of its `{` and its matching
@@ -723,7 +734,11 @@ impl RuleIndex {
         let mut enumerated = 0;
         while let Some(form) = pending.pop() {
             let Some((open, close)) = first_brace_group(&form) else {
-                self.insert_form(&form, line, FilterInstance::depth_range(&form, false).1);
+                self.insert_form(
+                    &form,
+                    line,
+                    FilterInstance::depth_range(&form, false, false).1,
+                );
                 enumerated += 1;
                 continue;
             };
@@ -834,56 +849,84 @@ impl FilterInstance {
     /// content in or out depending on how it happened to be written.
     ///
     /// A rule with no separator applies at any depth and is matched against the
-    /// path's last component. `**/name` means the same thing -- gitignore
-    /// documents `**/foo` as "the same as pattern `foo`" -- so the prefix is
-    /// stripped and the rule becomes a name rule, which keeps the commonest
-    /// patterns off `**` and its separator-crossing backtrack.
+    /// path's last component. `**/name` and `/**/name` mean the same thing --
+    /// gitignore documents `**/foo` as "the same as pattern `foo`" -- so the
+    /// prefix is stripped and the rule becomes a name rule, which keeps the
+    /// commonest patterns off `**` and its separator-crossing backtrack.
     ///
     /// `**/a/b` is not the same as `a/b`: it names `b` directly under any `a`, so
     /// it keeps the prefix and is matched against the whole path. A bare `**`
     /// names no component at all and is matched against the whole path too.
+    ///
+    /// A component of two or more `*` is a globstar, as in git, and compiles to
+    /// `**`, so every reader of the compiled glob meets one spelling of it. Git
+    /// reads one followed by an escaped `/` as a globstar matching at least one
+    /// component, so `a/**\/b` compiles to `a/*/**/b` rather than `a/**/*/b`:
+    /// the matcher can miss a match where a `**` is followed by a component
+    /// holding a wildcard, and confirms none in a glob holding an escape or a
+    /// brace group.
     #[lore_macro::test_pub]
     fn compile(glob: &str) -> (String, bool, bool) {
         let leading_separator = glob.starts_with('/');
         let ending_separator = glob.ends_with('/');
         let mut glob = glob.trim_matches('/').to_lowercase();
-
-        if !leading_separator
-            && let Some(rest) = glob.strip_prefix("**/")
-            && !rest.contains('/')
-            && !rest.is_empty()
-        {
-            glob = rest.to_owned();
+        if glob.contains("***") || glob.contains("**\\/") {
+            let mut components = glob.split('/').peekable();
+            let mut spelled = Vec::new();
+            while let Some(component) = components.next() {
+                let stars = match component.strip_suffix('\\') {
+                    Some(stars) if components.peek().is_some() => stars,
+                    _ => component,
+                };
+                spelled.push(if !is_globstar(stars) {
+                    component
+                } else if stars.len() < component.len() {
+                    "*/**"
+                } else {
+                    "**"
+                });
+            }
+            glob = spelled.join("/");
         }
 
-        let filename = !leading_separator && !glob.contains('/') && glob != "**";
+        let stripped = glob
+            .strip_prefix("**/")
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'));
+        if stripped {
+            glob.drain(..3);
+        }
+
+        let filename = glob != "**" && (stripped || (!leading_separator && !glob.contains('/')));
         (glob, filename, ending_separator)
     }
 
     /// How many path components `glob` can match: fewest, and most or
     /// [`u32::MAX`] where nothing bounds it. A name rule is matched against the
-    /// last component alone, so it applies at any depth.
+    /// last component alone, so it applies at any depth. `braced` says the
+    /// matcher evaluates the glob's brace groups rather than reading them as text.
     ///
-    /// The lower bound lets [`step`](Self::step) skip a line against a prefix
-    /// too short for it to match: each component consumes one, except a `**`
-    /// that is not the last, which may absorb nothing, so `a/**/b` can match
-    /// `a/b` while `a/**` does not match `a`.
+    /// Both bounds count the components of the text split at `/`. The lower
+    /// bound lets [`step`](Self::step) skip a line against a prefix with fewer
+    /// components: it counts every component except a `**` that is not the last,
+    /// which may absorb nothing, so `a/**/b` can match `a/b` while `a/**` does
+    /// not match `a`. It is 1 where a `/` in the text may match no separator:
+    /// when the text between the first `[` and the last `]` holds one, since a
+    /// bracket expression matches no separator, so `x[a/b]y` matches `xay`, and
+    /// when a brace group the matcher evaluates holds one, since an alternative
+    /// may hold fewer than the group, so `{a,b/c}*` matches `ax`. Every other `/`
+    /// matches exactly one separator.
     ///
     /// The upper bound is what a [`RuleIndex`] records, so that a rule unable to
     /// reach below a directory does not force a walk into it -- without it the
-    /// `*` that a leading `/*` compiles to would reach every path. A `**`
-    /// consumes one component or more, so a glob holding one is unbounded.
-    ///
-    /// Sound because of the matcher's own arithmetic: every other component
-    /// consumes exactly one path component, since `*` and `?` do not cross a
-    /// separator. Two constructs do, and leave the glob unbounded too: a `**`
-    /// that shares its component with other text, since `a**` at the end of a
-    /// glob matches `ab/c`, and a character class, since `[!x]` and `[/]` both
-    /// match a `/` in the path. It is an over-estimate under every construct
-    /// the matcher supports, which is the direction that has to hold -- brace
-    /// alternation picks a subset of the glob's separators, and escapes only
-    /// make a `/` stop separating, so no expansion has more components than the
-    /// glob text. Over-estimating costs traversal; under-estimating drops
+    /// `*` that a leading `/*` compiles to would reach every path. It is the
+    /// count, or unbounded where a component is exactly `**`, the one construct
+    /// the matcher lets match a separator that no `/` in the glob stands for.
+    /// `*`, `?` and a bracket expression never match one, and a `**` sharing its
+    /// component with other text is two `*`. A `/` outside a bracket expression
+    /// matches one separator, escaped or not, a `/` inside one matches none, and
+    /// a brace group matches the separators of one alternative. So no path the
+    /// glob matches has more components than the text, which is the direction
+    /// that has to hold: over-estimating costs traversal, under-estimating drops
     /// content.
     ///
     /// Both bounds come from one pass because both callers want both, and
@@ -891,7 +934,7 @@ impl FilterInstance {
     /// to `SOURCE_FILTER_THRESHOLD` rules in it, so a second scan per rule is
     /// paid there.
     #[lore_macro::test_pub]
-    fn depth_range(glob: &str, filename: bool) -> (u32, u32) {
+    fn depth_range(glob: &str, filename: bool, braced: bool) -> (u32, u32) {
         if filename {
             return (1, u32::MAX);
         }
@@ -904,12 +947,28 @@ impl FilterInstance {
             optional += u32::from(previous_was_globstar);
             total += 1;
             previous_was_globstar = component == "**";
-            unbounded |= component.contains("**") || component.contains('[');
+            unbounded |= previous_was_globstar;
         }
-        (
-            (total - optional).max(1),
-            if unbounded { u32::MAX } else { total },
-        )
+        let bracketed = glob
+            .find('[')
+            .zip(glob.rfind(']'))
+            .is_some_and(|(open, close)| open < close && glob[open..close].contains('/'));
+        let mut fewest = if bracketed {
+            1
+        } else {
+            (total - optional).max(1)
+        };
+        if braced && fewest > 1 {
+            let mut rest = glob;
+            while let Some((open, close)) = first_brace_group(rest) {
+                if rest[open..close].contains('/') {
+                    fewest = 1;
+                    break;
+                }
+                rest = &rest[close + 1..];
+            }
+        }
+        (fewest, if unbounded { u32::MAX } else { total })
     }
 
     /// Appends an exclusion.
@@ -927,12 +986,12 @@ impl FilterInstance {
     /// a filter that excludes half of it.
     pub fn add_exclusion(&mut self, glob: &str) -> Result<(), FilterError> {
         let (glob, filename, ending_separator) = Self::compile(glob);
-        let (min_depth, depth_max) = Self::depth_range(&glob, filename);
         let literal = is_literal(&glob);
+        let expand = !filename && !literal && glob.contains('{');
+        let (min_depth, depth_max) = Self::depth_range(&glob, filename, expand);
         if filename {
             self.exclude.insert_unprefixed(self.lines.len(), depth_max);
         } else {
-            let expand = !literal && glob.contains('{');
             self.exclude
                 .insert(&glob, expand, self.lines.len(), depth_max);
         }
@@ -959,6 +1018,10 @@ impl FilterInstance {
     /// The companion is never directory-only, whatever the authored rule was:
     /// `engine/` excludes what is under it, so `!engine/` re-includes it.
     ///
+    /// The companion is always evaluated as a glob, so for a rule compared as
+    /// text that holds a `{` it escapes every `{`, `}` and `,`: `!a{b,c}`
+    /// re-includes what lies below `a{b,c}`, not below `ab`.
+    ///
     /// Only a path rule gets a companion, and only a path rule enters the
     /// re-inclusion index. A name rule is skipped by [`step`](Self::step) below an
     /// excluded directory, so `!keep.txt` neither re-opens a pruned subtree nor
@@ -967,27 +1030,51 @@ impl FilterInstance {
     ///
     /// # Errors
     ///
-    /// A `**`-prefixed inclusion naming more than one component, such as
-    /// `!**/a/b`. No prefix bounds where it could match, so honouring it would
-    /// send a walk into every excluded directory in the repository. `!**/name`
-    /// compiles to `!name` and is accepted.
+    /// A path inclusion whose first authored component is a globstar, however
+    /// it is written: `!**/a/b`, `!/**/a/b`, `!**`, `!/**`, `!***` or `!**\/a`.
+    /// Such a rule matches from every directory in the repository, so the walk
+    /// would have to enter each excluded one to look. `!**/name` and `!/**/name`
+    /// compile to the name rule `!name` and are accepted, and so is `!**b/c`,
+    /// whose `**b` is no globstar. A rule with another first component is
+    /// accepted however far it reaches, such as `!*/**/c`.
     pub fn add_inclusion(&mut self, raw: &str) -> Result<(), FilterError> {
         let (glob, filename, ending_separator) = Self::compile(raw);
-        if raw.starts_with("**") && !filename {
+        let mut components = raw.trim_matches('/').split('/');
+        let first = components.next().unwrap_or_default();
+        let stars = first
+            .strip_suffix('\\')
+            .filter(|_| components.next().is_some())
+            .unwrap_or(first);
+        if !filename && is_globstar(stars) {
             return Err(FilterError::internal(
-                "filter inclusions cannot start with ** as that will force traversal of the entire revision tree",
+                "filter inclusions cannot start with a ** component as that will force traversal of the entire revision tree",
             ));
         }
 
-        let subtree = (!filename && !glob.ends_with('*')).then(|| format!("{glob}/**"));
-
-        let (min_depth, depth_max) = Self::depth_range(&glob, filename);
         let literal = is_literal(&glob);
         // A name rule is neither indexed nor given a companion, so it pays no scan.
         let braced = !filename && glob.contains('{');
+        let expand = braced && !literal;
+        let subtree = (!filename && !glob.ends_with('*')).then(|| {
+            if braced && literal {
+                let mut subtree = String::with_capacity(glob.len() + 8);
+                for c in glob.chars() {
+                    if matches!(c, '{' | '}' | ',') {
+                        subtree.push('\\');
+                    }
+                    subtree.push(c);
+                }
+                subtree.push_str("/**");
+                subtree
+            } else {
+                format!("{glob}/**")
+            }
+        });
+
+        let (min_depth, depth_max) = Self::depth_range(&glob, filename, expand);
         if !filename {
             self.reinclude
-                .insert(&glob, braced && !literal, self.lines.len(), depth_max);
+                .insert(&glob, expand, self.lines.len(), depth_max);
         }
         self.lines.push(FilterLine {
             min_depth,
@@ -1000,9 +1087,9 @@ impl FilterInstance {
         });
 
         if let Some(subtree) = subtree {
-            let (min_depth, depth_max) = Self::depth_range(&subtree, false);
+            let (min_depth, depth_max) = Self::depth_range(&subtree, false, expand);
             self.reinclude
-                .insert(&subtree, braced, self.lines.len(), depth_max);
+                .insert(&subtree, expand, self.lines.len(), depth_max);
             self.lines.push(FilterLine {
                 min_depth,
                 literal: false,

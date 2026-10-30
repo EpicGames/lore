@@ -23,6 +23,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as
   `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A
   server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
+- Ignore and view rules match paths as `.gitignore` does. A character class or a `**` inside a name matches within one
+  path component, so `!/Engine/Content**` re-includes `Engine/Content` but not its contents; use `!/Engine/Content`. A
+  file with a re-inclusion that starts with a `**` component, such as `!/**/a/b`, fails to load
 
 ### Features
 
@@ -71,11 +74,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch
   reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with
   `NOT_FOUND`
-- View filters: a view rule that matches only a few levels deep, such as `!/*`, no longer makes `lore clone`, a
-  whole-tree `lore diff` or `lore status --scan` walk and fetch every directory outside the view, and no longer makes
-  `lore clone` create each of them as an empty directory, a regression in v0.10.0. `lore sync --view` no longer misses
-  files to add or remove below a directory where either view excludes content through a character class, such as
-  `[!x]`, or a `**` inside a name, such as `/a/b**`, both of which match across a `/`
+- `lore clone`, a whole-tree `lore diff` and `lore status --scan` skip the directories a view such as `*`, `!/*`
+  excludes, and `lore clone` does not create them
 - The Lore service closes its SWFS mounts when it exits, however it is stopped. It used to leave them to EpicVFS,
   which kept a device for each one and could not be stopped afterwards: `sc stop EpicVFS` stayed in `STOP_PENDING`
   until the machine restarted
