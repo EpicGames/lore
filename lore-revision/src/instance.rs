@@ -985,7 +985,7 @@ pub struct LoreRepositoryInstanceDeleteBeginEventData {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
-pub enum LoreInstanceDeletePhase {
+pub enum LoreRepositoryInstanceDeletePhase {
     /// Unmounting the SWFS instance
     Unmounting = 0,
     /// Removing instance keys from mutable store
@@ -1000,7 +1000,7 @@ pub enum LoreInstanceDeletePhase {
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryInstanceDeleteProgressEventData {
     /// Current phase of the delete operation
-    pub phase: LoreInstanceDeletePhase,
+    pub phase: LoreRepositoryInstanceDeletePhase,
 }
 
 /// Event data for the completion of an instance delete operation.
@@ -1375,7 +1375,7 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
     let is_swfs = check_for_external_lore_dir(instance_id).is_ok_and(|opt| opt.is_some());
 
     // Emit begin event
-    LoreEvent::InstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData {
+    LoreEvent::RepositoryInstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData {
         instance_id,
         path: LoreString::from_str(&path),
         is_swfs: if is_swfs { 1 } else { 0 },
@@ -1391,26 +1391,26 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
 
     if dry_run {
         // Dry run: report what would happen
-        let unmounting = is_swfs.then_some(LoreInstanceDeletePhase::Unmounting);
-        for phase in [LoreInstanceDeletePhase::Deregistering]
+        let unmounting = is_swfs.then_some(LoreRepositoryInstanceDeletePhase::Unmounting);
+        for phase in [LoreRepositoryInstanceDeletePhase::Deregistering]
             .into_iter()
             .chain(unmounting)
-            .chain([LoreInstanceDeletePhase::DeletingFiles])
+            .chain([LoreRepositoryInstanceDeletePhase::DeletingFiles])
         {
-            LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
-                phase,
-            })
+            LoreEvent::RepositoryInstanceDeleteProgress(
+                LoreRepositoryInstanceDeleteProgressEventData { phase },
+            )
             .send();
         }
-        LoreEvent::InstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData {
-            instance_id,
-        })
+        LoreEvent::RepositoryInstanceDeleteComplete(
+            LoreRepositoryInstanceDeleteCompleteEventData { instance_id },
+        )
         .send();
         return Ok(());
     }
 
-    LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
-        phase: LoreInstanceDeletePhase::Deregistering,
+    LoreEvent::RepositoryInstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
+        phase: LoreRepositoryInstanceDeletePhase::Deregistering,
     })
     .send();
     // A registry inside the instance directory goes with it.
@@ -1419,17 +1419,19 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
     }
 
     if is_swfs {
-        LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
-            phase: LoreInstanceDeletePhase::Unmounting,
-        })
+        LoreEvent::RepositoryInstanceDeleteProgress(
+            LoreRepositoryInstanceDeleteProgressEventData {
+                phase: LoreRepositoryInstanceDeletePhase::Unmounting,
+            },
+        )
         .send();
         if let Some(mm) = MountManagerState::mount_manager() {
             let _ = mm.remove_mount(Path::new(&path));
         }
     }
 
-    LoreEvent::InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
-        phase: LoreInstanceDeletePhase::DeletingFiles,
+    LoreEvent::RepositoryInstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
+        phase: LoreRepositoryInstanceDeletePhase::DeletingFiles,
     })
     .send();
     if is_swfs {
@@ -1453,7 +1455,7 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
             })?;
     }
 
-    LoreEvent::InstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData {
+    LoreEvent::RepositoryInstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData {
         instance_id,
     })
     .send();
@@ -1579,7 +1581,7 @@ async fn instance_move_with(
     uses_shared_store(&repository).await?;
 
     // Emit begin event
-    LoreEvent::InstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData {
+    LoreEvent::RepositoryInstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData {
         instance_id,
         source_path: LoreString::from_str(&source_path),
         target_path: LoreString::from_str(target_path),
@@ -1587,7 +1589,7 @@ async fn instance_move_with(
     .send();
 
     if dry_run {
-        LoreEvent::InstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData {
+        LoreEvent::RepositoryInstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData {
             instance_id,
             target_path: LoreString::from_str(target_path),
         })
@@ -1621,7 +1623,7 @@ async fn instance_move_with(
         return Err(InstanceError::internal(message));
     }
 
-    LoreEvent::InstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData {
+    LoreEvent::RepositoryInstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData {
         instance_id,
         target_path: LoreString::from_str(target_path),
     })

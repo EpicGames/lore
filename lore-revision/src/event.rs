@@ -1328,15 +1328,15 @@ pub enum LoreEvent {
     /// One range of a file's lines, attributed to the revision that last changed them.
     FileAudit(LoreFileAuditEventData),
     /// The start of an instance delete operation.
-    InstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData),
+    RepositoryInstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData),
     /// Progress during an instance delete operation.
-    InstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData),
+    RepositoryInstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData),
     /// The completion of an instance delete operation.
-    InstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData),
+    RepositoryInstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData),
     /// The start of an instance move operation.
-    InstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData),
+    RepositoryInstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData),
     /// The completion of an instance move operation.
-    InstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData),
+    RepositoryInstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

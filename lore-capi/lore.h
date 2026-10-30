@@ -217,14 +217,14 @@ typedef enum lore_file_audit_outcome_t {
 } lore_file_audit_outcome_t;
 
 // Phase of an instance delete operation.
-typedef enum lore_instance_delete_phase_t {
+typedef enum lore_repository_instance_delete_phase_t {
   // Unmounting the SWFS instance
-  LORE_INSTANCE_DELETE_PHASE_UNMOUNTING = 0,
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_UNMOUNTING = 0,
   // Removing instance keys from mutable store
-  LORE_INSTANCE_DELETE_PHASE_DEREGISTERING = 1,
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DEREGISTERING = 1,
   // Deleting external directories or repository directory
-  LORE_INSTANCE_DELETE_PHASE_DELETING_FILES = 2,
-} lore_instance_delete_phase_t;
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DELETING_FILES = 2,
+} lore_repository_instance_delete_phase_t;
 
 // Which authentication path a client takes if a server advertises both its
 // gRPC auth service and an OIDC issuer. A path the server does not
@@ -3427,7 +3427,7 @@ typedef struct lore_repository_instance_delete_begin_event_data_t {
 // Event data for progress during an instance delete operation.
 typedef struct lore_repository_instance_delete_progress_event_data_t {
   // Current phase of the delete operation
-  enum lore_instance_delete_phase_t phase;
+  enum lore_repository_instance_delete_phase_t phase;
 } lore_repository_instance_delete_progress_event_data_t;
 
 // Event data for the completion of an instance delete operation.
@@ -3936,15 +3936,15 @@ enum lore_event_id_t {
   // One range of a file's lines, attributed to the revision that last changed them.
   LORE_EVENT_FILE_AUDIT,
   // The start of an instance delete operation.
-  LORE_EVENT_INSTANCE_DELETE_BEGIN,
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_BEGIN,
   // Progress during an instance delete operation.
-  LORE_EVENT_INSTANCE_DELETE_PROGRESS,
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_PROGRESS,
   // The completion of an instance delete operation.
-  LORE_EVENT_INSTANCE_DELETE_COMPLETE,
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_COMPLETE,
   // The start of an instance move operation.
-  LORE_EVENT_INSTANCE_MOVE_BEGIN,
+  LORE_EVENT_REPOSITORY_INSTANCE_MOVE_BEGIN,
   // The completion of an instance move operation.
-  LORE_EVENT_INSTANCE_MOVE_COMPLETE,
+  LORE_EVENT_REPOSITORY_INSTANCE_MOVE_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4189,11 +4189,11 @@ typedef struct lore_event_t {
     struct lore_auth_pending_event_data_t auth_pending;
     struct lore_storage_get_fragment_event_data_t storage_get_fragment;
     struct lore_file_audit_event_data_t file_audit;
-    struct lore_repository_instance_delete_begin_event_data_t instance_delete_begin;
-    struct lore_repository_instance_delete_progress_event_data_t instance_delete_progress;
-    struct lore_repository_instance_delete_complete_event_data_t instance_delete_complete;
-    struct lore_repository_instance_move_begin_event_data_t instance_move_begin;
-    struct lore_repository_instance_move_complete_event_data_t instance_move_complete;
+    struct lore_repository_instance_delete_begin_event_data_t repository_instance_delete_begin;
+    struct lore_repository_instance_delete_progress_event_data_t repository_instance_delete_progress;
+    struct lore_repository_instance_delete_complete_event_data_t repository_instance_delete_complete;
+    struct lore_repository_instance_move_begin_event_data_t repository_instance_move_begin;
+    struct lore_repository_instance_move_complete_event_data_t repository_instance_move_complete;
   };
 } lore_event_t;
 

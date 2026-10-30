@@ -1856,17 +1856,17 @@ fn handle_repository_instance_delete(globals: LoreGlobalArgs) -> u8 {
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::Complete(_) => {}
-            LoreEvent::InstanceDeleteBegin(data) => {
+            LoreEvent::RepositoryInstanceDeleteBegin(data) => {
                 let mode = if data.dry_run != 0 { " (dry run)" } else { "" };
                 println!(
                     "Deleting instance {} at {}{}",
                     data.instance_id, data.path, mode
                 );
             }
-            LoreEvent::InstanceDeleteProgress(data) => {
+            LoreEvent::RepositoryInstanceDeleteProgress(data) => {
                 println!("  {:?}", data.phase);
             }
-            LoreEvent::InstanceDeleteComplete(data) => {
+            LoreEvent::RepositoryInstanceDeleteComplete(data) => {
                 let outcome = if dry_run { "can be deleted" } else { "deleted" };
                 println!("Instance {} {}", data.instance_id, outcome);
             }
@@ -1890,14 +1890,14 @@ fn handle_repository_instance_move(globals: LoreGlobalArgs, target_path: &str) -
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::Complete(_) => {}
-            LoreEvent::InstanceMoveBegin(data) => {
+            LoreEvent::RepositoryInstanceMoveBegin(data) => {
                 let mode = if dry_run { " (dry run)" } else { "" };
                 println!(
                     "Moving instance {} from {} to {}{}",
                     data.instance_id, data.source_path, data.target_path, mode
                 );
             }
-            LoreEvent::InstanceMoveComplete(data) => {
+            LoreEvent::RepositoryInstanceMoveComplete(data) => {
                 let outcome = if dry_run { "can be moved" } else { "moved" };
                 println!(
                     "Instance {} {} to {}",
