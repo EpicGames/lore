@@ -830,6 +830,7 @@ async fn diff_filesystem_directory(
                     children: vec![StateNamedNode {
                         node: *node_id,
                         name: node.name_hash,
+                        staged: node.is_staged(),
                     }],
                 }
             }
@@ -1912,6 +1913,7 @@ async fn diff_filesystem_missing_nodes(
             &ctx.from.path,
             ctx.from_states,
             ctx.filter_mode,
+            false,
         )
         .await?
         else {

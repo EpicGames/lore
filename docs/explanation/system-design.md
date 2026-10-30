@@ -1290,7 +1290,8 @@ obvious "I only work on this directory" case.
 
 An *ignore file* (`.loreignore`) is an outbound filter declaring which paths the user does not
 want included in commits. Paths matching ignore rules are not staged, not committed, and not
-reported in status. Build artifacts, editor temporary files, machine-local configuration: all
+reported in status. A forced stage or a merge can still stage such a path; status lists it and the
+commit takes it. Build artifacts, editor temporary files, machine-local configuration: all
 typical inhabitants.
 
 Ignore is purely about *new* content. A file that is already part of the committed revision
@@ -1314,7 +1315,8 @@ The rule is simple: operations on *committed state* consult the view only; opera
   perfectly legitimate committed paths.
 - Operations on the working directory or staging area - staging, status, locking - filter
   through both. The view limits what the operation sees on disk; the ignore file then further
-  excludes things the user has declared shouldn't be staged.
+  excludes things the user has declared shouldn't be staged. Status lists what is already
+  staged through the view alone, since that is what the next commit holds.
 
 This split is what keeps `.loreignore` from breaking earlier history: a newly-added ignore
 rule does not retroactively excise committed files, because committed-state operations consult

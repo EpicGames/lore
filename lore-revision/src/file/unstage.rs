@@ -599,19 +599,7 @@ async fn unstage_path(
         resolved.unwrap_or(relative_path)
     };
 
-    let force = execution_context().globals().force();
     let parent_states = repository.filter.parent_exclusion_states(&relative_path);
-    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
-        force,
-        parent_states,
-        &relative_path,
-        true,
-        FilterMode::Full,
-    );
-    if excluded {
-        lore_trace!("Path excluded by filter: {}", relative_path.as_str());
-        return Ok(());
-    }
 
     // Path is repository root, unstage as directory
     if relative_path.is_empty() {
@@ -634,7 +622,7 @@ async fn unstage_path(
             options,
             stats.clone(),
             link_tracker.clone(),
-            states,
+            parent_states,
         )
         .await;
     }
@@ -920,12 +908,21 @@ async fn unstage_node(
         return Ok(());
     }
 
+    let block_index = NodeBlock::index(node_id);
+    let node_index = Node::index(node_id);
+
+    let block = state_staged
+        .block_with_nametable(repository.clone(), block_index)
+        .await
+        .forward::<UnstageError>("Failed deserializing state node block")?;
+    let mut node = block.node(node_index);
+
     let (child_states, excluded) = repository.filter.child_emit_excludes_unless_forced(
         execution_context().globals().force(),
         states,
         &node_path,
         true,
-        FilterMode::Full,
+        FilterMode::STAGED.at(node.is_staged()),
     );
     if excluded {
         lore_debug!("Node excluded by filter: {}", node_path.as_str());
@@ -937,15 +934,6 @@ async fn unstage_node(
         node_path.as_str(),
         repository.id
     );
-
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-
-    let block = state_staged
-        .block_with_nametable(repository.clone(), block_index)
-        .await
-        .forward::<UnstageError>("Failed deserializing state node block")?;
-    let mut node = block.node(node_index);
 
     lore_debug!("Found node {node_id}");
 

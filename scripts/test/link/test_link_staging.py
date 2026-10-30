@@ -626,7 +626,8 @@ def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
 
     Both crossings are covered: unstaging the repository root reaches the link
     node itself, and unstaging a path inside the link resolves through it to a
-    directory in the source repository.
+    directory in the source repository. The rules are view rules, since an ignore
+    rule does not keep staged content from being unstaged.
     """
     repo: Lore = new_lore_repo()
 
@@ -674,13 +675,14 @@ def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
     # Names the file below the mount rather than the mount, so the walk descends
     # and the verdict is reached inside the link. It matches the flattened
     # `linked/inside.txt` and cannot match the source path `sub/inside.txt`.
-    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
-        ignore_file.write(f"/{link_path}/inside.txt\n")
+    view_file = os.path.join(repo.dot_path(), "view")
+    with open(view_file, "w+") as view:
+        view.write(f"/{link_path}/inside.txt\n")
 
     repo.unstage(".")
 
     # Dropped so the status below reports the mounted file either way.
-    repo.remove_file(repo.ignore_file())
+    os.remove(view_file)
 
     staged = _staged_paths(repo)
     assert outside_file not in staged, (
@@ -694,12 +696,12 @@ def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
     # the link to a directory in the source repository, which is the crossing
     # the root walk above does not take.
     restage_everything()
-    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
-        ignore_file.write(f"/{link_path}/nested/deep.txt\n")
+    with open(view_file, "w+") as view:
+        view.write(f"/{link_path}/nested/deep.txt\n")
 
     repo.unstage(f"{link_path}/nested")
 
-    repo.remove_file(repo.ignore_file())
+    os.remove(view_file)
 
     staged = _staged_paths(repo)
     assert deep_file in staged, (
@@ -841,4 +843,23 @@ def test_link_scan_removes_the_directory_a_removed_link_emptied(new_lore_repo):
     verify = parent_repo.clone()
     assert working_tree_files(verify) == [DEFAULT_PARENT_FILE], (
         f"The branch holds the parent's own file alone, got {working_tree_files(verify)}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_status_lists_staged_changes_below_an_ignored_mount(new_lore_repo):
+    """Status lists a change staged with `--force` in a link mounted below a directory
+    the ignore file names."""
+    parent, _ = make_parent_with_link(new_lore_repo, link_path="vendor/lib")
+    with parent.open_file(parent.ignore_file(), "w+") as f:
+        f.write("vendor/\n")
+    parent.stage(parent.ignore_file())
+    parent.commit("Ignore vendor/")
+    with parent.open_file("vendor/lib/linked.txt", "w+") as f:
+        f.write("edited\n")
+    parent.stage("vendor/lib/linked.txt", force=True)
+
+    entries = {e.get("path"): e for e in parse_status_json(parent.status(json=True))}
+    assert entries.get("vendor/lib/linked.txt", {}).get("flagStaged") is True, (
+        f"status lists {entries}"
     )

@@ -1357,9 +1357,36 @@ bitflags! {
         const Ignore = 0b1;
         const View = 0b10;
         const Full = 0b11;
+        /// The ignore slot does not exclude a node with something staged at or below it. Only a
+        /// walk's per-node queries read the bit; see [`FilterMode::at`].
+        const KeepStaged = 0b1000;
     }
 }
 bitflagsops!(FilterMode, u16);
+
+impl FilterMode {
+    /// The mode for staged content: the view, and the ignore rules where nothing is staged.
+    pub const STAGED: Self = Self::Full.union(Self::KeepStaged);
+
+    /// The mode a walk through `self` asks about a node in, `staged` saying whether something is
+    /// staged at or below the node.
+    pub fn at(self, staged: bool) -> Self {
+        if staged {
+            self
+        } else {
+            self.difference(Self::KeepStaged)
+        }
+    }
+
+    /// The slots that exclude.
+    fn excluding(self) -> Self {
+        if self.contains(Self::KeepStaged) {
+            self.difference(Self::Ignore)
+        } else {
+            self
+        }
+    }
+}
 
 /// How far a query's verdict reaches.
 ///
@@ -1513,6 +1540,7 @@ impl Filter {
                 .view
                 .step(parent.view, lowercase, name, is_directory, depth);
         }
+        let mode = mode.excluding();
         let reason = if scope == Scope::Tree && is_directory {
             self.descend_reason(states, lowercase, depth, mode)
         } else if mode.contains(FilterMode::Ignore) && states.ignore.excluded {

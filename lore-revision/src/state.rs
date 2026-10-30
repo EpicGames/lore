@@ -140,6 +140,8 @@ pub type StateError = StateErrors;
 pub struct StateNamedNode {
     node: NodeID,
     name: u64,
+    /// Whether something is staged at or below the node.
+    staged: bool,
 }
 
 pub struct StateChildrenNodes {
@@ -4018,6 +4020,7 @@ impl State {
                     StateNamedNode {
                         node: child_id,
                         name: child_node.name_hash,
+                        staged: child_node.is_staged(),
                     },
                 );
             }
@@ -9187,7 +9190,7 @@ fn add_change_hierarchy(
                 level.states,
                 &path,
                 child_node.is_directory(),
-                filter_mode,
+                filter_mode.at(child_node.is_staged()),
             );
 
             if !excluded {

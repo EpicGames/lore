@@ -3169,3 +3169,31 @@ def test_layer_dry_run_adds_and_removes_nothing(new_lore_repo):
     assert os.path.isfile(layer_file), (
         "layer remove --dry-run removed the layer's files"
     )
+
+
+@pytest.mark.smoke
+def test_layer_status_lists_staged_changes_below_an_ignored_mount(new_lore_repo):
+    """Status lists a change staged with `--force` in a layer drawn from a repository's
+    root and mounted below a directory the ignore file names."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    with repo.open_file(repo.ignore_file(), "w+") as f:
+        f.write("vendor/\n")
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+    with layer_repo.open_file("a.txt", "w+") as f:
+        f.write("layer\n")
+    layer_repo.stage(scan=True)
+    layer_repo.commit()
+    layer_repo.push()
+
+    repo.layer_add("vendor/x", layer_repo, "/")
+    with repo.open_file("vendor/x/a.txt", "w+") as f:
+        f.write("edited\n")
+    repo.stage("vendor/x/a.txt", force=True)
+
+    entries = parse_status_json(repo.status(json=True))
+    assert [(e.get("path"), e.get("action"), e.get("flagStaged")) for e in entries] == [
+        ("vendor/x/a.txt", "keep", True)
+    ], f"status lists {entries}"

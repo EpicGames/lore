@@ -208,3 +208,60 @@ fn an_authored_rule_ending_in_an_escaped_star_gets_no_companion() {
         "art/foo\\* re-includes art/foo*/x.png"
     );
 }
+
+/// Every named mode other than [`FilterMode::KeepStaged`] keeps its bits through
+/// [`FilterMode::at`], so no mode can share the staged bit.
+#[test]
+fn a_mode_keeps_every_bit_but_the_staged_one_through_at() {
+    use bitflags::Flags;
+
+    for flag in FilterMode::FLAGS {
+        if flag.name() == "KeepStaged" {
+            continue;
+        }
+        let mode = *flag.value();
+        assert_eq!(mode.at(false), mode, "{}", flag.name());
+        assert_eq!(
+            (mode | FilterMode::KeepStaged).at(false),
+            mode,
+            "{}",
+            flag.name()
+        );
+    }
+}
+
+/// A staged node passes the ignore slot, which still folds it, so a child holding nothing staged
+/// inherits the exclusion. A whole-path query reads the staged mode as [`FilterMode::Full`].
+#[test]
+fn a_staged_node_passes_the_ignore_slot_and_its_unstaged_children_do_not() {
+    let mut filter = Filter::default();
+    filter
+        .ignore
+        .add_exclusion("bin/")
+        .expect("Filter exclusion");
+    let bin = path("bin");
+    let child = path("bin/a.txt");
+
+    let (states, excluded) =
+        filter.child_excludes_tree(FilterStates::ROOT, &bin, true, FilterMode::STAGED.at(true));
+    assert!(!excluded, "a staged directory passes the ignore slot");
+    assert!(
+        filter
+            .child_excludes_tree(FilterStates::ROOT, &bin, true, FilterMode::STAGED.at(false))
+            .1,
+        "an unstaged directory does not"
+    );
+    assert!(
+        filter
+            .child_excludes_tree(states, &child, false, FilterMode::STAGED.at(false))
+            .1,
+        "an unstaged child of the staged directory inherits the exclusion"
+    );
+    assert!(
+        !filter
+            .child_excludes_tree(states, &child, false, FilterMode::STAGED.at(true))
+            .1,
+        "a staged child passes it"
+    );
+    assert!(filter.excludes_tree(&bin, true, FilterMode::STAGED));
+}

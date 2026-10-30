@@ -3939,4 +3939,476 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// An execution context whose global force flag is set, which is what `--force` gives a
+    /// command.
+    fn forced_execution() -> Arc<lore_revision::interface::ExecutionContext> {
+        Arc::new(lore_revision::interface::ExecutionContext::new_client(
+            lore_revision::interface::LoreGlobalArgs {
+                force: 1,
+                ..Default::default()
+            },
+            lore_revision::relay::EventDispatcher::no_dispatch(),
+        ))
+    }
+
+    /// `names`, relative to `root`, as the paths a command is given.
+    fn path_arguments(root: &std::path::Path, names: &[&str]) -> LoreArray<LoreString> {
+        LoreArray::from_vec(
+            names
+                .iter()
+                .map(|name| LoreString::from(root.join(name).to_string_lossy().as_ref()))
+                .collect(),
+        )
+    }
+
+    /// Stages `names` below `root` through `repository` as `lore stage --scan` does, forced or not.
+    async fn stage_paths(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        root: &std::path::Path,
+        names: &[&str],
+        force: bool,
+    ) {
+        let token = repository
+            .try_write_token()
+            .expect("The repository was opened for writing");
+        let stage = file::stage::stage(
+            repository.clone(),
+            token,
+            path_arguments(root, names),
+            StageOptions {
+                scan: true,
+                ..Default::default()
+            },
+        );
+        if force {
+            LORE_CONTEXT.scope(forced_execution(), stage).await
+        } else {
+            stage.await
+        }
+        .expect("Stage failed");
+    }
+
+    /// A repository holding `committed` and, committed after them, the rule `ignore` in its
+    /// `.loreignore`. Answers a context that reads the rule and one that does not, which stands
+    /// for what was done before the rule was added.
+    async fn ignoring_repository(
+        committed: &[&str],
+        ignore: &str,
+    ) -> (
+        Arc<lore_revision::repository::RepositoryContext>,
+        Arc<lore_revision::repository::RepositoryContext>,
+        TempDir,
+    ) {
+        let committed: Vec<String> = committed.iter().map(|name| name.to_string()).collect();
+        let (unruled, tempdir) = committed_repository("", &committed).await;
+        let root = tempdir.to_path_buf();
+        let rule = lore_revision::repository::DOT_LOREIGNORE;
+        test_file_write(root.join(rule).as_path(), ignore.as_bytes());
+        let ruled = Arc::new(unruled.to_filter_context(
+            lore_revision::repository::load_filter(&root).expect("Filter load failed"),
+        ));
+        stage_paths(&ruled, &root, &[rule], false).await;
+        commit::commit_boxed(
+            ruled.clone(),
+            ruled
+                .try_write_token()
+                .expect("The repository was opened for writing"),
+            CommitOptions::new("Ignore".to_string()),
+        )
+        .await
+        .expect("Commit failed");
+        (ruled, unruled, tempdir)
+    }
+
+    /// What a status run over `paths` of `repository` reports, each change as the command line
+    /// lists it with an unresolved conflict marked `!`, and whether it is staged, in order.
+    async fn status_reported(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        paths: Option<Vec<lore_revision::util::path::RelativePath>>,
+        scan: bool,
+    ) -> Vec<(String, bool)> {
+        let reported = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = reported.clone();
+        let execution = Arc::new(
+            lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                lore_revision::interface::LoreGlobalArgs::default(),
+                lore_revision::relay::EventDispatcher::new(Some(Box::new(move |event| {
+                    if let lore_revision::event::LoreEvent::RepositoryStatusFile(data) = event {
+                        let source = match data.from_path.as_str() {
+                            "" => String::new(),
+                            from => format!("{from} -> "),
+                        };
+                        let directory =
+                            if data.r#type == lore_revision::interface::LoreNodeType::File {
+                                ""
+                            } else {
+                                "/"
+                            };
+                        captured.lock().expect("reported").push((
+                            format!(
+                                "{} {source}{}{directory}{}",
+                                data.action_as_string_short(),
+                                data.path.as_str(),
+                                data.conflict_as_string_short()
+                            ),
+                            data.flag_staged != 0,
+                        ));
+                    }
+                }))),
+                "test-user".to_string(),
+            ),
+        );
+        LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                lore_revision::repository::status::status_boxed(
+                    repository.clone(),
+                    paths,
+                    lore_revision::repository::status::StatusOptions {
+                        staged: true,
+                        scan,
+                        ..scan_status_options()
+                    },
+                ),
+            )
+            .await
+            .expect("Status failed");
+        execution.dispatcher.drain().await;
+        let mut reported = std::mem::take(&mut *reported.lock().expect("reported"));
+        reported.sort_unstable();
+        reported
+    }
+
+    /// What a walk from `repository`'s current state to its staged one through `mode` finds, as
+    /// sorted action letters and paths, and how many directories it enters.
+    async fn staged_walk(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        mode: lore_revision::filter::FilterMode,
+    ) -> (Vec<(String, String)>, u64) {
+        let (current, staged, _) = State::deserialize_current_and_staged(repository.clone())
+            .await
+            .expect("Deserialize failed");
+        let staged = staged.expect("The repository holds a staged state");
+        let (from, to) = (repository.clone(), repository.clone());
+        let mut walk = lore_revision::state::ChangeStream::spawn(async move |changes| {
+            lore_revision::state::diff(from, current, to, staged, None, None, &changes, mode).await
+        });
+        let mut found = Vec::new();
+        while let Some(change) = walk.next().await {
+            found.push((
+                change.action.as_string_short().to_string(),
+                change.path().as_str().to_string(),
+            ));
+        }
+        let stats = walk.finish().await.expect("Walk failed");
+        found.sort();
+        (
+            found,
+            stats
+                .directories_entered
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Status lists a forced edit and delete below a directory an ignore rule names, also asked
+    /// about one path, and hides a file there that is only marked dirty, also asked about it.
+    #[tokio::test]
+    async fn status_lists_forced_changes_below_an_ignored_directory_and_hides_a_dirty_file() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, unruled, tempdir) = ignoring_repository(
+                    &["bin/edit.txt", "bin/gone.txt", "bin/dirty.txt"],
+                    "bin/\n",
+                )
+                .await;
+                let root = tempdir.to_path_buf();
+                test_file_write(root.join("bin/dirty.txt").as_path(), b"marked");
+                file::dirty::dirty(unruled.clone(), path_arguments(&root, &["bin/dirty.txt"]))
+                    .await
+                    .expect("Dirty failed");
+                test_file_write(root.join("bin/edit.txt").as_path(), b"edited");
+                std::fs::remove_file(root.join("bin/gone.txt")).expect("Remove failed");
+                stage_paths(&ruled, &root, &["bin/edit.txt", "bin/gone.txt"], true).await;
+
+                let staged = vec![
+                    ("D bin/gone.txt".to_string(), true),
+                    ("M bin/edit.txt".to_string(), true),
+                ];
+                for scan in [false, true] {
+                    assert_eq!(
+                        status_reported(&ruled, None, scan).await,
+                        staged,
+                        "status with scan {scan}"
+                    );
+                }
+                assert_eq!(
+                    status_reported(&ruled, Some(vec![relative_path("bin/edit.txt")]), false).await,
+                    staged[1..]
+                );
+                assert_eq!(
+                    status_reported(&ruled, Some(vec![relative_path("bin/dirty.txt")]), false)
+                        .await,
+                    []
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Status lists a forced add of a file an ignore rule matches, and staged moves into and out
+    /// of a directory one names.
+    #[tokio::test]
+    async fn status_lists_a_forced_add_and_moves_into_and_out_of_an_ignored_directory() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, _, tempdir) =
+                    ignoring_repository(&["bin/out.txt", "src/into.txt"], "bin/\n").await;
+                let root = tempdir.to_path_buf();
+                test_file_write(root.join("bin/new.txt").as_path(), b"new");
+                stage_paths(&ruled, &root, &["bin/new.txt"], true).await;
+                for (from, to) in [
+                    ("src/into.txt", "bin/into.txt"),
+                    ("bin/out.txt", "src/out.txt"),
+                ] {
+                    std::fs::rename(root.join(from), root.join(to)).expect("Rename failed");
+                    LORE_CONTEXT
+                        .scope(
+                            forced_execution(),
+                            file::stage::stage_move(
+                                ruled.clone(),
+                                ruled
+                                    .try_write_token()
+                                    .expect("The repository was opened for writing"),
+                                root.join(from).to_string_lossy().into_owned(),
+                                root.join(to).to_string_lossy().into_owned(),
+                                StageOptions::default(),
+                            ),
+                        )
+                        .await
+                        .expect("Stage move failed");
+                }
+
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    vec![
+                        ("A bin/new.txt".to_string(), true),
+                        ("V bin/out.txt -> src/out.txt".to_string(), true),
+                        ("V src/into.txt -> bin/into.txt".to_string(), true),
+                    ]
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Status lists a forced delete of a directory an ignore rule names as it lists the delete
+    /// without the rule, and the walk does not fan out below it.
+    #[tokio::test]
+    async fn status_lists_a_forced_delete_of_an_ignored_directory() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, unruled, tempdir) =
+                    ignoring_repository(&["gen/a.txt", "gen/b.txt"], "gen/\n").await;
+                let root = tempdir.to_path_buf();
+                std::fs::remove_dir_all(root.join("gen")).expect("Remove failed");
+                stage_paths(&ruled, &root, &["gen"], true).await;
+
+                let reported = status_reported(&ruled, None, false).await;
+                assert_eq!(reported, status_reported(&unruled, None, false).await);
+                assert_eq!(reported, vec![("D gen/".to_string(), true)]);
+                assert_eq!(
+                    staged_walk(&ruled, lore_revision::filter::FilterMode::STAGED)
+                        .await
+                        .0,
+                    vec![("D".to_string(), "gen".to_string())]
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A merge stages a conflict on a path an ignore rule matches, and status lists it
+    /// unresolved.
+    #[tokio::test]
+    async fn status_lists_a_merge_conflict_on_an_ignored_path() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, _, tempdir) =
+                    ignoring_repository(&["bin/conflict.txt"], "bin/\n").await;
+                let root = tempdir.to_path_buf();
+                let token = ruled
+                    .try_write_token()
+                    .expect("The repository was opened for writing");
+                let commit_edit = async |content: &[u8]| {
+                    test_file_write(root.join("bin/conflict.txt").as_path(), content);
+                    stage_paths(&ruled, &root, &["bin/conflict.txt"], true).await;
+                    commit::commit_boxed(ruled.clone(), token, CommitOptions::new(String::new()))
+                        .await
+                        .expect("Commit failed");
+                };
+
+                let (base, main) = lore_revision::instance::load_current_anchor_boxed(&ruled)
+                    .await
+                    .expect("Anchor load failed");
+                lore_revision::branch::create::create(
+                    ruled.clone(),
+                    token,
+                    "feature".to_string(),
+                    None,
+                    String::new(),
+                    false,
+                )
+                .await
+                .expect("Branch create failed");
+                let (_, feature) = lore_revision::instance::load_current_anchor_boxed(&ruled)
+                    .await
+                    .expect("Anchor load failed");
+                commit_edit(b"feature").await;
+                lore_revision::instance::store_current_anchor_branch(&ruled, main)
+                    .await
+                    .expect("Anchor store failed");
+                lore_revision::instance::store_current_anchor(&ruled, base)
+                    .await
+                    .expect("Anchor store failed");
+                commit_edit(b"main").await;
+
+                let offline = Arc::new(
+                    lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                        lore_revision::interface::LoreGlobalArgs::default().set_offline(),
+                        lore_revision::relay::EventDispatcher::no_dispatch(),
+                        "test-user".to_string(),
+                    ),
+                );
+                let merged = LORE_CONTEXT
+                    .scope(
+                        offline,
+                        Box::pin(lore_revision::branch::merge::merge_start(
+                            ruled.clone(),
+                            token,
+                            feature,
+                            lore_revision::branch::merge::MergeStartOptions {
+                                message: String::new(),
+                                link_messages: std::collections::HashMap::new(),
+                                no_commit: false,
+                                scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                                inherit_metadata: Default::default(),
+                            },
+                        )),
+                    )
+                    .await;
+
+                merged.expect("Merge failed");
+                let (_, staged, _) = State::deserialize_current_and_staged(ruled.clone())
+                    .await
+                    .expect("Deserialize failed");
+                assert!(staged.expect("The merge staged its result").is_conflict());
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    vec![("M bin/conflict.txt!".to_string(), true)]
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The comparison status runs against the staged state does not enter a directory an ignore
+    /// rule names where nothing below it is staged, however much is marked dirty there.
+    #[tokio::test]
+    async fn the_staged_comparison_does_not_walk_an_ignored_directory_holding_nothing_staged() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, unruled, tempdir) =
+                    ignoring_repository(&["gen/a/f.txt", "gen/b/f.txt", "keep.txt"], "gen/\n")
+                        .await;
+                let root = tempdir.to_path_buf();
+                test_file_write(root.join("keep.txt").as_path(), b"edited");
+                stage_paths(&ruled, &root, &["keep.txt"], false).await;
+                std::fs::remove_dir_all(root.join("gen/a")).expect("Remove failed");
+                test_file_write(root.join("gen/b/f.txt").as_path(), b"edited");
+                file::dirty::dirty(
+                    unruled.clone(),
+                    LoreArray::from_vec(vec![LoreString::from(&root)]),
+                )
+                .await
+                .expect("Dirty failed");
+
+                let (marked, entered) =
+                    staged_walk(&ruled, lore_revision::filter::FilterMode::View).await;
+                assert!(
+                    marked.len() > 3 && entered > 1,
+                    "the dirty marks below gen are there to walk into"
+                );
+                assert_eq!(
+                    staged_walk(&ruled, lore_revision::filter::FilterMode::STAGED).await,
+                    (
+                        [".loreignore", "keep.txt", "seed.txt"]
+                            .map(|path| ("M".to_string(), path.to_string()))
+                            .to_vec(),
+                        1
+                    )
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Status lists a forced change of a file to a directory below a directory an ignore rule
+    /// names as it lists the change without the rule.
+    #[tokio::test]
+    async fn status_lists_a_forced_type_change_below_an_ignored_directory() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, unruled, tempdir) = ignoring_repository(&["bin/thing"], "bin/\n").await;
+                let root = tempdir.to_path_buf();
+                std::fs::remove_file(root.join("bin/thing")).expect("Remove failed");
+                std::fs::create_dir_all(root.join("bin/thing")).expect("Create directory failed");
+                test_file_write(root.join("bin/thing/inner.txt").as_path(), b"inner");
+                stage_paths(&ruled, &root, &["bin/thing"], true).await;
+
+                let reported = status_reported(&ruled, None, false).await;
+                assert_eq!(reported, status_reported(&unruled, None, false).await);
+                assert!(!reported.is_empty());
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Unstaging a path takes back a staged change to it that an ignore rule matches, which
+    /// status lists.
+    #[tokio::test]
+    async fn unstage_takes_back_a_staged_change_below_an_ignored_directory() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, _, tempdir) = ignoring_repository(&["bin/sub/a.txt"], "bin/\n").await;
+                let root = tempdir.to_path_buf();
+                test_file_write(root.join("bin/sub/a.txt").as_path(), b"edited");
+                stage_paths(&ruled, &root, &["bin/sub/a.txt"], true).await;
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    vec![("M bin/sub/a.txt".to_string(), true)]
+                );
+
+                file::unstage::unstage(
+                    ruled.clone(),
+                    ruled
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    path_arguments(&root, &["bin/sub/a.txt"]),
+                    file::unstage::UnstageOptions::default(),
+                )
+                .await
+                .expect("Unstage failed");
+                assert_eq!(status_reported(&ruled, None, false).await, []);
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }

@@ -220,8 +220,14 @@ pub fn diff_subtree(
     let from_filter = &from.mapping.repository.filter;
     let to_filter = &to.mapping.repository.filter;
     let flags = DiffFlags::between(from_filter, to_filter);
-    let (from_states, to_states, excluded) =
-        seed_sides(from_filter, to_filter, &path, flags, filter_mode);
+    // A repository's root carries no staged flag, so a walk rooted at one keeps it.
+    let (from_states, to_states, excluded) = seed_sides(
+        from_filter,
+        to_filter,
+        &path,
+        flags,
+        filter_mode.at(to.flags.contains(NodeFlags::Staged) || !to.mapping.node.is_valid_node_id()),
+    );
     if excluded {
         lore_debug!("Excluded by filter: {}", path.as_str());
         return Either::Left(std::future::ready(Ok(DiffWalkStats::default())));
@@ -605,19 +611,6 @@ fn diff_subtree_node_walk(
         };
         let mut to_index = 0;
         for from_named_node in from_nodes.children.iter() {
-            stats.queried();
-            let Some((from_node_search, from_node_states)) = get_filtered_node_and_path(
-                from_nodes,
-                from_named_node.node,
-                &paths.from,
-                states.from,
-                filter_mode,
-            )
-            .await?
-            else {
-                continue;
-            };
-
             while to_index < to_nodes.children.len()
                 && to_nodes.children[to_index].name < from_named_node.name
             {
@@ -625,21 +618,26 @@ fn diff_subtree_node_walk(
                 to_index += 1;
             }
 
-            if to_index >= to_nodes.children.len()
-                || to_nodes.children[to_index].name > from_named_node.name
-            {
-                add_change_for_solo_from_node(
-                    context,
-                    from_named_node,
-                    to,
-                    &from_node_search,
-                    from_node_states,
-                )
-                .await?;
-            } else {
-                let to_named_node = &to_nodes.children[to_index];
-                to_index += 1;
+            let paired = to_nodes
+                .children
+                .get(to_index)
+                .filter(|to_named_node| to_named_node.name == from_named_node.name);
+            stats.queried();
+            let Some((from_node_search, from_node_states)) = get_filtered_node_and_path(
+                from_nodes,
+                from_named_node.node,
+                &paths.from,
+                states.from,
+                filter_mode,
+                paired.is_some_and(|to_named_node| to_named_node.staged),
+            )
+            .await?
+            else {
+                continue;
+            };
 
+            if let Some(to_named_node) = paired {
+                to_index += 1;
                 add_change_for_paired_nodes(
                     work,
                     flags,
@@ -647,6 +645,15 @@ fn diff_subtree_node_walk(
                     context,
                     to_named_node,
                     from_named_node.node,
+                    &from_node_search,
+                    from_node_states,
+                )
+                .await?;
+            } else {
+                add_change_for_solo_from_node(
+                    context,
+                    from_named_node,
+                    to,
                     &from_node_search,
                     from_node_states,
                 )
@@ -771,6 +778,7 @@ async fn add_change_for_solo_to_node(
         &paths.to,
         states.to,
         filter_mode,
+        false,
     )
     .await?
     else {
@@ -1080,7 +1088,7 @@ async fn add_change_for_paired_nodes(
             from_type == LoreNodeType::File,
             to_type == LoreNodeType::File,
             flags,
-            filter_mode,
+            filter_mode.at(is_staged),
             stats,
         );
         if to_excludes_subtree {
@@ -1293,10 +1301,13 @@ async fn add_change_for_paired_nodes(
         } else {
             lore_trace!("Diff node {subpath} changed from {from_type:?} to {to_type:?}");
             stats.queried();
-            let (to_node_states, to_node_excluded) = to_nodes
-                .repository
-                .filter
-                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), filter_mode);
+            let (to_node_states, to_node_excluded) =
+                to_nodes.repository.filter.child_excludes_tree(
+                    states.to,
+                    &subpath,
+                    to_node.is_directory(),
+                    filter_mode.at(is_staged),
+                );
             add_change(
                 from.clone(),
                 to.clone(),
@@ -1372,6 +1383,7 @@ async fn find_sorted_children(
             from_nodes.children.push(StateNamedNode {
                 node: from.mapping.node,
                 name: node.name_hash,
+                staged: node.is_staged(),
             });
         }
 
@@ -1391,6 +1403,7 @@ async fn find_sorted_children(
             to_nodes.children.push(StateNamedNode {
                 node: to.mapping.node,
                 name: node.name_hash,
+                staged: node.is_staged(),
             });
         }
         directory_paths.from.pop();
@@ -1535,12 +1548,16 @@ async fn get_node_and_path(
 /// [`get_node_and_path`] for a walk standing in `path`: `parent_states` is the
 /// filter's verdict for it, and the child's own is returned alongside the node
 /// for the walk to carry below.
+///
+/// The node is asked about in the mode [`FilterMode::at`] answers, staged where the node carries
+/// something staged or `staged` says its counterpart in a staged tree does.
 pub async fn get_filtered_node_and_path(
     nodes: &StateChildrenNodes,
     node_id: NodeID,
     path: &RelativePath,
     parent_states: FilterStates,
     filter_mode: FilterMode,
+    staged: bool,
 ) -> Result<Option<(NodeSearchResult, FilterStates)>, StateError> {
     Ok(get_node_and_path(nodes, node_id, path)
         .await?
@@ -1549,7 +1566,7 @@ pub async fn get_filtered_node_and_path(
                 parent_states,
                 &result.path,
                 result.node.is_directory(),
-                filter_mode,
+                filter_mode.at(staged || result.node.is_staged()),
             );
             if excluded {
                 lore_trace!("Path excluded by filter: {}", path);

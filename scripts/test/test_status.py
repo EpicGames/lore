@@ -1130,3 +1130,37 @@ def test_status_scan_over_a_file_replaced_by_a_directory_keeps_the_file(new_lore
     repo.stage(".", offline=True)
     repo.commit("Change the file", offline=True)
     assert repo.file_info("entry", offline=True)[0].context == file_id
+
+
+@pytest.mark.smoke
+def test_status_lists_staged_changes_to_ignored_paths(new_lore_repo):
+    """Status lists an edit and a delete a forced stage takes of committed
+    files the ignore file matches, since they are what the next commit holds.
+    """
+    repo: Lore = new_lore_repo()
+    for name in ("keep.cfg", "gone.cfg"):
+        with repo.open_file(name, "w+") as f:
+            f.write("committed\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    with repo.open_file(repo.ignore_file(), "w+") as f:
+        f.write("*.cfg\n")
+    repo.stage(repo.ignore_file(), offline=True)
+    with repo.open_file("keep.cfg", "w+") as f:
+        f.write("edited\n")
+    repo.remove_file("gone.cfg")
+    repo.stage(["keep.cfg", "gone.cfg"], force=True, offline=True)
+
+    expected = {repo.ignore_file(): "add", "keep.cfg": "keep", "gone.cfg": "delete"}
+    for scan in (False, True):
+        entries = _status_files_by_path(repo, scan=scan)
+        assert {path: entry["action"] for path, entry in entries.items()} == expected, (
+            f"status --json (scan {scan}) lists {entries}"
+        )
+        assert all(entry["flagStaged"] is True for entry in entries.values())
+
+        sections = _status_sections(repo.status(scan=scan, offline=True))
+        assert sections == {"Changes staged for commit:": sorted(expected)}, (
+            f"status (scan {scan}) lists {sections}"
+        )
