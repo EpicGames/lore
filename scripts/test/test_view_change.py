@@ -267,10 +267,6 @@ def test_sync_view_narrows_then_widens_an_instance(new_lore_repo, scratch_dir):
 def test_sync_view_narrows_to_a_re_including_view(new_lore_repo, scratch_dir):
     """A view built the way they are authored -- drop everything at the top,
     re-include the one tree wanted, narrow within it -- is carried as written.
-
-    The unanchored exclusion it opens with is also the shape that defeats the
-    content-equality prune, so this is the walk that visits the whole tree and has
-    to arrive at the same answer.
     """
     repo = committed_repository(new_lore_repo)
     instance = repo.clone()

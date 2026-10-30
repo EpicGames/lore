@@ -96,9 +96,9 @@ pub enum FilterError {
 ///
 /// `decided_at` names the line that produced the verdict, and floors two
 /// searches: [`FilterInstance::step`] skips the lines before it, so a rule that
-/// already lost at an excluded ancestor cannot win below it, and
-/// `ReincludeIndex::below` ignores re-inclusions before it, so a rule that lost
-/// cannot force a descent either.
+/// already lost at an excluded ancestor cannot win below it, and the
+/// re-inclusion index's `RuleIndex::below` ignores re-inclusions before it, so
+/// a rule that lost cannot force a descent either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilterState {
     excluded: bool,
@@ -594,11 +594,11 @@ const MAX_ALTERNATIVES: usize = 64;
 /// Two independent bounds keep a rule out of an answer, and a rule escapes the
 /// index only by escaping both. The trie bounds *where* it can match: only the
 /// wildcard-free leading components of a glob can be indexed, so one whose first
-/// component holds a wildcard is recorded in `unanchored` and reaches any path.
+/// component holds a wildcard is recorded in `unprefixed` and reaches any path.
 /// The [`RuleReach`] depth bounds *how deep*: the `/*` that opens a filter
 /// written as "exclude the top, then re-include what is wanted" compiles to
-/// `*`, which is unanchored and so reaches every path, but which cannot match
-/// below the first level.
+/// `*`, which no prefix bounds and so reaches every path, but which cannot
+/// match below the first level.
 ///
 /// Over-approximating costs traversal, under-approximating drops content, so
 /// every uncertain case answers "a rule reaches here".
@@ -607,7 +607,7 @@ struct RuleIndex {
     root: RuleNode,
     /// Rules no prefix can rule out, because the first component of the glob
     /// holds a wildcard or the rule is matched against a name at any depth.
-    unanchored: RuleReach,
+    unprefixed: RuleReach,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -757,7 +757,7 @@ impl RuleIndex {
         for (index, component) in glob.split('/').enumerate() {
             if has_wildcard(component) {
                 if index == 0 {
-                    self.unanchored.widen(reach);
+                    self.unprefixed.widen(reach);
                 }
                 node.wildcard_tail.widen(reach);
                 return;
@@ -778,8 +778,8 @@ impl RuleIndex {
 
     /// Records the rule on line `line` as one no prefix bounds, so it reaches any
     /// path. `depth` bounds it as in [`insert`](Self::insert).
-    fn insert_unanchored(&mut self, line: usize, depth: u32) {
-        self.unanchored.widen(RuleReach::rule(line, depth));
+    fn insert_unprefixed(&mut self, line: usize, depth: u32) {
+        self.unprefixed.widen(RuleReach::rule(line, depth));
     }
 
     /// Whether a rule on line `floor` or later can match a path strictly below
@@ -799,7 +799,7 @@ impl RuleIndex {
     /// An empty `path` is the repository root, which names no component and
     /// holds everything: any rule the index carries at all lands below it.
     fn below(&self, path: &str, floor: u32, depth: u32) -> bool {
-        if self.unanchored.reaches(floor, depth) {
+        if self.unprefixed.reaches(floor, depth) {
             return true;
         }
         let mut node = &self.root;
@@ -932,7 +932,7 @@ impl FilterInstance {
         let (min_depth, depth_max) = Self::depth_range(&glob, filename);
         let literal = is_literal(&glob);
         if filename {
-            self.exclude.insert_unanchored(self.lines.len(), depth_max);
+            self.exclude.insert_unprefixed(self.lines.len(), depth_max);
         } else {
             let expand = !literal && glob.contains('{');
             self.exclude

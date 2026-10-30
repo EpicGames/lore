@@ -1,6 +1,7 @@
 ---
 status: accepted
 date: 2026-07-29
+amended: 2026-10-30
 deciders: Raghav Narula
 ---
 
@@ -44,7 +45,7 @@ A conflict at an out-of-view path:
 
 **An out-of-view subtree the branch never touched is adopted by reconciling it.** `GraftOracle` requires the view to exclude every path below the directory, and the branch's version of it to be byte-identical to the base's. It refuses a path resolving into a linked repository. The walk then emits one `FileAction::Graft` change instead of descending, and the apply diffs the staged subtree against source's: a child whose address matches is skipped without descending, a differing file is overwritten in place, an added node is created, a removed one is discarded.
 
-`FilterInstance::excludes_subtree` answers whether the whole subtree is out of view. Testing the directory path alone is not enough, because a view is an ordered glob list and a later inclusion line can re-include part of an excluded area. It requires no inclusion line anywhere in the view, and some exclusion line of the form `<prefix>/**` covering the path.
+`FilterInstance::excludes_subtree` answers whether the whole subtree is out of view. Testing the directory path alone is not enough, because a view is an ordered glob list and a later inclusion line can re-include part of an excluded area. **Amended 2026-10-30:** it requires the view to exclude the directory or one of its ancestors, and no path inclusion line at or after the line deciding that exclusion to be able to match below that path. A name inclusion such as `!keep.txt` never applies below an excluded directory. The filter's re-inclusion index bounds each path inclusion by its literal prefix and by the most path components it can match, so under `*`, `!/*`, `!a/b/**` the subtree `c/d` is out of view.
 
 **A conflict at an out-of-view path adopts the incoming side.** The node is staged from the source revision and flagged `StagedMergeTheirs`, the flag `merge resolve theirs` sets, so the choice is recorded rather than implied. Nothing is written to the working tree, and the path counts as merged rather than conflicted. An in-view conflict is unaffected.
 

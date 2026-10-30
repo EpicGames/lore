@@ -1500,8 +1500,8 @@ mod tests {
     /// wrong "covered" drops every change inside it silently. The other
     /// direction only costs traversal.
     ///
-    /// Held against `FilterInstance::excludes`, which folds every ancestor on
-    /// every call and consults no index, the way the rest of these tests hold
+    /// Held against `FilterInstance::excludes`, which never reads the exclusion
+    /// index `covers_subtree` answers from, the way the rest of these tests hold
     /// the memoized answers against it.
     #[test]
     fn a_covered_subtree_holds_nothing_excluded() {

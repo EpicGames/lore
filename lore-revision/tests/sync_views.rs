@@ -598,8 +598,8 @@ mod tests {
                     fixture.views.to_path_buf().join("absent"),
                     // A lone continuation byte, which is no encoding this reads.
                     fixture.view_file_bytes("undecodable", &[b'/', 0x80]),
-                    // An inclusion cannot be unanchored: it would put the whole tree in view to
-                    // find what it re-includes.
+                    // `add_inclusion` refuses a `**`-prefixed inclusion naming more than one
+                    // component.
                     fixture.view_file("malformed", &["/*", "!**/keep/kept.txt"]),
                 ];
 
