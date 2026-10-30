@@ -36,11 +36,16 @@ use workload::tree;
 /// The filter as a repository holds one: the hundred-line rule set in the ignore
 /// slot, view empty.
 fn build() -> Filter {
+    build_from(&rules())
+}
+
+/// A filter holding `rules` in the ignore slot.
+fn build_from(rules: &[String]) -> Filter {
     let mut filter = Filter::default();
-    for rule in rules() {
+    for rule in rules {
         match rule.strip_prefix('!') {
             Some(rest) => filter.ignore.add_inclusion(rest).expect("inclusion"),
-            None => filter.ignore.add_exclusion(&rule).expect("exclusion"),
+            None => filter.ignore.add_exclusion(rule).expect("exclusion"),
         }
     }
     filter
@@ -244,6 +249,49 @@ fn descend_large_tree() {
         let a = report("whole path", ROUNDS, whole.queries, whole_time);
         let b = report("threaded", ROUNDS, threaded.queries, threaded_time);
         println!("  speedup {:.2}x", a / b);
+    }
+}
+
+/// Descending the same tree under rule sets whose re-inclusion leads with a
+/// wildcard component: the `.loreignore` of an Unreal project, and a view
+/// re-including one directory of every project.
+///
+/// A walk enters an excluded directory only where a re-inclusion can match
+/// below it, so the nodes visited are what the re-inclusion index decides.
+#[test]
+#[ignore = "benchmark: run on demand with --ignored"]
+fn descend_large_tree_under_wildcard_led_reinclusions() {
+    let nodes = tree(12 * scale(), 4 * scale());
+    const ROUNDS: usize = 4;
+
+    for rules in [
+        &["Saved/", "!*/Saved/Config/"][..],
+        &["/*", "!/*/Content/Maps/"][..],
+    ] {
+        let rules: Vec<String> = rules.iter().map(|rule| (*rule).to_owned()).collect();
+        println!("\n{rules:?}, memo cold each walk:");
+        for (label, walk) in [
+            (
+                "whole path",
+                walk_whole_paths as fn(&Filter, &[TreeNode], FilterMode) -> WalkResult,
+            ),
+            ("threaded", walk_threaded),
+        ] {
+            let mut total = std::time::Duration::ZERO;
+            let mut last = None;
+            for _ in 0..ROUNDS {
+                let filter = build_from(&rules);
+                let start = Instant::now();
+                last = Some(walk(&filter, &nodes, FilterMode::Ignore));
+                total += start.elapsed();
+            }
+            let result = last.expect("at least one round");
+            println!(
+                "  visited {} nodes, kept {} files",
+                result.queries, result.files
+            );
+            report(label, ROUNDS, result.queries, total);
+        }
     }
 }
 

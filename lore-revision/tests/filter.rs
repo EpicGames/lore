@@ -1573,15 +1573,12 @@ mod tests {
             "engine"
         ));
 
-        // `*` keeps its own one-component bound whatever `engine/intermediate`
-        // needs: a single depth for the whole index would lend `*` the longer
-        // rule's reach and lose this prune everywhere.
+        // `/{x,y}` compares its braces as text, so the trie stops at its first
+        // component and only its depth of one keeps it from `game`, whatever
+        // `engine/intermediate` needs: a single depth for the whole index would
+        // lend it the longer rule's reach and lose this prune everywhere.
         assert!(covers(
-            &view_filter(
-                &dir,
-                "per-marker",
-                &["/*", "!/game", "/engine/intermediate"]
-            ),
+            &view_filter(&dir, "per-marker", &["/{x,y}", "/engine/intermediate"]),
             "game"
         ));
 

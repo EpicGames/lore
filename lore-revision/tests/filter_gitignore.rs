@@ -642,10 +642,8 @@ const DEEP: &[&str] = &[
 /// [`DEEP`] includes and the directories it enters, the root as `""`.
 ///
 /// Every re-inclusion is bounded: `!a/b/**` by its literal prefix, and each of
-/// the others by the one or two components it matches. Each of those holds a
-/// wildcard component, below which the index follows no text, so only its
-/// depth keeps a walk out of the directories below what it matches. Every one
-/// ends in `*`, so none has a subtree companion.
+/// the others by the one or two components it matches, which the index
+/// compares one by one. Every one ends in `*`, so none has a subtree companion.
 const SHALLOW: &[(&[&str], &[&str], &[&str])] = &[
     (
         &["*", "!/*", "!a/b/**"],
@@ -679,8 +677,8 @@ const SHALLOW: &[(&[&str], &[&str], &[&str])] = &[
 
 /// Rule sets holding a re-inclusion that does not end in `*`, so its subtree
 /// companion `<glob>/**` matches at any depth and a walk enters every directory
-/// below it that a literal prefix does not rule out. In `!/a\/b` the escaped
-/// `/` leaves no literal prefix.
+/// below it that its leading components do not rule out. In `!/a\/b` the
+/// escaped `/` leaves none to compare.
 const UNBOUNDED: &[&[&str]] = &[
     &["*", "!/*", "!a/*.xml"],
     &["*", "!/*", "!/*/b"],
@@ -689,24 +687,254 @@ const UNBOUNDED: &[&[&str]] = &[
     &["*", "!/a\\/b"],
 ];
 
+/// The tree the sets in [`LEADING`] are walked over: a `Saved` directory at
+/// three depths, and an `Engine` holding a directory named `*`, so each
+/// component a rule names has siblings it rules out.
+const LEADING_TREE: &[&str] = &[
+    "top.txt",
+    "A/B/Saved/Config/d.ini",
+    "Engine/*/Build/g.txt",
+    "Engine/Bld/i.txt",
+    "Engine/Build/h.txt",
+    "Engine/X/Build/e.txt",
+    "Engine/X/Other/f.txt",
+    "Game/Other/o.txt",
+    "Game/Saved/Config/a.ini",
+    "Game/Saved/Config2/b.ini",
+    "Game/Saved/Logs/l.log",
+    "Saved/Saved/Config/c.ini",
+];
+
+/// Rule sets whose re-inclusion holds a wildcard component, each with the
+/// directories a walk over [`LEADING_TREE`] enters, the root as `""`.
+///
+/// A component holding `*` or `?` matches one component, an escaped `\*` only
+/// the name `*`, and a `**` any number. A brace group in a rule compared as text
+/// is not compared, so `!/Engine/{Build,Config}/` reaches below every directory
+/// under `Engine`, as `!/Engine/**/Build/` does. [`CLASSES`] covers classes.
+const LEADING: &[(&[&str], &[&str])] = &[
+    (
+        &["Saved/", "!*/Saved/Config/"],
+        &[
+            "",
+            "A",
+            "A/B",
+            "Engine",
+            "Engine/*",
+            "Engine/*/Build",
+            "Engine/Bld",
+            "Engine/Build",
+            "Engine/X",
+            "Engine/X/Build",
+            "Engine/X/Other",
+            "Game",
+            "Game/Other",
+            "Game/Saved",
+            "Game/Saved/Config",
+            "Saved",
+            "Saved/Saved",
+            "Saved/Saved/Config",
+        ],
+    ),
+    (
+        &["**", "!*/Saved/Config/"],
+        &[
+            "",
+            "A",
+            "Engine",
+            "Game",
+            "Game/Saved",
+            "Game/Saved/Config",
+            "Saved",
+            "Saved/Saved",
+            "Saved/Saved/Config",
+        ],
+    ),
+    (
+        &["**", "!*/*/Build/"],
+        &[
+            "",
+            "A",
+            "A/B",
+            "Engine",
+            "Engine/*",
+            "Engine/*/Build",
+            "Engine/Bld",
+            "Engine/Build",
+            "Engine/X",
+            "Engine/X/Build",
+            "Game",
+            "Game/Other",
+            "Game/Saved",
+            "Saved",
+            "Saved/Saved",
+        ],
+    ),
+    (
+        &["**", "!Engine/*/Build/**"],
+        &[
+            "",
+            "Engine",
+            "Engine/*",
+            "Engine/*/Build",
+            "Engine/Bld",
+            "Engine/Build",
+            "Engine/X",
+            "Engine/X/Build",
+        ],
+    ),
+    (
+        &["**", "!/{Engine,Game}/*/Build/"],
+        &[
+            "",
+            "Engine",
+            "Engine/*",
+            "Engine/*/Build",
+            "Engine/Bld",
+            "Engine/Build",
+            "Engine/X",
+            "Engine/X/Build",
+            "Game",
+            "Game/Other",
+            "Game/Saved",
+        ],
+    ),
+    (&["**", "!/Engine/B?ild/"], &["", "Engine", "Engine/Build"]),
+    (
+        &["**", "!/Engine/\\*/Build/"],
+        &["", "Engine", "Engine/*", "Engine/*/Build"],
+    ),
+    (
+        &["**", "!/Engine/**/Build/"],
+        &[
+            "",
+            "Engine",
+            "Engine/*",
+            "Engine/*/Build",
+            "Engine/Bld",
+            "Engine/Build",
+            "Engine/X",
+            "Engine/X/Build",
+            "Engine/X/Other",
+        ],
+    ),
+    (
+        &["**", "!/Engine/{Build,Config}/"],
+        &[
+            "",
+            "Engine",
+            "Engine/*",
+            "Engine/*/Build",
+            "Engine/Bld",
+            "Engine/Build",
+            "Engine/X",
+            "Engine/X/Build",
+            "Engine/X/Other",
+        ],
+    ),
+];
+
+/// The tree the sets in [`CLASSES`] are walked over: names that a class, a `*`
+/// after text or a leading `Ä` tells apart, and names starting with `!` and
+/// with a space.
+const CLASS_TREE: &[&str] = &[
+    "Xtra/Saved/Config/a.ini",
+    "Game/Saved/Config/b.ini",
+    "Game/Saved/Logs/c.log",
+    "Dngine/X/Build/d.txt",
+    "Engine/X/Build/e.txt",
+    "Engine/X/Other/f.txt",
+    "Engine/Y/Build/g.txt",
+    "Gngine/X/Build/h.txt",
+    "EngineX/X/i.txt",
+    "EngineX/Z/j.txt",
+    "\u{c4}pfel/Saved/k.txt",
+    "\u{c4}pfel/Other/l.txt",
+    "Apfel/Saved/m.txt",
+    "!Bang/X/n.txt",
+    "!Bang/Y/o.txt",
+    " Space/X/p.txt",
+    " Space/Y/q.txt",
+    "Space/X/r.txt",
+];
+
+/// Rule sets whose re-inclusion holds a class, a `*` after text, a non-ASCII
+/// name, a leading `!` or a leading space, each with the directories a walk over
+/// [`CLASS_TREE`] enters, the root as `""`.
+const CLASSES: &[(&[&str], &[&str])] = &[
+    (
+        &["**", "!/[!x]*/Saved/Config/"],
+        &[
+            "",
+            "!Bang",
+            " Space",
+            "Apfel",
+            "Apfel/Saved",
+            "Dngine",
+            "Engine",
+            "EngineX",
+            "Game",
+            "Game/Saved",
+            "Game/Saved/Config",
+            "Gngine",
+            "Space",
+            "\u{c4}pfel",
+            "\u{c4}pfel/Saved",
+        ],
+    ),
+    (
+        &["**", "!/[D-F]ngine/X/Build/"],
+        &[
+            "",
+            "Dngine",
+            "Dngine/X",
+            "Dngine/X/Build",
+            "Engine",
+            "Engine/X",
+            "Engine/X/Build",
+        ],
+    ),
+    (
+        &["**", "!/Engine*/X/"],
+        &[
+            "",
+            "Engine",
+            "Engine/X",
+            "Engine/X/Build",
+            "Engine/X/Other",
+            "EngineX",
+            "EngineX/X",
+        ],
+    ),
+    (
+        &["**", "!/\u{c4}*/Saved/"],
+        &["", "\u{c4}pfel", "\u{c4}pfel/Saved"],
+    ),
+    (&["**", "!!*/X/"], &["", "!Bang", "!Bang/X"]),
+    (&["**", "!/ S*/X/"], &["", " Space", " Space/X"]),
+];
+
 /// Pruning only saves work: a walk that declines to descend reaches exactly the
 /// files a walk entering every directory includes.
 ///
 /// [`gitignore_conformance`] holds the pruned walk against git, which prunes
 /// too, so a walk pruning where it must not can still agree with git there.
 /// This compares it with no pruning at all, across the ground truth and the
-/// sets in [`SHALLOW`] and [`UNBOUNDED`]. A ground-truth case the filter refuses
-/// is skipped, since [`gitignore_conformance`] counts it, and a set here that
-/// the filter refuses fails the test.
+/// sets in [`SHALLOW`], [`UNBOUNDED`], [`LEADING`] and [`CLASSES`]. A
+/// ground-truth case the filter refuses is skipped, since
+/// [`gitignore_conformance`] counts it, and a set here that the filter refuses
+/// fails the test.
 #[test]
 fn pruning_changes_no_answer() {
     let sets = SHALLOW
         .iter()
-        .map(|(rules, _, _)| *rules)
-        .chain(UNBOUNDED.iter().copied())
-        .map(|rules| {
+        .map(|(rules, _, _)| (*rules, DEEP))
+        .chain(UNBOUNDED.iter().map(|rules| (*rules, DEEP)))
+        .chain(LEADING.iter().map(|(rules, _)| (*rules, LEADING_TREE)))
+        .chain(CLASSES.iter().map(|(rules, _)| (*rules, CLASS_TREE)))
+        .map(|(rules, tree)| {
             let filter = build(rules).unwrap_or_else(|| panic!("{rules:?} is refused"));
-            (rules, filter, DEEP)
+            (rules, filter, tree)
         });
     let walks = CASES
         .iter()
@@ -724,10 +952,9 @@ fn pruning_changes_no_answer() {
 /// A re-inclusion that cannot match below a directory does not send a walk
 /// into it.
 ///
-/// `!/*` compiles to `*`, whose one component is a wildcard, so no literal
-/// prefix bounds where the rule matches and only its depth of one component
-/// keeps a walk out of the directories below the root ones. Each set in
-/// [`SHALLOW`] includes the files and enters the directories listed with it.
+/// `!/*` compiles to `*`, which matches any one component and nothing below
+/// it, so it keeps a walk out of the directories below the root ones. Each set
+/// in [`SHALLOW`] includes the files and enters the directories listed with it.
 /// Under `!/*` a root directory is itself included, and the files inside it stay
 /// excluded unless another rule re-includes them.
 #[test]
@@ -757,6 +984,182 @@ fn a_shallow_reinclusion_does_not_open_the_tree_below_it() {
     assert!(!filter.excludes_subtree(&path("a/b")));
 }
 
+/// A re-inclusion sends a walk only into a directory whose components its own
+/// leading components match, wildcard components included.
+///
+/// `Saved/` with `!*/Saved/Config/` is a `.loreignore` an Unreal project
+/// holds: the rule names `Config` third, so nothing below `Game/Saved/Logs`
+/// can match it. Each set in [`LEADING`] and [`CLASSES`] enters the
+/// directories listed with it, and the walk verdict for a whole path agrees.
+#[test]
+fn a_reinclusion_reaches_only_below_its_leading_components() {
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+
+    let mut wrong = Vec::new();
+    let sets = LEADING
+        .iter()
+        .map(|set| (set, LEADING_TREE))
+        .chain(CLASSES.iter().map(|set| (set, CLASS_TREE)));
+    for ((rules, entered), tree) in sets {
+        let filter = build(rules).unwrap_or_else(|| panic!("{rules:?} is refused"));
+        let (_, walked) = walk_tree_entering(&filter, tree, true);
+        if walked != set(entered) {
+            wrong.push(format!("{rules:?} enters {walked:?}"));
+        }
+    }
+
+    let mut filter = Filter::default();
+    filter.ignore = build(&["Saved/", "!*/Saved/Config/"]).expect("filter builds");
+    for (directory, dropped) in [
+        ("Game/Saved", false),
+        ("Game/Saved/Config", false),
+        ("Game/Saved/Logs", true),
+        ("Game/Saved/Config2", true),
+    ] {
+        if filter.excludes_tree(&path(directory), true, FilterMode::Ignore) != dropped {
+            wrong.push(format!("the walk verdict for {directory} is not {dropped}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Names at the first two levels of the randomized tree: text, case, a class and
+/// a `*` as text, non-ASCII, and leading `!` and space.
+const RANDOM_NAMES: &[&str] = &["a", "ab", "B", "x*", "[a]", "\u{c4}", " a", "!a", "?"];
+
+/// Names at the third level of the randomized tree, fewer, since every walk
+/// lists the children of a directory by scanning the whole tree.
+const RANDOM_LEAVES: &[&str] = &["a", "B", "[a]"];
+
+/// Components the randomized rules are built from: text, every wildcard, classes,
+/// escapes, brace groups and globstars.
+const RANDOM_COMPONENTS: &[&str] = &[
+    "*", "?", "a*", "*a", "a?", "?b", "[a]", "[!a]*", "[A-C]*", "[^x]?", "\\*", "x\\*", "\\[a\\]",
+    "\u{e4}*", "\u{c4}", "[\u{e4}]", "?*", "a", "ab", "b", "{a,b}", "{a,x*}", "\\!a", "!a", " a",
+    "\\ a", "[a-b]", "[]a]", "a**", "**a", "\\a", "[!]a]", "**", "x*", "[[]a]", "\\?", "[?]",
+    "[*]",
+];
+
+/// The exclusion each randomized filter opens with.
+const RANDOM_EXCLUSIONS: &[&str] = &["**", "*", "/*", "a*/", "*/", "\u{c4}*/", "[ab]*/", "*/*/"];
+
+/// Filters [`randomized_pruning_changes_no_answer`] builds and checks.
+const RANDOM_FILTERS: usize = 200;
+
+/// A xorshift generator, so a seed reproduces the same filters everywhere.
+struct Xorshift(u64);
+
+impl Xorshift {
+    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+        items[(self.next() % items.len() as u64) as usize]
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// A rule of one to three components, rooted, directory-only, with a `/**`
+    /// tail, or none of those.
+    fn rule(&mut self) -> String {
+        let count = 1 + self.next() % 3;
+        let mut rule = (0..count)
+            .map(|_| self.pick(RANDOM_COMPONENTS))
+            .collect::<Vec<_>>()
+            .join("/");
+        match self.next() % 4 {
+            0 => rule.insert(0, '/'),
+            1 => rule.push('/'),
+            2 => rule.push_str("/**"),
+            _ => {}
+        }
+        rule
+    }
+}
+
+/// Pruning changes no answer, and no subtree answer claims more than the walk
+/// finds, under randomized filters whose rules mix every component kind the
+/// index compares or stops at, over a tree whose names those components tell
+/// apart.
+///
+/// Each filter opens with an exclusion, re-includes one to three rules, and
+/// half of them exclude and re-include once more. A directory
+/// `excludes_subtree` drops holds nothing the walk includes, and one
+/// `covers_subtree` takes whole holds nothing it excludes.
+#[test]
+fn randomized_pruning_changes_no_answer() {
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+
+    let mut files = vec!["f".to_owned()];
+    for a in RANDOM_NAMES {
+        files.push(format!("{a}/f"));
+        for b in RANDOM_NAMES {
+            files.push(format!("{a}/{b}/f"));
+            for c in RANDOM_LEAVES {
+                files.push(format!("{a}/{b}/{c}/f"));
+            }
+        }
+    }
+    let tree: Vec<&str> = files.iter().map(String::as_str).collect();
+    let dirs: BTreeSet<&str> = tree.iter().flat_map(|file| ancestors(file)).collect();
+
+    let mut rng = Xorshift(0x9e37_79b9_7f4a_7c15);
+    let mut wrong = Vec::new();
+    for _ in 0..RANDOM_FILTERS {
+        let mut lines = vec![rng.pick(RANDOM_EXCLUSIONS).to_owned()];
+        for _ in 0..=rng.next() % 3 {
+            lines.push(format!("!{}", rng.rule()));
+        }
+        if rng.next().is_multiple_of(2) {
+            lines.push(rng.rule());
+            lines.push(format!("!{}", rng.rule()));
+        }
+        let rules: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let Some(instance) = build(&rules) else {
+            continue;
+        };
+        let included = walk_tree_entering(&instance, &tree, false).0;
+        if walk_tree_entering(&instance, &tree, true).0 != included {
+            wrong.push(format!(
+                "pruning changes the files included under {rules:?}"
+            ));
+        }
+
+        let mut holds_included = BTreeSet::new();
+        let mut holds_excluded = BTreeSet::new();
+        for file in &tree {
+            let holds = if included.contains(*file) {
+                &mut holds_included
+            } else {
+                &mut holds_excluded
+            };
+            holds.extend(ancestors(file));
+        }
+        let mut filter = Filter::default();
+        filter.view = instance.clone();
+        for dir in &dirs {
+            let directory = path(dir);
+            if instance.excludes_subtree(&directory) && holds_included.contains(dir) {
+                wrong.push(format!("{rules:?} drops {dir}, which holds included files"));
+            }
+            let depth = dir.split('/').count() as u32;
+            let states = filter.exclusion_states(&directory);
+            if filter.covers_subtree(states, &directory, depth, FilterMode::View)
+                && holds_excluded.contains(dir)
+            {
+                wrong.push(format!(
+                    "{rules:?} covers {dir}, which holds excluded files"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// The directories the pruned walk enters over the probe tree, the root
 /// included, summed over every ground-truth case the filter accepts.
 ///
@@ -773,7 +1176,7 @@ fn directories_entered_across_the_ground_truth_are_pinned() {
         .map(|filter| walk_tree_entering(&filter, FILES, true).1.len())
         .sum();
     assert_eq!(
-        entered, 22506,
+        entered, 21352,
         "the directories entered across the ground truth changed: a rise loses a \
          prune and a drop gains one, and either is reviewed before the pin moves"
     );

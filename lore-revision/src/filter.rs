@@ -362,20 +362,62 @@ fn is_globstar(stars: &str) -> bool {
     stars.len() > 1 && stars.bytes().all(|byte| byte == b'*')
 }
 
-/// Whether a single path component holds a glob metacharacter, so no literal
-/// text can stand in for it.
+/// How a [`RuleIndex`] compares one component of a glob with one path
+/// component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ComponentKind {
+    /// The component holds no metacharacter, so it matches only its own text.
+    Text,
+    /// The matcher evaluates the component on its own. None of `*`, `?` and a
+    /// bracket expression matches a separator, so it matches one path component
+    /// as it does within the whole glob.
+    Pattern,
+}
+
+/// How a [`RuleIndex`] compares one component of a glob with a path component,
+/// or `None` where it cannot.
 ///
-/// A brace group counts. An alternative inside one may hold a separator, so
-/// neither the group's text nor what follows it names a component. A
-/// [`RuleIndex`] enumerates the alternatives rather than stop here, and this is
-/// what answers for the forms it declines to enumerate: a rule compared as text,
-/// an escaped brace, and one with more alternatives than the cap.
+/// A globstar matches any number of components. A brace group may hold a
+/// separator in an alternative, and a rule compared as text holds its braces as
+/// text. A [`RuleIndex`] enumerates the alternatives rather than stop here, and
+/// this is what answers for the forms it declines to enumerate: a rule compared
+/// as text, an escaped brace, and one with more alternatives than the cap.
 ///
-/// So does a backslash. The matcher unescapes it, so the component's text is not
-/// the name it matches, and an escaped `/` matches a separator inside what the
-/// text splits into two components: `a\/b` names `a/b`, not a component `a\`.
-fn has_wildcard(component: &str) -> bool {
-    component.contains(['*', '?', '[', '{', '\\'])
+/// A component ending in an unpaired backslash escapes the separator after it:
+/// `a\/b` names `a/b`, not a component `a\`. And where `brackets` says a bracket
+/// expression may hold a separator, which it matches none of, the text's
+/// components from the first `[` on need not be the path's.
+fn component_kind(component: &str, brackets: bool) -> Option<ComponentKind> {
+    if is_globstar(component) {
+        return None;
+    }
+    let mut kind = ComponentKind::Text;
+    let mut escaping = false;
+    for byte in component.bytes() {
+        match byte {
+            b'{' => return None,
+            b'[' if brackets => return None,
+            b'*' | b'?' | b'[' | b']' => kind = ComponentKind::Pattern,
+            b'\\' => {
+                kind = ComponentKind::Pattern;
+                escaping = !escaping;
+                continue;
+            }
+            _ => {}
+        }
+        escaping = false;
+    }
+    (!escaping).then_some(kind)
+}
+
+/// Whether a `/` lies between the first `[` and the last `]` in `glob`, so a
+/// bracket expression may hold it. One matches no separator, so `x[a/b]y`
+/// matches `xay`.
+fn bracket_holds_separator(glob: &str) -> bool {
+    glob.find('[').is_some_and(|open| {
+        glob.rfind(']')
+            .is_some_and(|close| open < close && glob[open..close].contains('/'))
+    })
 }
 
 /// The first brace group in `glob`, as the offsets of its `{` and its matching
@@ -544,8 +586,8 @@ impl RuleReach {
 /// two-way groups reach it; a rule written by hand carries a handful.
 const MAX_ALTERNATIVES: usize = 64;
 
-/// Literal-prefix index over the lines of one polarity, answering whether any of
-/// them can match below a directory without evaluating a glob.
+/// Component index over the lines of one polarity, answering whether any of
+/// them can match below a directory without evaluating a whole glob.
 ///
 /// A walk needs that answer for every directory it meets. Over the inclusions it
 /// decides whether to descend into an excluded directory anyway; over the
@@ -555,49 +597,69 @@ const MAX_ALTERNATIVES: usize = 64;
 /// paths carries up to `SOURCE_FILTER_THRESHOLD` of them.
 ///
 /// Two independent bounds keep a rule out of an answer, and a rule escapes the
-/// index only by escaping both. The trie bounds *where* it can match: only the
-/// wildcard-free leading components of a glob can be indexed, so one whose first
-/// component holds a wildcard is recorded in `unprefixed` and reaches any path.
-/// The [`RuleReach`] depth bounds *how deep*: the `/*` that opens a filter
-/// written as "exclude the top, then re-include what is wanted" compiles to
-/// `*`, which no prefix bounds and so reaches every path, but which cannot
-/// match below the first level.
+/// index only by escaping both. The trie bounds *where* it can match: each edge
+/// is a leading component of a glob, compared with one path component as the
+/// matcher compares it, so `*/saved/config` reaches below `game/saved` and not
+/// below `game/saved/logs`. It follows a glob up to the first component it
+/// cannot compare, such as a `**` or a brace group, below which the rule
+/// reaches any path. The [`RuleReach`] depth bounds *how deep*, and so bounds
+/// such a rule too: `/{a,b}`, which compares its braces as text, cannot match
+/// below the first level.
 ///
 /// Over-approximating costs traversal, under-approximating drops content, so
 /// every uncertain case answers "a rule reaches here".
 #[derive(Clone, Debug, Default)]
 struct RuleIndex {
     root: RuleNode,
-    /// Rules no prefix can rule out, because the first component of the glob
-    /// holds a wildcard or the rule is matched against a name at any depth.
+    /// Rules no leading component can rule out: a name rule, matched at any
+    /// depth, and a glob whose first component the index cannot compare.
     unprefixed: RuleReach,
 }
 
 #[derive(Clone, Debug, Default)]
 struct RuleNode {
-    /// Component to child. Shallow and narrow in practice, so a `Vec` beats a
-    /// map: lookup is a handful of string compares with no hashing.
-    children: Vec<(String, RuleNode)>,
+    /// Component to child. Patterns come before text, so a walk can stop at the
+    /// first text that matches. Shallow and narrow in practice, so a `Vec` beats
+    /// a map: lookup is a handful of compares with no hashing.
+    children: Vec<(Component, RuleNode)>,
     /// Rules sitting strictly below this node.
     below: RuleReach,
-    /// Rules with a wildcard tail starting here, which could match anything at
-    /// or below this node.
+    /// Rules whose next component the index cannot compare, such as a `**`, so
+    /// they could match anything below this node.
     wildcard_tail: RuleReach,
 }
 
+/// A leading component of an indexed glob, compared with one path component as
+/// `kind` says.
+#[derive(Clone, Debug)]
+struct Component {
+    glob: String,
+    kind: ComponentKind,
+}
+
 impl RuleNode {
-    /// Records `reach` as below this node, and returns the child named
-    /// `component`, added if it is not there.
-    fn child(&mut self, component: &str, reach: RuleReach) -> &mut RuleNode {
+    /// Records `reach` as below this node, and returns the child for the
+    /// component `glob` compared as `kind`, added if it is not there.
+    ///
+    /// The kind is part of the edge: `[x]` as text and `[x]` as a pattern match
+    /// different names, so they lead to different children.
+    fn child(&mut self, glob: &str, kind: ComponentKind, reach: RuleReach) -> &mut RuleNode {
         self.below.widen(reach);
         let position = self
             .children
             .iter()
-            .position(|(name, _)| name == component)
+            .position(|(edge, _)| edge.kind == kind && edge.glob == glob)
             .unwrap_or_else(|| {
-                self.children
-                    .push((component.to_owned(), RuleNode::default()));
-                self.children.len() - 1
+                let position = match kind {
+                    ComponentKind::Text => self.children.len(),
+                    ComponentKind::Pattern => 0,
+                };
+                let edge = Component {
+                    glob: glob.to_owned(),
+                    kind,
+                };
+                self.children.insert(position, (edge, RuleNode::default()));
+                position
             });
         &mut self.children[position].1
     }
@@ -732,22 +794,23 @@ impl RuleIndex {
     /// enumerates them.
     ///
     /// Each node on the way down gains the rule as something below it -- at least
-    /// the next component, maybe deeper. A wildcard component ends the descent and
-    /// marks the node it stops at, because no literal text stands in for it. A
-    /// glob that is literal throughout names its final node and marks nothing
-    /// below it.
+    /// the next component, maybe deeper. A component the index cannot compare
+    /// ends the descent and marks the node it stops at, because the rule could
+    /// match anything below it. A glob compared throughout names its final node
+    /// and marks nothing below it.
     fn insert_form(&mut self, glob: &str, line: usize, depth: u32) {
         let reach = RuleReach::rule(line, depth);
+        let brackets = bracket_holds_separator(glob);
         let mut node = &mut self.root;
         for (index, component) in glob.split('/').enumerate() {
-            if has_wildcard(component) {
+            let Some(kind) = component_kind(component, brackets) else {
                 if index == 0 {
                     self.unprefixed.widen(reach);
                 }
                 node.wildcard_tail.widen(reach);
                 return;
-            }
-            node = node.child(component, reach);
+            };
+            node = node.child(component, kind, reach);
         }
     }
 
@@ -758,7 +821,7 @@ impl RuleIndex {
         let reach = RuleReach::rule(line, u32::MAX);
         let mut node = &mut self.root;
         for component in path.split('/') {
-            node = node.child(component, reach);
+            node = node.child(component, ComponentKind::Text, reach);
         }
         node.wildcard_tail.widen(reach);
     }
@@ -780,32 +843,54 @@ impl RuleIndex {
     /// every line still applies passes `0` -- see
     /// [`FilterInstance::covers_subtree`].
     ///
-    /// Returns early when nothing in the index is late enough or deep enough to
-    /// matter, and when the walk falls off the indexed branches.
+    /// Each component of `path` is compared with the edges out of the node the
+    /// walk stands on, and may match more than one, so the walk follows each.
+    /// It reads no more of a rule than its components up to the first it cannot
+    /// compare, and returns early when nothing in the index is late enough or
+    /// deep enough to matter, and when it falls off the indexed branches.
     ///
     /// An empty `path` is the repository root, which names no component and
     /// holds everything: any rule the index carries at all lands below it.
     fn below(&self, path: &str, floor: u32, depth: u32) -> bool {
-        if self.unprefixed.reaches(floor, depth) {
-            return true;
-        }
-        let mut node = &self.root;
-        if !node.below.reaches(floor, depth) {
-            return false;
-        }
-        if path.is_empty() {
-            return true;
-        }
-        for component in path.split('/') {
+        self.unprefixed.reaches(floor, depth)
+            || (self.root.below.reaches(floor, depth) && self.root.reaches(path, floor, depth))
+    }
+}
+
+impl RuleNode {
+    /// Whether a rule recorded at or below this node can match a path strictly
+    /// below the queried one. `rest` is the part of that path below this node.
+    /// See [`RuleIndex::below`].
+    ///
+    /// Follows the one text edge that matches in a loop, and each pattern edge
+    /// that matches in a call of its own.
+    fn reaches(&self, mut rest: &str, floor: u32, depth: u32) -> bool {
+        let mut node = self;
+        while !rest.is_empty() {
             if node.wildcard_tail.reaches(floor, depth) {
                 return true;
             }
-            match node
-                .children
-                .iter()
-                .find(|(name, _)| name.as_str() == component)
-            {
-                Some((_, child)) => node = child,
+            let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            rest = tail;
+            let mut next = None;
+            for (edge, child) in &node.children {
+                match edge.kind {
+                    ComponentKind::Text if edge.glob == name => {
+                        next = Some(child);
+                        break;
+                    }
+                    ComponentKind::Text => {}
+                    ComponentKind::Pattern => {
+                        if (edge.glob == "*" || glob_match::glob_match(&edge.glob, name))
+                            && child.reaches(rest, floor, depth)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            match next {
+                Some(child) => node = child,
                 None => return false,
             }
         }
@@ -891,10 +976,11 @@ impl FilterInstance {
     /// matches exactly one separator.
     ///
     /// The upper bound is what a [`RuleIndex`] records, so that a rule unable to
-    /// reach below a directory does not force a walk into it -- without it the
-    /// `*` that a leading `/*` compiles to would reach every path. It is the
-    /// count, or unbounded where a component is exactly `**`, the one construct
-    /// the matcher lets match a separator that no `/` in the glob stands for.
+    /// reach below a directory does not force a walk into it -- without it a
+    /// rule the index stops following at its first component, such as `/{a,b}`
+    /// compared as text, would reach every path. It is the count, or unbounded
+    /// where a component is exactly `**`, the one construct the matcher lets
+    /// match a separator that no `/` in the glob stands for.
     /// `*`, `?` and a bracket expression never match one, and a `**` sharing its
     /// component with other text is two `*`. A `/` outside a bracket expression
     /// matches one separator, escaped or not, a `/` inside one matches none, and
@@ -920,11 +1006,7 @@ impl FilterInstance {
             previous_was_globstar = component == "**";
             unbounded |= previous_was_globstar;
         }
-        let bracketed = glob
-            .find('[')
-            .zip(glob.rfind(']'))
-            .is_some_and(|(open, close)| open < close && glob[open..close].contains('/'));
-        let mut fewest = if bracketed {
+        let mut fewest = if bracket_holds_separator(glob) {
             1
         } else {
             (total - optional).max(1)

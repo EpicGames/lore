@@ -141,6 +141,7 @@ fn path_inclusion(added: &RelativePath) -> FilterInstance {
 fn a_path_inclusion_reincludes_its_path_alone() {
     for (added, others) in [
         ("dir/[x].txt", &["dir/x.txt"][..]),
+        ("d/[x]/f", &["d/x/f"][..]),
         ("{guid}/[x].txt", &["guid/x.txt"][..]),
         ("**/f.txt", &["f.txt", "a/f.txt"][..]),
         ("dir/notes*", &["dir/notes", "dir/notesx"][..]),
@@ -189,6 +190,30 @@ fn a_path_inclusion_bounds_the_walk_whatever_its_first_component_holds() {
             filter.excludes_subtree(&path("engine")),
             "{first}/f.txt holds engine open"
         );
+    }
+}
+
+/// A path inclusion and a rule holding the same component text reach apart,
+/// whichever is added first: `[x]` names the directory `[x]` in the path
+/// `[x]/b/f`, and the directory `x` in the rule `/[x]/a/`.
+#[test]
+fn a_path_inclusion_and_a_rule_with_its_text_reach_apart() {
+    for path_first in [true, false] {
+        let mut filter = FilterInstance::default();
+        filter.add_exclusion("**").expect("exclude");
+        if path_first {
+            filter.add_path_inclusion(&path("[x]/b/f"));
+        }
+        filter.add_inclusion("/[x]/a/").expect("include");
+        if !path_first {
+            filter.add_path_inclusion(&path("[x]/b/f"));
+        }
+        for kept in ["[x]/b/f/g", "x/a/g"] {
+            assert!(
+                !filter.excludes(&path(kept), false),
+                "{kept} is excluded, the path inclusion added first: {path_first}"
+            );
+        }
     }
 }
 
