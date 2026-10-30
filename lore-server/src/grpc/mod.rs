@@ -214,6 +214,19 @@ pub fn get_repository(metadata: &MetadataMap) -> Result<RepositoryId, Status> {
     Ok(context.into())
 }
 
+/// Decodes a repository id carried in a request body.
+///
+/// The all-zero id is refused because it identifies the namespace-root
+/// partition, which holds the deployment's repository name table rather than
+/// a repository.
+pub fn requested_repository_id(id: &[u8]) -> Result<RepositoryId, Status> {
+    let id = Context::from(id);
+    if id.is_zero() {
+        return Err(Status::invalid_argument("Repository id must not be zero"));
+    }
+    Ok(id.into())
+}
+
 pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, Status> {
     match extensions.get::<AuthorizationToken>() {
         Some(auth) => Ok(auth.clone()),

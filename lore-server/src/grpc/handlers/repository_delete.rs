@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_proto::RepositoryDeleteRequest;
 use lore_proto::RepositoryDeleteResponse;
@@ -31,6 +30,7 @@ use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::may_administer_repository;
+use crate::grpc::requested_repository_id;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]
@@ -47,9 +47,9 @@ pub async fn handler(
     let authorization = extract_authorization_header(&request);
     let (_metadata, extensions, req) = request.into_parts();
 
+    let id = requested_repository_id(&req.id)?;
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
-    let id: RepositoryId = Context::from(req.id).into();
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,

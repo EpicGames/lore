@@ -394,3 +394,48 @@ async fn the_creator_must_reach_the_repository_to_delete() {
     }))
     .await;
 }
+
+mod zero_repository_id {
+    use super::*;
+
+    /// The all-zero id names the namespace-root partition: the delete is
+    /// refused and whatever is stored there stays in place.
+    #[tokio::test]
+    async fn is_refused_and_deletes_nothing() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let namespace_root = RepositoryId::default();
+            seed_repository(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                namespace_root,
+                "alice",
+            )
+            .await;
+
+            let status = handler(
+                delete_request(namespace_root, AuthorizationToken::default()),
+                &RepositoryRegistry::Unregistered,
+                &allow_all(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &TestInstrumentProvider,
+            )
+            .await
+            .expect_err("the zero id must be refused");
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                namespace_root,
+            ));
+            repository::metadata_hash(repository)
+                .await
+                .expect("the stored metadata must survive");
+        }))
+        .await;
+    }
+}

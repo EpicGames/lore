@@ -36,6 +36,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
+use crate::grpc::requested_repository_id;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -129,7 +130,7 @@ pub async fn repository_create_implementation(
     let correlation_id = caller_context.correlation_id;
     let authorization = caller_context.authorization;
 
-    let id: RepositoryId = Context::from(req.id).into();
+    let id = requested_repository_id(&req.id)?;
     let name = req.name;
     let description = req.description;
     let default_branch_id: Context = req.default_branch_id.into();
