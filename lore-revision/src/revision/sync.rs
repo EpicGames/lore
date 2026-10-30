@@ -258,7 +258,8 @@ impl Default for SyncOptions {
     }
 }
 
-/// The view the working tree is to be left materialized under, parsed from the file naming it.
+/// The view the working tree is to be left materialized under, parsed from the file naming it,
+/// and the bytes it was parsed from.
 ///
 /// `None` keeps the view the instance holds, which is every sync that carries the tree between
 /// revisions alone.
@@ -271,7 +272,9 @@ impl Default for SyncOptions {
 /// the working tree against the target state, a walk that asks one view for both sides, and a
 /// dependency set is resolved against the target revision alone, so the changes it keeps are no
 /// longer the difference between two views.
-async fn sync_load_view(options: &SyncOptions) -> Result<Option<FilterInstance>, SyncError> {
+async fn sync_load_view(
+    options: &SyncOptions,
+) -> Result<Option<(FilterInstance, Vec<u8>)>, SyncError> {
     let Some(path) = options.view.as_deref() else {
         return Ok(None);
     };
@@ -288,26 +291,50 @@ async fn sync_load_view(options: &SyncOptions) -> Result<Option<FilterInstance>,
         .into());
     }
 
-    let bytes = lore_io::IoDriver::global()
-        .read_file_bytes(path)
-        .await
-        .internal_with(|| format!("Failed to read view filter {}", path.display()))?;
-    Ok(Some(
-        filter::parse_filter(&bytes, path).forward_with::<SyncError, _>(|| {
-            format!("Failed to parse view filter {}", path.display())
-        })?,
-    ))
+    let view_file = Vec::from(
+        lore_io::IoDriver::global()
+            .read_file_bytes(path)
+            .await
+            .internal_with(|| format!("Failed to read view filter {}", path.display()))?,
+    );
+    let view = filter::parse_filter(&view_file, path).forward_with::<SyncError, _>(|| {
+        format!("Failed to parse view filter {}", path.display())
+    })?;
+    Ok(Some((view, view_file)))
 }
 
-/// Publishes the view the working tree now stands under, in the instance's own directory.
+/// Publishes `view_file`, the bytes of the view file the working tree now stands under, in the
+/// instance's own directory.
 ///
 /// Written after the tree and the anchor, so an interrupted apply leaves the instance under the
 /// view it started from: the same change set is computed again on a re-run and carries the tree the
 /// rest of the way. Published first it would leave the instance naming a view the tree only partly
 /// holds, which nothing afterwards can tell from a finished apply.
-async fn sync_store_view(repository: &Arc<RepositoryContext>) -> Result<(), SyncError> {
+///
+/// The I/O driver's atomic whole-file write publishes it: a temporary sibling, synced to disk with
+/// its parent directory, renamed over the target. A reader sees the previous view or the new one,
+/// and a failed write leaves the previous one rather than a view short of rules. A sibling left by
+/// a write stopped part way is named with [`repository::TEMP_FILE_EXTENSION`], which the ignore
+/// filter excludes and the working-tree scanners skip.
+async fn sync_store_view(
+    repository: &Arc<RepositoryContext>,
+    view_file: Vec<u8>,
+) -> Result<(), SyncError> {
     let path = repository.dot_dir_path()?.join(repository::VIEW_FILTER);
-    filter::save(&repository.filter.view, &path)
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(repository::TEMP_FILE_EXTENSION);
+    lore_io::IoDriver::global()
+        .write_file_segments_atomic(
+            temporary,
+            &path,
+            &lore_io::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+            vec![view_file],
+            true,
+            (),
+        )
         .await
         .internal_with(|| format!("Failed to write view filter {}", path.display()))?;
     Ok(())
@@ -436,16 +463,18 @@ pub(crate) async fn sync(
             return Err(hold::refused("reset local changes in a sync").into());
         }
     }
-    let view = sync_load_view(&options).await?;
-    let view_change = view.is_some();
     let repository_current = repository.clone();
-    let repository = match view {
-        Some(view) => Arc::new(repository.with_filter_and_remote(
-            Arc::new(repository.filter.with_view(view)),
-            repository.remote().await,
-        )),
-        None => repository,
+    let (repository, view_file) = match sync_load_view(&options).await? {
+        Some((view, view_file)) => (
+            Arc::new(repository.with_filter_and_remote(
+                Arc::new(repository.filter.with_view(view)),
+                repository.remote().await,
+            )),
+            Some(view_file),
+        ),
+        None => (repository, None),
     };
+    let view_change = view_file.is_some();
 
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
@@ -946,8 +975,8 @@ pub(crate) async fn sync(
                 .await
                 .forward::<SyncError>("Failed to rebase staged anchor")?;
 
-            if view_change {
-                sync_store_view(&repository).await?;
+            if let Some(view_file) = view_file {
+                sync_store_view(&repository, view_file).await?;
             }
 
             // Set the local branch LATEST to match remote if we synced to that

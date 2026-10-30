@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -73,9 +72,6 @@ pub struct FilterLine {
     negated: bool,
     directory: bool,
     filename: bool,
-    /// Emitted by [`FilterInstance::add_inclusion`] rather than authored, so
-    /// [`save`] leaves it out. Read nowhere else.
-    generated: bool,
     /// Fewest path components this line can match, so a prefix shorter than that
     /// is skipped without running the glob. A whole-path query folds over every
     /// ancestor, and most lines cannot possibly match the shallow ones.
@@ -311,69 +307,6 @@ pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterE
         );
     }
     Ok(filter)
-}
-
-/// Writes the authored rules back out, in order, as UTF-8 with no byte-order
-/// mark whatever encoding they were read from.
-///
-/// Reconstructed from the compiled lines: a name rule is written as it stands, a
-/// rooted single-component rule regains its leading separator, and a
-/// directory-only rule its trailing one. An authored `**/foo` comes back as
-/// `foo`, which gitignore defines as the same rule.
-///
-/// A reader sees either the previous rules or the new ones, and a save that
-/// fails leaves the previous ones.
-///
-/// The whole file is built in memory, so it costs one write rather than one per
-/// rule, and the I/O driver's atomic whole-file write publishes it: a temporary
-/// sibling, synced to disk with its parent directory, renamed over the target.
-/// Opening the target itself would truncate it at the open, so a write that then
-/// failed part way, on a full filesystem for instance, would leave a prefix of
-/// the new rules or nothing at all. A filter short a rule excludes less than the
-/// file asked for and nothing downstream can tell, which is the same reason
-/// [`load_filter`] refuses a file it cannot decode whole.
-///
-/// A save whose write, sync or rename fails removes the sibling, and one stopped
-/// part way leaves it. Nothing reports it while it exists: it is named with
-/// [`TEMP_FILE_EXTENSION`], which the ignore filter excludes and the
-/// working-tree scanners skip.
-pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::Result<()> {
-    let path = path.as_ref();
-    let mut out = String::new();
-    for line in filter.lines.iter().filter(|line| !line.generated) {
-        if line.negated {
-            out.push('!');
-        }
-        if !line.filename && !line.glob.contains('/') {
-            out.push('/');
-        }
-        out.push_str(&line.glob);
-        if line.directory {
-            out.push('/');
-        }
-        out.push('\n');
-    }
-    lore_io::IoDriver::global()
-        .write_file_segments_atomic(
-            temp_sibling(path),
-            path,
-            &lore_io::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true),
-            vec![out.into_bytes()],
-            true,
-            (),
-        )
-        .await
-}
-
-/// The temporary file [`save`] builds the new contents of `path` in, beside it
-/// in the same directory so the rename onto it stays within one filesystem.
-fn temp_sibling(path: &Path) -> PathBuf {
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(TEMP_FILE_EXTENSION);
-    PathBuf::from(temp)
 }
 
 /// How many components a non-empty relative path has.
@@ -1000,7 +933,6 @@ impl FilterInstance {
             negated: false,
             directory: ending_separator,
             filename,
-            generated: false,
             min_depth,
             literal,
         });
@@ -1083,7 +1015,6 @@ impl FilterInstance {
             negated: true,
             directory: ending_separator,
             filename,
-            generated: false,
         });
 
         if let Some(subtree) = subtree {
@@ -1097,7 +1028,6 @@ impl FilterInstance {
                 negated: true,
                 directory: false,
                 filename: false,
-                generated: true,
             });
         }
 

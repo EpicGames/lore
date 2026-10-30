@@ -232,10 +232,8 @@ def test_sync_view_narrows_then_widens_an_instance(new_lore_repo, scratch_dir):
         "delete assets/drop/two.uasset",
     }, "the directory and the files leaving the view are each reported once"
     assert current_revision(instance) == before, "a view change mints no revision"
-    assert stored_view(instance) == "assets/drop\n", (
-        "the view the tree stands under is published as the instance's own, written "
-        "back from the rules as parsed: a rule holding a separator is anchored at the "
-        "root already, so it keeps no leading one"
+    assert stored_view(instance) == "/assets/drop\n", (
+        "the view the tree stands under is published as the instance's own, as written"
     )
     assert_status_clean(instance, "a narrowed instance is coherent with its view")
     assert materialized(instance) == materialized(repo.clone(view=narrow)), (
@@ -495,7 +493,7 @@ def test_sync_view_refuses_to_delete_local_modifications(new_lore_repo, scratch_
     assert not instance.path_exists(ALSO_DROPPED), (
         "the rest of the subtree leaves the view"
     )
-    assert stored_view(instance) == "assets/drop\n", "the view is published"
+    assert stored_view(instance) == "/assets/drop\n", "the view is published"
 
 
 @pytest.mark.smoke
@@ -518,7 +516,7 @@ def test_sync_view_applied_twice_changes_nothing(new_lore_repo, scratch_dir):
         "a re-applied view carries nothing"
     )
     assert materialized(instance) == once, "a re-applied view leaves the tree alone"
-    assert stored_view(instance) == "assets/drop\n", "the view file is rewritten as is"
+    assert stored_view(instance) == "/assets/drop\n", "the view file is stored as is"
     assert_status_clean(instance, "the instance stays coherent with its view")
 
 
@@ -578,8 +576,7 @@ def test_sync_view_carries_a_layer_mount_out_of_view_and_back(
         "the mount is carried to the view alone, at the revision the layer holds"
     )
     assert stored_view(instance) == "/lay\n", (
-        "the view the tree stands under is published as the instance's own: a rule of "
-        "one component keeps the leading separator that roots it"
+        "the view the tree stands under is published as the instance's own"
     )
     assert_status_clean(instance, "a mount out of view is not a phantom delete")
 
@@ -785,13 +782,13 @@ def test_sync_view_through_the_c_api(new_lore_repo, scratch_dir, lore_library_pa
     assert not instance.path_exists(DROPPED_DIRECTORY), (
         "the view file named in the struct is the one applied"
     )
-    assert stored_view(instance) == "assets/drop\n", "the view is published"
+    assert stored_view(instance) == "/assets/drop\n", "the view is published"
     assert_status_clean(instance, "a C API view change leaves a coherent instance")
 
     assert instance.revision_sync_capi(lore_library_path) == 0, (
         "a sync naming no view succeeds"
     )
-    assert stored_view(instance) == "assets/drop\n", (
+    assert stored_view(instance) == "/assets/drop\n", (
         "a sync naming no view leaves the view the instance holds standing"
     )
     assert not instance.path_exists(DROPPED_DIRECTORY), (
@@ -821,7 +818,7 @@ def test_sync_view_leaves_another_instance_over_the_same_store_alone(
     sync_view(first, narrow)
 
     assert not first.path_exists(DROPPED_DIRECTORY), "the instance asked is narrowed"
-    assert stored_view(first) == "assets/drop\n", (
+    assert stored_view(first) == "/assets/drop\n", (
         "and publishes the view it stands under"
     )
     assert stored_view(second) is None, "the other instance holds no view of its own"

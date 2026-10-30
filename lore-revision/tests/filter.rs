@@ -1262,40 +1262,6 @@ mod tests {
         }
     }
 
-    /// `save` writes UTF-8 with no byte-order mark, whatever encoding the rules
-    /// were loaded from, so the file Lore writes back does not depend on the one
-    /// it read.
-    #[tokio::test]
-    async fn save_writes_utf8_without_a_byte_order_mark() {
-        let dir = TempDir::new("lore-filter-encoding-save-");
-        let mut expected: Option<String> = None;
-
-        for (name, bytes) in every_encoding(ENCODED_RULES) {
-            let source = dir.child(name);
-            test_file_write(&source, &bytes);
-            let filter = lore_revision::filter::load_filter(&source).expect("load");
-
-            let target = dir.child(&format!("{name}.saved"));
-            lore_revision::filter::save(&filter, &target)
-                .await
-                .expect("save");
-            let written = std::fs::read(&target).expect("read back");
-
-            assert!(
-                !written.starts_with(&[0xEF, 0xBB, 0xBF])
-                    && !lore_revision::util::encoding::is_utf16_bom(&written),
-                "{name} saved behind a byte-order mark"
-            );
-            let text = String::from_utf8(written)
-                .unwrap_or_else(|_| panic!("{name} did not save as UTF-8"));
-            assert!(!text.is_empty(), "{name} saved no rules");
-            match &expected {
-                Some(expected) => assert_eq!(&text, expected, "{name} saved different text"),
-                None => expected = Some(text),
-            }
-        }
-    }
-
     /// `parse_filter` reads the rules a load of the same bytes reads, so a
     /// caller that has the bytes already does not get a different filter for
     /// having read them itself.
@@ -1807,73 +1773,6 @@ mod tests {
                 FilterMode::Ignore
             ),
             "the ignore slot no longer excludes the temporary extension"
-        );
-    }
-
-    /// The file `save` builds the new rules in, named as the implementation
-    /// names it so these tests fail if it stops writing through a sibling at all.
-    fn temp_sibling_of(path: &std::path::Path) -> std::path::PathBuf {
-        let mut temp = path.as_os_str().to_owned();
-        temp.push(lore_revision::repository::TEMP_FILE_EXTENSION);
-        std::path::PathBuf::from(temp)
-    }
-
-    /// A save that succeeds leaves the target and nothing else, the sibling
-    /// having been renamed onto it rather than copied.
-    #[tokio::test]
-    async fn save_leaves_no_temporary_file_behind() {
-        let dir = TempDir::new("lore-filter-save-clean-");
-        let target = dir.child("rules");
-        test_file_write(&target, ENCODED_RULES.as_bytes());
-        let filter = lore_revision::filter::load_filter(&target).expect("load");
-
-        lore_revision::filter::save(&filter, &target)
-            .await
-            .expect("save");
-
-        let temporary = temp_sibling_of(&target);
-        assert!(
-            !temporary.exists(),
-            "the save left {} behind",
-            temporary.display()
-        );
-    }
-
-    /// A save that fails leaves the previous rules.
-    ///
-    /// The target is never the file being written, so it never holds part of the
-    /// new rules. Here a directory occupies the sibling's path so the write
-    /// cannot open; a write breaking off part way, on a full filesystem for
-    /// instance, reaches the same place having touched nothing but the sibling.
-    ///
-    /// A filter file lost to a failed save is not visible afterwards: the rules
-    /// stop excluding what they named, and that reads as a filter matching
-    /// nothing.
-    #[tokio::test]
-    async fn a_failed_save_leaves_the_previous_rules() {
-        let dir = TempDir::new("lore-filter-save-failure-");
-        let target = dir.child("rules");
-        test_file_write(&target, ENCODED_RULES.as_bytes());
-        let filter = lore_revision::filter::load_filter(&target).expect("load");
-
-        // Occupy the sibling the save writes through, so opening it fails.
-        let temporary = temp_sibling_of(&target);
-        std::fs::create_dir(&temporary).expect("occupy the temporary path");
-
-        assert!(
-            lore_revision::filter::save(&filter, &target).await.is_err(),
-            "a save that could not be written reported success"
-        );
-        assert_eq!(
-            std::fs::read(&target).expect("read the target back"),
-            ENCODED_RULES.as_bytes(),
-            "a failed save changed the target"
-        );
-
-        let reloaded = lore_revision::filter::load_filter(&target).expect("reload");
-        assert!(
-            reloaded.excludes(&probe_path("build.log"), false),
-            "the rules that were there before no longer apply"
         );
     }
 }

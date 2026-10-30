@@ -52,7 +52,7 @@ mod tests {
     const DROPPED_CONTENT: &[u8] = b"dropped by the narrowing";
     const ALSO_DROPPED: &str = "drop/also-dropped.txt";
     const ALSO_DROPPED_CONTENT: &[u8] = b"dropped by the narrowing as well";
-    /// The one rule the narrowing view holds, and the file it is written back out as.
+    /// The one rule the narrowing view holds.
     const EXCLUDE_DROPPED: &str = "/drop";
     const NARROW_VIEW: &str = "narrow";
     /// A view file holding no rules, which puts the whole repository in view.
@@ -340,7 +340,7 @@ mod tests {
                 );
                 assert_eq!(
                     fixture.stored_view().as_deref(),
-                    Some("/drop\n"),
+                    Some(EXCLUDE_DROPPED),
                     "the view the tree now stands under is published as the instance's own"
                 );
                 assert_eq!(
@@ -530,8 +530,61 @@ mod tests {
                         fixture.working_file(DROPPED),
                         fixture.stored_view().as_deref(),
                     ),
-                    (Some(KEPT_CONTENT), None, Some("/drop\n")),
+                    (Some(KEPT_CONTENT), None, Some(EXCLUDE_DROPPED)),
                     "the tree and the view file are what the first apply left"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The view is stored as its file was written, so an escaped `!` or `#` names a file rather than
+    /// starting a re-inclusion or a comment. A scan finds the tree as the view left it, and a
+    /// re-applied file carries nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_view_is_stored_as_its_file_was_written() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                for path in ["!important.txt", "#notes.txt"] {
+                    test_file_write(fixture.working(path).as_path(), path.as_bytes());
+                }
+                test_commit_tree(&fixture.instance, "Names a view file escapes").await;
+                let written = "# Names starting with ! or # are escaped.\n\\!important.txt\n\
+                               \\#notes.txt\n**/Also-Dropped.TXT\n***/absent/\n/Leading\n";
+                let options = SyncOptions {
+                    view: Some(fixture.view_file_bytes("authored", written.as_bytes())),
+                    ..Default::default()
+                };
+                fixture
+                    .sync(fixture.instance.repository.clone(), options.clone())
+                    .await
+                    .0
+                    .expect("Failed to apply the view");
+
+                let reopened = fixture.reopened();
+                let (current, staged) = test_anchor_states(&reopened).await;
+                assert_eq!(
+                    test_reported(&test_scan(reopened, staged, current).await),
+                    Vec::<(String, String)>::new(),
+                    "a scan finds the tree as the stored view left it"
+                );
+                assert_eq!(
+                    fixture.stored_view().as_deref(),
+                    Some(written),
+                    "the view is stored as written"
+                );
+
+                let (result, recorded) = fixture.sync(fixture.reopened(), options).await;
+
+                result.expect("Failed to re-apply the view");
+                assert_eq!(
+                    (recorded.realized(), fixture.stored_view().as_deref()),
+                    (Realized::default(), Some(written)),
+                    "a re-applied view file carries nothing and stores the same file"
                 );
             }))
             .await
@@ -878,7 +931,7 @@ mod tests {
                     (
                         Some(local.as_slice()),
                         None,
-                        Some("/drop\n"),
+                        Some(EXCLUDE_DROPPED),
                         Realized::default()
                     ),
                     "nothing is carried and the instance stands under the view it was left under"

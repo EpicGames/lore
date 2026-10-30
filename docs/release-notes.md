@@ -81,6 +81,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `NOT_FOUND`
 - `lore clone`, a whole-tree `lore diff` and `lore status --scan` skip the directories a view such as `*`, `!/*`
   excludes, and `lore clone` does not create them
+- `lore sync --view` stores the view file as written, as `lore clone --view` does, so a rule escaped as `\!name` stays
+  a literal name and `lore status --scan` does not report that file deleted
 - The Lore service closes its SWFS mounts when it exits, however it is stopped. It used to leave them to EpicVFS,
   which kept a device for each one and could not be stopped afterwards: `sc stop EpicVFS` stayed in `STOP_PENDING`
   until the machine restarted

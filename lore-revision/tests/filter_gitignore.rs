@@ -1235,49 +1235,6 @@ fn a_forced_step_excludes_nothing_and_carries_no_verdict() {
     }
 }
 
-/// `save` writes back rules that load to the same filter, and leaves out the
-/// companions `add_inclusion` generates.
-#[tokio::test]
-#[allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
-async fn saved_rules_reload_to_the_same_filter() {
-    let authored = [
-        "/Intermediate",
-        "*.tmp",
-        "Binaries/",
-        "engine/content",
-        "!engine/content/keep",
-        "**/node_modules",
-    ];
-    let mut original = FilterInstance::default();
-    for rule in authored {
-        match rule.strip_prefix('!') {
-            Some(rest) => original.add_inclusion(rest).expect("include"),
-            None => original.add_exclusion(rule).expect("exclude"),
-        }
-    }
-
-    let dir = lore_base::test_util::TempDir::new("lore-filter-save-roundtrip-");
-    let file = dir.child("filter");
-    lore_revision::filter::save(&original, &file)
-        .await
-        .expect("save");
-    let reloaded = lore_revision::filter::load_filter(&file).expect("load");
-
-    assert_eq!(reloaded.lines.len(), original.lines.len());
-    for case in CASES.iter().take(200) {
-        for probe in FILES {
-            let probe = path(probe);
-            assert_eq!(
-                reloaded.excludes(&probe, false),
-                original.excludes(&probe, false),
-                "round trip changed the verdict for {} ({:?})",
-                probe.as_str(),
-                case.patterns
-            );
-        }
-    }
-}
-
 /// Folding a whole path and stepping down it one component at a time reach the
 /// same verdict.
 ///
