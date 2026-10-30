@@ -945,6 +945,16 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 		ptr = mmap(0, map_size, PROT_READ | PROT_WRITE, flags, (int)VM_MAKE_TAG(240U), 0);
 	}
 #elif defined(MAP_HUGETLB)
+	// Regular pages are committed when first touched, so map them without charging the
+	// commit limit. Under the default overcommit heuristic fork() charges every private
+	// writable mapping again, and refuses one larger than RAM plus swap: a process with a
+	// large rpmalloc reservation could not fork() at all, but failed with ENOMEM. Huge TLB
+	// mappings keep their reservation, without which a fault on an exhausted pool is SIGBUS.
+#if defined(MAP_NORESERVE)
+	const int page_flags = flags | MAP_NORESERVE;
+#else
+	const int page_flags = flags;
+#endif
 	int huge_flags = 0;
 	if (os_huge_pages) {
 		huge_flags = MAP_HUGETLB;
@@ -955,13 +965,13 @@ os_mmap(size_t size, size_t alignment, size_t* offset, size_t* mapped_size) {
 			huge_flags |= (int)(os_huge_page_shift << MAP_HUGE_SHIFT);
 #endif
 	}
-	void* ptr =
-	    mmap(0, map_size, PROT_READ | PROT_WRITE | PROT_MAX(PROT_READ | PROT_WRITE), huge_flags | flags, -1, 0);
+	void* ptr = mmap(0, map_size, PROT_READ | PROT_WRITE | PROT_MAX(PROT_READ | PROT_WRITE),
+	                 os_huge_pages ? (huge_flags | flags) : page_flags, -1, 0);
 #if defined(MADV_HUGEPAGE)
 	// In some configurations, huge pages allocations might fail thus
 	// we fallback to normal allocations and promote the region as transparent huge page
 	if ((ptr == MAP_FAILED || !ptr) && os_huge_pages) {
-		ptr = mmap(0, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
+		ptr = mmap(0, map_size, PROT_READ | PROT_WRITE, page_flags, -1, 0);
 		if (ptr && (ptr != MAP_FAILED)) {
 			// Best-effort promotion to transparent huge pages; ignore failures (for
 			// example when THP is disabled system-wide, where madvise returns EINVAL).

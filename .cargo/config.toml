@@ -23,6 +23,10 @@ rustflags = [
     "-C", "target-feature=+crt-static",
     # For Windows builds, always split debuginfo
     "-C", "split-debuginfo=packed",
+    # Reproducible links: without this the linker stamps every binary with the
+    # link time, so each rebuilt proc-macro DLL differs and every crate using it
+    # misses sccache, which hashes the DLL's bytes, on every build.
+    "-C", "link-arg=/Brepro",
     # allows uuid IntoBytes/FromBytes unstable feature
     "--cfg", "uuid_unstable"
 ]
