@@ -17,6 +17,9 @@ These rules apply to every comment, wherever it appears.
 - When the compiler cannot capture a semantic or an invariant, express it through the function name and the
   argument names first. Use a comment only for behaviour or semantics that naming cannot convey.
 - Write each comment about the thing it documents. Do not describe specific consumers or use cases.
+- State only what the code is and does. Never state what a change did or didn't do, or what the code was
+  before it, with words such as *no longer*, *now*, *used to*, *instead of* or *doesn't grow*. The commit
+  message carries that history.
 - Comments shouldn't be used to group functions into sections.
 - Comments shouldn't be used for code that is self-explanatory from the code itself.
 - Comments can be used to document complex logic and dependencies between different code sections.
