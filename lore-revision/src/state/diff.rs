@@ -980,10 +980,13 @@ async fn add_change_for_paired_nodes(
     let from_address = from_node.address;
     let to_address = to_node.address;
     let hash_equal = from_address == to_address;
+    // Node ids only compare within one revision, so across a pin move the mounts are compared by
+    // path below.
+    let mount_equal = !hash_equal || from_node.mounts_same_source(&to_node);
     let from_mode = from_node.mode;
     let to_mode = to_node.mode;
     let mode_equal = from_mode == to_mode;
-    let is_modify = !hash_equal || !mode_equal;
+    let is_modify = !hash_equal || !mode_equal || !mount_equal;
     // What the walk measured of the content, which the action states nothing about: a node can be
     // moved and modified at once, or moved with the content it had.
     let measured = if is_modify {
@@ -1151,6 +1154,7 @@ async fn add_change_for_paired_nodes(
                 .await?;
             }
             if !hash_equal
+                || !mount_equal
                 || is_staged
                 || is_staged_merge
                 || is_dirty
@@ -1188,7 +1192,17 @@ async fn add_change_for_paired_nodes(
                             .node_has_staged_children(linked_repository.clone(), to_node.child)
                             .await?;
 
-                        if is_staged { has_staged_children } else { true }
+                        // The two subtrees of a remount, or of a link replaced by one to another
+                        // repository, don't correspond, so the link node is reported instead.
+                        (!is_staged || has_staged_children)
+                            && !(from_node.is_link()
+                                && crate::link::link_remounted(
+                                    &linked_repository,
+                                    from_node,
+                                    &to_node,
+                                    &linked_state,
+                                )
+                                .await?)
                     };
 
                     if !recurse_link {

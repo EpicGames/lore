@@ -590,6 +590,32 @@ impl Node {
         }
     }
 
+    /// The node a link mounts in the revision it pins. `None` for anything else, whose `child`
+    /// addresses the local tree instead and says nothing about a mount.
+    pub fn mount_source(&self) -> Option<NodeID> {
+        self.is_link().then_some(self.child)
+    }
+
+    /// Node ids are only comparable within one revision, so this answers for two nodes pinning
+    /// the same one. Their shared [`address`](Self::address) cannot express the difference.
+    pub fn mounts_same_source(&self, other: &Node) -> bool {
+        self.mount_source() == other.mount_source()
+    }
+
+    /// Whether a link mounts the root of the revision it pins, which is the same node in every
+    /// revision, so its mount needs no revision read to compare or carry.
+    pub fn mounts_root(&self) -> bool {
+        self.mount_source() == Some(ROOT_NODE)
+    }
+
+    /// A link's `child` names the subtree it mounts, so it has to travel with the address it is
+    /// resolved against. Anything else keeps its `child`, which addresses the local tree.
+    pub fn take_mount_source(&mut self, other: &Node) {
+        if let Some(mount_source) = other.mount_source() {
+            self.child = mount_source;
+        }
+    }
+
     /// Verify that this node, reached as a child of `expected_parent` during a
     /// tree walk, has its parent pointer matching. Detects cycles (a child
     /// pointer leading to an ancestor) and diamonds (a node referenced as a

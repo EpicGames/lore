@@ -3,7 +3,13 @@
 import re
 
 import pytest
-from link_helpers import link_pin, make_parent_with_link, setup_link_merge_conflict
+from link_helpers import (
+    assert_mount_exposes,
+    link_pin,
+    make_parent_with_link,
+    make_parent_with_remount,
+    setup_link_merge_conflict,
+)
 
 
 @pytest.mark.smoke
@@ -856,6 +862,26 @@ def test_link_merge_into_scope_isolation(new_lore_repo):
     assert not repo.file_exists("feature-main-only.txt"), (
         "Main repo file from feature branch should NOT be on main after link-only merge into"
     )
+
+
+@pytest.mark.smoke
+def test_link_merge_into_carries_a_remount(new_lore_repo):
+    """`merge into --link` lands the mount the merged branch exposes along with its pin."""
+    link_path = "linked/repo"
+    repo, _source_repo = make_parent_with_remount(
+        new_lore_repo,
+        {"first/a.txt": "a\n"},
+        "/",
+        "second",
+        link_path,
+        link_changes={"second/b.txt": "b\n"},
+    )
+
+    repo.branch_merge_into("main", "Merge the link into main", link=link_path)
+    repo.branch_switch("main")
+
+    assert_mount_exposes(repo, link_path, "second", ["b.txt"])
+    assert_mount_exposes(repo.clone(), link_path, "second", ["b.txt"])
 
 
 @pytest.mark.smoke

@@ -4,7 +4,14 @@ import os
 import re
 
 import pytest
-from link_helpers import DEFAULT_PARENT_FILE, make_parent_with_link, make_repo
+from link_helpers import (
+    DEFAULT_PARENT_FILE,
+    assert_crr_clean,
+    assert_mount_exposes,
+    make_parent_with_link,
+    make_repo,
+    remount,
+)
 from lore_parsers import parse_status_json
 from test_utils import unstaged_entries, working_tree_files
 
@@ -576,6 +583,35 @@ def _staged_paths(repo: Lore) -> list[str]:
         entry["path"]
         for entry in parse_status_json(repo.status(json=True))
         if entry["flagStaged"]
+    )
+
+
+@pytest.mark.smoke
+def test_link_remount_unstaged_restores_the_committed_mount(new_lore_repo):
+    """Unstaging a remount returns the link to the subtree the current revision mounts.
+
+    A remount keeps the pin, so it has to count as a staged link update on its own.
+    """
+    link_path = "linked/repo"
+    repo, source_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"first/a.txt": "a\n", "second/b.txt": "b\n"},
+        {"main-file.txt": "initial content\n"},
+        source_path="first",
+    )
+
+    remount(repo, link_path, source_repo.get_id(), "second", message=None)
+    assert_mount_exposes(repo, link_path, "second", ["b.txt"])
+
+    repo.unstage(link_path)
+
+    assert_mount_exposes(repo, link_path, "first", ["a.txt"])
+    assert_crr_clean(
+        repo,
+        expected_files_present=[f"{link_path}/a.txt"],
+        expected_files_absent=[f"{link_path}/b.txt"],
+        expected_link_registry={source_repo.get_id(): True},
     )
 
 

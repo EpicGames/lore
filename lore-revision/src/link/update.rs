@@ -165,8 +165,22 @@ pub(crate) async fn update(
         return Ok(());
     }
 
+    // The pinned revision numbers its nodes afresh, so the mount is carried across by path.
+    let pin = link::ResolvedLinkPin::resolve(
+        &link,
+        link::LinkPinRealizeTarget {
+            link_path: link_path.clone(),
+            old_signature: current_link_revision,
+            new_signature: link_revision,
+            current_node: linked_node,
+            mount_source: link::LinkMountSource::SamePath,
+        },
+    )
+    .await?;
+
     let mut node = link_node;
     node.address.hash = link_revision;
+    node.child = pin.node_target;
 
     lore_debug!("Staging link node");
     let link_node = stage::stage_single_node(
@@ -193,15 +207,7 @@ pub(crate) async fn update(
         .forward::<LinkError>("Failed to update link")?;
 
     // Filesystem realize uses the full mount path.
-    link::realize_link_pin_change(
-        repository.clone(),
-        link.clone(),
-        link_path.clone(),
-        current_link_revision,
-        link_revision,
-        linked_node,
-    )
-    .await?;
+    link::realize_resolved_link_pin(repository.clone(), link.clone(), &pin).await?;
 
     // Fold nested link revisions up into the top-level state (no-op if flat).
     link::propagate_link_chain(&chain, token).await?;

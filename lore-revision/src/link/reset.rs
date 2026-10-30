@@ -176,18 +176,21 @@ pub(crate) async fn reset_staged_remove_link(
         operation,
         repository.clone(),
         linked_repository,
-        link_path,
-        Hash::default(),
-        current_link_node.address.hash,
-        current_link_node.child,
+        link::LinkPinRealizeTarget {
+            link_path,
+            old_signature: Hash::default(),
+            new_signature: current_link_node.address.hash,
+            current_node: current_link_node.child,
+            mount_source: link::LinkMountSource::SamePath,
+        },
     )
     .await?;
 
     Ok(())
 }
 
-/// Puts a link whose pin move was staged back to the pin the current revision holds, on disk and
-/// in the registry.
+/// Puts a link whose pin or mount move was staged back to the pin and mount the current revision
+/// holds, on disk and in the registry.
 ///
 /// Realizes through the caller's `operation`, as [`reset_staged_remove_link`] does.
 pub(crate) async fn reset_staged_update_link(
@@ -217,10 +220,13 @@ pub(crate) async fn reset_staged_update_link(
         operation,
         repository.clone(),
         linked_repository,
-        link_path,
-        staged_pin,
-        current_pin,
-        staged_link_node.child,
+        link::LinkPinRealizeTarget {
+            link_path,
+            old_signature: staged_pin,
+            new_signature: current_pin,
+            current_node: staged_link_node.child,
+            mount_source: link::LinkMountSource::Node(current_link_node.child),
+        },
     )
     .await?;
 

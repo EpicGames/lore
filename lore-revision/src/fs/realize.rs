@@ -1665,10 +1665,9 @@ async fn sync_execute_modify_add(
 
 /// Record a link node the change just staged in the staged state's link registry.
 ///
-/// Only a link the registry has never seen gets an entry. One already there is
-/// owned by [`stage_link_pin`](crate::link::stage_link_pin) and
-/// [`update_link_pin_by_node`](crate::link::update_link_pin_by_node).
-async fn stage_link_registry_entry(
+/// A link the registry has never seen gets an entry, and one whose row names another pin is
+/// brought to the node's, the row being what every later link operation reads the pin from.
+pub(crate) async fn stage_link_registry_entry(
     repository: &Arc<RepositoryContext>,
     state_stage: &Arc<State>,
     change: &NodeChange,
@@ -1677,11 +1676,23 @@ async fn stage_link_registry_entry(
 ) -> Result<(), SyncError> {
     let link_id: RepositoryId = node.address.context.into();
 
-    if state_stage
+    let replaced: RepositoryId = change.from.address.context.into();
+    if change.from.is_link() && replaced != link_id {
+        lore_debug!(
+            "Link at {} moves from repository {replaced} to {link_id}",
+            change.path()
+        );
+        state_stage
+            .link_remove(repository.clone(), replaced, staged_node)
+            .await
+            .ok();
+    }
+
+    let existing = state_stage
         .link_find(repository.clone(), link_id, staged_node)
         .await
-        .is_ok()
-    {
+        .ok();
+    if existing.is_some_and(|reference| reference.signature == node.address.hash) {
         lore_trace!(
             "Link {link_id} at {} is already in the registry",
             change.path()
@@ -1689,7 +1700,7 @@ async fn stage_link_registry_entry(
         return Ok(());
     }
 
-    let (branch, flags) = match change
+    let incoming = change
         .to
         .mapping
         .state
@@ -1698,8 +1709,35 @@ async fn stage_link_registry_entry(
             link_id,
             change.to.mapping.node,
         )
-        .await
-    {
+        .await;
+
+    if let Some(existing) = existing {
+        let branch = incoming
+            .as_ref()
+            .map_or(existing.branch, |reference| reference.branch);
+        lore_debug!(
+            "Moving link {link_id} at {} to revision {} branch {branch}",
+            change.path(),
+            node.address.hash
+        );
+        return state_stage
+            .link_update(
+                repository.clone(),
+                link_id,
+                branch,
+                node.address.hash,
+                staged_node,
+            )
+            .await
+            .forward_with::<SyncError, _>(|| {
+                format!(
+                    "Failed to update link {link_id} at {} in the link registry",
+                    change.path()
+                )
+            });
+    }
+
+    let (branch, flags) = match incoming {
         Ok(reference) => (
             reference.branch,
             LinkFlags::from_bits_retain(reference.flags),
@@ -1803,6 +1841,81 @@ async fn node_with_a_local_mode(
     Ok(node)
 }
 
+/// Rewrites a mount whose link node moved to another subtree of the repository it points at.
+///
+/// The diff reports such a move as the link node alone, so the content the mount exposes has to be
+/// carried here.
+async fn realize_moved_mount(
+    operation: &Arc<InstanceOperationImpl>,
+    change: &NodeChange,
+    node: Node,
+) -> Result<(), SyncError> {
+    if !change.from.is_link() {
+        return Ok(());
+    }
+
+    let repository = change.to.mapping.repository.clone();
+    // Another repository's subtree shares nothing with the one it replaces, so it is cloned afresh.
+    if change.from.address.context != node.address.context {
+        let path = change.path();
+        operation
+            .remove_recursive(path)
+            .await
+            .forward::<SyncError>("Failed removing the subtree the link exposed")?;
+        operation
+            .create_dir_all(path)
+            .await
+            .forward::<SyncError>("Failed recreating the link directory")?;
+        return Box::pin(clone_added_link(&repository, operation, &node, path)).await;
+    }
+
+    let from_node = change
+        .from
+        .mapping
+        .state
+        .node(repository.clone(), change.from.mapping.node)
+        .await
+        .forward::<SyncError>("Failed reading the link node the mount stands at")?;
+    if from_node.mounts_same_source(&node) && change.from.address == node.address {
+        return Ok(());
+    }
+
+    let link_context = repository
+        .to_link_context(node.address.context.into())
+        .await;
+    realize_link_pin_change_boxed(
+        operation,
+        repository,
+        link_context,
+        crate::link::LinkPinRealizeTarget {
+            link_path: change.path().clone(),
+            old_signature: change.from.address.hash,
+            new_signature: node.address.hash,
+            current_node: from_node.child,
+            mount_source: crate::link::LinkMountSource::Node(node.child),
+        },
+    )
+    .await
+    .forward::<SyncError>("Failed realizing the subtree a link exposes")
+}
+
+/// [`realize_link_pin_change_in_operation`](crate::link::realize_link_pin_change_in_operation) for
+/// a moved mount, the cold path. Boxed with an explicit `Send`, since that realize reaches
+/// [`realize_moved_mount`] again.
+fn realize_link_pin_change_boxed(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    link_context: Arc<RepositoryContext>,
+    target: crate::link::LinkPinRealizeTarget,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), crate::link::LinkError>> + Send + '_>> {
+    Box::pin(crate::link::realize_link_pin_change_in_operation(
+        operation,
+        repository,
+        link_context,
+        target,
+    ))
+}
+
 /// Realizes on disk a node a change adds, modifies or moves, and stages it in `state_stage` when
 /// given.
 ///
@@ -1889,6 +2002,8 @@ fn realize_change_modify_add(
             // for add. That's why we can just clone the linked files
             if node.is_link() && change.action == change::FileAction::Add {
                 Box::pin(clone_added_link(&repository, &operation, &node, path)).await?;
+            } else if node.is_link() && !dry_run {
+                realize_moved_mount(&operation, &change, node).await?;
             }
         } else if node.is_file() && !dry_run && write_to_disk {
             if rename_carried_the_content(&change, renamed) {

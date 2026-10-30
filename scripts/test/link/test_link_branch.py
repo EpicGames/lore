@@ -8,6 +8,7 @@ from link_helpers import (
     DEFAULT_PARENT_FILE,
     make_parent_with_link,
     make_repo,
+    remote_branch_entries,
 )
 from lore_parsers import parse_jsonl
 
@@ -747,25 +748,6 @@ def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
     )
 
 
-def _remote_branch_entries(repo: Lore) -> list[dict]:
-    """Remote branch list entries for a repository.
-
-    Archived branches are deliberately not requested. The remote leg reports
-    every entry as unarchived and the client asks for archived branches to be
-    excluded, so an archived branch is absent from this list entirely rather than
-    present with a flag set — its absence is the signal, and asking for archived
-    entries would only cost an extra scan.
-
-    Read from JSON rather than the text parser because the text form drops the
-    branch id, and the id is what branch creation shares between a parent branch
-    and the branch it creates in a linked repository.
-    """
-    output = repo.branch_list(json=True)
-    return [
-        e for e in parse_jsonl(output, "branchListEntry") if e["location"] == "remote"
-    ]
-
-
 @pytest.mark.smoke
 def test_link_branch_archive_leaves_child_branch(new_lore_repo):
     """Archiving a branch in a parent does not remove the linked repository's.
@@ -779,7 +761,7 @@ def test_link_branch_archive_leaves_child_branch(new_lore_repo):
     parent.branch_create("feature")
     parent_branch_id = parent.branch_info("feature").id
 
-    cascaded = [e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"]
+    cascaded = [e for e in remote_branch_entries(link_repo) if e["name"] == "feature"]
     assert len(cascaded) == 1, (
         f"Branch create should cascade one 'feature' branch into the linked "
         f"repository, got {cascaded}"
@@ -797,7 +779,7 @@ def test_link_branch_archive_leaves_child_branch(new_lore_repo):
         "Archived branch should be gone from the parent's branch list"
     )
 
-    survivor = [e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"]
+    survivor = [e for e in remote_branch_entries(link_repo) if e["name"] == "feature"]
     assert len(survivor) == 1, (
         f"The linked repository should keep its branch when the parent "
         f"archives, got {survivor}"
@@ -830,7 +812,7 @@ def test_link_archived_parent_branch_does_not_disturb_link_resolution(new_lore_r
     parent.branch_switch("main")
     parent.branch_archive("feature")
 
-    assert any(e["name"] == "feature" for e in _remote_branch_entries(link_repo)), (
+    assert any(e["name"] == "feature" for e in remote_branch_entries(link_repo)), (
         "Precondition: the linked branch outlives the parent's archive"
     )
 

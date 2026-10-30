@@ -546,6 +546,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore-server`: logs default to `warn` rather than `error`, so a server started without `RUST_LOG` reports the
   conditions an operator has to act on. `RUST_LOG` still wins where it is set, and `RUST_LOG=error` restores the
   previous output
+- Fix re-pointing a link at another subtree, which failed with `Nothing staged for commit` and was undone by merges
+  and branch switches. Both branches remounting the same link now stops the merge, as a divergent pin does. Links
+  mounting a subtree change the hash of their parent directory from this release on
+- Fix merges under a view filter dropping links inside an out-of-view subtree or failing with `Link not found`
+- Fix `lore push` failing with `Failed to push link` after a merge brought a following link onto a branch the linked
+  repository did not have yet
+- Fix merges keeping the old repository of a link re-pointed at another repository at the same path
 - Fix a moved file being deleted when the change that moves it is realized over a working tree that already holds it,
   which is what re-running an interrupted `lore sync` does. The rename finds nothing at the source it was already
   carried from, and the recovery that follows removed the destination and then skipped rewriting it, because whether the

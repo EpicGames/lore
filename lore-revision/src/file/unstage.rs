@@ -1054,7 +1054,7 @@ async fn unstage_node(
         was_staged_delete = node.is_staged_delete();
 
         let is_staged_update_link =
-            link::is_staged_pin_change(&node, &current_node, repository.clone())
+            link::is_staged_link_update(&node, &current_node, repository.clone())
                 .await
                 .forward::<UnstageError>("Failed to check link staged pin change")?;
 
@@ -1083,6 +1083,9 @@ async fn unstage_node(
             node.flags |= NodeFlags::Link;
             node.address.hash = current_node.address.hash;
             node.child = current_node.child;
+            stats
+                .directory_unstaged_count
+                .fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false

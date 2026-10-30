@@ -159,6 +159,9 @@ class LinkNotFoundError(LoreException): ...
 class LinkPinDivergedError(LoreException): ...
 
 
+class LinkMountDivergedError(LoreException): ...
+
+
 class OverlappingLinkError(LoreException): ...
 
 
@@ -256,6 +259,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
     ("Link pin conflict at", LinkPinDivergedError),
+    ("Link mount conflict at", LinkMountDivergedError),
     ("overlaps the link already mounted at", OverlappingLinkError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),

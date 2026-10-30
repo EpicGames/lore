@@ -947,6 +947,7 @@ async fn merge_start_link(
         link_reference.signature,
         result.signature,
         link_reference.branch,
+        link::LinkMountSource::SamePath,
         link::LinkPinRealize::WorkingTree,
     )
     .await
@@ -1497,6 +1498,7 @@ async fn finalize_link_conflict_state(
             merged.link_reference.signature,
             merged.new_signature,
             merged.link_reference.branch,
+            link::LinkMountSource::SamePath,
             link::LinkPinRealize::WorkingTree,
         )
         .await
@@ -1586,7 +1588,7 @@ async fn finalize_main_merge(
         branch,
         current_branch,
         state_current.revision(),
-        state_current,
+        state_current.clone(),
         &options.inherit_metadata,
     )
     .await?;
@@ -1602,6 +1604,7 @@ async fn finalize_main_merge(
                 merged.link_reference.signature,
                 merged.new_signature,
                 merged.link_reference.branch,
+                link::LinkMountSource::SamePath,
                 link::LinkPinRealize::WorkingTree,
             )
             .await
@@ -1658,6 +1661,18 @@ async fn finalize_main_merge(
         crate::instance::store_staged_anchor(&repository, signature)
             .await
             .forward::<MergeError>("storing staged anchor")?;
+
+        // Linked repositories are changed only once the merge cannot fail above, so a refused
+        // merge leaves no branch behind.
+        link::create_branches_for_merged_links(
+            repository.clone(),
+            &state_current,
+            &state_staged,
+            current_branch,
+            branch,
+        )
+        .await
+        .forward::<MergeError>("creating branches for merged links")?;
     }
 
     if !has_conflicts && !dry_run && !options.no_commit {
@@ -1809,6 +1824,7 @@ async fn graft_overwrite_node(
         node.address = source_node.address;
         node.size = source_node.size;
         node.mode = source_node.mode;
+        node.take_mount_source(source_node);
         block_writer.mark_dirty()
     };
     if dirtied {
@@ -1860,6 +1876,7 @@ async fn graft_add_node(
         flags: source_node.flags,
         ..Default::default()
     };
+    node.take_mount_source(source_node);
     // Source's nodes are committed, so they bring no staged or dirty state.
     node.clear_all_change_flags();
 
@@ -1952,6 +1969,18 @@ async fn apply_graft_copy(
             )
             .await?
         };
+
+        if source_node.is_link() {
+            crate::fs::realize::stage_link_registry_entry(
+                &repository,
+                &state_staged,
+                adopted,
+                source_node,
+                staged_id,
+            )
+            .await
+            .forward::<MergeError>("registering adopted link")?;
+        }
 
         graft_copy_file_metadata(
             repository.clone(),
@@ -2657,6 +2686,20 @@ pub async fn emit_conflict_events(
     }
 }
 
+/// The mount a link had before the merge, for an abort to return it to with its pin.
+///
+/// The merge may have remounted the link onto a subtree the pin it returns to does not hold.
+async fn pre_merge_mount(
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    link_path: &str,
+) -> Result<link::LinkMountSource, MergeError> {
+    let pre_merge = link::resolve_link_at_path(state_current, repository.clone(), link_path)
+        .await
+        .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
+    Ok(link::LinkMountSource::Node(pre_merge.link_node.child))
+}
+
 /// Per-entry view of a link merge ready to be rolled back or replayed.
 struct ResolvedAbortEntry {
     link_path: String,
@@ -2735,6 +2778,12 @@ pub async fn branch_merge_abort(
             .await
             .forward::<MergeError>("deserializing link merge state")?;
         let resolved = resolve_abort_entries(&repository, &state_staged, &entries).await?;
+        let (current_revision, _) = crate::instance::load_current_anchor(&repository)
+            .await
+            .forward::<MergeError>("loading current anchor")?;
+        let state_current = State::deserialize(repository.clone(), current_revision)
+            .await
+            .forward::<MergeError>("deserializing current state")?;
 
         // Walk entries in reverse to undo link merges. After each entry is
         // restored, write the shrunken `LinkMergeState` to the parent staged
@@ -2761,6 +2810,8 @@ pub async fn branch_merge_abort(
             )
             .await?;
 
+            let mount_source = pre_merge_mount(&repository, &state_current, &r.link_path).await?;
+
             link::stage_link_pin(
                 repository.clone(),
                 &state_staged,
@@ -2770,6 +2821,7 @@ pub async fn branch_merge_abort(
                 r.link_reference.signature,
                 entry.base.signature,
                 entry.base.branch,
+                mount_source,
                 link::LinkPinRealize::WorkingTree,
             )
             .await
@@ -2838,7 +2890,7 @@ async fn merge_abort_link(
     let link_path_rel =
         RelativePath::from_str(&link_path).internal_with(|| format!("link abort: {link_path}"))?;
 
-    let (_state_current, state_staged_opt, _current_branch) =
+    let (state_current, state_staged_opt, _current_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
             .forward::<MergeError>("deserializing current and staged state")?;
@@ -2872,6 +2924,7 @@ async fn merge_abort_link(
         .ok_or_else(|| MergeError::internal(format!("link not found: {link_path}")))?;
 
     // Restore on-disk content, stage restored node, and update link registry back to base
+    let mount_source = pre_merge_mount(&repository, &state_current, &link_path).await?;
     link::stage_link_pin(
         repository.clone(),
         &state_staged,
@@ -2881,6 +2934,7 @@ async fn merge_abort_link(
         link_reference.signature,
         entry.base.signature,
         entry.base.branch,
+        mount_source,
         link::LinkPinRealize::WorkingTree,
     )
     .await
@@ -2945,6 +2999,7 @@ async fn merge_abort_ignore_links(
             // Re-read the link reference from the post-abort state to find
             // the now-current pin (which is back to pre-merge after abort).
             let link::ResolvedLink {
+                link_node: current_node,
                 link_reference: current_ref,
                 ..
             } = link::resolve_link_at_path(&state_current, repository.clone(), &r.link_path)
@@ -2956,10 +3011,11 @@ async fn merge_abort_ignore_links(
                 &state_current,
                 &r.link_context,
                 r.link_path_rel.clone(),
-                r.link_node,
+                current_node,
                 current_ref.signature,
                 r.link_reference.signature,
                 r.link_reference.branch,
+                link::LinkMountSource::SamePath,
                 link::LinkPinRealize::WorkingTree,
             )
             .await
@@ -4198,13 +4254,22 @@ async fn merge_into_link(
         .await
         .forward::<MergeError>("deserializing staged state")?;
 
-    // Update the link pin on the staged state to match the current state's pin
-    link::update_link_pin_by_path(
-        &state_staged,
+    let target_link = link::resolve_link_at_path(&state_staged, repository.clone(), link_path)
+        .await
+        .forward_with::<MergeError, _>(|| format!("link not found: {link_path_owned}"))?;
+    let link_path_rel =
+        RelativePath::from_str(link_path).internal_with(|| format!("link: {link_path}"))?;
+    link::stage_link_pin(
         repository.clone(),
-        link_path,
-        current_link.link_reference.branch,
+        &state_staged,
+        &current_link.link_context,
+        link_path_rel,
+        target_link.link_node,
+        target_link.link_reference.signature,
         current_link.link_reference.signature,
+        current_link.link_reference.branch,
+        link::LinkMountSource::Node(current_link.link_node.child),
+        link::LinkPinRealize::StateOnly,
     )
     .await
     .forward::<MergeError>("updating link pin")?;
@@ -4710,6 +4775,20 @@ pub async fn merge_into(
             fragments: stats.complete(),
         })
         .send();
+
+        // Linked repositories change only once nothing but the push can fail, and before it, so
+        // the published target never holds a link with no branch to push to.
+        if !options.ignore_links {
+            link::create_branches_for_merged_links(
+                repository.clone(),
+                &state_branch,
+                &state_new,
+                branch,
+                current_branch,
+            )
+            .await
+            .forward::<MergeError>("creating branches for merged links")?;
+        }
 
         let response = revision_protocol
             .branch_push(branch, signature, false, false)

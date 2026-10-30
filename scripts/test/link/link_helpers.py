@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Repository setup and output parsing shared by the link tests."""
 
+import os
 import re
 
-from lore_parsers import parse_status_json
+from lore_parsers import parse_jsonl, parse_status_json
 from test_utils import unstaged_entries
 
 from lore import Lore
@@ -19,6 +20,27 @@ def make_repo(new_lore_repo, files: dict, message: str = "Initial commit") -> Lo
     repo: Lore = new_lore_repo()
     repo.write_commit_push(message, files)
     return repo
+
+
+def make_repo_renumbering_folder(
+    new_lore_repo, folder: str = "sub"
+) -> tuple[Lore, str, str]:
+    """Returns (repo, first_pin, second_pin), where `{folder}/a.txt` reads "one" then "two".
+
+    The second pin recreates `folder` after another, so it is a different node there: a mount
+    that follows it by node id rather than by path lands on the other folder.
+    """
+    repo = make_repo(new_lore_repo, {f"{folder}/a.txt": "one\n"})
+    first_pin = repo.branch_info().local_latest
+    repo.rmtree(folder)
+    repo.stage(scan=True)
+    repo.commit(f"Drop {folder}")
+    repo.push()
+    repo.write_commit_push(
+        f"Recreate {folder} after another",
+        {"other/z.txt": "z\n", f"{folder}/a.txt": "two\n"},
+    )
+    return repo, first_pin, repo.branch_info().local_latest
 
 
 def make_parent_with_link(
@@ -43,6 +65,74 @@ def make_parent_with_link(
     parent_repo.commit("Add link")
     parent_repo.push()
     return parent_repo, link_repo
+
+
+def remount(
+    repo: Lore,
+    link_path: str,
+    source_id: str,
+    source_path: str,
+    message: str | None = "Remount the link",
+    pin: str | None = None,
+):
+    """Re-points the link at `link_path` to `source_path`, at `pin` when given, committed and
+    pushed unless `message` is None."""
+    repo.link_remove(link_path)
+    repo.link_add(link_path, source_id, source_path, pin=pin)
+    if message is not None:
+        repo.commit(message)
+        repo.push()
+
+
+def make_parent_with_remount(
+    new_lore_repo,
+    link_files: dict,
+    source_path: str,
+    remount_path: str,
+    link_path: str = DEFAULT_LINK_MOUNT,
+    branch: str = "feature-branch",
+    link_changes: dict | None = None,
+) -> tuple[Lore, Lore]:
+    """Returns (parent_repo, link_repo): the link mounts `source_path` on main and is remounted
+    onto `remount_path` on `branch`, which is left checked out.
+
+    `link_changes` are written through the mount and committed on `branch` before the remount,
+    so the remount can target a subtree only that change brings in.
+    """
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        link_files,
+        {DEFAULT_PARENT_FILE: "baseline\n"},
+        source_path=source_path,
+    )
+    parent_repo.branch_create(branch)
+    if link_changes:
+        parent_repo.write_commit_push(
+            "Change inside the link",
+            {f"{link_path}/{path}": content for path, content in link_changes.items()},
+        )
+    remount(parent_repo, link_path, link_repo.get_id(), remount_path)
+    return parent_repo, link_repo
+
+
+def remote_branch_entries(repo: Lore) -> list[dict]:
+    """Remote branch list entries for a repository.
+
+    Archived branches are deliberately not requested. The remote leg reports
+    every entry as unarchived and the client asks for archived branches to be
+    excluded, so an archived branch is absent from this list entirely rather than
+    present with a flag set — its absence is the signal, and asking for archived
+    entries would only cost an extra scan.
+
+    Read from JSON rather than the text parser because the text form drops the
+    branch id, and the id is what branch creation shares between a parent branch
+    and the branch it creates in a linked repository.
+    """
+    output = repo.branch_list(json=True)
+    return [
+        e for e in parse_jsonl(output, "branchListEntry") if e["location"] == "remote"
+    ]
 
 
 def link_pin(repo: Lore, source_id: str) -> str:
@@ -88,6 +178,26 @@ def assert_crr_clean(
             assert needle not in link_list_output, (
                 f"Expected {needle!r} not in link_list, got: {link_list_output}"
             )
+
+
+def assert_mount_source(repo: Lore, link_path: str, source_path: str):
+    """The link at `link_path` names `source_path` as what it exposes."""
+    info = repo.link_info(link_path)
+    assert f"Source path: {source_path}" in info, (
+        f"Link at {link_path} should mount {source_path!r}.\nGot:\n{info}"
+    )
+
+
+def assert_mount_exposes(
+    repo: Lore, link_path: str, source_path: str, expected_names: list[str]
+):
+    """The link at `link_path` mounts `source_path` and nothing else."""
+    assert_mount_source(repo, link_path, source_path)
+    mounted = sorted(os.listdir(os.path.join(repo.path, link_path)))
+    assert mounted == sorted(expected_names), (
+        f"Mount {link_path} should expose exactly {sorted(expected_names)}, "
+        f"got: {mounted}"
+    )
 
 
 def setup_link_merge_conflict(

@@ -3222,7 +3222,10 @@ struct NodeHashData {
     name_hash: u64,
     mode: u32,
     address: Address,
-    padding: u32,
+    /// A link's mount source, which its address does not express. Zero for
+    /// every other node and for a link mounting the repository root, so only a
+    /// subtree mount reaches a hash it did not before.
+    mount_source: u32,
     size: u64,
 }
 
@@ -3232,7 +3235,7 @@ impl NodeHashData {
             name_hash: node.name_hash,
             mode: node.mode as u32,
             address: node.address,
-            padding: 0,
+            mount_source: node.mount_source().unwrap_or(ROOT_NODE),
             size: node.size,
         }
     }

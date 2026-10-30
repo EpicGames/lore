@@ -304,6 +304,80 @@ def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, scratch_dir):
 
 
 @pytest.mark.smoke
+def test_merge_grafts_links_inside_an_out_of_view_subtree(new_lore_repo, scratch_dir):
+    """Links the other branch remounted, added or re-pinned out of view land as it has them.
+
+    A link's mount, its registry entry and its branch in the linked repository all live outside
+    the address the subtree is adopted by, so adopting it has to carry each of them, and nothing of
+    the links may reach the sparse working tree.
+    """
+    source = new_lore_repo()
+    source.write_commit_push("Source", {"first/a.txt": "a\n", "second/b.txt": "b\n"})
+    added = new_lore_repo()
+    added.write_commit_push("Added", {"sub/c.txt": "c\n"})
+    pinned = new_lore_repo()
+    pinned.write_commit_push("Pin one", {"d.txt": "one\n"})
+    pin_one = pinned.branch_info().local_latest
+    pinned.write_commit_push("Pin two", {"d.txt": "two\n"})
+    pin_two = pinned.branch_info().local_latest
+
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"keep.txt": "v1\n", "hidden/top.txt": "v1\n"})
+    repo.link_add("hidden/lib", source.get_id(), "first")
+    repo.link_add("hidden/pinned", pinned.get_id(), "/", pin=pin_one)
+    repo.commit("Links inside the out-of-view subtree")
+    repo.branch_push()
+
+    clone = repo.clone(view=_write_view_filter(scratch_dir, "/hidden\n"))
+    clone.branch_create("feature-branch")
+    clone.write_files({"keep.txt": "v2 on feature\n"})
+    clone.stage(scan=True)
+    clone.commit("feature changes the in-view file")
+    clone.branch_push()
+    clone.branch_switch("main")
+
+    repo.link_update("hidden/pinned", pin=pin_two)
+    repo.commit("main re-pins a link out of view")
+    repo.link_remove("hidden/lib")
+    repo.link_add("hidden/lib", source.get_id(), "second")
+    repo.link_add("hidden/added", added.get_id(), "sub")
+    repo.commit("main remounts and adds links out of view")
+    repo.branch_push()
+
+    clone.revision_sync()
+    clone.branch_switch("feature-branch")
+    merge_output = clone.branch_merge_start("main")
+    assert "out-of-view subtrees" in merge_output, (
+        "expected the merge to adopt the out-of-view subtree wholesale, "
+        "output was:\n" + merge_output
+    )
+    assert not clone.path_exists("hidden"), (
+        "out-of-view directory materialized on disk: hidden/"
+    )
+    clone.branch_push()
+
+    verify = repo.clone(branch="feature-branch")
+    for link_path, source_path, exposed in [
+        ("hidden/lib", "second", {"b.txt": "b\n"}),
+        ("hidden/added", "sub", {"c.txt": "c\n"}),
+        ("hidden/pinned", "/", {"d.txt": "two\n"}),
+    ]:
+        link_info = verify.link_info(link_path)
+        assert f"Source path: {source_path}" in link_info, (
+            f"merged {link_path} should mount {source_path}:\n{link_info}"
+        )
+        mounted = sorted(os.listdir(os.path.join(verify.path, link_path)))
+        assert mounted == sorted(exposed), (
+            f"merged {link_path} should expose {sorted(exposed)}, got {mounted}"
+        )
+        for name, content in exposed.items():
+            with verify.open_file(f"{link_path}/{name}") as input_file:
+                assert input_file.read() == content, (
+                    f"merged {link_path}/{name} should hold main's content"
+                )
+
+
+@pytest.mark.smoke
 def test_merge_does_not_graft_when_view_reincludes_subpath(new_lore_repo, scratch_dir):
     """A view that re-includes part of an excluded subtree must still write the
     re-included paths to disk during a merge.

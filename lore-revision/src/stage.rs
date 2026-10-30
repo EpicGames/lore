@@ -1023,13 +1023,13 @@ pub(crate) async fn stage_single_node(
             );
 
             if node_flags.node_type() == existing_node.node_type() {
-                // Update the existing node
                 let block_dirtied = {
                     let mut block_writer = block.write();
                     let existing_node = block_writer.node(node_index);
                     existing_node.address = node.address;
                     existing_node.mode = node.mode;
                     existing_node.size = node.size;
+                    existing_node.take_mount_source(&node);
                     block_writer.mark_dirty()
                 };
                 if block_dirtied {

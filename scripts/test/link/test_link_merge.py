@@ -3,9 +3,25 @@
 import re
 
 import pytest
-from error_types import LinkPinDivergedError, UnresolvedConflictError
-from link_helpers import assert_crr_clean, link_pin, make_parent_with_link, make_repo
+from error_types import (
+    LinkMountDivergedError,
+    LinkPinDivergedError,
+    UnresolvedConflictError,
+)
+from link_helpers import (
+    assert_crr_clean,
+    assert_mount_exposes,
+    assert_mount_source,
+    link_pin,
+    make_parent_with_link,
+    make_parent_with_remount,
+    make_repo,
+    make_repo_renumbering_folder,
+    remote_branch_entries,
+    remount,
+)
 from lore_parsers import parse_jsonl, parse_status_json
+from test_utils import unstaged_entries
 
 from lore import Lore
 
@@ -86,6 +102,170 @@ def test_link_add_on_branch_merge_into(new_lore_repo):
         expected_files_absent=[],
         expected_link_registry={source_repo.get_id(): True, link_path: True},
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("merge_into", [False, True])
+def test_link_add_merged_into_another_branch_pushes(new_lore_repo, merge_into):
+    """A link merged onto a branch it was not added on follows that branch and pushes.
+
+    The link follows its parent's branch, which only `link add` and `branch create` give a
+    counterpart in the linked repository, so the merge has to give it one, even where the
+    repository is already mounted elsewhere without following.
+    """
+    link_path = "linked/repo"
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    source_repo = make_repo(
+        new_lore_repo,
+        {"shared/link-file.txt": "link source content\n", "pinned/p.txt": "p\n"},
+    )
+    repo.link_add(
+        "vendor/pinned", source_repo.get_id(), "pinned", disable_branching=True
+    )
+    repo.commit("Mount the repository without following")
+    repo.push()
+
+    repo.branch_create("release")
+    repo.write_commit_push("Release change", {"release-file.txt": "release\n"})
+    repo.branch_switch("main")
+    repo.branch_create("feature-branch")
+    repo.link_add(link_path, source_repo.get_id(), "shared")
+    repo.commit("Add link on feature-branch")
+    repo.push()
+
+    if merge_into:
+        repo.branch_merge_start("release", message="Merge release into feature-branch")
+        repo.push()
+        repo.branch_merge_into("release", message="Merge feature-branch into release")
+        repo.branch_switch("release")
+    else:
+        repo.branch_switch("release")
+        repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    repo.write_commit_push("Change on release", {"after-merge.txt": "after\n"})
+
+    link_output = repo.link_list()
+    assert re.search(
+        rf"Link\s+{source_repo.get_id()}.*?Branch:\s+release",
+        link_output,
+        re.DOTALL,
+    ), f"Merged link should track 'release'.\nGot: {link_output}"
+    clone = repo.clone(branch="release")
+    assert clone.file_exists(f"{link_path}/link-file.txt"), (
+        "A fresh clone of the merged branch should expose the linked content"
+    )
+
+
+@pytest.mark.smoke
+def test_link_add_merged_with_ignore_links_leaves_linked_branches(new_lore_repo):
+    """`--ignore-links` creates no branch in a linked repository a merge brings in."""
+    source_repo = make_repo(new_lore_repo, {"link-file.txt": "link source content\n"})
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+
+    repo.branch_create("feature-branch")
+    repo.write_commit_push("Feature change", {"feature-file.txt": "feature\n"})
+    repo.branch_switch("main")
+    repo.link_add("linked/repo", source_repo.get_id(), "/")
+    repo.commit("Add link on main")
+    repo.push()
+
+    repo.branch_switch("feature-branch")
+    repo.branch_merge_start("main", message="Merge main", ignore_links=True)
+
+    branches = sorted(entry["name"] for entry in remote_branch_entries(source_repo))
+    assert branches == ["main"], (
+        f"The linked repository should still hold only 'main'.\nGot: {branches}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("merge_into", [False, True])
+def test_link_remount_on_branch_merge(new_lore_repo, merge_into):
+    """A remount made on a branch lands on main through `branch merge start` and `into`."""
+    link_path = "linked/repo"
+    repo, _source_repo = make_parent_with_remount(
+        new_lore_repo,
+        {"first/first.txt": "first\n", "second/second.txt": "second\n"},
+        "first",
+        "second",
+        link_path,
+    )
+
+    if merge_into:
+        repo.branch_merge_into("main", message="Merge feature-branch into main")
+        repo.branch_switch("main")
+    else:
+        repo.branch_switch("main")
+        repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+        repo.push()
+
+    assert_mount_exposes(repo, link_path, "second", ["second.txt"])
+    assert_mount_exposes(repo.clone(), link_path, "second", ["second.txt"])
+
+
+@pytest.mark.smoke
+def test_link_remount_with_content_change_on_branch_merge_start(new_lore_repo):
+    """A remount lands even where the link's own merge owns the pin.
+
+    Committing inside the link makes it eligible for `merge_repository`, which settles the pin
+    before the parent's link rows are compared. The remount has to reach the parent anyway.
+    """
+    link_path = "linked/repo"
+    repo, _source_repo = make_parent_with_remount(
+        new_lore_repo,
+        {"first/first.txt": "first\n", "second/second.txt": "second\n"},
+        "first",
+        "second",
+        link_path,
+    )
+
+    with repo.open_file(f"{link_path}/second.txt", "w+") as f:
+        f.writelines(["edited through the remounted subtree\n"])
+    repo.stage(scan=True)
+    repo.commit("Edit inside the link on feature branch")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    repo.push()
+
+    assert_mount_source(repo, link_path, "second")
+    assert_mount_exposes(repo.clone(), link_path, "second", ["second.txt"])
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("link_scoped", [False, True])
+def test_link_remount_with_content_change_undone_by_branch_merge_abort(
+    new_lore_repo, link_scoped
+):
+    """Aborting a merge that remounted a link returns it to the mount it had before.
+
+    The remount targets a subtree the merged link content introduces, which the pin the abort
+    returns to does not hold, so the mount has to return with the pin.
+    """
+    link_path = "linked/repo"
+    repo, _source_repo = make_parent_with_remount(
+        new_lore_repo,
+        {"first/a.txt": "a\n"},
+        "/",
+        "second",
+        link_path,
+        link_changes={"second/b.txt": "b\n"},
+    )
+
+    repo.branch_switch("main")
+    repo.write_commit_push(
+        "Change inside the link on main", {f"{link_path}/first/x.txt": "x\n"}
+    )
+    repo.branch_merge_start("feature-branch", no_commit=True)
+    assert_mount_exposes(repo, link_path, "second", ["b.txt"])
+
+    repo.branch_merge_abort(link=link_path if link_scoped else None)
+
+    assert_mount_exposes(repo, link_path, "/", ["first"])
+    assert repo.file_exists(f"{link_path}/first/x.txt"), (
+        "the abort should restore main's link content"
+    )
+    assert unstaged_entries(repo) == [], "the working tree should match the mount"
 
 
 @pytest.mark.smoke
@@ -251,6 +431,47 @@ def test_link_pin_update_on_branch_merge_start(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("remount_too", [False, True])
+def test_link_pin_move_on_a_subtree_link_merges_into_the_registry(
+    new_lore_repo, remount_too
+):
+    """A subtree link's pin move reaches the registry before the merge commits.
+
+    Covers the folder being renumbered at the new pin, and the move remounting the link as well.
+    """
+    link_path = "linked/repo"
+    source_repo, pin_one, pin_two = make_repo_renumbering_folder(new_lore_repo)
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    repo.link_add(link_path, source_repo.get_id(), "sub", pin=pin_one)
+    repo.commit("Add link")
+    repo.push()
+
+    repo.branch_create("feature-branch")
+    if remount_too:
+        remount(repo, link_path, source_repo.get_id(), "other", pin=pin_two)
+    else:
+        repo.link_update(link_path, pin=pin_two)
+        repo.commit("Move the pin on feature branch")
+        repo.push()
+
+    repo.branch_switch("main")
+    repo.write_commit_push("Change on main", {"main-only.txt": "main\n"})
+    repo.branch_merge_start("feature-branch", no_commit=True)
+
+    assert link_pin(repo, source_repo.get_id()) == pin_two, (
+        "The merge should stage the pin the merged branch moved"
+    )
+    if remount_too:
+        assert_mount_exposes(repo, link_path, "other", ["z.txt"])
+    else:
+        assert_mount_exposes(repo, link_path, "sub", ["a.txt"])
+        with repo.open_file(f"{link_path}/a.txt") as f:
+            assert f.read() == "two\n", (
+                "The mount should hold the newly pinned revision"
+            )
+
+
+@pytest.mark.smoke
 def test_link_pin_update_on_branch_merge_into(new_lore_repo):
     """A pin-only update reaches main through `branch merge into`.
 
@@ -392,6 +613,29 @@ def test_link_pin_update_divergent_does_not_silently_pick_a_side(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_pin_update_divergent_creates_no_branch_for_a_merged_in_link(
+    new_lore_repo,
+):
+    """A merge refused for a divergent pin leaves the linked repositories it brings in alone."""
+    repo, _source_repo, _revision_two, _revision_three = _diverge_link_pins(
+        new_lore_repo, "linked/repo"
+    )
+    other_repo = make_repo(new_lore_repo, {"other.txt": "other\n"})
+    repo.link_add("linked/other", other_repo.get_id(), "/")
+    repo.commit("Add a following link on main")
+    repo.push()
+
+    repo.branch_switch("feature-branch")
+    with pytest.raises(LinkPinDivergedError):
+        repo.branch_merge_start("main", message="Merge divergent link pins")
+
+    branches = sorted(entry["name"] for entry in remote_branch_entries(other_repo))
+    assert branches == ["main"], (
+        f"The merged-in linked repository should still hold only 'main'.\nGot: {branches}"
+    )
+
+
+@pytest.mark.smoke
 def test_link_pin_update_divergent_detected_with_ignore_links(new_lore_repo):
     """`--ignore-links` skips link content work but not the row comparison.
 
@@ -445,6 +689,65 @@ def test_link_pin_update_merge_ignore_links_keeps_pin(new_lore_repo):
     assert link_pin(repo, source_repo.get_id()) == pin_base, (
         "--ignore-links should not move the link pin"
     )
+
+
+@pytest.mark.smoke
+def test_link_remount_on_the_target_survives_a_merged_pin_move(new_lore_repo):
+    """The target's own remount stays when the merged branch only moved the pin."""
+    link_path = "linked/repo"
+    source_repo = make_repo(
+        new_lore_repo, {"first/a.txt": "a\n", "second/b.txt": "b\n"}
+    )
+    pin_one = source_repo.branch_info().local_latest
+    source_repo.write_commit_push("Second revision", {"second/c.txt": "c\n"})
+    pin_two = source_repo.branch_info().local_latest
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    repo.link_add(link_path, source_repo.get_id(), "first", pin=pin_one)
+    repo.commit("Add link")
+    repo.push()
+
+    repo.branch_create("feature-branch")
+    repo.link_update(link_path, pin=pin_two)
+    repo.commit("Move the pin on feature branch")
+    repo.push()
+
+    repo.branch_switch("main")
+    remount(repo, link_path, source_repo.get_id(), "second", pin=pin_one)
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    repo.push()
+
+    assert link_pin(repo, source_repo.get_id()) == pin_two, (
+        "The merge should carry the pin the merged branch moved"
+    )
+    assert_mount_exposes(repo, link_path, "second", ["b.txt", "c.txt"])
+
+
+@pytest.mark.smoke
+def test_link_remount_divergent_does_not_silently_pick_a_side(new_lore_repo):
+    """Both branches remounting a link stops the merge instead of resolving it.
+
+    The mount is the one part of a link its pin cannot express, so a side that moved it is
+    invisible to the pin comparison and has to be judged on its own.
+    """
+    link_path = "linked/repo"
+    repo, source_repo = make_parent_with_remount(
+        new_lore_repo,
+        {"first/a.txt": "a\n", "second/b.txt": "b\n"},
+        "/",
+        "second",
+        link_path,
+    )
+
+    repo.branch_switch("main")
+    remount(repo, link_path, source_repo.get_id(), "first")
+
+    with pytest.raises(LinkMountDivergedError):
+        repo.branch_merge_start("feature-branch", message="Merge divergent remounts")
+
+    assert_mount_exposes(repo, link_path, "first", ["a.txt"])
+
+    repo.branch_merge_abort()
+    assert_mount_exposes(repo, link_path, "first", ["a.txt"])
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +951,42 @@ def test_merge_outside_the_folder_keeps_a_link_replacing_it(new_lore_repo):
     assert clone.compare_file(source, "shared/b.txt", "b.txt"), (
         "a fresh clone must serve the linked repository's content at the mount"
     )
+
+
+@pytest.mark.smoke
+def test_merge_of_a_link_replaced_by_another_repository_lands_the_new_one(
+    new_lore_repo,
+):
+    """A link re-pointed at another repository at the same path merges as that repository.
+
+    The two repositories' subtrees share nothing, so the mount and its registry row have to be
+    replaced rather than diffed.
+    """
+    link_path = "linked/repo"
+    first = make_repo(new_lore_repo, {"a.txt": "a\n"})
+    second = make_repo(new_lore_repo, {"b.txt": "b\n"})
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    repo.link_add(link_path, first.get_id(), "/")
+    repo.commit("Link the first repository")
+    repo.push()
+
+    repo.branch_create("feature-branch")
+    repo.link_remove(link_path)
+    repo.link_add(link_path, second.get_id(), "/")
+    repo.commit("Link the second repository instead")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.write_commit_push("Change on main", {"main-only.txt": "main\n"})
+    repo.branch_merge_start("feature-branch", message="Merge feature-branch")
+    repo.push()
+
+    linked = re.findall(r"^Link\s+(\w+)", repo.link_list(), re.MULTILINE)
+    assert linked == [second.get_id()], (
+        f"The merged registry should hold only the second repository, got {linked}"
+    )
+    assert_mount_exposes(repo, link_path, "/", ["b.txt"])
+    assert_mount_exposes(repo.clone(), link_path, "/", ["b.txt"])
 
 
 @pytest.mark.smoke
