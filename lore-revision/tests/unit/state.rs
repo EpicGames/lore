@@ -18,6 +18,7 @@ use lore_revision::util::path::RelativePathBuf;
 use lore_storage::hash;
 use zerocopy::FromZeros;
 
+mod apply;
 mod diff;
 mod reparent;
 mod stream;

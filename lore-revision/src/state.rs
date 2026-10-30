@@ -2865,21 +2865,7 @@ impl State {
             }));
         }
 
-        // The hash is case-insensitive, so only a matching hash needs the stored name
-        // read back to tell a rename that changes the case from one that changes nothing.
-        let name_hash = hash::hash_string(dst_name);
-        let renamed = node.name_hash != name_hash
-            || block
-                .node_name_clone(node_index)
-                .forward::<StateError>("Node name")?
-                != dst_name;
         let source_parent_id = node.parent;
-        if !renamed && source_parent_id == destination_parent_id {
-            return Err(StateError::from(InvalidArguments {
-                reason: "the node is already under that parent by that name".into(),
-            }));
-        }
-
         let reparented = source_parent_id != destination_parent_id;
         let parent_block_index = NodeBlock::index(destination_parent_id);
         let parent_node_index = Node::index(destination_parent_id);
@@ -2889,22 +2875,10 @@ impl State {
             None
         };
 
-        if renamed {
-            let dirtied = {
-                let mut writer = block.write();
-                let (name_offset, name_length) = writer
-                    .node_name_store(dst_name, node.name_offset, node.name_length)
-                    .forward::<StateError>("Storing the moved node's name")?;
-                let record = writer.node(node_index);
-                record.name_offset = name_offset;
-                record.name_length = name_length;
-                record.name_hash = name_hash;
-                writer.mark_dirty()
-            };
-            if dirtied {
-                self.block_modified(block.clone(), block_index);
-            }
-            self.mark_dirty();
+        if !self.node_rename(&block, block_index, node_index, &node, dst_name)? && !reparented {
+            return Err(StateError::from(InvalidArguments {
+                reason: "the node is already under that parent by that name".into(),
+            }));
         }
 
         if let Some(parent_block) = parent_block {
@@ -2957,6 +2931,48 @@ impl State {
         }
 
         Ok(())
+    }
+
+    /// Stores `name` as the name of `node`, the node at `node_index` in `block`, where it differs
+    /// from the stored name, and answers whether it did. `block` holds its name table, as
+    /// [`Self::block_with_nametable`] returns it. The name hash folds case, so a name that hashes
+    /// alike is compared with the stored one to tell a change of case from no change.
+    ///
+    /// Only the name changes: the node keeps its place, its children and its flags.
+    fn node_rename(
+        &self,
+        block: &Arc<NodeBlock>,
+        block_index: usize,
+        node_index: usize,
+        node: &Node,
+        name: &str,
+    ) -> Result<bool, StateError> {
+        let name_hash = hash::hash_string(name);
+        if node.name_hash == name_hash
+            && *block
+                .node_name_ref(node_index)
+                .forward::<StateError>("Node name")?
+                == *name
+        {
+            return Ok(false);
+        }
+
+        let dirtied = {
+            let mut writer = block.write();
+            let (name_offset, name_length) = writer
+                .node_name_store(name, node.name_offset, node.name_length)
+                .forward::<StateError>("Storing the node's name")?;
+            let record = writer.node(node_index);
+            record.name_offset = name_offset;
+            record.name_length = name_length;
+            record.name_hash = name_hash;
+            writer.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block.clone(), block_index);
+        }
+        self.mark_dirty();
+        Ok(true)
     }
 
     /// Whether `candidate` is `node_id` itself or one of its descendants, so moving
@@ -8888,6 +8904,12 @@ fn collect_new_addresses_recurse(
 /// Each `NodeChange` carries source node data in its `to` field, which is copied into
 /// the target state tree.
 ///
+/// A move deletes the node at its source and stages the moved node at its destination. The
+/// destination of a move that only changes case resolves to the node at its source, so that node
+/// is renamed in place instead, keeping its children. It takes the moved node's content only where
+/// the move modifies it, and otherwise keeps the target's: the 3-way diff folds a change the target
+/// made at the source into a move that leaves the content as it was.
+///
 /// Preconditions:
 /// - The changes must be conflict-free (no entries with `Flags::Conflict`)
 /// - All fragment data referenced by the changes must already exist in the immutable store
@@ -8937,7 +8959,6 @@ pub async fn apply_tree_changes(
             continue;
         }
 
-        // For move actions, delete the old path first
         if change.action == FileAction::Move
             && let Some(from_path) = change.move_source()
         {
@@ -8951,17 +8972,38 @@ pub async fn apply_tree_changes(
             };
 
             if node_link.is_valid() {
-                crate::stage::stage_delete(
-                    repository.clone(),
-                    target_state.clone(),
-                    from_path.clone(),
-                    node_link.node,
-                    NodeFlags::StagedMerge,
-                    stats.clone(),
-                    None,
-                )
-                .await
-                .forward::<StateError>("Node not found")?;
+                if from_path.as_lowercase_str() == change.path().as_lowercase_str() {
+                    let block_index = NodeBlock::index(node_link.node);
+                    let node_index = Node::index(node_link.node);
+                    let block = target_state
+                        .block_with_nametable(repository.clone(), block_index)
+                        .await?;
+                    target_state.node_rename(
+                        &block,
+                        block_index,
+                        node_index,
+                        &block.node(node_index),
+                        change.path().name(),
+                    )?;
+                    if !change.flags.contains(change::Flags::Modify) {
+                        target_state
+                            .node_mark(repository.clone(), node_link.node, NodeFlags::Staged, true)
+                            .await?;
+                        continue;
+                    }
+                } else {
+                    crate::stage::stage_delete(
+                        repository.clone(),
+                        target_state.clone(),
+                        from_path.clone(),
+                        node_link.node,
+                        NodeFlags::StagedMerge,
+                        stats.clone(),
+                        None,
+                    )
+                    .await
+                    .forward::<StateError>("Node not found")?;
+                }
             }
         }
 

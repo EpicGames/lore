@@ -95,6 +95,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   `lore push --fast-forward-merge` report a conflict for a file both sides change when its path holds glob characters
   such as `[` and `]`
 - `lore status` lists and `lore unstage` takes back staged changes to paths an ignore rule matches
+- `lore push --fast-forward-merge` keeps a rename that changes only case where the push also changes content in the
+  directory holding it. A renamed directory keeps its files, and a renamed file keeps edits made to it on the target
+  branch
 
 ## v0.12.0 (Oct 26th 2026) [#1966]
 

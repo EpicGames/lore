@@ -4,7 +4,7 @@ import logging
 import os
 
 import pytest
-from lore_parsers import parse_push_stats_json, parse_revision_list_json
+from lore_parsers import parse_jsonl, parse_push_stats_json, parse_revision_list_json
 
 from lore import Lore
 
@@ -372,6 +372,52 @@ def test_push_fast_forward_merge_non_merge(new_lore_repo):
     assert ff_metadata.strip(), (
         "Expected 'fast-forward-merge' metadata on the server-created revision"
     )
+
+
+@pytest.mark.smoke
+def test_push_fast_forward_merge_case_rename(new_lore_repo):
+    """A fast-forward merge of a revision that renames a directory only in case
+    keeps the new name and every file below it, and a revision committed on top
+    of the merge records no move."""
+    repo: Lore = new_lore_repo()
+    repo.make_dirs("Docs")
+    for path in ["Config.txt", "Docs/Guide.txt", "Docs/notes.txt"]:
+        with repo.open_file(path, "w+") as f:
+            f.write(f"initial {path}\n")
+    repo.stage(scan=True)
+    repo.commit("Initial", offline=True)
+    repo.push()
+
+    # Directory addresses fold case, so the rename comes with a modification for
+    # the revision diff to report it.
+    repo.move("Docs", "docs")
+    with repo.open_file(os.path.join("docs", "Guide.txt"), "w+") as f:
+        f.write("modified\n")
+    repo.stage(scan=True, case="rename", offline=True)
+    repo.commit("Rename in case", offline=True)
+
+    clone_b = repo.clone()
+    with clone_b.open_file("other.txt", "w+") as f:
+        f.write("concurrent\n")
+    clone_b.stage(scan=True, offline=True)
+    clone_b.commit("Concurrent push", offline=True)
+    clone_b.push()
+
+    repo.push(fast_forward_merge=True)
+
+    expected = {"Config.txt", "docs/Guide.txt", "docs/notes.txt", "other.txt"}
+    assert _collect_repo_files(repo.clone()) == expected
+    repo.sync()
+    assert _collect_repo_files(repo) == expected
+
+    with repo.open_file("follow.txt", "w+") as f:
+        f.write("follow\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Follow-up", offline=True)
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    assert [delta for delta in deltas if delta["action"] == "move"] == [], deltas
 
 
 @pytest.mark.smoke
