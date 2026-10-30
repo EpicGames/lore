@@ -686,15 +686,18 @@ async fn a_cancelled_refresh_leaves_the_refresh_token_removed() {
     let expired = jwt("alice", EXPIRED, 1);
     logged_in(ENDPOINT, &expired, Some("refresh-1"), None).await;
 
-    let cancelled = tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        refresh_user_token(ENDPOINT, "alice", &expired, |_| {
-            std::future::pending::<Refreshed<std::io::Error>>()
-        }),
-    )
-    .await;
+    // Cancel once the grant has started rather than after a deadline: where opening the store is
+    // slow, as on the macOS CI runners, a deadline expires before the refresh token is removed.
+    let started = tokio::sync::Notify::new();
+    let refresh = refresh_user_token(ENDPOINT, "alice", &expired, |_| {
+        started.notify_one();
+        std::future::pending::<Refreshed<std::io::Error>>()
+    });
+    tokio::select! {
+        result = refresh => panic!("the refresh ended without waiting for the grant: {result:?}"),
+        () = started.notified() => {}
+    }
 
-    assert!(cancelled.is_err(), "the grant never answers");
     assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
     let stored = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
     assert_eq!(stored.ok(), Some(expired));
