@@ -940,8 +940,8 @@ async fn dirty_path(
 /// `Templates` where `/Templates/*` filters the contents but not the directory
 /// node itself — must not re-mark its entire filtered subtree as deleted. The
 /// directory node passed in is always marked; only its excluded children are
-/// skipped. The non-emitting `excludes` is used so a large pruned subtree does
-/// not produce a `FilterExclude` event per node.
+/// skipped. The non-emitting `child_excludes_tree_unless_forced` is used so a
+/// large pruned subtree does not produce a `FilterExclude` event per node.
 async fn dirty_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
-//! Timing for the walk entry points, which main has no counterpart for.
+//! Timing for one slot's threaded step and descent query.
 //!
 //! Run with:
 //!     `cargo test -p lore-revision --release --test filter_walk_bench -- --nocapture`
@@ -26,13 +26,12 @@ fn build() -> FilterInstance {
     filter
 }
 
-/// Per-node cost of `child_exclusion_state`, the call a tree walk makes.
+/// Per-node cost of `child_exclusion_state`, one slot's threaded step, and of
+/// `should_descend`, its descent query.
 ///
 /// `excludes` folds a path's ancestors because it is handed a whole path with no
 /// walk behind it. A walk already holds the parent's verdict, so it pays for one
-/// step per node, not one per component. Main has no equivalent -- its
-/// `excludes` is a single pass over the line list and never looks at ancestors --
-/// so main's `excludes` number is the like-for-like comparison.
+/// step per node, not one per component.
 #[test]
 #[ignore = "benchmark: run on demand with --ignored"]
 fn child_exclusion_state_throughput() {
@@ -79,7 +78,6 @@ fn child_exclusion_state_throughput() {
         queries as f64 / elapsed.as_secs_f64() / 1e6,
     );
 
-    // And the descent question, which main cannot answer at all.
     let dirs: Vec<(FilterState, RelativePath)> = steps
         .iter()
         .map(|(parent, path, _)| {

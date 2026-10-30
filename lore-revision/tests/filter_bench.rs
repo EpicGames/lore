@@ -172,8 +172,7 @@ fn time(label: &str, calls: usize, run: impl Fn() -> usize) {
     );
 }
 
-/// `Filter::excludes`, the call every production site reaches through
-/// `emit_excludes`, over paths spanning every rule kind.
+/// `Filter::excludes` over paths spanning every rule kind.
 #[test]
 #[ignore = "benchmark: run on demand with --ignored"]
 fn excludes_throughput() {

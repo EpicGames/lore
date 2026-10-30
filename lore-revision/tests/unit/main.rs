@@ -14,6 +14,7 @@ mod dependency;
 mod event;
 mod file;
 mod filter;
+mod filter_walk;
 mod fs;
 mod global;
 /// The fixtures the crate's process-isolated tests include, shared with these.

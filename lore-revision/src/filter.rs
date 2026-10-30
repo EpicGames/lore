@@ -113,7 +113,9 @@ impl FilterState {
     };
 
     /// Whether the path this state describes is excluded.
-    pub fn excluded(&self) -> bool {
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn excluded(&self) -> bool {
         self.excluded
     }
 }
@@ -379,12 +381,8 @@ fn component_count(path: &str) -> u32 {
     path.bytes().filter(|byte| *byte == b'/').count() as u32 + 1
 }
 
-/// How deep a query about `path` stands, which bounds which rules can reach
-/// below it. The repository root arrives empty and names no component.
-///
-/// This is the `depth` [`Filter::covers_subtree`] is asked with, and the one
-/// [`FilterInstance::settles_subtree`] asks at. A walk that descends a
-/// component at a time counts instead, and pays nothing for it.
+/// How many components `path` has, which is none for the empty path that names
+/// the repository root.
 pub(crate) fn query_depth(path: &str) -> u32 {
     if path.is_empty() {
         0
@@ -1093,12 +1091,14 @@ impl FilterInstance {
 
     /// The exclusion verdict for `path`, given its parent's.
     ///
-    /// The walk form of [`excludes`](Self::excludes): one pass over the lines
-    /// rather than one per ancestor, because the caller already holds the
+    /// The threaded form of [`excludes`](Self::excludes): one pass over the
+    /// lines rather than one per ancestor, because the caller already holds the
     /// parent's verdict. Read the answer with
     /// [`FilterState::excluded`], and pass the returned state to
     /// [`should_descend`](Self::should_descend) and to the children below it.
-    pub fn child_exclusion_state(
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn child_exclusion_state(
         &self,
         parent: FilterState,
         path: &impl FilterPath,
@@ -1121,15 +1121,16 @@ impl FilterInstance {
     /// it.
     ///
     /// Folds down the path's own ancestors, which is what a walk would have
-    /// done. A path named on the command line, replayed from a change list or
-    /// resolved from a clone dependency has to reproduce that, or it gets an
-    /// answer about the pattern rather than about the path.
-    pub fn exclusion_state(&self, path: &impl FilterPath, is_directory: bool) -> FilterState {
+    /// done.
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn exclusion_state(&self, path: &impl FilterPath, is_directory: bool) -> FilterState {
         self.exclusion_state_settled(path, is_directory).0
     }
 
-    /// [`exclusion_state`](Self::exclusion_state), also reporting whether the
-    /// fold ended on a prefix that settles its whole subtree.
+    /// The exclusion verdict for a path that arrives whole, folded down its own
+    /// ancestors, and whether the fold ended on a prefix that settles its whole
+    /// subtree.
     ///
     /// The fold already asks that of every prefix to know when to stop, so a
     /// caller wanting the answer for `path` itself takes it from here rather than
@@ -1147,7 +1148,7 @@ impl FilterInstance {
             path_prefixes(path.as_lowercase_str(), is_directory)
         {
             state = self.step(state, prefix, name, prefix_is_directory, depth);
-            if self.settles_subtree(state, prefix) {
+            if self.settles_subtree(state, prefix, depth) {
                 return (state, true);
             }
         }
@@ -1155,22 +1156,18 @@ impl FilterInstance {
     }
 
     /// Whether `state` excludes `path` and no rule can re-include anything below
-    /// it, so every descendant is excluded too.
-    ///
-    /// A walk stops descending here, a fold stops folding here, and
-    /// [`excludes_subtree`](Self::excludes_subtree) reports it. `path` is the
-    /// lowercase form `state` was produced for.
-    ///
-    /// The query stands at `path`'s own depth, so a re-inclusion that cannot
-    /// match below it does not hold the walk open. That bound is what stops
-    /// the `!/*` of a view written as "exclude everything, re-include the root
-    /// files", which no prefix bounds, from sending every walk into every
-    /// excluded directory in the repository.
-    fn settles_subtree(&self, state: FilterState, path: &str) -> bool {
-        state.excluded
-            && !self
-                .reinclude
-                .below(path, state.decided_at, query_depth(path))
+    /// it, so every descendant is excluded too. `path` is the lowercase form
+    /// `state` was produced for, and `depth` is how many components it has.
+    fn settles_subtree(&self, state: FilterState, path: &str, depth: u32) -> bool {
+        if !state.excluded {
+            return false;
+        }
+        debug_assert_eq!(
+            depth,
+            query_depth(path),
+            "a depth that is not {path:?}'s own reports a subtree as settled that is not"
+        );
+        !self.reinclude.below(path, state.decided_at, depth)
     }
 
     /// Whether `state` includes `path` and no rule can exclude anything below
@@ -1213,7 +1210,7 @@ impl FilterInstance {
     ) -> bool {
         let state = self.step(parent, match_path, match_name, is_directory, depth);
         if subtree {
-            self.settles_subtree(state, match_path)
+            self.settles_subtree(state, match_path, depth)
         } else {
             state.excluded
         }
@@ -1222,31 +1219,34 @@ impl FilterInstance {
     /// Whether `path` is excluded by this slot alone, its ancestors accounted for.
     ///
     /// Folds the ancestors on every call. [`Filter::excludes`] answers the same
-    /// question across both slots and folds a directory once, so it is what a
-    /// caller wants; this is the single-slot form, and the unmemoized one the
-    /// filter tests hold the memoized answers against.
-    pub fn excludes(&self, path: &impl FilterPath, is_directory: bool) -> bool {
+    /// question across both slots and folds a directory once; this is the
+    /// single-slot form, and the unmemoized one the filter tests hold the
+    /// memoized answers against.
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn excludes(&self, path: &impl FilterPath, is_directory: bool) -> bool {
         self.exclusion_state(path, is_directory).excluded
     }
 
-    /// Whether a walk standing at `path` should descend into it.
+    /// Whether this slot lets a walk standing at `path` descend into it.
     ///
     /// An excluded directory is still descended when a rule could re-include
     /// something below it; the contents stay excluded unless such a rule
     /// actually matches them. Git prunes there instead and documents
     /// re-inclusion below an excluded directory as impossible -- one of the
     /// departures `tests/filter_gitignore.rs` enumerates and asserts.
-    pub fn should_descend(&self, state: FilterState, path: &impl FilterPath) -> bool {
-        if path.is_empty() || path.as_str() == "." {
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn should_descend(&self, state: FilterState, path: &impl FilterPath) -> bool {
+        if !state.excluded || path.is_empty() || path.as_str() == "." {
             return true;
         }
-        !self.settles_subtree(state, path.as_lowercase_str())
+        let lowercase = path.as_lowercase_str();
+        !self.settles_subtree(state, lowercase, component_count(lowercase))
     }
 
-    /// Whether every path below `path` is excluded, at any depth.
-    ///
-    /// The negation of [`should_descend`](Self::should_descend) for an excluded
-    /// directory: nothing below can be re-included, so nothing below is in.
+    /// Whether `path` is excluded and no rule can re-include anything below it,
+    /// so every path below it is excluded too.
     pub fn excludes_subtree(&self, path: &RelativePath) -> bool {
         if path.is_empty() || path.as_str() == "." {
             return false;
@@ -1291,6 +1291,7 @@ bitflagsops!(FilterMode, u16);
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
     /// The path itself. Says nothing about what sits below it.
+    #[cfg(feature = "test-util")]
     Node,
     /// The path and everything below it, which is what a walk has to know
     /// before it drops a directory. See [`Filter::excludes_tree`].
@@ -1339,37 +1340,21 @@ impl Filter {
     /// The exclusion verdict for `path` in both slots, given its parent's, plus
     /// why it is excluded if it is.
     ///
-    /// The walk form of [`excludes`](Self::excludes); see
+    /// The threaded form of [`excludes`](Self::excludes); see
     /// [`FilterInstance::child_exclusion_state`].
     ///
     /// Ignore is reported before view at the same depth, which is the order a
     /// walk would have hit them.
-    pub fn child_exclusion_states(
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn child_exclusion_states(
         &self,
         parent: FilterStates,
         path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, Option<FilterReason>) {
-        let mut states = parent;
-        let mut reason = None;
-        if mode.contains(FilterMode::Ignore) {
-            states.ignore = self
-                .ignore
-                .child_exclusion_state(parent.ignore, path, is_directory);
-            if states.ignore.excluded {
-                reason = Some(FilterReason::Ignore);
-            }
-        }
-        if mode.contains(FilterMode::View) {
-            states.view = self
-                .view
-                .child_exclusion_state(parent.view, path, is_directory);
-            if reason.is_none() && states.view.excluded {
-                reason = Some(FilterReason::View);
-            }
-        }
-        (states, reason)
+        self.child_exclude_reason(parent, path, is_directory, mode, Scope::Node)
     }
 
     /// Whether a walk should descend into `path`, for the slots in `mode`.
@@ -1383,50 +1368,82 @@ impl Filter {
         path: &impl FilterPath,
         mode: FilterMode,
     ) -> bool {
-        self.descend_reason(states, path, mode).is_none()
+        let excluded = (mode.contains(FilterMode::Ignore) && states.ignore.excluded)
+            || (mode.contains(FilterMode::View) && states.view.excluded);
+        if !excluded || path.is_empty() || path.as_str() == "." {
+            return true;
+        }
+        let lowercase = path.as_lowercase_str();
+        self.descend_reason(states, lowercase, component_count(lowercase), mode)
+            .is_none()
     }
 
-    /// The slot that stops a walk at `path`, or `None` when it descends.
+    /// The slot that stops a walk at `path`, or `None` when it descends. `path`
+    /// is the lowercase form `states` were produced for, and `depth` is how many
+    /// components it has.
     ///
-    /// Ignore is consulted before view, which is the order
-    /// [`exclude_reason`](Self::exclude_reason) reports a path both slots
-    /// exclude in.
+    /// Ignore is consulted before view.
     fn descend_reason(
         &self,
         states: FilterStates,
-        path: &impl FilterPath,
+        path: &str,
+        depth: u32,
         mode: FilterMode,
     ) -> Option<FilterReason> {
-        if mode.contains(FilterMode::Ignore) && !self.ignore.should_descend(states.ignore, path) {
+        if mode.contains(FilterMode::Ignore)
+            && self.ignore.settles_subtree(states.ignore, path, depth)
+        {
             return Some(FilterReason::Ignore);
         }
-        if mode.contains(FilterMode::View) && !self.view.should_descend(states.view, path) {
+        if mode.contains(FilterMode::View) && self.view.settles_subtree(states.view, path, depth) {
             return Some(FilterReason::View);
         }
         None
     }
 
-    /// One step of a walk: the states `path`'s children inherit, and why the
-    /// walk drops `path` with everything under it -- `None` to keep it and, for
-    /// a directory, to descend into it.
+    /// One step of a walk: the states `path`'s children inherit, and why `path`
+    /// is excluded at `scope` -- `None` to keep it and, for a directory at
+    /// [`Scope::Tree`], to descend into it.
     ///
-    /// The threaded form of [`exclude_reason`](Self::exclude_reason) at
-    /// [`Scope::Tree`]. The caller holds the parent's states, so no ancestor is
-    /// folded and the subtree half is one index lookup rather than a second pass
-    /// over the lines.
+    /// The threaded form of [`exclude_reason`](Self::exclude_reason). The caller
+    /// holds the parent's states, so no ancestor is folded and the subtree half
+    /// is one index lookup rather than a second pass over the lines.
+    ///
+    /// A file has no subtree, so it is answered the same at either scope.
     fn child_exclude_reason(
         &self,
         parent: FilterStates,
         path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
+        scope: Scope,
     ) -> (FilterStates, Option<FilterReason>) {
-        let (states, reason) = self.child_exclusion_states(parent, path, is_directory, mode);
-        // A file has no subtree, so both scopes ask the same question of one.
-        if !is_directory {
-            return (states, reason);
+        if self.is_empty(mode) || path.is_empty() || path.as_str() == "." {
+            return (parent, None);
         }
-        let reason = self.descend_reason(states, path, mode);
+        let lowercase = path.as_lowercase_str();
+        let name = path.name_lowercase();
+        let depth = component_count(lowercase);
+        let mut states = parent;
+        if mode.contains(FilterMode::Ignore) && !self.ignore.lines.is_empty() {
+            states.ignore = self
+                .ignore
+                .step(parent.ignore, lowercase, name, is_directory, depth);
+        }
+        if mode.contains(FilterMode::View) && !self.view.lines.is_empty() {
+            states.view = self
+                .view
+                .step(parent.view, lowercase, name, is_directory, depth);
+        }
+        let reason = if scope == Scope::Tree && is_directory {
+            self.descend_reason(states, lowercase, depth, mode)
+        } else if mode.contains(FilterMode::Ignore) && states.ignore.excluded {
+            Some(FilterReason::Ignore)
+        } else if mode.contains(FilterMode::View) && states.view.excluded {
+            Some(FilterReason::View)
+        } else {
+            None
+        };
         (states, reason)
     }
 
@@ -1439,7 +1456,8 @@ impl Filter {
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
-        let (states, reason) = self.child_exclude_reason(parent, path, is_directory, mode);
+        let (states, reason) =
+            self.child_exclude_reason(parent, path, is_directory, mode, Scope::Tree);
         (states, reason.is_some())
     }
 
@@ -1453,7 +1471,8 @@ impl Filter {
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
-        let (states, reason) = self.child_exclude_reason(parent, path, is_directory, mode);
+        let (states, reason) =
+            self.child_exclude_reason(parent, path, is_directory, mode, Scope::Tree);
         (states, Self::emit(path, reason))
     }
 
@@ -1566,16 +1585,8 @@ impl Filter {
         }
         let (parent, name) = path.split_lowercase();
         let ancestor = self.ancestor(parent);
-
-        if mode.contains(FilterMode::Ignore)
-            && self.ignore.settles_subtree(ancestor.states.ignore, parent)
-        {
-            return Some(FilterReason::Ignore);
-        }
-        if mode.contains(FilterMode::View)
-            && self.view.settles_subtree(ancestor.states.view, parent)
-        {
-            return Some(FilterReason::View);
+        if let Some(reason) = self.descend_reason(ancestor.states, parent, ancestor.depth, mode) {
+            return Some(reason);
         }
 
         // A file has no subtree, so both scopes ask the same question of one.
@@ -1663,14 +1674,16 @@ impl Filter {
     /// Says nothing about what sits below it: a directory excluded by its own
     /// rule can still hold re-included content. A caller about to drop a path
     /// *and its subtree* wants [`excludes_tree`](Self::excludes_tree) instead.
-    pub fn excludes(&self, path: &impl FilterPath, is_directory: bool, mode: FilterMode) -> bool {
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn excludes(&self, path: &impl FilterPath, is_directory: bool, mode: FilterMode) -> bool {
         self.exclude_reason(path, is_directory, mode, Scope::Node)
             .is_some()
     }
 
     /// Whether a walk can drop `path` without looking inside it.
     ///
-    /// For a file this is [`excludes`](Self::excludes). For a directory it is
+    /// For a file this is whether `path` itself is excluded. For a directory it is
     /// the stricter question [`excludes_subtree`](Self::excludes_subtree) asks:
     /// an excluded directory is still kept when a rule could re-include
     /// something below it, because the walk has to descend and the node has to
