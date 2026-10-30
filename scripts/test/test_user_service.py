@@ -3,9 +3,9 @@
 """Smoke tests for a user directory advertised apart from the auth service.
 
 `[environment.endpoint] user_url` defines where clients resolve user
-IDs to display names over `lore.user.v1.UserService`, where the
-server's repository catalog lists partitions, and where the server
-registers the repositories it creates and deletes. Without it the client
+IDs to display names over `lore.user.v1.UserService`, and where the
+server lists, registers and unregisters repositories over
+`lore.user.v1.RepositoryRegistryService`. Without it the client
 speaks the `UrcAuthApi` directory RPCs to `auth_url`, the catalog
 `LookupUserPermissions` and the server the rebac resource RPCs, covered
 by `test_auth_online.py`.
@@ -30,7 +30,7 @@ from mock_auth_server import (
     MockAuthServer,
     MockUser,
     empty_response,
-    partition_list_response,
+    repository_list_response,
     user_list_response,
 )
 from test_auth_online import (
@@ -78,8 +78,8 @@ def _reset_stubs(stubs):
     stubs.auth.reset()
     stubs.directory.reset()
     # Every repository create and delete registers with the directory.
-    stubs.directory.on("PartitionAdd").respond(empty_response())
-    stubs.directory.on("PartitionRemove").respond(empty_response())
+    stubs.directory.on("RepositoryRegister").respond(empty_response())
+    stubs.directory.on("RepositoryUnregister").respond(empty_response())
 
 
 def _launch(request, tmp_path_factory, executable, stubs, user_url):
@@ -312,7 +312,7 @@ def test_a_shared_display_name_finds_no_lock_owner(service_env, make_actor):
 @pytest.mark.smoke
 def test_repository_list_is_the_directorys_answer(service_env, make_actor):
     """`lore repository list` on a server advertising `user_url` asks the
-    directory's `PartitionList` once and lists exactly the partitions it
+    directory's `RepositoryList` once and lists exactly the repositories it
     streams: a second repository the same user created but the directory
     omits is not listed, and neither stub sees `LookupUserPermissions`."""
     env = service_env
@@ -323,25 +323,25 @@ def test_repository_list_is_the_directorys_answer(service_env, make_actor):
     unlisted = owner.actor.make_repo(repo_id=unlisted_id)
     unlisted.repository_create(repo_id=unlisted_id, identity=USER1.user_id)
 
-    env.directory.on("PartitionList", bearer=owner.login_token).respond(
-        partition_list_response(owner.resource_id.removeprefix("urc-"))
+    env.directory.on("RepositoryList", bearer=owner.login_token).respond(
+        repository_list_response(owner.resource_id.removeprefix("urc-"))
     )
 
     listing = owner.repo.repository_list().splitlines()
 
     assert f"{owner.repo.name} ({owner.repo.get_id()})" in listing
     assert not any(unlisted.get_id() in line for line in listing), (
-        "a partition the directory did not stream must not be listed"
+        "a repository the directory did not stream must not be listed"
     )
-    assert env.directory.calls["PartitionList"] == 1
+    assert env.directory.calls["RepositoryList"] == 1
     assert env.mock.calls["LookupUserPermissions"] == 0
     assert env.directory.calls["LookupUserPermissions"] == 0
 
 
-def listing_of(owner, directory, partitions) -> str:
-    """`lore repository list` with the directory streaming `partitions`."""
-    directory.on("PartitionList", bearer=owner.login_token).respond(
-        partition_list_response(*partitions)
+def listing_of(owner, directory, repository_ids) -> str:
+    """`lore repository list` with the directory streaming `repository_ids`."""
+    directory.on("RepositoryList", bearer=owner.login_token).respond(
+        repository_list_response(*repository_ids)
     )
     return owner.repo.repository_list()
 
@@ -350,45 +350,45 @@ def listing_of(owner, directory, partitions) -> str:
 def test_repository_create_and_delete_register_with_the_directory(
     service_env, make_actor
 ):
-    """Repository create adds the partition to the directory under the
-    creator's credential, and delete removes it; the auth service's rebac
-    resource RPCs are not called. Answering `PartitionList` with what was
-    added and not removed, as a directory would, lists the repository after
-    create and not after delete."""
+    """Repository create registers the repository with the directory under
+    the creator's credential, and delete unregisters it; the auth service's
+    rebac resource RPCs are not called. Answering `RepositoryList` with what
+    was registered and not unregistered, as a directory would, lists the
+    repository after create and not after delete."""
     env = service_env
     directory = env.directory
     owner = provision_owner(env, make_actor(env), "registrar", USER1)
-    partition = owner.resource_id.removeprefix("urc-")
+    repository_id = owner.resource_id.removeprefix("urc-")
 
-    [add] = directory.requests_for("PartitionAdd")
-    assert add["partition"].hex() == partition
-    assert add["name"] == owner.repo.name
-    assert add["bearer"] == owner.login_token, (
-        "the partition must be added under the creating user's credential"
+    [register] = directory.requests_for("RepositoryRegister")
+    assert register["id"].hex() == repository_id
+    assert register["name"] == owner.repo.name
+    assert register["bearer"] == owner.login_token, (
+        "the repository must be registered under the creating user's credential"
     )
-    assert owner.repo.get_id() in listing_of(owner, directory, [partition])
+    assert owner.repo.get_id() in listing_of(owner, directory, [repository_id])
 
     owner.repo.repository_delete()
 
-    [remove] = directory.requests_for("PartitionRemove")
-    assert remove["partition"].hex() == partition
-    assert remove["bearer"] == owner.login_token
+    [unregister] = directory.requests_for("RepositoryUnregister")
+    assert unregister["id"].hex() == repository_id
+    assert unregister["bearer"] == owner.login_token
     assert owner.repo.get_id() not in listing_of(owner, directory, [])
     assert env.mock.calls["CreateResource"] == 0
     assert env.mock.calls["DeleteResource"] == 0
 
 
 @pytest.mark.smoke
-def test_a_refused_partition_add_leaves_no_repository(service_env, make_actor):
-    """A `PartitionAdd` the directory refuses fails the create before
-    anything is stored: listed by the directory anyway, the partition has no
+def test_a_refused_repository_register_leaves_no_repository(service_env, make_actor):
+    """A `RepositoryRegister` the directory refuses fails the create before
+    anything is stored: listed by the directory anyway, the id has no
     repository to list."""
     env = service_env
     directory = env.directory
     owner = provision_owner(env, make_actor(env), "refused", USER1)
 
     refused_id = uuid.uuid4().hex
-    directory.on("PartitionAdd", partition=bytes.fromhex(refused_id)).deny()
+    directory.on("RepositoryRegister", id=bytes.fromhex(refused_id)).deny()
     refused = owner.actor.make_repo(repo_id=refused_id)
     with pytest.raises(LoreException):
         refused.repository_create(repo_id=refused_id, identity=USER1.user_id)
@@ -401,36 +401,36 @@ def test_a_refused_partition_add_leaves_no_repository(service_env, make_actor):
 
 
 @pytest.mark.smoke
-def test_a_refused_partition_remove_fails_the_delete(service_env, make_actor):
-    """`PartitionRemove` authorizes the delete, as `DeleteResource` does on
+def test_a_refused_repository_unregister_fails_the_delete(service_env, make_actor):
+    """`RepositoryUnregister` authorizes the delete, as `DeleteResource` does on
     the `auth_url` path: refused, the delete fails before anything is
     removed, and the repository is still listed."""
     env = service_env
     directory = env.directory
     owner = provision_owner(env, make_actor(env), "kept", USER1)
-    partition = owner.resource_id.removeprefix("urc-")
-    directory.on("PartitionRemove", partition=bytes.fromhex(partition)).deny()
+    repository_id = owner.resource_id.removeprefix("urc-")
+    directory.on("RepositoryUnregister", id=bytes.fromhex(repository_id)).deny()
 
     with pytest.raises(LoreException):
         owner.repo.repository_delete()
 
-    assert owner.repo.get_id() in listing_of(owner, directory, [partition])
+    assert owner.repo.get_id() in listing_of(owner, directory, [repository_id])
 
 
 @pytest.mark.smoke
-def test_a_partition_listed_under_another_name_fails_the_create(
+def test_a_repository_registered_under_another_name_fails_the_create(
     service_env, make_actor
 ):
-    """A repeated `PartitionAdd` under the same name answers `OK`, so
-    `ALREADY_EXISTS` means the directory lists the partition under another
-    name: the create fails and stores no repository under this one."""
+    """A repeated `RepositoryRegister` under the same name answers `OK`, so
+    `ALREADY_EXISTS` means the directory has the repository registered under
+    another name: the create fails and stores no repository under this one."""
     env = service_env
     directory = env.directory
     owner = provision_owner(env, make_actor(env), "conflict", USER1)
 
     conflicting_id = uuid.uuid4().hex
-    directory.on("PartitionAdd", partition=bytes.fromhex(conflicting_id)).deny(
-        grpc.StatusCode.ALREADY_EXISTS, "listed under another name"
+    directory.on("RepositoryRegister", id=bytes.fromhex(conflicting_id)).deny(
+        grpc.StatusCode.ALREADY_EXISTS, "registered under another name"
     )
     conflicting = owner.actor.make_repo(repo_id=conflicting_id)
     with pytest.raises(LoreException):

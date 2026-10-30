@@ -13,8 +13,8 @@ use lore_base::types::Context;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
-use lore_proto::lore::user::v1::PartitionListRequest;
-use lore_proto::lore::user::v1::PartitionListResponse;
+use lore_proto::lore::user::v1::RepositoryListRequest;
+use lore_proto::lore::user::v1::RepositoryListResponse;
 use lore_revision::lore_debug;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -27,7 +27,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::auth::grpc_get_auth_client;
-use super::auth::grpc_get_user_service_client;
+use super::auth::grpc_get_repository_registry_client;
 use super::common::create_request_with_authorization;
 use super::repository_authorizer::VerifiedToken;
 use super::repository_authorizer::bearer_header;
@@ -282,15 +282,15 @@ fn repositories_from_response(
     (repositories, next_page_token)
 }
 
-/// A `RepositoryCatalog` implementation using `lore.user.v1.UserService`.
-/// Collects the `PartitionList` stream and pages it as the baseline catalog
-/// pages the store.
-pub struct UserServiceRepositoryCatalog {
+/// A `RepositoryCatalog` implementation using
+/// `lore.user.v1.RepositoryRegistryService`. Collects the `RepositoryList`
+/// stream and pages it as the baseline catalog pages the store.
+pub struct RepositoryRegistryCatalog {
     user_url: String,
     limit: usize,
 }
 
-impl UserServiceRepositoryCatalog {
+impl RepositoryRegistryCatalog {
     pub fn new(user_url: String) -> Self {
         Self::with_limit(user_url, MAX_LISTED_REPOSITORIES)
     }
@@ -302,25 +302,22 @@ impl UserServiceRepositoryCatalog {
 }
 
 #[async_trait]
-impl RepositoryCatalog for UserServiceRepositoryCatalog {
-    // TODO: call `RepositoryRegistryService`, which replaces the deprecated
-    // partition RPCs.
-    #[allow(deprecated)]
+impl RepositoryCatalog for RepositoryRegistryCatalog {
     async fn list_repositories(
         &self,
         token: Option<&VerifiedToken<'_>>,
         page_size: Option<u32>,
         page_token: Option<&str>,
     ) -> Result<(Vec<RepositoryId>, Option<String>), Status> {
-        lore_debug!("Repository fetch partitions from the user directory");
+        lore_debug!("Repository fetch repositories from the repository registry");
 
-        let mut client = grpc_get_user_service_client(&self.user_url).await?;
+        let mut client = grpc_get_repository_registry_client(&self.user_url).await?;
         let request =
-            create_request_with_authorization(PartitionListRequest {}, bearer_header(token))?;
+            create_request_with_authorization(RepositoryListRequest {}, bearer_header(token))?;
         let mut stream = client
-            .partition_list(request)
+            .repository_list(request)
             .await
-            .warn_map_err(partition_list_error)?
+            .warn_map_err(repository_list_error)?
             .into_inner();
         let mut held = Vec::new();
         while let Some(response) = stream.next().await {
@@ -328,30 +325,30 @@ impl RepositoryCatalog for UserServiceRepositoryCatalog {
                 return Err(too_many_repositories());
             }
             held.extend(repository_from_response(
-                response.warn_map_err(partition_list_error)?,
+                response.warn_map_err(repository_list_error)?,
             ));
         }
         page(held, page_size, page_token)
     }
 }
 
-fn partition_list_error(err: &Status) -> Status {
+fn repository_list_error(err: &Status) -> Status {
     match err.code() {
-        Code::PermissionDenied => Status::permission_denied("List partitions denied"),
+        Code::PermissionDenied => Status::permission_denied("List repositories denied"),
         Code::Unauthenticated => {
-            Status::unauthenticated("List partitions failed - unauthenticated")
+            Status::unauthenticated("List repositories failed - unauthenticated")
         }
         _ => Status::internal(format!(
-            "Failed to call user directory PartitionList: {err}"
+            "Failed to call repository registry RepositoryList: {err}"
         )),
     }
 }
 
-/// The partition a `PartitionList` message names. A value that is not a
+/// The repository a `RepositoryList` message names. A value that is not a
 /// 16-byte repository id is skipped.
 #[lore_macro::test_pub]
-fn repository_from_response(response: PartitionListResponse) -> Option<RepositoryId> {
-    <[u8; 16]>::try_from(response.partition.as_ref())
+fn repository_from_response(response: RepositoryListResponse) -> Option<RepositoryId> {
+    <[u8; 16]>::try_from(response.id.as_ref())
         .ok()
         .map(RepositoryId::from)
 }
@@ -366,8 +363,8 @@ pub enum CatalogSelection {
     /// `LookupUserPermissions` at this `UrcAuthApi` endpoint, forwarding the
     /// caller's token.
     AuthClient(String),
-    /// `PartitionList` at this `lore.user.v1.UserService` endpoint,
-    /// forwarding the caller's token.
+    /// `RepositoryList` at this `lore.user.v1.RepositoryRegistryService`
+    /// endpoint, forwarding the caller's token.
     UserService(String),
 }
 
@@ -381,7 +378,7 @@ impl fmt::Display for CatalogSelection {
                 f.write_str("BaselineRepositoryCatalog(reachable)")
             }
             Self::AuthClient(url) => write!(f, "AuthClientRepositoryCatalog({url})"),
-            Self::UserService(url) => write!(f, "UserServiceRepositoryCatalog({url})"),
+            Self::UserService(url) => write!(f, "RepositoryRegistryCatalog({url})"),
         }
     }
 }
@@ -470,7 +467,7 @@ pub fn repository_catalog(
             if baseline_reachable {
                 warn!("[server.auth] baseline_access is not consulted by the user_service catalog");
             }
-            Arc::new(UserServiceRepositoryCatalog::new(url))
+            Arc::new(RepositoryRegistryCatalog::new(url))
         }
     })
 }

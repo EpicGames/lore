@@ -5,18 +5,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use lore_base::types::Context;
-use lore_proto::lore::user::v1::PartitionAddRequest;
-use lore_proto::lore::user::v1::PartitionAddResponse;
-use lore_proto::lore::user::v1::PartitionListRequest;
-use lore_proto::lore::user::v1::PartitionListResponse;
-use lore_proto::lore::user::v1::PartitionRemoveRequest;
-use lore_proto::lore::user::v1::PartitionRemoveResponse;
-use lore_proto::lore::user::v1::UserFindRequest;
-use lore_proto::lore::user::v1::UserFindResponse;
-use lore_proto::lore::user::v1::UserGetRequest;
-use lore_proto::lore::user::v1::UserGetResponse;
-use lore_proto::lore::user::v1::user_service_server::UserService;
-use lore_proto::lore::user::v1::user_service_server::UserServiceServer;
+use lore_proto::lore::user::v1::RepositoryListRequest;
+use lore_proto::lore::user::v1::RepositoryListResponse;
+use lore_proto::lore::user::v1::RepositoryRegisterRequest;
+use lore_proto::lore::user::v1::RepositoryRegisterResponse;
+use lore_proto::lore::user::v1::RepositoryUnregisterRequest;
+use lore_proto::lore::user::v1::RepositoryUnregisterResponse;
+use lore_proto::lore::user::v1::repository_registry_service_server::RepositoryRegistryService;
+use lore_proto::lore::user::v1::repository_registry_service_server::RepositoryRegistryServiceServer;
 use lore_proto::rebac::CreateResourceRequest;
 use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lore::RepositoryId;
@@ -87,7 +83,7 @@ fn display_names_the_registry() {
     );
     assert_eq!(
         RepositoryRegistry::UserService(USER_URL.to_string()).to_string(),
-        format!("UserService({USER_URL})")
+        format!("RepositoryRegistryService({USER_URL})")
     );
 }
 
@@ -137,13 +133,14 @@ async fn unregistered_sends_nothing() {
         .expect("nothing to unregister from");
 }
 
-/// Records `PartitionAdd` and `PartitionRemove` requests with their
-/// `authorization` header, answering each with `status`, `OK` when `None`.
+/// Records `RepositoryRegister` and `RepositoryUnregister` requests with
+/// their `authorization` header, answering each with `status`, `OK` when
+/// `None`.
 #[derive(Default)]
-struct Directory {
+struct Registry {
     status: Option<Code>,
-    adds: Mutex<Vec<(PartitionAddRequest, Option<String>)>>,
-    removes: Mutex<Vec<(PartitionRemoveRequest, Option<String>)>>,
+    registers: Mutex<Vec<(RepositoryRegisterRequest, Option<String>)>>,
+    unregisters: Mutex<Vec<(RepositoryUnregisterRequest, Option<String>)>>,
 }
 
 fn authorization<T>(request: &tonic::Request<T>) -> Option<String> {
@@ -153,7 +150,7 @@ fn authorization<T>(request: &tonic::Request<T>) -> Option<String> {
         .map(|value| value.to_str().unwrap().to_string())
 }
 
-impl Directory {
+impl Registry {
     fn answer<T: Default>(&self) -> Result<tonic::Response<T>, Status> {
         match self.status {
             None => Ok(tonic::Response::new(T::default())),
@@ -163,48 +160,34 @@ impl Directory {
 }
 
 #[tonic::async_trait]
-impl UserService for Directory {
-    async fn user_get(
+impl RepositoryRegistryService for Registry {
+    type RepositoryListStream = tokio_stream::Empty<Result<RepositoryListResponse, Status>>;
+
+    async fn repository_list(
         &self,
-        _request: tonic::Request<UserGetRequest>,
-    ) -> Result<tonic::Response<UserGetResponse>, Status> {
+        _request: tonic::Request<RepositoryListRequest>,
+    ) -> Result<tonic::Response<Self::RepositoryListStream>, Status> {
         Err(Status::unimplemented("not under test"))
     }
 
-    async fn user_find(
+    async fn repository_register(
         &self,
-        _request: tonic::Request<UserFindRequest>,
-    ) -> Result<tonic::Response<UserFindResponse>, Status> {
-        Err(Status::unimplemented("not under test"))
-    }
-
-    type PartitionListStream = tokio_stream::Empty<Result<PartitionListResponse, Status>>;
-
-    async fn partition_list(
-        &self,
-        _request: tonic::Request<PartitionListRequest>,
-    ) -> Result<tonic::Response<Self::PartitionListStream>, Status> {
-        Err(Status::unimplemented("not under test"))
-    }
-
-    async fn partition_add(
-        &self,
-        request: tonic::Request<PartitionAddRequest>,
-    ) -> Result<tonic::Response<PartitionAddResponse>, Status> {
+        request: tonic::Request<RepositoryRegisterRequest>,
+    ) -> Result<tonic::Response<RepositoryRegisterResponse>, Status> {
         let authorization = authorization(&request);
-        self.adds
+        self.registers
             .lock()
             .unwrap()
             .push((request.into_inner(), authorization));
         self.answer()
     }
 
-    async fn partition_remove(
+    async fn repository_unregister(
         &self,
-        request: tonic::Request<PartitionRemoveRequest>,
-    ) -> Result<tonic::Response<PartitionRemoveResponse>, Status> {
+        request: tonic::Request<RepositoryUnregisterRequest>,
+    ) -> Result<tonic::Response<RepositoryUnregisterResponse>, Status> {
         let authorization = authorization(&request);
-        self.removes
+        self.unregisters
             .lock()
             .unwrap()
             .push((request.into_inner(), authorization));
@@ -212,63 +195,63 @@ impl UserService for Directory {
     }
 }
 
-async fn serve(status: Option<Code>) -> (RepositoryRegistry, Arc<Directory>) {
-    let directory = Arc::new(Directory {
+async fn serve(status: Option<Code>) -> (RepositoryRegistry, Arc<Registry>) {
+    let stub = Arc::new(Registry {
         status,
-        ..Directory::default()
+        ..Registry::default()
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let service = directory.clone();
+    let service = stub.clone();
     lore_base::lore_spawn!(async move {
         tonic::transport::Server::builder()
-            .add_service(UserServiceServer::from_arc(service))
+            .add_service(RepositoryRegistryServiceServer::from_arc(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
     });
     let registry = RepositoryRegistry::select(Some(AUTH_URL), Some(&format!("http://{address}")));
-    (registry, directory)
+    (registry, stub)
 }
 
-/// The directory is sent the repository id bytes and name, under the
+/// The registry is sent the repository id bytes and name, under the
 /// caller's token, and nothing reaches the `auth_url`, which does not resolve.
 #[tokio::test]
-async fn user_service_registers_and_unregisters_the_partition() {
-    let (registry, directory) = serve(None).await;
+async fn user_service_registers_and_unregisters_the_repository() {
+    let (registry, stub) = serve(None).await;
     let bearer = Some("Bearer caller".to_string());
 
     registry
         .add(bearer.clone(), repository(), "org/repo")
         .await
-        .expect("the directory adds the partition");
+        .expect("the registry registers the repository");
     registry
         .remove(bearer.clone(), repository())
         .await
-        .expect("the directory removes the partition");
+        .expect("the registry unregisters the repository");
 
-    let expected_partition: bytes::Bytes = repository().into();
-    let adds = directory.adds.lock().unwrap();
-    let [(add, add_authorization)] = adds.as_slice() else {
-        panic!("one PartitionAdd, got {}", adds.len());
+    let expected_id: bytes::Bytes = repository().into();
+    let registers = stub.registers.lock().unwrap();
+    let [(register, register_authorization)] = registers.as_slice() else {
+        panic!("one RepositoryRegister, got {}", registers.len());
     };
-    assert_eq!(add.partition, expected_partition);
-    assert_eq!(add.name, "org/repo");
-    assert_eq!(add_authorization, &bearer);
-    let removes = directory.removes.lock().unwrap();
-    let [(remove, remove_authorization)] = removes.as_slice() else {
-        panic!("one PartitionRemove, got {}", removes.len());
+    assert_eq!(register.id, expected_id);
+    assert_eq!(register.name, "org/repo");
+    assert_eq!(register_authorization, &bearer);
+    let unregisters = stub.unregisters.lock().unwrap();
+    let [(unregister, unregister_authorization)] = unregisters.as_slice() else {
+        panic!("one RepositoryUnregister, got {}", unregisters.len());
     };
-    assert_eq!(remove.partition, expected_partition);
-    assert_eq!(remove_authorization, &bearer);
+    assert_eq!(unregister.id, expected_id);
+    assert_eq!(unregister_authorization, &bearer);
 }
 
 #[tokio::test]
 async fn user_service_already_exists_is_a_name_conflict() {
-    let (registry, _directory) = serve(Some(Code::AlreadyExists)).await;
+    let (registry, _stub) = serve(Some(Code::AlreadyExists)).await;
     let err = registry
         .add(None, repository(), "org/repo")
         .await
-        .expect_err("the partition is listed under another name");
+        .expect_err("the repository is registered under another name");
     assert_eq!(err.code(), Code::AlreadyExists);
 }
 
@@ -287,7 +270,7 @@ async fn user_service_refusals_map_as_the_rebac_ones() {
         ),
         (Code::NotFound, Code::FailedPrecondition, Code::Internal),
     ] {
-        let (registry, _directory) = serve(Some(answer)).await;
+        let (registry, _stub) = serve(Some(answer)).await;
         let add = registry.add(None, repository(), "org/repo").await;
         assert_eq!(
             add.unwrap_err().code(),

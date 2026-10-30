@@ -7,6 +7,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- `lore-server`: with `user_url` set, the server lists, registers and unregisters repositories through
+  `lore.user.v1.RepositoryRegistryService` at `user_url` instead of the deprecated `UserService` partition RPCs. The
+  directory at `user_url` must serve `RepositoryRegistryService` before the server is upgraded. Servers without
+  `user_url` are not affected
 - `lore-server`: with authorization configured, operations that change a partition check for the `write` permission.
   Any permission on a partition still allows reading it, but no longer allows writing. Servers without authorization
   configured allow every caller to read, write and administer repositories

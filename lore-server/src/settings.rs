@@ -501,8 +501,8 @@ pub enum RepositoryCatalogMode {
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,
-    /// Ask `PartitionList` on the `lore.user.v1.UserService` at
-    /// `[environment.endpoint] user_url`, forwarding the caller's token.
+    /// Ask `RepositoryList` on the `lore.user.v1.RepositoryRegistryService`
+    /// at `[environment.endpoint] user_url`, forwarding the caller's token.
     UserService,
 }
 

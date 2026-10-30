@@ -12,18 +12,14 @@ use lore_base::types::RepositoryId;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
 use lore_proto::auth::ResourcePermission;
-use lore_proto::lore::user::v1::PartitionAddRequest;
-use lore_proto::lore::user::v1::PartitionAddResponse;
-use lore_proto::lore::user::v1::PartitionListRequest;
-use lore_proto::lore::user::v1::PartitionListResponse;
-use lore_proto::lore::user::v1::PartitionRemoveRequest;
-use lore_proto::lore::user::v1::PartitionRemoveResponse;
-use lore_proto::lore::user::v1::UserFindRequest;
-use lore_proto::lore::user::v1::UserFindResponse;
-use lore_proto::lore::user::v1::UserGetRequest;
-use lore_proto::lore::user::v1::UserGetResponse;
-use lore_proto::lore::user::v1::user_service_server::UserService;
-use lore_proto::lore::user::v1::user_service_server::UserServiceServer;
+use lore_proto::lore::user::v1::RepositoryListRequest;
+use lore_proto::lore::user::v1::RepositoryListResponse;
+use lore_proto::lore::user::v1::RepositoryRegisterRequest;
+use lore_proto::lore::user::v1::RepositoryRegisterResponse;
+use lore_proto::lore::user::v1::RepositoryUnregisterRequest;
+use lore_proto::lore::user::v1::RepositoryUnregisterResponse;
+use lore_proto::lore::user::v1::repository_registry_service_server::RepositoryRegistryService;
+use lore_proto::lore::user::v1::repository_registry_service_server::RepositoryRegistryServiceServer;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_server::auth::jwt::AuthorizationToken;
@@ -646,15 +642,15 @@ fn selection_display_names_the_implementation() {
     );
     assert_eq!(
         CatalogSelection::UserService("https://directory.example.com".to_string()).to_string(),
-        "UserServiceRepositoryCatalog(https://directory.example.com)"
+        "RepositoryRegistryCatalog(https://directory.example.com)"
     );
 }
 
 #[test]
-fn partition_list_response_yields_the_partition_bytes() {
+fn repository_list_response_yields_the_id_bytes() {
     let partition = repository("0194b726b34e72b0b45550b88a967076");
-    let response = |partition: &[u8]| PartitionListResponse {
-        partition: partition.to_vec().into(),
+    let response = |id: &[u8]| RepositoryListResponse {
+        id: id.to_vec().into(),
         permission: vec!["read".to_string()],
     };
     assert_eq!(
@@ -666,47 +662,33 @@ fn partition_list_response_yields_the_partition_bytes() {
     assert_eq!(repository_from_response(response(&[7; 17])), None);
 }
 
-/// Streams `partitions` from `PartitionList`, recording the
+/// Streams `repositories` from `RepositoryList`, recording the
 /// `authorization` header of each call.
-struct Directory {
-    partitions: Vec<Vec<u8>>,
+struct Registry {
+    repositories: Vec<Vec<u8>>,
     authorizations: Mutex<Vec<Option<String>>>,
 }
 
 #[tonic::async_trait]
-impl UserService for Directory {
-    async fn user_get(
-        &self,
-        _request: tonic::Request<UserGetRequest>,
-    ) -> Result<tonic::Response<UserGetResponse>, Status> {
-        Err(Status::unimplemented("not under test"))
-    }
+impl RepositoryRegistryService for Registry {
+    type RepositoryListStream =
+        tokio_stream::Iter<std::vec::IntoIter<Result<RepositoryListResponse, Status>>>;
 
-    async fn user_find(
+    async fn repository_list(
         &self,
-        _request: tonic::Request<UserFindRequest>,
-    ) -> Result<tonic::Response<UserFindResponse>, Status> {
-        Err(Status::unimplemented("not under test"))
-    }
-
-    type PartitionListStream =
-        tokio_stream::Iter<std::vec::IntoIter<Result<PartitionListResponse, Status>>>;
-
-    async fn partition_list(
-        &self,
-        request: tonic::Request<PartitionListRequest>,
-    ) -> Result<tonic::Response<Self::PartitionListStream>, Status> {
+        request: tonic::Request<RepositoryListRequest>,
+    ) -> Result<tonic::Response<Self::RepositoryListStream>, Status> {
         let authorization = request
             .metadata()
             .get("authorization")
             .map(|value| value.to_str().unwrap().to_string());
         self.authorizations.lock().unwrap().push(authorization);
         let messages: Vec<_> = self
-            .partitions
+            .repositories
             .iter()
-            .map(|partition| {
-                Ok(PartitionListResponse {
-                    partition: partition.clone().into(),
+            .map(|id| {
+                Ok(RepositoryListResponse {
+                    id: id.clone().into(),
                     permission: vec!["read".to_string()],
                 })
             })
@@ -714,49 +696,49 @@ impl UserService for Directory {
         Ok(tonic::Response::new(tokio_stream::iter(messages)))
     }
 
-    async fn partition_add(
+    async fn repository_register(
         &self,
-        _request: tonic::Request<PartitionAddRequest>,
-    ) -> Result<tonic::Response<PartitionAddResponse>, Status> {
+        _request: tonic::Request<RepositoryRegisterRequest>,
+    ) -> Result<tonic::Response<RepositoryRegisterResponse>, Status> {
         Err(Status::unimplemented("not under test"))
     }
 
-    async fn partition_remove(
+    async fn repository_unregister(
         &self,
-        _request: tonic::Request<PartitionRemoveRequest>,
-    ) -> Result<tonic::Response<PartitionRemoveResponse>, Status> {
+        _request: tonic::Request<RepositoryUnregisterRequest>,
+    ) -> Result<tonic::Response<RepositoryUnregisterResponse>, Status> {
         Err(Status::unimplemented("not under test"))
     }
 }
 
-async fn serve(partitions: Vec<Vec<u8>>) -> (String, Arc<Directory>) {
-    let directory = Arc::new(Directory {
-        partitions,
+async fn serve(repositories: Vec<Vec<u8>>) -> (String, Arc<Registry>) {
+    let registry = Arc::new(Registry {
+        repositories,
         authorizations: Mutex::new(Vec::new()),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let service = directory.clone();
+    let service = registry.clone();
     lore_base::lore_spawn!(async move {
         tonic::transport::Server::builder()
-            .add_service(UserServiceServer::from_arc(service))
+            .add_service(RepositoryRegistryServiceServer::from_arc(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
     });
-    (format!("http://{address}"), directory)
+    (format!("http://{address}"), registry)
 }
 
-/// The stream is paged by the catalog: every streamed partition is listed
+/// The stream is paged by the catalog: every streamed repository is listed
 /// once across the pages, a duplicate or malformed entry is not, and each
-/// page asks the directory with the caller's token.
+/// page asks the registry with the caller's token.
 #[tokio::test]
-async fn user_service_catalog_pages_the_stream() {
+async fn repository_registry_catalog_pages_the_stream() {
     let ids = identifiers(5);
     let mut streamed: Vec<Vec<u8>> = ids.iter().map(|id| id.as_ref().to_vec()).collect();
     streamed.push(ids[2].as_ref().to_vec());
     streamed.push(vec![1, 2, 3]);
-    let (url, directory) = serve(streamed).await;
-    let catalog = UserServiceRepositoryCatalog::new(url);
+    let (url, registry) = serve(streamed).await;
+    let catalog = RepositoryRegistryCatalog::new(url);
     let claims = AuthorizationToken::default();
     let token = VerifiedToken {
         raw: "raw.jwt",
@@ -781,7 +763,7 @@ async fn user_service_catalog_pages_the_stream() {
     let mut expected = ids.clone();
     expected.sort_unstable();
     assert_eq!(listed, expected);
-    let authorizations = directory.authorizations.lock().unwrap();
+    let authorizations = registry.authorizations.lock().unwrap();
     assert_eq!(authorizations.len(), 3, "one call per page");
     assert!(
         authorizations
@@ -791,28 +773,28 @@ async fn user_service_catalog_pages_the_stream() {
 }
 
 #[tokio::test]
-async fn user_service_catalog_lists_everything_through_list_all() {
+async fn repository_registry_catalog_lists_everything_through_list_all() {
     let ids = identifiers(3);
     let (url, _) = serve(ids.iter().map(|id| id.as_ref().to_vec()).collect()).await;
-    let catalog: Arc<dyn RepositoryCatalog> = Arc::new(UserServiceRepositoryCatalog::new(url));
+    let catalog: Arc<dyn RepositoryCatalog> = Arc::new(RepositoryRegistryCatalog::new(url));
     let mut expected = ids.clone();
     expected.sort_unstable();
     assert_eq!(catalog.list_all(None, BUDGET).await.unwrap(), expected);
 }
 
-/// A directory streaming more partitions than the limit fails the listing
+/// A registry streaming more repositories than the limit fails the listing
 /// rather than growing it; exactly the limit is listed.
 #[tokio::test]
-async fn user_service_catalog_refuses_a_stream_over_the_limit() {
+async fn repository_registry_catalog_refuses_a_stream_over_the_limit() {
     let ids = identifiers(4);
     let (url, _) = serve(ids.iter().map(|id| id.as_ref().to_vec()).collect()).await;
-    let err = UserServiceRepositoryCatalog::with_limit(url.clone(), 3)
+    let err = RepositoryRegistryCatalog::with_limit(url.clone(), 3)
         .list_repositories(None, None, None)
         .await
         .unwrap_err();
     assert_eq!(err.code(), Code::ResourceExhausted);
 
-    let (listed, _) = UserServiceRepositoryCatalog::with_limit(url, 4)
+    let (listed, _) = RepositoryRegistryCatalog::with_limit(url, 4)
         .list_repositories(None, None, None)
         .await
         .unwrap();

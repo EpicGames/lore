@@ -2,9 +2,10 @@
 # SPDX-License-Identifier: MIT
 """Declarative stub of the UCS auth service, for authenticated-path smoke tests.
 
-Serves the `epic_urc.UrcAuthApi`, `ucs.auth.RebacApi` and
-`lore.user.v1.UserService` gRPC services (lore-proto/proto/auth_api.proto,
-rebac_api.proto, lore/user/v1/user.proto) plus an HTTP endpoint with
+Serves the `epic_urc.UrcAuthApi`, `ucs.auth.RebacApi`,
+`lore.user.v1.UserService` and `lore.user.v1.RepositoryRegistryService` gRPC
+services (lore-proto/proto/auth_api.proto, rebac_api.proto,
+lore/user/v1/user.proto) plus an HTTP endpoint with
 the JWKS document the lore server validates tokens against. The stub holds
 **no behavior of its own**: each test registers the request/response pairs its
 scenario needs with `on(...)`, and anything unregistered is denied. A test
@@ -65,6 +66,7 @@ logger = logging.getLogger(__name__)
 _AUTH_SERVICE = "epic_urc.UrcAuthApi"
 _REBAC_SERVICE = "ucs.auth.RebacApi"
 _USER_SERVICE = "lore.user.v1.UserService"
+_REGISTRY_SERVICE = "lore.user.v1.RepositoryRegistryService"
 
 
 def _identity_bytes(raw: bytes) -> bytes:
@@ -196,8 +198,8 @@ def user_list_response(*users: MockUser) -> bytes:
     )
 
 
-def partition_list_response(*repository_ids: str) -> list[bytes]:
-    """A `lore.user.v1` `PartitionList` answer: one message per repository id
+def repository_list_response(*repository_ids: str) -> list[bytes]:
+    """A `lore.user.v1` `RepositoryList` answer: one message per repository id
     (hex), each granting `read`."""
     return [
         encode_bytes_field(1, bytes.fromhex(repository_id))
@@ -208,7 +210,7 @@ def partition_list_response(*repository_ids: str) -> list[bytes]:
 
 def empty_response() -> bytes:
     """An empty message: `CreateResource`/`DeleteResource` and
-    `PartitionAdd`/`PartitionRemove` responses, or a
+    `RepositoryRegister`/`RepositoryUnregister` responses, or a
     `GetAuthSession`/`RefreshAuthSession` answer carrying no token yet."""
     return b""
 
@@ -255,23 +257,21 @@ _REQUEST_FIELDS: dict[str, dict[str, tuple[int, str]]] = {
         "username": (2, _STRING),
         "display_name": (3, _STRING),
     },
-    "PartitionList": {},
-    "PartitionAdd": {"partition": (1, _BYTES), "name": (2, _STRING)},
-    "PartitionRemove": {"partition": (1, _BYTES)},
+    "RepositoryList": {},
+    "RepositoryRegister": {"id": (1, _BYTES), "name": (2, _STRING)},
+    "RepositoryUnregister": {"id": (1, _BYTES)},
 }
 
 _REBAC_METHODS = ("CreateResource", "DeleteResource")
 
-_USER_METHODS = (
-    "UserGet",
-    "UserFind",
-    "PartitionList",
-    "PartitionAdd",
-    "PartitionRemove",
-)
+# The deprecated `UserService` partition RPCs are not served, so a call to one
+# answers UNIMPLEMENTED.
+_USER_METHODS = ("UserGet", "UserFind")
+
+_REGISTRY_METHODS = ("RepositoryList", "RepositoryRegister", "RepositoryUnregister")
 
 # Server-streaming RPCs: a rule's response is the list of messages to stream.
-_STREAM_METHODS = ("PartitionList",)
+_STREAM_METHODS = ("RepositoryList",)
 
 # The status an unmatched request is refused with. Chosen to mirror how the
 # real service refuses the corresponding case: a token endpoint answers "who
@@ -486,11 +486,12 @@ class MockAuthServer:
         auth_methods = {
             name: self._unary(name)
             for name in _REQUEST_FIELDS
-            if name not in _REBAC_METHODS + _USER_METHODS
+            if name not in _REBAC_METHODS + _USER_METHODS + _REGISTRY_METHODS
         }
-        user_methods = {
+        user_methods = {name: self._unary(name) for name in _USER_METHODS}
+        registry_methods = {
             name: self._stream(name) if name in _STREAM_METHODS else self._unary(name)
-            for name in _USER_METHODS
+            for name in _REGISTRY_METHODS
         }
         rebac_methods = {name: self._unary(name) for name in _REBAC_METHODS}
         self._grpc_server.add_generic_rpc_handlers(
@@ -498,6 +499,9 @@ class MockAuthServer:
                 grpc.method_handlers_generic_handler(_AUTH_SERVICE, auth_methods),
                 grpc.method_handlers_generic_handler(_REBAC_SERVICE, rebac_methods),
                 grpc.method_handlers_generic_handler(_USER_SERVICE, user_methods),
+                grpc.method_handlers_generic_handler(
+                    _REGISTRY_SERVICE, registry_methods
+                ),
             )
         )
         self.grpc_port = self._grpc_server.add_insecure_port("127.0.0.1:0")
