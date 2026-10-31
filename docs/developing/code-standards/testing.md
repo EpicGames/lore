@@ -35,6 +35,23 @@ Cheapest first. Cost tracks how much must be standing before the test can run.
 
 Edge cases belong in unit tests. The smoke test covers the happy path only.
 
+### Build profile
+
+Build and run tests on the `release` profile, one test or a full suite alike. It compiles incrementally, and one build serves every test run. While iterating on a change, run only the tests it touches: a unit test by its test binary and name, and a smoke test by its node ID. Run the full unit and smoke suites once the change is done.
+
+```bash
+# One unit test, or the tests a name matches
+cargo test --release -p lore-telemetry --test unit observe::result::can_observe_success_no_callback
+
+# One smoke test
+cargo build --release -p lore-client -p lore-server --bin lore --bin loreserver
+uv run pytest "scripts/test/<file>.py::<test>" --lore-client-binary=release --lore-server-binary=release
+
+# The full unit and smoke suites
+cargo test --release
+uv run pytest scripts/test/ --lore-client-binary=release --lore-server-binary=release
+```
+
 ---
 
 ## 2. Rust unit tests
@@ -461,3 +478,4 @@ Lore has a load-testing suite that exercises concurrent clone, commit, sync, loc
 8. **Use `offline=True`** for operations that don't need the server.
 9. **Feature-gate integration tests** that require external dependencies.
 10. **Put Rust unit tests in `tests/unit/`**, with `[lib] test = false`. Give a test its own `tests/*.rs` binary only when it needs its own process, and reach private items only through the `test-util` feature, usually with `#[lore_macro::test_pub]`.
+11. **Build and run tests on a release build**, one test or a full suite, unit and smoke alike (see [Build profile](#build-profile)).
