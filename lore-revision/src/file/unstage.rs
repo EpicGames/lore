@@ -921,7 +921,7 @@ async fn unstage_node(
         execution_context().globals().force(),
         states,
         &node_path,
-        true,
+        !node.is_file(),
         FilterMode::STAGED.at(node.is_staged()),
     );
     if excluded {

@@ -555,6 +555,338 @@ pub async fn children_named(
     named
 }
 
+/// `path` as a repository path.
+#[allow(dead_code)]
+pub fn relative_path(path: &str) -> lore_revision::util::path::RelativePath {
+    lore_revision::util::path::RelativePath::new_from_initial_path(path).expect("Path init failed")
+}
+
+/// An execution context whose global force flag is set, which is what `--force` gives a
+/// command.
+#[allow(dead_code)]
+pub fn forced_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_client(
+        lore_revision::interface::LoreGlobalArgs {
+            force: 1,
+            ..Default::default()
+        },
+        lore_revision::relay::EventDispatcher::no_dispatch(),
+    ))
+}
+
+/// Runs `body` inside the execution context a command runs in.
+#[allow(dead_code)]
+pub fn in_execution<F: std::future::Future<Output = ()> + Send + 'static>(
+    body: F,
+) -> impl std::future::Future<Output = ()> {
+    #[allow(clippy::disallowed_methods)]
+    let task = lore_base::runtime::runtime()
+        .spawn(lore_base::runtime::LORE_CONTEXT.scope(setup_test_execution(), body));
+    async move { task.await.expect("Test task failed") }
+}
+
+/// A repository opened as the command line opens it, so a status run finds its branch and
+/// reads `ignore` as the `.loreignore` it holds, with `files` and one more file committed.
+/// The write token it holds is what lets a scan persist a node it creates.
+#[allow(dead_code)]
+pub async fn committed_repository(
+    ignore: &str,
+    files: &[String],
+) -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    TempDir,
+) {
+    let tempdir = generate_tempdir();
+    let path = tempdir.to_path_buf();
+    let branch_id = lore_revision::lore::BranchId::from(uuid::Uuid::now_v7());
+    let write_token =
+        lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+    lore_revision::repository::create_local(
+        path.as_path(),
+        &write_token,
+        lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7()),
+        branch_id,
+        lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
+        lore_revision::repository::RepositoryConfig::default(),
+        false,
+    )
+    .await
+    .expect("Failed to initialize repository");
+    test_file_write(
+        path.join(lore_revision::repository::DOT_LOREIGNORE)
+            .as_path(),
+        ignore.as_bytes(),
+    );
+    test_file_write(path.join("seed.txt").as_path(), b"seed");
+    for file in files {
+        let file = path.join(file);
+        std::fs::create_dir_all(file.parent().expect("A file has a parent"))
+            .expect("Create directory failed");
+        test_file_write(file.as_path(), b"committed");
+    }
+
+    let repository = lore_revision::repository::load_and_connect_with_token(
+        path.as_path(),
+        lore_revision::repository::RepositoryAccess::ReadWrite,
+        Some(write_token),
+    )
+    .await
+    .expect("Failed to open the repository");
+    lore_revision::instance::store_current_anchor_branch(&repository, branch_id)
+        .await
+        .expect("Failed to store anchor branch");
+
+    stage_paths(&repository, &path, &["."], true, false).await;
+    lore_revision::commit::commit_boxed(
+        repository.clone(),
+        repository
+            .try_write_token()
+            .expect("The repository was opened for writing"),
+        lore_revision::commit::CommitOptions::new("Seed".to_string()),
+    )
+    .await
+    .expect("Commit failed");
+
+    (repository, tempdir)
+}
+
+/// `names`, relative to `root`, as the paths a command is given.
+#[allow(dead_code)]
+pub fn path_arguments(
+    root: &std::path::Path,
+    names: &[&str],
+) -> lore_revision::interface::LoreArray<lore_revision::interface::LoreString> {
+    lore_revision::interface::LoreArray::from_vec(
+        names
+            .iter()
+            .map(|name| {
+                lore_revision::interface::LoreString::from(
+                    root.join(name).to_string_lossy().as_ref(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Stages `names` below `root` through `repository` as `lore stage` does, scanning where `scan`
+/// asks and forced where `force` does.
+#[allow(dead_code)]
+pub async fn stage_paths(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    root: &std::path::Path,
+    names: &[&str],
+    scan: bool,
+    force: bool,
+) {
+    let token = repository
+        .try_write_token()
+        .expect("The repository was opened for writing");
+    let stage = lore_revision::file::stage::stage(
+        repository.clone(),
+        token,
+        path_arguments(root, names),
+        lore_revision::stage::StageOptions {
+            scan,
+            ..Default::default()
+        },
+    );
+    if force {
+        lore_base::runtime::LORE_CONTEXT
+            .scope(forced_execution(), stage)
+            .await
+    } else {
+        stage.await
+    }
+    .expect("Stage failed");
+}
+
+/// A repository holding `committed` and, committed after them, the rule `ignore` in its
+/// `.loreignore`. Answers a context that reads the rule and one that does not, which stands
+/// for what was done before the rule was added.
+#[allow(dead_code)]
+pub async fn ignoring_repository(
+    committed: &[&str],
+    ignore: &str,
+) -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    TempDir,
+) {
+    let committed: Vec<String> = committed.iter().map(|name| name.to_string()).collect();
+    let (unruled, tempdir) = committed_repository("", &committed).await;
+    let root = tempdir.to_path_buf();
+    let rule = lore_revision::repository::DOT_LOREIGNORE;
+    test_file_write(root.join(rule).as_path(), ignore.as_bytes());
+    let ruled = std::sync::Arc::new(unruled.to_filter_context(
+        lore_revision::repository::load_filter(&root).expect("Filter load failed"),
+    ));
+    stage_paths(&ruled, &root, &[rule], true, false).await;
+    lore_revision::commit::commit_boxed(
+        ruled.clone(),
+        ruled
+            .try_write_token()
+            .expect("The repository was opened for writing"),
+        lore_revision::commit::CommitOptions::new("Ignore".to_string()),
+    )
+    .await
+    .expect("Commit failed");
+    (ruled, unruled, tempdir)
+}
+
+/// A committed repository ignoring `Intermediate/`, whose working tree holds the file
+/// `src/Intermediate` and the directory `build/Intermediate`, neither tracked.
+#[allow(dead_code)]
+pub async fn intermediate_repository() -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    TempDir,
+) {
+    let (repository, tempdir) = committed_repository("Intermediate/\n", &[]).await;
+    let root = tempdir.to_path_buf();
+    std::fs::create_dir_all(root.join("src")).expect("Create directory failed");
+    test_file_write(root.join("src/Intermediate").as_path(), b"file");
+    std::fs::create_dir_all(root.join("build/Intermediate")).expect("Create directory failed");
+    test_file_write(
+        root.join("build/Intermediate/a.txt").as_path(),
+        b"directory",
+    );
+    (repository, tempdir)
+}
+
+/// A repository holding `ignore` in its `.loreignore`, whose file `src/Intermediate`, committed
+/// before the rule, the working tree replaced with a directory holding `a.txt`.
+#[allow(dead_code)]
+pub async fn replaced_intermediate_repository(
+    ignore: &str,
+) -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    TempDir,
+) {
+    let (ruled, _, tempdir) = ignoring_repository(&["src/Intermediate"], ignore).await;
+    let root = tempdir.to_path_buf();
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::remove_file(root.join("src/Intermediate")).expect("Delete failed");
+    std::fs::create_dir_all(root.join("src/Intermediate")).expect("Create directory failed");
+    test_file_write(root.join("src/Intermediate/a.txt").as_path(), b"directory");
+    (ruled, tempdir)
+}
+
+/// The tree the next commit takes: the staged one, or the current one where nothing is staged.
+#[allow(dead_code)]
+pub async fn next_tree(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+) -> std::sync::Arc<lore_revision::state::State> {
+    let (current, staged, _) =
+        lore_revision::state::State::deserialize_current_and_staged(repository.clone())
+            .await
+            .expect("Deserialize failed");
+    staged.unwrap_or(current)
+}
+
+/// The node the next commit takes at `path`.
+#[allow(dead_code)]
+pub async fn next_node(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    path: &str,
+) -> lore_revision::node::Node {
+    next_tree(repository)
+        .await
+        .find_node(repository.clone(), path)
+        .await
+        .unwrap_or_else(|err| panic!("No node at {path}: {err}"))
+}
+
+/// Whether `state` holds `path`.
+#[allow(dead_code)]
+pub async fn holds(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state: &std::sync::Arc<lore_revision::state::State>,
+    path: &str,
+) -> bool {
+    state
+        .find_node_link(repository.clone(), path)
+        .await
+        .is_ok_and(|link| link.is_valid())
+}
+
+/// Asserts that `case` took in the file `src/Intermediate` and left out the directory
+/// `build/Intermediate`, as [`intermediate_repository`] holds them.
+#[allow(dead_code)]
+pub async fn assert_file_in_and_directory_out(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    case: &str,
+) {
+    let tree = next_tree(repository).await;
+    assert!(
+        holds(repository, &tree, "src/Intermediate").await,
+        "{case} left out the file src/Intermediate"
+    );
+    assert!(
+        !holds(repository, &tree, "build/Intermediate").await,
+        "{case} took in the directory build/Intermediate"
+    );
+}
+
+/// The files a sparse tree is drawn from. The view `/*`, `!*/Saved/Config/` keeps the last.
+#[allow(dead_code)]
+pub const SPARSE_FILES: [&str; 6] = [
+    "top.txt",
+    "Engine/Build/b.txt",
+    "Engine/Source/Runtime/r.cpp",
+    "Game/Content/c.uasset",
+    "Game/Saved/Logs/l.log",
+    "Game/Saved/Config/a.ini",
+];
+
+/// A committed repository read through the view `/*`, `!*/Saved/Config/`, whose working tree
+/// holds `Game/Saved/Config/a.ini` and the directories of every file, as a clone under that
+/// view leaves it, and no other file.
+#[allow(dead_code)]
+pub async fn sparse_repository() -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    TempDir,
+) {
+    let files: Vec<String> = SPARSE_FILES.iter().map(|file| file.to_string()).collect();
+    let (repository, tempdir) = committed_repository("", &files).await;
+    let root = tempdir.to_path_buf();
+    test_file_write(
+        root.join(lore_revision::repository::DOT_LORE)
+            .join(lore_revision::repository::VIEW_FILTER)
+            .as_path(),
+        b"/*\n!*/Saved/Config/\n",
+    );
+    for file in &SPARSE_FILES[..5] {
+        // Test fixture writes; not subject to repository write-token discipline.
+        #[allow(clippy::disallowed_methods)]
+        std::fs::remove_file(root.join(file)).expect("Delete failed");
+    }
+    let filter = lore_revision::repository::load_filter(&root).expect("Load filter failed");
+    (
+        std::sync::Arc::new(repository.to_filter_context(filter)),
+        tempdir,
+    )
+}
+
+/// The files of [`SPARSE_FILES`] the next commit takes a node of that `marked` holds for.
+#[allow(dead_code)]
+pub async fn sparse_files_marked(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    marked: fn(&lore_revision::node::Node) -> bool,
+) -> Vec<&'static str> {
+    let tree = next_tree(repository).await;
+    let mut found = Vec::new();
+    for file in SPARSE_FILES {
+        if tree
+            .find_node(repository.clone(), file)
+            .await
+            .is_ok_and(|node| marked(&node))
+        {
+            found.push(file);
+        }
+    }
+    found
+}
+
 /// Fixtures for revisions built in memory, on a path-less repository writing through an in-memory
 /// token, which is the shape the memory-based revision tree handle runs on.
 #[allow(dead_code)]

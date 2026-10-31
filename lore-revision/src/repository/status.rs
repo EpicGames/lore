@@ -1487,23 +1487,24 @@ fn resolve_scan_target(
             });
         }
 
-        if !operation
+        let Some(info) = operation
             .file_info(&path)
             .await
-            .is_ok_and(|info| info.exists())
-        {
+            .ok()
+            .filter(|info| info.exists())
+        else {
             if report_ignored {
                 emit_path_ignore(path.as_str()).await;
             }
             lore_trace!("Ignoring invalid path: {path}");
             return None;
-        }
+        };
 
         let filter = &repository.filter;
         let (_, excluded) = filter.child_excludes_tree(
             filter.parent_exclusion_states(&path),
             &path,
-            true,
+            info.is_dir(),
             FilterMode::Full,
         );
         Some(ScanTarget {

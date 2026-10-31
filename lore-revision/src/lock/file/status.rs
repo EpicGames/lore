@@ -21,13 +21,14 @@ use crate::lock;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lock::util::fold_batch_results;
+use crate::lock::util::lock_tree;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_trace;
+use crate::node::Node;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::runtime::execution_context;
-use crate::state;
 use crate::util::path::RelativePath;
 
 #[derive(Clone, Debug)]
@@ -125,14 +126,9 @@ pub async fn status(
         .await
         .forward::<StatusError>("Unable to check lock status while offline")?;
 
-    let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
+    let (state, current_branch) = lock_tree(&repository)
         .await
-        .forward::<StatusError>("Failed to deserialize current revision anchor")?;
-    let staged_revision = crate::instance::load_staged_revision(&repository)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(current_revision);
+        .forward::<StatusError>("Failed to deserialize state")?;
 
     let branch = if options.branch.is_empty() {
         current_branch
@@ -144,9 +140,6 @@ pub async fn status(
     };
 
     let mut resources = HashSet::<lock::LockResource>::with_capacity(options.paths.len());
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<StatusError>("Failed to deserialize state")?;
 
     lore_debug!("Inspecting {} path(s)", options.paths.len());
     let force = execution_context().globals().force();
@@ -155,29 +148,25 @@ pub async fn status(
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
                 .forward_with::<StatusError, _>(|| format!("Invalid path: {}", path.as_str()))?;
 
+        let node = state
+            .find_node(repository.clone(), relative_path.as_str())
+            .await;
         if !force
-            && repository
-                .filter
-                .emit_excludes(&relative_path, true, FilterMode::Full)
+            && repository.filter.emit_excludes(
+                &relative_path,
+                Node::asked_as_directory(node.as_ref().ok()),
+                FilterMode::Full,
+            )
         {
             lore_trace!("Path excluded by filter: {}", relative_path.as_str());
             continue;
         }
 
-        if let Ok(node_link) = state
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-        {
-            if !node_link.is_valid() {
-                emit_path_ignore(path.as_str()).await;
-                lore_trace!("Ignoring invalid path: {path}");
-                continue;
-            }
-        } else {
+        if node.is_err() || relative_path.is_empty() {
             emit_path_ignore(path.as_str()).await;
             lore_debug!("Ignoring invalid path, not found in repository: {path}");
             continue;
-        };
+        }
 
         let resource = assemble_resource_for_path(relative_path.as_str(), branch);
         resources.insert(resource);

@@ -64,6 +64,39 @@ async fn one_call_reads_the_working_tree_through_one_operation() {
     assert_eq!(vec![false], *filesystem.finalize_events.lock());
 }
 
+/// A named path below a directory the ignore file leaves out whole is left out whatever it
+/// holds, so the call reads nothing of the working tree for it.
+#[tokio::test]
+async fn a_path_below_an_ignored_directory_is_left_out_unread() {
+    let filesystem = Arc::new(TestFilesystemProvider::new());
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+    let repository = Arc::new(RepositoryContext::new(
+        default_repository_creation_args(immutable_store, mutable_store)
+            .with_filesystem_provider(filesystem.clone())
+            .with_filter(Arc::new(crate::helper::test_filter(&["ignored/"], &[]))),
+    ));
+    let paths: Vec<RelativePath> = ["ignored/a.txt", "ignored/b.txt"]
+        .into_iter()
+        .map(crate::helper::relative_path)
+        .collect();
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let state = State::new();
+            dirty_relative_paths_in(repository, state.clone(), state, paths)
+                .await
+                .expect("marking the named paths");
+        })
+        .await;
+
+    assert_eq!(
+        0,
+        filesystem.file_infos(),
+        "The call read the working tree for paths the filter leaves out whatever they hold"
+    );
+}
+
 /// The repository tracks no links, so a listing yields none and the walk marks none: a link
 /// beside a file leaves the file marked and nothing standing for the link.
 ///

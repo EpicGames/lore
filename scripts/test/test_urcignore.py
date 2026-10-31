@@ -4,6 +4,7 @@ import logging
 import os
 
 import pytest
+from status_util import Operation, verify_operations_in_status
 
 from lore import Lore
 
@@ -282,6 +283,42 @@ def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
         "branch switch with --reset should not delete files excluded by "
         ".loreignore (FilterMode::View does not check .loreignore)"
     )
+
+
+@pytest.mark.smoke
+def test_urcignore_directory_rule_leaves_files_of_that_name(new_lore_repo):
+    """A directory-only rule such as `Intermediate/` leaves out directories of
+    that name and nothing else: a file `src/Intermediate` is reported, diffed,
+    staged, committed and locked like any other file.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file(repo.ignore_file(), "w+") as f:
+        f.write("Intermediate/\n")
+    repo.make_dirs("src")
+    with repo.open_file("src/Intermediate", "w+") as f:
+        f.write("file\n")
+
+    output = repo.status(scan=True)
+    verify_operations_in_status(output, [], untracked_files=["src/Intermediate"])
+    assert "+++ src/Intermediate" in repo.diff("src/Intermediate"), (
+        "diff should report the file src/Intermediate"
+    )
+
+    repo.stage(scan=True)
+    verify_operations_in_status(repo.status(), [(Operation.ADD, "src/Intermediate")])
+
+    repo.commit("Add src/Intermediate")
+    repo.push()
+
+    assert repo.lock_acquire("src/Intermediate").acquired == ["src/Intermediate"]
+    assert [lock.file for lock in repo.lock_status("src/Intermediate")] == [
+        "src/Intermediate"
+    ]
+    assert [lock.file for lock in repo.lock_query("main", path="src/Intermediate")] == [
+        "src/Intermediate"
+    ]
+    assert repo.lock_release("src/Intermediate").released == ["src/Intermediate"]
 
 
 @pytest.mark.smoke

@@ -262,12 +262,17 @@ pub struct FilesystemDiffContext {
     /// The path as the file system spells it, which parts from the mappings' own spelling only
     /// where the two name a component with different case.
     pub filesystem_path: RelativePath,
-    /// The filter's verdict at `filesystem_path`, which each child steps from rather
-    /// than refolding the ancestors it already accounts for.
+    /// The filter's verdict at `filesystem_path`, or at its parent where `asks_path` is set,
+    /// which each child steps from rather than refolding the ancestors it already accounts for.
     pub states: FilterStates,
     /// The same verdict on the `from` side, which diverges from `states` once a move
     /// puts the two sides at different paths.
     pub from_states: FilterStates,
+    /// Whether the walk asks the filter about `filesystem_path` itself once it reads what the
+    /// working tree holds there, `states` and `from_states` then being the verdict at its parent.
+    /// A walk over a path a caller names does; below it, each listing asks about the entries it
+    /// lists.
+    pub asks_path: bool,
     pub filter_mode: FilterMode,
     pub intent: FilesystemDiffIntent,
     pub layer_mounts: Arc<Vec<LayerMountInfo>>,

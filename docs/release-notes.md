@@ -94,6 +94,19 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and
   `lore push --fast-forward-merge` report a conflict for a file both sides change when its path holds glob characters
   such as `[` and `]`
+- `lore stage --scan` leaves out a file an ignore file excludes where a re-inclusion reaches below a directory of the
+  file's name, such as `Game/Saved/direct.log` under `Saved/` and `!*/Saved/*/Keep/`
+- `lore stage` stages no deletion of the files a view leaves out of a sparse working tree, with or without `--force`,
+  whether it scans, names a path or finds their directory removed from the working tree. Without `--force` it keeps the
+  committed files an ignore file excludes when their directory is removed, and takes back a staged add there; with
+  `--force` it stages their removal. `lore file dirty` of a directory marks no deletion of the files the view leaves out
+- `lore status` and `lore stage` report and stage the removal of a tracked file the working tree replaced with a
+  directory an ignore rule excludes, such as `src/Intermediate` under `Intermediate/`, and leave out what the directory
+  holds. `lore diff` of a path one revision holds a file at and the next a directory lists what the directory holds
+  where the rules keep the directory and ignore a file of its name, such as under `Intermediate` and `!Intermediate/`
+- `lore stage`, `lore diff`, `lore file dirty`, `lore lock` and `lore status` apply a directory-only ignore rule such
+  as `Intermediate/` to directories only, so a file named `Intermediate` is tracked like any other file, and
+  `lore unstage` applies a directory-only view rule to directories only
 - `lore status` lists and `lore unstage` takes back staged changes to paths an ignore rule matches
 - `lore push --fast-forward-merge` keeps a rename that changes only case where the push also changes content in the
   directory holding it. A renamed directory keeps its files, and a renamed file keeps edits made to it on the target

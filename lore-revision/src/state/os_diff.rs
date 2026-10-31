@@ -95,6 +95,77 @@ pub(crate) async fn ensure_scan_dir_chain(
     Ok(current_node)
 }
 
+/// What a walk over a path a caller names does with the path, once it has read what the working
+/// tree holds there.
+///
+/// `Walk` stays unboxed: it is the common answer, moved once into the walk, and boxing it would add
+/// a heap allocation per named path.
+#[allow(clippy::large_enum_variant)]
+enum NamedRoot {
+    /// Walk the path, from the filter verdict at it, through what the working tree holds there.
+    Walk(FilterStates, crate::fs::os::PathListingResult),
+    /// Report the node the tree holds there missing, from the verdict at it.
+    Missing(FilterStates),
+    /// Leave the path out.
+    Excluded,
+}
+
+/// [`NamedRoot`] for `ctx`'s path, read from the working tree at `absolute_path`.
+///
+/// The path is asked about as what the working tree holds there, else as the node the tree holds,
+/// a link as a directory, and as a directory where neither holds anything. Where the filter leaves
+/// out what the working tree holds and the tree holds a node of the other kind, that node is missing
+/// from the working tree and is asked about as what it is, as the walk over the parent asks about a
+/// node its listing claims nothing for. The tree's node is read only where the listing leaves the
+/// answer open: where the working tree holds nothing, or the filter leaves out what it holds and
+/// keeps a node of the other kind.
+///
+/// The listing is read here and handed back to walk, so the caller's future holds it across no
+/// await of its own.
+async fn named_root(
+    ctx: &FilesystemDiffContext,
+    absolute_path: std::path::PathBuf,
+) -> Result<NamedRoot, StateError> {
+    let listing = crate::fs::os::list_path(absolute_path)
+        .await
+        .forward::<StateError>("Failed to list the path")?;
+    let filter = &ctx.from.repository.filter;
+    let path = &ctx.filesystem_path;
+    let held = async || {
+        ctx.from
+            .state
+            .try_node(ctx.from.repository.clone(), ctx.from.node)
+            .await
+    };
+    let listed = match &listing {
+        crate::fs::os::PathListingResult::Directory { .. } => true,
+        crate::fs::os::PathListingResult::File { .. } => false,
+        crate::fs::os::PathListingResult::NotFound => {
+            let is_directory = Node::asked_as_directory(held().await.as_ref());
+            let (states, excluded) =
+                filter.child_emit_excludes(ctx.states, path, is_directory, ctx.filter_mode);
+            return Ok(if excluded {
+                NamedRoot::Excluded
+            } else {
+                NamedRoot::Missing(states)
+            });
+        }
+    };
+    let (states, excluded) = filter.child_emit_excludes(ctx.states, path, listed, ctx.filter_mode);
+    if !excluded {
+        return Ok(NamedRoot::Walk(states, listing));
+    }
+    drop(listing);
+    let (states, excluded) = filter.child_excludes_tree(ctx.states, path, !listed, ctx.filter_mode);
+    if excluded {
+        return Ok(NamedRoot::Excluded);
+    }
+    Ok(match held().await {
+        Some(node) if Node::asked_as_directory(Some(&node)) != listed => NamedRoot::Missing(states),
+        _ => NamedRoot::Excluded,
+    })
+}
+
 async fn diff_filesystem_subtree_impl(
     mut ctx: FilesystemDiffContext,
     changes: &ChangeSender,
@@ -102,11 +173,34 @@ async fn diff_filesystem_subtree_impl(
     let absolute_path = ctx
         .filesystem_path
         .to_absolute_path(ctx.from.repository.require_path()?);
+    let listing = if ctx.asks_path {
+        match named_root(&ctx, absolute_path).await? {
+            NamedRoot::Walk(states, listing) => {
+                ctx.states = states;
+                ctx.from_states = states;
+                listing
+            }
+            NamedRoot::Missing(states) => {
+                return diff_filesystem_missing(
+                    ctx.from,
+                    ctx.filesystem_path,
+                    states,
+                    ctx.filter_mode,
+                    ctx.intent,
+                    changes,
+                    &ctx.link_mounts,
+                )
+                .await;
+            }
+            NamedRoot::Excluded => return Ok(FilesystemDiffStats::default()),
+        }
+    } else {
+        crate::fs::os::list_path(absolute_path)
+            .await
+            .forward::<StateError>("Failed to list the path")?
+    };
 
-    match crate::fs::os::list_path(absolute_path)
-        .await
-        .forward::<StateError>("Failed to list the path")?
-    {
+    match listing {
         crate::fs::os::PathListingResult::Directory { listing } => {
             // A path-filtered scan can enter a directory present on disk but
             // absent from state_from (an untracked add). Create its dirty-add
@@ -1583,6 +1677,7 @@ async fn diff_filesystem_linked_directory(
             filesystem_path: item_path,
             states: item_states,
             from_states: from_item_states,
+            asks_path: false,
             filter_mode: ctx.filter_mode,
             intent: ctx.intent,
             discards: ctx.discards.clone(),
@@ -1761,6 +1856,7 @@ async fn diff_filesystem_matched_directory(
             filesystem_path: item_path,
             states: item_states,
             from_states: from_item_states,
+            asks_path: false,
             filter_mode: ctx.filter_mode,
             intent: ctx.intent,
             discards: ctx.discards.clone(),
@@ -1874,6 +1970,7 @@ async fn diff_filesystem_type_change(
                 filesystem_path: item_path,
                 states: item_states,
                 from_states: item_states,
+                asks_path: false,
                 filter_mode: ctx.filter_mode,
                 intent: ctx.intent,
                 discards: ctx.discards.clone(),
@@ -2145,6 +2242,7 @@ async fn diff_filesystem_new_entries(
                         // The layer is walked at its mount path, which is the
                         // path on disk.
                         from_states: child_states,
+                        asks_path: false,
                         filter_mode: ctx.filter_mode,
                         intent: ctx.intent,
                         discards: ctx.discards.clone(),
@@ -2244,6 +2342,7 @@ async fn diff_filesystem_new_entries(
                     filesystem_path: child_file_path.clone(),
                     states: child_states,
                     from_states: dir_from_states,
+                    asks_path: false,
                     filter_mode: ctx.filter_mode,
                     intent: ctx.intent,
                     discards: ctx.discards.clone(),

@@ -75,6 +75,7 @@ use crate::immutable::read_options_from_repository;
 use crate::instance::InstanceId;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
+use crate::link::LinkedState;
 use crate::lore::*;
 use crate::lore_debug;
 use crate::lore_info;
@@ -3281,6 +3282,29 @@ impl State {
             .forward::<StateError>("Node name")
     }
 
+    /// The node `node` names and its name, read from one block, or `None` for a node whose name
+    /// the read path refuses, logged as the node being skipped; see
+    /// [`NodeBlock::node_name_ref_or_skip`].
+    ///
+    /// The name holds a read lock on the node's block for its lifetime, which callers drop before
+    /// calling `write()` on that block. The node is copied out before that lock is taken: a second
+    /// read lock on the block while the name holds one waits behind any writer queued between them.
+    pub async fn node_and_name_or_skip(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Option<(Node, NodeNameLock)>, StateError> {
+        let block = self
+            .block_with_nametable(repository, NodeBlock::index(node))
+            .await?;
+        let index = Node::index(node);
+        let read = block.node(index);
+        Ok(block
+            .node_name_ref_or_skip(index, node)
+            .forward::<StateError>("Node name")?
+            .map(|name| (read, name)))
+    }
+
     /// [`Self::node_name_clone`], answering `None` for a node whose name the read path refuses,
     /// logged as the node being skipped; see [`NodeBlock::node_name_ref_or_skip`].
     ///
@@ -3771,12 +3795,28 @@ impl State {
     /// that name, and a revision holding one anyway is not reached through it, whichever case
     /// it is spelled in. Resolution is by name hash, which folds case, so this is the one check
     /// on the path that a listing's skip of such a node does not already cover.
-    pub async fn find_relative_node_link(
+    ///
+    /// Answers [`Self::find_relative`]'s future itself, mapped to the link, so the caller's future
+    /// holds no second copy of the arguments.
+    pub fn find_relative_node_link<'a>(
+        &'a self,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &'a str,
+    ) -> impl Future<Output = Result<NodeLink, StateError>> + Send + 'a {
+        futures::FutureExt::map(self.find_relative(repository, root, path), |found| {
+            found.map(|(link, _)| link)
+        })
+    }
+
+    /// [`Self::find_relative_node_link`], with the linked state holding the node where a link was
+    /// crossed to reach it, for a caller that reads the node.
+    pub(crate) async fn find_relative(
         &self,
         repository: Arc<RepositoryContext>,
         root: NodeID,
         path: &str,
-    ) -> Result<NodeLink, StateError> {
+    ) -> Result<(NodeLink, Option<LinkedState>), StateError> {
         let mut path = RelativePath::from_str(path).unwrap();
         let mut current_node = root;
         let mut repository = repository;
@@ -3802,21 +3842,23 @@ impl State {
                     let link = node.linked_node();
                     repository = repository.to_link_context(link.repository).await;
                     let link_state = State::deserialize(repository.clone(), link.revision).await?;
-                    return Box::pin(link_state.find_relative_node_link(
-                        repository,
+                    let (found, held) = Box::pin(link_state.find_relative(
+                        repository.clone(),
                         link.node,
                         path.as_str(),
                     ))
-                    .await;
+                    .await?;
+                    return Ok((found, held.or(Some((repository, link_state)))));
                 }
             }
         }
 
-        Ok(NodeLink {
+        let found = NodeLink {
             node: current_node,
             repository: repository.id,
             revision: self.revision(),
-        })
+        };
+        Ok((found, None))
     }
 
     pub async fn find_node_link(
@@ -3863,20 +3905,12 @@ impl State {
         repository: Arc<RepositoryContext>,
         path: &str,
     ) -> Result<Node, StateError> {
-        let node_link = self.find_node_link(repository.clone(), path).await?;
-
-        let iblock = NodeBlock::index(node_link.node);
-        let inode = Node::index(node_link.node);
-        if node_link.revision == self.revision() {
-            let block = self.block(repository.clone(), iblock).await?;
-            let block_reader = block.read();
-            Ok(*block_reader.node(inode))
-        } else {
-            let repository = repository.to_link_context(node_link.repository).await;
-            let state = State::deserialize(repository.clone(), node_link.revision).await?;
-            let block = state.block(repository, iblock).await?;
-            let block_reader = block.read();
-            Ok(*block_reader.node(inode))
+        let (found, held) = self
+            .find_relative(repository.clone(), ROOT_NODE, path)
+            .await?;
+        match held {
+            Some((repository, state)) => state.node(repository, found.node).await,
+            None => self.node(repository, found.node).await,
         }
     }
 
@@ -6382,7 +6416,9 @@ fn walk_filter_mode(filter_mode: FilterMode, intent: FilesystemDiffIntent) -> Fi
 /// `operation`, appending a change per difference to `changes`.
 ///
 /// Resolution reads the trees alone, so a filesystem implementation is handed roots it
-/// never has to follow a link to find.
+/// never has to follow a link to find. The filter is asked about `path` as what the working tree
+/// holds there, else as the node `from` holds, a link as a directory, and as a directory where
+/// neither holds anything.
 ///
 /// `layer_mounts` is consulted only by the parent's walk to switch context when crossing
 /// into a configured layer. Pass an empty Arc for non-layer-aware callers; the
@@ -6437,15 +6473,11 @@ pub(crate) async fn diff_filesystem_queuing(
         state: state_current,
     } = current;
     let filter_mode = walk_filter_mode(filter_mode, intent);
-
     let states = match path.as_ref() {
         Some(path) => {
-            let parent_states = repository_from.filter.parent_exclusion_states(path);
-            let (states, excluded) =
-                repository_from
-                    .filter
-                    .child_emit_excludes(parent_states, path, true, filter_mode);
-            if excluded {
+            let filter = &repository_from.filter;
+            let states = filter.parent_exclusion_states(path);
+            if filter.emit_excludes_any_kind(states, path, filter_mode) {
                 return Ok(ChangeStream::nothing());
             }
             states
@@ -6484,6 +6516,7 @@ pub(crate) async fn diff_filesystem_queuing(
                 filesystem_path: RelativePath::new(),
                 states,
                 from_states: states,
+                asks_path: false,
                 filter_mode,
                 intent,
                 layer_mounts,
@@ -6536,6 +6569,7 @@ pub(crate) async fn diff_filesystem_queuing(
             filesystem_path: path,
             states,
             from_states: states,
+            asks_path: true,
             filter_mode,
             intent,
             layer_mounts,
@@ -6753,6 +6787,7 @@ pub async fn diff_filesystem_subtree(
             filesystem_path,
             states,
             from_states: states,
+            asks_path: false,
             filter_mode,
             intent,
             layer_mounts,

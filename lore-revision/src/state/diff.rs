@@ -206,6 +206,10 @@ impl DiffWalkStats {
 /// begins and where both sides' filters are in hand, so deriving them anywhere
 /// else would only be a second answer to the same question.
 ///
+/// Each side asks about `path` as the node it holds there, a link as a directory, and as the other
+/// side's node where it holds none, so a type change asks its delete side and its add side each as
+/// what it is.
+///
 /// Returns [`diff_subtree_walk`]'s future itself, seeded when called, or a ready one
 /// where both sides drop `path`: a future of its own would hold the sides again
 /// beside the walk they are moved into.
@@ -220,11 +224,13 @@ pub fn diff_subtree(
     let from_filter = &from.mapping.repository.filter;
     let to_filter = &to.mapping.repository.filter;
     let flags = DiffFlags::between(from_filter, to_filter);
+    let kinds = root_kinds(&from, &to);
     // A repository's root carries no staged flag, so a walk rooted at one keeps it.
     let (from_states, to_states, excluded) = seed_sides(
         from_filter,
         to_filter,
         &path,
+        kinds,
         flags,
         filter_mode.at(to.flags.contains(NodeFlags::Staged) || !to.mapping.node.is_valid_node_id()),
     );
@@ -261,9 +267,10 @@ pub fn diff_subtree(
 /// The verdicts a walk over `path` starts from, one per side, and whether the walk
 /// drops `path`.
 ///
-/// One filter held by both sides is asked once: the same rules put the same
-/// question about the same path answer the same way, and every caller that is not
-/// moving the view holds one filter.
+/// One filter held by both sides is asked once where both sides ask about `path` as the same
+/// kind: the same rules put the same question about the same path answer the same way, and every
+/// caller that is not moving the view holds one filter. `kinds` says whether the from side and the
+/// to side ask about `path` as a directory.
 ///
 /// `path` is dropped where both sides exclude it, and only there is the exclusion
 /// announced. The to side is asked last, and in the announcing form only once the
@@ -273,20 +280,38 @@ fn seed_sides(
     from_filter: &Arc<Filter>,
     to_filter: &Arc<Filter>,
     path: &RelativePath,
+    kinds: (bool, bool),
     flags: DiffFlags,
     mode: FilterMode,
 ) -> (FilterStates, FilterStates, bool) {
-    let two_views = flags.contains(DiffFlags::TwoViews);
-    let from_seed = two_views.then(|| seed_states(from_filter, path, false, mode));
+    let (from_is_directory, to_is_directory) = kinds;
+    let separate = flags.contains(DiffFlags::TwoViews) || from_is_directory != to_is_directory;
+    let from_seed =
+        separate.then(|| seed_states(from_filter, path, from_is_directory, false, mode));
     let announce = from_seed.is_none_or(|(_, excluded)| excluded);
-    let to_seed = seed_states(to_filter, path, announce, mode);
+    let to_seed = seed_states(to_filter, path, to_is_directory, announce, mode);
     let (from_states, from_excluded) = from_seed.unwrap_or(to_seed);
     (from_states, to_seed.0, from_excluded && to_seed.1)
 }
 
+/// Whether the from side and the to side of a walk's root ask about its path as a directory: each
+/// as the node it holds, a link as a directory, and as the other side's node where it holds none.
+fn root_kinds(from: &NodeChangeState, to: &NodeChangeState) -> (bool, bool) {
+    let from_directory = !from.flags.contains(NodeFlags::File);
+    let to_directory = !to.flags.contains(NodeFlags::File);
+    match (
+        from.mapping.node.is_valid_or_root_node_id(),
+        to.mapping.node.is_valid_or_root_node_id(),
+    ) {
+        (true, false) => (from_directory, from_directory),
+        (false, true) => (to_directory, to_directory),
+        _ => (from_directory, to_directory),
+    }
+}
+
 /// The states a walk rooted at `path` threads into its children, and whether
-/// `filter` excludes `path` with everything below it. `path` is taken as a
-/// directory, which is what a walk rooted at one stands in.
+/// `filter` excludes `path` with everything below it. `is_directory` is whether
+/// `path` names a directory.
 ///
 /// `path`'s own ancestors are folded here, since a walk starting at it has none
 /// behind it.
@@ -296,14 +321,15 @@ fn seed_sides(
 fn seed_states(
     filter: &Filter,
     path: &RelativePath,
+    is_directory: bool,
     announce: bool,
     mode: FilterMode,
 ) -> (FilterStates, bool) {
     let parent = filter.parent_exclusion_states(path);
     if announce {
-        filter.child_emit_excludes(parent, path, true, mode)
+        filter.child_emit_excludes(parent, path, is_directory, mode)
     } else {
-        filter.child_excludes_tree(parent, path, true, mode)
+        filter.child_excludes_tree(parent, path, is_directory, mode)
     }
 }
 

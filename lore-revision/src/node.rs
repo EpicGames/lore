@@ -467,6 +467,13 @@ impl Node {
         !self.is_file() && !self.is_link()
     }
 
+    /// Whether the filter is asked about a path a command names as a directory, where the tree
+    /// holds `node` there: unless it is a file, a link counting as the directory it mounts, and
+    /// where the tree holds nothing.
+    pub fn asked_as_directory(node: Option<&Node>) -> bool {
+        node.is_none_or(|node| !node.is_file())
+    }
+
     pub fn node_type(&self) -> LoreNodeType {
         NodeFlags::from_bits_retain(self.flags).node_type()
     }

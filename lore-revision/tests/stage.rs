@@ -2702,4 +2702,320 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    #[tokio::test]
+    async fn a_stage_scan_stages_a_file_a_directory_only_rule_names() {
+        in_execution(async {
+            let (repository, tempdir) = intermediate_repository().await;
+            stage_paths(&repository, &tempdir, &["."], true, false).await;
+            assert_file_in_and_directory_out(&repository, "a stage scan").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_stage_of_a_file_a_directory_only_rule_names_stages_it() {
+        in_execution(async {
+            let (repository, tempdir) = intermediate_repository().await;
+            stage_paths(
+                &repository,
+                &tempdir,
+                &["src/Intermediate", "build/Intermediate"],
+                false,
+                false,
+            )
+            .await;
+            assert_file_in_and_directory_out(&repository, "a stage of the paths").await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_stage_scan_stages_the_removal_of_a_file_a_directory_only_rule_names() {
+        in_execution(async {
+            let (ruled, _, tempdir) =
+                ignoring_repository(&["src/Intermediate"], "Intermediate/\n").await;
+            std::fs::remove_file(tempdir.join("src/Intermediate")).expect("Delete failed");
+            stage_paths(&ruled, &tempdir, &["."], true, false).await;
+            assert!(
+                next_node(&ruled, "src/Intermediate")
+                    .await
+                    .is_staged_delete(),
+                "the removal of src/Intermediate is not staged"
+            );
+        })
+        .await;
+    }
+
+    /// A named stage of a tracked file removed from the working tree asks about it as the file the
+    /// tree holds.
+    #[tokio::test]
+    async fn a_stage_of_a_removed_file_a_directory_only_rule_names_stages_its_removal() {
+        in_execution(async {
+            let (ruled, _, tempdir) =
+                ignoring_repository(&["src/Intermediate"], "Intermediate/\n").await;
+            std::fs::remove_file(tempdir.join("src/Intermediate")).expect("Delete failed");
+            stage_paths(&ruled, &tempdir, &["src/Intermediate"], false, false).await;
+            assert!(
+                next_node(&ruled, "src/Intermediate")
+                    .await
+                    .is_staged_delete(),
+                "the removal of src/Intermediate is not staged"
+            );
+        })
+        .await;
+    }
+
+    /// A stage of a tracked file the working tree replaced with a directory a directory-only rule
+    /// names stages the file's removal and leaves out what the directory holds, scanning or naming
+    /// the path: the file the tree holds is asked about as a file.
+    #[tokio::test]
+    async fn a_stage_of_a_file_replaced_by_a_directory_a_directory_only_rule_names_stages_its_removal()
+     {
+        for (name, scan) in [(".", true), ("src/Intermediate", false)] {
+            in_execution(async move {
+                let (ruled, tempdir) = replaced_intermediate_repository("Intermediate/\n").await;
+                stage_paths(&ruled, &tempdir, &[name], scan, false).await;
+                assert!(
+                    next_node(&ruled, "src/Intermediate")
+                        .await
+                        .is_staged_delete(),
+                    "a stage of {name} left the removal of the file src/Intermediate unstaged"
+                );
+                assert!(
+                    !holds(&ruled, &next_tree(&ruled).await, "src/Intermediate/a.txt").await,
+                    "a stage of {name} took in src/Intermediate/a.txt, which the rule excludes"
+                );
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_staged_move_to_a_file_a_directory_only_rule_names_is_staged() {
+        in_execution(async {
+            let (ruled, _, tempdir) =
+                ignoring_repository(&["src/Intermediate"], "Intermediate/\n").await;
+            let root = tempdir.to_path_buf();
+            std::fs::create_dir_all(root.join("lib")).expect("Create directory failed");
+            std::fs::rename(root.join("src/Intermediate"), root.join("lib/Intermediate"))
+                .expect("Move failed");
+            file::stage::stage_move(
+                ruled.clone(),
+                ruled
+                    .try_write_token()
+                    .expect("The repository was opened for writing"),
+                root.join("src/Intermediate").to_string_lossy().to_string(),
+                root.join("lib/Intermediate").to_string_lossy().to_string(),
+                StageOptions::default(),
+            )
+            .await
+            .expect("Stage move failed");
+            assert!(
+                next_node(&ruled, "lib/Intermediate").await.is_staged(),
+                "the move to lib/Intermediate is not staged"
+            );
+        })
+        .await;
+    }
+
+    /// Pins that [`stage::stage_single_node`], which staging a link and realizing a tree reach,
+    /// asks about a link as the directory it mounts: `Mount/` leaves out a link mounted at `Mount`.
+    #[tokio::test]
+    async fn a_directory_only_rule_naming_a_mount_leaves_out_the_link() {
+        in_execution(async {
+            let (repository, _tempdir) = committed_repository("Mount/\n", &[]).await;
+            let link = stage::stage_single_node(
+                repository.clone(),
+                next_tree(&repository).await,
+                relative_path("Mount"),
+                node::Node {
+                    flags: NodeFlags::Link.bits(),
+                    ..Default::default()
+                },
+                Arc::default(),
+                None,
+                lore_revision::filter::FilterMode::Full,
+            )
+            .await
+            .expect("Stage failed");
+            assert!(!link.is_valid(), "the link mounted at Mount was staged");
+        })
+        .await;
+    }
+
+    /// A staging scan leaves out a file directly in a directory the ignore file excludes, where a
+    /// re-inclusion such as `!*/Saved/*/Keep/` reaches below a directory of the file's name, and
+    /// stages the file that re-inclusion brings back.
+    #[tokio::test]
+    async fn a_stage_scan_leaves_out_a_file_a_deeper_re_inclusion_does_not_reach() {
+        in_execution(async {
+            let (repository, tempdir) =
+                committed_repository("Saved/\n!*/Saved/*/Keep/\n", &[]).await;
+            let root = tempdir.to_path_buf();
+            for file in ["Game/Saved/Logs/Keep/k.log", "Game/Saved/direct.log"] {
+                let path = root.join(file);
+                std::fs::create_dir_all(path.parent().expect("A file has a parent"))
+                    .expect("Create directory failed");
+                test_file_write(path.as_path(), file.as_bytes());
+            }
+            stage_paths(&repository, &root, &["."], true, false).await;
+            let tree = next_tree(&repository).await;
+            assert!(
+                holds(&repository, &tree, "Game/Saved/Logs/Keep/k.log").await,
+                "the stage left out Game/Saved/Logs/Keep/k.log"
+            );
+            assert!(
+                !holds(&repository, &tree, "Game/Saved/direct.log").await,
+                "the stage took in Game/Saved/direct.log, which the ignore file excludes"
+            );
+        })
+        .await;
+    }
+
+    /// A staging scan of an unchanged sparse tree stages no deletion of the files its view leaves
+    /// out of the working tree, forced or not: forcing passes the ignore file, not the view.
+    #[tokio::test]
+    async fn a_stage_scan_of_a_sparse_tree_stages_no_deletion() {
+        for force in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = sparse_repository().await;
+                stage_paths(&repository, &tempdir, &["."], true, force).await;
+                let deleted = sparse_files_marked(&repository, node::Node::is_staged_delete).await;
+                assert!(
+                    deleted.is_empty(),
+                    "a stage scan, forced {force}, staged the deletion of files the view \
+                     excludes: {deleted:?}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A staging scan keeps what the view excludes below a directory removed from a sparse tree,
+    /// forced or not.
+    #[tokio::test]
+    async fn a_stage_scan_of_a_sparse_tree_keeps_what_the_view_excludes_below_a_removed_directory()
+    {
+        for force in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = sparse_repository().await;
+                std::fs::remove_dir_all(tempdir.join("Engine")).expect("Delete failed");
+                std::fs::remove_dir_all(tempdir.join("Game/Content")).expect("Delete failed");
+                stage_paths(&repository, &tempdir, &["."], true, force).await;
+                let deleted = sparse_files_marked(&repository, node::Node::is_staged_delete).await;
+                assert!(
+                    deleted.is_empty(),
+                    "a stage scan, forced {force}, staged the deletion of files the view \
+                     excludes: {deleted:?}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A named stage of a file a sparse tree's view excludes stages no deletion of it, forced or
+    /// not.
+    #[tokio::test]
+    async fn a_stage_of_a_file_the_view_excludes_stages_no_deletion() {
+        for force in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = sparse_repository().await;
+                stage_paths(
+                    &repository,
+                    &tempdir,
+                    &["top.txt", "Engine/Build/b.txt"],
+                    false,
+                    force,
+                )
+                .await;
+                let deleted = sparse_files_marked(&repository, node::Node::is_staged_delete).await;
+                assert!(
+                    deleted.is_empty(),
+                    "a stage of the paths, forced {force}, staged the deletion of files the view \
+                     excludes: {deleted:?}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A staging scan keeps a committed file the ignore file excludes below a directory removed from
+    /// the working tree, removing it being an explicit act, and stages the removal of the file
+    /// beside it, scanning the tree or the directory. A forced scan, which passes the ignore file,
+    /// stages the removal of both.
+    #[tokio::test]
+    async fn a_stage_scan_keeps_what_the_ignore_file_excludes_below_a_removed_directory_unless_forced()
+     {
+        for name in [".", "Plugins/Foo"] {
+            for force in [false, true] {
+                in_execution(async move {
+                    let (ruled, _, tempdir) = ignoring_repository(
+                        &["Plugins/Foo/Binaries/foo.dll", "Plugins/Foo/foo.uplugin"],
+                        "Binaries/\n",
+                    )
+                    .await;
+                    std::fs::remove_dir_all(tempdir.join("Plugins/Foo")).expect("Delete failed");
+                    stage_paths(&ruled, &tempdir, &[name], true, force).await;
+                    assert_eq!(
+                        next_node(&ruled, "Plugins/Foo/Binaries/foo.dll")
+                            .await
+                            .is_staged_delete(),
+                        force,
+                        "a stage of {name}, forced {force}, got the removal of \
+                         Plugins/Foo/Binaries/foo.dll wrong"
+                    );
+                    assert!(
+                        next_node(&ruled, "Plugins/Foo/foo.uplugin")
+                            .await
+                            .is_staged_delete(),
+                        "a stage of {name}, forced {force}, left the removal of \
+                         Plugins/Foo/foo.uplugin unstaged"
+                    );
+                })
+                .await;
+            }
+        }
+    }
+
+    /// A staging scan takes back the staged add of a file the ignore file excludes below a directory
+    /// removed from the working tree, as it does for any other staged add there: the ignore file
+    /// leaves out no staged node, as status and unstage read it.
+    #[tokio::test]
+    async fn a_stage_scan_takes_back_a_staged_ignored_file_below_a_removed_directory() {
+        in_execution(async {
+            let (ruled, _, tempdir) =
+                ignoring_repository(&["Plugins/Foo/foo.uplugin"], "Binaries/\n").await;
+            let root = tempdir.to_path_buf();
+            std::fs::create_dir_all(root.join("Plugins/Foo/Binaries"))
+                .expect("Create directory failed");
+            test_file_write(root.join("Plugins/Foo/Binaries/new.dll").as_path(), b"new");
+            stage_paths(
+                &ruled,
+                &root,
+                &["Plugins/Foo/Binaries/new.dll"],
+                false,
+                true,
+            )
+            .await;
+            assert!(
+                next_node(&ruled, "Plugins/Foo/Binaries/new.dll")
+                    .await
+                    .is_staged_add(),
+                "the forced stage of Plugins/Foo/Binaries/new.dll staged no add"
+            );
+            std::fs::remove_dir_all(root.join("Plugins/Foo")).expect("Delete failed");
+            stage_paths(&ruled, &root, &["."], true, false).await;
+            let tree = next_tree(&ruled).await;
+            let left = tree
+                .find_node(ruled.clone(), "Plugins/Foo/Binaries/new.dll")
+                .await
+                .ok();
+            assert!(
+                left.is_none_or(|node| !node.is_staged_add()),
+                "a stage scan left the add of Plugins/Foo/Binaries/new.dll staged: {left:?}"
+            );
+        })
+        .await;
+    }
 }

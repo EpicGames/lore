@@ -1189,14 +1189,6 @@ pub async fn stage_move(
     let current_revision = state_current.revision();
     let state = state_staged.unwrap_or(state_current);
 
-    if !execution_context().globals().force()
-        && repository
-            .filter
-            .emit_excludes(&to_path, true, FilterMode::Full)
-    {
-        return Err(StageError::internal(format!("Ignored path {to_path}")));
-    }
-
     // Find from node (must exist, optionally already staged for delete)
     let from_node_link = state
         .find_node_link(repository.clone(), from_path.as_str())
@@ -1223,6 +1215,14 @@ pub async fn stage_move(
         .node(repository.clone(), from_node_link.node)
         .await
         .forward::<StageError>("Failed deserializing state node block")?;
+
+    if !execution_context().globals().force()
+        && repository
+            .filter
+            .emit_excludes(&to_path, !from_node.is_file(), FilterMode::Full)
+    {
+        return Err(StageError::internal(format!("Ignored path {to_path}")));
+    }
 
     // Find to node (optional)
     let to_node_link = state

@@ -1,10 +1,37 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+
+use lore_error_set::prelude::*;
+
 use crate::hash;
 use crate::lock;
 use crate::lore::BranchId;
+use crate::repository::RepositoryContext;
+use crate::state::State;
+use crate::state::StateError;
 
 pub const LOCK_BATCH_SIZE: usize = 100;
+
+/// The tree a lock command reads its paths against, the staged one or the current one where
+/// nothing is staged, and the branch the working copy is on.
+pub async fn lock_tree(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(Arc<State>, BranchId), StateError> {
+    let (current_revision, branch) =
+        crate::instance::load_current_anchor(repository)
+            .await
+            .forward::<StateError>("Failed to deserialize current revision anchor")?;
+    let staged_revision = crate::instance::load_staged_revision(repository)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(current_revision);
+    Ok((
+        State::deserialize(repository.clone(), staged_revision).await?,
+        branch,
+    ))
+}
 
 pub fn assemble_resource_for_path(path: &str, branch: BranchId) -> lock::LockResource {
     let hash = hash::hash_slice(path.as_bytes());

@@ -1555,14 +1555,32 @@ impl Filter {
         path: &impl FilterPath,
         mode: FilterMode,
     ) -> bool {
+        self.descends(states, path.as_lowercase_str(), mode)
+    }
+
+    /// [`should_descend`](Self::should_descend) for the lowercase path `states` were produced
+    /// for.
+    fn descends(&self, states: FilterStates, lowercase: &str, mode: FilterMode) -> bool {
         let excluded = (mode.contains(FilterMode::Ignore) && states.ignore.excluded)
             || (mode.contains(FilterMode::View) && states.view.excluded);
-        if !excluded || path.is_empty() || path.as_str() == "." {
+        if !excluded || lowercase.is_empty() || lowercase == "." {
             return true;
         }
-        let lowercase = path.as_lowercase_str();
         self.descend_reason(states, lowercase, component_count(lowercase), mode)
             .is_none()
+    }
+
+    /// Whether the filter leaves out `path` whatever it holds, as a walk does not descend into
+    /// its parent, whose verdict is `parent`, emitting a [`LoreEvent::FilterExclude`] where it
+    /// does. A path its parent leaves open is answered `false`: what it holds decides.
+    pub fn emit_excludes_any_kind(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        mode: FilterMode,
+    ) -> bool {
+        !self.descends(parent, path.split_lowercase().0, mode)
+            && self.child_emit_excludes(parent, path, true, mode).1
     }
 
     /// The slot that stops a walk at `path`, or `None` when it descends. `path`

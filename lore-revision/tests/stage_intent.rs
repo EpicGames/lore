@@ -849,18 +849,6 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// An execution context whose global force flag is set, which is what `--force` gives a
-    /// command.
-    fn forced_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
-        std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_client(
-            lore_revision::interface::LoreGlobalArgs {
-                force: 1,
-                ..Default::default()
-            },
-            lore_revision::relay::EventDispatcher::no_dispatch(),
-        ))
-    }
-
     /// Force stages what the working copy already matches, the directory included: the user
     /// asked for those nodes to carry the action, and a walk that reported nothing would
     /// leave the ask unanswered.

@@ -53,13 +53,14 @@ fn one_filter_answers_for_both_sides() {
         &filter,
         &filter,
         &path,
+        (true, true),
         DiffFlags::empty(),
         FilterMode::Full,
     );
 
     assert_eq!(
         (from_states, excluded),
-        seed_states(&filter, &path, true, FilterMode::Full),
+        seed_states(&filter, &path, true, true, FilterMode::Full),
         "one filter must seed both sides with the one answer it gives"
     );
     assert_eq!(from_states, to_states);
@@ -72,8 +73,14 @@ fn two_filters_seed_each_side_from_its_own() {
     let to = Arc::new(Filter::default());
     let path = stepped_path();
 
-    let (from_states, to_states, excluded) =
-        seed_sides(&from, &to, &path, DiffFlags::TwoViews, FilterMode::Full);
+    let (from_states, to_states, excluded) = seed_sides(
+        &from,
+        &to,
+        &path,
+        (true, true),
+        DiffFlags::TwoViews,
+        FilterMode::Full,
+    );
 
     assert_ne!(
         from_states, to_states,

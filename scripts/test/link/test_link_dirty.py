@@ -72,6 +72,26 @@ def test_link_dirty_inside_a_link_mounted_from_a_subfolder(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_dirty_of_a_removed_file_a_directory_only_rule_names(new_lore_repo):
+    """Marking a file below a mount, removed from the working tree, marks its
+    removal where a directory-only rule such as `Intermediate/` names it: the path
+    is asked about as the file the linked tree holds there.
+    """
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_files={"src/Intermediate": "file\n"}
+    )
+    removed = f"{DEFAULT_LINK_MOUNT}/src/Intermediate"
+    parent_repo.write_files({parent_repo.ignore_file(): "Intermediate/\n"})
+    parent_repo.remove_file(removed)
+    parent_repo.dirty(removed)
+
+    entries = status_by_path(parent_repo)
+    assert entries.get(removed, {}).get("action") == "delete", (
+        f"Expected the removal of {removed} marked, got: {entries}"
+    )
+
+
+@pytest.mark.smoke
 def test_link_dirty_inside_the_deepest_nested_link(new_lore_repo):
     parent_repo, deepest_mount = build_link_chain(new_lore_repo, MAX_LINK_DEPTH)
     edited = f"{deepest_mount}/a.txt"

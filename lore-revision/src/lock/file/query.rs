@@ -13,10 +13,12 @@ use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
+use crate::lock::util::lock_tree;
 use crate::lore::BranchId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::node::Node;
 use crate::repository::RepositoryContext;
 use crate::util::path::RelativePath;
 
@@ -112,13 +114,21 @@ pub async fn query(
             RelativePath::new_from_user_path(repository.require_path()?, options.path.as_str())
                 .forward_with::<QueryError, _>(|| format!("Invalid path: {}", options.path))?;
 
-        if !execution_context().globals().force()
-            && repository
-                .filter
-                .emit_excludes(&relative_path, true, FilterMode::Full)
-        {
-            lore_trace!("Path excluded by filter: {}", relative_path.as_str());
-            return Ok(());
+        if !execution_context().globals().force() {
+            let (state, _) = lock_tree(&repository)
+                .await
+                .forward_any::<QueryError>("Failed to deserialize state")?;
+            let node = state
+                .find_node(repository.clone(), relative_path.as_str())
+                .await;
+            if repository.filter.emit_excludes(
+                &relative_path,
+                Node::asked_as_directory(node.as_ref().ok()),
+                FilterMode::Full,
+            ) {
+                lore_trace!("Path excluded by filter: {}", relative_path.as_str());
+                return Ok(());
+            }
         }
         Some(relative_path.to_string())
     };
