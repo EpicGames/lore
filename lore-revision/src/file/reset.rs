@@ -1631,8 +1631,8 @@ async fn reset_walk_node(
 /// `reset_walk_node`. Subdirectory walks are gated by the `directory_inflight`
 /// counter: spawn when under `RESET_DIRECTORY_MAX`, run inline (degrade to
 /// sync) once over. A directory the revision holds with no children is created
-/// here, and purge (when enabled) runs for every directory once its child walks
-/// have completed.
+/// here unless the filter excludes it, and purge (when enabled) runs for every
+/// directory once its child walks have completed.
 async fn reset_walk_directory(
     ctx: ResetContext,
     directory_path: RelativePath,
@@ -1654,7 +1654,7 @@ async fn reset_walk_directory(
     let mut child_node_iter = node.child();
 
     if child_node_iter.is_none() {
-        if !directory_path.is_empty() {
+        if !directory_path.is_empty() && !states.excluded(FilterMode::Full) {
             create_empty_directory::<ResetError>(&operation, &directory_path).await?;
         }
         if !options.purge {

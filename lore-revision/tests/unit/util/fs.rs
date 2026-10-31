@@ -469,3 +469,28 @@ fn an_unlink_holds_no_metadata() {
         size_of_val(&query)
     );
 }
+
+/// A directory holding entries is kept as it stands: clearing its read-only flag could not let it
+/// be removed, and would leave it writable by everyone.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unlink_leaves_a_directory_holding_entries_as_it_stands() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = temp_dir();
+    let directory = temp.path().join("held");
+    std::fs::create_dir(&directory).expect("create the directory");
+    std::fs::write(directory.join("entry"), b"held").expect("write the entry");
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+        .expect("set the directory's mode");
+
+    assert!(
+        unlink(&directory).await.is_err(),
+        "a directory holding entries is not removed"
+    );
+    let mode = std::fs::metadata(&directory)
+        .expect("the directory stays")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755, "the directory keeps its mode");
+}

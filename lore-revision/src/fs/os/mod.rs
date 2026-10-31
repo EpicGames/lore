@@ -266,6 +266,13 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
+    async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+        lore_io::IoDriver::global()
+            .remove_dir(self.absolute(path))
+            .await?;
+        Ok(())
+    }
+
     async fn write_node(
         &self,
         repository: Arc<RepositoryContext>,

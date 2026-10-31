@@ -5,7 +5,7 @@ import os
 
 import pytest
 from lore_parsers import parse_status_json
-from test_utils import to_posix
+from test_utils import to_posix, working_tree_files
 
 from lore import Lore
 
@@ -230,3 +230,67 @@ def test_view_clone_materializes_directory_emptied_by_filter(
         "status --scan on a pristine view-filtered clone reported changes "
         f"(clone/status view mismatch): {sorted(by_path)}"
     )
+
+
+def _commit(repo: Lore, files: list[str], directories: tuple[str, ...] = ()) -> None:
+    """Commits and pushes `files`, each holding its own path, and the empty
+    `directories`."""
+    repo.write_files({path: path for path in files})
+    for path in directories:
+        repo.make_dirs(path)
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+
+@pytest.mark.smoke
+def test_view_with_a_wildcard_reinclusion_creates_no_excluded_directory(
+    new_lore_repo, scratch_dir
+):
+    """A view whose re-inclusion opens with a wildcard, `!*/Saved/Config/`, makes a clone
+    and a layer add enter every directory the view excludes to look for what it
+    re-includes. Neither creates a directory it finds nothing in, the mount aside, a dry
+    run of the clone reports none, status reports nothing missing and a scanning stage
+    stages nothing."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    _commit(
+        repo,
+        ["Game/Saved/Config/a.ini", "Game/Saved/Logs/l.log", "Engine/Build/b.txt"],
+        ("Engine/Empty", "Game/Saved/Config/Kept"),
+    )
+    _commit(layer_repo, ["Saved/Config/a.ini", "Saved/Logs/l.log"], ("Empty",))
+    view = os.path.join(scratch_dir("view", create=True), "view.txt")
+    with open(view, "w") as view_file:
+        view_file.write("/*\n!*/Saved/Config/\n")
+
+    target = scratch_dir("dry-run", create=True)
+    reported = repo.run(
+        ["repository", "clone", repo.remote_path, str(target), "--view", view],
+        dry_run=True,
+    ).splitlines()
+    excluded = ["Engine", "Engine/Build", "Engine/Empty", "Game/Saved/Logs"]
+    assert [path for path in excluded if path in reported] == [], reported
+
+    clone: Lore = repo.clone(view=view)
+
+    kept = [
+        "Game",
+        "Game/Saved",
+        "Game/Saved/Config",
+        "Game/Saved/Config/Kept",
+        "Game/Saved/Config/a.ini",
+    ]
+    assert working_tree_files(clone, directories=True) == kept
+    assert parse_status_json(clone.status(json=True, offline=True, scan=True)) == []
+    clone.stage(scan=True, offline=True)
+    assert parse_status_json(clone.status(json=True, offline=True)) == []
+
+    clone.layer_add("Mount", layer_repo, "/")
+
+    assert working_tree_files(clone, directories=True) == kept + [
+        "Mount",
+        "Mount/Saved",
+        "Mount/Saved/Config",
+        "Mount/Saved/Config/a.ini",
+    ]

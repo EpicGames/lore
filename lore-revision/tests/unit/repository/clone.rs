@@ -13,6 +13,7 @@ use lore_base::error::AddressNotFound;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
+use lore_revision::filter::Filter;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
@@ -30,6 +31,7 @@ use zerocopy::FromZeros;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::working_tree_repository;
+use crate::repository::test_helpers::working_tree_repository_filtered;
 
 async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
     let temp = TempDir::new("lore-clone-temp-path-");
@@ -457,6 +459,143 @@ async fn a_tree_warm_up_told_to_stop_walks_nothing() {
     let stopped = warmed(test, nested_entries(), u32::MAX, Arc::new(|| true)).await;
 
     assert_eq!((stopped.directories, stopped.blocks), (0, 0));
+}
+
+/// A view whose re-inclusion opens with a wildcard sends discovery into every directory the view
+/// excludes. A clone creates such a directory only where content it keeps lands below it, and still
+/// creates an empty directory the view keeps.
+#[tokio::test]
+async fn a_clone_creates_no_directory_the_view_excludes() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-excluded-directories-");
+            let mut filter = Filter::default();
+            filter.view.add_exclusion("/*").expect("view exclusion");
+            filter
+                .view
+                .add_inclusion("*/saved/config/")
+                .expect("view inclusion");
+            let repository = working_tree_repository_filtered(temp.path(), filter).await;
+            let empty_file = Node {
+                address: Default::default(),
+                ..file_node(b"")
+            };
+            let state = State::new();
+            for (name, node) in [
+                ("game", empty_directory_node()),
+                ("game/saved", empty_directory_node()),
+                ("game/saved/config", empty_directory_node()),
+                ("game/saved/config/a.ini", empty_file),
+                ("game/saved/config/kept", empty_directory_node()),
+                ("game/saved/logs", empty_directory_node()),
+                ("game/saved/logs/l.log", empty_file),
+                ("engine", empty_directory_node()),
+                ("engine/empty", empty_directory_node()),
+            ] {
+                stage_single_node(
+                    repository.clone(),
+                    state.clone(),
+                    relative_path(name),
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::empty(),
+                )
+                .await
+                .expect("stage the node");
+            }
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            clone_in_path(ctx).await.expect("clone under the view");
+
+            let exists = |path: &str| on_disk(&temp, &relative_path(path)).exists();
+            assert_eq!(
+                (
+                    exists("game/saved/config/a.ini"),
+                    exists("game/saved/config/kept"),
+                    exists("game/saved/logs"),
+                    exists("engine"),
+                ),
+                (true, true, false, false),
+                "the clone holds what the view keeps and no directory it excludes"
+            );
+        })
+        .await;
+}
+
+/// A clone creates a directory the view includes whose children the view excludes, though a
+/// re-inclusion opening with a wildcard sends discovery into each of them.
+#[tokio::test]
+async fn a_clone_creates_a_directory_the_view_includes_whose_children_it_excludes() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-included-directory-");
+            let mut filter = Filter::default();
+            filter
+                .view
+                .add_exclusion("/engine/*")
+                .expect("view exclusion");
+            filter
+                .view
+                .add_inclusion("*/saved/config/")
+                .expect("view inclusion");
+            let repository = working_tree_repository_filtered(temp.path(), filter).await;
+            let empty_file = Node {
+                address: Default::default(),
+                ..file_node(b"")
+            };
+            let state = State::new();
+            for (name, node) in [
+                ("engine", empty_directory_node()),
+                ("engine/saved", empty_directory_node()),
+                ("engine/saved/r.cpp", empty_file),
+            ] {
+                stage_single_node(
+                    repository.clone(),
+                    state.clone(),
+                    relative_path(name),
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::empty(),
+                )
+                .await
+                .expect("stage the node");
+            }
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            clone_in_path(ctx).await.expect("clone under the view");
+
+            let exists = |path: &str| on_disk(&temp, &relative_path(path)).exists();
+            assert_eq!(
+                (exists("engine"), exists("engine/saved")),
+                (true, false),
+                "the directory the view includes is created and the one it excludes is not"
+            );
+        })
+        .await;
 }
 
 /// The missing file finishes before discovery supplies more work. Files supplied after the

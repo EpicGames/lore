@@ -162,6 +162,12 @@ impl InstanceOperation for SwfsOperation {
         Ok(())
     }
 
+    async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+        self.os.remove_empty_directory(path).await?;
+        self.record_written(path);
+        Ok(())
+    }
+
     async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
         self.os.rename(from, to).await?;
         self.record_written(from);

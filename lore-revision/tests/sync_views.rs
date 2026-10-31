@@ -23,17 +23,22 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Hash;
+    use lore_revision::file::reset::ResetOptions;
+    use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
+    use lore_revision::fs::filesystem_provider::StageIntent;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::node::NodeFlags;
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::revision::sync;
     use lore_revision::revision::sync::SyncError;
     use lore_revision::revision::sync::SyncOptions;
+    use lore_revision::stage::StageOptions;
 
     include!("helper.rs");
 
@@ -46,6 +51,10 @@ mod tests {
     /// The file the second revision adds, in view throughout.
     const ADDED: &str = "keep/added.txt";
     const ADDED_CONTENT: &[u8] = b"added by the second revision";
+    /// What the second revision adds below [`DROPPED_DIRECTORY`]: an empty directory, and a file in
+    /// a directory of its own.
+    const DROPPED_ADDED_EMPTY: &str = "drop/fresh";
+    const DROPPED_ADDED: &str = "drop/added/new.txt";
     /// The directory the narrowing view drops, and the two files in it.
     const DROPPED_DIRECTORY: &str = "drop";
     const DROPPED: &str = "drop/dropped.txt";
@@ -57,6 +66,18 @@ mod tests {
     const NARROW_VIEW: &str = "narrow";
     /// A view file holding no rules, which puts the whole repository in view.
     const WIDE_VIEW: &str = "wide";
+    /// An empty directory below [`DROPPED_DIRECTORY`], which [`Fixture::commit_empty_directory`]
+    /// commits.
+    const DROPPED_EMPTY: &str = "drop/empty";
+    /// An empty directory at the top level, which [`Fixture::commit_empty_directory`] commits, and
+    /// a walk under [`REACHING_RULES`] enters.
+    const VACANT: &str = "vacant";
+    /// A file in [`VACANT`], which [`Fixture::filled_then_emptied`] commits and removes.
+    const FILLED: &str = "vacant/filled.txt";
+    /// A view excluding the top level and re-including [`KEPT`] by a rule that opens with a
+    /// wildcard, so a walk enters every top-level directory, and the file it is written to.
+    const REACHING_RULES: &[&str] = &["/*", "!*/kept.txt"];
+    const REACHING_VIEW: &str = "reaching";
 
     /// What a sync did to the working tree, as its progress events report it.
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -72,6 +93,7 @@ mod tests {
         files_written: AtomicUsize,
         bytes_written: AtomicU64,
         files_deleted: AtomicUsize,
+        delete_total: AtomicUsize,
         reported: Mutex<Vec<String>>,
     }
 
@@ -83,6 +105,14 @@ mod tests {
                 bytes_written: self.bytes_written.load(Ordering::Relaxed),
                 files_deleted: self.files_deleted.load(Ordering::Relaxed),
             }
+        }
+
+        /// The largest delete count and delete total that arrived.
+        fn deletes(&self) -> (usize, usize) {
+            (
+                self.files_deleted.load(Ordering::Relaxed),
+                self.delete_total.load(Ordering::Relaxed),
+            )
         }
 
         /// Every path a per-file event named, with the action it carried, in order.
@@ -115,6 +145,9 @@ mod tests {
                     recorded
                         .files_deleted
                         .fetch_max(progress.file_delete, Ordering::Relaxed);
+                    recorded
+                        .delete_total
+                        .fetch_max(progress.file_delete_total, Ordering::Relaxed);
                 }
                 LoreEvent::RevisionSyncFile(file) => recorded
                     .reported
@@ -169,12 +202,16 @@ mod tests {
             }
         }
 
-        /// Rewrites [`KEPT`] and adds [`ADDED`] in a second revision, answering it and leaving the
-        /// working tree standing on the first.
+        /// Rewrites [`KEPT`] and adds [`ADDED`], [`DROPPED_ADDED_EMPTY`] and [`DROPPED_ADDED`] in a
+        /// second revision, answering it and leaving the working tree standing on the first.
         async fn second_revision(&self) -> Hash {
             let first = self.anchor().await;
             test_file_write(self.working(KEPT).as_path(), KEPT_REWRITTEN);
             test_file_write(self.working(ADDED).as_path(), ADDED_CONTENT);
+            for directory in [DROPPED_ADDED_EMPTY, "drop/added"] {
+                std::fs::create_dir_all(self.working(directory)).expect("Create directory failed");
+            }
+            test_file_write(self.working(DROPPED_ADDED).as_path(), ADDED_CONTENT);
             let second = test_commit_tree(&self.instance, "Second").await.revision();
 
             self.sync(
@@ -283,6 +320,63 @@ mod tests {
                 .await
                 .expect("Failed to load current anchor")
                 .0
+        }
+
+        /// Commits [`DROPPED_EMPTY`] and [`VACANT`] in a revision of its own, which the working tree
+        /// stands on.
+        async fn commit_empty_directory(&self) {
+            for directory in [DROPPED_EMPTY, VACANT] {
+                std::fs::create_dir_all(self.working(directory)).expect("Create directory failed");
+            }
+            test_commit_tree(&self.instance, "Empty").await;
+        }
+
+        /// Commits [`FILLED`], then commits [`VACANT`] emptied of it, answering the two revisions in
+        /// that order, with the working tree standing on the second.
+        async fn filled_then_emptied(&self) -> (Hash, Hash) {
+            std::fs::create_dir_all(self.working(VACANT)).expect("Create directory failed");
+            test_file_write(self.working(FILLED).as_path(), b"filled");
+            let filled = test_commit_tree(&self.instance, "Filled").await.revision();
+            std::fs::remove_file(self.working(FILLED)).expect("Delete failed");
+            let emptied = test_commit_tree(&self.instance, "Emptied").await.revision();
+            (filled, emptied)
+        }
+
+        /// Syncs `repository` to the view holding `rules`, written to the view file `name`, at the
+        /// revision the instance stands on rather than the latest of its branch.
+        async fn change_view(
+            &self,
+            repository: Arc<RepositoryContext>,
+            name: &str,
+            rules: &[&str],
+        ) {
+            let view = self.view_file(name, rules);
+            let revision = self.anchor().await;
+            self.sync(
+                repository,
+                SyncOptions {
+                    revision: Some(revision.to_string()),
+                    view: Some(view),
+                    ..Default::default()
+                },
+            )
+            .await
+            .0
+            .expect("Failed to change the view");
+        }
+
+        /// Carries the working tree from the whole repository to [`REACHING_RULES`] by way of
+        /// [`NARROW_VIEW`], which drops [`DROPPED_DIRECTORY`] whole, so the tree holds what a clone
+        /// under the reaching view holds whatever a narrowing straight to it leaves.
+        async fn under_reaching_view(&self) {
+            self.change_view(
+                self.instance.repository.clone(),
+                NARROW_VIEW,
+                &[EXCLUDE_DROPPED],
+            )
+            .await;
+            self.change_view(self.reopened(), REACHING_VIEW, REACHING_RULES)
+                .await;
         }
 
         /// The staged state the instance holds, which a dirty path anchors.
@@ -1023,6 +1117,437 @@ mod tests {
                 assert!(
                     fixture.working(DROPPED_DIRECTORY).is_dir(),
                     "the directory is kept for the file it still holds"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A widening to a view whose re-inclusion opens with a wildcard creates no directory that view
+    /// excludes: the walk enters [`DROPPED_DIRECTORY`] looking for what the re-inclusion could match,
+    /// and finds nothing there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widening_creates_no_directory_the_target_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+
+                fixture.under_reaching_view().await;
+
+                assert_eq!(
+                    (
+                        fixture.working_file(KEPT).as_deref(),
+                        fixture.working(DROPPED_DIRECTORY).exists(),
+                    ),
+                    (Some(KEPT_CONTENT), false),
+                    "the re-included file stays and the excluded directory is not created"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A narrowing to a view whose re-inclusion opens with a wildcard leaves no directory that view
+    /// excludes, an empty one included, and keeps the one holding what it re-includes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrowing_leaves_no_directory_the_target_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.commit_empty_directory().await;
+
+                fixture
+                    .change_view(
+                        fixture.instance.repository.clone(),
+                        REACHING_VIEW,
+                        REACHING_RULES,
+                    )
+                    .await;
+
+                assert_eq!(
+                    (
+                        fixture.working_file(KEPT).as_deref(),
+                        fixture.working(DROPPED_DIRECTORY).exists(),
+                        fixture.working(VACANT).exists(),
+                    ),
+                    (Some(KEPT_CONTENT), false, false),
+                    "the re-included file stays and the excluded directories are removed"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A widening from a view whose re-inclusion opens with a wildcard creates the committed empty
+    /// directory that view excluded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widening_creates_an_empty_directory_the_source_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.commit_empty_directory().await;
+                fixture.under_reaching_view().await;
+
+                fixture
+                    .change_view(fixture.reopened(), WIDE_VIEW, &[])
+                    .await;
+
+                assert_eq!(
+                    (
+                        fixture.working_file(DROPPED).as_deref(),
+                        fixture.working(DROPPED_EMPTY).is_dir(),
+                        fixture.working(VACANT).is_dir(),
+                    ),
+                    (Some(DROPPED_CONTENT), true, true),
+                    "what enters the view is written, the empty directories included"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset under a view whose re-inclusion opens with a wildcard creates no directory that view
+    /// excludes, an empty one included.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_creates_no_directory_the_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.commit_empty_directory().await;
+                fixture.under_reaching_view().await;
+
+                lore_revision::file::reset::reset(
+                    fixture.reopened(),
+                    &fixture.instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&fixture.instance.path)]),
+                    LoreString::default(),
+                    ResetOptions::default(),
+                )
+                .await
+                .expect("Failed to reset");
+
+                assert_eq!(
+                    (
+                        fixture.working_file(KEPT).as_deref(),
+                        fixture.working(DROPPED_DIRECTORY).exists(),
+                        fixture.working(VACANT).exists(),
+                    ),
+                    (Some(KEPT_CONTENT), false, false),
+                    "the re-included file stays and the excluded directories are not created"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A sync to a revision adding below a directory a view excludes, under a view whose
+    /// re-inclusion opens with a wildcard, creates none of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revision_change_creates_no_directory_the_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let second = fixture.second_revision().await;
+                fixture.under_reaching_view().await;
+
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.reopened(),
+                        SyncOptions {
+                            revision: Some(second.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to sync to the second revision");
+                assert_eq!(
+                    (
+                        fixture.working_file(KEPT).as_deref(),
+                        fixture.working(DROPPED_DIRECTORY).exists(),
+                    ),
+                    (Some(KEPT_REWRITTEN), false),
+                    "the re-included file is rewritten and the excluded directory is not created"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// `stage --scan` under a view whose re-inclusion opens with a wildcard stages the delete of
+    /// nothing the view leaves off the disk, file or directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scanning_stage_deletes_no_directory_the_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.commit_empty_directory().await;
+                fixture.under_reaching_view().await;
+                let repository = fixture.reopened();
+
+                let staged = lore_revision::file::stage::stage(
+                    repository.clone(),
+                    &fixture.instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&fixture.instance.path)]),
+                    StageOptions {
+                        scan: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Failed to stage");
+
+                let state = lore_revision::state::State::deserialize(repository.clone(), staged)
+                    .await
+                    .expect("Failed to deserialize the staged state");
+                for path in [
+                    DROPPED_DIRECTORY,
+                    DROPPED_EMPTY,
+                    VACANT,
+                    DROPPED,
+                    ALSO_DROPPED,
+                ] {
+                    let node = state
+                        .find_node(repository.clone(), path)
+                        .await
+                        .expect("the tree holds the path");
+                    assert!(
+                        !NodeFlags::from_bits_retain(node.flags).contains(NodeFlags::StagedDelete),
+                        "{path} is not staged for deletion, flags {:x}",
+                        node.flags
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A staging walk under a view whose re-inclusion opens with a wildcard reports the delete of
+    /// nothing the view leaves off the disk.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_staging_walk_deletes_no_directory_the_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.commit_empty_directory().await;
+                fixture.under_reaching_view().await;
+                let repository = fixture.reopened();
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let changes = test_scan_with_intent(
+                    repository,
+                    staged,
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                assert_eq!(
+                    test_reported(&changes),
+                    Vec::<(String, String)>::new(),
+                    "nothing the view excludes is reported deleted"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A widening to another revision creates the empty directory that revision holds where the
+    /// source view excluded it, though the source revision held it with a file, and a scan then
+    /// finds the tree as the revision holds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widening_to_another_revision_creates_the_empty_directory_it_holds() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let (filled, emptied) = fixture.filled_then_emptied().await;
+                fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(filled.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .0
+                    .expect("Failed to sync to the filled revision");
+                fixture
+                    .change_view(fixture.reopened(), REACHING_VIEW, REACHING_RULES)
+                    .await;
+                let wide = fixture.view_file(WIDE_VIEW, &[]);
+
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.reopened(),
+                        SyncOptions {
+                            revision: Some(emptied.to_string()),
+                            view: Some(wide),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to widen to the emptied revision");
+                let repository = fixture.reopened();
+                let (current, staged) = test_anchor_states(&repository).await;
+                assert_eq!(
+                    (
+                        fixture.working(VACANT).is_dir(),
+                        test_reported(&test_scan(repository, staged, current).await),
+                    ),
+                    (true, Vec::new()),
+                    "the empty directory is created and a scan finds nothing missing"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A narrowing to another revision removes an empty directory the target view excludes, though
+    /// the target revision holds it with a file the view excludes too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrowing_to_another_revision_leaves_no_directory_the_target_view_excludes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let (filled, _emptied) = fixture.filled_then_emptied().await;
+                let reaching = fixture.view_file(REACHING_VIEW, REACHING_RULES);
+
+                let (result, _recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(filled.to_string()),
+                            view: Some(reaching),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to narrow to the filled revision");
+                assert_eq!(
+                    (
+                        fixture.working_file(KEPT).as_deref(),
+                        fixture.working(DROPPED_DIRECTORY).exists(),
+                        fixture.working(VACANT).exists(),
+                    ),
+                    (Some(KEPT_CONTENT), false, false),
+                    "the re-included file stays and the excluded directories are removed"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A narrowing to a view whose re-inclusion opens with a wildcard counts the directory it leaves
+    /// empty and removes as a delete, done and in total, beside the file it deletes there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrowing_counts_the_directory_it_removes_as_a_delete() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                const CONFIG: &str = "Game/Saved/Config/a.ini";
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                std::fs::remove_file(fixture.working(ALSO_DROPPED)).expect("Delete failed");
+                std::fs::remove_dir_all(fixture.working("keep")).expect("Delete failed");
+                std::fs::create_dir_all(fixture.working("Game/Saved/Config"))
+                    .expect("Create directory failed");
+                test_file_write(fixture.working(CONFIG).as_path(), b"kept");
+                test_commit_tree(&fixture.instance, "Config").await;
+                let view = fixture.view_file(REACHING_VIEW, &["/*", "!*/Saved/Config/"]);
+                let revision = fixture.anchor().await;
+
+                let (result, recorded) = fixture
+                    .sync(
+                        fixture.instance.repository.clone(),
+                        SyncOptions {
+                            revision: Some(revision.to_string()),
+                            view: Some(view),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+
+                result.expect("Failed to narrow the view");
+                assert_eq!(
+                    (
+                        fixture.working(DROPPED_DIRECTORY).exists(),
+                        fixture.working_file(CONFIG).is_some(),
+                        recorded.deletes(),
+                    ),
+                    (false, true, (2, 2)),
+                    "the file and the directory it empties are both counted, done and in total"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A narrowing keeps a directory the target view excludes that still holds a local file once
+    /// its tracked content is gone, and removes the empty one below it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrowing_keeps_an_excluded_directory_holding_a_local_file() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.commit_empty_directory().await;
+                // Named with the extension the ignore filter carries a rule for, so nothing reports
+                // it and nothing would stage it either.
+                let local = format!(
+                    "{DROPPED_DIRECTORY}/local{}",
+                    lore_revision::repository::TEMP_FILE_EXTENSION
+                );
+                test_file_write(fixture.working(&local).as_path(), b"local work");
+
+                fixture
+                    .change_view(
+                        fixture.instance.repository.clone(),
+                        REACHING_VIEW,
+                        REACHING_RULES,
+                    )
+                    .await;
+
+                assert_eq!(
+                    (
+                        fixture.working_file(&local).as_deref(),
+                        fixture.working_file(DROPPED),
+                        fixture.working(DROPPED_EMPTY).exists(),
+                    ),
+                    (Some(b"local work".as_slice()), None, false),
+                    "the local file and its directory stay, and the tracked content goes"
                 );
             }))
             .await

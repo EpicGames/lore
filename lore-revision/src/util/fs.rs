@@ -516,7 +516,7 @@ pub fn filesystem_path_fork<'a>(
 
 /// Removes the file or empty directory at `absolute_path`, retrying once after clearing its
 /// read-only flag, and answers `Ok` for a path that does not exist or whose metadata cannot be
-/// read.
+/// read. A directory holding entries is not retried.
 pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
     let absolute_path = absolute_path.as_ref();
     lore_trace!("Deleting {}", absolute_path.display());
@@ -549,6 +549,9 @@ pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
                     err
                 );
                 return Ok(());
+            }
+            if err.kind() == tokio::io::ErrorKind::DirectoryNotEmpty {
+                return Err(err);
             }
             lore_debug!(
                 "Error deleting directory {}: {} - retry after setting write permission",

@@ -121,6 +121,28 @@ fn an_empty_reach_reaches_nothing() {
     );
 }
 
+/// A filter re-includes below an excluded directory only through an inclusion that can land
+/// below one: a name rule matches at any depth but re-opens no directory a rule excluded.
+#[test]
+fn a_filter_reincludes_only_through_an_inclusion_below_a_directory() {
+    for (rules, reincludes) in [
+        (&[][..], false),
+        (&["/engine/", "*.tmp"][..], false),
+        (&["/*", "!*.ini"][..], false),
+        (&["/*", "!/game/saved/config/"][..], true),
+        (&["/*", "!*/saved/config/"][..], true),
+    ] {
+        let mut filter = FilterInstance::default();
+        for rule in rules {
+            match rule.strip_prefix('!') {
+                Some(inclusion) => filter.add_inclusion(inclusion).expect("include"),
+                None => filter.add_exclusion(rule).expect("exclude"),
+            }
+        }
+        assert_eq!(filter.reincludes(), reincludes, "{rules:?}");
+    }
+}
+
 fn path(text: &str) -> RelativePath {
     RelativePath::new_from_initial_path(text).expect("a path")
 }

@@ -663,6 +663,12 @@ pub trait InstanceOperation: Send + Sync {
     /// Delete a file or empty directory.
     fn remove(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
+    /// Delete the directory at `path`, which fails where `path` holds entries or is no directory.
+    fn remove_empty_directory(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<(), FsError>> + Send;
+
     /// Delete a directory and all contents.
     fn remove_recursive(
         &self,
@@ -1124,6 +1130,19 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
+    async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Os(this) => this.remove_empty_directory(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove_empty_directory(path).await,
+        }
+    }
+
     async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
         if self.dry_run {
             return Ok(());
@@ -1501,6 +1520,10 @@ pub mod test_util {
         }
 
         async fn remove(&self, _path: &RelativePath) -> Result<(), FsError> {
+            panic!("Test operation unimplemented except finalize")
+        }
+
+        async fn remove_empty_directory(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 

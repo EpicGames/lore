@@ -14,17 +14,23 @@ mod tests {
 
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Hash;
     use lore_revision::branch;
     use lore_revision::branch::BranchLatestStatus;
+    use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreEvent;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::layer;
     use lore_revision::layer::Layer;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::relay::EventDispatcher;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::revision::sync;
     use lore_revision::revision::sync::SyncError;
@@ -272,6 +278,37 @@ mod tests {
             sync::sync_boxed(self.reopened(), &self.instance.write_token, options).await
         }
 
+        /// Syncs the instance under `options`, answering the largest delete count and delete total
+        /// its progress events report.
+        async fn sync_counting_deletes(&self, options: SyncOptions) -> (usize, usize) {
+            let deletes = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+            let recorded = deletes.clone();
+            let execution = Arc::new(ExecutionContext::new_client_with_user_id(
+                LoreGlobalArgs::default(),
+                EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::RevisionSyncProgress(progress) = event {
+                        recorded
+                            .0
+                            .fetch_max(progress.file_delete, Ordering::Relaxed);
+                        recorded
+                            .1
+                            .fetch_max(progress.file_delete_total, Ordering::Relaxed);
+                    }
+                }))),
+                "test-user".to_string(),
+            ));
+            LORE_CONTEXT
+                .scope(execution.clone(), async {
+                    self.sync(options).await.expect("Failed to sync");
+                    execution.dispatcher.drain().await;
+                })
+                .await;
+            (
+                deletes.0.load(Ordering::Relaxed),
+                deletes.1.load(Ordering::Relaxed),
+            )
+        }
+
         /// The absolute path of a working tree path.
         fn working(&self, path: &str) -> PathBuf {
             self.instance.path.join(path)
@@ -411,9 +448,11 @@ mod tests {
                         fixture.working_file(MOUNTED_KEPT),
                         fixture.working_file(MOUNTED_DROPPED),
                         fixture.working(MOUNTED_DROPPED_DIRECTORY).exists(),
+                        fixture.working(MOUNT).is_dir(),
                     ),
-                    (None, None, false),
-                    "the mount's content leaves the working tree with the view that admitted it"
+                    (None, None, false, true),
+                    "the mount's content leaves the working tree with the view that admitted it, and \
+                     the mount directory stays"
                 );
                 assert_eq!(
                     fixture.working_file(OWN).as_deref(),
@@ -424,6 +463,78 @@ mod tests {
                     fixture.layer().await.current,
                     fixture.layer_revision,
                     "the layer is carried to the view alone, at the revision it holds"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A narrowing to a view whose re-inclusion opens with a wildcard, so a walk enters each
+    /// directory below the mount, removes the excluded directory it empties there and keeps the
+    /// mount directory, which it empties too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrowing_removes_the_excluded_directories_it_empties_in_the_mount() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.materialize_mount();
+                let narrow = fixture.view_file(NARROW_VIEW, &["/*", "!*/drop/absent.txt"]);
+
+                fixture
+                    .sync(SyncOptions {
+                        view: Some(narrow),
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("Failed to narrow the view inside the mount");
+
+                assert_eq!(
+                    (
+                        fixture.working_file(MOUNTED_KEPT),
+                        fixture.working(MOUNTED_DROPPED_DIRECTORY).exists(),
+                        fixture.working(MOUNT).is_dir(),
+                    ),
+                    (None, false, true),
+                    "the emptied directory leaves the mount, and the mount directory stays"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A narrowing inside the mount to a view whose re-inclusion opens with a wildcard counts the
+    /// directory it leaves empty and removes as a delete, done and in total, beside the file it
+    /// deletes there.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_narrowing_counts_the_directory_it_removes_in_the_mount_as_a_delete() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.materialize_mount();
+                let narrow =
+                    fixture.view_file(NARROW_VIEW, &["/*", "!*/kept.txt", "!*/drop/Saved/Config/"]);
+
+                let deletes = fixture
+                    .sync_counting_deletes(SyncOptions {
+                        view: Some(narrow),
+                        ..Default::default()
+                    })
+                    .await;
+
+                assert_eq!(
+                    (
+                        fixture.working(MOUNTED_DROPPED_DIRECTORY).exists(),
+                        fixture.working(MOUNTED_KEPT).is_file(),
+                        deletes,
+                    ),
+                    (false, true, (2, 2)),
+                    "the file and the directory it empties are both counted, done and in total"
                 );
             }))
             .await

@@ -61,6 +61,9 @@ LINK_DROPPED = os.path.join("link", "drop", "one.uasset")
 # Excludes the mount whole, and excludes a subtree of it while keeping the rest.
 LINK_EXCLUDED_VIEW = ["/link"]
 LINK_NARROW_VIEW = ["/link/drop"]
+# Excludes every top-level path and re-includes by a rule opening with a wildcard,
+# so a walk enters each top-level directory and the mount, and finds nothing to keep.
+LINK_REACHING_VIEW = ["/*", "!*/Saved/Config/"]
 
 # Where the layer tests mount a second repository, and what it holds there.
 LAYER_MOUNT = "lay"
@@ -732,6 +735,26 @@ def test_sync_view_carries_a_link_mount_out_of_view_and_back(
 
     assert materialized(instance) == whole, (
         "a widening reads the mount back from the linked repository's store"
+    )
+
+
+@pytest.mark.smoke
+def test_sync_view_removes_a_link_mount_a_reaching_view_empties(
+    new_lore_repo, scratch_dir
+):
+    """A narrowing to a view whose re-inclusion opens with a wildcard enters the link
+    mount looking for what it re-includes, removes what it finds there, and removes
+    the mount directory it leaves empty, as a clone under that view leaves it out."""
+    repo = repository_with_link(new_lore_repo)
+    instance = repo.clone()
+    reaching = view_file(scratch_dir, "link-reaching", LINK_REACHING_VIEW)
+
+    sync_view(instance, reaching)
+
+    assert not instance.path_exists(LINK_MOUNT), "the emptied mount directory is removed"
+    assert_status_clean(instance, "a mount the narrowing emptied is not a delete")
+    assert not repo.clone(view=reaching).path_exists(LINK_MOUNT), (
+        "a clone under the view holds no mount directory either"
     )
 
 

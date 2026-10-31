@@ -88,6 +88,13 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   excludes, and `lore clone` does not create them
 - `lore sync --view` stores the view file as written, as `lore clone --view` does, so a rule escaped as `\!name` stays
   a literal name and `lore status --scan` does not report that file deleted
+- Under a view re-including paths such as `!*/Saved/Config/`, `lore clone`, `lore sync`, `lore branch switch`,
+  `lore layer add` and `lore reset` create a directory the view excludes only for content the view keeps below it,
+  and `lore sync` and `lore branch switch` remove one they leave empty. A layer's mount directory and the parent
+  directories of a dependency clone's targets stand whatever the view
+- `lore stage --scan` and `lore status --scan` add or delete a directory the view or the ignore file excludes only
+  along with content below it, also under rules such as `/Engine/` and `!/Engine/**/Build/`, and so does
+  `lore stage --scan <directory>`. `lore --force stage --scan` adds such a directory whatever it holds
 - The Lore service closes its SWFS mounts when it exits, however it is stopped. It used to leave them to EpicVFS,
   which kept a device for each one and could not be stopped afterwards: `sc stop EpicVFS` stayed in `STOP_PENDING`
   until the machine restarted

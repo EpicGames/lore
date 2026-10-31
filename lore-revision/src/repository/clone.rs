@@ -377,8 +377,10 @@ struct BlockDiscoverItem {
     depth: u32,
     /// Cycle detector state, carried across block boundaries.
     cycle: SiblingCycleGuard,
-    /// Whether any child has been visited, carried across block boundaries.
-    visited_child: bool,
+    /// Whether any child the view itself includes has been visited, carried across block
+    /// boundaries. Content below such a child creates the directory; with none, the walk creates
+    /// a directory the view includes itself.
+    kept_child: bool,
 }
 
 impl BlockDiscoverItem {
@@ -400,7 +402,7 @@ impl BlockDiscoverItem {
             follow_deps: false,
             depth: depth.saturating_add(1),
             cycle: SiblingCycleGuard::new(parent),
-            visited_child: false,
+            kept_child: false,
         }
     }
 }
@@ -678,7 +680,7 @@ async fn process_block_item(
     let mut current_node_id = item.node_id;
     let expected_parent = item.expected_parent;
     let mut cycle = item.cycle;
-    let mut visited_child = item.visited_child;
+    let mut kept_child = item.kept_child;
 
     loop {
         let node_index = Node::index(current_node_id);
@@ -707,7 +709,7 @@ async fn process_block_item(
                 FilterMode::View,
             );
             if !excluded {
-                visited_child = true;
+                kept_child |= !node_states.excluded(FilterMode::View);
                 match &dispatcher.walk {
                     Walk::Warm(warm) => {
                         warm.directories.fetch_add(1, Ordering::Relaxed);
@@ -774,7 +776,8 @@ async fn process_block_item(
                     }
                     Walk::Clone(clone) if node.is_directory() => {
                         let dry_run = execution_context().globals().dry_run();
-                        if dry_run {
+                        let kept = !node_states.excluded(FilterMode::View);
+                        if dry_run && kept {
                             lore_info!("{}", node_path);
                         }
 
@@ -786,7 +789,7 @@ async fn process_block_item(
                                 node_states,
                                 item.depth,
                             ));
-                        } else if !dry_run {
+                        } else if !dry_run && kept {
                             create_empty_directory::<CloneError>(&clone.operation, &node_path)
                                 .await?;
                         }
@@ -813,14 +816,15 @@ async fn process_block_item(
                     follow_deps: false,
                     depth: item.depth,
                     cycle,
-                    visited_child,
+                    kept_child,
                 });
                 break;
             }
             None => {
                 if let Walk::Clone(clone) = &dispatcher.walk
-                    && !visited_child
+                    && !kept_child
                     && !item.repository_path.is_empty()
+                    && !item.states.excluded(FilterMode::View)
                     && !execution_context().globals().dry_run()
                 {
                     create_empty_directory::<CloneError>(&clone.operation, &item.repository_path)
@@ -950,7 +954,7 @@ async fn process_block_item_dependency(
                 follow_deps: dep_ctx.recursive,
                 depth: item.depth + 1,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
-                visited_child: false,
+                kept_child: false,
             });
         }
     }
@@ -1685,7 +1689,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 follow_deps: true,
                 depth: 0,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
-                visited_child: false,
+                kept_child: false,
             });
         }
 
@@ -2342,9 +2346,14 @@ async fn spawn_clone_directory(
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let future = async move {
-        if !execution_context().globals().dry_run() {
-            let result = ctx.operation.create_dir_all(&repository_path).await;
-            if result.is_err()
+        if !states.excluded(FilterMode::View) {
+            if execution_context().globals().dry_run() {
+                lore_info!("{}", repository_path);
+            } else if ctx
+                .operation
+                .create_dir_all(&repository_path)
+                .await
+                .is_err()
                 && !ctx
                     .operation
                     .file_info(&repository_path)
@@ -2358,8 +2367,6 @@ async fn spawn_clone_directory(
                     "Failed to create directory {repository_path}"
                 )));
             }
-        } else {
-            lore_info!("{}", repository_path);
         }
 
         let result = clone_child_node(ctx, storage, repository_path, node, states).await;

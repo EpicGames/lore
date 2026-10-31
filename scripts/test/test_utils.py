@@ -34,8 +34,11 @@ def to_posix(path: str | Path) -> str:
     return str(path).replace("\\", "/")
 
 
-def working_tree_files(repo: "Lore", root: str = "") -> list[str]:
-    """Every file the working tree holds below `root`, repo-relative and sorted.
+def working_tree_files(
+    repo: "Lore", root: str = "", directories: bool = False
+) -> list[str]:
+    """Every file the working tree holds below `root`, and every directory where
+    `directories`, repo-relative and sorted.
 
     Lore's own directories are left out, so the result is the content a
     consumer of the working tree sees. A missing `root` holds nothing.
@@ -46,8 +49,8 @@ def working_tree_files(repo: "Lore", root: str = "") -> list[str]:
         sub_directories[:] = [
             name for name in sub_directories if name not in _LORE_DIRECTORIES
         ]
-        for file_name in file_names:
-            found.append(to_posix(Path(directory, file_name).relative_to(base)))
+        for name in file_names + (sub_directories if directories else []):
+            found.append(to_posix(Path(directory, name).relative_to(base)))
     return sorted(found)
 
 

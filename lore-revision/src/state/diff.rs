@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::change;
+use crate::change::NodeChange;
 use crate::change::NodeChangeState;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
@@ -41,8 +42,10 @@ use crate::state::StateChildrenNodes;
 use crate::state::StateError;
 use crate::state::StateNamedNode;
 use crate::state::add_change;
+use crate::state::compute_change_flags;
 use crate::state::emit_change;
 use crate::state::named_node_sort;
+use crate::state::stream::emit;
 use crate::util::path::RelativePath;
 
 /// Decides whether a source subtree can be adopted whole during a merge.
@@ -971,6 +974,31 @@ fn views_diverge_below(
     !(covers(from_filter, states.from) && covers(to_filter, states.to))
 }
 
+/// The add or the delete of a paired directory alone, where the two views place it on disk
+/// differently.
+///
+/// A directory a view excludes stands on disk only for content below it. The walk below reports
+/// that content, and its writes and deletes create and empty the directory. Where either revision
+/// holds the directory with no children, one side has nothing below it to answer for it, so it is
+/// reported here: added where the target view takes it in, deleted where the target view leaves it
+/// out. A delete of a directory still holding something keeps it. The change carries no hierarchy.
+fn presence_change(
+    from_node: &Node,
+    to_node: &Node,
+    from_states: FilterStates,
+    to_states: FilterStates,
+    mode: FilterMode,
+) -> Option<change::FileAction> {
+    if from_node.child().is_some() && to_node.child().is_some() {
+        return None;
+    }
+    match (from_states.excluded(mode), to_states.excluded(mode)) {
+        (true, false) => Some(change::FileAction::Add),
+        (false, true) => Some(change::FileAction::Delete),
+        _ => None,
+    }
+}
+
 /// Report the change between the two nodes the walk paired by name, and descend where both are
 /// directories.
 ///
@@ -1168,6 +1196,24 @@ async fn add_change_for_paired_nodes(
                 to: to_subtree_states,
             };
             let child_depth = paths.depth + 1;
+
+            if to_type == LoreNodeType::Directory
+                && let Some(action) = presence_change(
+                    from_node,
+                    &to_node,
+                    from_node_states,
+                    to_subtree_states,
+                    filter_mode,
+                )
+            {
+                emit(changes, || NodeChange {
+                    action,
+                    flags: compute_change_flags(&to_node),
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+                .await?;
+            }
 
             // A conflict on a directory node is at the path itself, and the
             // walk below it reports nothing that carries it.

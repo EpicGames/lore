@@ -1413,6 +1413,12 @@ impl FilterInstance {
         }
         self.exclusion_state_settled(path, true).1
     }
+
+    /// Whether a rule can re-include something below a directory this filter excludes, so a
+    /// walk can enter one.
+    pub fn reincludes(&self) -> bool {
+        self.reinclude.below("", 0, 0)
+    }
 }
 
 /// Data for the event emitted when a path is excluded by a filter.
@@ -1478,7 +1484,6 @@ impl FilterMode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
     /// The path itself. Says nothing about what sits below it.
-    #[cfg(feature = "test-util")]
     Node,
     /// The path and everything below it, which is what a walk has to know
     /// before it drops a directory. See [`Filter::excludes_tree`].
@@ -1497,6 +1502,22 @@ impl FilterStates {
         ignore: FilterState::ROOT,
         view: FilterState::ROOT,
     };
+
+    /// Whether the path these states describe is itself excluded, for the slots in `mode`.
+    pub fn excluded(self, mode: FilterMode) -> bool {
+        self.reason(mode).is_some()
+    }
+
+    /// The slot in `mode` that excludes the path these states describe, ignore ahead of view.
+    fn reason(self, mode: FilterMode) -> Option<FilterReason> {
+        if mode.contains(FilterMode::Ignore) && self.ignore.excluded {
+            Some(FilterReason::Ignore)
+        } else if mode.contains(FilterMode::View) && self.view.excluded {
+            Some(FilterReason::View)
+        } else {
+            None
+        }
+    }
 }
 
 impl Filter {
@@ -1561,9 +1582,7 @@ impl Filter {
     /// [`should_descend`](Self::should_descend) for the lowercase path `states` were produced
     /// for.
     fn descends(&self, states: FilterStates, lowercase: &str, mode: FilterMode) -> bool {
-        let excluded = (mode.contains(FilterMode::Ignore) && states.ignore.excluded)
-            || (mode.contains(FilterMode::View) && states.view.excluded);
-        if !excluded || lowercase.is_empty() || lowercase == "." {
+        if !states.excluded(mode) || lowercase.is_empty() || lowercase == "." {
             return true;
         }
         self.descend_reason(states, lowercase, component_count(lowercase), mode)
@@ -1643,12 +1662,8 @@ impl Filter {
         let mode = mode.excluding();
         let reason = if scope == Scope::Tree && is_directory {
             self.descend_reason(states, lowercase, depth, mode)
-        } else if mode.contains(FilterMode::Ignore) && states.ignore.excluded {
-            Some(FilterReason::Ignore)
-        } else if mode.contains(FilterMode::View) && states.view.excluded {
-            Some(FilterReason::View)
         } else {
-            None
+            states.reason(mode)
         };
         (states, reason)
     }
@@ -1880,9 +1895,7 @@ impl Filter {
     /// Says nothing about what sits below it: a directory excluded by its own
     /// rule can still hold re-included content. A caller about to drop a path
     /// *and its subtree* wants [`excludes_tree`](Self::excludes_tree) instead.
-    #[cfg(feature = "test-util")]
-    #[lore_macro::test_pub]
-    fn excludes(&self, path: &impl FilterPath, is_directory: bool, mode: FilterMode) -> bool {
+    pub fn excludes(&self, path: &impl FilterPath, is_directory: bool, mode: FilterMode) -> bool {
         self.exclude_reason(path, is_directory, mode, Scope::Node)
             .is_some()
     }

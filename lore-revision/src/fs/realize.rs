@@ -1758,7 +1758,88 @@ async fn realize_changes_delete(
         }
     }
 
+    if !dry_run && !repository.is_layer() {
+        remove_emptied_excluded_directories(
+            &operation,
+            &repository,
+            &delete_changes,
+            &RelativePath::new(),
+            &stats,
+        )
+        .await;
+    }
+
     Ok(kept)
+}
+
+/// Removes each directory the view excludes below `floor` and above a delete in `changes` that the
+/// deletes left empty, deepest first, reporting each one removed. Each removal counts as a delete in
+/// `stats`, done and in total, and a progress event follows the last.
+///
+/// A directory the view excludes stands on disk only for content below it. One still holding
+/// anything, a local file included, is kept. `floor` is the root, or the mount of a layer, which
+/// stands whatever the view and is realized under the layer's context, so the layer's sync removes
+/// the directories below it rather than the realize. A realize under a link's context keeps every
+/// directory. The directories of a link the realized tree mounts are treated as any other. Without
+/// a rule re-including below a directory it excludes, a view leaves none of them on disk to remove.
+/// Ancestors a delete shares with the one before it are gathered once, which sorted deletes make
+/// the most of.
+pub(crate) async fn remove_emptied_excluded_directories(
+    operation: &InstanceOperationImpl,
+    repository: &RepositoryContext,
+    changes: &[NodeChange],
+    floor: &RelativePath,
+    stats: &Arc<SyncRealizeStats>,
+) {
+    if !repository.filter.view.reincludes() || repository.is_link() {
+        return;
+    }
+    let mut directories = Vec::new();
+    let mut previous = "";
+    for change in changes
+        .iter()
+        .filter(|change| change.action == change::FileAction::Delete)
+    {
+        let mut directory = change.path().parent_path();
+        while directory
+            .below(floor)
+            .is_some_and(|below| !below.is_empty())
+            && !directory.covers(&previous)
+        {
+            let parent = directory.parent_path();
+            directories.push(directory);
+            directory = parent;
+        }
+        previous = change.path().as_str();
+    }
+    directories.sort_unstable_by(|left, right| right.as_str().cmp(left.as_str()));
+    directories.dedup_by(|left, right| left.as_str() == right.as_str());
+    let mut removed = false;
+    for directory in directories {
+        if repository
+            .filter
+            .excludes(&directory, true, FilterMode::View)
+            && operation.remove_empty_directory(&directory).await.is_ok()
+        {
+            stats
+                .complete
+                .file_delete_total
+                .fetch_add(1, Ordering::Relaxed);
+            stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
+            event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData {
+                path: LoreString::from(&directory),
+                size: 0,
+                action: change::FileAction::Delete.into(),
+                flag_file: 0,
+            })
+            .send();
+            removed = true;
+        }
+    }
+    if removed {
+        event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(stats))
+            .send();
+    }
 }
 
 struct SyncWorkItem {
@@ -2165,9 +2246,10 @@ fn realize_change_modify_add(
         let path = change.path();
 
         // Only on-disk work honours the view. This gates directory creation, link
-        // cloning and the file write. The move rename below is not gated, because
+        // cloning and the file write. A directory the view excludes is created by
+        // the first write below it. The move rename below is not gated, because
         // it repositions a path an earlier in-view realize may have written.
-        let write_to_disk = !view_filter.excludes_tree(path, node.is_directory(), FilterMode::View);
+        let write_to_disk = !view_filter.excludes(path, node.is_directory(), FilterMode::View);
 
         lore_trace!(
             "{}{} {}",

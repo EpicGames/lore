@@ -959,7 +959,8 @@ pub async fn sync(
     .await
 }
 
-/// Realizes the layer's target state over its mount, within `operation`.
+/// Realizes the layer's target state over its mount, within `operation`, and removes the
+/// directories below the mount that the view excludes and the realize left empty.
 #[allow(clippy::too_many_arguments)]
 async fn sync_in_operation(
     operation: Arc<InstanceOperationImpl>,
@@ -994,7 +995,7 @@ async fn sync_in_operation(
             state_current.revision_number(),
             state_target.revision_number()
         );
-        state::diff_collect_subtree(current, target, mount_path, options.filter_mode)
+        state::diff_collect_subtree(current, target, mount_path.clone(), options.filter_mode)
             .await
             .forward::<LayerError>("Failed to calculate state diff when synchronizing")?
     } else {
@@ -1018,7 +1019,7 @@ async fn sync_in_operation(
                 path: mount_path.clone(),
                 node: current.mapping.node,
             },
-            mount_path,
+            mount_path.clone(),
             options.filter_mode,
             FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
@@ -1057,17 +1058,28 @@ async fn sync_in_operation(
         changes
     };
 
+    let dry_run = execution_context().globals().dry_run();
     crate::fs::realize::realize_changes(
         repository_target.clone(),
         operation.clone(),
-        changes,
+        changes.clone(),
         None,
-        execution_context().globals().dry_run(),
+        dry_run,
         false, /* Not a merge */
-        stats,
+        stats.clone(),
     )
     .await
     .forward::<LayerError>("Failed to sync layer files")?;
+    if !dry_run {
+        crate::fs::realize::remove_emptied_excluded_directories(
+            &operation,
+            &repository_target,
+            &changes,
+            &mount_path,
+            &stats,
+        )
+        .await;
+    }
 
     Ok(())
 }
