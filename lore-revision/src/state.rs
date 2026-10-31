@@ -9006,7 +9006,7 @@ pub async fn apply_tree_changes(
             };
 
             if node_link.is_valid() {
-                if from_path.as_lowercase_str() == change.path().as_lowercase_str() {
+                if change.is_case_only_move() {
                     let block_index = NodeBlock::index(node_link.node);
                     let node_index = Node::index(node_link.node);
                     let block = target_state

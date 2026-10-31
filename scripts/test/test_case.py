@@ -302,6 +302,32 @@ def test_case_keep(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("force", [False, True])
+def test_case_variant_in_a_deleted_directory_is_deleted_with_it(new_lore_repo, force):
+    """A revision renaming a file in case alone leaves the working tree's spelling, and a
+    later revision deleting the directory deletes the file with it, forced or not."""
+    repo: Lore = new_lore_repo()
+    directory = Path("Plugin")
+    repo.write_commit_push(None, {directory / "VerseInput.Build.cs": os.urandom(1174)})
+
+    repo.move(directory / "VerseInput.Build.cs", directory / "VerseInput.build.cs")
+    repo.stage(scan=True, case="rename")
+    # Tree hashes fold case, so a rename in case alone commits only when forced.
+    repo.commit(force=True)
+    repo.push()
+
+    repo.rmtree(directory)
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    repo.sync("@1")
+    repo.sync("@2")
+    repo.sync("@3", force=force)
+    assert not repo.path_exists(directory), "The sync has to delete the directory"
+
+
+@pytest.mark.smoke
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Requires case-sensitive filesystem"
 )

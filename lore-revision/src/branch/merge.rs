@@ -2139,7 +2139,8 @@ async fn apply_graft_copy(
 /// local modification would be overwritten.
 ///
 /// The conflicts are checked after the changes, so the failure reported is the earliest one
-/// the merge would have hit.
+/// the merge would have hit. The moves among the changes answer for both where a directory is
+/// deleted, and are copied only where the diff deletes a directory.
 async fn verify_diff_against_filesystem(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
@@ -2148,11 +2149,26 @@ async fn verify_diff_against_filesystem(
     conflicts: &mut [(NodeChange, NodeChange)],
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
+    let deletes_a_directory = changes
+        .iter()
+        .chain(conflicts.iter().map(|(_, change_to)| change_to))
+        .any(|change| change.action == FileAction::Delete && change.from.flags.is_directory());
+    let moves = if deletes_a_directory {
+        changes
+            .iter()
+            .filter(|change| change.move_source().is_some())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let incoming = Arc::new(crate::fs::realize::IncomingMoves::new(Arc::new(moves)));
     verify_changes_against_filesystem(
         operation,
         repository,
         state_current,
         changes.iter_mut().collect(),
+        &incoming,
         merge_type,
     )
     .await?;
@@ -2164,6 +2180,7 @@ async fn verify_diff_against_filesystem(
             .iter_mut()
             .map(|(_, change_to)| change_to)
             .collect(),
+        &incoming,
         merge_type,
     )
     .await?;
@@ -2176,13 +2193,17 @@ async fn verify_diff_against_filesystem(
 ///
 /// What the verify settles on a change is carried back onto it, since the merge realizes every
 /// change it verified rather than the ones the working copy still needs.
-async fn verify_changes_against_filesystem(
-    operation: &Arc<InstanceOperationImpl>,
-    repository: &Arc<RepositoryContext>,
-    state_current: &Arc<State>,
-    mut changes: Vec<&mut NodeChange>,
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn verify_changes_against_filesystem<'a>(
+    operation: &'a Arc<InstanceOperationImpl>,
+    repository: &'a Arc<RepositoryContext>,
+    state_current: &'a Arc<State>,
+    mut changes: Vec<&'a mut NodeChange>,
+    incoming: &'a Arc<crate::fs::realize::IncomingMoves>,
     merge_type: MergeType,
-) -> Result<(), MergeError> {
+) -> impl Future<Output = Result<(), MergeError>> + 'a {
     fn collect(
         joined: Result<Result<(usize, change::Flags), MergeError>, tokio::task::JoinError>,
         changes: &mut [&mut NodeChange],
@@ -2197,48 +2218,52 @@ async fn verify_changes_against_filesystem(
         }
     }
 
-    let stats = Arc::new(sync::SyncVerifyStats::default());
-    let mut tasks = JoinSet::new();
-    let mut failure = None;
-    for index in 0..changes.len() {
-        let change = changes[index].clone();
-        lore_spawn!(tasks, {
-            let stats = stats.clone();
-            let repository = repository.clone();
-            let operation = operation.clone();
-            let state_current = state_current.clone();
-            async move {
-                let mut change = change;
-                let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
-                let no_force_hash_check = false;
-                crate::fs::realize::verify_filesystem(
-                    &mut change,
-                    repository.clone(),
-                    operation,
-                    crate::state::NodeMapping::root(repository, state_current),
-                    no_forward_changes,
-                    no_force_hash_check,
-                    stats,
-                    FilterMode::Full,
-                )
-                .await
-                .forward::<MergeError>("verifying filesystem for change")?;
+    async move {
+        let stats = Arc::new(sync::SyncVerifyStats::default());
+        let mut tasks = JoinSet::new();
+        let mut failure = None;
+        for index in 0..changes.len() {
+            let change = changes[index].clone();
+            lore_spawn!(tasks, {
+                let stats = stats.clone();
+                let repository = repository.clone();
+                let operation = operation.clone();
+                let state_current = state_current.clone();
+                let incoming = incoming.clone();
+                async move {
+                    let mut change = change;
+                    let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
+                    let no_force_hash_check = false;
+                    crate::fs::realize::verify_filesystem(
+                        &mut change,
+                        repository.clone(),
+                        operation,
+                        crate::state::NodeMapping::root(repository, state_current),
+                        no_forward_changes,
+                        no_force_hash_check,
+                        stats,
+                        FilterMode::Full,
+                        &incoming,
+                    )
+                    .await
+                    .forward::<MergeError>("verifying filesystem for change")?;
 
-                Ok((index, change.flags))
+                    Ok((index, change.flags))
+                }
+            });
+            while tasks.len() > MAX_CONCURRENT_TREE_TASKS
+                && let Some(joined) = tasks.join_next().await
+            {
+                collect(joined, &mut changes, &mut failure);
             }
-        });
-        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
-            && let Some(joined) = tasks.join_next().await
-        {
+        }
+        while let Some(joined) = tasks.join_next().await {
             collect(joined, &mut changes, &mut failure);
         }
-    }
-    while let Some(joined) = tasks.join_next().await {
-        collect(joined, &mut changes, &mut failure);
-    }
-    match failure {
-        Some(err) => Err(err),
-        None => Ok(()),
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 }
 

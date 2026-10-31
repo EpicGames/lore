@@ -333,6 +333,286 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// The directory the case tests delete, and the file in it a revision renames in case alone.
+    const PLUGIN: &str = "Plugin";
+    const BUILD_RULES: &str = "VerseInput.Build.cs";
+    const BUILD_RULES_RENAMED: &str = "VerseInput.build.cs";
+
+    /// Commits `instance` holding [`BUILD_RULES`] in [`PLUGIN`] and then a revision renaming it to
+    /// [`BUILD_RULES_RENAMED`], answering both. Tree hashes fold case, so the rename stages a tree
+    /// hashing as the current one and commits only when forced.
+    async fn commit_a_rename_in_case_alone(
+        instance: &TestRepository,
+    ) -> (lore_base::types::Hash, lore_base::types::Hash) {
+        let directory = instance.path.join(PLUGIN);
+        fs::create_dir_all(directory.as_path()).expect("Failed to create the directory");
+        test_file_write(directory.join(BUILD_RULES).as_path(), b"build rules");
+        let first = test_commit_tree(instance, "First").await.revision();
+
+        fs::rename(
+            directory.join(BUILD_RULES),
+            directory.join(BUILD_RULES_RENAMED),
+        )
+        .expect("Failed to rename the file");
+        file::stage::stage(
+            instance.repository.clone(),
+            &instance.write_token,
+            LoreArray::from_vec(vec![LoreString::from(&instance.path)]),
+            StageOptions {
+                scan: true,
+                case_change: stage::StageCaseChange::Rename,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to stage the rename");
+        let forced = lore_revision::interface::LoreGlobalArgs {
+            force: 1,
+            ..Default::default()
+        };
+        let second = LORE_CONTEXT
+            .scope(test_execution_with(forced), test_commit(instance, "Second"))
+            .await
+            .revision();
+        (first, second)
+    }
+
+    /// A revision renaming a file in case alone leaves the working tree's spelling, and a merge
+    /// of a branch deleting the directory takes the file with it. The repository keeps its own
+    /// stores, which hold the branch metadata a new branch reads.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_merge_deletes_a_directory_holding_a_case_variant_of_its_file() {
+        let _ = test_store_create().await.expect("Failed to create stores");
+        let offline =
+            test_execution_with(lore_revision::interface::LoreGlobalArgs::default().set_offline());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(offline, async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                fs::create_dir_all(path.as_path()).expect("Create directory failed");
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                    Context::from(uuid::Uuid::now_v7()),
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to create repository");
+                let instance = TestRepository {
+                    repository,
+                    write_token,
+                    path,
+                    _tempdir: tempdir,
+                };
+                let (first, second) = Box::pin(commit_a_rename_in_case_alone(&instance)).await;
+                let directory = instance.path.join(PLUGIN);
+
+                branch::create::create(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    "feature".to_string(),
+                    None,
+                    String::new(),
+                    false,
+                )
+                .await
+                .expect("Failed to create the branch");
+                let (_, feature) =
+                    lore_revision::instance::load_current_anchor_boxed(&instance.repository)
+                        .await
+                        .expect("Failed to load the current anchor");
+                fs::remove_dir_all(directory.as_path()).expect("Failed to remove the directory");
+                test_commit_tree(&instance, "Delete the directory").await;
+
+                sync_to(&instance, first, false).await;
+                sync_to(&instance, second, false).await;
+                let unrelated = instance.path.join("unrelated.txt");
+                test_file_write(unrelated.as_path(), b"main moves on");
+                file::stage::stage(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&unrelated)]),
+                    StageOptions::default(),
+                )
+                .await
+                .expect("Failed to stage the unrelated file");
+                test_commit(&instance, "Main moves on").await;
+
+                Box::pin(branch::merge::merge_start(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    feature,
+                    branch::merge::MergeStartOptions {
+                        message: "merge feature into main".to_string(),
+                        link_messages: std::collections::HashMap::new(),
+                        no_commit: true,
+                        scope: branch::merge::MergeScope::MainOnly,
+                        inherit_metadata: lore_revision::metadata::MetadataInherit::default(),
+                    },
+                ))
+                .await
+                .expect("The merge has to take the directory");
+
+                assert!(
+                    !directory.exists(),
+                    "the merge has to delete the directory with the file it holds"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The file a revision moves out of [`PLUGIN`] as it deletes the directory, the spelling the
+    /// working tree holds it under, and the directory it moves to.
+    const RULES: &str = "Rules.cs";
+    const RULES_VARIANT: &str = "rules.cs";
+    const SHARED: &str = "Shared";
+
+    /// Commits `instance` holding `content` as [`RULES`] in [`PLUGIN`] and then a revision moving
+    /// it into [`SHARED`] as `carried` and deleting [`PLUGIN`], answering the second. The working
+    /// tree is left on the first revision, holding `variant` as [`RULES_VARIANT`] in place of the
+    /// file.
+    async fn a_move_out_of_a_deleted_directory(
+        instance: &TestRepository,
+        content: &[u8],
+        carried: &[u8],
+        variant: &[u8],
+    ) -> lore_base::types::Hash {
+        let directory = instance.path.join(PLUGIN);
+        let shared = instance.path.join(SHARED);
+        fs::create_dir_all(directory.as_path()).expect("Failed to create the directory");
+        test_file_write(directory.join(RULES).as_path(), content);
+        let first = test_commit_tree(instance, "First").await.revision();
+
+        fs::create_dir_all(shared.as_path()).expect("Failed to create the destination");
+        fs::rename(directory.join(RULES), shared.join(RULES)).expect("Failed to move the file");
+        test_file_write(shared.join(RULES).as_path(), carried);
+        file::stage::stage_move(
+            instance.repository.clone(),
+            &instance.write_token,
+            directory.join(RULES).to_string_lossy().into_owned(),
+            shared.join(RULES).to_string_lossy().into_owned(),
+            StageOptions {
+                scan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to stage the move");
+        fs::remove_dir(directory.as_path()).expect("Failed to remove the directory");
+        file::stage::stage(
+            instance.repository.clone(),
+            &instance.write_token,
+            LoreArray::from_vec(vec![LoreString::from(&directory)]),
+            StageOptions {
+                scan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to stage the directory delete");
+        let second = test_commit(instance, "Second").await.revision();
+
+        sync_to(instance, first, false).await;
+        fs::remove_file(directory.join(RULES)).expect("Failed to remove the file");
+        test_file_write(directory.join(RULES_VARIANT).as_path(), variant);
+        second
+    }
+
+    /// A case variant of a file a revision moves out of a directory it deletes goes with the
+    /// directory once the move has written its destination, where it holds the content the move
+    /// starts from or the content it carries.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_deleted_directory_takes_a_case_variant_of_a_file_moved_out_of_it() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let content: &[u8] = b"rules";
+                let edited: &[u8] = b"rules, edited";
+                for (carried, variant) in [(content, content), (edited, content), (edited, edited)]
+                {
+                    let instance = test_repository_create(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        RepositoryId::from(uuid::Uuid::now_v7()),
+                    )
+                    .await;
+                    let second = Box::pin(a_move_out_of_a_deleted_directory(
+                        &instance, content, carried, variant,
+                    ))
+                    .await;
+
+                    sync_to(&instance, second, false).await;
+
+                    assert_eq!(
+                        fs::read(instance.path.join(SHARED).join(RULES)).expect("The moved file"),
+                        carried
+                    );
+                    assert!(
+                        !instance.path.join(PLUGIN).exists(),
+                        "A variant holding {} goes, the move carrying {}",
+                        String::from_utf8_lossy(variant),
+                        String::from_utf8_lossy(carried)
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A forced sync keeps a case variant of a file the revision moves out of a directory it
+    /// deletes where the variant holds other content of the same size, and the directory with it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_forced_sync_keeps_an_edited_case_variant_of_a_file_moved_out_of_a_deleted_directory()
+    {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                let content = b"rules";
+                let edited = b"mine!";
+                let second = Box::pin(a_move_out_of_a_deleted_directory(
+                    &instance, content, content, edited,
+                ))
+                .await;
+
+                LORE_CONTEXT
+                    .scope(forced_execution(), sync_to(&instance, second, false))
+                    .await;
+
+                assert_eq!(
+                    fs::read(instance.path.join(SHARED).join(RULES)).expect("The moved file"),
+                    content
+                );
+                assert_eq!(
+                    fs::read(instance.path.join(PLUGIN).join(RULES_VARIANT))
+                        .expect("The edited variant"),
+                    edited
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_explicit_revision() {
         let (_immutable_store, _mutable_store, execution) =

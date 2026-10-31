@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Borrow;
 use std::ops::BitAnd;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
@@ -280,43 +282,74 @@ pub async fn realize_state(
     Ok(())
 }
 
-pub async fn verify_filesystem_for_changes(
+/// Verifies the changes `args` holds against the working copy, each as [`verify_filesystem`]
+/// does, and answers those still having work to do, sorted by path.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn verify_filesystem_for_changes(
     args: Arc<SyncVerifyArgs>,
-) -> Result<Arc<Vec<NodeChange>>, SyncError> {
-    let mut failure = None;
-    let mut tasks = JoinSet::new();
-    let mut changes = Vec::with_capacity(args.changes.len());
-    let stats = Arc::new(SyncVerifyStats::default());
-    for change in args.changes.iter() {
-        lore_spawn!(tasks, {
-            let forward_changes = args.options.forward_changes;
-            let force_hash_check = args.options.force_hash_check;
-            let filter_mode = args.options.filter_mode;
-            let change = change.clone();
-            let repository_current = args.repository_current.clone();
-            let operation = args.operation.clone();
-            let current = args.current.clone();
-            let stats = stats.clone();
-            async move {
-                let mut change = change;
-                let realize = verify_filesystem(
-                    &mut change,
-                    repository_current,
-                    operation,
-                    current,
-                    forward_changes,
-                    force_hash_check,
-                    stats,
-                    filter_mode,
-                )
-                .await?;
+) -> impl Future<Output = Result<Arc<Vec<NodeChange>>, SyncError>> {
+    async move {
+        let mut failure = None;
+        let mut tasks = JoinSet::new();
+        let mut changes = Vec::with_capacity(args.changes.len());
+        let stats = Arc::new(SyncVerifyStats::default());
+        let incoming = Arc::new(IncomingMoves::new(args.changes.clone()));
+        for change in args.changes.iter() {
+            lore_spawn!(tasks, {
+                let forward_changes = args.options.forward_changes;
+                let force_hash_check = args.options.force_hash_check;
+                let filter_mode = args.options.filter_mode;
+                let change = change.clone();
+                let repository_current = args.repository_current.clone();
+                let operation = args.operation.clone();
+                let current = args.current.clone();
+                let stats = stats.clone();
+                let incoming = incoming.clone();
+                async move {
+                    let mut change = change;
+                    let realize = verify_filesystem(
+                        &mut change,
+                        repository_current,
+                        operation,
+                        current,
+                        forward_changes,
+                        force_hash_check,
+                        stats,
+                        filter_mode,
+                        &incoming,
+                    )
+                    .await?;
 
-                Ok(realize.then_some(change))
+                    Ok(realize.then_some(change))
+                }
+            });
+            while tasks.len() > MAX_CONCURRENT_TREE_TASKS
+                && let Some(result) = tasks.join_next().await
+            {
+                match result
+                    .internal("Recursion task failed")
+                    .map_err(SyncError::from)
+                    .flatten()
+                {
+                    Ok(change) => {
+                        if let Some(change) = change {
+                            changes.push(change);
+                        }
+                    }
+                    Err(err) => {
+                        failure = failure.or(Some(err));
+                    }
+                }
             }
-        });
-        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
-            && let Some(result) = tasks.join_next().await
-        {
+
+            if failure.is_some() {
+                break;
+            }
+        }
+        // Wait for the remaining tasks
+        while let Some(result) = tasks.join_next().await {
             match result
                 .internal("Recursion task failed")
                 .map_err(SyncError::from)
@@ -333,38 +366,17 @@ pub async fn verify_filesystem_for_changes(
             }
         }
 
-        if failure.is_some() {
-            break;
+        if let Some(err) = failure {
+            return Err(err);
         }
-    }
-    // Wait for the remaining tasks
-    while let Some(result) = tasks.join_next().await {
-        match result
-            .internal("Recursion task failed")
-            .map_err(SyncError::from)
-            .flatten()
-        {
-            Ok(change) => {
-                if let Some(change) = change {
-                    changes.push(change);
-                }
-            }
-            Err(err) => {
-                failure = failure.or(Some(err));
-            }
-        }
-    }
 
-    if let Some(err) = failure {
-        return Err(err);
+        // Re-sort after parallel verification which collects results in completion order.
+        // Parent directories must appear before their children so that directory renames
+        // in the realize path complete before child file operations are spawned.
+        change::sort_by_path(&mut changes);
+
+        Ok(Arc::new(changes))
     }
-
-    // Re-sort after parallel verification which collects results in completion order.
-    // Parent directories must appear before their children so that directory renames
-    // in the realize path complete before child file operations are spawned.
-    change::sort_by_path(&mut changes);
-
-    Ok(Arc::new(changes))
 }
 
 /// The address of the content a change brings in. `NodeChangeState` carries it where the
@@ -580,6 +592,165 @@ async fn mode_is_the_working_tree_own(
     })
 }
 
+/// The moves of a change set, looked up by the path each moves from.
+pub struct IncomingMoves {
+    changes: Arc<Vec<NodeChange>>,
+    by_source: OnceLock<Vec<usize>>,
+}
+
+impl IncomingMoves {
+    /// The moves `changes` holds, indexed on the first lookup.
+    pub fn new(changes: Arc<Vec<NodeChange>>) -> Self {
+        Self {
+            changes,
+            by_source: OnceLock::new(),
+        }
+    }
+
+    fn source(change: &NodeChange) -> &str {
+        change.move_source().map_or("", RelativePath::as_str)
+    }
+
+    /// The move carrying the node at `path` elsewhere, `path` spelled as the tree the moves start
+    /// from spells it. A tree can hold two spellings of one name, each moved on its own.
+    fn carrying(&self, path: &RelativePath) -> Option<&NodeChange> {
+        let changes = &self.changes;
+        let by_source = self.by_source.get_or_init(|| {
+            let mut by_source: Vec<usize> = (0..changes.len())
+                .filter(|&index| changes[index].move_source().is_some())
+                .collect();
+            by_source.sort_unstable_by(|&a, &b| {
+                Self::source(&changes[a]).cmp(Self::source(&changes[b]))
+            });
+            by_source
+        });
+        by_source
+            .binary_search_by(|&index| Self::source(&changes[index]).cmp(path.as_str()))
+            .ok()
+            .map(|found| &changes[by_source[found]])
+    }
+}
+
+/// Whether deleting a directory would lose the entry `change` reports below it.
+///
+/// Nothing is lost of an added entry, which the non-recursive directory delete keeps, of a
+/// tracked entry already missing, or of a file under a case variant of its name holding what the
+/// node holds. A file that differs from its node is lost unless `incoming` holds a move that
+/// carries it out of the directory to a node holding the same content, compared by size before
+/// content.
+async fn holds_local_work(
+    operation: &InstanceOperationImpl,
+    change: &NodeChange,
+    incoming: Option<&IncomingMoves>,
+) -> Result<bool, SyncError> {
+    match change.action {
+        change::FileAction::Add => return Ok(false),
+        change::FileAction::Delete => {
+            return Ok(operation
+                .file_info(change.path())
+                .await
+                .is_ok_and(|info| info.exists()));
+        }
+        _ if change.is_case_variant() => return Ok(false),
+        _ => {}
+    }
+    let Some(moved) = incoming.and_then(|incoming| incoming.carrying(&change.from.mapping.path))
+    else {
+        return Ok(true);
+    };
+    let (Some(observed), Ok(node)) = (change.to.observed, moved.to.get_node().await) else {
+        return Ok(true);
+    };
+    let comparison = state::file_matches_node(
+        moved.to.mapping.repository.clone(),
+        &node,
+        observed.size(),
+        change.path(),
+        operation,
+        &lore_storage::ContentHashes::default(),
+    )
+    .await
+    .forward::<SyncError>("Failed to compare the file to the incoming node")?;
+    Ok(!matches!(comparison, NodeComparison::Matches))
+}
+
+/// Removes the files `directory` holds under a case variant of the name of a file a change in
+/// `changes` deletes or moves away directly in it, where they hold the content the change starts
+/// from or the content the move carries, and then `directory`, answering whether it removed the
+/// directory. `changes` is sorted by the path each starts from.
+///
+/// A case-sensitive file system keeps a file spelled otherwise than the revision spells it, which
+/// the delete or the move of the revision's spelling misses. A file holding other content,
+/// compared by size before content, a directory, a link and a file no change folds to stay in
+/// place, and keep the directory. The listing is drained before anything is removed, and of its
+/// entries only the names of the files that fold to a change are kept.
+///
+/// Runs only where a directory delete finds the directory holding entries, a cold path its callers
+/// box: inline, the content comparison would make every future awaiting a realize as large as its
+/// own.
+async fn remove_directory_of_case_variants<C: Borrow<NodeChange>>(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    changes: &[C],
+) -> bool {
+    let prefix = format!("{directory}/");
+    let first = changes
+        .partition_point(|change| change.borrow().from.mapping.path.as_str() < prefix.as_str());
+    let mut folded: Vec<(u64, &NodeChange)> = changes[first..]
+        .iter()
+        .map(Borrow::borrow)
+        .map_while(|change| {
+            Some((
+                change,
+                change.from.mapping.path.as_str().strip_prefix(&prefix)?,
+            ))
+        })
+        .filter(|(change, name)| !name.contains('/') && change.from.flags.contains(NodeFlags::File))
+        .map(|(change, name)| (hash::hash_string(name), change))
+        .collect();
+    if folded.is_empty() {
+        return false;
+    }
+    folded.sort_unstable_by_key(|(name_hash, _)| *name_hash);
+    let Ok(mut listing) = operation.read_directory(directory).await else {
+        return false;
+    };
+    let mut variants = Vec::new();
+    while let Some(entry) = listing.next().await {
+        if let Ok(entry) = entry
+            && entry.info.is_file()
+            && let Ok(found) = folded.binary_search_by_key(&entry.name_hash, |(hash, _)| *hash)
+        {
+            variants.push((entry.name, entry.info.size(), folded[found].1));
+        }
+    }
+    let mut removed = false;
+    for (name, size, change) in &variants {
+        let path = directory.join(name);
+        let established = lore_storage::ContentHashes::default();
+        let carried = change.move_source().map(|_| &change.to);
+        for side in std::iter::once(&change.from).chain(carried) {
+            let Ok(node) = side.get_node().await else {
+                continue;
+            };
+            if let Ok(NodeComparison::Matches) = state::file_matches_node(
+                side.mapping.repository.clone(),
+                &node,
+                *size,
+                &path,
+                operation,
+                &established,
+            )
+            .await
+            {
+                removed |= operation.remove(&path).await.is_ok();
+                break;
+            }
+        }
+    }
+    removed && operation.remove(directory).await.is_ok()
+}
+
 /// Checks `change` against the working copy, refusing the ones that would overwrite local work
 /// and settling on it what realizing it has to know, and answers whether it still has work to do.
 ///
@@ -590,6 +761,9 @@ async fn mode_is_the_working_tree_own(
 /// A file found to hold the incoming content has its time recorded where it is older than the
 /// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads
 /// before reading the file.
+///
+/// `incoming` holds the moves of the change set the change belongs to, which answer for the target
+/// where a directory is deleted.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_filesystem(
     change: &mut NodeChange,
@@ -600,6 +774,7 @@ pub async fn verify_filesystem(
     force_full_check: bool,
     stats: Arc<SyncVerifyStats>,
     filter_mode: FilterMode,
+    incoming: &IncomingMoves,
 ) -> Result<bool, SyncError> {
     lore_trace!("Verify path: {change:?}");
     let repository_path = change.path().clone();
@@ -893,36 +1068,16 @@ pub async fn verify_filesystem(
             )?;
             let mut has_modified_file = false;
             while let Some(subchange) = directory_changes.next().await {
-                let subchange_path = subchange.path().clone();
-
-                if subchange.action == change::FileAction::Add {
-                    // Allow locally added files to remain and keep directory
+                let incoming = (!has_modified_file).then_some(incoming);
+                if !holds_local_work(&operation, &subchange, incoming).await? {
                     lore_trace!(
-                        "Allow locally added file in {}",
-                        subchange
-                            .path()
-                            .to_absolute_path(change.from.mapping.repository.require_path()?)
-                            .display()
-                    );
-                    continue;
-                }
-
-                let file_info = operation.file_info(&subchange_path).await.ok();
-
-                // A tracked entry that is already missing on disk is
-                // effectively pre-aligned with the directory delete the
-                // destination branch is performing. There is nothing to
-                // lose by letting the switch proceed.
-                if subchange.action == change::FileAction::Delete
-                    && file_info.as_ref().is_none_or(|info| !info.exists())
-                {
-                    lore_trace!(
-                        "Skip already-missing tracked entry inside deleted directory: {}",
+                        "Deleted directory entry {} holds no local work",
                         subchange.path()
                     );
                     continue;
                 }
 
+                let file_info = operation.file_info(subchange.path()).await.ok();
                 if !has_modified_file {
                     lore_error!(
                         "Deleted directory has modified files in file system: {}",
@@ -1010,7 +1165,7 @@ pub async fn realize_changes(
         .store(file_delete_total, Ordering::Relaxed);
 
     // First perform all deletes in case of delete-add for going from/to file & directory
-    realize_changes_delete(
+    let kept = realize_changes_delete(
         repository.clone(),
         operation.clone(),
         changes.clone(),
@@ -1078,8 +1233,9 @@ pub async fn realize_changes(
     let (tx, rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
     let discover_stats = stats.clone();
+    let discover_changes = changes.clone();
     let producer = lore_spawn!(async move {
-        let result = sync_discover_modify_add(changes, discover_stats.clone(), tx).await;
+        let result = sync_discover_modify_add(discover_changes, discover_stats.clone(), tx).await;
         discover_stats
             .discovery
             .complete
@@ -1096,10 +1252,11 @@ pub async fn realize_changes(
     let consumer_stats = stats.clone();
     // A view-excluded path is staged into the tree but not written to disk.
     let view_filter = repository.filter.clone();
+    let consumer_operation = operation.clone();
     let consumer = lore_spawn!(async move {
         sync_execute_modify_add(
             rx,
-            operation,
+            consumer_operation,
             state_stage,
             dry_run,
             is_merge,
@@ -1119,7 +1276,58 @@ pub async fn realize_changes(
     consumer_result?;
     producer_result?;
 
+    remove_directories_moved_out_of(&operation, &changes, kept).await;
+
     Ok(())
+}
+
+/// Removes the directories in `kept`, which their deletes found holding entries, out of which a
+/// move in `changes` carries an entry, deepest first. A directory stays where it holds an entry
+/// other than a case variant of a file moved out of it that holds what the move starts from or
+/// carries.
+///
+/// Deletes run before moves, so a directory holding the source of a move still holds it when its
+/// delete runs.
+async fn remove_directories_moved_out_of(
+    operation: &InstanceOperationImpl,
+    changes: &[NodeChange],
+    kept: Vec<NodeChange>,
+) {
+    if kept.is_empty() {
+        return;
+    }
+    let mut moves: Vec<&NodeChange> = changes
+        .iter()
+        .filter(|change| change.move_source().is_some())
+        .collect();
+    moves.sort_unstable_by(|a, b| {
+        a.from
+            .mapping
+            .path
+            .as_str()
+            .cmp(b.from.mapping.path.as_str())
+    });
+    for change in kept {
+        let prefix = format!("{}/", change.path());
+        let first =
+            moves.partition_point(|moved| moved.from.mapping.path.as_str() < prefix.as_str());
+        if moves
+            .get(first)
+            .is_some_and(|moved| moved.from.mapping.path.as_str().starts_with(&prefix))
+            && (operation.remove(change.path()).await.is_ok()
+                || Box::pin(remove_directory_of_case_variants(
+                    operation,
+                    change.path(),
+                    &moves,
+                ))
+                .await)
+        {
+            event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(
+                &change, 0, false,
+            ))
+            .send();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1378,6 +1586,8 @@ fn progress_ticker(stats: Arc<SyncRealizeStats>) -> AbortOnDropHandle<()> {
     }))
 }
 
+/// Realizes the deletes `changes` holds, deepest first, and answers the directory deletes that
+/// found their directory holding entries and kept it.
 async fn realize_changes_delete(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
@@ -1386,7 +1596,7 @@ async fn realize_changes_delete(
     dry_run: bool,
     is_merge: bool,
     stats: Arc<SyncRealizeStats>,
-) -> Result<(), SyncError> {
+) -> Result<Vec<NodeChange>, SyncError> {
     // Sort the changes by path length and iterate in descending order. This will make sure that
     // directories have files deleted first, before attempting to delete the directory.
     // If a directory still have local files which are view/ignore filtered, these directories
@@ -1400,6 +1610,7 @@ async fn realize_changes_delete(
         .cloned()
         .collect();
     change::sort_by_path(delete_changes.as_mut_slice());
+    let mut kept = Vec::new();
     for change in delete_changes.iter().rev() {
         let change = change.clone();
 
@@ -1474,8 +1685,12 @@ async fn realize_changes_delete(
                             )));
                         }
                     } else {
-                        // Directory unlink failed, keep it and the locally added/modified files
-                        deleted = false;
+                        deleted = Box::pin(remove_directory_of_case_variants(
+                            &operation,
+                            &change_path,
+                            &delete_changes,
+                        ))
+                        .await;
                         break;
                     }
                 } else {
@@ -1537,9 +1752,13 @@ async fn realize_changes_delete(
                 }
             }
         }
+
+        if !deleted {
+            kept.push(change);
+        }
     }
 
-    Ok(())
+    Ok(kept)
 }
 
 struct SyncWorkItem {

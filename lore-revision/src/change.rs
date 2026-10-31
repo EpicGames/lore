@@ -260,6 +260,20 @@ impl NodeChange {
             .then_some(&self.from.mapping.path)
     }
 
+    /// Whether the change is a move whose source differs from its destination in case alone.
+    pub fn is_case_only_move(&self) -> bool {
+        self.move_source()
+            .is_some_and(|source| source.as_lowercase_str() == self.path().as_lowercase_str())
+    }
+
+    /// Whether a walk against the working tree found a file under a case variant of its name,
+    /// holding what the node holds.
+    pub fn is_case_variant(&self) -> bool {
+        self.is_case_only_move()
+            && !self.flags.contains(Flags::Modify)
+            && self.from.flags.contains(NodeFlags::File)
+    }
+
     /// The side the change resolves to: `from` for a delete, `to` otherwise.
     pub fn resolved_side(&self) -> &NodeChangeState {
         match self.action {

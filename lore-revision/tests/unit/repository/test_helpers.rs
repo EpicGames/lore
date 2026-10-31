@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use lore_revision::filter::Filter;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
@@ -15,6 +16,14 @@ use crate::helper::default_repository_creation_args;
 
 /// A repository over in-memory stores and no remote, writing its working tree at `path`.
 pub async fn working_tree_repository(path: &Path) -> Arc<RepositoryContext> {
+    working_tree_repository_filtered(path, Filter::default()).await
+}
+
+/// [`working_tree_repository`] under `filter`.
+pub async fn working_tree_repository_filtered(
+    path: &Path,
+    filter: Filter,
+) -> Arc<RepositoryContext> {
     let immutable_store = lore_storage::local::immutable_store::create(
         None::<&str>,
         lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -33,7 +42,9 @@ pub async fn working_tree_repository(path: &Path) -> Arc<RepositoryContext> {
 
     Arc::new(
         RepositoryContext::new(
-            default_repository_creation_args(immutable_store, mutable_store).with_path(path),
+            default_repository_creation_args(immutable_store, mutable_store)
+                .with_path(path)
+                .with_filter(Arc::new(filter)),
         )
         .with_write_token(RepositoryWriteToken::acquire(path).await),
     )

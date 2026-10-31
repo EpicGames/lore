@@ -103,6 +103,39 @@ def test_link_remove_force_discards_local_edit(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_remove_takes_a_case_variant_of_a_pinned_file(new_lore_repo):
+    """A file spelled in another case holding the pinned content is no local work."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.move(f"{link_path}/deep/inner.txt", f"{link_path}/deep/Inner.txt")
+
+    parent_repo.link_remove(link_path)
+
+    assert "No links found in this repository" in parent_repo.link_list()
+
+
+@pytest.mark.smoke
+def test_link_remove_keeps_a_modified_case_variant_of_a_pinned_file(new_lore_repo):
+    """A file spelled in another case holding other content than the pinned file is local work."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    variant = f"{link_path}/deep/Inner.txt"
+    parent_repo.move(f"{link_path}/deep/inner.txt", variant)
+    parent_repo.write_files({variant: "locally edited\n"})
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove(link_path)
+
+    with parent_repo.open_file(variant) as f:
+        assert f.read() == "locally edited\n"
+
+
+@pytest.mark.smoke
 def test_link_remove_ignores_changes_outside_the_mount(new_lore_repo):
     """The guard scans the whole working tree, so it must filter to the mount."""
     link_path = "libs/shared"

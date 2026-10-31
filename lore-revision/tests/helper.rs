@@ -503,9 +503,16 @@ pub async fn test_anchor_states(
 }
 
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    test_execution_with(lore_revision::interface::LoreGlobalArgs::default())
+}
+
+/// An execution whose global arguments are `args`.
+pub fn test_execution_with(
+    args: lore_revision::interface::LoreGlobalArgs,
+) -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
     std::sync::Arc::new(
         lore_revision::interface::ExecutionContext::new_client_with_user_id(
-            lore_revision::interface::LoreGlobalArgs::default(),
+            args,
             lore_revision::relay::EventDispatcher::no_dispatch(),
             "test-user".to_string(),
         ),

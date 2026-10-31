@@ -180,7 +180,8 @@ pub fn remove_boxed(
 }
 
 /// Removing a link deletes its mounted directory from disk, taking any
-/// uncommitted work inside it with no way back.
+/// uncommitted work inside it with no way back. A file under a case variant
+/// of its name holding what the link holds is no such work.
 async fn verify_no_local_changes_under_link(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -212,7 +213,7 @@ async fn verify_no_local_changes_under_link(
     .await
     .forward::<LinkError>("Failed comparing link content with the file system")?;
     let modified = changes
-        .any(|change| link_path.covers_ignore_case(change.path()))
+        .any(|change| link_path.covers_ignore_case(change.path()) && !change.is_case_variant())
         .await
         .forward::<LinkError>("Failed comparing link content with the file system")?;
 

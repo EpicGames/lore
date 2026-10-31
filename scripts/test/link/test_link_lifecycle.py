@@ -1566,3 +1566,45 @@ def test_link_stage_move_inside_a_link_is_refused(new_lore_repo):
     assert "Links not yet implemented" in output, (
         f"A move across a link boundary should be refused, got: {output}"
     )
+
+
+@pytest.mark.smoke
+def test_link_update_takes_a_case_variant_of_a_file_the_update_deletes(new_lore_repo):
+    """A file spelled in another case holding the pinned content goes with its directory."""
+    link_path = "libs/shared"
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned\n", "keep.txt": "keep\n"}
+    )
+    link_repo.rmtree("deep")
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    parent_repo.move(f"{link_path}/deep/inner.txt", f"{link_path}/deep/Inner.txt")
+    parent_repo.link_update(link_path)
+
+    assert not parent_repo.path_exists(f"{link_path}/deep")
+
+
+@pytest.mark.smoke
+def test_link_update_keeps_a_modified_case_variant_of_a_file_the_update_deletes(
+    new_lore_repo,
+):
+    """A file spelled in another case holding other content than the pinned file is local work."""
+    link_path = "libs/shared"
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned\n", "keep.txt": "keep\n"}
+    )
+    link_repo.rmtree("deep")
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    variant = f"{link_path}/deep/Inner.txt"
+    parent_repo.move(f"{link_path}/deep/inner.txt", variant)
+    parent_repo.write_files({variant: "locally edited\n"})
+    with pytest.raises(LocalChanges):
+        parent_repo.link_update(link_path)
+
+    with parent_repo.open_file(variant) as f:
+        assert f.read() == "locally edited\n"
