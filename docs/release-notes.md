@@ -123,14 +123,14 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   as `Intermediate/` to directories only, so a file named `Intermediate` is tracked like any other file, and
   `lore unstage` applies a directory-only view rule to directories only
 - `lore status` lists and `lore unstage` takes back staged changes to paths an ignore rule matches
-- `lore push --fast-forward-merge` keeps a rename that changes only case where the push also changes content in the
-  directory holding it. A renamed directory keeps its files, and a renamed file keeps edits made to it on the target
-  branch
 - After a merge under a sparse view, diffs and file history list the files it adds, moves and deletes in out-of-view
   directories, and `lore link list` reflects the links it adds, moves and removes there
 - `lore revision info --delta` lists a directory a merge brings in as added, with or without a view
 - `lore clone`, `lore sync` and `lore stage --scan` skip a directory no re-inclusion can reach, such as `Game/Saved/Logs`
   under `Saved/`, `!*/Saved/Config/`
+- A rename that changes only the case of a name, such as `Build.cs` to `build.cs`, commits without `--force`, and
+  `lore sync`, `lore branch switch`, `lore branch merge` and `lore push --fast-forward-merge` apply it. This holds for
+  renames committed with this release or later
 - `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and
   `lore push --fast-forward-merge` keep both changes where one side moves a file, or a directory holding it, and the
   other edits the file, with or without the same move: the edit lands where the move put the file. Edits of a file on

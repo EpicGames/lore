@@ -8,6 +8,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_revision::filter::FilterMode;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
@@ -15,8 +16,10 @@ use lore_revision::revision::DiffResult;
 use lore_revision::revision::diff3_collect;
 use lore_revision::state::State;
 use lore_revision::state::apply_tree_changes;
+use lore_revision::state::diff_collect;
 use lore_storage::hash::hash_string;
 
+use crate::case_folding::case_folding;
 use crate::helper::in_memory;
 use crate::helper::in_memory::add;
 use crate::helper::in_memory::branch_id;
@@ -402,6 +405,43 @@ async fn a_case_only_move_of_a_directory_keeps_its_children() {
     .await;
 }
 
+/// A directory renamed only in case on a tree hashed under the rule folding case, which the new
+/// address of the rename marks modified, keeps the target's node, holding the edit the target made
+/// below it, so a diff against the source reports that edit.
+#[tokio::test]
+async fn a_case_only_move_of_a_case_folding_directory_keeps_the_target_node() {
+    run(|repository| async move {
+        let folding = case_folding(&repository, &in_memory::token(), base(&repository).await).await;
+        let source = edited(&repository, folding, &[Edit::Move("Dir/Sub", "Dir/sub")]).await;
+        let target = edited(&repository, folding, &[Edit::Write("Dir/Sub/c.txt", 3)]).await;
+        let diff = diff3_collect(repository.clone(), folding, source, target, None, false)
+            .await
+            .expect("diffing the revisions");
+        let merged = revision_state(&repository, apply(&repository, &diff).await).await;
+
+        let tree = contents(&repository, &merged).await;
+        let target_tree = contents(&repository, &*revision_state(&repository, target).await).await;
+        assert_eq!(tree.get("Dir/sub"), target_tree.get("Dir/Sub"), "{tree:?}");
+        assert_eq!(tree.get("Dir/sub/c.txt"), Some(&content(3, 0o644)));
+        let changes = diff_collect(
+            repository.clone(),
+            merged,
+            repository.clone(),
+            revision_state(&repository, source).await,
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("diffing the merged revision");
+        let paths: Vec<String> = changes
+            .iter()
+            .map(|change| change.path().to_string())
+            .collect();
+        assert!(paths.contains(&"Dir/sub/c.txt".to_string()), "{paths:?}");
+    })
+    .await;
+}
+
 /// A rename that only changes case keeps the content the head gave the file meanwhile, which the
 /// 3-way diff folds into the rename.
 #[tokio::test]
@@ -543,13 +583,9 @@ const MOVES: [Moved; 4] = [
 ];
 
 /// The edits of the side making `moved`, and an edit of the moved file to `version` where one is
-/// given. A directory's address folds case, so the move comes with an edit of `Dir/b.txt` beside
-/// it for the revision diff to report a move that only changes case.
+/// given.
 fn moving(moved: &Moved, version: Option<u64>) -> Vec<Edit> {
-    let mut edits = vec![
-        Edit::Move(moved.from, moved.to),
-        Edit::Write("Dir/b.txt", 9),
-    ];
+    let mut edits = vec![Edit::Move(moved.from, moved.to)];
     edits.extend(version.map(|version| Edit::Write(moved.file_moved, version)));
     edits
 }
@@ -569,11 +605,6 @@ async fn an_edit_against_a_move_takes_both() {
                 assert_eq!(
                     merged.get(moved.file_moved),
                     Some(&content(version, 0o644)),
-                    "{context}"
-                );
-                assert_eq!(
-                    merged.get("Dir/b.txt"),
-                    Some(&content(9, 0o644)),
                     "{context}"
                 );
                 assert!(!merged.contains_key(moved.from), "{context}");
@@ -655,21 +686,23 @@ async fn a_mode_change_against_an_edit_of_a_moved_file_conflicts() {
     .await;
 }
 
-/// Two moves of one file to different names conflict, names that differ only in case included,
+/// Two moves of one node to different names conflict, names that differ only in case included,
 /// and the same move on both sides merges.
 #[tokio::test]
-async fn moves_of_one_file_to_different_names_conflict() {
+async fn moves_of_one_node_to_different_names_conflict() {
     run(|repository| async move {
-        for (source, target) in [
-            ("B.txt", "A.txt"),
-            ("file.txt", "FILE.txt"),
-            ("B.txt", "file.txt"),
-            ("file.txt", "B.txt"),
+        for (from, source, target) in [
+            ("File.txt", "B.txt", "A.txt"),
+            ("File.txt", "file.txt", "FILE.txt"),
+            ("File.txt", "B.txt", "file.txt"),
+            ("File.txt", "file.txt", "B.txt"),
+            ("Dir/a.txt", "Dir/A.txt", "Dir/A.TXT"),
+            ("Dir/Sub", "Dir/sub", "Dir/SUB"),
         ] {
             let diff = diff(
                 &repository,
-                &[Edit::Move("File.txt", source)],
-                &[Edit::Move("File.txt", target)],
+                &[Edit::Move(from, source)],
+                &[Edit::Move(from, target)],
             )
             .await;
             assert_eq!(
@@ -678,15 +711,20 @@ async fn moves_of_one_file_to_different_names_conflict() {
                 "{source} against {target}"
             );
         }
-        for name in ["B.txt", "file.txt"] {
+        for (from, name, file) in [
+            ("File.txt", "B.txt", "B.txt"),
+            ("File.txt", "file.txt", "file.txt"),
+            ("Dir/a.txt", "Dir/A.txt", "Dir/A.txt"),
+            ("Dir/Sub", "Dir/sub", "Dir/sub/c.txt"),
+        ] {
             let merged = merge(
                 &repository,
-                &[Edit::Move("File.txt", name)],
-                &[Edit::Move("File.txt", name)],
+                &[Edit::Move(from, name)],
+                &[Edit::Move(from, name)],
             )
             .await;
-            assert_eq!(merged.get(name), Some(&content(1, 0o644)), "{merged:?}");
-            assert!(!merged.contains_key("File.txt"), "{merged:?}");
+            assert_eq!(merged.get(file), Some(&content(1, 0o644)), "{merged:?}");
+            assert!(!merged.contains_key(from), "{merged:?}");
         }
     })
     .await;
@@ -918,10 +956,7 @@ async fn the_same_case_only_rename_of_a_directory_on_both_sides_is_the_edit_belo
                 Edit::Move("Dir/Sub", "Dir/sub"),
                 Edit::Write("Dir/sub/c.txt", 2),
             ],
-            &[
-                Edit::Move("Dir/Sub", "Dir/sub"),
-                Edit::Write("Dir/b.txt", 9),
-            ],
+            &[Edit::Move("Dir/Sub", "Dir/sub")],
         )
         .await;
         assert_eq!(
@@ -1072,6 +1107,53 @@ async fn a_move_a_fast_forward_merge_applied_is_a_delete_and_an_add() {
     .await;
 }
 
+/// A file renamed only in case, in a directory nothing else in the push changes, takes its new
+/// name, which the push carries together with an edit elsewhere.
+#[tokio::test]
+async fn a_case_only_move_of_a_file_alone_in_its_directory_takes_its_new_name() {
+    run(|repository| async move {
+        let merged = merge(
+            &repository,
+            &[
+                Edit::Move("Dir/a.txt", "Dir/A.txt"),
+                Edit::Write("Other.txt", 2),
+            ],
+            &[Edit::Write("File.txt", 3)],
+        )
+        .await;
+
+        assert_eq!(merged.get("Dir/A.txt"), Some(&content(1, 0o644)));
+        assert_eq!(merged.get("Dir/b.txt"), Some(&content(1, 0o644)));
+        assert_eq!(merged.get("Other.txt"), Some(&content(2, 0o644)));
+        assert_eq!(merged.get("File.txt"), Some(&content(3, 0o644)));
+        assert!(!merged.contains_key("Dir/a.txt"), "{merged:?}");
+    })
+    .await;
+}
+
+/// A directory renamed only in case, in a directory nothing else in the push changes, takes its
+/// new name and keeps its children.
+#[tokio::test]
+async fn a_case_only_move_of_a_directory_alone_in_its_directory_takes_its_new_name() {
+    run(|repository| async move {
+        let merged = merge(
+            &repository,
+            &[
+                Edit::Move("Dir/Sub", "Dir/sub"),
+                Edit::Write("Other.txt", 2),
+            ],
+            &[Edit::Write("File.txt", 3)],
+        )
+        .await;
+
+        assert_eq!(merged.get("Dir/sub/c.txt"), Some(&content(1, 0o644)));
+        assert!(!merged.contains_key("Dir/Sub"), "{merged:?}");
+        assert_eq!(merged.get("Other.txt"), Some(&content(2, 0o644)));
+        assert_eq!(merged.get("File.txt"), Some(&content(3, 0o644)));
+    })
+    .await;
+}
+
 /// An edit of a file the target moves onto a path the source also changed conflicts where the file
 /// stood and where the move put it, as it does with no move: the edit cannot follow the move.
 #[tokio::test]
@@ -1150,19 +1232,13 @@ async fn a_move_away_against_a_move_onto_a_path_the_source_changed_conflicts() {
 async fn a_directory_delete_against_a_case_only_rename_conflicts_on_the_directory() {
     run(|repository| async move {
         let deleting = [Edit::Delete("Dir/Sub")];
-        let renaming = [
-            Edit::Move("Dir/Sub", "Dir/sub"),
-            Edit::Write("Dir/b.txt", 9),
-        ];
+        let renaming = [Edit::Move("Dir/Sub", "Dir/sub")];
         for (source, target, changes, conflict) in [
             (&deleting[..], &renaming[..], vec![], ("Dir/sub", "Dir/sub")),
             (
                 &renaming[..],
                 &deleting[..],
-                vec![
-                    "Keep Dir/b.txt <- Dir/b.txt",
-                    "Delete Dir/Sub/c.txt <- Dir/Sub/c.txt",
-                ],
+                vec!["Delete Dir/Sub/c.txt <- Dir/Sub/c.txt"],
                 ("Dir/sub", "Dir/Sub"),
             ),
         ] {

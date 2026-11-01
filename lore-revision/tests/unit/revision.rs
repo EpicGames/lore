@@ -18,7 +18,9 @@ use lore_revision::util::path::RelativePath;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_store_create;
 
+mod case_rename;
 mod diff;
+mod instance;
 mod last_merged;
 mod merge_moves;
 mod resolve;

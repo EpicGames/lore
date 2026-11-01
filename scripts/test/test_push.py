@@ -377,8 +377,9 @@ def test_push_fast_forward_merge_non_merge(new_lore_repo):
 @pytest.mark.smoke
 def test_push_fast_forward_merge_case_rename(new_lore_repo):
     """A fast-forward merge of a revision that renames a directory only in case
-    keeps the new name and every file below it, and a revision committed on top
-    of the merge records no move."""
+    keeps the new name and every file below it, an instance that pushed the
+    other side renames the directory on disk when it syncs, and a revision
+    committed on top of the merge records no move."""
     repo: Lore = new_lore_repo()
     repo.make_dirs("Docs")
     for path in ["Config.txt", "Docs/Guide.txt", "Docs/notes.txt"]:
@@ -388,11 +389,7 @@ def test_push_fast_forward_merge_case_rename(new_lore_repo):
     repo.commit("Initial", offline=True)
     repo.push()
 
-    # Directory addresses fold case, so the rename comes with a modification for
-    # the revision diff to report it.
     repo.move("Docs", "docs")
-    with repo.open_file(os.path.join("docs", "Guide.txt"), "w+") as f:
-        f.write("modified\n")
     repo.stage(scan=True, case="rename", offline=True)
     repo.commit("Rename in case", offline=True)
 
@@ -409,6 +406,8 @@ def test_push_fast_forward_merge_case_rename(new_lore_repo):
     assert _collect_repo_files(repo.clone()) == expected
     repo.sync()
     assert _collect_repo_files(repo) == expected
+    clone_b.sync()
+    assert _collect_repo_files(clone_b) == expected
 
     with repo.open_file("follow.txt", "w+") as f:
         f.write("follow\n")

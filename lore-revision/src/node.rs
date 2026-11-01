@@ -361,7 +361,8 @@ pub struct Node {
     pub size: u64,
     /// Node content address
     /// - For files this is the content payload (content hash and file ID).
-    /// - For directories the hash of all child node content hashes (sorted by node name hash in ascending order).
+    /// - For directories the hash of every child's name and content, in ascending order of name
+    ///   hash; see [`rehash_directory`](crate::commit::rehash_directory).
     /// - For a submodule this is the target revision hash and repository ID.
     pub address: Address,
 }
@@ -1273,22 +1274,40 @@ impl NodeBlock {
     /// Read only node access without keeping lock, data returned by clone
     pub fn node_name_clone(&self, node_index: usize) -> Result<String, NodeNameError> {
         let guard = self.data.read();
-        let node = &guard.data.node[node_index];
+        let name =
+            std::str::from_utf8(Self::name_bytes(&guard, node_index)?).internal("Node name")?;
+        validate_node_name(name)?;
+        Ok(name.to_string())
+    }
+
+    /// A copy of the node at `node_index`, with the bytes of the name it stores appended to
+    /// `name`, unchecked against the name rules. No lock is held on return.
+    pub fn node_and_name_bytes(
+        &self,
+        node_index: usize,
+        name: &mut Vec<u8>,
+    ) -> Result<Node, NodeNameError> {
+        let guard = self.data.read();
+        name.extend_from_slice(Self::name_bytes(&guard, node_index)?);
+        Ok(guard.data.node[node_index])
+    }
+
+    /// The bytes of the name the node at `node_index` stores in the name table of `data`,
+    /// unchecked against the name rules.
+    fn name_bytes(data: &NodeBlockRuntimeData, node_index: usize) -> Result<&[u8], NodeNameError> {
+        let node = &data.data.node[node_index];
         let offset = node.name_offset as usize;
         let length = node.name_length as usize;
-        if guard.name.len() < (offset + length) {
+        if data.name.len() < (offset + length) {
             return Err(InvalidArguments {
                 reason: format!(
                     "node name offset {offset} + length {length} exceeds name table size {}",
-                    guard.name.len()
+                    data.name.len()
                 ),
             }
             .into());
         }
-        let name =
-            std::str::from_utf8(&guard.name[offset..(offset + length)]).internal("Node name")?;
-        validate_node_name(name)?;
-        Ok(name.to_string())
+        Ok(&data.name[offset..(offset + length)])
     }
 
     /// Returns the node name as a lock guard that holds a read lock on the block data.
@@ -1316,20 +1335,8 @@ impl NodeBlock {
         guard: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeBlockRuntimeData>,
         node_index: usize,
     ) -> Result<NodeNameLock, NodeNameError> {
-        let node = &guard.data.node[node_index];
-        let offset = node.name_offset as usize;
-        let length = node.name_length as usize;
-        if guard.name.len() < (offset + length) {
-            return Err(InvalidArguments {
-                reason: format!(
-                    "node name offset {offset} + length {length} exceeds name table size {}",
-                    guard.name.len()
-                ),
-            }
-            .into());
-        }
         let name_str =
-            std::str::from_utf8(&guard.name[offset..(offset + length)]).internal("Node name")?;
+            std::str::from_utf8(Self::name_bytes(&guard, node_index)?).internal("Node name")?;
         validate_node_name(name_str)?;
         let name: *const str = name_str;
         Ok(NodeNameLock {

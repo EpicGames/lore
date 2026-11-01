@@ -545,8 +545,7 @@ mod tests {
     const BUILD_RULES_RENAMED: &str = "VerseInput.build.cs";
 
     /// Commits `instance` holding [`BUILD_RULES`] in [`PLUGIN`] and then a revision renaming it to
-    /// [`BUILD_RULES_RENAMED`], answering both. Tree hashes fold case, so the rename stages a tree
-    /// hashing as the current one and commits only when forced.
+    /// [`BUILD_RULES_RENAMED`], answering both.
     async fn commit_a_rename_in_case_alone(
         instance: &TestRepository,
     ) -> (lore_base::types::Hash, lore_base::types::Hash) {
@@ -572,20 +571,13 @@ mod tests {
         )
         .await
         .expect("Failed to stage the rename");
-        let forced = lore_revision::interface::LoreGlobalArgs {
-            force: 1,
-            ..Default::default()
-        };
-        let second = LORE_CONTEXT
-            .scope(test_execution_with(forced), test_commit(instance, "Second"))
-            .await
-            .revision();
+        let second = test_commit(instance, "Second").await.revision();
         (first, second)
     }
 
-    /// A revision renaming a file in case alone leaves the working tree's spelling, and a merge
-    /// of a branch deleting the directory takes the file with it. The repository keeps its own
-    /// stores, which hold the branch metadata a new branch reads.
+    /// A file the working tree spells in another case than the revision does goes with the
+    /// directory a merged branch deletes. The repository keeps its own stores, which hold the
+    /// branch metadata a new branch reads.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_merge_deletes_a_directory_holding_a_case_variant_of_its_file() {
         let _ = test_store_create().await.expect("Failed to create stores");
@@ -638,6 +630,11 @@ mod tests {
 
                 sync_to(&instance, first, false).await;
                 sync_to(&instance, second, false).await;
+                fs::rename(
+                    directory.join(BUILD_RULES_RENAMED),
+                    directory.join(BUILD_RULES),
+                )
+                .expect("Failed to spell the file in another case");
                 let unrelated = instance.path.join("unrelated.txt");
                 test_file_write(unrelated.as_path(), b"main moves on");
                 file::stage::stage(

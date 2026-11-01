@@ -3542,8 +3542,13 @@ class TestMoveMerge:
     @pytest.mark.smoke
     @pytest.mark.parametrize(
         "moved",
-        [("Dir/a.txt", "Dir/z.txt"), ("Dir", "Moved")],
-        ids=["file", "directory"],
+        [
+            ("Dir/a.txt", "Dir/z.txt"),
+            ("Dir", "Moved"),
+            ("Dir/a.txt", "Dir/A.txt"),
+            ("Dir", "dir"),
+        ],
+        ids=["file", "directory", "file-case", "directory-case"],
     )
     @pytest.mark.parametrize(
         "operation",
@@ -3552,7 +3557,8 @@ class TestMoveMerge:
     def test_an_edit_against_a_move_keeps_both(self, new_lore_repo, operation, moved):
         """Each operation that joins two lines of history keeps both changes where one
         line moves a file, or the directory holding it, and the other edits the file:
-        the edit lands where the move put the file, with no conflict."""
+        the edit lands where the move put the file, with no conflict. A move that
+        changes only case is a move like any other."""
         source, destination = moved
         base = ["Dir/a.txt", "Dir/b.txt", "Top.txt"]
         repo: Lore = new_lore_repo()

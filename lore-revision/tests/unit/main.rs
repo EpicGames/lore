@@ -8,6 +8,7 @@
 
 mod auth;
 mod branch;
+mod case_folding;
 mod change;
 mod commit;
 mod dependency;

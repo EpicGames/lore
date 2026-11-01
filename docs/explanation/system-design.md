@@ -393,7 +393,7 @@ graph that produce new revisions whose parents and contents follow from the oper
 
 A revision's tree of files and directories is itself a Merkle tree. Each file node's hash derives
 from the file's content (directly, or via a fragment list when the file is large enough to be
-split). Each directory node's hash derives from the sorted hash list of its children. The root hash
+split). Each directory node's hash derives from its children's names and hashes. The root hash
 uniquely identifies the entire repository state - every byte of every file in the revision is
 reachable and verifiable from a single 32-byte root hash.
 
@@ -1079,6 +1079,9 @@ node's name is found by following its `name_offset` and `name_length` into that 
 lower-case name hash on the node lets common lookups (case-insensitive name match) happen
 without dereferencing the table at all. Keeping names out of the node lets node records stay
 small and uniform regardless of file-name length.
+
+A directory's hash covers each child's name exactly as stored, so a rename that changes only case
+changes it, while lookups match children by the name hash alone.
 
 Fixed-size everywhere is the design driver. A node block can be mmapped from disk straight into
 memory and used without parsing or copying; node-to-node navigation is a 32-bit index lookup;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -3216,6 +3217,12 @@ async fn commit_link(
     Ok((signature, node_id))
 }
 
+/// The key a directory's address is hashed under in BLAKE3's keyed mode. A revision may also hold
+/// unkeyed directory addresses, hashed from the children without their names, and the key keeps
+/// the two apart.
+const DIRECTORY_HASH_KEY: [u8; 32] = *b"lore directory exact child names";
+
+/// What a child contributes to its directory's address besides its name.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, IntoBytes, FromBytes, Immutable)]
 struct NodeHashData {
@@ -3241,6 +3248,21 @@ impl NodeHashData {
     }
 }
 
+/// A child of a directory [`rehash_directory`] hashes: what it contributes besides its name, and
+/// where its name lies among the names read for the directory.
+struct ChildHashData {
+    data: NodeHashData,
+    name: Range<u32>,
+}
+
+/// Rehash the directory `node_id`, when it is the root or staged, and every staged directory below
+/// it, clearing their staged flags.
+///
+/// A directory's address is the hash, keyed with [`DIRECTORY_HASH_KEY`], of every child in the
+/// order of their name hashes: for each, its [`NodeHashData`], then the length and the bytes of
+/// the name it stores, unchecked against the name rules. A rename that changes only case
+/// therefore changes the address. The names are read from the name table of each block holding a
+/// child of a rehashed directory.
 pub async fn rehash_directory(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -3261,22 +3283,25 @@ pub async fn rehash_directory(
     lore_trace!("Rehash directory node {} address {}", node_id, node.address);
     debug_assert!(node.is_directory());
 
-    let mut child_data: Vec<NodeHashData> = vec![];
+    let mut child_data: Vec<ChildHashData> = vec![];
+    let mut names: Vec<u8> = vec![];
 
     let mut total_size = 0;
-    let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?;
+    let mut children =
+        StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?;
 
     let mut tasks = JoinSet::new();
     let mut walk_failure = None;
 
     loop {
-        let child = match children
-            .next()
+        let (child_node_id, child_node) = match children
+            .next_with_name_bytes(&mut names)
             .await
-            .forward::<CommitError>("Failed deserializing state block")
-        {
+            .forward::<CommitError>(
+            "Failed deserializing state block",
+        ) {
             Ok(Some(child)) => child,
             Ok(None) => break,
             Err(err) => {
@@ -3284,13 +3309,15 @@ pub async fn rehash_directory(
                 break;
             }
         };
-        let (child_node_id, child_node) = child;
+        let Ok(name_end) = u32::try_from(names.len()) else {
+            walk_failure = Some(CommitError::internal(
+                "Names of a directory's children exceed 4 GiB",
+            ));
+            break;
+        };
 
         if child_node.is_staged_delete() {
-            let node_path = state
-                .node_path(repository.clone(), child_node_id)
-                .await
-                .unwrap_or_default();
+            let node_path = path_for_message(&repository, &state, child_node_id).await;
             lore_warn!(
                 "Encountered deleted node {child_node_id} when rehashing directory node {node_id}: {node_path}"
             );
@@ -3304,10 +3331,7 @@ pub async fn rehash_directory(
             lore_debug!(
                 "Node {} {} dirty flags not cleared 0x{:x} address {}",
                 child_node_id,
-                state
-                    .node_path(repository.clone(), child_node_id)
-                    .await
-                    .unwrap_or_default(),
+                path_for_message(&repository, &state, child_node_id).await,
                 child_node.flags,
                 child_node.address
             );
@@ -3317,22 +3341,25 @@ pub async fn rehash_directory(
             break;
         }
 
+        let child = ChildHashData {
+            data: NodeHashData::from_node(&child_node),
+            name: name_end - child_node.name_length..name_end,
+        };
+
         if child_node.is_directory() {
             lore_trace!("Spawning rehash of directory node {}", child_node_id);
-            lore_spawn!(tasks, {
-                let repository = repository.clone();
-                let state = state.clone();
-                async move { rehash_directory_recurse(repository, state, child_node_id).await }
-            });
+            let index = child_data.len() as u32;
+            child_data.push(child);
+            lore_spawn!(
+                tasks,
+                rehash_directory_recurse(repository.clone(), state.clone(), child_node_id, index)
+            );
         } else {
             if child_node.is_staged() {
                 lore_debug!(
                     "Node {} {} staged flags not cleared 0x{:x} address {}",
                     child_node_id,
-                    state
-                        .node_path(repository.clone(), child_node_id)
-                        .await
-                        .unwrap_or_default(),
+                    path_for_message(&repository, &state, child_node_id).await,
                     child_node.flags,
                     child_node.address
                 );
@@ -3367,16 +3394,16 @@ pub async fn rehash_directory(
 
             total_size += child_node.size;
 
-            child_data.push(NodeHashData::from_node(&child_node));
+            child_data.push(child);
         }
     }
 
     let mut task_failure = Ok(());
     while let Some(task) = tasks.join_next().await {
         match task {
-            Ok(Ok(result)) => {
+            Ok(Ok((index, result))) => {
                 total_size += result.size;
-                child_data.push(result);
+                child_data[index as usize].data = result;
             }
             Ok(Err(err)) => {
                 if walk_failure.is_none() {
@@ -3391,12 +3418,14 @@ pub async fn rehash_directory(
     }
     task_failure.internal("Recursion task failed")?;
 
-    child_data.sort_unstable_by_key(|lhs| lhs.name_hash);
+    child_data.sort_unstable_by_key(|child| child.data.name_hash);
 
-    let mut hasher = blake3::Hasher::new();
-    for data in child_data.iter() {
+    let mut hasher = blake3::Hasher::new_keyed(&DIRECTORY_HASH_KEY);
+    for child in child_data.iter() {
         // Assumes little endian
-        hasher.update(data.as_bytes());
+        hasher.update(child.data.as_bytes());
+        hasher.update(&(child.name.end - child.name.start).to_le_bytes());
+        hasher.update(&names[child.name.start as usize..child.name.end as usize]);
     }
     let blake3_hash = hasher.finalize();
 
@@ -3428,11 +3457,18 @@ pub async fn rehash_directory(
     Ok(())
 }
 
+/// What the rehash of a subdirectory returns: its index among the children of the directory
+/// being rehashed, and what it contributes to that directory's address.
+type ChildRehash = Result<(u32, NodeHashData), CommitError>;
+
+/// Rehash the directory `node_id`, the child at `index` of the directory being rehashed, and
+/// return what it contributes to that directory's address with the index.
 fn rehash_directory_recurse(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
-) -> Pin<Box<dyn Future<Output = Result<NodeHashData, CommitError>> + Send>> {
+    index: u32,
+) -> Pin<Box<dyn Future<Output = ChildRehash> + Send>> {
     Box::pin(async move {
         rehash_directory(repository.clone(), state.clone(), node_id).await?;
 
@@ -3444,8 +3480,20 @@ fn rehash_directory_recurse(
             .forward::<CommitError>("Failed deserializing state block")?;
         let node = block.node(node_index);
 
-        Ok(NodeHashData::from_node(&node))
+        Ok((index, NodeHashData::from_node(&node)))
     })
+}
+
+/// The path of `node_id` for a message, or an empty one where it cannot be read. The read is boxed
+/// so a rehash's future holds only the box while it runs, on paths that report a failure.
+async fn path_for_message(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node_id: NodeID,
+) -> String {
+    Box::pin(state.node_path(repository.clone(), node_id))
+        .await
+        .unwrap_or_default()
 }
 
 fn delta_add(delta: Arc<parking_lot::RwLock<BytesMut>>, node_id: NodeID, flags: u16) {

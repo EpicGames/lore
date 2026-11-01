@@ -282,6 +282,36 @@ impl StateNodeChildrenWithNameIterator {
             }
         }
     }
+
+    /// Get the next child node, with the bytes of the name it stores appended to `name`,
+    /// unchecked against the name rules, so a child [`Self::next`] skips for its name is yielded
+    /// too.
+    pub async fn next_with_name_bytes(
+        &mut self,
+        name: &mut Vec<u8>,
+    ) -> Result<Option<(NodeID, Node)>, StateError> {
+        let Some(node_id) = self.current_node_id else {
+            return Ok(None);
+        };
+        let iblock = NodeBlock::index(node_id);
+        if iblock != self.current_iblock || self.current_block.is_none() {
+            self.current_iblock = iblock;
+            self.current_block = Some(
+                self.state
+                    .block_with_nametable(self.repository.clone(), iblock)
+                    .await?,
+            );
+        }
+        let node = self
+            .current_block
+            .as_ref()
+            .unwrap()
+            .node_and_name_bytes(Node::index(node_id), name)
+            .forward::<StateError>("Node name")?;
+        node.walk_step(node_id, self.parent_node_id, &mut self.cycle)?;
+        self.current_node_id = node.sibling();
+        Ok(Some((node_id, node)))
+    }
 }
 
 /// Iterator over child nodes of a directory, loading blocks without nametable.
@@ -9006,9 +9036,11 @@ fn collect_new_addresses_recurse(
 ///
 /// A move deletes the node at its source and stages the moved node at its destination. The
 /// destination of a move that only changes case resolves to the node at its source, so that node
-/// is renamed in place instead, keeping its children. It takes the moved node's content only where
-/// the move modifies it, and otherwise keeps the target's: the 3-way diff folds a change the target
-/// made at the source into a move that leaves the content as it was.
+/// is renamed in place instead, keeping its children. A renamed directory keeps the rest of the
+/// target's node, since its address derives from its children, which the changes below it reach.
+/// A renamed file or link takes the moved node's content only where the move modifies it, and
+/// otherwise keeps the target's: the 3-way diff folds a change the target made at the source into
+/// a move that leaves the content as it was.
 ///
 /// Preconditions:
 /// - The changes must be conflict-free (no entries with `Flags::Conflict`)
@@ -9078,14 +9110,18 @@ pub async fn apply_tree_changes(
                     let block = target_state
                         .block_with_nametable(repository.clone(), block_index)
                         .await?;
-                    target_state.node_rename(
-                        &block,
-                        block_index,
-                        node_index,
-                        &block.node(node_index),
-                        change.path().name(),
-                    )?;
-                    if !change.flags.contains(change::Flags::Modify) {
+                    let renamed_directory = {
+                        let node = block.node(node_index);
+                        target_state.node_rename(
+                            &block,
+                            block_index,
+                            node_index,
+                            &node,
+                            change.path().name(),
+                        )?;
+                        node.is_directory()
+                    };
+                    if renamed_directory || !change.flags.contains(change::Flags::Modify) {
                         target_state
                             .node_mark(repository.clone(), node_link.node, NodeFlags::Staged, true)
                             .await?;
