@@ -18,6 +18,11 @@ _BUCKET_PREFIX = "index_"
 _HEADER_SIZE = 16
 _HASH_SIZE = 32
 _FAN_OUT_LEVEL_MAX = 256
+# An immutable bucket header's second field: set bit, count of packfile sizes recorded, and the
+# 8-byte id and size of each one after the first following the entries.
+_SIZES_RECORDED = 1 << 31
+_SIZES_COUNT_SHIFT = 24
+_PACKFILE_SIZE_SIZE = 8
 
 
 def _bucket_for(bucket_byte: int, level: int) -> int:
@@ -124,10 +129,14 @@ def _torn_file(path: str, name: str) -> str | None:
     if size < _HEADER_SIZE:
         return f"{size} bytes, shorter than its header"
     with open(path, "rb") as handle:
-        _version, _unused, count, _unused_two = struct.unpack(
+        _version, packfile_sizes, count, _first_packfile_size = struct.unpack(
             "<IIII", handle.read(_HEADER_SIZE)
         )
-    entries_size = size - _HEADER_SIZE - 4 * count
+    trailer_size = 0
+    if packfile_sizes & _SIZES_RECORDED:
+        recorded = (packfile_sizes & ~_SIZES_RECORDED) >> _SIZES_COUNT_SHIFT
+        trailer_size = max(recorded - 1, 0) * _PACKFILE_SIZE_SIZE
+    entries_size = size - _HEADER_SIZE - 4 * count - trailer_size
     if count == 0:
         return None if entries_size == 0 else f"{size} bytes for no entries"
     if (
