@@ -61,6 +61,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore repository instance prune` keeps an instance whose instance file cannot be read on filesystems that report an
+  empty directory's size as zero, such as Btrfs: reading a directory as a file fails instead of reading as empty
 - `lore-server`: repository create and delete return `INVALID_ARGUMENT` for the all-zero repository id. This id
   identifies the namespace-root partition holding the repository name table
 - `lore-revision`: links and layers name both sides of a mount the same way, `mount_path` and `source_path`. No behaviour change

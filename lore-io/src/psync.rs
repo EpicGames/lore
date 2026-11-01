@@ -143,7 +143,17 @@ impl PsyncDriver {
                     .read(true)
                     .to_std_blocking()
                     .open(path)?;
-                let len = file.metadata()?.len() as usize;
+                let metadata = file.metadata()?;
+                // A directory opens for reading on Unix, and its size is whatever the filesystem
+                // reports, zero on some, so reading it by that size could answer with an empty
+                // file rather than an error.
+                if metadata.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "is a directory, not a file",
+                    ));
+                }
+                let len = metadata.len() as usize;
                 crate::driver::check_whole_file_len(len)?;
                 // SAFETY: every byte up to `len` is filled before returning, and a file that
                 // shrank returns an error rather than the buffer.

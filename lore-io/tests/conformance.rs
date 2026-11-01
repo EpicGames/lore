@@ -260,6 +260,18 @@ async fn read_file_bytes_roundtrip() {
     }
 }
 
+/// A directory is not a file, whatever size the filesystem reports for it: zero on some, so a
+/// read sized by it would otherwise answer with an empty file.
+#[tokio::test]
+async fn read_file_bytes_refuses_a_directory() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-read-directory-");
+        let path = dir.child("directory");
+        std::fs::create_dir(&path).expect("create directory");
+        assert!(driver.read_file_bytes(&path).await.is_err());
+    }
+}
+
 /// The whole-file operations hold a pool thread and the whole file for their duration, so they
 /// are for small files and say so. A caller that reaches for the wrong one finds out at the
 /// call rather than by occupying one of at most 32 threads for a multi-gigabyte transfer.
