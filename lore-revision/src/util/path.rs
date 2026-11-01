@@ -440,13 +440,21 @@ pub struct RelativePathData {
 }
 
 /// The COW path type with offset-based views
+///
+/// A walk holds a path for every change it finds, millions for a large tree, so the size of a
+/// path is a large share of what a change costs. 32-bit offsets keep it to 24 bytes.
 #[derive(Clone)]
 pub struct RelativePath {
     data: Arc<RelativePathData>,
-    start: usize,       // View start offset into path
-    end: usize,         // View end offset into path
-    start_lower: usize, // View start offset into path_lower
-    end_lower: usize,   // View end offset into path_lower
+    start: u32,       // View start offset into path
+    end: u32,         // View end offset into path
+    start_lower: u32, // View start offset into path_lower
+    end_lower: u32,   // View end offset into path_lower
+}
+
+/// An offset into a path's data. Paths are bounded far below 4 GiB by every filesystem.
+fn offset(value: usize) -> u32 {
+    u32::try_from(value).expect("a path shorter than 4 GiB")
 }
 
 /// The shared data an empty path views, so naming one costs an atomic rather than an
@@ -472,15 +480,13 @@ impl RelativePath {
 
     pub fn pop(&mut self) -> &mut Self {
         if !self.is_empty() {
-            let view = &self.data.path[self.start..self.end];
-            if let Some(sep) = view.rfind('/') {
+            if let Some(sep) = self.as_str().rfind('/') {
                 // Adjust end to remove the last component
-                self.end = self.start + sep;
+                self.end = self.start + offset(sep);
 
                 // Adjust end_lower similarly
-                let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
-                if let Some(sep_lower) = view_lower.rfind('/') {
-                    self.end_lower = self.start_lower + sep_lower;
+                if let Some(sep_lower) = self.as_lowercase_str().rfind('/') {
+                    self.end_lower = self.start_lower + offset(sep_lower);
                 }
             } else {
                 // No separator found, clear the view
@@ -492,20 +498,18 @@ impl RelativePath {
     }
 
     pub fn pop_root(&mut self) -> &str {
-        let view = &self.data.path[self.start..self.end];
-        let root = if let Some(sep) = view.find('/') {
-            &self.data.path[self.start..(self.start + sep)]
-        } else {
-            &self.data.path[self.start..self.end]
-        };
+        let start = self.start as usize;
+        let view = &self.data.path[start..self.end as usize];
+        let root_len = view.find('/').unwrap_or(view.len());
+        let root = &self.data.path[start..start + root_len];
 
-        let root_len = root.len();
         if root_len + 1 < self.len() {
-            self.start = self.start + root_len + 1;
+            self.start = self.start + offset(root_len) + 1;
 
-            let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
+            let view_lower =
+                &self.data.path_lower[self.start_lower as usize..self.end_lower as usize];
             if let Some(sep) = view_lower.find('/') {
-                self.start_lower = self.start_lower + sep + 1;
+                self.start_lower = self.start_lower + offset(sep) + 1;
             }
         } else {
             self.start = self.end;
@@ -539,8 +543,8 @@ impl RelativePath {
         let separator = self.as_str().rfind('/');
         let separator_lower = self.as_lowercase_str().rfind('/');
         if let (Some(separator), Some(separator_lower)) = (separator, separator_lower) {
-            self.end = self.start + separator;
-            self.end_lower = self.start_lower + separator_lower;
+            self.end = self.start + offset(separator);
+            self.end_lower = self.start_lower + offset(separator_lower);
         } else {
             self.end = self.start;
             self.end_lower = self.start_lower;
@@ -583,7 +587,7 @@ impl RelativePath {
     }
 
     pub fn len(&self) -> usize {
-        self.end - self.start
+        (self.end - self.start) as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -591,11 +595,11 @@ impl RelativePath {
     }
 
     pub fn as_str(&self) -> &str {
-        &self.data.path[self.start..self.end]
+        &self.data.path[self.start as usize..self.end as usize]
     }
 
     pub fn as_lowercase_str(&self) -> &str {
-        &self.data.path_lower[self.start_lower..self.end_lower]
+        &self.data.path_lower[self.start_lower as usize..self.end_lower as usize]
     }
 
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePath, PathError> {
@@ -644,9 +648,9 @@ impl RelativePath {
                 // We have exclusive ownership
                 // If we're viewing the full string, we can avoid allocation
                 if self.start == 0
-                    && self.end == data.path.len()
+                    && self.end as usize == data.path.len()
                     && self.start_lower == 0
-                    && self.end_lower == data.path_lower.len()
+                    && self.end_lower as usize == data.path_lower.len()
                 {
                     // Full view - take ownership directly
                     RelativePathBuf {
@@ -655,15 +659,18 @@ impl RelativePath {
                     }
                 } else {
                     // Partial view - must extract substring
-                    let path = data.path[self.start..self.end].to_owned();
-                    let path_lower = data.path_lower[self.start_lower..self.end_lower].to_owned();
+                    let path = data.path[self.start as usize..self.end as usize].to_owned();
+                    let path_lower = data.path_lower
+                        [self.start_lower as usize..self.end_lower as usize]
+                        .to_owned();
                     RelativePathBuf { path, path_lower }
                 }
             }
             Err(arc) => {
                 // Shared - must clone the view
-                let path = arc.path[self.start..self.end].to_owned();
-                let path_lower = arc.path_lower[self.start_lower..self.end_lower].to_owned();
+                let path = arc.path[self.start as usize..self.end as usize].to_owned();
+                let path_lower =
+                    arc.path_lower[self.start_lower as usize..self.end_lower as usize].to_owned();
                 RelativePathBuf { path, path_lower }
             }
         }
@@ -698,8 +705,8 @@ impl RelativePath {
     /// More efficient than `into_buf().append()` because it pre-allocates the exact
     /// capacity needed and copies directly without intermediate allocations.
     pub fn append_into_buf(&self, suffix: &str) -> RelativePathBuf {
-        let view = &self.data.path[self.start..self.end];
-        let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
+        let view = self.as_str();
+        let view_lower = self.as_lowercase_str();
 
         if suffix.is_empty() {
             let mut path = String::with_capacity(view.len());
@@ -726,8 +733,8 @@ impl RelativePath {
     /// More efficient than `into_buf().push()` because it pre-allocates the exact
     /// capacity needed and copies directly without intermediate allocations.
     pub fn push_into_buf(&self, suffix: impl AsRef<str>) -> RelativePathBuf {
-        let view = &self.data.path[self.start..self.end];
-        let view_lower = &self.data.path_lower[self.start_lower..self.end_lower];
+        let view = self.as_str();
+        let view_lower = self.as_lowercase_str();
 
         let suffix = suffix.as_ref();
         if suffix.is_empty() {
@@ -1025,8 +1032,8 @@ impl FromStr for RelativePath {
     fn from_str(path: &str) -> Result<Self, std::convert::Infallible> {
         let mut path_lower = String::with_capacity(path.len());
         push_lowercase(&mut path_lower, path);
-        let end = path.len();
-        let end_lower = path_lower.len();
+        let end = offset(path.len());
+        let end_lower = offset(path_lower.len());
         Ok(RelativePath {
             data: Arc::new(RelativePathData {
                 path: path.to_owned(),
@@ -1344,8 +1351,8 @@ impl RelativePathBuf {
     /// Convert to immutable `RelativePath`.
     /// Creates an Arc-wrapped data structure with the full view.
     pub fn freeze(self) -> RelativePath {
-        let end = self.path.len();
-        let end_lower = self.path_lower.len();
+        let end = offset(self.path.len());
+        let end_lower = offset(self.path_lower.len());
         RelativePath {
             data: Arc::new(RelativePathData {
                 path: self.path,

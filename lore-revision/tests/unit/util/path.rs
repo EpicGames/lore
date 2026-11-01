@@ -4,6 +4,13 @@ use std::str::FromStr;
 
 use lore_revision::util::path::*;
 
+/// A walk holds a path per change, millions for a large tree, so a path stays 24 bytes: the shared
+/// data and four 32-bit offsets.
+#[test]
+fn a_path_is_24_bytes() {
+    assert_eq!(std::mem::size_of::<RelativePath>(), 24);
+}
+
 /// What `f` returns and the allocations the calling thread made running it.
 ///
 /// Counting stays on, since switching it off would undercount a test measuring on another thread.

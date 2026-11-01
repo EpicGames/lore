@@ -61,6 +61,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `RelativePath` keeps its view offsets in 32 bits, 24 bytes inline rather than 40. On a 5-million-change sync this
+  lowers the memory held after the diff from 2.9 to 2.7 GiB and the peak resident size from 3.9 to 3.8 GB
 - `lore repository instance prune` keeps an instance whose instance file cannot be read on filesystems that report an
   empty directory's size as zero, such as Btrfs: reading a directory as a file fails instead of reading as empty
 - `lore-server`: repository create and delete return `INVALID_ARGUMENT` for the all-zero repository id. This id
