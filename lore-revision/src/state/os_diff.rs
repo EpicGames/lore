@@ -1456,7 +1456,7 @@ async fn diff_filesystem_directory_walk(
         let Some(current_index) =
             claim_named_child(node_list, node_list_found, item.name_hash, staging).await?
         else {
-            new_file_list.push(item);
+            new_file_list.push((item, item_states));
             continue;
         };
 
@@ -1684,7 +1684,8 @@ async fn diff_filesystem_directory_walk(
 
     diff_filesystem_new_entries(
         ctx,
-        &new_file_list,
+        &mut new_file_list,
+        current_node_list,
         &mut nested_probe,
         repository_root,
         staging,
@@ -2058,7 +2059,8 @@ async fn diff_filesystem_type_change(
     // A directory that replaced a file is walked against the node the replacement
     // minted, so the content it holds is staged with it. A walk that only reports
     // mints no node and walks it against an empty listing, so the content is reported
-    // as added and a reversed diff deletes it before the directory itself. A marking
+    // as added and a reversed diff deletes it before the directory itself, untracked
+    // content included, since a reset puts the committed file back. A marking
     // walk without a minted node stays out: its chain would resolve the path to the
     // old file node and queue that node for discard. A nested repository root stays
     // out too, as it does everywhere else in the walk: reported as added, a reversed
@@ -2098,7 +2100,10 @@ async fn diff_filesystem_type_change(
                 from_states: item_states,
                 asks_path: false,
                 filter_mode: ctx.filter_mode,
-                intent: ctx.intent,
+                intent: match ctx.intent {
+                    FilesystemDiffIntent::ReportTracked => FilesystemDiffIntent::Report,
+                    intent => intent,
+                },
                 discards: ctx.discards.clone(),
                 layer_mounts: ctx.layer_mounts.clone(),
                 link_mounts: ctx.link_mounts.clone(),
@@ -2268,251 +2273,362 @@ async fn diff_filesystem_missing_nodes(
     Ok(())
 }
 
-/// Reports the entries of the listing no node matched, walking below new directories, for
-/// [`diff_filesystem_directory_walk`].
+/// The child of the current revision's directory that the entry at `index` of `entries` stands
+/// for, where the two are of one kind, or [`INVALID_NODE`] where there is none. `entries` is
+/// sorted by name hash.
+///
+/// A child stands for one entry of its folded name: the one spelled as the child is, or a case
+/// variant where it is the only entry of the name, as [`child_standing_for`] decides. Several
+/// variants with none spelled as the child stand for nothing. A lone entry of a lone child's
+/// folded name stands for it without its name being read.
+///
+/// Where the current revision holds a file and the disk a directory, the walk below it lists
+/// that file as the directory's only child, which no entry stands for.
+async fn tracked_child(
+    ctx: &FilesystemDiffContext,
+    current_node_list: &StateChildrenNodes,
+    entries: &[(FileListItem, FilterStates)],
+    index: usize,
+) -> Result<NodeID, StateError> {
+    let item = &entries[index].0;
+    let children = current_node_list.children.as_slice();
+    let Ok(found) = children.binary_search_by(|child| child.name.cmp(&item.name_hash)) else {
+        return Ok(INVALID_NODE);
+    };
+    let tracked = run_around(children, found, |child| child.name == item.name_hash);
+    let listed = run_around(entries, index, |(entry, _)| {
+        entry.name_hash == item.name_hash
+    });
+    let node_id = if tracked.len() == 1 && listed.len() == 1 {
+        children[found].node
+    } else {
+        let standing = Box::pin(child_standing_for(
+            current_node_list,
+            &children[tracked],
+            &entries[listed.clone()],
+            index - listed.start,
+        ))
+        .await?;
+        match standing {
+            Some(node_id) => node_id,
+            None => return Ok(INVALID_NODE),
+        }
+    };
+    if node_id == ctx.current.node {
+        return Ok(INVALID_NODE);
+    }
+    let node = current_node_list
+        .state
+        .node(current_node_list.repository.clone(), node_id)
+        .await?;
+    let agrees = types_agree(&node, item.metadata.is_file(), item.metadata.is_dir());
+    Ok(if agrees { node_id } else { INVALID_NODE })
+}
+
+/// The range of `items` around `at` that `same` holds for.
+fn run_around<T>(items: &[T], at: usize, same: impl Fn(&T) -> bool) -> std::ops::Range<usize> {
+    let start = items[..at]
+        .iter()
+        .rposition(|item| !same(item))
+        .map_or(0, |before| before + 1);
+    let end = items[at..]
+        .iter()
+        .position(|item| !same(item))
+        .map_or(items.len(), |after| at + after);
+    start..end
+}
+
+/// The child of `children` the entry at `at` of `entries` stands for, all of one folded name:
+/// the child it spells, or where it spells none and is the only entry, the first child. A lone
+/// case variant thus stands for the child on a filesystem that folds case and after a rename that
+/// changes case alone, and a variant beside another entry of the name stands for nothing.
+///
+/// Boxed by its caller, as it is the cold path: it reads the children's names, which only a
+/// directory holding two entries or two children of one folded name asks for.
+async fn child_standing_for(
+    nodes: &StateChildrenNodes,
+    children: &[StateNamedNode],
+    entries: &[(FileListItem, FilterStates)],
+    at: usize,
+) -> Result<Option<NodeID>, StateError> {
+    for child in children {
+        if spelled_as(nodes, child.node, entries[at].0.name.as_str()).await? {
+            return Ok(Some(child.node));
+        }
+    }
+    Ok((entries.len() == 1).then_some(children[0].node))
+}
+
+/// Whether the state spells the name of `node_id` as `name`.
+async fn spelled_as(
+    nodes: &StateChildrenNodes,
+    node_id: NodeID,
+    name: &str,
+) -> Result<bool, StateError> {
+    Ok(nodes
+        .state
+        .node_name_ref_or_skip(nodes.repository.clone(), node_id)
+        .await?
+        .is_some_and(|held| *held == *name))
+}
+
+/// Reports the entries no node matched, each with the filter's verdict for it, walking below new
+/// directories, for [`diff_filesystem_directory_walk`]. A
+/// [`FilesystemDiffIntent::ReportTracked`] walk leaves out each entry the current revision does
+/// not track, as [`tracked_child`] decides, and sorts `new_file_list` by name hash for it.
 ///
 /// A new directory the filter excludes stands on disk only for content below it, so a marking
 /// walk walks below it first, and reports it where that walk marked something and discards it
 /// where it did not.
-#[allow(clippy::too_many_arguments)]
-async fn diff_filesystem_new_entries(
-    ctx: &FilesystemDiffContext,
-    new_file_list: &[FileListItem],
-    nested_probe: &mut Option<std::path::PathBuf>,
-    repository_root: &std::path::Path,
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn diff_filesystem_new_entries<'a>(
+    ctx: &'a FilesystemDiffContext,
+    new_file_list: &'a mut [(FileListItem, FilterStates)],
+    current_node_list: &'a StateChildrenNodes,
+    nested_probe: &'a mut Option<std::path::PathBuf>,
+    repository_root: &'a std::path::Path,
     staging: bool,
-    tasks: &mut SubtreeTasks,
-    changes: &ChangeSender,
-    stats: &mut FilesystemDiffStats,
-) -> Result<(), StateError> {
-    // Remaining files/directories are added (all are children of node_path)
-    'new_file_iter: for file in new_file_list.iter() {
-        // For directory listing, new items are children
-        let child_file_path = ctx
-            .filesystem_path
-            .push_into_buf(file.name.as_str())
-            .freeze();
-
-        let (child_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
-            ctx.states,
-            &child_file_path,
-            file.metadata.is_dir(),
-            ctx.filter_mode,
-        );
-        if excluded {
-            continue 'new_file_iter;
-        }
-
-        let is_directory = file.metadata.is_dir();
-
-        if is_directory {
-            // A directory on disk with no `state_from` node that matches a
-            // link in `state_current` is a link add, not a per-file add: the
-            // mounted content belongs to the linked repository. Skip the
-            // entry; the link node is reported via `state::diff_collect` (in
-            // `lore status`) and `link list`, not via `file diff`.
-            //
-            // The realistic scan-side caller (`lore status` via
-            // `diff_filesystem`) stages the link in `state_from` before
-            // status runs, so the link is matched in the paired
-            // `was_link && is_directory` branch above and never reaches here;
-            // the `continue` fires with a dirty-marking intent only in a
-            // constructed corner case, where skipping dirty-add is still
-            // correct (the link is not new in the working state).
-            if ctx
-                .link_mounts
-                .iter()
-                .any(|m| m.mount_path.as_str() == child_file_path.as_str())
-            {
-                lore_trace!(
-                    "Filesystem path {child_file_path} matches a link in the current state, skipping link-internal content"
-                );
-                continue 'new_file_iter;
-            }
-            // Layer mount detection: if this directory's parent-relative path
-            // matches a configured layer mount, switch comparison context to
-            // the layer's repo and state for the recursion. The layer mount
-            // itself is NOT emitted as an "add" — its content is owned by the
-            // layer's pinned revision, not the parent's tree.
-            if let Some(mount) = ctx
-                .layer_mounts
-                .iter()
-                .find(|m| m.mount_path.as_str() == child_file_path.as_str())
-            {
-                // A staging walk leaves the mount alone: the layer's own tree is staged by
-                // its own walk against its own state, and staging it from here as well
-                // would settle the same nodes twice.
-                if staging {
-                    lore_trace!("Filesystem path {child_file_path} is a layer mount, skipping");
+    tasks: &'a mut SubtreeTasks,
+    changes: &'a ChangeSender,
+    stats: &'a mut FilesystemDiffStats,
+) -> impl Future<Output = Result<(), StateError>> + 'a {
+    if matches!(ctx.intent, FilesystemDiffIntent::ReportTracked) {
+        new_file_list.sort_unstable_by_key(|(item, _)| item.name_hash);
+    }
+    let new_file_list: &'a [(FileListItem, FilterStates)] = new_file_list;
+    async move {
+        // Remaining files/directories are added (all are children of node_path)
+        'new_file_iter: for index in 0..new_file_list.len() {
+            let (file, child_states) = &new_file_list[index];
+            let child_states = *child_states;
+            let current = if matches!(ctx.intent, FilesystemDiffIntent::ReportTracked) {
+                let current = tracked_child(ctx, current_node_list, new_file_list, index).await?;
+                if !current.is_valid_node_id() {
                     continue 'new_file_iter;
                 }
-                lore_trace!(
-                    "Filesystem path {child_file_path} is a layer mount, recursing into layer state"
-                );
-                let layer_repository = mount.repository.clone();
-                let layer_state = mount.state.clone();
-                let layer_source_node = mount.source_node;
-                diff_filesystem_subtree_dispatch(
-                    FilesystemDiffContext {
-                        operation: ctx.operation.clone(),
-                        from: NodeMapping {
-                            repository: layer_repository.clone(),
-                            state: layer_state.clone(),
-                            path: child_file_path.clone(),
-                            node: layer_source_node,
-                        },
-                        current: NodeMapping {
-                            repository: layer_repository,
-                            state: layer_state,
-                            path: child_file_path.clone(),
-                            node: layer_source_node,
-                        },
-                        filesystem_path: child_file_path,
-                        states: child_states,
-                        // The layer is walked at its mount path, which is the
-                        // path on disk.
-                        from_states: child_states,
-                        asks_path: false,
-                        filter_mode: ctx.filter_mode,
-                        intent: ctx.intent,
-                        discards: ctx.discards.clone(),
-                        // Non-overlapping layers: no nested mounts inside a layer.
-                        layer_mounts: Arc::new(vec![]),
-                        // Crossing into the layer state; parent's link mounts
-                        // are paths in the parent tree and do not apply here.
-                        link_mounts: Arc::new(vec![]),
-                    },
-                    tasks,
-                    changes,
-                    stats,
-                )
-                .await?;
-                continue 'new_file_iter;
-            }
-            let probe = nested_probe
-                .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
-            if is_nested_repository_root(probe, file.name.as_str()).await {
-                lore_trace!("Skipping nested repository root {child_file_path}");
-                continue 'new_file_iter;
-            }
-            lore_trace!("Filesystem has new directory in path {child_file_path}, recursing");
+                current
+            } else {
+                INVALID_NODE
+            };
+            // For directory listing, new items are children
+            let child_file_path = ctx
+                .filesystem_path
+                .push_into_buf(file.name.as_str())
+                .freeze();
 
-            // Scan: persist a Dirty+Add node for the new directory before
-            // recursing, so files inside it resolve their parent and the staged
-            // anchor rebase can descend the dirty subtree. Emit it as a single
-            // node (the recursion below surfaces the children) and recurse
-            // against it so a rescan matches the persisted subtree.
-            let mut dir_from_root = INVALID_NODE;
-            let mut dir_from_path = RelativePath::new();
-            let mut dir_from_states = FilterStates::ROOT;
-            if ctx.intent.marks_dirty() {
-                // The new directory is a child of the directory currently being
-                // walked; its node is the correct parent even across link/layer
-                // boundaries (resolving by parent path would not match there).
-                let dir_node = Node {
-                    flags: NodeFlags::DirtyAdd.bits(),
-                    name_hash: crate::hash::hash_string(file.name.as_str()),
-                    ..Default::default()
-                };
-                dir_from_root = ctx
-                    .from
-                    .state
-                    .node_add(
-                        ctx.from.repository.clone(),
-                        ctx.from.node,
-                        dir_node,
-                        file.name.as_str(),
-                    )
-                    .await
-                    .forward::<StateError>("scan add: failed to add new directory node")?;
-                if !child_states.excluded(ctx.filter_mode) {
-                    report_new_directory(
-                        &ctx.from,
-                        dir_from_root,
-                        &child_file_path,
-                        ctx.intent,
+            let is_directory = file.metadata.is_dir();
+
+            if is_directory {
+                // A directory on disk with no `state_from` node that matches a
+                // link in `state_current` is a link add, not a per-file add: the
+                // mounted content belongs to the linked repository. Skip the
+                // entry; the link node is reported via `state::diff_collect` (in
+                // `lore status`) and `link list`, not via `file diff`.
+                //
+                // The realistic scan-side caller (`lore status` via
+                // `diff_filesystem`) stages the link in `state_from` before
+                // status runs, so the link is matched in the paired
+                // `was_link && is_directory` branch above and never reaches here;
+                // the `continue` fires with a dirty-marking intent only in a
+                // constructed corner case, where skipping dirty-add is still
+                // correct (the link is not new in the working state).
+                if ctx
+                    .link_mounts
+                    .iter()
+                    .any(|m| m.mount_path.as_str() == child_file_path.as_str())
+                {
+                    lore_trace!(
+                        "Filesystem path {child_file_path} matches a link in the current state, skipping link-internal content"
+                    );
+                    continue 'new_file_iter;
+                }
+                // Layer mount detection: if this directory's parent-relative path
+                // matches a configured layer mount, switch comparison context to
+                // the layer's repo and state for the recursion. The layer mount
+                // itself is NOT emitted as an "add" — its content is owned by the
+                // layer's pinned revision, not the parent's tree.
+                if let Some(mount) = ctx
+                    .layer_mounts
+                    .iter()
+                    .find(|m| m.mount_path.as_str() == child_file_path.as_str())
+                {
+                    // A staging walk leaves the mount alone: the layer's own tree is staged by
+                    // its own walk against its own state, and staging it from here as well
+                    // would settle the same nodes twice.
+                    if staging {
+                        lore_trace!("Filesystem path {child_file_path} is a layer mount, skipping");
+                        continue 'new_file_iter;
+                    }
+                    lore_trace!(
+                        "Filesystem path {child_file_path} is a layer mount, recursing into layer state"
+                    );
+                    let layer_repository = mount.repository.clone();
+                    let layer_state = mount.state.clone();
+                    let layer_source_node = mount.source_node;
+                    diff_filesystem_subtree_dispatch(
+                        FilesystemDiffContext {
+                            operation: ctx.operation.clone(),
+                            from: NodeMapping {
+                                repository: layer_repository.clone(),
+                                state: layer_state.clone(),
+                                path: child_file_path.clone(),
+                                node: layer_source_node,
+                            },
+                            current: NodeMapping {
+                                repository: layer_repository,
+                                state: layer_state,
+                                path: child_file_path.clone(),
+                                node: layer_source_node,
+                            },
+                            filesystem_path: child_file_path,
+                            states: child_states,
+                            // The layer is walked at its mount path, which is the
+                            // path on disk.
+                            from_states: child_states,
+                            asks_path: false,
+                            filter_mode: ctx.filter_mode,
+                            intent: ctx.intent,
+                            discards: ctx.discards.clone(),
+                            // Non-overlapping layers: no nested mounts inside a layer.
+                            layer_mounts: Arc::new(vec![]),
+                            // Crossing into the layer state; parent's link mounts
+                            // are paths in the parent tree and do not apply here.
+                            link_mounts: Arc::new(vec![]),
+                        },
+                        tasks,
                         changes,
                         stats,
                     )
                     .await?;
+                    continue 'new_file_iter;
                 }
-                dir_from_path = child_file_path.clone();
-                dir_from_states = child_states;
+                let probe = nested_probe
+                    .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+                if is_nested_repository_root(probe, file.name.as_str()).await {
+                    lore_trace!("Skipping nested repository root {child_file_path}");
+                    continue 'new_file_iter;
+                }
+                lore_trace!("Filesystem has new directory in path {child_file_path}, recursing");
+
+                // Scan: persist a Dirty+Add node for the new directory before
+                // recursing, so files inside it resolve their parent and the staged
+                // anchor rebase can descend the dirty subtree. Emit it as a single
+                // node (the recursion below surfaces the children) and recurse
+                // against it so a rescan matches the persisted subtree.
+                let mut dir_from_root = INVALID_NODE;
+                let mut dir_from_path = RelativePath::new();
+                let mut dir_from_states = FilterStates::ROOT;
+                if ctx.intent.marks_dirty() {
+                    // The new directory is a child of the directory currently being
+                    // walked; its node is the correct parent even across link/layer
+                    // boundaries (resolving by parent path would not match there).
+                    let dir_node = Node {
+                        flags: NodeFlags::DirtyAdd.bits(),
+                        name_hash: crate::hash::hash_string(file.name.as_str()),
+                        ..Default::default()
+                    };
+                    dir_from_root = ctx
+                        .from
+                        .state
+                        .node_add(
+                            ctx.from.repository.clone(),
+                            ctx.from.node,
+                            dir_node,
+                            file.name.as_str(),
+                        )
+                        .await
+                        .forward::<StateError>("scan add: failed to add new directory node")?;
+                    if !child_states.excluded(ctx.filter_mode) {
+                        report_new_directory(
+                            &ctx.from,
+                            dir_from_root,
+                            &child_file_path,
+                            ctx.intent,
+                            changes,
+                            stats,
+                        )
+                        .await?;
+                    }
+                    dir_from_path = child_file_path.clone();
+                    dir_from_states = child_states;
+                }
+
+                let subtree = FilesystemDiffContext {
+                    operation: ctx.operation.clone(),
+                    from: NodeMapping {
+                        repository: ctx.from.repository.clone(),
+                        state: ctx.from.state.clone(),
+                        path: dir_from_path,
+                        node: dir_from_root,
+                    },
+                    current: NodeMapping {
+                        repository: current_node_list.repository.clone(),
+                        state: current_node_list.state.clone(),
+                        path: child_file_path.clone(),
+                        node: current,
+                    },
+                    filesystem_path: child_file_path.clone(),
+                    states: child_states,
+                    from_states: dir_from_states,
+                    asks_path: false,
+                    filter_mode: ctx.filter_mode,
+                    intent: ctx.intent,
+                    discards: ctx.discards.clone(),
+                    layer_mounts: ctx.layer_mounts.clone(),
+                    // Same parent state; deeper paths may still match a link.
+                    link_mounts: ctx.link_mounts.clone(),
+                };
+                if ctx.intent.marks_dirty() && child_states.excluded(ctx.filter_mode) {
+                    Box::pin(diff_filesystem_new_excluded_dispatch(
+                        subtree,
+                        ctx.from.clone(),
+                        tasks,
+                        changes,
+                        stats,
+                    ))
+                    .await?;
+                    continue 'new_file_iter;
+                }
+                diff_filesystem_subtree_dispatch(subtree, tasks, changes, stats).await?;
+
+                // The single Dirty+Add directory node emitted above is the scan's
+                // report for this new directory; skip the transient change below.
+                if ctx.intent.marks_dirty() {
+                    continue 'new_file_iter;
+                }
             }
 
-            let subtree = FilesystemDiffContext {
-                operation: ctx.operation.clone(),
-                from: NodeMapping {
-                    repository: ctx.from.repository.clone(),
-                    state: ctx.from.state.clone(),
-                    path: dir_from_path,
-                    node: dir_from_root,
-                },
-                current: NodeMapping {
-                    repository: ctx.current.repository.clone(),
-                    state: ctx.current.state.clone(),
-                    path: RelativePath::new(),
-                    node: INVALID_NODE,
-                },
-                filesystem_path: child_file_path.clone(),
-                states: child_states,
-                from_states: dir_from_states,
-                asks_path: false,
-                filter_mode: ctx.filter_mode,
+            let file_ctx = FileDiffContext {
+                repository_from: ctx.from.repository.clone(),
+                state_from: ctx.from.state.clone(),
+                from_node_id: INVALID_NODE,
+                from_node: None,
+                parent_node_id: Some(ctx.from.node),
                 intent: ctx.intent,
-                discards: ctx.discards.clone(),
-                layer_mounts: ctx.layer_mounts.clone(),
-                // Same parent state; deeper paths may still match a link.
-                link_mounts: ctx.link_mounts.clone(),
+                states: child_states,
+                observed: FileInfo::from_metadata(&file.metadata),
+                insists: false,
             };
-            if ctx.intent.marks_dirty() && child_states.excluded(ctx.filter_mode) {
-                Box::pin(diff_filesystem_new_excluded_dispatch(
-                    subtree,
-                    ctx.from.clone(),
-                    tasks,
-                    changes,
-                    stats,
-                ))
-                .await?;
-                continue 'new_file_iter;
-            }
-            diff_filesystem_subtree_dispatch(subtree, tasks, changes, stats).await?;
 
-            // The single Dirty+Add directory node emitted above is the scan's
-            // report for this new directory; skip the transient change below.
-            if ctx.intent.marks_dirty() {
-                continue 'new_file_iter;
-            }
+            lore_trace!("Filesystem has new item in path {child_file_path}, add add change");
+
+            handle_single_file_compare_result(
+                &file_ctx,
+                SingleFileCompareResult::NewFile,
+                &child_file_path,
+                None,
+                is_directory,
+                changes,
+                stats,
+                ctx.filter_mode,
+            )
+            .await?;
         }
 
-        let file_ctx = FileDiffContext {
-            repository_from: ctx.from.repository.clone(),
-            state_from: ctx.from.state.clone(),
-            from_node_id: INVALID_NODE,
-            from_node: None,
-            parent_node_id: Some(ctx.from.node),
-            intent: ctx.intent,
-            states: child_states,
-            observed: FileInfo::from_metadata(&file.metadata),
-            insists: false,
-        };
-
-        lore_trace!("Filesystem has new item in path {child_file_path}, add add change");
-
-        handle_single_file_compare_result(
-            &file_ctx,
-            SingleFileCompareResult::NewFile,
-            &child_file_path,
-            None,
-            is_directory,
-            changes,
-            stats,
-            ctx.filter_mode,
-        )
-        .await?;
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// The subtree walks a directory has in flight, each reporting what it counted.

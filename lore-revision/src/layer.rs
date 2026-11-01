@@ -1021,7 +1021,7 @@ async fn sync_in_operation(
             },
             mount_path.clone(),
             options.filter_mode,
-            FilesystemDiffIntent::Report,
+            FilesystemDiffIntent::ReportTracked,
             Arc::new(Vec::new()),
         )
         .await
@@ -1037,7 +1037,7 @@ async fn sync_in_operation(
     let options = Arc::new(options);
     let changes = Arc::new(changes);
     let force = execution_context().globals().force();
-    let changes = if !changes.is_empty() && !force {
+    let changes = if !changes.is_empty() && !force && !options.reset {
         lore_info!(
             "Verifying {} layer changes with local file system",
             changes.len()

@@ -1747,7 +1747,9 @@ Reset changes to a path or file to the current revision, discarding your local c
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
@@ -2344,7 +2346,9 @@ Reset changes to a file or directory
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the

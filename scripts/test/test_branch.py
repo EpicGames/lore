@@ -378,11 +378,8 @@ def test_branch(new_lore_repo):
     repo.remove_file(verify_forced_file)
 
     for file in test_files:
-        assert not repo.file_exists(file), (
-            "Branch switch with --force --reset did not delete filesystem file"
-        )
-        assert not os.path.exists(os.path.dirname(os.path.join(repo.path, file))), (
-            "Branch switch with --force --reset did not delete filesystem directory"
+        assert repo.file_exists(file), (
+            "Branch switch with --force --reset deleted an untracked file"
         )
 
 

@@ -4724,13 +4724,15 @@ typedef struct lore_file_metadata_set_args_t {
   struct lore_uint32_array_t entries;
 } lore_file_metadata_set_args_t;
 
-// Arguments for resetting files to a revision, optionally purging untracked files.
+// Arguments for resetting files to a revision, optionally deleting what the revision does not
+// hold.
 typedef struct lore_file_reset_args_t {
   // Pointer to an array of paths
   struct lore_string_array_t paths;
   // Revision to reset files into
   struct lore_string_t revision;
-  // Purge untracked files
+  // Delete what the revision does not hold within the view: untracked files, whatever the
+  // ignore file says, and files the view excludes. Nested repositories stay
   uint8_t purge;
 } lore_file_reset_args_t;
 
@@ -4740,7 +4742,8 @@ typedef struct lore_file_reset_to_last_merged_args_t {
   struct lore_string_array_t paths;
   // Branch whose last merged revision to reset to
   struct lore_string_t branch;
-  // Purge untracked files
+  // Delete what the revision does not hold within the view: untracked files, whatever the
+  // ignore file says, and files the view excludes. Nested repositories stay
   uint8_t purge;
   // Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
   uint32_t merge_side;

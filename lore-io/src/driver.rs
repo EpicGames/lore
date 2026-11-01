@@ -541,6 +541,29 @@ impl IoDriver {
         }
     }
 
+    /// Removes the tree at `path` as [`Self::remove_dir_all`] does, but keeps each directory that
+    /// holds a directory named `boundary`, with all it holds and the directories leading to it, and
+    /// each entry whose name `reserved` answers for, with the directories leading to it. A link is
+    /// removed, not followed, and a path that does not exist is `Ok`.
+    ///
+    /// The walk runs as one job, with as many listings and removals as [`Self::remove_dir_all`],
+    /// and reads both rules from each listing, with no stat of its own. Each directory is listed in
+    /// full before anything in it is removed, so the job holds the entry names of each directory
+    /// on its current path.
+    ///
+    /// Every backend runs this on the syscall pool, so it goes there directly, as
+    /// [`Self::write_file_segments_atomic`] does.
+    pub async fn remove_dir_all_keeping(
+        &self,
+        path: impl AsRef<Path>,
+        boundary: &'static str,
+        reserved: impl Fn(&str) -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        PsyncDriver
+            .remove_dir_all_keeping(path.as_ref().to_path_buf(), boundary, reserved)
+            .await
+    }
+
     pub(crate) async fn file_metadata_raw(
         &self,
         file: Arc<File>,

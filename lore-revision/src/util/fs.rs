@@ -30,7 +30,9 @@ use crate::lore_trace;
 #[cfg(not(target_family = "windows"))]
 use crate::lore_warn;
 use crate::node::NodeFileMode;
+use crate::repository::DOT_LORE;
 use crate::repository::TEMP_FILE_EXTENSION;
+use crate::repository::is_reserved_node_name;
 use crate::util::time::Retry;
 use crate::util::time::RetryPolicy;
 
@@ -735,6 +737,40 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
     }
 
     Ok(())
+}
+
+/// Removes what `absolute_path` holds as [`unlink_recursive`] does, but keeps each nested
+/// repository in it, a directory holding `.lore`, and each entry named `.lore` or `.urc`, as
+/// [`is_reserved_node_name`] answers, with the directories leading to them. A legacy `.urc` is no
+/// boundary, as `state::is_nested_repository_root` describes, so the entries beside it go. A failed
+/// removal is retried once after clearing the read-only flag of `absolute_path`.
+pub async fn unlink_recursive_keeping_repositories(absolute_path: &Path) -> tokio::io::Result<()> {
+    let driver = lore_io::IoDriver::global();
+    let Err(err) = driver
+        .remove_dir_all_keeping(absolute_path, DOT_LORE, is_reserved_node_name)
+        .await
+    else {
+        lore_trace!(
+            "Deleted {} around nested repositories",
+            absolute_path.display()
+        );
+        return Ok(());
+    };
+    lore_debug!(
+        "Error deleting {}: {} - retry after setting write permission",
+        absolute_path.display(),
+        err
+    );
+    let Ok(metadata) = driver.metadata(absolute_path).await else {
+        return Err(err);
+    };
+    let mut permissions = metadata.permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    let _ = driver.set_permissions(absolute_path, permissions).await;
+    driver
+        .remove_dir_all_keeping(absolute_path, DOT_LORE, is_reserved_node_name)
+        .await
 }
 
 pub fn file_unlink_retry() -> Retry {

@@ -183,8 +183,8 @@ pub async fn test_repository_create(
     }
 }
 
-/// A context over `instance` whose view holds `globs` and whose ignore slot is empty, a leading
-/// `!` re-including as it does in a view file.
+/// A context over `instance`, holding its write token, whose view holds `globs` and whose ignore
+/// slot is empty, a leading `!` re-including as it does in a view file.
 ///
 /// Each call mints its own filter, so two contexts hold different ones whether or not their
 /// rules agree -- which is what a diff reads as two views.
@@ -208,13 +208,16 @@ pub fn test_filter_context(
     ignore: &[&str],
     view: &[&str],
 ) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
-    std::sync::Arc::new(lore_revision::repository::RepositoryContext::new(
-        default_repository_creation_args(immutable_store, mutable_store)
-            .with_path(&instance.path)
-            .with_id(instance.repository.id)
-            .with_instance_id(instance.repository.instance_id)
-            .with_filter(std::sync::Arc::new(test_filter(ignore, view))),
-    ))
+    std::sync::Arc::new(
+        lore_revision::repository::RepositoryContext::new(
+            default_repository_creation_args(immutable_store, mutable_store)
+                .with_path(&instance.path)
+                .with_id(instance.repository.id)
+                .with_instance_id(instance.repository.instance_id)
+                .with_filter(std::sync::Arc::new(test_filter(ignore, view))),
+        )
+        .with_write_token(instance.write_token.share()),
+    )
 }
 
 /// A filter whose ignore slot holds `ignore` and whose view holds `view`, a leading `!`

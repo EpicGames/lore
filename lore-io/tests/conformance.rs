@@ -357,6 +357,109 @@ async fn remove_dir_all_takes_the_tree_and_reports_a_missing_one() {
     }
 }
 
+/// Recursive removal around a boundary keeps the directory holding one, deep in the tree, with
+/// all it holds and every directory leading to it, and removes the rest. A reserved entry deep in
+/// the tree stays with every directory leading to it, and its siblings go. A tree holding no
+/// boundary goes whole, a link is removed rather than followed, and a missing path is `Ok`.
+#[tokio::test]
+async fn remove_dir_all_keeping_keeps_each_boundary_and_its_ancestors() {
+    fn reserved(name: &str) -> bool {
+        name.eq_ignore_ascii_case(".lore") || name.eq_ignore_ascii_case(".urc")
+    }
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-removetree-keeping-");
+        let root = dir.child("tree");
+        let kept = root.join("a/b/repository");
+        driver.create_dir_all(kept.join(".lore")).await.unwrap();
+        driver
+            .create_dir_all(root.join("a/gone/deeper"))
+            .await
+            .unwrap();
+        driver.create_dir_all(root.join("c")).await.unwrap();
+        driver
+            .create_dir_all(root.join("a/legacy/.urc"))
+            .await
+            .unwrap();
+        for file in [
+            "top.txt",
+            "a/one.txt",
+            "a/b/two.txt",
+            "a/b/repository/work.txt",
+            "a/b/repository/.lore/id",
+            "a/gone/deeper/three.txt",
+            "c/four.txt",
+            "a/legacy/.urc/state",
+            "a/legacy/beside.txt",
+        ] {
+            driver
+                .write_file_bytes(root.join(file), Bytes::from_static(b"leaf"), false)
+                .await
+                .unwrap();
+        }
+        let outside = dir.child("outside");
+        driver.create_dir_all(&outside).await.unwrap();
+        driver
+            .write_file_bytes(outside.join("held.txt"), Bytes::from_static(b"held"), false)
+            .await
+            .unwrap();
+        #[cfg(target_family = "unix")]
+        std::os::unix::fs::symlink(&outside, root.join("a/link")).unwrap();
+
+        driver
+            .remove_dir_all_keeping(&root, ".lore", reserved)
+            .await
+            .unwrap();
+
+        for held in [
+            "a/b/repository/work.txt",
+            "a/b/repository/.lore/id",
+            "a/legacy/.urc/state",
+        ] {
+            assert!(root.join(held).is_file(), "{held} must stay");
+        }
+        for gone in [
+            "top.txt",
+            "a/one.txt",
+            "a/b/two.txt",
+            "a/gone",
+            "a/link",
+            "a/legacy/beside.txt",
+            "c",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(root.join(gone)).is_err(),
+                "{gone} must be gone"
+            );
+        }
+        assert!(
+            outside.join("held.txt").is_file(),
+            "a link must not be followed"
+        );
+
+        driver
+            .remove_dir_all_keeping(root.join("a/b/repository"), ".lore", reserved)
+            .await
+            .unwrap();
+        assert!(
+            kept.join("work.txt").is_file(),
+            "a boundary at the root must stay"
+        );
+
+        driver
+            .remove_dir_all_keeping(&outside, ".lore", reserved)
+            .await
+            .unwrap();
+        assert!(
+            driver.metadata(&outside).await.is_err(),
+            "a tree without a boundary must be gone"
+        );
+        driver
+            .remove_dir_all_keeping(&outside, ".lore", reserved)
+            .await
+            .expect("removing a missing tree is Ok");
+    }
+}
+
 /// A listing yields every child with the metadata the walk resolved for it, and ends. The
 /// entries arrive in whatever order the walk finds them, so the test compares them as a set.
 #[tokio::test]

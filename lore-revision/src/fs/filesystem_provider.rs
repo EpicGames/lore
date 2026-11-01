@@ -226,6 +226,9 @@ pub struct StageIntent {
 pub enum FilesystemDiffIntent {
     /// Report them, leaving the trees untouched.
     Report,
+    /// Report them as [`Report`](Self::Report) does, leaving out each entry `from` lacks that
+    /// `current` does not track, which is what a reset to `from` leaves alone.
+    ReportTracked,
     /// Set and clear `Dirty` on each node as the walk settles it.
     MarkDirty,
     /// Mark as [`MarkDirty`](Self::MarkDirty) does and record the staged action too.
@@ -929,6 +932,27 @@ impl InstanceOperationImpl {
     /// ([`FilesystemProvider::holds_state`]).
     pub fn holds_state(&self) -> bool {
         self.holds_state
+    }
+
+    /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
+    /// keeps each nested repository in it, with the directories leading to one. An SWFS mount
+    /// deletes nothing on disk, so there the two are the same.
+    pub async fn remove_recursive_keeping_repositories(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.remove_recursive_keeping_repositories(path).await
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
+        }
     }
 
     /// Hands `target`, under `repository`, its context, to a provider that holds its state in a

@@ -286,6 +286,58 @@ def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("command", ["sync", "branch switch"])
+def test_urcignore_reset_restores_committed_file(new_lore_repo, command):
+    """
+    Verify that `sync --reset` and `branch switch --reset` carry the target
+    revision's change to a committed file an ignore rule matches over a local
+    edit, and its deletes of others, and leave untracked files alone, whether
+    an ignore rule matches them or not.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_files(
+        {
+            "Game/cache.tmp": "committed\n",
+            "Game/gone.tmp": "committed\n",
+            "Saved/Old/drop.ini": "committed\n",
+        }
+    )
+    repo.stage(scan=True)
+    repo.commit("Commit files before the ignore rules")
+    repo.write_commit_push("Add ignore rules", {repo.ignore_file(): "*.tmp\nSaved/\n"})
+
+    clone = repo.clone()
+    if command == "branch switch":
+        clone.branch_create("feature")
+        clone.branch_switch("feature")
+
+    repo.write_files({"Game/cache.tmp": "incoming\n"})
+    repo.remove_file("Game/gone.tmp")
+    repo.rmtree("Saved")
+    repo.stage(["Game/cache.tmp", "Game/gone.tmp", "Saved/Old/drop.ini"], force=True)
+    repo.commit("Change and delete ignored committed files")
+    repo.push()
+
+    untracked = {
+        "Game/build.tmp": "untracked\n",
+        "Game/notes.txt": "untracked\n",
+        "Saved/Old/run.log": "untracked\n",
+    }
+    clone.write_files({"Game/cache.tmp": "local\n", **untracked})
+    if command == "sync":
+        clone.sync(reset=True)
+    else:
+        clone.branch_switch("main", reset=True)
+
+    for path, content in {"Game/cache.tmp": "incoming\n", **untracked}.items():
+        assert clone.file_exists(path), f"{command}: {path} is missing"
+        with clone.open_file(path) as f:
+            assert f.read() == content, f"{command}: {path} does not hold {content!r}"
+    for path in ["Game/gone.tmp", "Saved/Old/drop.ini"]:
+        assert not clone.file_exists(path), f"{command}: {path} survived the reset"
+
+
+@pytest.mark.smoke
 def test_urcignore_directory_rule_leaves_files_of_that_name(new_lore_repo):
     """A directory-only rule such as `Intermediate/` leaves out directories of
     that name and nothing else: a file `src/Intermediate` is reported, diffed,

@@ -362,7 +362,9 @@ pub struct FileUnstageArgs {
 
 #[derive(Args)]
 pub struct FileResetArgs {
-    /// Delete untracked files
+    /// Delete every file the revision does not hold within the view: untracked files, whatever
+    /// the ignore file says, and files the view excludes. Nested repositories stay. With
+    /// `--force` the view is not applied, and the files it excludes are restored
     #[clap(long, action)]
     purge: bool,
 

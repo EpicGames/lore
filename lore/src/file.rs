@@ -851,7 +851,8 @@ fn unstage_local(
     )
 }
 
-/// Arguments for resetting files to a revision, optionally purging untracked files.
+/// Arguments for resetting files to a revision, optionally deleting what the revision does not
+/// hold.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(reset_local)]
@@ -860,11 +861,13 @@ pub struct LoreFileResetArgs {
     pub paths: LoreArray<LoreString>,
     /// Revision to reset files into
     pub revision: LoreString,
-    /// Purge untracked files
+    /// Delete what the revision does not hold within the view: untracked files, whatever the
+    /// ignore file says, and files the view excludes. Nested repositories stay
     pub purge: u8,
 }
 
-/// Resets one or more files to a specified revision, optionally purging untracked files.
+/// Resets one or more files to a specified revision, optionally deleting what the revision does
+/// not hold.
 ///
 /// # Events
 ///
@@ -928,7 +931,8 @@ pub struct LoreFileResetToLastMergedArgs {
     pub paths: LoreArray<LoreString>,
     /// Branch whose last merged revision to reset to
     pub branch: LoreString,
-    /// Purge untracked files
+    /// Delete what the revision does not hold within the view: untracked files, whatever the
+    /// ignore file says, and files the view excludes. Nested repositories stay
     pub purge: u8,
     /// Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
     pub merge_side: u32,

@@ -1512,7 +1512,7 @@ fn a_walk_seeded_partway_down_matches_one_from_the_root() {
 /// The equivalence tests above run one slot, where a verdict cannot be reached
 /// by the other. This puts rules in both and holds the threaded walk against
 /// `excludes_tree`, which is the shape `FilterMode::Full` operations -- stage,
-/// reset, unstage, dirty -- ask in.
+/// unstage, dirty -- ask in.
 #[test]
 fn a_threaded_walk_agrees_with_a_whole_path_query_across_both_slots() {
     use lore_revision::filter::Filter;

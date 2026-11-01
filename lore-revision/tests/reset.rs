@@ -11,6 +11,7 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::SystemTime;
 
     use lore_base::runtime::LORE_CONTEXT;
@@ -21,12 +22,14 @@ mod tests {
     use lore_revision::commit::CommitOptions;
     use lore_revision::file;
     use lore_revision::file::reset;
+    use lore_revision::file::reset::LoreFileResetCountData;
     use lore_revision::file::reset::ResetOptions;
     use lore_revision::filter::FilterMode;
     use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
     use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
@@ -387,6 +390,594 @@ mod tests {
         .await;
     }
 
+    /// Resets `paths`, relative to the fixture's root, through `repository`, to `revision`
+    /// where one is named, purging what the revision does not hold.
+    async fn reset_purging_through(
+        fixture: &TestRepository,
+        repository: Arc<RepositoryContext>,
+        paths: &[&str],
+        revision: &str,
+    ) {
+        reset::reset(
+            repository,
+            &fixture.write_token,
+            LoreArray::from_vec(
+                paths
+                    .iter()
+                    .map(|path| {
+                        LoreString::from(fixture.path.join(path).to_string_lossy().as_ref())
+                    })
+                    .collect(),
+            ),
+            LoreString::from(revision),
+            ResetOptions {
+                purge: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("A reset must succeed");
+    }
+
+    /// Resets `paths` through `repository` with a purge, as [`reset_purging_through`] does, under
+    /// an execution holding `globals`, and answers the counts the reset reports at its end.
+    async fn reset_purging_under(
+        fixture: &TestRepository,
+        repository: Arc<RepositoryContext>,
+        paths: &[&str],
+        globals: LoreGlobalArgs,
+    ) -> LoreFileResetCountData {
+        let counts = Arc::new(Mutex::new(None));
+        let recorded = counts.clone();
+        let execution = Arc::new(ExecutionContext::new_client(
+            globals,
+            EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
+                if let LoreEvent::FileResetEnd(end) = event {
+                    *recorded.lock().expect("Failed to record the counts") =
+                        Some(end.count.clone());
+                }
+            }))),
+        ));
+        LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                reset_purging_through(fixture, repository, paths, ""),
+            )
+            .await;
+        execution.dispatcher.drain().await;
+        counts
+            .lock()
+            .expect("Failed to read the counts")
+            .take()
+            .expect("A reset reports its counts at its end")
+    }
+
+    /// Asserts what each of `expected` holds below the fixture's root, `None` for a path the
+    /// working tree must not hold.
+    fn assert_working_files(fixture: &TestRepository, expected: &[(&str, Option<&[u8]>)]) {
+        for (relative, content) in expected {
+            let path = fixture.path.join(relative);
+            assert_eq!(
+                std::fs::read(&path).ok().as_deref(),
+                *content,
+                "{relative} after the reset"
+            );
+            assert!(
+                content.is_some() || !path.exists(),
+                "{relative} is still there"
+            );
+        }
+    }
+
+    /// A purge deletes everything the revision's view-filtered tree lacks, whatever the ignore
+    /// rules say: untracked files whether a rule matches them or not, one below a committed
+    /// directory a rule excludes, a temporary file and merge sides among them, and a committed
+    /// directory the view excludes. It keeps and resets the committed files a rule matches.
+    #[tokio::test]
+    async fn a_purge_deletes_all_the_view_filtered_revision_lacks_whatever_the_ignore_rules_say() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_directory_create(&path("saved"));
+            test_directory_create(&path("hidden"));
+            for relative in ["cache.tmp", "saved/config.ini", "hidden/a.txt"] {
+                test_file_write(&path(relative), b"committed");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            test_file_write(&path("cache.tmp"), b"local");
+            test_file_write(&path("saved/config.ini"), b"local");
+            test_directory_create(&path("saved/logs"));
+            for relative in [
+                "build.tmp",
+                "plain.txt",
+                "saved/logs/run.log",
+                "write.~loretemp",
+                "a.txt~theirs",
+                "saved/config.ini~base",
+            ] {
+                test_file_write(&path(relative), b"untracked");
+            }
+
+            let filtered = test_filter_context(
+                &fixture,
+                fixture.repository.immutable_store(),
+                fixture.repository.mutable_store.clone(),
+                &["*.tmp", "saved/"],
+                &["hidden/"],
+            );
+            reset_purging_through(&fixture, filtered, &[""], "").await;
+
+            assert_working_files(
+                &fixture,
+                &[
+                    ("cache.tmp", Some(b"committed")),
+                    ("saved/config.ini", Some(b"committed")),
+                    ("write.~loretemp", None),
+                    ("a.txt~theirs", None),
+                    ("saved/config.ini~base", None),
+                    ("build.tmp", None),
+                    ("plain.txt", None),
+                    ("saved/logs", None),
+                    ("hidden", None),
+                ],
+            );
+        })
+        .await;
+    }
+
+    /// A purge counts and removes nothing for a committed file the view excludes that the working
+    /// tree does not hold.
+    #[tokio::test]
+    async fn a_purge_counts_no_delete_for_an_excluded_file_the_working_tree_lacks() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("art.psd"), b"committed");
+            test_file_write(&path("kept.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+            std::fs::remove_file(path("art.psd")).expect("Failed to delete file");
+
+            let filtered = test_filter_context(
+                &fixture,
+                fixture.repository.immutable_store(),
+                fixture.repository.mutable_store.clone(),
+                &[],
+                &["*.psd"],
+            );
+            let counts =
+                reset_purging_under(&fixture, filtered, &[""], LoreGlobalArgs::default()).await;
+
+            assert_eq!(
+                (counts.directory_delete_count, counts.file_delete_count),
+                (0, 0),
+                "the purge counted a delete of a file the working tree does not hold"
+            );
+        })
+        .await;
+    }
+
+    /// A forced purge applies no view, so it restores a committed file the view excludes rather
+    /// than deleting it.
+    #[tokio::test]
+    async fn a_forced_purge_restores_a_committed_file_the_view_excludes() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_directory_create(&path("hidden"));
+            test_file_write(&path("hidden/a.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+            test_file_write(&path("hidden/a.txt"), b"local");
+
+            let filtered = test_filter_context(
+                &fixture,
+                fixture.repository.immutable_store(),
+                fixture.repository.mutable_store.clone(),
+                &[],
+                &["hidden/"],
+            );
+            reset_purging_under(
+                &fixture,
+                filtered,
+                &[""],
+                LoreGlobalArgs {
+                    force: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            assert_working_files(&fixture, &[("hidden/a.txt", Some(b"committed"))]);
+        })
+        .await;
+    }
+
+    /// A purge keeps the temporary file a write in progress holds beside a file the revision
+    /// holds, named from the file's extension or for a file without one, and deletes one beside
+    /// nothing the revision holds.
+    #[tokio::test]
+    async fn a_purge_keeps_only_the_temporary_files_of_files_the_revision_holds() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("a.bin"), b"committed");
+            test_file_write(&path("plain"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+            for relative in ["a.bin.~loretemp", "plain..~loretemp", "gone.bin.~loretemp"] {
+                test_file_write(&path(relative), b"partial");
+            }
+
+            reset_purging_through(&fixture, fixture.repository.clone(), &[""], "").await;
+
+            assert_working_files(
+                &fixture,
+                &[
+                    ("a.bin.~loretemp", Some(b"partial")),
+                    ("plain..~loretemp", Some(b"partial")),
+                    ("gone.bin.~loretemp", None),
+                ],
+            );
+        })
+        .await;
+    }
+
+    /// A purge leaves a nested repository in place, one an ignore rule matches, whether it reaches
+    /// the repository from the root or names it.
+    #[tokio::test]
+    async fn a_purge_leaves_an_ignored_nested_repository_in_place() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("kept.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+            test_directory_create(&path("nested/.lore"));
+
+            for purged in ["", "nested"] {
+                test_file_write(&path("nested/inner.txt"), b"inner");
+                test_file_write(&path("junk.txt"), b"untracked");
+                let ignoring = test_filter_context(
+                    &fixture,
+                    fixture.repository.immutable_store(),
+                    fixture.repository.mutable_store.clone(),
+                    &["nested/"],
+                    &[],
+                );
+                reset_purging_through(&fixture, ignoring, &[purged, "junk.txt"], "").await;
+
+                assert_working_files(
+                    &fixture,
+                    &[
+                        ("nested/inner.txt", Some(b"inner")),
+                        ("kept.txt", Some(b"committed")),
+                        ("junk.txt", None),
+                    ],
+                );
+                assert!(
+                    path("nested/.lore").is_dir(),
+                    "a purge of {purged:?} deleted the nested repository"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A purge deletes an untracked directory an ignore rule matches around the nested repository
+    /// below it, keeping the repository whole and the directories leading to it, whether it
+    /// reaches the directory from the root or names it.
+    #[tokio::test]
+    async fn a_purge_keeps_a_nested_repository_below_an_ignored_directory() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("kept.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            for purged in ["", "external"] {
+                test_directory_create(&path("external/libs/nested/.lore"));
+                test_directory_create(&path("external/cache"));
+                for relative in [
+                    "external/top.txt",
+                    "external/cache/blob.bin",
+                    "external/libs/beside.txt",
+                    "external/libs/nested/inner.txt",
+                ] {
+                    test_file_write(&path(relative), b"untracked");
+                }
+                let ignoring = test_filter_context(
+                    &fixture,
+                    fixture.repository.immutable_store(),
+                    fixture.repository.mutable_store.clone(),
+                    &["external/"],
+                    &[],
+                );
+                reset_purging_through(&fixture, ignoring, &[purged], "").await;
+
+                assert_working_files(
+                    &fixture,
+                    &[
+                        ("kept.txt", Some(b"committed")),
+                        ("external/libs/nested/inner.txt", Some(b"untracked")),
+                        ("external/top.txt", None),
+                        ("external/cache", None),
+                        ("external/libs/beside.txt", None),
+                    ],
+                );
+                assert!(
+                    path("external/libs/nested/.lore").is_dir(),
+                    "a purge of {purged:?} deleted the nested repository"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A purge naming an untracked directory leaves a legacy `.urc` in it, as a purge listing the
+    /// directory does, and deletes the files beside it.
+    #[tokio::test]
+    async fn a_purge_naming_a_directory_leaves_a_legacy_control_directory_in_it() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("kept.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+            test_directory_create(&path("external/.urc"));
+            test_directory_create(&path("external/sub"));
+            for relative in [
+                "external/.urc/state",
+                "external/a.txt",
+                "external/sub/b.txt",
+            ] {
+                test_file_write(&path(relative), b"untracked");
+            }
+
+            reset_purging_through(&fixture, fixture.repository.clone(), &["external"], "").await;
+
+            assert_working_files(
+                &fixture,
+                &[
+                    ("kept.txt", Some(b"committed")),
+                    ("external/.urc/state", Some(b"untracked")),
+                    ("external/a.txt", None),
+                    ("external/sub", None),
+                ],
+            );
+        })
+        .await;
+    }
+
+    /// A reset without `--purge` to a revision that lacks a committed directory it names deletes
+    /// the directory around the nested repository below it, keeping the repository whole.
+    #[tokio::test]
+    async fn a_reset_keeps_a_nested_repository_below_a_committed_directory_the_target_lacks() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("kept.txt"), b"committed");
+            let first = test_commit_tree(&fixture, "First").await.revision();
+            test_directory_create(&path("tools"));
+            test_file_write(&path("tools/build.sh"), b"committed");
+            test_commit_tree(&fixture, "Second").await;
+            test_directory_create(&path("tools/vendor/sdk/.lore"));
+            test_file_write(&path("tools/vendor/sdk/inner.txt"), b"nested");
+            test_file_write(&path("tools/vendor/beside.txt"), b"untracked");
+
+            reset::reset(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                LoreArray::from_vec(vec![LoreString::from(
+                    path("tools").to_string_lossy().as_ref(),
+                )]),
+                LoreString::from(first.to_string().as_str()),
+                ResetOptions::default(),
+            )
+            .await
+            .expect("A reset must succeed");
+
+            assert_working_files(
+                &fixture,
+                &[
+                    ("kept.txt", Some(b"committed")),
+                    ("tools/vendor/sdk/inner.txt", Some(b"nested")),
+                    ("tools/build.sh", None),
+                    ("tools/vendor/beside.txt", None),
+                ],
+            );
+            assert!(
+                path("tools/vendor/sdk/.lore").is_dir(),
+                "the reset deleted the nested repository"
+            );
+        })
+        .await;
+    }
+
+    /// A purge to another revision deletes the files the current revision commits that the target
+    /// lacks, one an ignore rule matches among them, as a reset sync to it does.
+    #[tokio::test]
+    async fn a_purge_to_another_revision_deletes_the_ignored_committed_files_it_lacks() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("a.txt"), b"committed");
+            let first = test_commit_tree(&fixture, "First").await.revision();
+            test_file_write(&path("cfg.tmp"), b"committed");
+            test_file_write(&path("plain.txt"), b"committed");
+            test_commit_tree(&fixture, "Second").await;
+
+            let ignoring = test_filter_context(
+                &fixture,
+                fixture.repository.immutable_store(),
+                fixture.repository.mutable_store.clone(),
+                &["*.tmp"],
+                &[],
+            );
+            reset_purging_through(&fixture, ignoring, &[""], &first.to_string()).await;
+
+            assert_working_files(
+                &fixture,
+                &[
+                    ("a.txt", Some(b"committed")),
+                    ("cfg.tmp", None),
+                    ("plain.txt", None),
+                ],
+            );
+        })
+        .await;
+    }
+
+    /// A purge naming a committed file the view excludes deletes it, as one reaching it from a
+    /// directory above does, and leaves the excluded file beside it alone.
+    #[tokio::test]
+    async fn a_purge_naming_a_committed_file_the_view_excludes_deletes_it() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_directory_create(&path("hidden"));
+            test_file_write(&path("hidden/a.txt"), b"committed");
+            test_file_write(&path("hidden/b.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            let filtered = test_filter_context(
+                &fixture,
+                fixture.repository.immutable_store(),
+                fixture.repository.mutable_store.clone(),
+                &[],
+                &["hidden/"],
+            );
+            reset_purging_through(&fixture, filtered, &["hidden/a.txt"], "").await;
+
+            assert_working_files(
+                &fixture,
+                &[("hidden/a.txt", None), ("hidden/b.txt", Some(b"committed"))],
+            );
+        })
+        .await;
+    }
+
+    /// A reset naming a committed file the view excludes, to a revision that lacks it, leaves the
+    /// file in place without `--purge`, and deletes it with `--purge` or with `--force`, which
+    /// applies no view.
+    #[tokio::test]
+    async fn a_reset_naming_an_excluded_file_the_target_lacks_deletes_it_only_purging_or_forced() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_file_write(&path("kept.txt"), b"committed");
+            let first = test_commit_tree(&fixture, "First").await.revision();
+            test_directory_create(&path("docs"));
+            test_file_write(&path("docs/x.txt"), b"committed");
+            test_commit_tree(&fixture, "Second").await;
+
+            for (purge, force) in [(false, false), (true, false), (false, true)] {
+                test_file_write(&path("docs/x.txt"), b"committed");
+                let filtered = test_filter_context(
+                    &fixture,
+                    fixture.repository.immutable_store(),
+                    fixture.repository.mutable_store.clone(),
+                    &[],
+                    &["docs/"],
+                );
+                let execution = Arc::new(ExecutionContext::new_client(
+                    LoreGlobalArgs {
+                        force: u8::from(force),
+                        ..Default::default()
+                    },
+                    EventDispatcher::no_dispatch(),
+                ));
+                LORE_CONTEXT
+                    .scope(
+                        execution,
+                        reset::reset(
+                            filtered,
+                            &fixture.write_token,
+                            LoreArray::from_vec(vec![LoreString::from(
+                                path("docs/x.txt").to_string_lossy().as_ref(),
+                            )]),
+                            LoreString::from(first.to_string().as_str()),
+                            ResetOptions {
+                                purge,
+                                ..Default::default()
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("A reset must succeed");
+
+                assert_eq!(
+                    path("docs/x.txt").exists(),
+                    !purge && !force,
+                    "a reset with purge {purge} and force {force} of an excluded file the target \
+                     lacks"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A reset of a directory puts back a committed file an ignore rule matches where a directory
+    /// of build output replaced it, deleting the directory.
+    #[tokio::test]
+    async fn a_reset_puts_back_an_ignored_committed_file_a_directory_replaced() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_directory_create(&path("game"));
+            test_file_write(&path("game/cache.tmp"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+            std::fs::remove_file(path("game/cache.tmp")).expect("Failed to delete file");
+            test_directory_create(&path("game/cache.tmp"));
+            test_file_write(&path("game/cache.tmp/out.bin"), b"output");
+
+            let ignoring = test_filter_context(
+                &fixture,
+                fixture.repository.immutable_store(),
+                fixture.repository.mutable_store.clone(),
+                &["*.tmp"],
+                &[],
+            );
+            reset::reset(
+                ignoring,
+                &fixture.write_token,
+                LoreArray::from_vec(vec![LoreString::from(
+                    path("game").to_string_lossy().as_ref(),
+                )]),
+                LoreString::default(),
+                ResetOptions::default(),
+            )
+            .await
+            .expect("A reset must succeed");
+
+            assert_eq!(
+                std::fs::read(path("game/cache.tmp")).ok().as_deref(),
+                Some(&b"committed"[..])
+            );
+        })
+        .await;
+    }
+
+    /// A reset naming an empty committed directory below a directory an ignore rule excludes
+    /// creates it, as a reset consults the view alone.
+    #[tokio::test]
+    async fn a_reset_creates_an_empty_committed_directory_below_an_ignored_one() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            test_directory_create(&path("saved/empty"));
+            test_commit_tree(&fixture, "Initial").await;
+            std::fs::remove_dir(path("saved/empty")).expect("Failed to delete directory");
+
+            let ignoring = test_filter_context(
+                &fixture,
+                fixture.repository.immutable_store(),
+                fixture.repository.mutable_store.clone(),
+                &["saved/"],
+                &[],
+            );
+            reset::reset(
+                ignoring,
+                &fixture.write_token,
+                LoreArray::from_vec(vec![LoreString::from(
+                    path("saved/empty").to_string_lossy().as_ref(),
+                )]),
+                LoreString::default(),
+                ResetOptions::default(),
+            )
+            .await
+            .expect("A reset must succeed");
+
+            assert!(
+                path("saved/empty").is_dir(),
+                "the reset did not create the empty committed directory"
+            );
+        })
+        .await;
+    }
+
     fn create_file(path: &Path) -> File {
         let mut file = File::options()
             .create(true)
@@ -629,58 +1220,18 @@ mod tests {
                 // Check the current filesystem status again after reset with purging
                 let changes = filesystem_changes(&repository, &state_current).await;
 
-                // We expect the ignored file to still be changed (and extant)
-                let file_ignored_reset_contents =
-                    std::fs::read_to_string(file_ignore_path.as_path())
-                        .expect("Could not read from file_ignored.txt");
-                assert_eq!(file_ignored_contents, file_ignored_reset_contents);
-
-                // We expect the ignored file to still be changed (and extant)
-                assert!(
-                    std::fs::exists(&root_file_ignored_path)
-                        .expect("Could not check the existence of root_file_ignored.txt"),
-                    "root_file_ignored.txt was purged."
-                );
+                // The purge deletes the untracked files whatever the ignore file says
+                for ignored in [file_ignored_path, root_file_ignored_path] {
+                    assert!(
+                        !std::fs::exists(&ignored)
+                            .expect("Could not check the existence of a file"),
+                        "{} was not purged.",
+                        ignored.display()
+                    );
+                }
 
                 // No more changes expected after reset with purge
                 assert!(changes.is_empty());
-
-                // Reset all changes to the repository with both purge and force
-                let force_context = Arc::new(ExecutionContext::new_client(
-                    LoreGlobalArgs {
-                        force: 1,
-                        ..Default::default()
-                    },
-                    EventDispatcher::no_dispatch(),
-                ));
-                LORE_CONTEXT
-                    .scope(
-                        force_context,
-                        reset::reset(
-                            repository.clone(),
-                            &write_token,
-                            LoreArray::from_vec(vec![LoreString::from(&path)]),
-                            LoreString::default(),
-                            ResetOptions {
-                                purge: true,
-                                ..Default::default()
-                            },
-                        ),
-                    )
-                    .await
-                    .expect("Failed to reset changes");
-
-                // We expect the ignored files to be destroyed
-                assert!(
-                    !std::fs::exists(file_ignored_path)
-                        .expect("Could not check the existence of file_ignored.txt"),
-                    "file_ignored.txt was not force purged."
-                );
-                assert!(
-                    !std::fs::exists(root_file_ignored_path)
-                        .expect("Could not check the existence of root_file_ignored.txt"),
-                    "root_file_ignored.txt was not force purged."
-                );
             }))
             .await
             .expect("Test task failed");

@@ -187,8 +187,8 @@ pub async fn realize_state(
                 node: ROOT_NODE,
             },
             RelativePath::new(),
-            options.filter_mode | FilterMode::Ignore,
-            FilesystemDiffIntent::Report,
+            options.filter_mode,
+            FilesystemDiffIntent::ReportTracked,
             Arc::new(Vec::new()),
         )
         .await

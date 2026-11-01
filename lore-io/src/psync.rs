@@ -375,6 +375,17 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn remove_dir_all_keeping(
+        &self,
+        path: PathBuf,
+        boundary: &'static str,
+        reserved: impl Fn(&str) -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        SyscallPool::global()
+            .submit(move || remove_tree_keeping(path, boundary, &reserved))
+            .await
+    }
+
     pub(crate) async fn sync(&self, file: Arc<File>, data_only: bool) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
@@ -403,6 +414,119 @@ fn forgive_existing_dir(
         Ok(()) => Ok(()),
         Err(_) if path.is_dir() => Ok(()),
         Err(err) => Err(err),
+    }
+}
+
+/// Removes the tree at `path` as `std::fs::remove_dir_all` does, but keeps each directory that
+/// holds a directory named `boundary`, with all it holds and the directories leading to it, and
+/// each entry whose name `reserved` answers for, with the directories leading to it. A path that
+/// does not exist is `Ok`, as is an entry removed by someone else during the walk.
+fn remove_tree_keeping(
+    mut path: PathBuf,
+    boundary: &str,
+    reserved: &impl Fn(&str) -> bool,
+) -> std::io::Result<()> {
+    let file_type = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata.file_type(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    forgive_missing(remove_entry_keeping(
+        &mut path,
+        file_type,
+        boundary,
+        reserved,
+        &mut Vec::new(),
+    ))
+    .map(drop)
+}
+
+/// Removes the entry of `file_type` at `path` as [`remove_tree_keeping`] does, and answers whether
+/// it is gone. A link is removed, not followed.
+///
+/// A directory is listed in full before anything in it is removed, since the boundary can be its
+/// last entry. `entries` is one stack every level shares, holding the listings of the directories
+/// on the current path, and a call's caller truncates what the call leaves on it. `path` is one
+/// buffer each name is pushed onto and popped off.
+fn remove_entry_keeping(
+    path: &mut PathBuf,
+    file_type: std::fs::FileType,
+    boundary: &str,
+    reserved: &impl Fn(&str) -> bool,
+    entries: &mut Vec<(std::ffi::OsString, std::fs::FileType)>,
+) -> std::io::Result<bool> {
+    if !file_type.is_dir() {
+        remove_non_directory(path, file_type)?;
+        return Ok(true);
+    }
+    let start = entries.len();
+    let mut removed_all = true;
+    for entry in std::fs::read_dir(&*path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && name == boundary {
+            return Ok(false);
+        }
+        if name.to_str().is_some_and(reserved) {
+            removed_all = false;
+            continue;
+        }
+        entries.push((name, file_type));
+    }
+    while entries.len() > start {
+        let index = entries.len() - 1;
+        let file_type = entries[index].1;
+        path.push(&entries[index].0);
+        let removed = remove_entry_keeping(path, file_type, boundary, reserved, entries);
+        path.pop();
+        entries.truncate(index);
+        removed_all &= forgive_missing(removed)?;
+    }
+    if removed_all {
+        std::fs::remove_dir(&*path)?;
+    }
+    Ok(removed_all)
+}
+
+/// Answers an entry that is not there as removed.
+fn forgive_missing(removed: std::io::Result<bool>) -> std::io::Result<bool> {
+    match removed {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        removed => removed,
+    }
+}
+
+/// Removes the file or link at `path`. Windows removes a link to a directory as a directory, and a
+/// read-only file once its flag is cleared, as `std::fs::remove_dir_all` does.
+fn remove_non_directory(
+    path: &std::path::Path,
+    file_type: std::fs::FileType,
+) -> std::io::Result<()> {
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if file_type.is_symlink_dir() {
+            return std::fs::remove_dir(path);
+        }
+        match std::fs::remove_file(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let mut permissions = std::fs::symlink_metadata(path)?.permissions();
+                if !permissions.readonly() {
+                    return Err(err);
+                }
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(path, permissions)?;
+                std::fs::remove_file(path)
+            }
+            removed => removed,
+        }
+    }
+    #[cfg(not(target_family = "windows"))]
+    {
+        let _ = file_type;
+        std::fs::remove_file(path)
     }
 }
 

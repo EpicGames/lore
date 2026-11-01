@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::future::Future;
+use std::path::Path;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -13,6 +15,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -35,6 +38,7 @@ use crate::link;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore_debug;
+use crate::lore_limit_drain_tasks;
 use crate::lore_trace;
 use crate::node;
 use crate::node::Node;
@@ -47,6 +51,7 @@ use crate::path::resolve_user_paths;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::is_reserved_node_name;
 use crate::revision;
 use crate::revision::sync::SyncRealizeStats;
@@ -190,6 +195,9 @@ pub struct ResetStats {
     file_inflight: Arc<Semaphore>,
     file_inflight_count: AtomicU64,
     directory_inflight: AtomicU64,
+
+    /// The mounts a purge leaves to each layer's own walk, none where the reset does not purge.
+    layer_mounts: Vec<RelativePath>,
 }
 
 impl Default for ResetStats {
@@ -202,6 +210,7 @@ impl Default for ResetStats {
             file_inflight: Arc::new(Semaphore::new(RESET_FILE_DISCOVERY)),
             file_inflight_count: AtomicU64::new(0),
             directory_inflight: AtomicU64::new(0),
+            layer_mounts: Vec::new(),
         }
     }
 }
@@ -219,7 +228,8 @@ impl ResetStats {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ResetOptions {
-    /// Delete untracked files
+    /// Delete what the target revision's view-filtered tree does not hold, whatever the
+    /// ignore file says, but for nested repositories
     pub purge: bool,
     /// Single node, no recursion
     pub single_node: bool,
@@ -356,6 +366,11 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
     }
 
     for layer in walk.layer_walks.iter() {
+        if let Err(err) = clear_layer_mount(&walk.operation, &walk.stats, &layer.mount).await {
+            return wrap_path_error(&walk.operation, &layer.mount, err)
+                .await
+                .err();
+        }
         for (mount_path, state_path) in layer.paths.iter() {
             let walked = reset_walk_path(
                 ResetContext {
@@ -383,6 +398,21 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
     None
 }
 
+/// Deletes what stands at a layer's mount where it is no directory, so the layer's walk puts the
+/// layer's directory back, as a reset deletes a directory standing where it restores a file.
+async fn clear_layer_mount(
+    operation: &InstanceOperationImpl,
+    stats: &Arc<ResetStats>,
+    mount: &RelativePath,
+) -> Result<(), ResetError> {
+    match operation.file_info(mount).await {
+        Ok(info) if info.exists() && !info.is_dir() => {
+            reset_delete_path(operation, stats, mount, false, false).await
+        }
+        _ => Ok(()),
+    }
+}
+
 fn count_data(stats: &ResetStats) -> LoreFileResetCountData {
     LoreFileResetCountData {
         directory_reset_count: stats.directory_reset_count.load(Ordering::Relaxed),
@@ -392,13 +422,35 @@ fn count_data(stats: &ResetStats) -> LoreFileResetCountData {
     }
 }
 
-/// A routed layer's states, and its paths paired as (on disk under the mount, in the
+/// A routed layer's states, its mount, and its paths paired as (on disk under the mount, in the
 /// layer's tree under `source_path`).
 #[derive(Clone)]
 struct ResetLayerWalk {
     layer: layer::Layer,
     state: Arc<layer::LayerState>,
+    mount: RelativePath,
     paths: Vec<(RelativePath, RelativePath)>,
+}
+
+/// The shared state of a reset over `layers`, holding their mounts where the reset purges.
+fn reset_stats(layers: &[layer::Layer], options: ResetOptions) -> Result<ResetStats, ResetError> {
+    let layer_mounts = if options.purge {
+        layers
+            .iter()
+            .map(|layer| {
+                RelativePath::new_from_initial_path(&layer.target_path)
+                    .forward_with::<ResetError, _>(|| {
+                        format!("Invalid layer target path {}", layer.target_path)
+                    })
+            })
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
+    Ok(ResetStats {
+        layer_mounts,
+        ..Default::default()
+    })
 }
 
 async fn resolve_layer_walks(
@@ -424,18 +476,20 @@ async fn resolve_layer_walks(
             .await
             .forward::<ResetError>("Failed to deserialize layer state")?;
 
+        let paths = remains
+            .iter()
+            .map(|remain| {
+                (
+                    mount_path.join(remain.as_str()),
+                    source_path.join(remain.as_str()),
+                )
+            })
+            .collect();
         walks.push(ResetLayerWalk {
             layer: layer.clone(),
             state: Arc::new(state),
-            paths: remains
-                .iter()
-                .map(|remain| {
-                    (
-                        mount_path.join(remain.as_str()),
-                        source_path.join(remain.as_str()),
-                    )
-                })
-                .collect(),
+            mount: mount_path,
+            paths,
         });
     }
     Ok(walks)
@@ -576,7 +630,7 @@ pub async fn reset(
 
     let layer_walks = resolve_layer_walks(repository.clone(), &layers, &layer_jobs).await?;
 
-    let stats = Arc::new(ResetStats::default());
+    let stats = Arc::new(reset_stats(&layers, options)?);
     // Staged link nodes are reset by the prelude above, before the walk runs;
     // count them here so the summary reflects the work done. Links are
     // directory-shaped nodes, so they count as directories like the walk does.
@@ -765,12 +819,18 @@ pub async fn reset_to_last_merged(
         "Found branch point {branch_point} from branch {branch:?} for current branch {branch_current}"
     );
 
+    let stats = Arc::new(reset_stats(
+        &layer::list(repository.clone())
+            .await
+            .forward::<ResetError>("Failed to list layers")?,
+        options,
+    )?);
+
     event::LoreEvent::FileResetBegin(LoreFileResetBeginEventData {
         path_count: paths.len(),
     })
     .send();
 
-    let stats = Arc::new(ResetStats::default());
     let outer_stats = stats.clone();
     let producer_repository = repository.clone();
     let producer_stats = stats.clone();
@@ -1304,8 +1364,9 @@ async fn reset_walk_named_path(
         Err(e) if e.is_node_not_found() => {
             // A path absent from the target revision is one of: a file committed
             // in the current revision but added after the target (delete it so the
-            // working tree matches the target), a pending dirty-add, or an
-            // untracked file (keep on disk unless --purge, discarding add tracking).
+            // working tree matches the target, unless the view excludes it, which
+            // only --purge deletes), a pending dirty-add, or an untracked file (keep
+            // on disk unless --purge, discarding add tracking).
             let mut delete_path = options.purge;
             if let Ok(staged_link) = state_staged
                 .find_node_link(repository.clone(), state_path.as_str())
@@ -1389,19 +1450,20 @@ async fn reset_walk_named_path(
                         }
                         parent_id = next_parent;
                     }
-                } else {
-                    // Committed in the current revision but absent from the target;
-                    // delete it so the working tree matches the target revision.
-                    delete_path = true;
+                } else if !delete_path {
+                    let (_, excluded) = repository.filter.child_emit_excludes_unless_forced(
+                        execution_context().globals().force(),
+                        parent_states,
+                        &relative_path,
+                        staged_node.is_directory(),
+                        FilterMode::View,
+                    );
+                    delete_path = !excluded;
                 }
             }
 
             if delete_path {
-                let is_directory = operation
-                    .file_info(&relative_path)
-                    .await
-                    .is_ok_and(|info| info.is_dir());
-                reset_delete_path(&operation, &stats, &relative_path, is_directory).await?;
+                Box::pin(purge_path(&operation, &stats, &repository, &relative_path)).await?;
             }
 
             Ok(())
@@ -1411,12 +1473,14 @@ async fn reset_walk_named_path(
 }
 
 /// Removes `relative_path` from the working tree, counted against the tally `is_directory`
-/// names it for.
+/// names it for. `keep_repositories` keeps each nested repository below it, with the directories
+/// leading to one.
 async fn reset_delete_path(
     operation: &InstanceOperationImpl,
     stats: &Arc<ResetStats>,
     relative_path: &RelativePath,
     is_directory: bool,
+    keep_repositories: bool,
 ) -> Result<(), ResetError> {
     lore_trace!("Reset removing path {}", relative_path.as_str());
     stats
@@ -1429,18 +1493,74 @@ async fn reset_delete_path(
     })
     .send();
 
-    operation
-        .remove_recursive(relative_path)
-        .await
-        .forward::<ResetError>("Failed to remove path")?;
+    let removed = if keep_repositories {
+        operation
+            .remove_recursive_keeping_repositories(relative_path)
+            .await
+    } else {
+        operation.remove_recursive(relative_path).await
+    };
+    removed.forward::<ResetError>("Failed to remove path")?;
     Ok(())
 }
 
-/// Apply view/ignore filter, staged check, and dispatch a single child node
+/// Removes what the working tree holds at `relative_path`, as [`reset_delete_path`] does, but
+/// for a nested repository, which is left in place at any depth with the directories leading to
+/// it, and a layer mount: a mount is left to the layer's own walk, and a directory on the way to
+/// one is purged around it. A path below a mount is left as it is where `repository` is not a
+/// layer, as a walk of the parent repository judges nothing the layer holds; the layer's own walk
+/// purges it. A path the working tree does not hold is left as it is.
+async fn purge_path(
+    operation: &Arc<InstanceOperationImpl>,
+    stats: &Arc<ResetStats>,
+    repository: &RepositoryContext,
+    relative_path: &RelativePath,
+) -> Result<(), ResetError> {
+    let mount = stats.layer_mounts.iter().find(|mount| {
+        relative_path.covers_ignore_case(mount)
+            || (!repository.is_layer() && mount.covers_ignore_case(relative_path))
+    });
+    let around_mount = match mount {
+        Some(mount) if relative_path.len() < mount.len() => true,
+        Some(_) => return Ok(()),
+        None => false,
+    };
+    let Ok(info) = operation.file_info(relative_path).await else {
+        return Ok(());
+    };
+    if !info.exists() {
+        return Ok(());
+    }
+    if info.is_dir() {
+        let repository_root = repository.require_path()?;
+        if around_mount {
+            return Box::pin(purge_untracked_children(
+                operation,
+                stats,
+                repository_root,
+                relative_path,
+                Vec::new(),
+            ))
+            .await;
+        }
+        let mut parent = relative_path
+            .parent_path()
+            .to_absolute_path(repository_root);
+        if state::is_nested_repository_root(&mut parent, relative_path.name()).await {
+            lore_trace!("Leaving nested repository {relative_path} in place");
+            return Ok(());
+        }
+    }
+    reset_delete_path(operation, stats, relative_path, info.is_dir(), true).await
+}
+
+/// Apply the view filter, staged check, and dispatch a single child node
 /// (file, directory, or link) to its appropriate handler. Files are pushed to
 /// `file_tx`; directories and links recurse via `reset_walk_directory`.
 /// `parent_states` is the filter verdict for the directory holding
-/// `relative_path`, which this node's own query steps from.
+/// `relative_path`, which this node's own query steps from. A reset asks the view
+/// alone, and a purge deletes a node the view excludes, boxed, so a walk that does
+/// not purge holds no room for it.
 async fn reset_walk_node(
     ctx: ResetContext,
     relative_path: RelativePath,
@@ -1465,10 +1585,13 @@ async fn reset_walk_node(
         parent_states,
         &relative_path,
         node.is_directory(),
-        FilterMode::Full,
+        FilterMode::View,
     );
     if excluded {
         lore_trace!("Path excluded by filter: {}", relative_path.as_str());
+        if options.purge {
+            Box::pin(purge_path(&operation, &stats, &repository, &relative_path)).await?;
+        }
         return Ok(());
     }
 
@@ -1631,8 +1754,9 @@ async fn reset_walk_node(
 /// `reset_walk_node`. Subdirectory walks are gated by the `directory_inflight`
 /// counter: spawn when under `RESET_DIRECTORY_MAX`, run inline (degrade to
 /// sync) once over. A directory the revision holds with no children is created
-/// here unless the filter excludes it, and purge (when enabled) runs for every
-/// directory once its child walks have completed.
+/// here unless the view excludes it, and purge (when enabled) runs for every
+/// directory once its child walks have completed. The purge is boxed, so a walk
+/// that does not purge holds no room for it.
 async fn reset_walk_directory(
     ctx: ResetContext,
     directory_path: RelativePath,
@@ -1654,20 +1778,19 @@ async fn reset_walk_directory(
     let mut child_node_iter = node.child();
 
     if child_node_iter.is_none() {
-        if !directory_path.is_empty() && !states.excluded(FilterMode::Full) {
+        if !directory_path.is_empty() && !states.excluded(FilterMode::View) {
             create_empty_directory::<ResetError>(&operation, &directory_path).await?;
         }
         if !options.purge {
             return Ok(());
         }
-        return purge_untracked_children(
+        return Box::pin(purge_untracked_children(
             &operation,
-            &repository,
             &stats,
+            repository.require_path()?,
             &directory_path,
             Vec::new(),
-            states,
-        )
+        ))
         .await;
     }
 
@@ -1792,33 +1915,40 @@ async fn reset_walk_directory(
         return Ok(());
     }
 
-    purge_untracked_children(
+    Box::pin(purge_untracked_children(
         &operation,
-        &repository,
         &stats,
+        repository.require_path()?,
         &directory_path,
         node_children_names,
-        states,
-    )
+    ))
     .await
 }
 
 /// Removes the children the working tree holds under `directory_path` that the target revision
-/// does not, which is what `--purge` adds to restoring the ones it does.
+/// does not, which is what `--purge` adds to restoring the ones it does. No filter is asked:
+/// an untracked path is removed whether an ignore rule or the view matches it or not.
 ///
-/// `node_children_names` names the children the revision holds, each of them restored by the
-/// walk already, and is sorted here to be matched against each filesystem entry by binary
-/// search. A path the filter excludes is left alone whatever the revision holds, unless forced.
+/// `node_children_names` names the children the revision holds, each of them settled by the
+/// walk already, restored or, where the view excludes it, removed. It is sorted here to be
+/// matched against each filesystem entry by binary search. The temporary file a write in progress
+/// holds beside a child the revision holds is left alone. An entry named `.lore` or `.urc`, and a
+/// nested repository, a directory holding `.lore`, are left in place at any depth, with the
+/// directories leading to them. What stands at a layer mount
+/// is left to the layer's own walk, whatever its kind, and a directory on the way to one is
+/// purged around it.
 ///
-/// A directory the working tree does not hold has nothing to purge, which is what all of its
-/// tracked children being filter-excluded leaves.
+/// Each removal runs in a task, and the tasks are drained to [`MAX_CONCURRENT_TREE_TASKS`] after
+/// each spawn. The first failure, of the listing, a removal or a purge around a mount, ends the
+/// listing, and it is answered once the tasks still live have been awaited.
+///
+/// A directory the working tree does not hold has nothing to purge.
 async fn purge_untracked_children(
     operation: &Arc<InstanceOperationImpl>,
-    repository: &Arc<RepositoryContext>,
     stats: &Arc<ResetStats>,
+    repository_root: &Path,
     directory_path: &RelativePath,
     mut node_children_names: Vec<String>,
-    states: FilterStates,
 ) -> Result<(), ResetError> {
     if !operation
         .file_info(directory_path)
@@ -1836,57 +1966,112 @@ async fn purge_untracked_children(
         })?;
 
     node_children_names.sort_unstable();
-    let force = execution_context().globals().force();
+    let holds = |name: &str| {
+        node_children_names
+            .binary_search_by(|held| held.as_str().cmp(name))
+            .is_ok()
+    };
+    let mut probe: Option<PathBuf> = None;
     let mut tasks = JoinSet::new();
+    let mut failure = None;
     while let Some(filesystem_child) = filesystem_children.next().await {
+        #[cfg(feature = "test-util")]
+        let filesystem_child = PURGE_TASKS.entry(filesystem_child);
         let filesystem_child =
-            filesystem_child.forward_any::<ResetError>("Unusable directory entry")?;
-        if is_reserved_node_name(&filesystem_child.name) {
+            match filesystem_child.forward_any::<ResetError>("Unusable directory entry") {
+                Ok(filesystem_child) => filesystem_child,
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            };
+        let name = filesystem_child.name.as_str();
+        if is_reserved_node_name(name) || holds(name) || is_write_in_progress(name, holds) {
             continue;
         }
 
-        let child_path = directory_path.join(&filesystem_child.name);
-
-        let (_, excluded) = repository.filter.child_emit_excludes_unless_forced(
-            force,
-            states,
-            &child_path,
-            filesystem_child.info.is_dir(),
-            FilterMode::Full,
-        );
-        if excluded {
-            lore_trace!("Path excluded by filter: {child_path}");
-            continue;
-        }
-
-        if node_children_names
-            .binary_search(&filesystem_child.name)
-            .is_err()
+        let child_path = directory_path.join(name);
+        let is_directory = filesystem_child.info.is_dir();
+        if let Some(mount) = stats
+            .layer_mounts
+            .iter()
+            .find(|mount| child_path.covers_ignore_case(mount))
+            && (is_directory || mount.len() == child_path.len())
         {
-            lore_trace!(
-                "Child node {} not found, removing path from disk",
-                filesystem_child.name.as_str()
-            );
+            if mount.len() != child_path.len()
+                && let Err(err) = Box::pin(purge_untracked_children(
+                    operation,
+                    stats,
+                    repository_root,
+                    &child_path,
+                    Vec::new(),
+                ))
+                .await
+            {
+                failure = Some(err);
+                break;
+            }
+            continue;
+        }
+        if is_directory {
+            let probe =
+                probe.get_or_insert_with(|| directory_path.to_absolute_path(repository_root));
+            if state::is_nested_repository_root(probe, name).await {
+                lore_trace!("Leaving nested repository {child_path} in place");
+                continue;
+            }
+        }
 
-            stats
-                .delete_count(filesystem_child.info.is_dir())
-                .fetch_add(1, Ordering::Relaxed);
+        lore_trace!("Child node {name} not found, removing path from disk");
 
-            let child_operation = operation.clone();
-            lore_spawn!(tasks, async move {
-                child_operation.remove_recursive(&child_path).await
-            });
+        stats
+            .delete_count(is_directory)
+            .fetch_add(1, Ordering::Relaxed);
+
+        let child_operation = operation.clone();
+        #[cfg(feature = "test-util")]
+        let live = PURGE_TASKS.enter();
+        lore_spawn!(tasks, async move {
+            #[cfg(feature = "test-util")]
+            let _live = live;
+            #[cfg(feature = "test-util")]
+            PURGE_TASKS.wait_if_held().await;
+            child_operation
+                .remove_recursive_keeping_repositories(&child_path)
+                .await
+                .forward::<ResetError>("Failed to remove invalid node")
+        });
+        if let Err(err) = lore_limit_drain_tasks!(
+            tasks,
+            MAX_CONCURRENT_TREE_TASKS,
+            ResetError::internal("Recursion task failed")
+        ) {
+            failure = Some(err);
+            break;
         }
     }
 
     while let Some(result) = tasks.join_next().await {
-        result
+        let result = result
             .internal("Recursion task failed")
-            .map_err(ResetError::from)?
-            .forward::<ResetError>("Failed to remove invalid node")?;
+            .map_err(ResetError::from)
+            .flatten();
+        failure = failure.or(result.err());
     }
 
-    Ok(())
+    failure.map_or(Ok(()), Err)
+}
+
+/// Counts and holds the removal tasks purges spawn, and fails a purge's listing, for a test.
+#[cfg(feature = "test-util")]
+pub static PURGE_TASKS: crate::test_util::TaskProbe = crate::test_util::TaskProbe::new();
+
+/// Whether `name` is the temporary file a write in progress puts a child `holds` answers for in
+/// place through. The storage layer names it from the child's extension: `a.txt.~loretemp` for
+/// `a.txt`, and `a..~loretemp` for `a`, which has none.
+fn is_write_in_progress(name: &str, holds: impl Fn(&str) -> bool) -> bool {
+    name.strip_suffix(TEMP_FILE_EXTENSION)
+        .is_some_and(|written| holds(written) || written.strip_suffix('.').is_some_and(&holds))
 }
 
 /// Drain the file work channel and run per-file reset work. Each task
@@ -2045,7 +2230,7 @@ async fn reset_file_realize(
     // If being reset from a directory to a file the directory must be deleted before the file is
     // created.
     if info.is_ok_and(|info| info.is_dir()) {
-        reset_delete_path(&operation, &stats, &relative_path, true).await?;
+        reset_delete_path(&operation, &stats, &relative_path, true, false).await?;
     }
 
     stats.file_reset_count.fetch_add(1, Ordering::Relaxed);

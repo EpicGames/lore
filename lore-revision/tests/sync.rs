@@ -272,6 +272,212 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A reset sync to another revision carries its change to a committed file an ignore rule
+    /// matches over a local edit, and its deletes of others, one with its directory, as a sync
+    /// does. It restores one deleted locally and one a directory of build output replaced, and
+    /// leaves untracked files alone whether a rule matches them or not, one in the deleted
+    /// directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_carries_a_revision_over_ignored_committed_files() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = Box::pin(test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                ))
+                .await;
+                let path = |relative: &str| instance.path.join(relative);
+
+                fs::create_dir_all(path("saved/old")).expect("Failed to create the directories");
+                for relative in [
+                    "cache.tmp",
+                    "gone.tmp",
+                    "swap.tmp",
+                    "saved/config.ini",
+                    "saved/old/a.ini",
+                ] {
+                    test_file_write(&path(relative), b"committed");
+                }
+                let first = test_commit_tree(&instance, "Committed").await.revision();
+                test_file_write(&path("cache.tmp"), b"incoming");
+                fs::remove_file(path("gone.tmp")).expect("Failed to delete the file");
+                fs::remove_dir_all(path("saved/old")).expect("Failed to delete the directory");
+                let second = test_commit_tree(&instance, "Changed and deleted")
+                    .await
+                    .revision();
+
+                sync_to(&instance, first, false).await;
+                test_file_write(&path("cache.tmp"), b"local");
+                fs::remove_file(path("saved/config.ini")).expect("Failed to delete the file");
+                fs::remove_file(path("swap.tmp")).expect("Failed to delete the file");
+                fs::create_dir_all(path("swap.tmp")).expect("Failed to create the directory");
+                test_file_write(&path("swap.tmp/out.bin"), b"output");
+                for relative in ["build.tmp", "notes.txt", "saved/old/run.log"] {
+                    test_file_write(&path(relative), b"untracked");
+                }
+
+                let ignoring = test_filter_context(
+                    &instance,
+                    instance.repository.immutable_store(),
+                    instance.repository.mutable_store.clone(),
+                    &["*.tmp", "saved/"],
+                    &[],
+                );
+                sync::sync_boxed(
+                    ignoring,
+                    &instance.write_token,
+                    SyncOptions {
+                        revision: Some(second.to_string()),
+                        reset: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Failed to reset the working tree");
+
+                for (relative, expected) in [
+                    ("cache.tmp", Some(&b"incoming"[..])),
+                    ("saved/config.ini", Some(&b"committed"[..])),
+                    ("swap.tmp", Some(&b"committed"[..])),
+                    ("build.tmp", Some(&b"untracked"[..])),
+                    ("notes.txt", Some(&b"untracked"[..])),
+                    ("saved/old/run.log", Some(&b"untracked"[..])),
+                    ("gone.tmp", None),
+                    ("saved/old/a.ini", None),
+                ] {
+                    assert_eq!(
+                        fs::read(path(relative)).ok().as_deref(),
+                        expected,
+                        "{relative} after the reset"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset sync counts an entry tracked only where the current revision holds one of the
+    /// same name and kind, so it leaves alone untracked entries that took the place of a committed
+    /// one: a file where a directory was, a directory where a file was, and a file named as the
+    /// directory it sits in, which stands where the current revision holds a file of that name and
+    /// the incoming one a directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_counts_an_entry_tracked_only_as_the_kind_the_revision_holds() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = Box::pin(test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                ))
+                .await;
+                let path = |relative: &str| instance.path.join(relative);
+
+                fs::create_dir_all(path("cache")).expect("Failed to create the directory");
+                for relative in ["cache/a.bin", "old", "dir"] {
+                    test_file_write(&path(relative), b"committed");
+                }
+                let first = test_commit_tree(&instance, "Committed").await.revision();
+                fs::remove_dir_all(path("cache")).expect("Failed to delete the directory");
+                fs::remove_file(path("old")).expect("Failed to delete the file");
+                fs::remove_file(path("dir")).expect("Failed to delete the file");
+                fs::create_dir_all(path("dir")).expect("Failed to create the directory");
+                test_file_write(&path("dir/keep.ini"), b"incoming");
+                let second = test_commit_tree(&instance, "Deleted and replaced")
+                    .await
+                    .revision();
+
+                sync_to(&instance, first, false).await;
+                fs::remove_dir_all(path("cache")).expect("Failed to delete the directory");
+                test_file_write(&path("cache"), b"untracked");
+                fs::remove_file(path("old")).expect("Failed to delete the file");
+                fs::create_dir_all(path("old")).expect("Failed to create the directory");
+                test_file_write(&path("old/old"), b"untracked");
+                fs::remove_file(path("dir")).expect("Failed to delete the file");
+                fs::create_dir_all(path("dir")).expect("Failed to create the directory");
+                test_file_write(&path("dir/dir"), b"untracked");
+
+                sync_to(&instance, second, true).await;
+
+                for (relative, expected) in [
+                    ("cache", &b"untracked"[..]),
+                    ("old/old", b"untracked"),
+                    ("dir/dir", b"untracked"),
+                    ("dir/keep.ini", b"incoming"),
+                ] {
+                    assert_eq!(
+                        fs::read(path(relative)).ok().as_deref(),
+                        Some(expected),
+                        "{relative} after the reset"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset sync to a revision that lacks a committed file deletes the entry spelled as the
+    /// current revision holds it and leaves an untracked one spelled in another case beside it.
+    /// Where the working tree holds the file in one other case only, that entry stands for it, and
+    /// where it holds the file in several other cases, none does and all stay.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_sync_deletes_only_the_spelling_the_current_revision_tracks() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = Box::pin(test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                ))
+                .await;
+                let path = |relative: &str| instance.path.join(relative);
+
+                test_file_write(&path("keep.txt"), b"committed");
+                let first = test_commit_tree(&instance, "First").await.revision();
+                for relative in ["Foo", "Bar", "Baz"] {
+                    test_file_write(&path(relative), b"committed");
+                }
+                test_commit_tree(&instance, "Second").await;
+                test_file_write(&path("foo"), b"untracked");
+                fs::rename(path("Bar"), path("bar")).expect("Failed to rename the file");
+                fs::rename(path("Baz"), path("baz")).expect("Failed to rename the file");
+                test_file_write(&path("BAZ"), b"untracked");
+
+                sync_to(&instance, first, true).await;
+
+                for (relative, expected) in [
+                    ("keep.txt", Some(&b"committed"[..])),
+                    ("foo", Some(&b"untracked"[..])),
+                    ("Foo", None),
+                    ("bar", None),
+                    ("baz", Some(&b"committed"[..])),
+                    ("BAZ", Some(&b"untracked"[..])),
+                ] {
+                    assert_eq!(
+                        fs::read(path(relative)).ok().as_deref(),
+                        expected,
+                        "{relative} after the reset"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// A provider that holds its state in a `State` refuses a sync restricted to a dependency set,
     /// as it holds whole revisions, and one resetting local changes, before the instance moves.
     #[tokio::test(flavor = "multi_thread")]

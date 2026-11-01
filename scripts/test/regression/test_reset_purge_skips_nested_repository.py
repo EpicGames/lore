@@ -10,15 +10,13 @@ from test_nested_repository import _create_nested_repository
 
 
 @pytest.mark.regression
-@pytest.mark.bug_reproduction
-# "." walks the tree and deletes every child the target revision does not list,
-# "nested" is looked up directly, missed, and deleted as a path absent from the target.
-# The same outcome, two scenarios, a guard added at one site does not cover the other.
+# "." reaches the nested repository through the purge of the root, and "nested" names it as a
+# path the target revision lacks: two sites, each guarded on its own.
 @pytest.mark.parametrize("purged", [".", "nested"])
 def test_reset_purge_skips_nested_repository(new_lore_repo, purged):
-    """A repository created inside another repository's working tree must survive
-    `reset --purge` in the outer repository, untracked work included. The scan
-    already treats a nested repository as a boundary; the purge walk does not.
+    """A repository created inside another repository's working tree survives
+    `reset --purge` in the outer repository, untracked work included: the purge
+    treats a nested repository as a boundary, as the scan does.
     """
     outer: Lore = new_lore_repo()
     outer.write_commit_push("base", {"kept.txt": b"outer\n"})

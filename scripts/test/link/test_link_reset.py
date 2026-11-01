@@ -267,13 +267,10 @@ def test_link_reset_refuses_a_staged_file_inside_a_link(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_reset_honours_a_directory_rule_naming_the_mount(new_lore_repo):
-    """A directory rule naming a link mount excludes the content mounted there.
-
-    The mount node is a link, not a directory, so the rule does not match the
-    node itself. It matches the mount path, which is what the content below it
-    sits in, and every walk folds the mount path that way. Reset has to reach
-    the same verdict or it restores files the filter excludes.
+def test_link_reset_purge_ignores_a_directory_rule_naming_the_mount(new_lore_repo):
+    """`lore reset --purge .` restores the committed content mounted at a link and
+    deletes the untracked files in the mount and beside it, whatever the ignore
+    rules say, even one naming the mount as a directory.
     """
     repo: Lore = new_lore_repo()
 
@@ -302,25 +299,26 @@ def test_link_reset_honours_a_directory_rule_naming_the_mount(new_lore_repo):
     mounted_file = f"{link_path}/{link_file}"
     assert repo.compare_file(repo, mounted_file)
 
-    # A rooted directory rule naming the mount, the shape a sparse view uses.
     with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
-        ignore_file.write(f"/{link_path}/\n")
+        ignore_file.write(f"/{link_path}/\n*.tmp\n")
 
     with repo.open_file(mounted_file, "w+") as output_file:
         output_file.writelines(["inside modified\n"])
     with repo.open_file(outside_file, "w+") as output_file:
         output_file.writelines(["outside modified\n"])
+    untracked = [f"{link_path}/untracked.txt", f"{link_path}/build.tmp", "build.tmp"]
+    repo.write_files({path: "untracked\n" for path in untracked})
 
-    repo.reset(".")
+    repo.reset(".", purge=True)
 
     with repo.open_file(outside_file, "r") as f:
-        assert "outside original" in f.read(), (
-            "Reset should restore a file the filter does not exclude"
-        )
+        assert "outside original" in f.read(), "Reset should restore a committed file"
     with repo.open_file(mounted_file, "r") as f:
-        assert "inside modified" in f.read(), (
-            "Reset should not descend into a link mount the filter excludes"
+        assert "inside original" in f.read(), (
+            "Reset should restore the committed file mounted at the link"
         )
+    for path in untracked:
+        assert not repo.file_exists(path), f"The purge kept the untracked {path}"
 
 
 # ---------------------------------------------------------------------------

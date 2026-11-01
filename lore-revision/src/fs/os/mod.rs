@@ -86,6 +86,16 @@ impl OsOperation {
     fn absolute(&self, path: &RelativePath) -> PathBuf {
         path.to_absolute_path(&self.filesystem_root)
     }
+
+    /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
+    /// keeps each nested repository in it, with the directories leading to one.
+    pub(crate) async fn remove_recursive_keeping_repositories(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(), FsError> {
+        util::fs::unlink_recursive_keeping_repositories(&self.absolute(path)).await?;
+        Ok(())
+    }
 }
 
 /// A directory read from the OS file system, one chunk of entries and their metadata per

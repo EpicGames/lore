@@ -32,6 +32,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Ignore and view rules match paths as `.gitignore` does. A character class or a `**` inside a name matches within one
   path component, so `!/Engine/Content**` re-includes `Engine/Content` but not its contents; use `!/Engine/Content`. A
   file with a re-inclusion that starts with a `**` component, such as `!/**/a/b`, fails to load
+- `lore sync --reset` and `lore branch switch --reset` leave untracked files in place, and restore and delete only what
+  the revision tracks, including committed files an ignore rule matches. `lore reset --purge` deletes untracked files
+- `lore reset` does not consult the ignore file. It restores committed files an ignore rule matches, and `--purge`
+  deletes untracked files whether or not an ignore rule matches them, as well as committed files the view excludes
 
 ### Features
 
@@ -101,6 +105,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and
   `lore push --fast-forward-merge` report a conflict for a file both sides change when its path holds glob characters
   such as `[` and `]`
+- A layer's `lore sync --reset` and `lore branch switch --reset` discard local edits in the mount, as they do in the
+  parent repository
+- `lore reset --purge` deletes the untracked files in a layer's mount and leaves the layer's unchanged files in place
+- `lore reset` keeps nested repositories, wherever they are in the working tree
 - `lore stage --scan` leaves out a file an ignore file excludes where a re-inclusion reaches below a directory of the
   file's name, such as `Game/Saved/direct.log` under `Saved/` and `!*/Saved/*/Keep/`
 - `lore stage` stages no deletion of the files a view leaves out of a sparse working tree, with or without `--force`,

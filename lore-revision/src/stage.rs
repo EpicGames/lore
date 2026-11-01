@@ -3518,7 +3518,7 @@ async fn stage_from_parent_revision_in_operation(
     #[cfg(not(feature = "test-util"))]
     let permits = MAX_CONCURRENT_TREE_TASKS;
     #[cfg(feature = "test-util")]
-    let permits = resolve_tasks::budget();
+    let permits = RESOLVE_TASKS.budget();
     let budget = Arc::new(Semaphore::new(permits));
     let mut tasks = JoinSet::new();
     let dispatch_result: Result<(), StageError> = async {
@@ -3802,7 +3802,7 @@ async fn stage_from_parent_revision_in_operation(
                     StageError::internal_with_context(err, "The task budget is closed")
                 })?;
                 #[cfg(feature = "test-util")]
-                let live = resolve_tasks::Live::enter();
+                let live = RESOLVE_TASKS.enter();
                 lore_spawn!(tasks, {
                     let operation = operation.clone();
                     let repository = repository.clone();
@@ -4411,7 +4411,7 @@ pub(crate) async fn stage_from_parent_state(
             let operation = operation.clone();
             let stage_change = async move {
                 #[cfg(feature = "test-util")]
-                resolve_tasks::wait_if_held().await;
+                RESOLVE_TASKS.wait_if_held().await;
                 let info = operation
                     .file_info(&file_path)
                     .await
@@ -4448,7 +4448,7 @@ pub(crate) async fn stage_from_parent_state(
             };
             if let Ok(permit) = budget.clone().try_acquire_owned() {
                 #[cfg(feature = "test-util")]
-                let live = resolve_tasks::Live::enter();
+                let live = RESOLVE_TASKS.enter();
                 lore_spawn!(tasks, async move {
                     let _permit = permit;
                     #[cfg(feature = "test-util")]
@@ -4483,98 +4483,6 @@ pub(crate) async fn stage_from_parent_state(
     final_result
 }
 
-/// Counts the tasks one-side resolutions have live, for a test to read the peak, and holds
-/// every change they stage until released, so a test can see the tasks pile up. Per process,
-/// so a test using this runs alone in its binary.
+/// Counts and holds the tasks one-side resolutions spawn, and sizes their budget, for a test.
 #[cfg(feature = "test-util")]
-pub mod resolve_tasks {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    use tokio::sync::Notify;
-
-    static LIVE: AtomicUsize = AtomicUsize::new(0);
-    static PEAK: AtomicUsize = AtomicUsize::new(0);
-    static SPAWNED: AtomicUsize = AtomicUsize::new(0);
-    static HELD: AtomicBool = AtomicBool::new(false);
-    static RELEASED: Notify = Notify::const_new();
-    static BUDGET: AtomicUsize = AtomicUsize::new(crate::MAX_CONCURRENT_TREE_TASKS);
-
-    /// Zeroes the counts and restores the budget.
-    pub fn reset() {
-        LIVE.store(0, Ordering::Relaxed);
-        PEAK.store(0, Ordering::Relaxed);
-        SPAWNED.store(0, Ordering::Relaxed);
-        BUDGET.store(crate::MAX_CONCURRENT_TREE_TASKS, Ordering::Relaxed);
-    }
-
-    /// Sizes the budget the next resolution runs under, so a test can exceed it with a small
-    /// tree. [`crate::MAX_CONCURRENT_TREE_TASKS`] until set.
-    pub fn set_budget(permits: usize) {
-        BUDGET.store(permits, Ordering::Relaxed);
-    }
-
-    /// The permits a resolution's budget holds.
-    pub(crate) fn budget() -> usize {
-        BUDGET.load(Ordering::Relaxed)
-    }
-
-    /// Stops every change about to be staged until [`release`] is called.
-    pub fn hold() {
-        HELD.store(true, Ordering::Release);
-    }
-
-    /// Lets the changes [`hold`] stopped go on.
-    pub fn release() {
-        HELD.store(false, Ordering::Release);
-        RELEASED.notify_waiters();
-    }
-
-    /// Waits while a hold is on. The wakeup is registered before the flag is read, so a
-    /// release between the two is not missed.
-    pub(crate) async fn wait_if_held() {
-        loop {
-            let released = RELEASED.notified();
-            tokio::pin!(released);
-            released.as_mut().enable();
-            if !HELD.load(Ordering::Acquire) {
-                return;
-            }
-            released.await;
-        }
-    }
-
-    /// The tasks live now.
-    pub fn live() -> usize {
-        LIVE.load(Ordering::Relaxed)
-    }
-
-    /// The most tasks live at once since the last reset.
-    pub fn peak() -> usize {
-        PEAK.load(Ordering::Relaxed)
-    }
-
-    /// The tasks spawned since the last reset.
-    pub fn spawned() -> usize {
-        SPAWNED.load(Ordering::Relaxed)
-    }
-
-    /// A task counted as live from its spawn until this is dropped.
-    pub(crate) struct Live;
-
-    impl Live {
-        pub(crate) fn enter() -> Self {
-            SPAWNED.fetch_add(1, Ordering::Relaxed);
-            let live = LIVE.fetch_add(1, Ordering::AcqRel) + 1;
-            PEAK.fetch_max(live, Ordering::AcqRel);
-            Live
-        }
-    }
-
-    impl Drop for Live {
-        fn drop(&mut self) {
-            LIVE.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
+pub static RESOLVE_TASKS: crate::test_util::TaskProbe = crate::test_util::TaskProbe::new();

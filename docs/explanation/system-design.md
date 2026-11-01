@@ -1312,7 +1312,8 @@ The rule is simple: operations on *committed state* consult the view only; opera
   branches, computing a diff between revisions, restoring a file from a revision - filter
   through the view. They do not consult the ignore file: a file that was committed before an
   ignore rule was added must still flow through, otherwise the system would refuse to update
-  perfectly legitimate committed paths.
+  perfectly legitimate committed paths. Resetting to a revision is one of them, so the ignore
+  file has no say in what a reset restores or removes.
 - Operations on the working directory or staging area - staging, status, locking - filter
   through both. The view limits what the operation sees on disk; the ignore file then further
   excludes things the user has declared shouldn't be staged. Status lists what is already

@@ -1902,6 +1902,109 @@ def test_layer_sync_reset_restores_a_layer_mounted_away_from_its_source(new_lore
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("command", ["sync", "branch switch"])
+def test_layer_reset_carries_ignored_files_in_the_mount(new_lore_repo, command):
+    """`lore sync --reset` and `lore branch switch --reset` carry a layer's revision over the
+    files in its mount that an ignore rule matches: they restore an edited committed file and
+    apply the layer's delete of another. They leave untracked files in the mount alone, whether
+    an ignore rule matches them or not."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(
+        None,
+        {
+            LAYER_FILE: b"layer content v1",
+            "lay/cfg.tmp": b"committed",
+            "lay/gone.tmp": b"committed",
+        },
+    )
+    repo.layer_add("lay", layer_repo, "lay/")
+    repo.write_commit_push("Add ignore rules", {repo.ignore_file(): "*.tmp\n"})
+    if command == "branch switch":
+        repo.branch_create("feature")
+        repo.push()
+        repo.branch_switch("feature")
+
+    layer_repo.remove_file("lay/gone.tmp")
+    layer_repo.stage("lay/gone.tmp")
+    layer_repo.commit("Delete gone.tmp")
+    layer_repo.push()
+    repo.write_files(
+        {
+            "lay/cfg.tmp": b"local\n",
+            "lay/build.tmp": b"untracked\n",
+            "lay/notes.txt": b"untracked\n",
+        }
+    )
+
+    if command == "sync":
+        repo.sync(reset=True)
+    else:
+        repo.branch_switch("main", reset=True)
+
+    expected = {
+        LAYER_FILE: b"layer content v1",
+        "lay/cfg.tmp": b"committed",
+        "lay/build.tmp": b"untracked\n",
+        "lay/notes.txt": b"untracked\n",
+    }
+    for path, content in expected.items():
+        with repo.open_file(path, mode="rb") as out:
+            assert out.read() == content, f"{command}: {path} does not hold {content!r}"
+    assert not repo.file_exists("lay/gone.tmp"), f"{command}: lay/gone.tmp survived"
+
+
+@pytest.mark.smoke
+def test_layer_reset_purge_keeps_committed_layer_content(new_lore_repo):
+    """`lore reset --purge .` resets a layer's committed content in its mount
+    and deletes the untracked files there and in the parent, whatever the
+    ignore rules say. It leaves a layer file the working tree did not change in
+    place."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(
+        None,
+        {
+            LAYER_FILE: b"layer content v1",
+            "lay/cfg.tmp": b"committed",
+            "lay/stable.txt": b"committed",
+        },
+    )
+    repo.layer_add("lay", layer_repo, "lay/")
+    repo.write_commit_push("Add ignore rules", {repo.ignore_file(): "*.tmp\n"})
+    stable = os.stat(os.path.join(repo.path, "lay", "stable.txt")).st_ino
+
+    untracked = ["lay/build.tmp", "lay/notes.txt", "build.tmp"]
+    repo.write_files(
+        {
+            LAYER_FILE: "local\n",
+            "lay/cfg.tmp": "local\n",
+            **{path: "untracked\n" for path in untracked},
+        }
+    )
+
+    repo.reset(".", purge=True)
+
+    for path, content in {
+        LAYER_FILE: b"layer content v1",
+        "lay/cfg.tmp": b"committed",
+        "lay/stable.txt": b"committed",
+        MAIN_FILE: b"main content",
+    }.items():
+        with repo.open_file(path, mode="rb") as out:
+            assert out.read() == content, f"{path} does not hold {content!r}"
+    for path in untracked:
+        assert not repo.file_exists(path), f"The purge kept the untracked {path}"
+    assert os.stat(os.path.join(repo.path, "lay", "stable.txt")).st_ino == stable, (
+        "The purge deleted the unchanged layer file and wrote it back"
+    )
+
+
+@pytest.mark.smoke
 def test_layer_remove_without_repository(new_lore_repo):
     """`lore layer remove <path>` without a source repository argument finds
     the unique layer at that path and removes it.

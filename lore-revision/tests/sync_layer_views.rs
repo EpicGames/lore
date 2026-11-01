@@ -7,6 +7,9 @@
 //! instance's view decides which of it stands on disk. So a view change is work for every mount at
 //! the revision the layer already holds, and a mount is carried the way the tree is: the old view on
 //! the from side of the diff and the new one on the to side.
+//!
+//! A reset that purges leaves a mount to the layer's own walk in the same way: the instance's walk
+//! deletes what its revision lacks around a mount and nothing inside it.
 
 #[cfg(test)]
 mod tests {
@@ -14,21 +17,28 @@ mod tests {
 
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
+    use lore_base::types::BranchPoint;
     use lore_base::types::Hash;
     use lore_revision::branch;
     use lore_revision::branch::BranchLatestStatus;
+    use lore_revision::file::reset;
+    use lore_revision::file::reset::ResetMergeSide;
+    use lore_revision::file::reset::ResetOptions;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEvent;
+    use lore_revision::interface::LoreFileAction;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::layer;
     use lore_revision::layer::Layer;
+    use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository::RepositoryContext;
@@ -67,12 +77,34 @@ mod tests {
     const NARROW_VIEW: &str = "narrow";
     /// A view file holding no rules, which puts the whole repository in view.
     const WIDE_VIEW: &str = "wide";
+    /// A mount two levels below a directory the instance's revision does not hold.
+    const MOUNT_BELOW_UNTRACKED: &str = "a/b/mount";
+    /// The name of a file no revision holds, written into each directory a purge is to empty.
+    const UNTRACKED: &str = "junk.txt";
+    const UNTRACKED_CONTENT: &[u8] = b"untracked";
 
-    /// An instance mounting a second repository at [`MOUNT`], each on its own revision.
+    /// What a reset reports deleting and writing.
+    ///
+    /// The reset sends a Delete event for each path it is asked to reset that the revision lacks,
+    /// and counts each untracked child it purges from a directory it lists without one.
+    #[derive(Debug, Default, PartialEq)]
+    struct Purged {
+        /// The paths of the reset's Delete events, sorted.
+        deleted: Vec<String>,
+        /// The directories and the files the reset counts deleted.
+        deletes: (u64, u64),
+        /// The files the reset counts written, which a layer file left in place is not.
+        written: u64,
+    }
+
+    /// An instance mounting a second repository, each on its own revision.
     struct Fixture {
         instance: TestRepository,
         /// The repository the layer draws from, mounted whole.
         source: TestRepository,
+        /// Where the instance mounts the layer: [`MOUNT`], or the path
+        /// [`Self::create_mounted_at`] names.
+        mount: &'static str,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         views: TempDir,
@@ -84,6 +116,15 @@ mod tests {
         async fn create(
             immutable_store: Arc<dyn lore_storage::ImmutableStore>,
             mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> Self {
+            Self::create_mounted_at(immutable_store, mutable_store, MOUNT).await
+        }
+
+        /// [`Self::create`], with the layer mounted at `mount` in place of [`MOUNT`].
+        async fn create_mounted_at(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+            mount: &'static str,
         ) -> Self {
             let source = test_repository_create(
                 immutable_store.clone(),
@@ -125,6 +166,7 @@ mod tests {
             let fixture = Self {
                 instance,
                 source,
+                mount,
                 immutable_store,
                 mutable_store,
                 views: generate_tempdir(),
@@ -147,7 +189,7 @@ mod tests {
             lore_revision::util::config::save(
                 &LayerConfig {
                     layers: vec![Layer {
-                        target_path: MOUNT.to_string(),
+                        target_path: self.mount.to_string(),
                         source_path: String::new(),
                         repository: self.source.repository.id,
                         metadata: None,
@@ -225,10 +267,148 @@ mod tests {
         /// Written directly, so a test carrying a mount out of view does not stand on the path that
         /// carries one in.
         fn materialize_mount(&self) {
-            std::fs::create_dir_all(self.working(MOUNTED_DROPPED_DIRECTORY))
+            let mount = self.working(self.mount);
+            std::fs::create_dir_all(mount.join(SOURCE_DROPPED_DIRECTORY))
                 .expect("Create directory failed");
-            test_file_write(self.working(MOUNTED_KEPT).as_path(), KEPT_CONTENT);
-            test_file_write(self.working(MOUNTED_DROPPED).as_path(), DROPPED_CONTENT);
+            test_file_write(mount.join(SOURCE_KEPT).as_path(), KEPT_CONTENT);
+            test_file_write(mount.join(SOURCE_DROPPED).as_path(), DROPPED_CONTENT);
+        }
+
+        /// Creates a branch off the revision the instance is on, moves the instance onto it and
+        /// commits [`SECOND`] there, answering the branch it was created from. That branch was last
+        /// merged into the new one at its branch point, a revision that lacks the file.
+        ///
+        /// Created through [`branch::create`], since [`branch::create::create`] creates the branch
+        /// in the layer repository as well, which needs branch metadata for the layer's branch that
+        /// the instance does not hold.
+        async fn branch_off(&self) -> BranchId {
+            let (revision, default_branch) =
+                lore_revision::instance::load_current_anchor_boxed(&self.instance.repository)
+                    .await
+                    .expect("Failed to load current anchor");
+            let feature = BranchId::from(uuid::Uuid::now_v7());
+            branch::create(
+                self.instance.repository.clone(),
+                &self.instance.write_token,
+                feature,
+                "feature",
+                branch::default_category(),
+                "test-user",
+                1,
+                vec![BranchPoint {
+                    branch: default_branch,
+                    revision,
+                }],
+                false,
+                false,
+            )
+            .await
+            .expect("Failed to create the branch");
+            lore_revision::instance::store_current_anchor_branch(
+                &self.instance.repository,
+                feature,
+            )
+            .await
+            .expect("Failed to move the instance onto the branch");
+
+            let second = self.working(SECOND);
+            test_file_write(second.as_path(), SECOND_CONTENT);
+            lore_revision::file::stage::stage(
+                self.instance.repository.clone(),
+                &self.instance.write_token,
+                LoreArray::from_vec(vec![LoreString::from(&second)]),
+                lore_revision::stage::StageOptions::default(),
+            )
+            .await
+            .expect("Failed to stage the branch's file");
+            test_commit(&self.instance, "Second").await;
+            default_branch
+        }
+
+        /// Resets `paths`, relative to the working tree's root, with a purge: to the revision the
+        /// instance is on, or to the point each path was last merged from `last_merged_from`.
+        /// Answers what the reset reports deleting and writing.
+        ///
+        /// The branch is named by its id, since the instance holds no name for its default branch.
+        async fn reset_purging(
+            &self,
+            paths: &[&str],
+            last_merged_from: Option<BranchId>,
+        ) -> Purged {
+            self.reset_reporting(paths, last_merged_from, true).await
+        }
+
+        /// Resets `paths` as [`Self::reset_purging`] does, purging where `purge` says so.
+        async fn reset_reporting(
+            &self,
+            paths: &[&str],
+            last_merged_from: Option<BranchId>,
+            purge: bool,
+        ) -> Purged {
+            let paths = LoreArray::from_vec(
+                paths
+                    .iter()
+                    .map(|path| LoreString::from(&self.working(path)))
+                    .collect(),
+            );
+            let options = ResetOptions {
+                purge,
+                ..Default::default()
+            };
+            let purged = Arc::new(Mutex::new(Purged::default()));
+            let recorded = purged.clone();
+            let execution = Arc::new(ExecutionContext::new_client_with_user_id(
+                LoreGlobalArgs::default(),
+                EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
+                    let mut purged = recorded.lock().expect("Failed to record the reset");
+                    match event {
+                        LoreEvent::FileResetFile(file) if file.action == LoreFileAction::Delete => {
+                            purged.deleted.push(file.path.to_string());
+                        }
+                        LoreEvent::FileResetEnd(end) => {
+                            purged.deletes = (
+                                end.count.directory_delete_count,
+                                end.count.file_delete_count,
+                            );
+                            purged.written = end.count.file_reset_count;
+                        }
+                        _ => {}
+                    }
+                }))),
+                "test-user".to_string(),
+            ));
+            LORE_CONTEXT
+                .scope(execution.clone(), async {
+                    match last_merged_from {
+                        Some(branch_id) => {
+                            reset::reset_to_last_merged(
+                                self.instance.repository.clone(),
+                                paths,
+                                LoreString::from(branch_id.to_string().as_str()),
+                                ResetMergeSide::Resolved,
+                                options,
+                            )
+                            .await
+                        }
+                        None => {
+                            reset::reset(
+                                self.instance.repository.clone(),
+                                &self.instance.write_token,
+                                paths,
+                                LoreString::default(),
+                                options,
+                            )
+                            .await
+                        }
+                    }
+                    .expect("Failed to reset");
+                    execution.dispatcher.drain().await;
+                })
+                .await;
+
+            let mut purged = std::mem::take(&mut *purged.lock().expect("Failed to read the reset"));
+            purged.deleted.sort();
+            purged
         }
 
         /// Writes the view the instance holds, which the next [`Self::reopened`] reads.
@@ -661,5 +841,264 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
+    }
+
+    /// Purges `named` in an instance mounting the layer at [`MOUNT_BELOW_UNTRACKED`], with an
+    /// untracked file in each directory on the way to the mount and in it, and asserts that the
+    /// purge deletes those files alone and leaves the layer's file in place.
+    async fn assert_a_purge_around_a_mount_below_an_untracked_directory(named: &'static str) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let kept = format!("{MOUNT_BELOW_UNTRACKED}/{SOURCE_KEPT}");
+                let untracked = ["a", "a/b", MOUNT_BELOW_UNTRACKED]
+                    .map(|directory| format!("{directory}/{UNTRACKED}"));
+                let fixture = Fixture::create_mounted_at(
+                    immutable_store,
+                    mutable_store,
+                    MOUNT_BELOW_UNTRACKED,
+                )
+                .await;
+                fixture.materialize_mount();
+                for path in &untracked {
+                    test_file_write(fixture.working(path).as_path(), UNTRACKED_CONTENT);
+                }
+
+                let purged = fixture.reset_purging(&[named], None).await;
+
+                let untracked_left: Vec<&String> = untracked
+                    .iter()
+                    .filter(|path| fixture.working(path).exists())
+                    .collect();
+                assert_eq!(
+                    (untracked_left, fixture.working_file(&kept).as_deref()),
+                    (Vec::<&String>::new(), Some(KEPT_CONTENT)),
+                    "a purge of {named:?} deletes the untracked files on the way to the mount and \
+                     inside it, and keeps the layer's file"
+                );
+                assert_eq!(
+                    purged,
+                    Purged {
+                        deleted: Vec::new(),
+                        deletes: (0, untracked.len() as u64),
+                        written: 0,
+                    },
+                    "a purge of {named:?} deletes the untracked files alone: no directory on the \
+                     way to the mount, and no file the layer holds, which it would write back"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A purge of the root deletes the untracked files on the way to a mount two levels below an
+    /// untracked directory and inside it, and leaves the layer's file in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_of_the_root_deletes_only_the_untracked_files_around_a_mount() {
+        assert_a_purge_around_a_mount_below_an_untracked_directory("").await;
+    }
+
+    /// A purge of an untracked directory a layer is mounted two levels below deletes the untracked
+    /// files on the way to the mount and inside it, and leaves the layer's file in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_of_an_untracked_directory_above_a_mount_deletes_only_the_untracked_files() {
+        assert_a_purge_around_a_mount_below_an_untracked_directory("a").await;
+    }
+
+    /// A purge to the point the root was last merged from a branch walks no layer, so it leaves the
+    /// mount's content as it is and purges the rest of the working tree.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_purge_leaves_the_mount_and_purges_the_rest() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.materialize_mount();
+                let default_branch = fixture.branch_off().await;
+                test_file_write(fixture.working(UNTRACKED).as_path(), UNTRACKED_CONTENT);
+
+                let purged = fixture.reset_purging(&[""], Some(default_branch)).await;
+
+                assert_eq!(
+                    (
+                        fixture.working(UNTRACKED).exists(),
+                        fixture.working(SECOND).exists(),
+                        fixture.working_file(MOUNTED_KEPT).as_deref(),
+                        fixture.working_file(MOUNTED_DROPPED).as_deref(),
+                    ),
+                    (false, false, Some(KEPT_CONTENT), Some(DROPPED_CONTENT)),
+                    "the purge deletes the untracked file and the file the branch point lacks, and \
+                     leaves the mount's content"
+                );
+                assert_eq!(
+                    purged,
+                    Purged {
+                        deleted: Vec::new(),
+                        deletes: (0, 2),
+                        written: 0,
+                    },
+                    "the purge deletes those two files alone, and no directory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A purge to the point the root was last merged from a branch walks no layer, so it leaves a
+    /// file standing at the mount path as it is, as it leaves the mount's content.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_purge_leaves_a_file_at_the_mount_path() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let default_branch = fixture.branch_off().await;
+                test_file_write(fixture.working(MOUNT).as_path(), UNTRACKED_CONTENT);
+
+                let purged = fixture.reset_purging(&[""], Some(default_branch)).await;
+
+                assert_eq!(
+                    (
+                        fixture.working_file(MOUNT).as_deref(),
+                        fixture.working(SECOND).exists(),
+                    ),
+                    (Some(UNTRACKED_CONTENT), false),
+                    "the purge deletes the file the branch point lacks and leaves the file at \
+                     the mount path"
+                );
+                assert_eq!(
+                    purged,
+                    Purged {
+                        deleted: Vec::new(),
+                        deletes: (0, 1),
+                        written: 0,
+                    },
+                    "the purge deletes the one file the branch point lacks alone"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Resets the root, purging where `purge` says so, where a file stands at the mount path, and
+    /// asserts that the layer's walk deletes the file and writes the layer's files back.
+    async fn assert_a_reset_puts_the_layer_back_where_a_file_stands_at_the_mount_path(purge: bool) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                test_file_write(fixture.working(MOUNT).as_path(), UNTRACKED_CONTENT);
+
+                let reset = fixture.reset_reporting(&[""], None, purge).await;
+
+                assert_eq!(
+                    (
+                        fixture.working_file(MOUNTED_KEPT).as_deref(),
+                        fixture.working_file(MOUNTED_DROPPED).as_deref(),
+                    ),
+                    (Some(KEPT_CONTENT), Some(DROPPED_CONTENT)),
+                    "purge {purge}: the reset puts the layer's files back at the mount path"
+                );
+                assert_eq!(
+                    reset,
+                    Purged {
+                        deleted: vec![MOUNT.to_string()],
+                        deletes: (0, 1),
+                        written: 2,
+                    },
+                    "purge {purge}: the layer's walk deletes the file at the mount path and \
+                     writes the layer's two files"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A purge of the root walks the layer, which puts its content back where a file stands at the
+    /// mount path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_puts_the_layer_back_where_a_file_stands_at_the_mount_path() {
+        assert_a_reset_puts_the_layer_back_where_a_file_stands_at_the_mount_path(true).await;
+    }
+
+    /// A reset of the root without a purge walks the layer as well, which puts its content back
+    /// where a file stands at the mount path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_puts_the_layer_back_where_a_file_stands_at_the_mount_path() {
+        assert_a_reset_puts_the_layer_back_where_a_file_stands_at_the_mount_path(false).await;
+    }
+
+    /// Purges a layer's file and an untracked file in its mount, on a branch off the default one:
+    /// to the point they were last merged from the default branch where `last_merged` says so, and
+    /// to the revision the instance is on otherwise. Asserts that the layer's file is left in
+    /// place, and the untracked file deleted only where the purge walks the layer.
+    async fn assert_a_purge_of_paths_in_a_mount(last_merged: bool) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let untracked = format!("{MOUNT}/{UNTRACKED}");
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                fixture.materialize_mount();
+                let default_branch = fixture.branch_off().await;
+                test_file_write(fixture.working(&untracked).as_path(), UNTRACKED_CONTENT);
+
+                let purged = fixture
+                    .reset_purging(
+                        &[MOUNTED_KEPT, &untracked],
+                        last_merged.then_some(default_branch),
+                    )
+                    .await;
+
+                assert_eq!(
+                    (
+                        fixture.working_file(MOUNTED_KEPT).as_deref(),
+                        fixture.working(&untracked).exists(),
+                    ),
+                    (Some(KEPT_CONTENT), last_merged),
+                    "last merged {last_merged}: the purge keeps the layer's file, and the \
+                     untracked file only where it walks no layer"
+                );
+                let deleted = if last_merged {
+                    Vec::new()
+                } else {
+                    vec![untracked.clone()]
+                };
+                assert_eq!(
+                    purged,
+                    Purged {
+                        deletes: (0, deleted.len() as u64),
+                        deleted,
+                        written: 0,
+                    },
+                    "last merged {last_merged}: the purge deletes the untracked file alone, where \
+                     it deletes anything, and leaves the layer's file in place"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A purge to the point the paths were last merged from a branch walks no layer, so naming a
+    /// layer's file and an untracked file in its mount leaves both as they are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_last_merged_purge_of_paths_in_a_mount_leaves_them_as_they_are() {
+        assert_a_purge_of_paths_in_a_mount(true).await;
+    }
+
+    /// A purge naming a layer's file and an untracked file in its mount has the layer's own walk
+    /// delete the untracked file, and leaves the layer's file in place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_purge_of_paths_in_a_mount_deletes_only_the_untracked_one() {
+        assert_a_purge_of_paths_in_a_mount(false).await;
     }
 }
