@@ -17,7 +17,7 @@ LORE_BENCH_FILES=4000 uv run pytest scripts/test/test_view_change_bench.py \
     --lore-client-binary=./target/release/lore
 ```
 
-Peak resident size comes from `/usr/bin/time -v`, so each command is run through
+Peak resident size comes from `/usr/bin/time` (`-v`, or `-l` on macOS), so each command is run through
 it rather than through `Lore.run`; without it the run still reports timings.
 Allocation counts need the glibc interposer preloaded and the system allocator
 selected, as that file describes:
@@ -35,6 +35,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import sys
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -125,7 +126,9 @@ def timed_lore(
             "LORE_ALLOC_COUNT_FILE": count_file,
         }
     timer = shutil.which("time") if os.path.exists("/usr/bin/time") else None
-    wrapped = ["/usr/bin/time", "-v"] + command if timer else command
+    # macOS's time reports resources with -l, and the peak in bytes; GNU time with -v, in KiB.
+    flag = "-l" if sys.platform == "darwin" else "-v"
+    wrapped = ["/usr/bin/time", flag] + command if timer else command
 
     started = time.monotonic()
     result = subprocess.run(
@@ -133,11 +136,15 @@ def timed_lore(
     )
     seconds = time.monotonic() - started
 
-    peak = re.search(r"Maximum resident set size \(kbytes\): (\d+)", result.stderr)
+    peak_rss_kib = None
+    if peak := re.search(r"Maximum resident set size \(kbytes\): (\d+)", result.stderr):
+        peak_rss_kib = int(peak.group(1))
+    elif peak := re.search(r"(\d+)\s+maximum resident set size", result.stderr):
+        peak_rss_kib = int(peak.group(1)) // 1024
     measured = Measured(
         label=label,
         seconds=seconds,
-        peak_rss_kib=int(peak.group(1)) if peak else None,
+        peak_rss_kib=peak_rss_kib,
     )
     progress = parse_jsonl(result.stdout, "revisionSyncProgress")
     if progress:
