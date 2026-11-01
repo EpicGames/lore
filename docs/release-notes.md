@@ -131,6 +131,11 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore revision info --delta` lists a directory a merge brings in as added, with or without a view
 - `lore clone`, `lore sync` and `lore stage --scan` skip a directory no re-inclusion can reach, such as `Game/Saved/Logs`
   under `Saved/`, `!*/Saved/Config/`
+- `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and
+  `lore push --fast-forward-merge` keep both changes where one side moves a file, or a directory holding it, and the
+  other edits the file, with or without the same move: the edit lands where the move put the file. Edits of a file on
+  both sides conflict, whether or not either side moved it, as do a delete of a file against a move of it and two
+  moves of a file to different names
 - `lore sync`, `lore branch merge` and `lore link update` delete a directory the revision deletes, and
   `lore link remove` a link, when an unchanged file in it is spelled in another case than in the revision. The first
   three also delete a directory the revision deletes when the revision moves a file out of it

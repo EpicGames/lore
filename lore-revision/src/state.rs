@@ -6010,6 +6010,72 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
     });
 }
 
+/// The side of `change`, an add or a delete of a walk, that holds the node, and the side the walk
+/// found nothing on.
+fn walked_sides(change: &NodeChange) -> (&NodeChangeState, &NodeChangeState) {
+    match change.action {
+        FileAction::Delete => (&change.from, &change.to),
+        _ => (&change.to, &change.from),
+    }
+}
+
+/// Whether `change`, an add or a delete of a walk, adds or deletes a file that has an identity, and
+/// the side the walk found nothing on is `state` itself rather than a linked repository's tree.
+pub fn changes_own_file(state: &Arc<State>, change: &NodeChange) -> bool {
+    let (side, absent) = walked_sides(change);
+    Arc::ptr_eq(&absent.mapping.state, state)
+        && side.flags.contains(NodeFlags::File)
+        && !side.address.context.is_zero()
+}
+
+/// The move of a node from where `from` stands to where `to` stands.
+fn moved(from: NodeChangeState, to: NodeChangeState) -> NodeChange {
+    NodeChange {
+        action: FileAction::Move,
+        flags: if from.differs_from(&to) {
+            change::Flags::Modify
+        } else {
+            change::Flags::None
+        },
+        from,
+        to,
+    }
+}
+
+/// The move `change`, an add or a delete [`changes_own_file`] answers for, is half of: where the
+/// tree the walk found nothing in holds the node with its ID, a file of the same identity, the move
+/// between the path it stands at there and the change's path. `None` where that tree holds no such
+/// file.
+pub async fn whole_move(change: &NodeChange) -> Result<Option<NodeChange>, StateError> {
+    let (side, absent) = walked_sides(change);
+    let (repository, state, id) = (
+        &absent.mapping.repository,
+        &absent.mapping.state,
+        side.mapping.node,
+    );
+    let Some(node) = state.try_node(repository.clone(), id).await else {
+        return Ok(None);
+    };
+    if !node.is_file()
+        || node.is_discarded()
+        || node.is_staged_delete()
+        || node.address.context != side.address.context
+    {
+        return Ok(None);
+    }
+    let Some(path) = state
+        .node_path_below(repository.clone(), id, ROOT_NODE)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let other = absent.from_child(id, &node, path);
+    Ok(Some(match change.action {
+        FileAction::Delete => moved(change.from.clone(), other),
+        _ => moved(other, change.to.clone()),
+    }))
+}
+
 /// Calculate the set of changes between two revision states and emit them
 /// into `changes`. Streams raw `Add` / `Delete` / `Keep` records as discovered
 /// — does **not** run the post-walk move-coalescing or path-sort fixup that

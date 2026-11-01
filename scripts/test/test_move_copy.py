@@ -3539,6 +3539,96 @@ class TestMoveMerge:
             f"File should exist at '{path_b}' after merge abort (main branch state)"
         )
 
+    @pytest.mark.smoke
+    @pytest.mark.parametrize(
+        "moved",
+        [("Dir/a.txt", "Dir/z.txt"), ("Dir", "Moved")],
+        ids=["file", "directory"],
+    )
+    @pytest.mark.parametrize(
+        "operation",
+        ["merge", "sync", "cherry-pick", "revert", "fast-forward-merge"],
+    )
+    def test_an_edit_against_a_move_keeps_both(self, new_lore_repo, operation, moved):
+        """Each operation that joins two lines of history keeps both changes where one
+        line moves a file, or the directory holding it, and the other edits the file:
+        the edit lands where the move put the file, with no conflict."""
+        source, destination = moved
+        base = ["Dir/a.txt", "Dir/b.txt", "Top.txt"]
+        repo: Lore = new_lore_repo()
+        repo.make_dirs("Dir")
+        for path in base:
+            with repo.open_file(path, "w") as f:
+                f.write(f"{path}\n")
+        repo.stage(scan=True, offline=True)
+        repo.commit("Base", offline=True)
+        repo.push()
+
+        def edit(instance: Lore, content: str):
+            with instance.open_file("Dir/a.txt", "w") as f:
+                f.write(content)
+            instance.file_stage("Dir/a.txt", offline=True)
+            instance.commit("Edit", offline=True)
+
+        def move(instance: Lore):
+            instance.move(source, destination)
+            instance.file_stage_move(source, destination, offline=True)
+            instance.commit("Move", offline=True)
+
+        joined = repo
+        content = "edited\n"
+        if operation == "merge":
+            repo.branch_create("feature", offline=True)
+            edit(repo, content)
+            repo.branch_switch("main", offline=True)
+            move(repo)
+            repo.branch_merge("feature", offline=True)
+        elif operation == "sync":
+            clone = repo.clone()
+            move(repo)
+            repo.push()
+            edit(clone, content)
+            clone.sync()
+            joined = clone
+        elif operation == "cherry-pick":
+            repo.branch_create("feature", offline=True)
+            edit(repo, content)
+            picked = repo.history(branch="feature", offline=True)[-1].signature
+            repo.branch_switch("main", offline=True)
+            move(repo)
+            repo.revision_cherry_pick(revision=picked, message="Pick", offline=True)
+        elif operation == "revert":
+            edit(repo, content)
+            reverted = repo.history(offline=True)[-1].signature
+            move(repo)
+            repo.revision_revert(revision=reverted, message="Revert", offline=True)
+            content = "Dir/a.txt\n"
+        else:
+            clone = repo.clone()
+            move(clone)
+            clone.push()
+            edit(repo, content)
+            repo.push(fast_forward_merge=True)
+            joined = repo.clone()
+
+        def moved_path(path: str) -> str:
+            if path == source or path.startswith(source + "/"):
+                return destination + path[len(source) :]
+            return path
+
+        files = set()
+        for root, directories, names in os.walk(joined.path):
+            directories[:] = [d for d in directories if d not in (".urc", ".lore")]
+            for name in names:
+                files.add(
+                    to_posix(os.path.relpath(os.path.join(root, name), joined.path))
+                )
+        assert files == {moved_path(path) for path in base}
+        with joined.open_file(moved_path("Dir/a.txt"), "r") as f:
+            assert f.read() == content
+        status = parse_status_json(joined.status(offline=True, json=True))
+        assert [entry for entry in status if entry.get("flagConflict")] == [], status
+
 
 class TestFileMerge:
     """

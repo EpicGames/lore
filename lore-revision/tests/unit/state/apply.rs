@@ -8,8 +8,10 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_revision::lore::RepositoryId;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::revision::DiffResult;
 use lore_revision::revision::diff3_collect;
 use lore_revision::state::State;
 use lore_revision::state::apply_tree_changes;
@@ -48,13 +50,21 @@ fn content(version: u64, mode: u16) -> Content {
 }
 
 /// An edit a revision makes on the base.
+#[derive(Clone, Copy, Debug)]
 enum Edit {
     /// Moves the node at the first path to the second.
     Move(&'static str, &'static str),
-    /// Gives the file at the path the content of the version.
+    /// Gives the file at the path the content of the version, keeping the file it is.
     Write(&'static str, u64),
     /// Gives the file at the path the mode, at version 1.
     Chmod(&'static str, u16),
+    /// Deletes the node at the path.
+    Delete(&'static str),
+    /// Adds a file at the path, in a directory that exists, holding the version.
+    Add(&'static str, u64),
+    /// Adds a directory `Bulk` of that many files, which takes a revision's changes past the count
+    /// at which the 3-way diff walks the other side unfiltered.
+    Bulk(u32),
 }
 
 /// The node at `path` in `state`.
@@ -66,8 +76,8 @@ async fn node_at(repository: &Arc<RepositoryContext>, state: &State, path: &str)
         .node
 }
 
-/// A revision holding `File.txt`, `Other.txt`, a file named with the Kelvin sign, `Dir/a.txt` and
-/// `Dir/b.txt`, each at version 1, and a link at `Mount`.
+/// A revision holding `File.txt`, `Other.txt`, a file named with the Kelvin sign, `Dir/a.txt`,
+/// `Dir/b.txt` and `Dir/Sub/c.txt`, each at version 1, and a link at `Mount`.
 async fn base(repository: &Arc<RepositoryContext>) -> Hash {
     let state = State::new();
     for name in ["File.txt", "Other.txt", KELVIN] {
@@ -91,6 +101,15 @@ async fn base(repository: &Arc<RepositoryContext>) -> Hash {
     for name in ["a.txt", "b.txt"] {
         add(&state, repository.clone(), parent, file_at(name, 1), name).await;
     }
+    let sub = add(&state, repository.clone(), parent, directory("Sub"), "Sub").await;
+    add(
+        &state,
+        repository.clone(),
+        sub,
+        file_at("c.txt", 1),
+        "c.txt",
+    )
+    .await;
     let link = Node {
         flags: NodeFlags::Link.bits(),
         mode: 0o755,
@@ -121,17 +140,62 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
                     .expect("moving the node");
                 continue;
             }
+            Edit::Delete(path) => {
+                let node = node_at(repository, &state, path).await;
+                state
+                    .node_delete(repository.clone(), node)
+                    .await
+                    .expect("deleting the node");
+                continue;
+            }
+            Edit::Add(path, version) => {
+                let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+                let parent = node_at(repository, &state, parent).await;
+                add(
+                    &state,
+                    repository.clone(),
+                    parent,
+                    file_at(name, version),
+                    name,
+                )
+                .await;
+                continue;
+            }
+            Edit::Bulk(count) => {
+                let bulk = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory("Bulk"),
+                    "Bulk",
+                )
+                .await;
+                for index in 0..count {
+                    let name = format!("f{index:05}.txt");
+                    add(&state, repository.clone(), bulk, file_at(&name, 7), &name).await;
+                }
+                continue;
+            }
             Edit::Write(path, version) => (path, 0o644, version),
             Edit::Chmod(path, mode) => (path, mode, 1),
         };
         let node = node_at(repository, &state, path).await;
+        let file = state
+            .node(repository.clone(), node)
+            .await
+            .expect("reading the file")
+            .address
+            .context;
         state
             .node_modify(
                 repository.clone(),
                 node,
                 mode,
                 version,
-                Address::zero_context_hash(Hash::from_u64(version)),
+                Address {
+                    hash: Hash::from_u64(version),
+                    context: file,
+                },
             )
             .await
             .expect("modifying the file");
@@ -188,31 +252,99 @@ async fn contents(repository: &Arc<RepositoryContext>, state: &State) -> BTreeMa
     contents
 }
 
-/// Applies the changes `incoming` makes on the base to the head making `head` on it, as a
-/// fast-forward merge does, stores the result, and answers the stored revision's contents.
-async fn merge(
-    repository: &Arc<RepositoryContext>,
-    incoming: &[Edit],
-    head: &[Edit],
-) -> BTreeMap<String, Content> {
-    let base = base(repository).await;
-    let incoming = edited(repository, base, incoming).await;
-    let head = edited(repository, base, head).await;
+/// The 3-way diff a fast-forward merge takes of the edits `source` makes on the base against the
+/// edits `target` makes on it.
+async fn diff(repository: &Arc<RepositoryContext>, source: &[Edit], target: &[Edit]) -> DiffResult {
+    diff_with(repository, source, target, false).await
+}
 
-    let diff = diff3_collect(repository.clone(), base, incoming, head, None, false)
+/// [`diff`], listing the changes the two sides make alike where `include_same` asks for them.
+async fn diff_with(
+    repository: &Arc<RepositoryContext>,
+    source: &[Edit],
+    target: &[Edit],
+    include_same: bool,
+) -> DiffResult {
+    let base = base(repository).await;
+    let source = edited(repository, base, source).await;
+    let target = edited(repository, base, target).await;
+    diff3_collect(repository.clone(), base, source, target, None, include_same)
         .await
-        .expect("diffing the revisions");
-    assert!(diff.conflicts.is_empty(), "{:?}", diff.conflicts);
-    let merged = revision_state(repository, head).await;
+        .expect("diffing the revisions")
+}
+
+/// Applies `diff`, which has no conflicts, to its target as a fast-forward merge does, and answers
+/// the stored result.
+async fn apply(repository: &Arc<RepositoryContext>, diff: &DiffResult) -> Hash {
+    let merged = revision_state(repository, diff.target).await;
     apply_tree_changes(repository.clone(), merged.clone(), &diff.changes)
         .await
         .expect("applying the changes");
-    let stored = merged
+    merged
         .serialize(repository.clone(), &in_memory::token())
         .await
-        .expect("storing the merged revision");
-    let stored = revision_state(repository, stored).await;
-    contents(repository, &stored).await
+        .expect("storing the merged revision")
+}
+
+/// Applies the edits `source` makes on the base to the revision `target` makes on it, as a
+/// fast-forward merge does, stores the result, and answers the stored revision's contents.
+async fn merge(
+    repository: &Arc<RepositoryContext>,
+    source: &[Edit],
+    target: &[Edit],
+) -> BTreeMap<String, Content> {
+    let diff = diff(repository, source, target).await;
+    assert!(
+        diff.conflicts.is_empty(),
+        "{source:?} against {target:?}: {:?}",
+        diff.conflicts
+    );
+    let stored = apply(repository, &diff).await;
+    contents(repository, &*revision_state(repository, stored).await).await
+}
+
+/// The files of `tree` and what they hold, without the directories above them.
+fn files(tree: &BTreeMap<String, Content>) -> BTreeMap<String, Content> {
+    let directories: std::collections::HashSet<&str> = tree
+        .keys()
+        .flat_map(|path| path.match_indices('/').map(|(end, _)| &path[..end]))
+        .collect();
+    tree.iter()
+        .filter(|(path, _)| !directories.contains(path.as_str()))
+        .map(|(path, content)| (path.clone(), *content))
+        .collect()
+}
+
+/// The files of the base with `edits` made on it.
+async fn files_after(
+    repository: &Arc<RepositoryContext>,
+    edits: &[Edit],
+) -> BTreeMap<String, Content> {
+    let base = base(repository).await;
+    let revision = edited(repository, base, edits).await;
+    files(&contents(repository, &*revision_state(repository, revision).await).await)
+}
+
+/// Each change of `diff` by its action, the path it stands at and the path its node stood at, and
+/// each conflict by the paths of its two changes, the source's first.
+fn outcome(diff: &DiffResult) -> (Vec<String>, Vec<(String, String)>) {
+    (
+        diff.changes
+            .iter()
+            .map(|change| {
+                format!(
+                    "{:?} {} <- {}",
+                    change.action,
+                    change.path(),
+                    change.from.mapping.path
+                )
+            })
+            .collect(),
+        diff.conflicts
+            .iter()
+            .map(|(source, target)| (source.path().to_string(), target.path().to_string()))
+            .collect(),
+    )
 }
 
 /// Runs `test` against a repository of its own.
@@ -369,6 +501,808 @@ async fn a_move_that_changes_case_and_parent_moves_the_node() {
         assert_eq!(merged.get("A.txt"), Some(&content(1, 0o644)));
         assert_eq!(merged.get("Dir/b.txt"), Some(&content(1, 0o644)));
         assert!(!merged.contains_key("Dir/a.txt"), "{merged:?}");
+    })
+    .await;
+}
+
+/// A move the tests below make on one side: the node it moves and where to, and a file at or
+/// below the node with the path the move gives it.
+struct Moved {
+    from: &'static str,
+    to: &'static str,
+    file: &'static str,
+    file_moved: &'static str,
+}
+
+/// A file and a directory, each moved to another name and to a name differing only in case.
+const MOVES: [Moved; 4] = [
+    Moved {
+        from: "Dir/a.txt",
+        to: "Dir/z.txt",
+        file: "Dir/a.txt",
+        file_moved: "Dir/z.txt",
+    },
+    Moved {
+        from: "Dir/a.txt",
+        to: "Dir/A.txt",
+        file: "Dir/a.txt",
+        file_moved: "Dir/A.txt",
+    },
+    Moved {
+        from: "Dir/Sub",
+        to: "Dir/Zub",
+        file: "Dir/Sub/c.txt",
+        file_moved: "Dir/Zub/c.txt",
+    },
+    Moved {
+        from: "Dir/Sub",
+        to: "Dir/sub",
+        file: "Dir/Sub/c.txt",
+        file_moved: "Dir/sub/c.txt",
+    },
+];
+
+/// The edits of the side making `moved`, and an edit of the moved file to `version` where one is
+/// given. A directory's address folds case, so the move comes with an edit of `Dir/b.txt` beside
+/// it for the revision diff to report a move that only changes case.
+fn moving(moved: &Moved, version: Option<u64>) -> Vec<Edit> {
+    let mut edits = vec![
+        Edit::Move(moved.from, moved.to),
+        Edit::Write("Dir/b.txt", 9),
+    ];
+    edits.extend(version.map(|version| Edit::Write(moved.file_moved, version)));
+    edits
+}
+
+/// An edit on one side and a move on the other take both: the file stands where the move put it,
+/// with the content the edit gave it.
+#[tokio::test]
+async fn an_edit_against_a_move_takes_both() {
+    run(|repository| async move {
+        for moved in &MOVES {
+            for (source, target, version) in [
+                (moving(moved, None), vec![Edit::Write(moved.file, 3)], 3),
+                (vec![Edit::Write(moved.file, 2)], moving(moved, None), 2),
+            ] {
+                let merged = merge(&repository, &source, &target).await;
+                let context = format!("{source:?} against {target:?}: {merged:?}");
+                assert_eq!(
+                    merged.get(moved.file_moved),
+                    Some(&content(version, 0o644)),
+                    "{context}"
+                );
+                assert_eq!(
+                    merged.get("Dir/b.txt"),
+                    Some(&content(9, 0o644)),
+                    "{context}"
+                );
+                assert!(!merged.contains_key(moved.from), "{context}");
+            }
+        }
+    })
+    .await;
+}
+
+/// Edits of one file on both sides conflict, whether or not one side also moved it.
+#[tokio::test]
+async fn edits_on_both_sides_conflict_whether_or_not_one_side_moved() {
+    run(|repository| async move {
+        for moved in &MOVES {
+            for (source, target) in [
+                (moving(moved, Some(2)), vec![Edit::Write(moved.file, 3)]),
+                (vec![Edit::Write(moved.file, 2)], moving(moved, Some(3))),
+            ] {
+                let (from, to) = if matches!(source[0], Edit::Move(..)) {
+                    (moved.file_moved, moved.file)
+                } else {
+                    (moved.file, moved.file_moved)
+                };
+                let diff = diff(&repository, &source, &target).await;
+                assert_eq!(
+                    outcome(&diff).1,
+                    vec![(from.to_string(), to.to_string())],
+                    "{source:?} against {target:?}: {:?}",
+                    outcome(&diff)
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// A change of a moved file's mode on one side and an edit of it on the other conflict, the same
+/// move on both sides included, as two edits of the file do.
+#[tokio::test]
+async fn a_mode_change_against_an_edit_of_a_moved_file_conflicts() {
+    run(|repository| async move {
+        for moved in &MOVES[..2] {
+            let (file, moved_file) = (moved.file, moved.file_moved);
+            let movement = Edit::Move(file, moved_file);
+            for (source, target, conflict) in [
+                (
+                    vec![movement, Edit::Chmod(moved_file, 0o755)],
+                    vec![movement, Edit::Write(moved_file, 3)],
+                    (moved_file, moved_file),
+                ),
+                (
+                    vec![movement, Edit::Write(moved_file, 2)],
+                    vec![movement, Edit::Chmod(moved_file, 0o755)],
+                    (moved_file, moved_file),
+                ),
+                (
+                    vec![movement, Edit::Chmod(moved_file, 0o755)],
+                    vec![Edit::Write(file, 3)],
+                    (moved_file, file),
+                ),
+                (
+                    vec![Edit::Write(file, 2)],
+                    vec![movement, Edit::Chmod(moved_file, 0o755)],
+                    (file, moved_file),
+                ),
+            ] {
+                let diff = diff(&repository, &source, &target).await;
+                assert_eq!(
+                    outcome(&diff),
+                    (
+                        vec![],
+                        vec![(conflict.0.to_string(), conflict.1.to_string())]
+                    ),
+                    "{source:?} against {target:?}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// Two moves of one file to different names conflict, names that differ only in case included,
+/// and the same move on both sides merges.
+#[tokio::test]
+async fn moves_of_one_file_to_different_names_conflict() {
+    run(|repository| async move {
+        for (source, target) in [
+            ("B.txt", "A.txt"),
+            ("file.txt", "FILE.txt"),
+            ("B.txt", "file.txt"),
+            ("file.txt", "B.txt"),
+        ] {
+            let diff = diff(
+                &repository,
+                &[Edit::Move("File.txt", source)],
+                &[Edit::Move("File.txt", target)],
+            )
+            .await;
+            assert_eq!(
+                outcome(&diff),
+                (vec![], vec![(source.to_string(), target.to_string())]),
+                "{source} against {target}"
+            );
+        }
+        for name in ["B.txt", "file.txt"] {
+            let merged = merge(
+                &repository,
+                &[Edit::Move("File.txt", name)],
+                &[Edit::Move("File.txt", name)],
+            )
+            .await;
+            assert_eq!(merged.get(name), Some(&content(1, 0o644)), "{merged:?}");
+            assert!(!merged.contains_key("File.txt"), "{merged:?}");
+        }
+    })
+    .await;
+}
+
+/// A file deleted on one side conflicts with the other side's move of it, whichever side deletes,
+/// the delete standing where the move put the file.
+#[tokio::test]
+async fn a_delete_against_a_move_conflicts() {
+    run(|repository| async move {
+        let delete = [Edit::Delete("Dir/a.txt")];
+        let moving = [Edit::Move("Dir/a.txt", "Dir/z.txt")];
+        for (source, target, conflict) in [
+            (&delete[..], &moving[..], ("Dir/z.txt", "Dir/z.txt")),
+            (&moving[..], &delete[..], ("Dir/z.txt", "Dir/a.txt")),
+        ] {
+            let diff = diff(&repository, source, target).await;
+            assert_eq!(
+                outcome(&diff),
+                (
+                    vec![],
+                    vec![(conflict.0.to_string(), conflict.1.to_string())]
+                ),
+                "{source:?} against {target:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// A file one side replaces with another, by moving that one onto its path, conflicts with the
+/// other side's move of it, whichever side replaces it.
+#[tokio::test]
+async fn a_replacement_against_a_move_conflicts() {
+    run(|repository| async move {
+        let replace = [
+            Edit::Write("File.txt", 5),
+            Edit::Delete("Other.txt"),
+            Edit::Move("File.txt", "Other.txt"),
+        ];
+        let moving = [Edit::Move("Other.txt", "Moved.txt")];
+        for (source, target, changes, conflict) in [
+            (
+                &replace[..],
+                &moving[..],
+                vec!["Delete File.txt <- File.txt".to_string()],
+                ("Other.txt", "Moved.txt"),
+            ),
+            (
+                &moving[..],
+                &replace[..],
+                vec![],
+                ("Moved.txt", "Other.txt"),
+            ),
+        ] {
+            let diff = diff(&repository, source, target).await;
+            assert_eq!(
+                outcome(&diff),
+                (
+                    changes,
+                    vec![(conflict.0.to_string(), conflict.1.to_string())]
+                ),
+                "{source:?} against {target:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// Where the source changes so much that the 3-way diff walks the target unfiltered, the target's
+/// walk lists the destination of its own move as well, and an edit against the move is still one
+/// change, the moved file with the edit.
+#[tokio::test]
+async fn an_edit_against_a_move_is_one_change_without_the_target_filter() {
+    run(|repository| async move {
+        for (source, target, change, version) in [
+            (
+                vec![Edit::Bulk(10_000), Edit::Write("Dir/a.txt", 2)],
+                vec![Edit::Move("Dir/a.txt", "Dir/z.txt")],
+                "Keep Dir/z.txt <- Dir/z.txt",
+                2,
+            ),
+            (
+                vec![Edit::Bulk(10_000), Edit::Move("Dir/a.txt", "Dir/z.txt")],
+                vec![Edit::Write("Dir/a.txt", 3)],
+                "Move Dir/z.txt <- Dir/a.txt",
+                3,
+            ),
+        ] {
+            let diff = diff(&repository, &source, &target).await;
+            let (changes, conflicts) = outcome(&diff);
+            let changes: Vec<String> = changes
+                .into_iter()
+                .filter(|change| !change.contains("Bulk"))
+                .collect();
+            assert_eq!(
+                (changes, conflicts),
+                (vec![change.to_string()], vec![]),
+                "{source:?} against {target:?}"
+            );
+            let merged = files(
+                &contents(
+                    &repository,
+                    &*revision_state(&repository, apply(&repository, &diff).await).await,
+                )
+                .await,
+            );
+            assert_eq!(
+                merged,
+                files_after(
+                    &repository,
+                    &[
+                        Edit::Bulk(10_000),
+                        Edit::Write("Dir/a.txt", version),
+                        Edit::Move("Dir/a.txt", "Dir/z.txt"),
+                    ]
+                )
+                .await
+            );
+        }
+    })
+    .await;
+}
+
+/// Files added at one path below a directory one side renames only in case conflict, the other
+/// side's add standing at the directory's old spelling.
+#[tokio::test]
+async fn adds_at_one_path_below_a_directory_renamed_only_in_case_conflict() {
+    run(|repository| async move {
+        let renaming = [
+            Edit::Move("Dir/Sub", "Dir/sub"),
+            Edit::Add("Dir/sub/new.txt", 5),
+        ];
+        let adding = [Edit::Add("Dir/Sub/new.txt", 6)];
+        for (source, target, changes) in [
+            (
+                &renaming[..],
+                &adding[..],
+                vec!["Move Dir/sub <- Dir/Sub".to_string()],
+            ),
+            (&adding[..], &renaming[..], vec![]),
+        ] {
+            let diff = diff(&repository, source, target).await;
+            assert_eq!(
+                outcome(&diff),
+                (
+                    changes,
+                    vec![("Dir/sub/new.txt".to_string(), "Dir/sub/new.txt".to_string())]
+                ),
+                "{source:?} against {target:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// The moves both sides make alike: a file to another name and only in case, and a directory to
+/// another name with the file below it.
+const SAME_MOVES: [(&str, &str, &str); 3] = [
+    ("Dir/a.txt", "Dir/z.txt", "Dir/z.txt"),
+    ("Dir/a.txt", "Dir/A.txt", "Dir/A.txt"),
+    ("Dir/Sub", "Dir/Zub", "Dir/Zub/c.txt"),
+];
+
+/// The same move on both sides with an edit of the moved file on one side takes the move and the
+/// edit, whichever side edits.
+#[tokio::test]
+async fn the_same_move_on_both_sides_takes_an_edit_from_either() {
+    run(|repository| async move {
+        for (from, to, file) in SAME_MOVES {
+            for (source, target, version) in [
+                (
+                    vec![Edit::Move(from, to), Edit::Write(file, 2)],
+                    vec![Edit::Move(from, to)],
+                    2,
+                ),
+                (
+                    vec![Edit::Move(from, to)],
+                    vec![Edit::Move(from, to), Edit::Write(file, 3)],
+                    3,
+                ),
+            ] {
+                let merged = merge(&repository, &source, &target).await;
+                assert_eq!(
+                    files(&merged),
+                    files_after(
+                        &repository,
+                        &[Edit::Move(from, to), Edit::Write(file, version)]
+                    )
+                    .await,
+                    "{source:?} against {target:?}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// Edits on both sides of the same move conflict, once, where the moved file stands.
+#[tokio::test]
+async fn edits_on_both_sides_of_the_same_move_conflict() {
+    run(|repository| async move {
+        for (from, to, file) in SAME_MOVES {
+            let diff = diff(
+                &repository,
+                &[Edit::Move(from, to), Edit::Write(file, 2)],
+                &[Edit::Move(from, to), Edit::Write(file, 3)],
+            )
+            .await;
+            assert_eq!(
+                outcome(&diff).1,
+                vec![(file.to_string(), file.to_string())],
+                "{from} to {to}: {:?}",
+                outcome(&diff)
+            );
+        }
+    })
+    .await;
+}
+
+/// The same case-only rename of a directory on both sides, with an edit below it on one side, is
+/// the edit alone: neither side changes the directory itself.
+#[tokio::test]
+async fn the_same_case_only_rename_of_a_directory_on_both_sides_is_the_edit_below_it() {
+    run(|repository| async move {
+        let diff = diff(
+            &repository,
+            &[
+                Edit::Move("Dir/Sub", "Dir/sub"),
+                Edit::Write("Dir/sub/c.txt", 2),
+            ],
+            &[
+                Edit::Move("Dir/Sub", "Dir/sub"),
+                Edit::Write("Dir/b.txt", 9),
+            ],
+        )
+        .await;
+        assert_eq!(
+            outcome(&diff),
+            (
+                vec!["Keep Dir/sub/c.txt <- Dir/Sub/c.txt".to_string()],
+                vec![]
+            )
+        );
+    })
+    .await;
+}
+
+/// A source change that a move puts at a path where the target's change leaves the file alike
+/// stands only where the diff lists the changes the two sides make alike, as at a path neither
+/// side moved.
+#[tokio::test]
+async fn a_change_alike_where_a_move_puts_it_stands_only_with_the_alike_changes() {
+    run(|repository| async move {
+        let edited_alike = (
+            vec![Edit::Write("Dir/a.txt", 4)],
+            vec![
+                Edit::Move("Dir/a.txt", "Dir/z.txt"),
+                Edit::Write("Dir/z.txt", 4),
+            ],
+            vec![],
+            "Keep Dir/z.txt <- Dir/z.txt",
+        );
+        let added_alike = (
+            vec![
+                Edit::Move("Dir/Sub", "Dir/sub"),
+                Edit::Add("Dir/sub/new.txt", 5),
+            ],
+            vec![Edit::Add("Dir/Sub/new.txt", 5)],
+            vec!["Move Dir/sub <- Dir/Sub"],
+            "Add Dir/sub/new.txt <- Dir/sub/new.txt",
+        );
+        let moved_alike = (
+            vec![
+                Edit::Move("Dir/a.txt", "Dir/z.txt"),
+                Edit::Write("Dir/z.txt", 4),
+            ],
+            vec![
+                Edit::Move("Dir/a.txt", "Dir/z.txt"),
+                Edit::Write("Dir/z.txt", 4),
+            ],
+            vec![],
+            "Keep Dir/z.txt <- Dir/z.txt",
+        );
+        for (source, target, changes, alike) in [edited_alike, added_alike, moved_alike] {
+            for include_same in [false, true] {
+                let mut changes: Vec<String> =
+                    changes.iter().map(|change| change.to_string()).collect();
+                if include_same {
+                    changes.push(alike.to_string());
+                }
+                let diff = diff_with(&repository, &source, &target, include_same).await;
+                assert_eq!(
+                    outcome(&diff),
+                    (changes, vec![]),
+                    "{source:?} against {target:?}, include_same {include_same}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// The target revision with the move of `Dir/a.txt` to `Dir/z.txt` a fast-forward merge applied
+/// onto an edit of `Other.txt`, which gives the moved file another node.
+async fn fast_forward_moved(repository: &Arc<RepositoryContext>, base: Hash) -> Hash {
+    let moved = edited(repository, base, &[Edit::Move("Dir/a.txt", "Dir/z.txt")]).await;
+    let other = edited(repository, base, &[Edit::Write("Other.txt", 2)]).await;
+    let fast_forward = diff3_collect(repository.clone(), base, moved, other, None, false)
+        .await
+        .expect("diffing the revisions");
+    let target = apply(repository, &fast_forward).await;
+    assert_ne!(
+        node_at(
+            repository,
+            &*revision_state(repository, target).await,
+            "Dir/z.txt"
+        )
+        .await,
+        node_at(
+            repository,
+            &*revision_state(repository, base).await,
+            "Dir/a.txt"
+        )
+        .await,
+        "the fast-forward merge gives the moved file another node"
+    );
+    target
+}
+
+/// A move the target received through a fast-forward merge, which gives the moved file another
+/// node, is a delete and an add to the 3-way diff: an edit against it conflicts where the file
+/// stood, the same move with an edit conflicts where the move put the file, and the same move
+/// alone, or a delete, leaves the target's tree.
+#[tokio::test]
+async fn a_move_a_fast_forward_merge_applied_is_a_delete_and_an_add() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let target = fast_forward_moved(&repository, base).await;
+        let movement = Edit::Move("Dir/a.txt", "Dir/z.txt");
+        let deleted = "Delete Dir/a.txt <- Dir/a.txt";
+        for (source, changes, conflicts) in [
+            (
+                vec![Edit::Write("Dir/a.txt", 3)],
+                vec![],
+                vec![("Dir/a.txt", "Dir/a.txt")],
+            ),
+            (
+                vec![movement, Edit::Write("Dir/z.txt", 3)],
+                vec![deleted],
+                vec![("Dir/z.txt", "Dir/z.txt")],
+            ),
+            (vec![movement], vec![deleted], vec![]),
+            (vec![Edit::Delete("Dir/a.txt")], vec![], vec![]),
+        ] {
+            let revision = edited(&repository, base, &source).await;
+            let diff = diff3_collect(repository.clone(), base, revision, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert_eq!(
+                outcome(&diff),
+                (
+                    changes.iter().map(|change| change.to_string()).collect(),
+                    conflicts
+                        .iter()
+                        .map(|(source, target)| (source.to_string(), target.to_string()))
+                        .collect()
+                ),
+                "{source:?}"
+            );
+            if conflicts.is_empty() {
+                let merged = apply(&repository, &diff).await;
+                assert_eq!(
+                    files(
+                        &contents(&repository, &*revision_state(&repository, merged).await).await
+                    ),
+                    files_after(&repository, &[Edit::Write("Other.txt", 2), movement]).await,
+                    "{source:?}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// An edit of a file the target moves onto a path the source also changed conflicts where the file
+/// stood and where the move put it, as it does with no move: the edit cannot follow the move.
+#[tokio::test]
+async fn an_edit_against_a_move_onto_a_path_the_source_changed_conflicts_at_both() {
+    run(|repository| async move {
+        for (source, target, conflicts) in [
+            (
+                vec![Edit::Write("Dir/a.txt", 2), Edit::Add("Dir/z.txt", 5)],
+                vec![Edit::Move("Dir/a.txt", "Dir/z.txt")],
+                ["Dir/a.txt", "Dir/z.txt"],
+            ),
+            (
+                vec![Edit::Write("Dir/a.txt", 2), Edit::Write("Dir/b.txt", 3)],
+                vec![
+                    Edit::Write("Dir/a.txt", 4),
+                    Edit::Delete("Dir/b.txt"),
+                    Edit::Move("Dir/a.txt", "Dir/b.txt"),
+                ],
+                ["Dir/a.txt", "Dir/b.txt"],
+            ),
+        ] {
+            let (changes, mut paired) = outcome(&diff(&repository, &source, &target).await);
+            paired.sort();
+            assert_eq!(
+                (changes, paired),
+                (
+                    vec![],
+                    conflicts
+                        .iter()
+                        .map(|path| (path.to_string(), path.to_string()))
+                        .collect()
+                ),
+                "{source:?} against {target:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// The source's move of a file away conflicts with the target's move of it onto a path the source
+/// changed, as two moves of one file to different paths do.
+#[tokio::test]
+async fn a_move_away_against_a_move_onto_a_path_the_source_changed_conflicts() {
+    run(|repository| async move {
+        let diff = diff(
+            &repository,
+            &[
+                Edit::Move("Dir/a.txt", "Dir/y.txt"),
+                Edit::Write("Dir/b.txt", 3),
+            ],
+            &[
+                Edit::Write("Dir/a.txt", 4),
+                Edit::Delete("Dir/b.txt"),
+                Edit::Move("Dir/a.txt", "Dir/b.txt"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            outcome(&diff),
+            (
+                vec![],
+                vec![
+                    ("Dir/b.txt".to_string(), "Dir/b.txt".to_string()),
+                    ("Dir/y.txt".to_string(), "Dir/b.txt".to_string()),
+                ]
+            )
+        );
+    })
+    .await;
+}
+
+/// A directory deleted on one side conflicts with the other side's rename of it that only changes
+/// case, whichever side deletes. The source's delete of the files below the directory waits for
+/// the conflict.
+#[tokio::test]
+async fn a_directory_delete_against_a_case_only_rename_conflicts_on_the_directory() {
+    run(|repository| async move {
+        let deleting = [Edit::Delete("Dir/Sub")];
+        let renaming = [
+            Edit::Move("Dir/Sub", "Dir/sub"),
+            Edit::Write("Dir/b.txt", 9),
+        ];
+        for (source, target, changes, conflict) in [
+            (&deleting[..], &renaming[..], vec![], ("Dir/sub", "Dir/sub")),
+            (
+                &renaming[..],
+                &deleting[..],
+                vec![
+                    "Keep Dir/b.txt <- Dir/b.txt",
+                    "Delete Dir/Sub/c.txt <- Dir/Sub/c.txt",
+                ],
+                ("Dir/sub", "Dir/Sub"),
+            ),
+        ] {
+            let diff = diff(&repository, source, target).await;
+            assert_eq!(
+                outcome(&diff),
+                (
+                    changes.iter().map(|change| change.to_string()).collect(),
+                    vec![(conflict.0.to_string(), conflict.1.to_string())]
+                ),
+                "{source:?} against {target:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// Edits against several moves on the other side each follow their move, however the paths the
+/// moves put the files at sort among the source's changes.
+#[tokio::test]
+async fn edits_against_several_moves_each_follow_their_move() {
+    run(|repository| async move {
+        let edits = [
+            Edit::Write("Dir/Sub/c.txt", 2),
+            Edit::Write("Dir/a.txt", 2),
+            Edit::Write("Dir/b.txt", 2),
+            Edit::Write("File.txt", 2),
+            Edit::Write("Other.txt", 2),
+        ];
+        let moves = [
+            Edit::Move("File.txt", "Zz.txt"),
+            Edit::Move("Other.txt", "Yy.txt"),
+        ];
+        let merged = merge(&repository, &edits, &moves).await;
+        assert_eq!(
+            files(&merged),
+            files_after(&repository, &[&edits[..], &moves[..]].concat()).await
+        );
+    })
+    .await;
+}
+
+/// A link to the root of the revision `pin` of the repository the link at `Mount` points into.
+fn link_to(pin: Hash) -> Node {
+    Node {
+        flags: NodeFlags::Link.bits(),
+        mode: 0o755,
+        name_hash: hash_string("Mount"),
+        child: ROOT_NODE,
+        address: Address {
+            hash: pin,
+            context: Context::from(MOUNT_REPOSITORY),
+        },
+        ..Default::default()
+    }
+}
+
+/// A revision of the repository the link at `Mount` points into, holding `l.txt` and `name`.
+async fn linked_revision(linked: &Arc<RepositoryContext>, name: &str) -> Hash {
+    let state = State::new();
+    for name in ["l.txt", name] {
+        add(&state, linked.clone(), ROOT_NODE, file_at(name, 1), name).await;
+    }
+    commit(linked, &state, Hash::default(), branch_id()).await
+}
+
+/// The revision renaming the link of `base` at `Mount` to `mount` and pinning it to `pin`.
+async fn renamed_and_pinned(repository: &Arc<RepositoryContext>, base: Hash, pin: Hash) -> Hash {
+    let state = revision_state(repository, base).await;
+    let link = node_at(repository, &state, "Mount").await;
+    state
+        .move_node(repository.clone(), link, ROOT_NODE, "mount")
+        .await
+        .expect("renaming the link");
+    let block_index = NodeBlock::index(link);
+    let block = state
+        .block(repository.clone(), block_index)
+        .await
+        .expect("reading the link");
+    let dirtied = {
+        let mut writer = block.write();
+        writer.node(Node::index(link)).address.hash = pin;
+        writer.mark_dirty()
+    };
+    if dirtied {
+        state.block_modified(block, block_index);
+        state.mark_dirty();
+    }
+    state
+        .node_mark_staged(
+            repository.clone(),
+            link,
+            NodeFlags::StagedModify,
+            NodeFlags::DirtyModify,
+        )
+        .await
+        .expect("staging the pin");
+    commit(repository, &state, base, branch_id()).await
+}
+
+/// The same rename of a link that only changes case on both sides conflicts where the two pin it to
+/// different revisions, as two edits of one file do, and is no change of either side where they pin
+/// it alike.
+#[tokio::test]
+async fn the_same_case_only_rename_of_a_link_conflicts_where_the_pins_differ() {
+    run(|repository| async move {
+        let linked = repository
+            .to_link_context(RepositoryId::from(MOUNT_REPOSITORY))
+            .await;
+        let base_pin = linked_revision(&linked, "base.txt").await;
+        let (source_pin, target_pin) = (
+            linked_revision(&linked, "x.txt").await,
+            linked_revision(&linked, "y.txt").await,
+        );
+        let state = State::new();
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            link_to(base_pin),
+            "Mount",
+        )
+        .await;
+        let base = commit(&repository, &state, Hash::default(), branch_id()).await;
+        let source = renamed_and_pinned(&repository, base, source_pin).await;
+        for (target_pin, conflicts) in [
+            (target_pin, vec![("mount".to_string(), "mount".to_string())]),
+            (source_pin, vec![]),
+        ] {
+            let target = renamed_and_pinned(&repository, base, target_pin).await;
+            let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert_eq!(outcome(&diff).1, conflicts, "{:?}", outcome(&diff));
+            assert!(
+                diff.changes.iter().all(|change| !change.to.is_link()),
+                "{:?}",
+                outcome(&diff)
+            );
+        }
     })
     .await;
 }

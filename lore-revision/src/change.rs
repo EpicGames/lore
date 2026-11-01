@@ -260,6 +260,17 @@ impl NodeChange {
             .then_some(&self.from.mapping.path)
     }
 
+    /// The path the node stood at where the change leaves it at another: a move's source, or the
+    /// path a node stood at below a directory a move renamed. `None` for a node that stays where it
+    /// stood, and for one the change adds.
+    pub fn relocated_from(&self) -> Option<&RelativePath> {
+        let from = &self.from.mapping.path;
+        (self.from.mapping.node.is_valid_node_id()
+            && !from.is_empty()
+            && from.as_str() != self.path().as_str())
+        .then_some(from)
+    }
+
     /// Whether the change is a move whose source differs from its destination in case alone.
     pub fn is_case_only_move(&self) -> bool {
         self.move_source()
