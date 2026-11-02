@@ -2133,6 +2133,58 @@ mod deserialize_quic_internal {
     }
 }
 
+mod replicated_store_settings_initial_cwnd_bytes {
+    use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+    use lore_server::quic::initial_cwnd::InitialCwndBytes;
+
+    use super::*;
+
+    const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(initial_cwnd: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{initial_cwnd}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_initial_cwnd_is_the_peer_default() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes, DEFAULT_PEER_INITIAL_CWND_BYTES);
+    }
+
+    #[test]
+    fn configured_initial_cwnd_is_kept() {
+        let settings = parse("initial_cwnd_bytes = 65536").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes.get(), 65_536);
+    }
+
+    #[test]
+    fn initial_cwnd_below_minimum_is_rejected() {
+        let error = parse(&format!(
+            "initial_cwnd_bytes = {}",
+            InitialCwndBytes::MIN - 1
+        ))
+        .expect_err("below the minimum");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "initial_cwnd_bytes must be at least {}",
+                InitialCwndBytes::MIN
+            )),
+            "unexpected error: {error}"
+        );
+    }
+}
+
 mod quic_settings_initial_cwnd_bytes {
     use super::*;
 

@@ -20,7 +20,6 @@ use lore_revision::store::composite::replica_factory::ReplicaTargets;
 use lore_revision::util::time::RetryPolicy;
 use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client::CertificateSettings as QuicCertificateSettings;
-use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
 use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
@@ -31,12 +30,18 @@ use tonic::transport::ClientTlsConfig;
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
 use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
 use crate::quic::initial_cwnd::InitialCwndBytes;
+use crate::quic::initial_cwnd::default_peer_initial_cwnd_bytes;
 use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::store::grpc_replica::GrpcReplica;
 use crate::store::grpc_replica::ReplicationClient;
 use crate::store::replica::Replica;
 use crate::tls::CertificateSettings;
+
+/// The round-trip time, in milliseconds, used to size flow-control windows for connections to
+/// peers in other regions. This value covers the most distant region. The windows only limit how
+/// much data may be in flight, so connections to nearer regions can leave some capacity unused.
+const OTHER_REGION_EXPECTED_RTT_MS: u64 = 220;
 
 pub static METRICS_PEER_ID_LABEL: &str = "peer_id";
 pub static METRICS_PEER_LOCALITY_LABEL: &str = "peer_locality";
@@ -66,7 +71,7 @@ pub struct ReplicaFactorySettings {
     pub enable_same_region_write: bool,
     /// Initial congestion window, in bytes, for a new QUIC replica connection, and the floor for
     /// the window a periodically refreshed connection carries over.
-    #[serde(default = "default_initial_cwnd_bytes")]
+    #[serde(default = "default_peer_initial_cwnd_bytes")]
     pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
@@ -80,10 +85,6 @@ fn default_use_grpc_write_replication() -> bool {
 
 fn default_enable_same_region_write() -> bool {
     true
-}
-
-fn default_initial_cwnd_bytes() -> InitialCwndBytes {
-    DEFAULT_PEER_INITIAL_CWND_BYTES
 }
 
 #[derive(Debug)]
@@ -175,8 +176,7 @@ impl ReplicationStoreTargetFactory {
 
         let (rtt_ms, user_agent_component) = match peer_info.locality {
             Locality::SameRegion => (10, "replication-same-region"),
-            // todo(plockhart) configure expected_rtt_ms based off latency to replication target
-            Locality::OtherRegion => (DEFAULT_EXPECTED_RTT_MS, "replication-other-region"),
+            Locality::OtherRegion => (OTHER_REGION_EXPECTED_RTT_MS, "replication-other-region"),
         };
 
         let mut factory =

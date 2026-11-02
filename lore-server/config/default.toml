@@ -69,7 +69,11 @@ max_bidi_streams = 8
 # Used on Linux and Android only; other platforms bind one socket.
 num_sockets = 4
 transport_bits_per_second = 10_737_418_240  # 10 gbit/s
-transport_rtt = 100  # 100 ms
+# Sizes each connection's receive and send windows, which cap how much a client may have in
+# flight and how much of a response the server holds until it is acknowledged. The same value
+# applies to clients in this region and other regions, so it is sized for the most distant peers.
+# Each connection may buffer up to one window in each direction.
+transport_rtt = 220  # 220 ms
 # Window each connection starts sending responses with. Defaults to 1 MiB.
 # initial_cwnd_bytes = 1_048_576
 handler_timeout_seconds = 50

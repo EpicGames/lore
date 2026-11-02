@@ -6,6 +6,10 @@ use serde::Deserialize;
 /// between peers is known to carry far more than the conservative default window.
 pub const DEFAULT_PEER_INITIAL_CWND_BYTES: InitialCwndBytes = InitialCwndBytes(1024 * 1024);
 
+pub fn default_peer_initial_cwnd_bytes() -> InitialCwndBytes {
+    DEFAULT_PEER_INITIAL_CWND_BYTES
+}
+
 /// Bytes a QUIC sender may have in flight before its congestion controller has measured the
 /// path. Never less than two minimum-size QUIC datagrams: Cubic never lets its window fall below
 /// that once running, but adopts the initial window unchecked.

@@ -46,8 +46,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
   `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
-  1 MiB initial congestion window, set with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A
-  periodically refreshed connection starts at no less than this window
+  1 MiB initial congestion window. The same default applies to connections to the remote of a replicated store
+  configured under `[immutable_store.replicated]` or as a composite tier in `replicated` mode. Set the window with
+  `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A periodically refreshed connection starts
+  with a window at least this large
 - `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
   window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
   unless set. Values below 2400 bytes are rejected at startup
@@ -68,6 +70,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-server`: `[server.quic_internal]` sizes the flow-control windows of every connection it accepts for a 220 ms
+  round trip, up from 100 ms. Replication connections to `OtherRegion` peers use the same value. A peer in a distant
+  region can keep more than twice as much data in flight. Set the endpoint's value with `transport_rtt`
 - `RelativePath` keeps its view offsets in 32 bits, 24 bytes inline rather than 40. On a 5-million-change sync this
   lowers the memory held after the diff from 2.9 to 2.7 GiB and the peak resident size from 3.9 to 3.8 GB
 - `lore repository instance prune` keeps an instance whose instance file cannot be read on filesystems that report an

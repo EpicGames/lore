@@ -30,6 +30,7 @@ use crate::hooks::HookSettings;
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
 use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
 use crate::quic::initial_cwnd::InitialCwndBytes;
+use crate::quic::initial_cwnd::default_peer_initial_cwnd_bytes;
 use crate::store::replica_factory::ReplicaFactorySettings;
 use crate::tls::CertificateSettings;
 use crate::topology::TopologySettings;
@@ -861,6 +862,11 @@ pub struct ReplicatedStoreSettings {
     pub client_max_reconnects: Option<u32>,
     pub max_bandwidth_bytes_per_second: Option<u64>,
     pub expected_rtt_ms: Option<u64>,
+    /// Initial congestion window, in bytes, for a new connection to the remote's internal QUIC
+    /// endpoint. This is also the minimum window carried over when a connection is periodically
+    /// refreshed.
+    #[serde(default = "default_peer_initial_cwnd_bytes")]
+    pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
 #[derive(Copy, Clone, Default, Debug, Deserialize, PartialEq)]

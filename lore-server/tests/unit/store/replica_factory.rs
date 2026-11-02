@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
 use lore_server::quic::initial_cwnd::InitialCwndBytes;
 use lore_server::store::replica_factory::*;
 
@@ -11,10 +12,10 @@ mod replica_factory_settings {
     use super::*;
 
     #[test]
-    fn omitted_initial_cwnd_is_one_mebibyte() {
+    fn omitted_initial_cwnd_is_the_peer_default() {
         let settings = parse("").expect("valid settings");
 
-        assert_eq!(settings.initial_cwnd_bytes.get(), 1024 * 1024);
+        assert_eq!(settings.initial_cwnd_bytes, DEFAULT_PEER_INITIAL_CWND_BYTES);
     }
 
     #[test]
@@ -27,10 +28,18 @@ mod replica_factory_settings {
 
     #[test]
     fn initial_cwnd_below_minimum_is_rejected() {
-        parse(&format!(
+        let error = parse(&format!(
             "initial_cwnd_bytes = {}",
             InitialCwndBytes::MIN - 1
         ))
         .expect_err("below the minimum");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "initial_cwnd_bytes must be at least {}",
+                InitialCwndBytes::MIN
+            )),
+            "unexpected error: {error}"
+        );
     }
 }

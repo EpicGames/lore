@@ -1468,6 +1468,7 @@ async fn configure_replicated_immutable_store(
     if let Some(expected_rtt_ms) = settings.expected_rtt_ms {
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
+    factory.transport_config.initial_cwnd = Some(settings.initial_cwnd_bytes.get());
     factory.user_agent = Some(make_user_agent_with_component(
         user_agent_product(),
         "replicated-immutable-store",

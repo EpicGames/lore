@@ -87,6 +87,8 @@ mode = "replicated"
 remote_url = "lore://127.0.0.1:41340"
 periodic_client_refresh_secs = 300
 client_message_limit = 100
+# Window each connection starts sending with. Defaults to 1 MiB.
+# initial_cwnd_bytes = 1_048_576
 
 # Required because these retry settings have no defaults.
 [immutable_store.replicated.regenerate_retry]
