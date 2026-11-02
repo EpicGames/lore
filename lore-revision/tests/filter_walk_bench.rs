@@ -54,7 +54,7 @@ fn child_exclusion_state_throughput() {
         })
         .collect();
 
-    println!("compiled lines: {}", filter.lines.len());
+    println!("compiled lines: {}", filter.len());
 
     const ROUNDS: usize = 20_000;
     let mut sink = 0usize;

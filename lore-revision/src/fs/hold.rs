@@ -92,7 +92,7 @@ pub fn in_view<'a>(
     repository: &RepositoryContext,
     changes: &'a [NodeChange],
 ) -> Cow<'a, [NodeChange]> {
-    if repository.filter.view.lines.is_empty() {
+    if repository.filter.view.is_empty() {
         return Cow::Borrowed(changes);
     }
     let shows = |path: &RelativePath, side: &NodeChangeState| {

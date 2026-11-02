@@ -9,6 +9,7 @@ use bitflags::bitflags;
 use dashmap::DashMap;
 use lore_error_set::prelude::*;
 use serde::Serialize;
+use smallvec::SmallVec;
 
 use crate::bitflagsops;
 use crate::errors::InvalidArguments;
@@ -31,7 +32,8 @@ pub struct Filter {
     memo: AncestorMemo,
 }
 
-/// One filter's rules, with the indexes that answer subtree questions about them.
+/// One filter's rules, with the indexes that answer subtree questions about them
+/// and narrow the lines a step visits.
 ///
 /// The footprint is load-bearing. [`Filter`] holds two of these by value and a
 /// whole-path query reads across both, so a field costs several percent of that
@@ -44,8 +46,9 @@ pub struct FilterInstance {
     /// one line, except a path-form inclusion, which also contributes the
     /// subtree companion described on [`add_inclusion`](Self::add_inclusion).
     /// A path added by [`add_path_inclusion`](Self::add_path_inclusion)
-    /// contributes a line and its companion.
-    pub lines: Vec<FilterLine>,
+    /// contributes a line and its companion. Every line enters through
+    /// [`push_line`](Self::push_line), which keeps `prefixes` in step with it.
+    lines: Vec<FilterLine>,
     /// Answers whether any inclusion can land below a directory, which is what
     /// decides descent into an excluded one. Built as the lines are added.
     reinclude: RuleIndex,
@@ -53,6 +56,10 @@ pub struct FilterInstance {
     /// an included directory holds anything this filter could exclude. See
     /// [`covers_subtree`](Self::covers_subtree).
     exclude: RuleIndex,
+    /// The lines by their leading literal components once there are
+    /// [`INDEXED_LINES`] of them, which spares [`step`](Self::step) the lines
+    /// listed under components other than the path's.
+    prefixes: Option<Box<LinePrefixes>>,
 }
 
 /// One glob and the two facts about the authored rule that the glob text cannot
@@ -363,8 +370,8 @@ fn is_globstar(stars: &str) -> bool {
 }
 
 /// How a [`RuleIndex`] compares one component of a glob with one path
-/// component.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// component. A text edge sorts before a pattern edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum ComponentKind {
     /// The component holds no metacharacter, so it matches only its own text.
     Text,
@@ -618,9 +625,10 @@ struct RuleIndex {
 
 #[derive(Clone, Debug, Default)]
 struct RuleNode {
-    /// Component to child. Patterns come before text, so a walk can stop at the
-    /// first text that matches. Shallow and narrow in practice, so a `Vec` beats
-    /// a map: lookup is a handful of compares with no hashing.
+    /// Component to child: the text components sorted by their text, then the
+    /// patterns. A walk finds the one text that matches through
+    /// [`text`](Self::text), as adding a rule does, and tries every pattern. A
+    /// `Vec` rather than a map: a lookup is a few compares with no hashing.
     children: Vec<(Component, RuleNode)>,
     /// Rules sitting strictly below this node.
     below: RuleReach,
@@ -645,25 +653,61 @@ impl RuleNode {
     /// different names, so they lead to different children.
     fn child(&mut self, glob: &str, kind: ComponentKind, reach: RuleReach) -> &mut RuleNode {
         self.below.widen(reach);
-        let position = self
-            .children
-            .iter()
-            .position(|(edge, _)| edge.kind == kind && edge.glob == glob)
-            .unwrap_or_else(|| {
-                let position = match kind {
-                    ComponentKind::Text => self.children.len(),
-                    ComponentKind::Pattern => 0,
-                };
-                let edge = Component {
-                    glob: glob.to_owned(),
-                    kind,
-                };
-                self.children.insert(position, (edge, RuleNode::default()));
-                position
-            });
+        let found = match kind {
+            ComponentKind::Pattern => self
+                .patterns()
+                .position(|(edge, _)| edge.glob == glob)
+                .map(|from_last| self.children.len() - 1 - from_last)
+                .ok_or(self.children.len()),
+            ComponentKind::Text => self.text(glob).ok_or_else(|| {
+                self.children.partition_point(|(edge, _)| {
+                    (edge.kind, edge.glob.as_str()) < (ComponentKind::Text, glob)
+                })
+            }),
+        };
+        let position = found.unwrap_or_else(|position| {
+            let edge = Component {
+                glob: glob.to_owned(),
+                kind,
+            };
+            self.children.insert(position, (edge, RuleNode::default()));
+            position
+        });
         &mut self.children[position].1
     }
+
+    /// The pattern edges, which follow every text edge, from the last.
+    fn patterns(&self) -> impl Iterator<Item = &(Component, RuleNode)> {
+        self.children
+            .iter()
+            .rev()
+            .take_while(|(edge, _)| edge.kind == ComponentKind::Pattern)
+    }
+
+    /// The index of the text edge for `name`. A node of at most
+    /// [`SCANNED_CHILDREN`] edges is scanned and a wider one searched, which is
+    /// the cheaper of the two at either width.
+    fn text(&self, name: &str) -> Option<usize> {
+        if self.children.len() <= SCANNED_CHILDREN {
+            return self
+                .children
+                .iter()
+                .position(|(edge, _)| edge.kind == ComponentKind::Text && edge.glob == name);
+        }
+        self.children
+            .binary_search_by(|(edge, _)| {
+                (edge.kind, edge.glob.as_str()).cmp(&(ComponentKind::Text, name))
+            })
+            .ok()
+    }
 }
+
+/// Most edges [`RuleNode::text`] scans for a text component; a wider node is
+/// searched. An equality scan compares an edge's text only where its length
+/// matches, which on a narrow node costs less than a binary search's ordered
+/// comparisons.
+#[lore_macro::test_pub]
+const SCANNED_CHILDREN: usize = 16;
 
 /// Passes a `u64` key straight through.
 ///
@@ -872,29 +916,166 @@ impl RuleNode {
             }
             let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
             rest = tail;
-            let mut next = None;
-            for (edge, child) in &node.children {
-                match edge.kind {
-                    ComponentKind::Text if edge.glob == name => {
-                        next = Some(child);
-                        break;
-                    }
-                    ComponentKind::Text => {}
-                    ComponentKind::Pattern => {
-                        if (edge.glob == "*" || glob_match::glob_match(&edge.glob, name))
-                            && child.reaches(rest, floor, depth)
-                        {
-                            return true;
-                        }
-                    }
+            for (edge, child) in node.patterns() {
+                if (edge.glob == "*" || glob_match::glob_match(&edge.glob, name))
+                    && child.reaches(rest, floor, depth)
+                {
+                    return true;
                 }
             }
-            match next {
-                Some(child) => node = child,
+            match node.text(name) {
+                Some(index) => node = &node.children[index].1,
                 None => return false,
             }
         }
         node.below.reaches(floor, depth) || node.wildcard_tail.reaches(floor, depth)
+    }
+}
+
+/// Most leading components [`LinePrefixes`] lists a line under. A line with a
+/// longer literal prefix is listed under its first ones, which bounds the lists
+/// one step merges.
+const MAX_PREFIX_COMPONENTS: usize = 7;
+
+/// Fewest lines a filter indexes in [`LinePrefixes`]. A step over fewer scans
+/// every line.
+#[lore_macro::test_pub]
+const INDEXED_LINES: usize = 1000;
+
+/// The lines of one filter by their leading literal components.
+///
+/// A glob whose leading components are text, such as `engine/binaries` in
+/// `engine/binaries/*.pdb`, matches only paths that start with those
+/// components: the matcher compares text byte for byte, and a `/` outside a
+/// bracket expression matches one separator. Such a line is listed at the node
+/// those components lead to, so a step visits it only for a path that starts
+/// with them. A name rule, and a glob whose first component the index cannot
+/// compare as text, is listed at the root and visited for every path.
+///
+/// Lines are added in authored order, so every list ascends, and a step merges
+/// the lists along a path back into authored order. The nodes form an arena,
+/// with the root at index 0. The edges' text shares one buffer and a node keeps
+/// up to four lines inline, so a node holding no more than four lines and no
+/// children allocates nothing of its own.
+#[derive(Clone, Debug)]
+struct LinePrefixes {
+    nodes: Vec<PrefixNode>,
+    /// The text of every edge, each a range of it.
+    text: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrefixNode {
+    /// Edges to the children, sorted by their text.
+    children: Vec<PrefixEdge>,
+    /// Lines whose leading literal components, at most
+    /// [`MAX_PREFIX_COMPONENTS`] of them, lead to this node, ascending. The root
+    /// holds the lines with none, name rules among them.
+    lines: SmallVec<[u32; 4]>,
+}
+
+/// An edge from a [`PrefixNode`]: the range of [`LinePrefixes::text`] its
+/// component spans, and the child it leads to.
+#[derive(Clone, Copy, Debug)]
+struct PrefixEdge {
+    start: u32,
+    end: u32,
+    child: u32,
+}
+
+impl LinePrefixes {
+    /// An index holding the root alone.
+    fn new() -> Self {
+        Self {
+            nodes: vec![PrefixNode::default()],
+            text: Vec::new(),
+        }
+    }
+
+    /// Lists `line`, the line numbered `number`.
+    ///
+    /// The literal prefix ends at the first component holding `*`, `?`, `[`,
+    /// `]`, `\` or `{`, which [`component_kind`] reads as other than text.
+    fn insert(&mut self, line: &FilterLine, number: usize) {
+        let mut node = 0;
+        if !line.filename {
+            for component in line.glob.split('/').take(MAX_PREFIX_COMPONENTS) {
+                if component_kind(component, false) != Some(ComponentKind::Text) {
+                    break;
+                }
+                node = self.child(node, component.as_bytes());
+            }
+        }
+        self.nodes[node].lines.push(number as u32);
+    }
+
+    /// The edge out of `node` for `component`: `Ok` with its index, or `Err` with
+    /// the index it sorts at.
+    fn edge(&self, node: &PrefixNode, component: &[u8]) -> Result<usize, usize> {
+        node.children.binary_search_by(|edge| {
+            self.text[edge.start as usize..edge.end as usize].cmp(component)
+        })
+    }
+
+    /// The child of node `parent` for `component`, added if it is not there.
+    fn child(&mut self, parent: usize, component: &[u8]) -> usize {
+        match self.edge(&self.nodes[parent], component) {
+            Ok(index) => self.nodes[parent].children[index].child as usize,
+            Err(index) => {
+                let start = self.text.len() as u32;
+                self.text.extend_from_slice(component);
+                let child = self.nodes.len();
+                self.nodes.push(PrefixNode::default());
+                let edge = PrefixEdge {
+                    start,
+                    end: self.text.len() as u32,
+                    child: child as u32,
+                };
+                self.nodes[parent].children.insert(index, edge);
+                child
+            }
+        }
+    }
+
+    /// Calls `each` in ascending order with every line numbered `floor` or later
+    /// that is listed at the root or at a node `path`'s leading components lead
+    /// to, which includes every line that can match `path`.
+    fn visit(&self, path: &str, floor: usize, mut each: impl FnMut(usize)) {
+        let mut node = &self.nodes[0];
+        let mut lists: [&[u32]; MAX_PREFIX_COMPONENTS + 1] = [&[]; MAX_PREFIX_COMPONENTS + 1];
+        let mut count = 0;
+        let mut components = path.split('/');
+        loop {
+            let start = node.lines.partition_point(|&line| (line as usize) < floor);
+            if start < node.lines.len() {
+                lists[count] = &node.lines[start..];
+                count += 1;
+            }
+            let Some(component) = components.next() else {
+                break;
+            };
+            let Ok(index) = self.edge(node, component.as_bytes()) else {
+                break;
+            };
+            node = &self.nodes[node.children[index].child as usize];
+        }
+
+        let lists = &mut lists[..count];
+        loop {
+            let mut next: Option<(usize, u32)> = None;
+            for (index, list) in lists.iter().enumerate() {
+                if let Some(&line) = list.first()
+                    && next.is_none_or(|(_, lowest)| line < lowest)
+                {
+                    next = Some((index, line));
+                }
+            }
+            let Some((index, line)) = next else {
+                return;
+            };
+            lists[index] = &lists[index][1..];
+            each(line as usize);
+        }
     }
 }
 
@@ -1024,6 +1205,34 @@ impl FilterInstance {
         (fewest, if unbounded { u32::MAX } else { total })
     }
 
+    /// How many lines the filter holds: one per authored rule, and one more for
+    /// each subtree companion.
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether the filter holds no lines, so it excludes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Appends `line`, and lists it by its leading literal components once the
+    /// filter holds [`INDEXED_LINES`] lines, listing all of them on reaching it.
+    fn push_line(&mut self, line: FilterLine) {
+        self.lines.push(line);
+        let count = self.lines.len();
+        if count < INDEXED_LINES {
+            return;
+        }
+        let first = if count == INDEXED_LINES { 0 } else { count - 1 };
+        let prefixes = self
+            .prefixes
+            .get_or_insert_with(|| Box::new(LinePrefixes::new()));
+        for (number, line) in self.lines.iter().enumerate().skip(first) {
+            prefixes.insert(line, number);
+        }
+    }
+
     /// Appends an exclusion.
     ///
     /// One line, and no subtree companion: a walk does not descend past an
@@ -1048,7 +1257,7 @@ impl FilterInstance {
             self.exclude
                 .insert(&glob, expand, self.lines.len(), depth_max);
         }
-        self.lines.push(FilterLine {
+        self.push_line(FilterLine {
             glob,
             negated: false,
             directory: ending_separator,
@@ -1120,7 +1329,7 @@ impl FilterInstance {
             self.reinclude
                 .insert(&glob, expand, self.lines.len(), depth_max);
         }
-        self.lines.push(FilterLine {
+        self.push_line(FilterLine {
             min_depth,
             literal,
             glob,
@@ -1133,7 +1342,7 @@ impl FilterInstance {
             let (min_depth, depth_max) = Self::depth_range(&subtree, false, expand);
             self.reinclude
                 .insert(&subtree, expand, self.lines.len(), depth_max);
-            self.lines.push(FilterLine {
+            self.push_line(FilterLine {
                 min_depth,
                 literal: false,
                 glob: subtree,
@@ -1162,14 +1371,14 @@ impl FilterInstance {
         let glob = path.as_lowercase_str();
         let depth = component_count(glob);
         self.reinclude.insert_subtree(glob, self.lines.len() + 1);
-        self.lines.push(FilterLine {
+        self.push_line(FilterLine {
             glob: glob.to_owned(),
             negated: true,
             min_depth: depth,
             literal: true,
             ..FilterLine::default()
         });
-        self.lines.push(FilterLine {
+        self.push_line(FilterLine {
             glob: escaped_subtree(glob),
             negated: true,
             min_depth: depth + 1,
@@ -1181,8 +1390,11 @@ impl FilterInstance {
     /// for its parent.
     ///
     /// Lines are applied in order and a later match overrides an earlier one.
-    /// Two things narrow the scan:
+    /// These narrow the scan:
     ///
+    /// - In a filter of [`INDEXED_LINES`] lines or more, only the lines
+    ///   [`LinePrefixes`] lists for `match_path` are visited: a line whose
+    ///   leading literal components differ from the path's cannot match it.
     /// - An inclusion can only clear `excluded` and an exclusion can only set
     ///   it, so a line whose effect equals the current state could at most match
     ///   to no effect, and is skipped before the glob.
@@ -1216,18 +1428,18 @@ impl FilterInstance {
         );
         let pruned = parent.excluded;
         let mut state = parent;
-        for (offset, line) in self.lines[floor..].iter().enumerate() {
+        let mut apply = |number: usize, line: &FilterLine| {
             if line.negated != state.excluded {
-                continue;
+                return;
             }
             if line.directory && !is_directory {
-                continue;
+                return;
             }
             if pruned && line.negated && line.filename {
-                continue;
+                return;
             }
             if line.min_depth > depth {
-                continue;
+                return;
             }
             let to_match = if line.filename {
                 match_name
@@ -1242,9 +1454,19 @@ impl FilterInstance {
             if hit {
                 state = FilterState {
                     excluded: !line.negated,
-                    decided_at: (floor + offset) as u32,
+                    decided_at: number as u32,
                 };
             }
+        };
+        match &self.prefixes {
+            None => {
+                for (offset, line) in self.lines[floor..].iter().enumerate() {
+                    apply(floor + offset, line);
+                }
+            }
+            Some(prefixes) => prefixes.visit(match_path, floor, |number| {
+                apply(number, &self.lines[number]);
+            }),
         }
         state
     }

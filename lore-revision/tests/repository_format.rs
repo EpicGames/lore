@@ -78,7 +78,7 @@ mod tests {
         // The ignore filter should contain user-defined rules from .urcignore
         // plus auto-generated exclusions (.urc, .lore, conflict suffixes).
         // With one user rule ("secret.txt") and 6 auto-generated rules, we expect 7 lines.
-        assert_eq!(filter.ignore.lines.len(), 7);
+        assert_eq!(filter.ignore.len(), 7);
     }
 
     #[test]
@@ -95,7 +95,7 @@ mod tests {
 
         let filter = load_filter(&dir).expect("filter should load");
         // 2 user rules from .loreignore + 6 auto-generated = 8
-        assert_eq!(filter.ignore.lines.len(), 8);
+        assert_eq!(filter.ignore.len(), 8);
     }
 
     #[test]
@@ -113,6 +113,6 @@ mod tests {
 
         let filter = load_filter(&dir).expect("filter should load");
         // One user rule ("secret.txt") + 6 auto-generated rules = 7 lines.
-        assert_eq!(filter.ignore.lines.len(), 7);
+        assert_eq!(filter.ignore.len(), 7);
     }
 }

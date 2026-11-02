@@ -218,7 +218,7 @@ fn descend_large_tree() {
         "tree: {} nodes ({directories} directories, {} files), {} filter lines",
         nodes.len(),
         nodes.len() - directories,
-        build().ignore.lines.len()
+        build().ignore.len()
     );
 
     const ROUNDS: usize = 2;

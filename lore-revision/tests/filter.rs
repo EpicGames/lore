@@ -1137,8 +1137,8 @@ mod tests {
         for (name, bytes) in every_encoding(ENCODED_RULES) {
             let filter = load(name, &bytes);
             assert_eq!(
-                filter.lines.len(),
-                baseline.lines.len(),
+                filter.len(),
+                baseline.len(),
                 "{name} loaded a different number of rules"
             );
             for probe in ENCODED_PROBES {
@@ -1282,7 +1282,7 @@ mod tests {
         )
         .expect("parse");
 
-        assert_eq!(parsed.lines.len(), loaded.lines.len());
+        assert_eq!(parsed.len(), loaded.len());
         for probe in ENCODED_PROBES {
             for is_directory in [false, true] {
                 assert_eq!(
@@ -1296,7 +1296,6 @@ mod tests {
         assert!(
             lore_revision::filter::load_filter(dir.child("absent"))
                 .expect("an absent filter loads")
-                .lines
                 .is_empty(),
             "an absent filter is still an empty one"
         );
@@ -1720,8 +1719,8 @@ mod tests {
         second.add_exclusion("/*").expect("exclude");
         second.add_inclusion("/engine").expect("include");
         assert_eq!(
-            second.lines.len(),
-            first.view.lines.len(),
+            second.len(),
+            first.view.len(),
             "the two views have to be the same length to be the case this tests"
         );
 

@@ -48,6 +48,7 @@ use std::path::Path;
 use lore_revision::filter::FilterInstance;
 use lore_revision::filter::FilterState;
 use lore_revision::filter::FilterStates;
+use lore_revision::filter::INDEXED_LINES;
 use lore_revision::filter::parse_filter;
 use lore_revision::util::path::RelativePath;
 
@@ -70,6 +71,24 @@ fn path(value: &str) -> RelativePath {
 /// `!/**` -- see [`a_globstar_prefixed_path_inclusion_is_refused`].
 fn build(patterns: &[&str]) -> Option<FilterInstance> {
     parse_filter(patterns.join("\n").as_bytes(), Path::new(".gitignore")).ok()
+}
+
+/// How many ways [`indexed`] pads a filter.
+const LAYOUTS: usize = 3;
+
+/// A filter of `patterns` padded with copies of the exclusion `/padding`, which a
+/// step reads through the index once there are [`INDEXED_LINES`] lines. Layout 0
+/// puts all of them before `patterns`, which are listed one at a time; layout 1
+/// one fewer, so the first of `patterns` lists every line; and layout 2 all of
+/// them after, so the padding does.
+fn indexed(patterns: &[&str], layout: usize) -> FilterInstance {
+    let padding = ["/padding"; INDEXED_LINES];
+    let lines = match layout {
+        0 => [&padding[..], patterns].concat(),
+        1 => [&padding[1..], patterns].concat(),
+        _ => [patterns, &padding[..]].concat(),
+    };
+    build(&lines).unwrap_or_else(|| panic!("{patterns:?} is refused"))
 }
 
 /// Children of `dir` in `tree`, split into subdirectories and files.
@@ -926,6 +945,40 @@ const CLASSES: &[(&[&str], &[&str])] = &[
 /// fails the test.
 #[test]
 fn pruning_changes_no_answer() {
+    for (rules, filter, tree) in walks() {
+        assert_eq!(
+            walk_tree_entering(&filter, tree, true).0,
+            walk_tree_entering(&filter, tree, false).0,
+            "pruning changes the files included under {rules:?}"
+        );
+    }
+}
+
+/// Reading the lines through the index changes no answer: each set
+/// [`pruning_changes_no_answer`] walks includes the same files as alone in one
+/// of the layouts [`indexed`] pads it into, each set taking the next layout in
+/// turn.
+#[test]
+fn the_line_index_changes_no_answer() {
+    for (index, (rules, filter, tree)) in walks().enumerate() {
+        assert_eq!(
+            walk_tree(&indexed(rules, index % LAYOUTS), tree),
+            walk_tree(&filter, tree),
+            "the index changes the files included under {rules:?}"
+        );
+    }
+}
+
+/// The ground-truth cases the filter accepts, over [`FILES`], and the sets in
+/// [`SHALLOW`], [`UNBOUNDED`], [`LEADING`] and [`CLASSES`], over their trees.
+/// A set the filter refuses panics.
+fn walks() -> impl Iterator<
+    Item = (
+        &'static [&'static str],
+        FilterInstance,
+        &'static [&'static str],
+    ),
+> {
     let sets = SHALLOW
         .iter()
         .map(|(rules, _, _)| (*rules, DEEP))
@@ -936,17 +989,10 @@ fn pruning_changes_no_answer() {
             let filter = build(rules).unwrap_or_else(|| panic!("{rules:?} is refused"));
             (rules, filter, tree)
         });
-    let walks = CASES
+    CASES
         .iter()
         .filter_map(|case| Some((case.patterns, build(case.patterns)?, FILES)))
-        .chain(sets);
-    for (rules, filter, tree) in walks {
-        assert_eq!(
-            walk_tree_entering(&filter, tree, true).0,
-            walk_tree_entering(&filter, tree, false).0,
-            "pruning changes the files included under {rules:?}"
-        );
-    }
+        .chain(sets)
 }
 
 /// A re-inclusion that cannot match below a directory does not send a walk
@@ -1044,7 +1090,7 @@ const RANDOM_COMPONENTS: &[&str] = &[
 /// The exclusion each randomized filter opens with.
 const RANDOM_EXCLUSIONS: &[&str] = &["**", "*", "/*", "a*/", "*/", "\u{c4}*/", "[ab]*/", "*/*/"];
 
-/// Filters [`randomized_pruning_changes_no_answer`] builds and checks.
+/// Filters [`randomized_pruning_and_the_index_change_no_answer`] builds and checks.
 const RANDOM_FILTERS: usize = 200;
 
 /// A xorshift generator, so a seed reproduces the same filters everywhere.
@@ -1080,17 +1126,18 @@ impl Xorshift {
     }
 }
 
-/// Pruning changes no answer, and no subtree answer claims more than the walk
-/// finds, under randomized filters whose rules mix every component kind the
-/// index compares or stops at, over a tree whose names those components tell
-/// apart.
+/// Pruning and reading the lines through the index change no answer, and no
+/// subtree answer claims more than the walk finds, under randomized filters
+/// whose rules mix every component kind the indexes compare or stop at, over a
+/// tree whose names those components tell apart.
 ///
 /// Each filter opens with an exclusion, re-includes one to three rules, and
-/// half of them exclude and re-include once more. A directory
+/// half of them exclude and re-include once more. In every layout [`indexed`]
+/// pads it into, it includes the same files. A directory
 /// `excludes_subtree` drops holds nothing the walk includes, and one
 /// `covers_subtree` takes whole holds nothing it excludes.
 #[test]
-fn randomized_pruning_changes_no_answer() {
+fn randomized_pruning_and_the_index_change_no_answer() {
     use lore_revision::filter::Filter;
     use lore_revision::filter::FilterMode;
 
@@ -1127,6 +1174,13 @@ fn randomized_pruning_changes_no_answer() {
             wrong.push(format!(
                 "pruning changes the files included under {rules:?}"
             ));
+        }
+        for layout in 0..LAYOUTS {
+            if walk_tree(&indexed(&rules, layout), &tree) != included {
+                wrong.push(format!(
+                    "the index changes the files included under {rules:?}"
+                ));
+            }
         }
 
         let mut holds_included = BTreeSet::new();

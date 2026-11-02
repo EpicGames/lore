@@ -4,10 +4,10 @@
 //! Timing for the filter's query entry points, and what one costs to build and
 //! to hold.
 //!
-//! Written against `add_exclusion`, `add_inclusion` and the `excludes` family
-//! alone, whose signatures do not move, so the same file compiles on a revision
-//! either side of a change to the filter's internals and the numbers are
-//! comparable across it.
+//! Written against `add_exclusion`, `add_inclusion`, `len` and the `excludes`
+//! family alone, whose signatures do not move, so the same file compiles on a
+//! revision either side of a change to the filter's internals and the numbers
+//! are comparable across it.
 //!
 //! Run with:
 //!     `cargo test -p lore-revision --release --test filter_bench -- --ignored --nocapture --test-threads=1`
@@ -74,6 +74,24 @@ fn synthesized_rules(paths: usize) -> Vec<String> {
     out
 }
 
+/// One blanket exclusion, then `paths` re-inclusions of files in one directory,
+/// sorted or, with `shuffled`, scrambled, as an unsorted authored list gives.
+///
+/// The shape that makes one node of a component index as wide as a filter can,
+/// which is what adding a rule costs most at.
+fn wide_rules(paths: usize, shuffled: bool) -> Vec<String> {
+    let mut out = vec!["**".to_owned()];
+    out.extend((0..paths).map(|index| {
+        let file = if shuffled {
+            index * 7919 % paths
+        } else {
+            index
+        };
+        format!("!/Engine/Source/File{file:05}.cpp")
+    }));
+    out
+}
+
 /// Bytes the process holds resident, for a footprint measured as a delta.
 ///
 /// Page-granular and process-wide, so it resolves a batch rather than one
@@ -101,7 +119,7 @@ fn resident_bytes() -> Option<usize> {
 /// allocator reaching for pages.
 fn report_build(label: &str, batch: usize, rules: &[String]) {
     let warm = build_from(rules);
-    let lines = warm.ignore.lines.len();
+    let lines = warm.ignore.len();
     drop(warm);
 
     let before = resident_bytes();
@@ -135,8 +153,9 @@ fn report_build(label: &str, batch: usize, rules: &[String]) {
     drop(held);
 }
 
-/// What a filter costs to build and to hold, for the two shapes a repository
-/// meets: the file a user authors, and the one a diff synthesizes.
+/// What a filter costs to build and to hold, for the shapes a repository meets:
+/// the file a user authors, the one a diff synthesizes, and one whose paths sit
+/// in a single directory, sorted and not.
 ///
 /// Reported rather than compared. There is no threshold worth asserting here --
 /// a loose one catches nothing and a tight one breaks on an unrelated change --
@@ -147,6 +166,8 @@ fn report_build(label: &str, batch: usize, rules: &[String]) {
 fn build_cost_and_resident_size() {
     report_build("authored", 400, &rules());
     report_build("synthesized", 8, &synthesized_rules(10_000));
+    report_build("wide", 8, &wide_rules(10_000, false));
+    report_build("shuffled", 8, &wide_rules(10_000, true));
 }
 
 fn paths(list: Vec<(String, bool)>) -> Vec<(RelativePath, bool)> {
@@ -183,7 +204,7 @@ fn excludes_throughput() {
         .filter(|(path, is_dir)| filter.excludes(path, *is_dir, FilterMode::Full))
         .count();
     println!("probe paths        {} ({excluded} excluded)", probes.len());
-    println!("compiled lines     {}", filter.ignore.lines.len());
+    println!("compiled lines     {}", filter.ignore.len());
 
     const ROUNDS: usize = 20_000;
     time("excludes", ROUNDS * probes.len(), || {
