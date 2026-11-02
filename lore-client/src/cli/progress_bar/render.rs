@@ -47,6 +47,26 @@ pub fn format_bar_line(snap: &ProgressBarSnapshot<'_>, bar_width: u16) -> String
     }
 }
 
+/// The progress as a line of plain text, for output that is not a terminal: the counter and the
+/// message, or the message alone for a spinner.
+pub fn format_plain_line(
+    progress: u64,
+    max: u64,
+    units: Option<&str>,
+    growing: bool,
+    message: &str,
+) -> String {
+    if max == 0 {
+        return message.to_string();
+    }
+    let counter = format_counter(progress, max, units, growing);
+    if message.is_empty() {
+        counter
+    } else {
+        format!("{counter}  {message}")
+    }
+}
+
 pub fn format_spinner_line(frame: char, message: &str) -> String {
     if message.is_empty() {
         frame.to_string()

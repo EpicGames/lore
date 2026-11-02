@@ -39,6 +39,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- When stdout is not a terminal, a command's progress bar prints a plain progress line every 30 seconds instead of
+  drawing nothing. `LORE_PROGRESS_INTERVAL` sets the interval in seconds; 0 turns the lines off
 - `lore.user.v1` gains `RepositoryRegistryService` (`RepositoryList`, `RepositoryRegister`, `RepositoryUnregister`),
   served at `user_url`.
 - `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under

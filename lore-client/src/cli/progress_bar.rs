@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: MIT
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use anstream::stream::IsTerminal;
 use anstyle::Style;
@@ -14,6 +16,7 @@ use parking_lot::RwLock;
 
 use self::render::ProgressBarSnapshot;
 use self::render::format_bar_line;
+use self::render::format_plain_line;
 use self::render::format_spinner_line;
 use self::render::spinner_frame;
 use crate::config::config;
@@ -26,6 +29,10 @@ pub mod render;
 pub mod sync;
 
 const MIN_TERM_WIDTH: u16 = 10;
+
+/// Seconds between plain progress lines when stdout is not a terminal, unless
+/// `LORE_PROGRESS_INTERVAL` says otherwise.
+const PLAIN_LINE_INTERVAL_DEFAULT: u64 = 30;
 
 static CURRENT_PROGRESS_BAR: RwLock<WeakProgressBar> = RwLock::new(WeakProgressBar::empty());
 
@@ -141,7 +148,17 @@ impl ProgressBar {
     /// is dropped, without `Drop` ever having to join.
     fn spawn_render_thread(&self) {
         let weak = Arc::downgrade(&self.data);
+        // Where stdout is not a terminal the bar draws nothing and prints its progress as a plain
+        // line this often instead, so redirected output of a long operation shows it is moving.
+        // Whether stdout is a terminal does not change while the bar runs, so this is fixed here
+        // and kept in the thread rather than in the shared data. Zero prints none.
+        let plain_interval = if self.data.lock().is_terminal {
+            Duration::ZERO
+        } else {
+            plain_line_interval()
+        };
         std::thread::spawn(move || {
+            let mut plain_last = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_millis(100));
 
@@ -157,6 +174,24 @@ impl ProgressBar {
 
                 data.terminal_width = terminal_width().unwrap_or_default();
                 data.frame_tick = data.frame_tick.wrapping_add(1);
+
+                if !plain_interval.is_zero()
+                    && plain_last.elapsed() >= plain_interval
+                    && data.suspend_token.token.load(Ordering::SeqCst) == 0
+                {
+                    plain_last = Instant::now();
+                    let line = format_plain_line(
+                        data.progress,
+                        data.max_progress,
+                        data.options.units.as_deref(),
+                        data.is_growing,
+                        &data.message,
+                    );
+                    if !line.is_empty() {
+                        progress_bar_internal_print!("{line}\n");
+                        let _ = std::io::stdout().flush();
+                    }
+                }
 
                 if !data.is_visible() {
                     continue;
@@ -295,6 +330,20 @@ impl WeakProgressBar {
 #[must_use]
 pub fn suspend_current_progress_bar() -> Option<ProgressBarSuspendToken> {
     CURRENT_PROGRESS_BAR.read().upgrade().map(|pb| pb.suspend())
+}
+
+/// The interval between plain progress lines: `LORE_PROGRESS_INTERVAL` in seconds, 0 for none.
+/// Read once per process.
+fn plain_line_interval() -> Duration {
+    static INTERVAL: OnceLock<Duration> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        Duration::from_secs(
+            std::env::var("LORE_PROGRESS_INTERVAL")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(PLAIN_LINE_INTERVAL_DEFAULT),
+        )
+    })
 }
 
 pub fn terminal_width() -> Option<u16> {
