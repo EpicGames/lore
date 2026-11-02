@@ -49,7 +49,6 @@ use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::PARTITION_ID;
-use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
@@ -631,7 +630,7 @@ impl AwsImmutableStore {
             )
             .await
             .map_err(|e| {
-                warn!("DynamoDb lookup for fragment entry failed for {entry:?}: {e:?}");
+                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "DynamoDb lookup for fragment entry failed");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
@@ -671,7 +670,7 @@ impl AwsImmutableStore {
             .batch_get_item(&self.fragments_table_name, items, true)
             .await
             .map_err(|e| {
-                warn!("DynamoDb association resolve failed: {e:?}");
+                warn!({PARTITION_ID} = %partition, error = ?e, "DynamoDb association resolve failed");
                 if is_dynamodb_overloaded(&e) {
                     StoreError::from(SlowDown)
                 } else {
@@ -880,7 +879,7 @@ impl AwsImmutableStore {
                     .map_or(FragmentState::Stored, |entry| entry.state()))
             }
             Err(e) => {
-                warn!("Failed to publish fragment state for {hash}: {e:?}");
+                warn!(%hash, error = ?e, "Failed to publish fragment state");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     Err(StoreError::from(SlowDown))
                 } else {
@@ -1018,13 +1017,13 @@ impl AwsImmutableStore {
                     .as_service_error()
                     .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
             {
-                warn!("Fragment state for {hash} was not {expected:?} when moving to {updated:?}");
+                warn!(%hash, ?expected, ?updated, "Fragment state was not the expected state when updating it");
                 Err(StoreError::internal(
                     "Failed to update fragment state due to conflict",
                 ))
             }
             Err(e) => {
-                warn!("DynamoDB conditional put failed while updating state for {hash}: {e:?}");
+                warn!(%hash, error = ?e, "DynamoDB conditional put failed while updating fragment state");
                 Err(StoreError::internal_with_context(
                     e,
                     "DynamoDB conditional fragment state update failed",
@@ -1050,7 +1049,7 @@ impl AwsImmutableStore {
 
         self.dynamodb.put_item(&self.fragments_table_name, item).await
             .map_err(|e| {
-                warn!({REPOSITORY_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
+                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1089,7 +1088,7 @@ impl AwsImmutableStore {
             .batch_get_item(&self.fragment_state_table_name, items, true)
             .await
             .map_err(|e| {
-                warn!("DynamoDb fragment state resolve failed: {e:?}");
+                warn!(error = ?e, "DynamoDb fragment state resolve failed");
                 if is_dynamodb_overloaded(&e) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1152,7 +1151,7 @@ impl AwsImmutableStore {
             .batch_get_item(table_name, items, true /* consistent read */)
             .await
             .map_err(|e| {
-                warn!("DynamoDb legacy fragment metadata batch read failed: {e:?}");
+                warn!(error = ?e, "DynamoDb legacy fragment metadata batch read failed");
                 if is_dynamodb_overloaded(&e) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1214,9 +1213,7 @@ impl AwsImmutableStore {
             .await
             .map(|output| output.count > 0)
             .map_err(|e| {
-                warn!(
-                    "DynamoDb query for fragment association count failed for hash {hash}: {e:?}"
-                );
+                warn!(%hash, error = ?e, "DynamoDb query for fragment association count failed");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1247,7 +1244,7 @@ impl AwsImmutableStore {
             .delete_item(&self.fragments_table_name, item)
             .await
             .map_err(|e| {
-                warn!("Failed to delete fragment association for partition: {partition} and address: {address}: {e:?}");
+                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to delete fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1333,7 +1330,7 @@ impl AwsImmutableStore {
                     .map(|versions| versions.into_iter().map(|v| v.version_id).collect())
             })
             .map_err(|e| {
-                warn!("Failed to list versions for hash: {hash}: {e:?}");
+                warn!(%hash, error = ?e, "Failed to list payload versions");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1347,7 +1344,7 @@ impl AwsImmutableStore {
                     .delete_object(self.bucket.as_str(), hash, version)
                     .await
                     .map_err(|e| {
-                        warn!("Failed to delete payload for hash: {hash}: {e:?}");
+                        warn!(%hash, error = ?e, "Failed to delete payload");
                         if matches!(&e, AwsError::AwsSdkError(_)) {
                             StoreError::from(SlowDown)
                         } else {
@@ -1360,7 +1357,7 @@ impl AwsImmutableStore {
                 .delete_object(self.bucket.as_str(), hash, None)
                 .await
                 .map_err(|e| {
-                    warn!("Failed to delete payload for hash: {hash}: {e:?}");
+                    warn!(%hash, error = ?e, "Failed to delete payload");
                     if matches!(&e, AwsError::AwsSdkError(_)) {
                         StoreError::from(SlowDown)
                     } else {
@@ -1453,7 +1450,7 @@ impl AwsImmutableStore {
             )
             .await
             .map_err(|e| {
-                warn!(%hash, ?e, "Failed to get fragment state for hash");
+                warn!(%hash, error = ?e, "Failed to get fragment state");
                 if is_dynamodb_overloaded(&e) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1511,7 +1508,7 @@ impl AwsImmutableStore {
             .get_item(table_name, item, true /* consistent read */)
             .await
             .map_err(|e| {
-                warn!(%hash, ?e, "Failed to read fragment metadata table");
+                warn!(%hash, error = ?e, "Failed to read fragment metadata table");
                 if is_dynamodb_overloaded(&e) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1596,7 +1593,7 @@ impl AwsImmutableStore {
         let mut read = 0_usize;
         while let Some(bytes) = output.body.next().await {
             let bytes = bytes.map_err(|e| {
-                warn!("Failed to read bytes from S3 response for key: {hash}: {e:?}");
+                warn!(%hash, error = ?e, "Failed to read bytes from S3 response");
                 StoreError::internal_with_context(e, "Failed to read bytes from S3 response stream")
             })?;
             read += bytes.len();
@@ -2085,7 +2082,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     .instrument(span.clone())
                     .await
                     .inspect_err(|e| {
-                        warn!("Failed to release the obliteration mark: {e:?}");
+                        warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to release the obliteration mark");
                     });
             }
 
@@ -2109,7 +2106,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             )
             .await
             .inspect_err(|e| {
-                warn!("Failed to finalize obliterate for {address}: {e:?}");
+                warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to finalize obliterate");
             })
         })
         .into()
