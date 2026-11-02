@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -424,9 +425,13 @@ pub fn handle_clear_command(globals: LoreGlobalArgs) -> u8 {
 }
 
 pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u8 {
+    let token_ids = Mutex::new(HashSet::new());
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::AuthUserInfo(data) => {
+                if token_ids.lock().contains(data.id.as_str()) {
+                    return;
+                }
                 println!(
                     "{}ID:{} {}",
                     CommonStyles::HEADERS,
@@ -441,6 +446,7 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                 );
             }
             LoreEvent::AuthUserToken(user_token) => {
+                token_ids.lock().insert(user_token.id.to_string());
                 println!(
                     "{}ID:{} {}",
                     CommonStyles::HEADERS,
@@ -482,15 +488,17 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                         anstyle::Reset,
                         time.to_rfc2822()
                     );
-                } else if user_token.flag_refreshable != 0 {
+                } else if user_token.refreshable != 0 {
                     println!("Refreshable");
                 }
-                println!(
-                    "{}Token:{} {}",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    user_token.token.as_str()
-                );
+                if !user_token.token.is_empty() {
+                    println!(
+                        "{}Token:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        user_token.token.as_str()
+                    );
+                }
             }
             LoreEvent::AuthIdentity(data) => {
                 println!(

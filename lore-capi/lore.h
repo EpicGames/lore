@@ -541,7 +541,7 @@ typedef struct lore_auth_user_token_event_data_t {
   struct lore_string_t id;
   // Display name for the user
   struct lore_string_t name;
-  // The token string
+  // The token string, or empty when the caller did not ask for it
   struct lore_string_t token;
   // Preferred username from the token
   struct lore_string_t preferred_username;
@@ -553,7 +553,10 @@ typedef struct lore_auth_user_token_event_data_t {
   // if there is no refresh token, or if the provider did not give a deadline.
   uint64_t refresh_expires;
   // Non-zero if a refresh token is stored for the identity
-  uint8_t flag_refreshable;
+  uint8_t refreshable;
+  // Non-zero if `token` has not expired, or if it has but the stored refresh token can still
+  // renew it
+  uint8_t session_valid;
 } lore_auth_user_token_event_data_t;
 
 // Event data describing a stored authentication identity.
@@ -4375,7 +4378,7 @@ typedef struct lore_auth_local_user_info_args_t {
   struct lore_string_t auth_endpoint;
   // User identities to resolve; empty resolves the current user
   struct lore_string_array_t user_ids;
-  // Emit cached identity token details for identities with a local token
+  // Include the cached identity token string in `AuthUserToken` events
   uint8_t with_identity_token;
   // Emit the repository's authorization (access) token. Requires running
   // inside a repository
@@ -6594,9 +6597,10 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // ID. For remote resolution with proper authorization, use
 // `lore_auth_user_info` which queries the remote authentication service.
 //
-// When `with_identity_token` is set, identities with a locally stored token
-// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
-// token instead of `AUTH_USER_INFO`.
+// Every identity is answered with an `AUTH_USER_INFO` event, and an identity
+// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
+// `token` holds the cached identity token when `with_identity_token` is set,
+// and is empty otherwise.
 //
 // When `with_access_token` is set, the call requires a repository and
 // additionally emits one `AUTH_IDENTITY` event carrying the
@@ -6624,7 +6628,7 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
-// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted before `AUTH_USER_INFO` for an identity with a cached token, with the token details; `token` is empty unless `with_identity_token` is set |
 // | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 int32_t lore_auth_local_user_info(const struct lore_global_args_t *globals,
                                   const struct lore_auth_local_user_info_args_t *args,

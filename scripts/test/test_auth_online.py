@@ -41,6 +41,7 @@ from protobuf_wire import (
     field_message,
     parse_fields,
 )
+from lore_parsers import parse_jsonl
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -389,13 +390,24 @@ def test_unknown_api_key_is_rejected(auth_env, make_actor):
 def test_repository_create_and_delete_manage_the_auth_resource(auth_env, make_actor):
     """Repository create registers the rebac resource under the creator's
     credential; delete removes it. Asserted from the requests the stub saw.
-    The auth service hands out no refresh token, so the login reports none."""
+    The auth service hands out no refresh token, so the login reports none,
+    and `auth info` reports the login, without its token unless asked, beside
+    the user info it always reports."""
     mock = auth_env.mock
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
 
     login = owner.repo.auth_user_token_event()
+    assert login["token"] == owner.login_token
     assert login["refreshExpires"] == 0
-    assert login["flagRefreshable"] is False
+    assert login["refreshable"] is False
+    assert login["sessionValid"] is True
+
+    output = owner.repo.run(["auth", "info"], json=True)
+    [metadata] = parse_jsonl(output, "authUserToken")
+    assert metadata["token"] == ""
+    assert metadata["sessionValid"] is True
+    [user_info] = parse_jsonl(output, "authUserInfo")
+    assert user_info["id"] == USER1.user_id
 
     creations = mock.requests_for("CreateResource")
     assert [c["resource_id"] for c in creations] == [owner.resource_id]

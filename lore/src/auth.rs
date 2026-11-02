@@ -129,7 +129,13 @@ async fn resolve_user_info_local(
             with_identity_token: 0,
             with_access_token: 0,
         };
-        return local_user_info_impl(globals, local_args, callback).await;
+        let execution = setup_execution(globals, callback);
+        return LORE_CONTEXT
+            .scope(execution, async move {
+                let result = emit_local_user_info(&local_args, false).await;
+                execution_context().dispatcher.complete_result(result).await
+            })
+            .await;
     }
 
     repository_call_read(
@@ -666,7 +672,7 @@ pub struct LoreAuthLocalUserInfoArgs {
     pub auth_endpoint: LoreString,
     /// User identities to resolve; empty resolves the current user
     pub user_ids: LoreArray<LoreString>,
-    /// Emit cached identity token details for identities with a local token
+    /// Include the cached identity token string in `AuthUserToken` events
     pub with_identity_token: u8,
     /// Emit the repository's authorization (access) token. Requires running
     /// inside a repository
@@ -683,9 +689,10 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// `auth_endpoint` is empty, resolves it from the repository's remote
 /// environment configuration.
 ///
-/// When `with_identity_token` is set, emits `AuthUserToken` events (including
-/// the cached identity token string) for identities that have a locally stored
-/// token, and `AuthUserInfo` events for others.
+/// Emits an `AuthUserInfo` event for each identity, and an `AuthUserToken`
+/// event for each identity that has a locally stored token. The `AuthUserToken`
+/// event carries the cached token when `with_identity_token` is set, and an
+/// empty `token` otherwise.
 ///
 /// When `with_access_token` is set, the call requires a repository and
 /// additionally emits an `AuthIdentity` event carrying the repository-scoped
@@ -713,7 +720,7 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted once per resolved identity with user id and display name |
-/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted for each identity with a cached token, with the token details. `token` is empty unless `with_identity_token` is set |
 /// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 pub async fn local_user_info(
     globals: LoreGlobalArgs,
@@ -855,7 +862,7 @@ async fn local_user_info_impl(
             args,
             local_user_info,
             |repository, args| async move {
-                emit_local_user_info(&args).await?;
+                emit_local_user_info(&args, true).await?;
                 auth::userinfo::repository_access_token(repository)
                     .await
                     .forward::<AuthStoreError>("resolving the repository access token")
@@ -868,16 +875,20 @@ async fn local_user_info_impl(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let result = emit_local_user_info(&args).await;
+            let result = emit_local_user_info(&args, true).await;
             execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
 
-/// Resolves the requested identities from locally stored tokens and emits one
-/// `AuthUserInfo` or `AuthUserToken` event per identity. Runs inside an
-/// execution scope. The caller dispatches completion.
-async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), AuthStoreError> {
+/// Resolves the requested identities from locally stored tokens and emits an
+/// `AuthUserInfo` event per identity. With `user_token_events`, an identity with
+/// a stored token also gets an `AuthUserToken` event, before its `AuthUserInfo`.
+/// Runs inside an execution scope. The caller dispatches completion.
+async fn emit_local_user_info(
+    args: &LoreAuthLocalUserInfoArgs,
+    user_token_events: bool,
+) -> Result<(), AuthStoreError> {
     let execution = execution_context();
     let globals = execution.globals();
     let repository_path = globals.repository_path.to_string();
@@ -917,19 +928,24 @@ async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), Au
             .await;
 
     for entry in &resolved {
-        if include_identity_token && let Some(user_info) = &entry.local_user_info {
+        if user_token_events && let Some(user_info) = &entry.local_user_info {
+            let token = if include_identity_token {
+                user_info.token.clone().into()
+            } else {
+                LoreString::default()
+            };
             LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
                 id: user_info.id.clone().into(),
                 name: user_info.name.clone().into(),
-                token: user_info.token.clone().into(),
+                token,
                 preferred_username: user_info.preferred_username.clone().into(),
                 flag_service_account: user_info.is_service_account.into(),
                 expires: user_info.expires,
                 refresh_expires: entry.refresh_expires.unwrap_or_default(),
-                flag_refreshable: entry.refresh_expires.is_some().into(),
+                refreshable: entry.refresh_expires.is_some().into(),
+                session_valid: entry.session_valid().into(),
             })
             .send();
-            continue;
         }
 
         LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {

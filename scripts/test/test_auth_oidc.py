@@ -527,7 +527,8 @@ def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
     assert len(provider.valid_refresh_tokens()) == 1
     assert_user_logged_in(repo, provider)
     login = repo.auth_user_token_event()
-    assert login["flagRefreshable"] is True
+    assert login["refreshable"] is True
+    assert login["sessionValid"] is True
     assert abs(login["refreshExpires"] - (time.time() + 172800) * 1000) < 60_000
 
 

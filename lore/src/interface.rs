@@ -323,9 +323,10 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// ID. For remote resolution with proper authorization, use
 /// `lore_auth_user_info` which queries the remote authentication service.
 ///
-/// When `with_identity_token` is set, identities with a locally stored token
-/// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
-/// token instead of `AUTH_USER_INFO`.
+/// Every identity is answered with an `AUTH_USER_INFO` event, and an identity
+/// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
+/// `token` holds the cached identity token when `with_identity_token` is set,
+/// and is empty otherwise.
 ///
 /// When `with_access_token` is set, the call requires a repository and
 /// additionally emits one `AUTH_IDENTITY` event carrying the
@@ -353,7 +354,7 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
-/// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted before `AUTH_USER_INFO` for an identity with a cached token, with the token details; `token` is empty unless `with_identity_token` is set |
 /// | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_local_user_info(
