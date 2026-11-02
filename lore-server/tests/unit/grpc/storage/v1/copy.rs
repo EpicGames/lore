@@ -12,10 +12,12 @@ use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedTokenOwned;
 use lore_server::grpc::storage::v1::copy::*;
+use lore_storage::ImmutableStore;
 use rand::random;
 use tonic::Code;
 use zerocopy::IntoBytes;
 
+use crate::store::test_support::SlowDownImmutableStore;
 use crate::store::test_support::test_store_create;
 
 fn copy_request(source_repository: RepositoryId) -> storage_v1::CopyRequest {
@@ -49,14 +51,18 @@ fn access_token(resource_ids: &[String]) -> Arc<VerifiedTokenOwned> {
     })
 }
 
+/// Copies one item and returns its status code. `store` replaces the real store the copy runs
+/// against when set.
 async fn item_code(
     auth_token: Option<Arc<VerifiedTokenOwned>>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     source_repository: RepositoryId,
     destination_repository: RepositoryId,
+    store: Option<Arc<dyn ImmutableStore>>,
 ) -> i32 {
-    let (store, _mutable_store, execution) =
+    let (real_store, _mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
+    let store = store.unwrap_or(real_store);
     LORE_CONTEXT
         .scope(execution, async move {
             let response = copy_item(
@@ -91,6 +97,7 @@ async fn source_without_a_grant_is_denied_in_band() {
         authorizer,
         source,
         destination,
+        None,
     )
     .await;
     assert_eq!(code, Code::PermissionDenied as i32);
@@ -114,6 +121,7 @@ async fn granted_source_reaches_the_store() {
         authorizer,
         source,
         destination,
+        None,
     )
     .await;
     assert_eq!(code, Code::NotFound as i32);
@@ -128,7 +136,14 @@ async fn in_partition_item_skips_the_authorizer() {
     let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AuthClientAuthorizer::new(
         "https://auth.invalid".to_string(),
     ));
-    let code = item_code(Some(access_token(&[])), authorizer, repository, repository).await;
+    let code = item_code(
+        Some(access_token(&[])),
+        authorizer,
+        repository,
+        repository,
+        None,
+    )
+    .await;
     assert_eq!(code, Code::NotFound as i32);
 }
 
@@ -141,7 +156,24 @@ async fn tokenless_caller_stays_open_under_allow_all() {
         Arc::new(AllowAllRepositoryAuthorizer),
         random::<RepositoryId>(),
         random::<RepositoryId>(),
+        None,
     )
     .await;
     assert_eq!(code, Code::NotFound as i32);
+}
+
+/// When the store rejects a copy with a slow-down error, the item reports `RESOURCE_EXHAUSTED`
+/// in-band.
+#[tokio::test]
+async fn throttled_store_reports_resource_exhausted_in_band() {
+    let repository = random::<RepositoryId>();
+    let code = item_code(
+        None,
+        Arc::new(AllowAllRepositoryAuthorizer),
+        repository,
+        repository,
+        Some(Arc::new(SlowDownImmutableStore)),
+    )
+    .await;
+    assert_eq!(code, Code::ResourceExhausted as i32);
 }

@@ -10,6 +10,7 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
+use lore_storage::StoreError;
 use lore_storage::immutable_store::CopyBehavior;
 use tracing::warn;
 
@@ -114,7 +115,8 @@ pub async fn handle_copy(
                 .await
             {
                 Ok(()) => Ok(LoreResponse::Copy(CopyResponse::default())),
-                Err(err) if err.is_address_not_found() => Err(MessageHandleError::FragmentNotFound),
+                Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
+                Err(StoreError::AddressNotFound(_)) => Err(MessageHandleError::FragmentNotFound),
                 Err(err) => {
                     warn!(error = ?err, "Failed to copy fragment");
                     Err(MessageHandleError::StoreFailure)

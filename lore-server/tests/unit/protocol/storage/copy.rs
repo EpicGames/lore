@@ -33,6 +33,7 @@ use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
 use rand::random;
 
+use crate::store::test_support::SlowDownImmutableStore;
 use crate::store::test_support::test_store_create;
 
 fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
@@ -519,6 +520,30 @@ async fn test_handle_fragment_not_found() {
                 Err(MessageHandleError::FragmentNotFound) => (),
                 Err(e) => panic!("Expected FragmentNotFound error, got {e:?}"),
                 Ok(_) => panic!("Expected FragmentNotFound error, got Ok"),
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_handle_slow_down() {
+    let message = make_copy_message();
+
+    let destination_repository = random::<RepositoryId>();
+    let context_map = Arc::new(AttributeMap::default());
+    context_map.insert(destination_repository);
+
+    let store: Arc<dyn ImmutableStore> = Arc::new(SlowDownImmutableStore);
+
+    let (_unused_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            match message.handle(context_map, store, allow_all()).await {
+                Err(MessageHandleError::SlowDown) => (),
+                Err(e) => panic!("Expected SlowDown error, got {e:?}"),
+                Ok(_) => panic!("Expected SlowDown error, got Ok"),
             }
         })
         .await;

@@ -13,6 +13,7 @@ mod repository;
 mod revision;
 mod server;
 mod storage;
+mod storage_service;
 mod thinclient;
 mod tower;
 

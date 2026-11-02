@@ -70,6 +70,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- `lore-server`: a storage copy reports a slow-down from the store as `SlowDown` over QUIC and `RESOURCE_EXHAUSTED`
+  over gRPC, rather than as an internal error. The legacy `urc.rpc` gRPC get, put and copy streams report a slow-down
+  as `RESOURCE_EXHAUSTED` as well
 - gRPC connections over TLS fall back to the bundled webpki roots when no certificates load from the OS trust store,
   as QUIC connections already did. They used to fail with `NativeCertsNotFound` before reaching the server
 - `lore-server`: `[server.quic_internal]` sizes the flow-control windows of every connection it accepts for a 220 ms

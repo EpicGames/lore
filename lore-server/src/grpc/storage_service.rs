@@ -111,6 +111,15 @@ impl LoreStorageService {
     }
 }
 
+/// The status code for a handler error when the calling RPC doesn't assign one. A slow-down maps
+/// to `RESOURCE_EXHAUSTED`; all other errors map to `INTERNAL`.
+fn unmapped_error_code(err: &MessageHandleError) -> Code {
+    match err {
+        MessageHandleError::SlowDown => Code::ResourceExhausted,
+        _ => Code::Internal,
+    }
+}
+
 #[tonic::async_trait]
 impl StorageService for LoreStorageService {
     type GetStream = GetResponseStream;
@@ -205,7 +214,7 @@ impl StorageService for LoreStorageService {
                                     ),
                                     default => warn_error_to_status(&default, |err| {
                                         Status::with_details(
-                                            Code::Internal,
+                                            unmapped_error_code(err),
                                             format!("Error from get handler: {err}"),
                                             request.address.into(),
                                         )
@@ -367,10 +376,13 @@ impl StorageService for LoreStorageService {
                                         )),
                                         Err(err) => {
                                             let response = warn_error_to_status(&err, |err| {
-                                                Status::internal(format!(
-                                                    "Error storing fragment {}: {err}",
-                                                    request.address()
-                                                ))
+                                                Status::new(
+                                                    unmapped_error_code(err),
+                                                    format!(
+                                                        "Error storing fragment {}: {err}",
+                                                        request.address()
+                                                    ),
+                                                )
                                             });
                                             Err(response)
                                         }
@@ -604,7 +616,7 @@ impl StorageService for LoreStorageService {
                                                             msg.source_address.into(),
                                                         ),
                                                         _ => Status::with_details(
-                                                            Code::Internal,
+                                                            unmapped_error_code(err),
                                                             format!(
                                                                 "Error copying fragment: {err}"
                                                             ),

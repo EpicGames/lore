@@ -2,10 +2,127 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use bytes::Bytes;
+use lore_base::error::SlowDown;
+use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::Partition;
 use lore_revision::runtime::execution_context;
+use lore_storage::Fragment;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::StoreGetData;
+use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
+
+/// An `ImmutableStore` that returns `SlowDown` on every operation.
+pub struct SlowDownImmutableStore;
+
+#[async_trait]
+impl ImmutableStore for SlowDownImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        _partition: Partition,
+        _addresses: &[Address],
+        _results: &mut [lore_storage::StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
+        _partition: Partition,
+        _address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn get(
+        self: Arc<Self>,
+        _partition: Partition,
+        _address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn put(
+        self: Arc<Self>,
+        _partition: Partition,
+        _address: Address,
+        _fragment: Fragment,
+        _payload: Option<Bytes>,
+        _force: bool,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn obliterate(
+        self: Arc<Self>,
+        _partition: Partition,
+        _address: Address,
+        _stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn evict(
+        self: Arc<Self>,
+        _max_capacity: usize,
+        _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+    ) -> Result<usize, StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn compact(
+        self: Arc<Self>,
+        _max_size: usize,
+        _at: Option<usize>,
+        _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+    ) -> Result<Option<usize>, StoreError> {
+        Ok(None)
+    }
+
+    async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+        None
+    }
+
+    fn max_query_batch(&self) -> Option<usize> {
+        None
+    }
+
+    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+
+    async fn copy(
+        self: Arc<Self>,
+        _source_partition: Partition,
+        _source_address: Address,
+        _destination_partition: Partition,
+        _destination_context: Context,
+        _behavior: CopyBehavior,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::from(SlowDown))
+    }
+}
 
 /// A [`lore_storage::MutableStore`] that fails `load` with a chosen error —
 /// for every key, or for one key when `key` is set — while every other
