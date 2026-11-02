@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::auth::LoreAuthPendingEventData;
 use crate::auth::LoreAuthUrlEventData;
+use crate::auth::userinfo::session_valid;
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
 use crate::errors::Maintenance;
@@ -43,6 +44,7 @@ use crate::event::EventError;
 use crate::interface::LoreError;
 use crate::lore::execution_context;
 use crate::lore_debug;
+use crate::lore_info;
 
 #[error_set]
 pub enum LoginError {
@@ -331,9 +333,14 @@ pub fn with_client_credentials_boxed<'a>(
 ///
 /// The received token is validated against the remote's domain before being
 /// stored in the encrypted token store.
+///
+/// With `reuse_session`, a stored login whose session is still valid is
+/// returned instead, and no auth session is started. The login is the call's
+/// identity, or else the first identity stored for the auth endpoint.
 pub async fn interactive(
     remote_url: &str,
     no_browser: bool,
+    reuse_session: bool,
 ) -> Result<UserInfo, InteractiveLoginError> {
     lore_debug!("Interactive login with remote {remote_url}");
 
@@ -360,6 +367,15 @@ pub async fn interactive(
     } = select_auth_path(&environment)
         .forward::<InteractiveLoginError>("selecting the authentication path")?;
     lore_debug!("Login over the {path:?} path");
+
+    if reuse_session
+        && let Some(user_info) =
+            valid_stored_login(&auth_url, domain_from_url_or_url(&remote_url)).await
+    {
+        lore_info!("Already logged in as {}", user_info.id);
+        return Ok(user_info);
+    }
+
     let correlation_id = correlation_id();
 
     lore_debug!("Login on web with auth {auth_url} no_browser {no_browser}");
@@ -448,6 +464,31 @@ pub async fn interactive(
     }
 
     Ok(user_info)
+}
+
+/// The stored login for the call's identity at `auth_url`, or else for the
+/// first identity stored there, if its session is valid and its token may be
+/// sent to `remote_domain`.
+#[lore_macro::test_pub]
+async fn valid_stored_login(auth_url: &str, remote_domain: String) -> Option<UserInfo> {
+    let identity = match execution_context().globals().identity() {
+        Some(identity) => identity.to_string(),
+        None => token_store::load_identities(auth_url)
+            .await
+            .ok()?
+            .into_iter()
+            .next()?,
+    };
+    let user_info = lore_credential::user_info(
+        auth_url,
+        &identity,
+        token_store::tokens_only_for_recipient_domain(remote_domain),
+        "",
+        "",
+    )
+    .await?;
+    let refresh_expires = token_store::load_refresh_expires(auth_url, &identity).await;
+    session_valid(user_info.expires, refresh_expires).then_some(user_info)
 }
 
 /// Polls `session` until the user approves it, at the cadence the session

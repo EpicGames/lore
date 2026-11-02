@@ -78,6 +78,9 @@ pub struct AuthLoginArgs {
     /// Avoid opening a browser to login
     #[clap(long = "no-browser")]
     no_browser: bool,
+    /// Keep the stored login instead of logging in again while its session is valid
+    #[clap(long = "reuse-session", conflicts_with_all = ["token_type", "token", "client_id"])]
+    reuse_session: bool,
 }
 
 #[derive(Args)]
@@ -206,6 +209,7 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
         let args = LoreAuthLoginInteractiveArgs {
             remote_url,
             no_browser: if args.no_browser { 1 } else { 0 },
+            reuse_session: args.reuse_session.into(),
         };
         run_command(globals, args.into(), callback) as u8
     }

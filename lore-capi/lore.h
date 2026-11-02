@@ -4391,6 +4391,8 @@ typedef struct lore_auth_login_interactive_args_t {
   struct lore_string_t remote_url;
   // Emit the login URL instead of opening a browser
   uint8_t no_browser;
+  // Return the stored login instead of starting a new one while its session is valid
+  uint8_t reuse_session;
 } lore_auth_login_interactive_args_t;
 
 // Arguments for creating a new branch with the given name and category.
@@ -6641,6 +6643,10 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 
 // Authenticate interactively via a browser-based login flow.
 //
+// With `reuse_session` set, a stored login whose session is still valid, as
+// `session_valid` in `lore_auth_user_token_event_data_t` reports it, is
+// returned without starting a new login.
+//
 // # Events
 //
 // Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -6662,7 +6668,7 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
                                     const struct lore_auth_login_interactive_args_t *args,
                                     struct lore_event_callback_config_t callback);
@@ -6690,7 +6696,7 @@ int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
                                        const struct lore_auth_login_interactive_args_t *args,
                                        struct lore_event_callback_config_t callback);

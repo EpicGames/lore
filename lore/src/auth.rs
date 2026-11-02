@@ -369,9 +369,14 @@ pub struct LoreAuthLoginInteractiveArgs {
     pub remote_url: LoreString,
     /// Emit the login URL instead of opening a browser
     pub no_browser: u8,
+    /// Return the stored login instead of starting a new one while its session is valid
+    pub reuse_session: u8,
 }
 
 /// Authenticates interactively via browser-based login flow for a remote URL.
+///
+/// With `reuse_session` set, a stored login whose session is still valid is
+/// returned without starting a new login.
 ///
 /// # Events
 ///
@@ -392,7 +397,7 @@ pub struct LoreAuthLoginInteractiveArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUrl`](crate::interface::LoreEvent::AuthUrl) | Emitted with the login URL when no_browser mode is requested (instead of opening browser), and whenever the login has a code for the user to enter or confirm at that URL |
 /// | [`LoreEvent::AuthPending`](crate::interface::LoreEvent::AuthPending) | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires |
-/// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful interactive authentication |
+/// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 pub async fn login_interactive(
     globals: LoreGlobalArgs,
     args: LoreAuthLoginInteractiveArgs,
@@ -417,7 +422,13 @@ async fn login_interactive_local(
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                match auth::login::interactive(remote_url.as_str(), args.no_browser != 0).await {
+                match auth::login::interactive(
+                    remote_url.as_str(),
+                    args.no_browser != 0,
+                    args.reuse_session != 0,
+                )
+                .await
+                {
                     Ok(user_info) => {
                         send_user_info(user_info);
                         Ok(())

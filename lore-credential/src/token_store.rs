@@ -963,6 +963,7 @@ async fn remove_user_token_where(
 }
 
 pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenStoreError> {
+    let auth_endpoint = auth_endpoint.trim_end_matches('/');
     lore_trace!("Load user identities for endpoint {auth_endpoint}");
 
     let mut identities = vec![];

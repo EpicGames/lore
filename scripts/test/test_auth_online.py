@@ -335,7 +335,8 @@ def provision_owner(auth_env, make_actor, label: str, user: MockUser, api_key=No
 def test_interactive_login_authenticates(auth_env, make_actor):
     """`auth login --no-browser` prints the login URL the auth service handed
     out, completes the device-grant flow (StartAuthSession + GetAuthSession
-    polling), and reports success."""
+    polling), and reports success. A login with `--reuse-session` keeps that
+    login; one without starts another."""
     mock = auth_env.mock
     login_token = mock.mint_token(USER1)
     script_interactive_login(mock, USER1, login_token, "session-login-test")
@@ -356,6 +357,25 @@ def test_interactive_login_authenticates(auth_env, make_actor):
     listing = repo.run(urc_args=["auth", "list"])
     assert USER1.user_id in listing
     assert USER1.preferred_username in listing
+
+    output = repo.run(
+        urc_args=[
+            "auth",
+            "login",
+            auth_env.remote_url,
+            "--no-browser",
+            "--reuse-session",
+        ]
+    )
+    assert "Login at:" not in output
+    assert "Authentication successful" in output
+    assert mock.calls["StartAuthSession"] == 1, (
+        "a login reusing a valid session must not start another"
+    )
+
+    output = login_interactive(repo, auth_env.remote_url)
+    assert "Login at:" in output
+    assert mock.calls["StartAuthSession"] == 2
 
 
 @pytest.mark.smoke

@@ -64,6 +64,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_identities_ignores_trailing_slash() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                token_store::store_user_token(
+                    &format!("{AUTH_ENDPOINT}/"),
+                    "identity0",
+                    "some-token-0",
+                    vec![],
+                )
+                .await
+                .expect("Failed to store token");
+
+                let identities = token_store::load_identities(&format!("{AUTH_ENDPOINT}/"))
+                    .await
+                    .expect("Failed to get identities");
+                assert_eq!(identities, vec!["identity0".to_string()]);
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    #[tokio::test]
     async fn load_identities() {
         let _lock = sequential_mutex_lock().await;
 
@@ -527,6 +554,10 @@ mod tests {
     /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
     const SUPPLIED_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
 
+    /// A JWT naming "alice", expired (`exp` 1).
+    /// `{"iss":"lore","sub":"alice","name":"Alice","exp":1,"aud":["example.com"]}`
+    const EXPIRED_JWT: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjEsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+
     /// An access token with no identity token beside it must not fall back to
     /// the store: the caller is working from tokens they supplied, and the
     /// stored identities came from a login this call is not using. Proven
@@ -800,6 +831,55 @@ mod tests {
                     .expect("one identity");
                     assert!(identity.local_user_info.is_some());
                     assert_eq!(identity.refresh_expires, resolved, "{refresh_token:?}");
+                }
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    #[tokio::test]
+    async fn a_stored_login_is_reused_while_its_session_is_valid() {
+        let _lock = sequential_mutex_lock().await;
+
+        let (execution, _auth_dir) = setup_test_env().await;
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                const LIVE: u64 = 1_900_000_000_000;
+                const DEAD: u64 = 1;
+                for (token, refresh_token, refresh_expires, remote_domain, reused) in [
+                    (SUPPLIED_JWT, None, 0, "example.com", true),
+                    (EXPIRED_JWT, Some("refresh-1"), LIVE, "example.com", true),
+                    (EXPIRED_JWT, Some("refresh-1"), 0, "example.com", true),
+                    (EXPIRED_JWT, Some("refresh-1"), DEAD, "example.com", false),
+                    (EXPIRED_JWT, None, 0, "example.com", false),
+                    (SUPPLIED_JWT, None, 0, "other.org", false),
+                ] {
+                    token_store::store_user_token_and_refresh_token(
+                        AUTH_ENDPOINT,
+                        "alice",
+                        token,
+                        vec!["example.com".into()],
+                        refresh_token,
+                        refresh_expires,
+                        None,
+                    )
+                    .await
+                    .expect("Failed to store the login");
+
+                    let login = lore_revision::auth::login::valid_stored_login(
+                        AUTH_ENDPOINT,
+                        remote_domain.to_string(),
+                    )
+                    .await;
+                    assert_eq!(
+                        login.map(|info| info.id),
+                        reused.then(|| "alice".to_string()),
+                        "token expired {}, refresh token {refresh_token:?} until {refresh_expires}, \
+                         remote {remote_domain}",
+                        token == EXPIRED_JWT,
+                    );
                 }
             }))
             .await

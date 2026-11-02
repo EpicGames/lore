@@ -403,17 +403,23 @@ impl ResolvedIdentity {
     /// Whether the token in `local_user_info` is still valid, or a stored refresh token can
     /// still renew it.
     pub fn session_valid(&self) -> bool {
-        let Some(info) = &self.local_user_info else {
-            return false;
-        };
-        if !is_expired(info.expires) {
-            return true;
-        }
-        match self.refresh_expires {
-            Some(0) => true,
-            Some(refresh_expires) => !is_expired(refresh_expires),
-            None => false,
-        }
+        self.local_user_info
+            .as_ref()
+            .is_some_and(|info| session_valid(info.expires, self.refresh_expires))
+    }
+}
+
+/// Whether a login is still usable: its token, expiring at `expires`, has not expired, or a
+/// refresh token can still renew it. `refresh_expires` is `None` without a refresh token, and
+/// `Some(0)` for one with no deadline.
+pub fn session_valid(expires: u64, refresh_expires: Option<u64>) -> bool {
+    if !is_expired(expires) {
+        return true;
+    }
+    match refresh_expires {
+        Some(0) => true,
+        Some(refresh_expires) => !is_expired(refresh_expires),
+        None => false,
     }
 }
 

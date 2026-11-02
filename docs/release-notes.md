@@ -59,6 +59,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   expired, or while a stored refresh token can still renew it.
   `lore_auth_local_user_info` and `lore auth info` emit both `AuthUserInfo` and `AuthUserToken` for an identity with a
   stored token. `AuthUserToken` carries the token only with `with_identity_token`, and an empty `token` without it.
+- `lore auth login --reuse-session` (C API: `reuse_session` in `lore_auth_login_interactive_args_t`) returns the stored
+  login when its session is still valid, as `session_valid` reports it, and starts no new login
 - On Linux, the server's QUIC endpoints serve on several UDP sockets bound to their port, so clients spread across
   their receive buffers: `num_sockets` in `[server.quic]` and `[server.quic_internal]`, by default 16, capped at the
   processor count, and 4 for the internal endpoint. `num_listeners` is now optional and defaults to 1 per socket

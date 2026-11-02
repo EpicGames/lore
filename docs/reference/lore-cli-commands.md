@@ -1904,6 +1904,7 @@ Authenticate the CLI
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore auth info`
 
@@ -2036,6 +2037,7 @@ Authenticate the CLI
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore link`
 
