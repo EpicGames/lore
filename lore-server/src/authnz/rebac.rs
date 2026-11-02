@@ -13,13 +13,13 @@ use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
 use lore_transport::auth::ucs_auth::grpc_endpoint;
 use lore_transport::grpc::CorrelationInterceptor;
+use lore_transport::tls::grpc_client_tls_config;
 use opentelemetry::KeyValue;
 use smallvec::SmallVec;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::codegen::InterceptedService;
-use tonic::transport::ClientTlsConfig;
 
 use crate::grpc::ServerResultExt;
 
@@ -52,11 +52,7 @@ fn rebac_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> 
         .warn_map_err(|_| Status::internal("Failed to create rebac endpoint"))?;
     if auth_url.starts_with("https://") {
         endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .assume_http2(true)
-                    .with_native_roots(),
-            )
+            .tls_config(grpc_client_tls_config())
             .warn_map_err(|_| Status::internal("Failed to configure TLS for rebac"))?;
     }
     Ok(endpoint)

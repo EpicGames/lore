@@ -3,17 +3,25 @@
 //! TLS certificate helpers shared across the transport layer.
 //!
 //! This module owns the PEM loading primitives used by both the QUIC client
-//! and the server endpoints, plus [`generate_self_signed`] for producing
+//! and the server endpoints, the roots clients verify servers against
+//! ([`client_root_store`]), plus [`generate_self_signed`] for producing
 //! ephemeral certificates when none have been supplied via configuration
 //! (zero-config local development).
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::LazyLock;
 
+use lore_base::lore_warn;
 use rcgen::CertifiedKey;
 use rcgen::generate_simple_self_signed;
+use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::PrivateKeyDer;
 use rustls::pki_types::pem::PemObject;
+use rustls_native_certs::load_native_certs;
+use tonic::transport::ClientTlsConfig;
+use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::error::ProtocolError;
 
@@ -66,4 +74,32 @@ pub fn generate_self_signed(
         cert_pem: cert.pem(),
         key_pem: signing_key.serialize_pem(),
     })
+}
+
+static CLIENT_ROOT_STORE: LazyLock<Arc<RootCertStore>> = LazyLock::new(|| {
+    let mut store = RootCertStore {
+        roots: TLS_SERVER_ROOTS.to_vec(),
+    };
+    let native_certs = load_native_certs();
+    if native_certs.certs.is_empty() {
+        lore_warn!(
+            "no certificates loaded from the OS trust store, continuing with the built-in webpki roots: {:?}",
+            native_certs.errors
+        );
+    }
+    store.add_parsable_certificates(native_certs.certs);
+    Arc::new(store)
+});
+
+/// Roots for verifying servers: the bundled webpki roots and the certificates in the OS trust
+/// store, loaded once per process.
+pub fn client_root_store() -> Arc<RootCertStore> {
+    CLIENT_ROOT_STORE.clone()
+}
+
+/// TLS configuration for gRPC clients, trusting [`client_root_store`].
+pub fn grpc_client_tls_config() -> ClientTlsConfig {
+    ClientTlsConfig::new()
+        .assume_http2(true)
+        .trust_anchors(client_root_store().roots.iter().cloned())
 }

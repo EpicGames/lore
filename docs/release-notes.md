@@ -70,6 +70,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Fixes & Improvements
 
+- gRPC connections over TLS fall back to the bundled webpki roots when no certificates load from the OS trust store,
+  as QUIC connections already did. They used to fail with `NativeCertsNotFound` before reaching the server
 - `lore-server`: `[server.quic_internal]` sizes the flow-control windows of every connection it accepts for a 220 ms
   round trip, up from 100 ms. Replication connections to `OtherRegion` peers use the same value. A peer in a distant
   region can keep more than twice as much data in flight. Set the endpoint's value with `transport_rtt`

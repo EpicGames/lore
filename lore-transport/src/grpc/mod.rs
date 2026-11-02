@@ -49,7 +49,6 @@ use tonic::body::Body;
 use tonic::codegen::InterceptedService;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
-use tonic::transport::ClientTlsConfig;
 use tower::Layer;
 use tower::Service;
 use tower::ServiceBuilder;
@@ -65,6 +64,7 @@ use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
 use crate::connection::authenticates_server;
 use crate::error::ProtocolError;
+use crate::tls::grpc_client_tls_config;
 use crate::traits::*;
 use crate::types::*;
 
@@ -673,12 +673,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
 
     if remote.starts_with("https://") {
         endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .assume_http2(true)
-                    .with_webpki_roots()
-                    .with_native_roots(),
-            )
+            .tls_config(grpc_client_tls_config())
             .internal_with(|| format!("configuring TLS for {remote}"))?;
     }
     let user_agent = crate::user_agent();
