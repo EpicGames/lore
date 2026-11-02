@@ -183,11 +183,11 @@ impl Authentication for StubAuthentication {
         ))
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         auth_url: &str,
         authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         self.exchange_for_repository(

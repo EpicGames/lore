@@ -177,25 +177,54 @@ async fn an_exchange_names_the_partition_as_a_scope() {
     assert_eq!(fields.len(), 6, "{fields:?}");
 }
 
-/// A custom resource passes through verbatim as `resource`, whichever template the
-/// deployment names partitions with.
+/// Custom resources pass through verbatim, one `resource` each in a single exchange,
+/// whichever template the deployment names partitions with.
 #[tokio::test]
-async fn a_custom_resource_is_sent_verbatim() {
+async fn custom_resources_are_sent_verbatim() {
     let provider = provider_answering(exchange_response).await;
     let authn = login_token(&provider.issuer, &[]);
     let oidc = with_scope_template(&provider.issuer);
     let endpoint = oidc::endpoint(&oidc.issuer);
 
     OidcAuthentication::new(oidc)
-        .exchange_for_custom_resource(&endpoint, &authn, "urc-user-service", "corr")
+        .exchange_for_custom_resources(
+            &endpoint,
+            &authn,
+            &["urc-user-service", "stream:a:*"],
+            "corr",
+        )
         .await
         .expect("the exchange succeeds");
 
     let requests = provider.requests_to("/token");
     assert_eq!(requests.len(), 1);
     let fields = fields(&requests[0]);
-    assert_eq!(values(&fields, "resource"), ["urc-user-service"]);
+    assert_eq!(
+        values(&fields, "resource"),
+        ["urc-user-service", "stream:a:*"]
+    );
     assert!(values(&fields, "scope").is_empty(), "{fields:?}");
+}
+
+/// An exchange naming no resource would carry no target, so nothing is sent, on Tier 2 or
+/// on Tier 1.
+#[tokio::test]
+async fn custom_resources_without_a_resource_send_nothing() {
+    let provider = provider_answering(exchange_response).await;
+    let authn = login_token(&provider.issuer, &[]);
+
+    for oidc in [
+        with_scope_template(&provider.issuer),
+        oidc(&provider.issuer),
+    ] {
+        let endpoint = oidc::endpoint(&oidc.issuer);
+        let result = OidcAuthentication::new(oidc)
+            .exchange_for_custom_resources(&endpoint, &authn, &[], "corr")
+            .await;
+        assert!(result.is_err());
+    }
+
+    assert!(provider.received.lock().unwrap().is_empty());
 }
 
 /// Without a template the deployment is on Tier 1: the login token is the authorization,
@@ -216,7 +245,7 @@ async fn without_a_template_the_login_token_authorizes() {
     assert_eq!(authz.expires_ms, EXPIRES * 1000);
 
     let custom = auth
-        .exchange_for_custom_resource(&endpoint, &authn, "urc-user-service", "corr")
+        .exchange_for_custom_resources(&endpoint, &authn, &["urc-user-service"], "corr")
         .await
         .expect("the login token authorizes");
     assert_eq!(custom.token, authn);

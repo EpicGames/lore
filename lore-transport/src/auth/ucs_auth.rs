@@ -60,6 +60,11 @@ pub fn grpc_endpoint(auth_url: &str) -> String {
     }
 }
 
+/// A UCS Auth `expires_at`, seconds since the UNIX epoch, in milliseconds.
+fn seconds_to_ms(expires_at: i64) -> u64 {
+    u64::try_from(expires_at).unwrap_or(0).saturating_mul(1000)
+}
+
 /// Formats a `RepositoryId` as a UCS Auth resource identifier.
 #[lore_macro::test_pub]
 fn resource_id(repository: RepositoryId) -> String {
@@ -172,7 +177,7 @@ impl Authentication for UcsAuthentication {
                 token: token.user_token,
                 user_id: token.user_id,
                 user_name: token.user_name,
-                expires_ms: token.expires_at.max(0) as u64,
+                expires_ms: seconds_to_ms(token.expires_at),
                 // Populated by orchestration layer via JWT decode, not the proto response
                 acceptable_root_domains: Vec::new(),
                 refresh_token: None,
@@ -210,7 +215,7 @@ impl Authentication for UcsAuthentication {
             token: user_token.user_token,
             user_id: user_token.user_id,
             user_name: user_token.user_name,
-            expires_ms: user_token.expires_at.max(0) as u64,
+            expires_ms: seconds_to_ms(user_token.expires_at),
             // Populated by orchestration layer via JWT decode, not the proto response
             acceptable_root_domains: Vec::new(),
             refresh_token: None,
@@ -260,26 +265,27 @@ impl Authentication for UcsAuthentication {
         repository: RepositoryId,
         correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        self.exchange_for_custom_resource(
+        self.exchange_for_custom_resources(
             auth_url,
             authn_token,
-            &resource_id(repository),
+            &[&resource_id(repository)],
             correlation_id,
         )
         .await
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         auth_url: &str,
         authn_token: &str,
-        resource_id: &str,
+        resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
+        super::require_custom_resources(resource_ids)?;
         let mut client = connect_client(auth_url).await?;
 
         let mut request = tonic::Request::new(ExchangeUserTokenForMultiresourceTokenRequest {
-            resource_id: vec![resource_id.to_string()],
+            resource_id: resource_ids.iter().map(|id| id.to_string()).collect(),
         });
         set_auth_header(&mut request, authn_token)?;
 
@@ -295,7 +301,7 @@ impl Authentication for UcsAuthentication {
 
         Ok(AuthorizationToken {
             token: token.user_token,
-            expires_ms: token.expires_at.max(0) as u64,
+            expires_ms: seconds_to_ms(token.expires_at),
             // Populated by orchestration layer via JWT decode, not the proto response
             acceptable_root_domains: Vec::new(),
         })

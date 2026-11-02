@@ -165,11 +165,11 @@ impl Authentication for NoAuthentication {
         Err(Self::refused())
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<crate::types::AuthorizationToken, ProtocolError> {
         Err(Self::refused())
@@ -183,6 +183,19 @@ fn register_builtin() {
             let _ = authentication::add(scheme, ucs_auth.clone());
         }
     });
+}
+
+/// Refuses a custom resource exchange that names no resource, or names one by an empty ID.
+/// Sent on, it would ask the backend for a token without a target, which an RFC 8693 issuer
+/// may answer with one as broad as the subject token.
+#[lore_macro::test_pub]
+pub(crate) fn require_custom_resources(resource_ids: &[&str]) -> Result<(), ProtocolError> {
+    if resource_ids.is_empty() || resource_ids.iter().any(|id| id.is_empty()) {
+        return Err(ProtocolError::internal(
+            "a custom resource exchange needs at least one non-empty resource ID",
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `url` is a plain-http URL naming a loopback host, where the traffic never leaves

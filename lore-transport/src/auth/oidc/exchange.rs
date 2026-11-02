@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Token exchange (RFC 8693): the login token traded at the advertised exchange issuer for
-//! one scoped to a single resource, named as an RFC 8707 `resource` or as a scope value, and
+//! one scoped to its target, named by RFC 8707 `resource` values or by a scope value, and
 //! an external credential such as an API key traded at the login issuer for a login token.
 
 use lore_base::error::NotAuthenticated;
@@ -29,11 +29,12 @@ const JWT_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:jwt";
 /// Where a partition template puts the partition ID.
 const PARTITION_PLACEHOLDER: &str = "{id}";
 
-/// What an exchange asks for: the form parameter that names it, and its value. Exactly one
-/// is sent, since a provider that rejects `resource` fails an exchange carrying both.
+/// What an exchange asks for: one `resource` parameter per value (RFC 8707 §2), or one
+/// `scope`. Never both, since a provider that rejects `resource` fails an exchange carrying
+/// both.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
-    Resource(String),
+    Resources(Vec<String>),
     Scope(String),
 }
 
@@ -62,10 +63,10 @@ pub fn partition_target(
         Ok(template.replace(PARTITION_PLACEHOLDER, &repository.to_string()))
     };
     match (&oidc.resource_template, &oidc.scope_template) {
-        (Some(template), None) => Ok(Some(Target::Resource(render(
+        (Some(template), None) => Ok(Some(Target::Resources(vec![render(
             "resource_template",
             template,
-        )?))),
+        )?]))),
         (None, Some(template)) => Ok(Some(Target::Scope(render("scope_template", template)?))),
         (None, None) => Ok(None),
         (Some(_), Some(_)) => Err(ProtocolError::internal(
@@ -130,7 +131,11 @@ pub async fn exchange(
         ("requested_token_type", ACCESS_TOKEN_TYPE.to_owned()),
     ];
     match &target {
-        Target::Resource(resource) => form.push(("resource", resource.clone())),
+        Target::Resources(resources) => form.extend(
+            resources
+                .iter()
+                .map(|resource| ("resource", resource.clone())),
+        ),
         Target::Scope(scope) => form.push(("scope", scope.clone())),
     }
 

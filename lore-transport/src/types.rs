@@ -308,7 +308,7 @@ pub struct AuthenticationToken {
 
 /// Authorization token scoped to a specific resource.
 ///
-/// Returned from `exchange_for_repository` or `exchange_for_custom_resource`.
+/// Returned from `exchange_for_repository` or `exchange_for_custom_resources`.
 /// Shorter-lived than the authentication token and re-obtained via exchange
 /// when expired.
 #[derive(Clone, Debug)]

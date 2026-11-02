@@ -424,7 +424,7 @@ pub async fn exchange(
 
 /// Exchanges an authentication token for an authorization token scoped to an
 /// arbitrary resource identifier (non-repository). Mirrors `exchange` but
-/// delegates to the implementation's `exchange_for_custom_resource`, letting
+/// delegates to the implementation's `exchange_for_custom_resources`, letting
 /// callers authorize against resources the `RepositoryId` model cannot express.
 ///
 /// The `resource_id` is used verbatim as the cache/token-store key and is
@@ -531,10 +531,10 @@ pub async fn exchange_custom_resource(
 
     lore_trace!("Send auth exchange request");
     let authz = auth_impl
-        .exchange_for_custom_resource(
+        .exchange_for_custom_resources(
             &auth_url,
             &auth_service_only_token,
-            resource_id,
+            &[resource_id],
             &correlation_id,
         )
         .await

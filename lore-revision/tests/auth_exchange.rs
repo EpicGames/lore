@@ -140,11 +140,11 @@ mod tests {
             (self.exchange_result)(repository)
         }
 
-        async fn exchange_for_custom_resource(
+        async fn exchange_for_custom_resources(
             &self,
             _auth_url: &str,
             _authn_token: &str,
-            _resource_id: &str,
+            _resource_ids: &[&str],
             _correlation_id: &str,
         ) -> Result<AuthorizationToken, ProtocolError> {
             (self.exchange_result)(RepositoryId::default())
@@ -214,16 +214,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_for_custom_resource_success_returns_token() {
+    async fn exchange_for_custom_resources_success_returns_token() {
         let scheme = "test-exchange-custom-success";
         authentication::add(scheme, Arc::new(TestAuthentication::always_succeed())).unwrap();
 
         let auth = authentication::find(&format!("{scheme}://auth.test.com")).unwrap();
         let result = auth
-            .exchange_for_custom_resource(
+            .exchange_for_custom_resources(
                 &format!("{scheme}://auth.test.com"),
                 "authn-tok",
-                "bespoke-urc:uefn:some-stream",
+                &["bespoke-urc:uefn:some-stream"],
                 "corr",
             )
             .await;

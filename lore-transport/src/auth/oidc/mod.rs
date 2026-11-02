@@ -384,16 +384,18 @@ impl Authentication for OidcAuthentication {
         self.authorize(auth_url, authn_token, target).await
     }
 
-    /// The resource is sent verbatim as `resource`, whichever template names a partition.
-    async fn exchange_for_custom_resource(
+    /// Each resource is sent verbatim as a `resource`, whichever template names a partition.
+    async fn exchange_for_custom_resources(
         &self,
         auth_url: &str,
         authn_token: &str,
-        resource_id: &str,
+        resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
-        let target = exchange::is_exchanging(&self.oidc)
-            .then(|| exchange::Target::Resource(resource_id.to_owned()));
+        super::require_custom_resources(resource_ids)?;
+        let target = exchange::is_exchanging(&self.oidc).then(|| {
+            exchange::Target::Resources(resource_ids.iter().map(|id| id.to_string()).collect())
+        });
         self.authorize(auth_url, authn_token, target).await
     }
 }

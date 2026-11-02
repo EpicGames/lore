@@ -100,11 +100,11 @@ impl Authentication for Revoking {
         Err(unused())
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         Err(unused())
