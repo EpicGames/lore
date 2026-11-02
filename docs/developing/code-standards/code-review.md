@@ -26,7 +26,7 @@ Review adversarially, from the code, not from assumptions, memory, or the change
 4. Check the change against [Guidance](#guidance).
 5. Check for [irreversible changes](#irreversible-changes) and [performance](#performance) issues. These matter most.
 6. Flag a contradicted ADR with no new ADR, an unrecorded decision, and a superseded ADR whose `status` isn't updated.
-7. Check that a user-visible change has a `## Nightly` entry in `docs/release-notes.md`.
+7. Check that every change to shipped behaviour, including server, auth, storage and data-structure changes, adds a note to `docs/release-notes/` with the right `type`, rather than an entry in `docs/release-notes.md`.
 8. In async code, check that a restructured loop, `select!`, or match keeps its error precedence, draining, and channel-close semantics.
 9. Report each finding with its location and a concrete failure. Where one fix is obvious, name it.
 

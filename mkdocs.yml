@@ -57,6 +57,8 @@ exclude_docs: |
   assets/**/*.md
   # mkdocs hook source lives under assets/ but is config, not a published page.
   assets/hooks/
+  # Unreleased notes; a release folds them into release-notes.md.
+  release-notes/
 
 plugins:
   - search

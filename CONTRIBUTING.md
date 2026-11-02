@@ -138,12 +138,13 @@ Because the MIT license doesn't include an express patent grant, the DCO sign-of
 1. Fork the repository.
 2. Make your changes and ensure all tests pass and linting is clean.
 3. Add or update tests for the behavior you're changing.
-4. Open a pull request targeting `main`. The PR description should cover:
+4. If the change affects what Lore does (client, server, API, protocol or stored data), add a release note to [`docs/release-notes/`](docs/release-notes/README.md) rather than editing `docs/release-notes.md`.
+5. Open a pull request targeting `main`. The PR description should cover:
    - **What:** what does this PR do?
    - **Why:** what problem does it solve? Link to the GitHub Issue.
    - **How:** a brief description of your approach, especially if non-obvious.
    - **Testing:** how did you verify the change works?
-5. Every commit must include `Signed-off-by:` as described above.
+6. Every commit must include `Signed-off-by:` as described above.
 
 Keep PRs focused. One logical change per PR.
 
