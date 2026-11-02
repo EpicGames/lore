@@ -8,11 +8,18 @@
 # verbatim; the defect made lore silently fail to exclude matching paths.
 #
 # The matcher also reads a glob as git reads a gitignore pattern, where upstream
-# does not: a bracket expression never matches a separator, `**` is a globstar
-# only as a whole component, and a leading `!` is a literal.
+# does not: only `/` separates components, a bracket expression never matches
+# a separator, `**` is a globstar only as a whole component, and a leading `!`
+# is a literal.
 #
-# The changes are in src/lib.rs, marked with `LORE:` notes. Upstream the `**`
-# backtracking fix.
+# A path that does not start with the glob's literal prefix and end with its
+# literal suffix is rejected before the matcher runs, so against `a/**/*.ext` a
+# path that does not start with `a/` and end with `.ext` runs neither matching
+# pass.
+#
+# The changes are in src/lib.rs, marked with `LORE:` notes, and their tests are
+# marked the same in src/lib.rs, tests/doublestar.rs and tests/literal_ends.rs.
+# Upstream the `**` backtracking fix.
 #
 # Benches and their dev-dependencies are dropped; only the library is used.
 [package]

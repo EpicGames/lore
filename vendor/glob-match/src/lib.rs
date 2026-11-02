@@ -1,4 +1,4 @@
-use std::{ops::Range, path::is_separator};
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, Default)]
 struct State {
@@ -26,12 +26,19 @@ type Capture = Range<usize>;
 
 /// Whether `glob` matches `path`.
 ///
+/// LORE: a path that does not start with the glob's literal prefix and end
+/// with its literal suffix is rejected before either pass; see
+/// `holds_literal_ends`.
+///
 /// LORE: `glob_match_internal` can miss a match where a `**` is followed by a
 /// component holding a wildcard, because it commits the `**` backtrack point on
 /// the first literal match and cannot restore it. It never reports a match that
 /// is not there, so confirming its negatives against `doublestar` is sound, and
 /// only that shape of glob pays for the second pass. See `tests/doublestar.rs`.
 pub fn glob_match(glob: &str, path: &str) -> bool {
+  if !holds_literal_ends(glob.as_bytes(), path.as_bytes()) {
+    return false;
+  }
   if glob_match_internal(glob, path, None) {
     return true;
   }
@@ -39,6 +46,41 @@ pub fn glob_match(glob: &str, path: &str) -> bool {
     return doublestar::matches(glob.as_bytes(), path.as_bytes());
   }
   false
+}
+
+/// LORE: whether `path` starts with the literal prefix of `glob` and ends with
+/// its literal suffix, as every path the glob matches does. The prefix is the
+/// bytes before the first of `*`, `?`, `[`, `]`, `{`, `}`, `,` and `\`. The
+/// suffix is the bytes after the last of them or of `/`, and after the byte that
+/// follows the last `\`.
+///
+/// A wildcard, a bracket expression and a brace group match other bytes, and
+/// the last alternative of an unclosed group can end a match. A `/` after `**`
+/// can match nothing, so the suffix stops at one. A `\` can stand for another
+/// byte, as `\b` stands for a backspace.
+fn holds_literal_ends(glob: &[u8], path: &[u8]) -> bool {
+  let syntax = |c: &u8| {
+    matches!(
+      c,
+      b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b',' | b'/' | b'\\'
+    )
+  };
+  let mut prefix = path.iter();
+  for c in glob.iter().take_while(|&&c| c == b'/' || !syntax(&c)) {
+    if prefix.next() != Some(c) {
+      return false;
+    }
+  }
+  let mut suffix = path.iter().rev();
+  for (index, c) in glob.iter().enumerate().rev() {
+    if syntax(c) || (index > 0 && glob[index - 1] == b'\\') {
+      return true;
+    }
+    if suffix.next() != Some(c) {
+      return false;
+    }
+  }
+  true
 }
 
 /// LORE: a straightforward, correct matcher used only to confirm negatives from
@@ -234,8 +276,10 @@ pub fn glob_match_with_captures<'a>(glob: &str, path: &'a str) -> Option<Vec<Cap
 }
 
 /// LORE: matches a glob against a path as git matches a gitignore pattern, in
-/// three ways upstream does not:
+/// four ways upstream does not:
 ///
+/// - Only `/` separates components, as in a gitignore pattern, so `?`, `*` and
+///   a bracket expression match a `\` in a path on every platform.
 /// - A bracket expression never matches a separator, as `?` and `*` do not, so
 ///   `a[!x]b` and `a[--0]b` do not match `a/b`.
 /// - Two or more `*` are a globstar only as a whole component, opening the glob
@@ -309,7 +353,7 @@ fn glob_match_internal<'a>(
               // In effect, this makes the whole segment optional so that a/**/b matches a/b.
               if state.path_index == 0
                 || (state.path_index < path.len()
-                  && is_separator(path[state.path_index - 1] as char))
+                  && path[state.path_index - 1] == b'/')
               {
                 state.end_capture(&mut captures);
                 state.glob_index += 1;
@@ -327,7 +371,7 @@ fn glob_match_internal<'a>(
           // either jump back to a previous ** or end the wildcard.
           if state.globstar.path_index != state.wildcard.path_index
             && state.path_index < path.len()
-            && is_separator(path[state.path_index] as char)
+            && path[state.path_index] == b'/'
           {
             // Special case: don't jump back for a / at the end of the glob.
             if state.globstar.path_index > 0 && state.path_index + 1 < path.len() {
@@ -355,7 +399,7 @@ fn glob_match_internal<'a>(
           continue;
         }
         b'?' if state.path_index < path.len() => {
-          if !is_separator(path[state.path_index] as char) {
+          if path[state.path_index] != b'/' {
             state.add_char_capture(&mut captures);
             state.glob_index += 1;
             state.path_index += 1;
@@ -411,7 +455,7 @@ fn glob_match_internal<'a>(
             return false;
           }
           state.glob_index += 1;
-          if is_match != negated && !is_separator(c as char) {
+          if is_match != negated && c != b'/' {
             state.add_char_capture(&mut captures);
             state.path_index += 1;
             continue;
@@ -456,11 +500,7 @@ fn glob_match_internal<'a>(
             return false;
           }
 
-          let is_match = if c == b'/' {
-            is_separator(path[state.path_index] as char)
-          } else {
-            path[state.path_index] == c
-          };
+          let is_match = path[state.path_index] == c;
 
           if is_match {
             state.end_capture(&mut captures);
@@ -476,9 +516,8 @@ fn glob_match_internal<'a>(
             // If this is not a separator, lock in the previous globstar.
             //
             // LORE: this commit is irreversible, and that is the `**`
-            // backtracking defect -- see `doublestar` at the bottom of this
-            // file. Upstream's state machine is left exactly as it was; the
-            // correction happens in `glob_match`.
+            // backtracking defect -- see `doublestar`. The fast path keeps
+            // upstream's `**` backtracking, and `glob_match` corrects it.
             if c != b'/' {
               state.globstar.path_index = 0;
             }
@@ -1886,7 +1925,7 @@ mod tests {
     assert!(glob_match("**/*.md", "a.md"));
   }
 
-  /// LORE: the three departures from upstream on `glob_match_internal`, with
+  /// LORE: the four departures from upstream on `glob_match_internal`, with
   /// git's answer for each, held against the confirming matcher as well since
   /// the two must agree. A row with a `**` component followed by one holding a
   /// wildcard is one the confirming matcher is consulted for when the fast path
@@ -1933,6 +1972,11 @@ mod tests {
       ("a**\\/b", "ab/b", true),
       ("a**\\/b", "a/x/b", false),
       ("a/**/*/b\\/c", "a/x/b\\/c", false),
+      ("*/b", "a\\b", false),
+      ("a*", "a\\b", true),
+      ("a?b", "a\\b", true),
+      ("a[!x]b", "a\\b", true),
+      ("**/b", "a\\b", false),
     ];
     for (glob, path, matched) in cases {
       assert_eq!(glob_match(glob, path), *matched, "{glob} against {path}");
