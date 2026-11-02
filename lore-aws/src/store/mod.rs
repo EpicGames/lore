@@ -4,6 +4,7 @@ pub mod immutable_store;
 pub mod lock_store;
 pub mod mutable_store;
 pub mod object_metadata;
+mod single_flight;
 
 #[cfg(test)]
 pub mod test_util;

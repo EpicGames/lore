@@ -74,6 +74,8 @@ use crate::s3::S3;
 use crate::store::object_metadata::ObjectMetadataError;
 use crate::store::object_metadata::from_object_metadata;
 use crate::store::object_metadata::to_object_metadata;
+use crate::store::single_flight::Role;
+use crate::store::single_flight::SingleFlight;
 
 pub mod metadata_migrator;
 
@@ -465,6 +467,13 @@ const METRICS_MISSING_PAYLOAD_METRIC_NAME: &str = "missing_payload";
 /// Bare, for the reason on [`METRICS_MISSING_PAYLOAD_METRIC_NAME`].
 const METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME: &str = "association_without_state";
 
+/// Counts shared association and state reads by `role`. A `leader` issues the `DynamoDB` read; a
+/// `follower` uses the result of a read already in progress for the same key. `read` names the
+/// read, and `context` names the operation that requested it.
+///
+/// Bare, for the reason on [`METRICS_MISSING_PAYLOAD_METRIC_NAME`].
+const METRICS_SHARED_READS_METRIC_NAME: &str = "shared_reads";
+
 /// Lower bound on the obliteration drain, regardless of how the `DynamoDB` timeout is configured.
 const MIN_OBLITERATION_DRAIN_MILLIS: u64 = 100;
 
@@ -522,6 +531,45 @@ fn stored_durable(mut fragment: Fragment) -> Fragment {
 static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("store", "aws")]);
 
+/// The labels one operation records its shared reads under.
+struct SharedReadLabels {
+    association_leader: LabelArray,
+    association_follower: LabelArray,
+    state_leader: LabelArray,
+    state_follower: LabelArray,
+}
+
+impl SharedReadLabels {
+    fn new(provider: &impl InstrumentProvider, context: &'static str) -> Self {
+        let labels = |read: &'static str, role: &'static str| {
+            let mut labels = provider.get_labels_for_operation_context(context);
+            labels.push(KeyValue::new("read", read));
+            labels.push(KeyValue::new("role", role));
+            labels
+        };
+        Self {
+            association_leader: labels("exists", "leader"),
+            association_follower: labels("exists", "follower"),
+            state_leader: labels("state", "leader"),
+            state_follower: labels("state", "follower"),
+        }
+    }
+
+    fn association(&self, role: Role) -> &[KeyValue] {
+        match role {
+            Role::Leader => &self.association_leader,
+            Role::Follower => &self.association_follower,
+        }
+    }
+
+    fn state(&self, role: Role) -> &[KeyValue] {
+        match role {
+            Role::Leader => &self.state_leader,
+            Role::Follower => &self.state_follower,
+        }
+    }
+}
+
 struct GetS3objectContentsOutput {
     read: usize,
     bytes: BytesMut,
@@ -557,6 +605,13 @@ pub struct AwsImmutableStore {
     /// already says which condition it is, and either can be observed from more than one operation.
     missing_payload_counter: Counter<u64>,
     association_without_state_counter: Counter<u64>,
+    association_reads: SingleFlight<(Partition, Address), Result<bool, StoreError>>,
+    state_reads: SingleFlight<Hash, Result<Option<FragmentState>, StoreError>>,
+    shared_reads_counter: Counter<u64>,
+    shared_labels_get: SharedReadLabels,
+    shared_labels_put: SharedReadLabels,
+    shared_labels_copy: SharedReadLabels,
+    shared_labels_get_metadata: SharedReadLabels,
 }
 
 impl AwsImmutableStore {
@@ -574,6 +629,11 @@ impl AwsImmutableStore {
         let missing_payload_counter = provider.counter(METRICS_MISSING_PAYLOAD_METRIC_NAME);
         let association_without_state_counter =
             provider.counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME);
+        let shared_reads_counter = provider.counter(METRICS_SHARED_READS_METRIC_NAME);
+        let shared_labels_get = SharedReadLabels::new(&provider, "get");
+        let shared_labels_put = SharedReadLabels::new(&provider, "put");
+        let shared_labels_copy = SharedReadLabels::new(&provider, "copy");
+        let shared_labels_get_metadata = SharedReadLabels::new(&provider, "get_metadata");
         Self {
             s3,
             dynamodb,
@@ -603,13 +663,58 @@ impl AwsImmutableStore {
             labels_query,
             missing_payload_counter,
             association_without_state_counter,
+            association_reads: SingleFlight::default(),
+            state_reads: SingleFlight::default(),
+            shared_reads_counter,
+            shared_labels_get,
+            shared_labels_put,
+            shared_labels_copy,
+            shared_labels_get_metadata,
         }
+    }
+
+    /// Checks whether this partition holds the association for this address. Concurrent callers
+    /// checking the same address share the read. `labels` belong to the calling operation.
+    async fn exists(
+        &self,
+        partition: Partition,
+        address: Address,
+        labels: &SharedReadLabels,
+    ) -> Result<bool, StoreError> {
+        let (exists, role) = self
+            .association_reads
+            .run((partition, address), || {
+                self.read_association(partition, address)
+            })
+            .await;
+        self.shared_reads_counter.add(1, labels.association(role));
+        exists
+    }
+
+    /// Reads the lifecycle state of a hash, sharing the read with concurrent callers querying the
+    /// same hash. The shared read can begin before the caller's request. It always begins after
+    /// any state write by this store that completed before the request began. A caller must
+    /// tolerate a read racing an obliteration's mark. A step that needs a read issued after its
+    /// own request began, such as taking or releasing that mark, must read unshared. `labels`
+    /// belong to the calling operation.
+    async fn load_state_shared(
+        &self,
+        hash: Hash,
+        labels: &SharedReadLabels,
+    ) -> Result<Option<FragmentState>, StoreError> {
+        let (state, role) = self.state_reads.run(hash, || self.load_state(hash)).await;
+        self.shared_reads_counter.add(1, labels.state(role));
+        state
     }
 
     /// Whether this partition holds the association for this address, which is the whole of what
     /// this store will serve: it isolates partitions, so it reads no wider than the association
     /// asked about.
-    async fn exists(&self, partition: Partition, address: Address) -> Result<bool, StoreError> {
+    async fn read_association(
+        &self,
+        partition: Partition,
+        address: Address,
+    ) -> Result<bool, StoreError> {
         let entry = FragmentsEntry::new(partition, address);
         let item = serde_dynamo::to_item(&entry).map_err(|e| {
             warn!(
@@ -701,18 +806,20 @@ impl AwsImmutableStore {
     /// sees the fragment — which is accurate, since the payload survives for as long as any
     /// reference to it does.
     ///
-    /// `labels` is the calling operation's own label array, used for the one counter this can emit
-    /// so that `context` names that operation rather than the condition. Passed in rather than
-    /// chosen here because the condition says nothing about which read noticed it.
+    /// `labels` is the calling operation's label array for counting associations without state.
+    /// Its `context` names the operation rather than the condition. The caller supplies these
+    /// labels because the condition doesn't identify which read noticed it. `shared_labels` are the
+    /// same operation's labels for the shared reads it makes.
     async fn do_query(
         &self,
         partition: Partition,
         address: Address,
         labels: &[KeyValue],
+        shared_labels: &SharedReadLabels,
     ) -> Result<(QueryResultSource, StoreGetData), StoreError> {
         let (associated, state) = tokio::join!(
-            self.exists(partition, address),
-            self.load_state(address.hash)
+            self.exists(partition, address, shared_labels),
+            self.load_state_shared(address.hash, shared_labels)
         );
 
         let miss = Ok((QueryResultSource::State, StoreGetData::default()));
@@ -851,8 +958,11 @@ impl AwsImmutableStore {
         })?;
 
         match self
-            .dynamodb
-            .put_item_conditional(&self.fragment_state_table_name, item, RowAbsent)
+            .state_reads
+            .write(hash, || {
+                self.dynamodb
+                    .put_item_conditional(&self.fragment_state_table_name, item, RowAbsent)
+            })
             .await
         {
             Ok(_) => Ok(FragmentState::Stored),
@@ -940,8 +1050,11 @@ impl AwsImmutableStore {
             StoreError::internal_with_context(e, "Failed to serialize fragment state for delete")
         })?;
 
-        self.dynamodb
-            .delete_item(&self.fragment_state_table_name, item)
+        self.state_reads
+            .write(hash, || {
+                self.dynamodb
+                    .delete_item(&self.fragment_state_table_name, item)
+            })
             .await
             .map_err(|e| {
                 if matches!(&e, AwsError::AwsSdkError(_)) {
@@ -1003,12 +1116,14 @@ impl AwsImmutableStore {
         })?;
 
         match self
-            .dynamodb
-            .put_item_conditional(
-                &self.fragment_state_table_name,
-                item,
-                StateUnchanged(expected),
-            )
+            .state_reads
+            .write(hash, || {
+                self.dynamodb.put_item_conditional(
+                    &self.fragment_state_table_name,
+                    item,
+                    StateUnchanged(expected),
+                )
+            })
             .await
         {
             Ok(_) => Ok(()),
@@ -1047,7 +1162,12 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb.put_item(&self.fragments_table_name, item).await
+        self.association_reads
+            .write(
+                (partition, address),
+                || self.dynamodb.put_item(&self.fragments_table_name, item),
+            )
+            .await
             .map_err(|e| {
                 warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
@@ -1240,8 +1360,11 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb
-            .delete_item(&self.fragments_table_name, item)
+        self.association_reads
+            .write(
+                (partition, address),
+                || self.dynamodb.delete_item(&self.fragments_table_name, item),
+            )
             .await
             .map_err(|e| {
                 warn!({PARTITION_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to delete fragment association");
@@ -1840,8 +1963,12 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // for the resolution first would put two round trips in series on every hit. One
             // resolution is all there is to wait for — this store's read scope is the exact
             // association, so there is no wider level for a miss to fall back to.
-            let mut query_fut =
-                Box::pin(self.do_query(partition, address, &self.labels_get_metadata));
+            let mut query_fut = Box::pin(self.do_query(
+                partition,
+                address,
+                &self.labels_get_metadata,
+                &self.shared_labels_get_metadata,
+            ));
             let mut head_fut = Box::pin(self.head_fragment(address.hash));
 
             let mut head_result = None;
@@ -1902,7 +2029,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             timed!(self.latency_histogram, &self.labels_get, {
                 // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
                 // If load finishes first its result is stashed, and we keep waiting for exists check.
-                let exists_fut = self.exists(partition, address);
+                let exists_fut = self.exists(partition, address, &self.shared_labels_get);
                 let load_fut = self.load(address.hash);
                 tokio::pin!(exists_fut, load_fut);
 
@@ -1970,8 +2097,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 (None, false)
             } else {
                 let (associated, state) = tokio::join!(
-                    self.exists(partition, address),
-                    self.load_state(address.hash)
+                    self.exists(partition, address, &self.shared_labels_put),
+                    self.load_state_shared(address.hash, &self.shared_labels_put)
                 );
                 (state?, associated?)
             };
@@ -2135,7 +2262,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 self.has_partition_association(source_partition, source_address.hash)
                     .await?
             } else {
-                self.exists(source_partition, source_address).await?
+                self.exists(source_partition, source_address, &self.shared_labels_copy)
+                    .await?
             };
             if !present {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
@@ -4132,6 +4260,238 @@ mod test {
             assert!(
                 body.iter().all(|byte| *byte == expected_byte),
                 "the bytes must be the ones the winning writer uploaded, not a mix"
+            );
+        }
+    }
+
+    /// A store containing one fragment inserted through its put operation.
+    async fn stored(fake: &Fake) -> (Arc<AwsImmutableStore>, Partition, Address, Fragment, Bytes) {
+        let store = store(fake).await;
+        let partition: Partition = random();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("put should succeed");
+        (store, partition, address, fragment, payload)
+    }
+
+    mod put {
+        use tokio::sync::oneshot;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn takes_the_state_read_already_in_flight() {
+            let fake = Fake::default();
+            let (store, partition, address, fragment, payload) = stored(&fake).await;
+            let state_get_items = fake.state_get_items();
+
+            let (release, released) = oneshot::channel();
+            let mut in_flight = Box::pin(
+                store
+                    .state_reads
+                    .run(address.hash, || async { released.await.expect("released") }),
+            );
+            assert!(poll_once(in_flight.as_mut()).await.is_pending());
+
+            let mut put = store
+                .clone()
+                .put(partition, address, fragment, Some(payload), false);
+            assert!(poll_once(put.as_mut()).await.is_pending());
+
+            release
+                .send(Ok(Some(FragmentState::Stored)))
+                .expect("the read in flight is waiting");
+            assert_eq!(in_flight.await.1, Role::Leader);
+            put.await.expect("put should succeed");
+            assert_eq!(fake.state_get_items(), state_get_items);
+        }
+    }
+
+    mod get {
+        use std::task::Poll;
+
+        use tokio::sync::oneshot;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn after_a_copy_reads_the_association_the_copy_wrote() {
+            let fake = Fake::default();
+            let (store, partition, address, _, payload) = stored(&fake).await;
+            let destination_partition: Partition = random();
+            let destination = Address {
+                hash: address.hash,
+                context: random(),
+            };
+
+            let (_release, released) = oneshot::channel::<Result<bool, StoreError>>();
+            let mut before_copy = Box::pin(
+                store
+                    .association_reads
+                    .run((destination_partition, destination), || async {
+                        released.await.expect("released")
+                    }),
+            );
+            assert!(poll_once(before_copy.as_mut()).await.is_pending());
+
+            store
+                .clone()
+                .copy(
+                    partition,
+                    address,
+                    destination_partition,
+                    destination.context,
+                    CopyBehavior {
+                        durable: true,
+                        do_not_replicate: false,
+                    },
+                )
+                .await
+                .expect("copy should succeed");
+
+            let mut get = store.clone().get(destination_partition, destination);
+            let Poll::Ready(got) = poll_once(get.as_mut()).await else {
+                panic!("the get joined a read that began before the copy");
+            };
+            assert_eq!(got.expect("get should succeed").payload, Some(payload));
+        }
+    }
+
+    mod exists {
+        use std::task::Poll;
+
+        use tokio::sync::oneshot;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn after_a_delete_reads_the_association_gone() {
+            let fake = Fake::default();
+            let (store, partition, address, _, _) = stored(&fake).await;
+
+            let (_release, released) = oneshot::channel::<Result<bool, StoreError>>();
+            let mut before_delete =
+                Box::pin(store.association_reads.run((partition, address), || async {
+                    released.await.expect("released")
+                }));
+            assert!(poll_once(before_delete.as_mut()).await.is_pending());
+
+            store
+                .delete_association(partition, address)
+                .await
+                .expect("delete should succeed");
+
+            let mut exists = Box::pin(store.exists(partition, address, &store.shared_labels_put));
+            let Poll::Ready(exists) = poll_once(exists.as_mut()).await else {
+                panic!("the read joined one that began before the delete");
+            };
+            assert!(!exists.expect("exists should succeed"));
+        }
+    }
+
+    mod load_state_shared {
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        use tokio::sync::oneshot;
+
+        use super::*;
+
+        /// Keeps a state read for `hash` in flight so it predates the test's next operation.
+        async fn hold_state_read(
+            store: &AwsImmutableStore,
+            hash: Hash,
+        ) -> (
+            oneshot::Sender<Result<Option<FragmentState>, StoreError>>,
+            Pin<Box<impl Future<Output = (Result<Option<FragmentState>, StoreError>, Role)> + '_>>,
+        ) {
+            let (release, released) = oneshot::channel();
+            let mut in_flight = Box::pin(
+                store
+                    .state_reads
+                    .run(hash, || async { released.await.expect("released") }),
+            );
+            assert!(poll_once(in_flight.as_mut()).await.is_pending());
+            (release, in_flight)
+        }
+
+        #[tokio::test]
+        async fn after_an_obliteration_mark_reads_the_mark() {
+            let fake = Fake::default();
+            let store = store(&fake).await;
+            let hash: Hash = random();
+            fake.set_state(hash, FragmentState::Stored);
+            let _before_mark = hold_state_read(&store, hash).await;
+
+            store
+                .advance_state(hash, FragmentState::Stored, FragmentState::Obliterating)
+                .await
+                .expect("the mark should be taken");
+
+            let mut state = Box::pin(store.load_state_shared(hash, &store.shared_labels_put));
+            let Poll::Ready(state) = poll_once(state.as_mut()).await else {
+                panic!("the read joined one that began before the mark");
+            };
+            assert_eq!(
+                state.expect("state read should succeed"),
+                Some(FragmentState::Obliterating)
+            );
+        }
+
+        #[tokio::test]
+        async fn after_a_clear_reads_no_state() {
+            let fake = Fake::default();
+            let store = store(&fake).await;
+            let hash: Hash = random();
+            fake.set_state(hash, FragmentState::Stored);
+            let _before_clear = hold_state_read(&store, hash).await;
+
+            store.clear_state(hash).await.expect("clear should succeed");
+
+            let mut state = Box::pin(store.load_state_shared(hash, &store.shared_labels_put));
+            let Poll::Ready(state) = poll_once(state.as_mut()).await else {
+                panic!("the read joined one that began before the clear");
+            };
+            assert_eq!(state.expect("state read should succeed"), None);
+        }
+
+        #[tokio::test]
+        async fn after_a_publish_reads_the_published_state() {
+            let fake = Fake::default();
+            let store = store(&fake).await;
+            let hash: Hash = random();
+
+            let (_release, released) =
+                oneshot::channel::<Result<Option<FragmentState>, StoreError>>();
+            let mut before_publish = Box::pin(
+                store
+                    .state_reads
+                    .run(hash, || async { released.await.expect("released") }),
+            );
+            assert!(poll_once(before_publish.as_mut()).await.is_pending());
+
+            assert_eq!(
+                store
+                    .publish_state(hash)
+                    .await
+                    .expect("publish should succeed"),
+                FragmentState::Stored
+            );
+
+            let mut state = Box::pin(store.load_state_shared(hash, &store.shared_labels_put));
+            let Poll::Ready(state) = poll_once(state.as_mut()).await else {
+                panic!("the read joined one that began before the publish");
+            };
+            assert_eq!(
+                state.expect("state read should succeed"),
+                Some(FragmentState::Stored)
             );
         }
     }
