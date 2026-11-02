@@ -262,12 +262,40 @@ async fn merge_conflicts(
     );
 }
 
+/// Edits of one file on both branches conflict for each of `cases`: a move one branch also makes,
+/// whether the feature branch makes it rather than main, and what the merge leaves. Each case runs
+/// in an instance of its own, named for `name`.
+async fn edits_on_both_branches_conflict(
+    name: &str,
+    cases: &'static [(&'static Moved, bool, Conflicted)],
+) {
+    for (moved, move_on_feature, expected) in cases {
+        run(name, &TREE, move |instance| async move {
+            let (feature, main) = if *move_on_feature {
+                (
+                    moving(moved, Some("feature")),
+                    vec![Edit::Write(moved.file, "main")],
+                )
+            } else {
+                (
+                    vec![Edit::Write(moved.file, "feature")],
+                    moving(moved, Some("main")),
+                )
+            };
+            merge_conflicts(&instance, &feature, &main, expected).await;
+        })
+        .await;
+    }
+}
+
 /// Edits of one file on both branches conflict, whether or not one of them also moved it, the move
-/// on either branch, as [`MOVES`] lists them.
+/// on either branch, as [`MOVES`] lists them, except where the merge keeps two spellings of a name.
 #[tokio::test(flavor = "multi_thread")]
 async fn edits_on_both_branches_conflict_whether_or_not_one_moved() {
-    const EXPECTED: [[Conflicted; 2]; 4] = [
-        [
+    const CASES: [(&Moved, bool, Conflicted); 5] = [
+        (
+            &MOVES[0],
+            true,
             Conflicted {
                 conflict: "Dir/z.txt",
                 tree: &[
@@ -285,6 +313,10 @@ async fn edits_on_both_branches_conflict_whether_or_not_one_moved() {
                     "Top.txt",
                 ],
             },
+        ),
+        (
+            &MOVES[0],
+            false,
             Conflicted {
                 conflict: "Dir/a.txt",
                 tree: &[
@@ -302,32 +334,10 @@ async fn edits_on_both_branches_conflict_whether_or_not_one_moved() {
                     "Top.txt",
                 ],
             },
-        ],
-        [
-            Conflicted {
-                conflict: "Dir/a.txt",
-                tree: &[
-                    ("Dir/A.txt", "feature"),
-                    ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
-                    ("Dir/a.txt", "main"),
-                    ("Dir/b.txt", "Dir/b.txt"),
-                    ("Top.txt", "Top.txt"),
-                ],
-                staged: &["Dir/Sub/c.txt", "Dir/a.txt", "Dir/b.txt", "Top.txt"],
-            },
-            Conflicted {
-                conflict: "Dir/A.txt",
-                tree: &[
-                    ("Dir/A.txt", "main"),
-                    ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
-                    ("Dir/a.txt", "feature"),
-                    ("Dir/b.txt", "Dir/b.txt"),
-                    ("Top.txt", "Top.txt"),
-                ],
-                staged: &["Dir/A.txt", "Dir/Sub/c.txt", "Dir/b.txt", "Top.txt"],
-            },
-        ],
-        [
+        ),
+        (
+            &MOVES[2],
+            true,
             Conflicted {
                 conflict: "Dir/Zub/c.txt",
                 tree: &[
@@ -339,6 +349,10 @@ async fn edits_on_both_branches_conflict_whether_or_not_one_moved() {
                 ],
                 staged: &["Dir/Zub/c.txt", "Dir/a.txt", "Dir/b.txt", "Top.txt"],
             },
+        ),
+        (
+            &MOVES[2],
+            false,
             Conflicted {
                 conflict: "Dir/Sub/c.txt",
                 tree: &[
@@ -356,8 +370,10 @@ async fn edits_on_both_branches_conflict_whether_or_not_one_moved() {
                     "Top.txt",
                 ],
             },
-        ],
-        [
+        ),
+        (
+            &MOVES[3],
+            true,
             Conflicted {
                 conflict: "Dir/sub/c.txt",
                 tree: &[
@@ -368,6 +384,54 @@ async fn edits_on_both_branches_conflict_whether_or_not_one_moved() {
                 ],
                 staged: &["Dir/a.txt", "Dir/b.txt", "Dir/sub/c.txt", "Top.txt"],
             },
+        ),
+    ];
+    edits_on_both_branches_conflict(
+        "edits_on_both_branches_conflict_whether_or_not_one_moved",
+        &CASES,
+    )
+    .await;
+}
+
+/// Edits of one file on both branches conflict where one of them also moved it to a name differing
+/// only in case, and the merge keeps both spellings, which only a case-sensitive file system holds.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn edits_on_both_branches_conflict_keeping_both_spellings() {
+    const CASES: [(&Moved, bool, Conflicted); 3] = [
+        (
+            &MOVES[1],
+            true,
+            Conflicted {
+                conflict: "Dir/a.txt",
+                tree: &[
+                    ("Dir/A.txt", "feature"),
+                    ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
+                    ("Dir/a.txt", "main"),
+                    ("Dir/b.txt", "Dir/b.txt"),
+                    ("Top.txt", "Top.txt"),
+                ],
+                staged: &["Dir/Sub/c.txt", "Dir/a.txt", "Dir/b.txt", "Top.txt"],
+            },
+        ),
+        (
+            &MOVES[1],
+            false,
+            Conflicted {
+                conflict: "Dir/A.txt",
+                tree: &[
+                    ("Dir/A.txt", "main"),
+                    ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
+                    ("Dir/a.txt", "feature"),
+                    ("Dir/b.txt", "Dir/b.txt"),
+                    ("Top.txt", "Top.txt"),
+                ],
+                staged: &["Dir/A.txt", "Dir/Sub/c.txt", "Dir/b.txt", "Top.txt"],
+            },
+        ),
+        (
+            &MOVES[3],
+            false,
             Conflicted {
                 conflict: "Dir/sub/c.txt",
                 tree: &[
@@ -379,87 +443,77 @@ async fn edits_on_both_branches_conflict_whether_or_not_one_moved() {
                 ],
                 staged: &["Dir/a.txt", "Dir/b.txt", "Dir/sub/c.txt", "Top.txt"],
             },
-        ],
+        ),
     ];
-    for (moved, expected) in MOVES.iter().zip(&EXPECTED) {
-        for (move_on_feature, expected) in [true, false].into_iter().zip(expected) {
-            run(
-                "edits_on_both_branches_conflict_whether_or_not_one_moved",
-                &TREE,
-                move |instance| async move {
-                    let (feature, main) = if move_on_feature {
-                        (
-                            moving(moved, Some("feature")),
-                            vec![Edit::Write(moved.file, "main")],
-                        )
-                    } else {
-                        (
-                            vec![Edit::Write(moved.file, "feature")],
-                            moving(moved, Some("main")),
-                        )
-                    };
-                    merge_conflicts(&instance, &feature, &main, expected).await;
-                },
-            )
-            .await;
-        }
+    edits_on_both_branches_conflict(
+        "edits_on_both_branches_conflict_keeping_both_spellings",
+        &CASES,
+    )
+    .await;
+}
+
+/// Moves `Dir/a.txt` on both branches for each of `cases`: where the feature branch moves it,
+/// where main does, and what the merge leaves. Each case runs in an instance of its own, named for
+/// `name`.
+async fn moves_conflict(name: &str, cases: &'static [(&'static str, &'static str, Conflicted)]) {
+    for (feature, main, expected) in cases {
+        run(name, &TREE, move |instance| async move {
+            let feature = [Edit::Move("Dir/a.txt", feature)];
+            let main = [Edit::Move("Dir/a.txt", main)];
+            merge_conflicts(&instance, &feature, &main, expected).await;
+        })
+        .await;
     }
 }
 
-/// Moves of one file to different names on the two branches conflict, names differing only in
-/// case included.
+/// Moves of one file to different names on the two branches conflict.
 #[tokio::test(flavor = "multi_thread")]
 async fn moves_to_different_names_conflict() {
-    const CASES: [(&str, &str, Conflicted); 2] = [
-        (
-            "Dir/z.txt",
-            "Dir/y.txt",
-            Conflicted {
-                conflict: "Dir/z.txt",
-                tree: &[
-                    ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
-                    ("Dir/b.txt", "Dir/b.txt"),
-                    ("Dir/y.txt", "Dir/a.txt"),
-                    ("Dir/z.txt", "Dir/a.txt"),
-                    ("Top.txt", "Top.txt"),
-                ],
-                staged: &[
-                    "Dir/Sub/c.txt",
-                    "Dir/b.txt",
-                    "Dir/y.txt",
-                    "Dir/z.txt",
-                    "Top.txt",
-                ],
-            },
-        ),
-        (
-            "Dir/A.txt",
-            "Dir/A.TXT",
-            Conflicted {
-                conflict: "Dir/A.TXT",
-                tree: &[
-                    ("Dir/A.TXT", "Dir/a.txt"),
-                    ("Dir/A.txt", "Dir/a.txt"),
-                    ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
-                    ("Dir/b.txt", "Dir/b.txt"),
-                    ("Top.txt", "Top.txt"),
-                ],
-                staged: &["Dir/A.TXT", "Dir/Sub/c.txt", "Dir/b.txt", "Top.txt"],
-            },
-        ),
-    ];
-    for (feature, main, expected) in &CASES {
-        run(
-            "moves_to_different_names_conflict",
-            &TREE,
-            move |instance| async move {
-                let feature = [Edit::Move("Dir/a.txt", feature)];
-                let main = [Edit::Move("Dir/a.txt", main)];
-                merge_conflicts(&instance, &feature, &main, expected).await;
-            },
-        )
-        .await;
-    }
+    const CASES: [(&str, &str, Conflicted); 1] = [(
+        "Dir/z.txt",
+        "Dir/y.txt",
+        Conflicted {
+            conflict: "Dir/z.txt",
+            tree: &[
+                ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
+                ("Dir/b.txt", "Dir/b.txt"),
+                ("Dir/y.txt", "Dir/a.txt"),
+                ("Dir/z.txt", "Dir/a.txt"),
+                ("Top.txt", "Top.txt"),
+            ],
+            staged: &[
+                "Dir/Sub/c.txt",
+                "Dir/b.txt",
+                "Dir/y.txt",
+                "Dir/z.txt",
+                "Top.txt",
+            ],
+        },
+    )];
+    moves_conflict("moves_to_different_names_conflict", &CASES).await;
+}
+
+/// Moves of one file to names differing only in case on the two branches conflict, and the merge
+/// keeps both spellings, which only a case-sensitive file system holds.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn moves_to_names_differing_only_in_case_conflict() {
+    const CASES: [(&str, &str, Conflicted); 1] = [(
+        "Dir/A.txt",
+        "Dir/A.TXT",
+        Conflicted {
+            conflict: "Dir/A.TXT",
+            tree: &[
+                ("Dir/A.TXT", "Dir/a.txt"),
+                ("Dir/A.txt", "Dir/a.txt"),
+                ("Dir/Sub/c.txt", "Dir/Sub/c.txt"),
+                ("Dir/b.txt", "Dir/b.txt"),
+                ("Top.txt", "Top.txt"),
+            ],
+            staged: &["Dir/A.TXT", "Dir/Sub/c.txt", "Dir/b.txt", "Top.txt"],
+        },
+    )];
+    moves_conflict("moves_to_names_differing_only_in_case_conflict", &CASES).await;
 }
 
 /// A file deleted on one branch conflicts with the other branch's move of it, where the move put
