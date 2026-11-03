@@ -60,6 +60,31 @@ pub async fn diff_revision_paths(
     paths: Option<Vec<RelativePath>>,
     tx: mpsc::Sender<Result<NodeChange, DiffError>>,
 ) -> Result<(), DiffError> {
+    diff_revision_paths_filtered(
+        repository,
+        state_source,
+        state_target,
+        paths,
+        FilterMode::View,
+        tx,
+    )
+    .await
+}
+
+/// [`diff_revision_paths`] through `filter` rather than the repository's view.
+///
+/// [`FilterMode::View`] leaves out every path the local view excludes, which is what a caller
+/// bringing a working copy to the target wants. A caller describing what a revision changed
+/// passes [`FilterMode::empty()`], so a change to a path this working copy does not hold is
+/// reported too: both sides are stored states, which the walk reads whatever the view says.
+pub async fn diff_revision_paths_filtered(
+    repository: Arc<RepositoryContext>,
+    state_source: Arc<State>,
+    state_target: Arc<State>,
+    paths: Option<Vec<RelativePath>>,
+    filter: FilterMode,
+    tx: mpsc::Sender<Result<NodeChange, DiffError>>,
+) -> Result<(), DiffError> {
     let mut tasks: JoinSet<Result<(), DiffError>> = JoinSet::new();
     let paths = paths.unwrap_or_else(|| vec![RelativePath::new()]);
     for path in paths.iter() {
@@ -85,7 +110,7 @@ pub async fn diff_revision_paths(
                         path,
                         None,
                         &changes,
-                        FilterMode::View,
+                        filter,
                     )
                     .await
                 });
