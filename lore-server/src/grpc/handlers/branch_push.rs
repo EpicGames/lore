@@ -91,6 +91,19 @@ static FRAGMENT_LOOKUPS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     BranchPushInstrumentProvider.length_histogram("fragment_lookups", count_boundaries())
 });
 
+static PEAK_METADATA_READS_IN_FLIGHT: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider
+        .length_histogram("peak_metadata_reads_in_flight", doubling_boundaries())
+});
+
+// Zero gets a bucket of its own, for the pushes whose walk read no metadata blob.
+static METADATA_READS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram(
+        "metadata_reads",
+        vec![0., 1., 10., 100., 1_000., 10_000., 100_000., 1_000_000.],
+    )
+});
+
 static CONCURRENT_QUERY_BATCHES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     BranchPushInstrumentProvider.length_histogram("concurrent_query_batches", peak_boundaries())
 });
@@ -148,6 +161,10 @@ fn peak_boundaries() -> Vec<f64> {
         1., 10., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 25_000., 50_000.,
         100_000., 250_000.,
     ]
+}
+
+fn doubling_boundaries() -> Vec<f64> {
+    (0..=16).map(|power| f64::from(1u32 << power)).collect()
 }
 
 fn count_boundaries() -> Vec<f64> {
@@ -291,8 +308,8 @@ pub struct PushReport {
     phase_durations: [Option<Duration>; PushPhase::ALL.len()],
     store_latest_attempts: u64,
     fast_forward_merge_changes: Option<u64>,
-    /// Counts the per-address fragment lookups the verification's tree walk spawns.
-    lookups: Arc<StoreRequestTracker>,
+    /// The fragment lookups and metadata blob reads the verification's tree walk makes.
+    store_requests: Arc<StoreRequestTracker>,
     collected_addresses: Option<u64>,
     concurrent_query_batches: Option<u64>,
     /// When the verification's tree walk started. It runs until the existence checks start.
@@ -321,6 +338,8 @@ pub struct PushSummary {
     pub fast_forward_merge_changes: Option<u64>,
     pub num_lookups: u64,
     pub peak_lookups_in_flight: u64,
+    pub num_metadata_reads: u64,
+    pub peak_metadata_reads_in_flight: u64,
     /// The time the verification's tree walk took, counted up to the snapshot while it runs.
     /// `None` if it never started.
     pub verify_collect: Option<Duration>,
@@ -351,7 +370,7 @@ impl PushReport {
             phase_durations: [None; PushPhase::ALL.len()],
             store_latest_attempts: 0,
             fast_forward_merge_changes: None,
-            lookups: Arc::default(),
+            store_requests: Arc::default(),
             collected_addresses: None,
             concurrent_query_batches: None,
             collect_started: None,
@@ -424,8 +443,10 @@ impl PushReport {
             phase_durations,
             store_latest_attempts: self.store_latest_attempts,
             fast_forward_merge_changes: self.fast_forward_merge_changes,
-            num_lookups: self.lookups.requests(),
-            peak_lookups_in_flight: self.lookups.peak_in_flight(),
+            num_lookups: self.store_requests.lookups(),
+            peak_lookups_in_flight: self.store_requests.peak_lookups_in_flight(),
+            num_metadata_reads: self.store_requests.metadata_reads(),
+            peak_metadata_reads_in_flight: self.store_requests.peak_metadata_reads_in_flight(),
             verify_collect,
             verify_exist,
         }
@@ -504,6 +525,8 @@ impl Drop for PushReport {
                 fast_forward_merge_changes = summary.fast_forward_merge_changes,
                 num_lookups = summary.num_lookups,
                 peak_lookups_in_flight = summary.peak_lookups_in_flight,
+                num_metadata_reads = summary.num_metadata_reads,
+                peak_metadata_reads_in_flight = summary.peak_metadata_reads_in_flight,
                 num_collected_addresses = self.collected_addresses,
                 num_concurrent_query_batches = self.concurrent_query_batches,
                 "Slow, cancelled or failed branch push"
@@ -543,6 +566,12 @@ impl PushReport {
         }
         PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT.record(summary.peak_lookups_in_flight, &[]);
         FRAGMENT_LOOKUPS.record(summary.num_lookups, &[]);
+        METADATA_READS.record(summary.num_metadata_reads, &[]);
+        // A walk that read no metadata blob has no peak to report, and would only skew the peaks
+        // toward zero.
+        if summary.num_metadata_reads != 0 {
+            PEAK_METADATA_READS_IN_FLIGHT.record(summary.peak_metadata_reads_in_flight, &[]);
+        }
         if let Some(collected_addresses) = self.collected_addresses {
             COLLECTED_ADDRESSES.record(collected_addresses, &[]);
         }
@@ -1718,7 +1747,7 @@ async fn verify_fragments(
         parent_state,
         other_parent_state,
         state,
-        report.lookups.clone(),
+        report.store_requests.clone(),
     )
     .await?;
     report.exist_started = Some(Instant::now());

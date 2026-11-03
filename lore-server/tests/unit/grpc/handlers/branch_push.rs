@@ -408,6 +408,10 @@ mod extract_client_ip {
 }
 
 mod push {
+    use lore_revision::node::NodeFileMetadata;
+    use lore_revision::node::NodeFileMetadataBlock;
+    use lore_revision::node::node_to_file_metadata;
+
     use super::*;
 
     #[tokio::test]
@@ -917,6 +921,99 @@ mod push {
                 .expect("the head is stored");
             assert!(commit > std::time::Duration::ZERO);
             assert_eq!(phase_total(&summary), summary.elapsed);
+        }))
+        .await;
+    }
+
+    /// The summary reports one metadata read for each node whose file metadata changes in the
+    /// pushed revision. It also reports the peak number of metadata reads in flight: one, since all
+    /// changed nodes are in one file metadata block.
+    #[tokio::test]
+    async fn a_push_reports_the_metadata_blobs_it_reads() {
+        const CHANGED: u64 = 4;
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                random::<RepositoryId>(),
+            ));
+            let branch = create_test_branch(&repository).await;
+            let chain = push_linear_revisions(&repository, branch, Hash::default(), 1..=1).await;
+
+            let state = new_revision(&repository, branch, chain[0], Hash::default(), 2).await;
+            let mut nodes = vec![];
+            for index in 0..CHANGED {
+                let name = format!("dir-{index}");
+                let node = state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: lore_storage::hash::hash_string(&name),
+                            ..Default::default()
+                        },
+                        &name,
+                    )
+                    .await
+                    .expect("Failed to add a node");
+                nodes.push(node);
+            }
+            let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(nodes[0]));
+            let metadata_block = state
+                .block_file_metadata(repository.clone(), block_index)
+                .await
+                .expect("Failed to read the file metadata block");
+            for (index, &node) in nodes.iter().enumerate() {
+                let metadata_node = node_to_file_metadata(node);
+                assert_eq!(
+                    NodeFileMetadataBlock::index(metadata_node),
+                    block_index,
+                    "Every node must share one file metadata block"
+                );
+                let mut metadata = lore_revision::metadata::Metadata::new();
+                metadata
+                    .set_string("index", &index.to_string())
+                    .expect("Failed to set the metadata value");
+                let hash = metadata
+                    .serialize(repository.clone())
+                    .await
+                    .expect("Failed to serialize the metadata");
+                metadata_block
+                    .write()
+                    .node(NodeFileMetadata::index(metadata_node))
+                    .metadata = hash;
+            }
+            metadata_block.write().mark_dirty();
+            state.block_file_metadata_modified(metadata_block, block_index);
+            state.mark_dirty();
+            state
+                .serialize(repository.clone(), &get_write_token())
+                .await
+                .expect("serialize state");
+
+            let mut report = PushReport::new(PushHandler::Legacy, Default::default());
+            let result = push(
+                repository.clone(),
+                branch,
+                state.revision(),
+                crate::util::test_support::PUSH_ANY,
+                false,
+                false,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+                &mut report,
+            )
+            .await
+            .expect("push with changed file metadata");
+            assert!(result.success);
+
+            let summary = report.summary();
+            assert_eq!(summary.num_metadata_reads, CHANGED);
+            assert_eq!(summary.peak_metadata_reads_in_flight, 1);
         }))
         .await;
     }

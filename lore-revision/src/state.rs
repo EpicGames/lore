@@ -8216,8 +8216,9 @@ pub fn collect_new_fragments(
 /// The addresses of the fragments `state_to` holds that `state_from` does not, that
 /// `collection` keeps, sorted and deduplicated.
 ///
-/// `tracker` counts the store reads of the per-address tasks the collection spawns to look up
-/// each candidate fragment.
+/// `tracker` counts store reads made by the per-address tasks that the collection spawns to look up
+/// each candidate fragment. It also counts reads of metadata blobs named by changed file metadata
+/// blocks.
 pub async fn collect_fragments(
     repository: Arc<RepositoryContext>,
     state_from: Arc<State>,
@@ -8840,9 +8841,12 @@ async fn collect_new_node_metadata_fragments(
 
     let mut metadata_refs = vec![];
     for metadata_blob in metadata_blobs.iter() {
-        let metadata = Metadata::deserialize(repository.clone(), metadata_blob.hash)
-            .await
-            .forward::<StateError>("Failed to deserialize metadata")?;
+        let metadata = {
+            let _read = tracker.track_metadata_read();
+            Metadata::deserialize(repository.clone(), metadata_blob.hash)
+                .await
+                .forward::<StateError>("Failed to deserialize metadata")?
+        };
 
         collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
     }
@@ -8918,7 +8922,7 @@ async fn collect_new_addresses(
         lore_spawn!(task, {
             async move {
                 let query = {
-                    let _request = tracker.track();
+                    let _request = tracker.track_lookup();
                     repository
                         .immutable_store()
                         .get_metadata(repository.id, address)
@@ -8943,7 +8947,7 @@ async fn collect_new_addresses(
                 let mut addresses = vec![];
                 if fragmented
                     && let Ok((_fragment, buffer)) = {
-                        let _request = tracker.track();
+                        let _request = tracker.track_lookup();
                         immutable::load_raw(
                             repository.clone(),
                             address,
@@ -8997,7 +9001,7 @@ async fn collect_new_addresses(
 }
 
 /// Whether the remote holds `address` as a list of fragments. `false` without a remote, or when
-/// the remote cannot answer. The remote read counts as a request of `tracker`.
+/// the remote cannot answer. The remote read counts as a fragment lookup of `tracker`.
 async fn remote_lists_fragments(
     repository: &Arc<RepositoryContext>,
     address: Address,
@@ -9006,7 +9010,7 @@ async fn remote_lists_fragments(
     let Some(session) = immutable::resolve_session(repository) else {
         return false;
     };
-    let _request = tracker.track();
+    let _request = tracker.track_lookup();
     session
         .get_metadata(&address)
         .await

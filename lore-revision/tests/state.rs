@@ -577,170 +577,272 @@ mod tests {
         }
     }
 
-    /// Each file of the new revision is paired with the file of the same name in the old one,
-    /// whatever order the two sibling chains hold them in, so only content the old revision
-    /// does not name at that path is collected.
-    ///
-    /// No content is in the store, so an unpaired file would be collected. That is what makes
-    /// the absence of every unchanged file's content a check of the pairing.
-    #[tokio::test]
-    async fn collect_new_fragments_pairs_files_by_name() {
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+    mod collect_new_fragments {
+        use super::*;
 
-        #[allow(clippy::disallowed_methods)]
-        runtime()
-            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let fixture =
-                    test_repository_create(immutable_store, mutable_store, repository_id).await;
-                let repository = fixture.repository.clone();
-                let write_token = &fixture.write_token;
+        /// Each file in the new revision is paired with the file of the same name in the old
+        /// revision, regardless of their order in the two sibling chains. Only content that the old
+        /// revision doesn't name at that path is collected.
+        ///
+        /// No content is in the store, so an unpaired file would be collected. That is what makes
+        /// the absence of every unchanged file's content a check of the pairing.
+        #[tokio::test]
+        async fn pairs_files_by_name() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
 
-                const FILE_COUNT: u64 = 64;
-                let state_from = State::new();
-                let mut file_ids = vec![];
-                for index in 0..FILE_COUNT {
-                    let name = format!("file-{index:03}");
-                    let file_id = state_from
-                        .node_add(
-                            repository.clone(),
-                            ROOT_NODE,
-                            file_node(&name, file_content(1000 + index)),
-                            &name,
-                        )
+            #[allow(clippy::disallowed_methods)]
+            runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    let repository = fixture.repository.clone();
+                    let write_token = &fixture.write_token;
+
+                    const FILE_COUNT: u64 = 64;
+                    let state_from = State::new();
+                    let mut file_ids = vec![];
+                    for index in 0..FILE_COUNT {
+                        let name = format!("file-{index:03}");
+                        let file_id = state_from
+                            .node_add(
+                                repository.clone(),
+                                ROOT_NODE,
+                                file_node(&name, file_content(1000 + index)),
+                                &name,
+                            )
+                            .await
+                            .expect("Failed to add a file");
+                        file_ids.push(file_id);
+                    }
+                    let signature_from = state_from
+                        .serialize(repository.clone(), write_token)
                         .await
-                        .expect("Failed to add a file");
-                    file_ids.push(file_id);
-                }
-                let signature_from = state_from
-                    .serialize(repository.clone(), write_token)
-                    .await
-                    .expect("Failed to serialize from state");
+                        .expect("Failed to serialize from state");
 
-                let state_to = State::deserialize(repository.clone(), signature_from)
-                    .await
-                    .expect("Failed to deserialize state");
-                state_to
-                    .node_modify(repository.clone(), file_ids[10], 0o644, 10, file_content(2000))
-                    .await
-                    .expect("Failed to modify a file");
-                state_to
-                    .node_delete(repository.clone(), file_ids[20])
-                    .await
-                    .expect("Failed to delete a file");
-                for (name, content) in [("added-a", 3000), ("added-b", 3001)] {
+                    let state_to = State::deserialize(repository.clone(), signature_from)
+                        .await
+                        .expect("Failed to deserialize state");
                     state_to
-                        .node_add(
-                            repository.clone(),
-                            ROOT_NODE,
-                            file_node(name, file_content(content)),
-                            name,
-                        )
+                        .node_modify(repository.clone(), file_ids[10], 0o644, 10, file_content(2000))
                         .await
-                        .expect("Failed to add a file");
-                }
-                let signature_to = state_to
-                    .serialize(repository.clone(), write_token)
-                    .await
-                    .expect("Failed to serialize to state");
-                let state_to = State::deserialize(repository.clone(), signature_to)
-                    .await
-                    .expect("Failed to deserialize state");
-
-                let fragments = collect_new_fragments(
-                    repository.clone(),
-                    state_from.clone(),
-                    state_to.clone(),
-                    true,
-                    Arc::new(StoreRequestTracker::default()),
-                )
-                .await
-                .expect("Failed to collect fragments");
-
-                for content in [2000, 3000, 3001] {
-                    assert!(
-                        fragments.contains(&file_content(content)),
-                        "Content {content} of a modified or added file was not collected"
-                    );
-                }
-                for index in 0..FILE_COUNT {
-                    assert!(
-                        !fragments.contains(&file_content(1000 + index)),
-                        "Content of file-{index:03} was collected, which the old revision already names"
-                    );
-                }
-            }))
-            .await
-            .expect("Test task failed");
-    }
-
-    /// Every content fragment a collection looks up in the store is counted by the tracker it
-    /// is given, so each added file adds at least one request.
-    #[tokio::test]
-    async fn collect_new_fragments_counts_its_store_reads() {
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
-
-        #[allow(clippy::disallowed_methods)]
-        runtime()
-            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let fixture =
-                    test_repository_create(immutable_store, mutable_store, repository_id).await;
-                let repository = fixture.repository.clone();
-                let write_token = &fixture.write_token;
-
-                let state_from = State::new();
-                let signature_from = state_from
-                    .serialize(repository.clone(), write_token)
-                    .await
-                    .expect("Failed to serialize from state");
-
-                let state_to = State::deserialize(repository.clone(), signature_from)
-                    .await
-                    .expect("Failed to deserialize state");
-                const ADDED: u64 = 8;
-                for index in 0..ADDED {
-                    let name = format!("added-{index}");
+                        .expect("Failed to modify a file");
                     state_to
-                        .node_add(
-                            repository.clone(),
-                            ROOT_NODE,
-                            file_node(&name, file_content(4000 + index)),
-                            &name,
-                        )
+                        .node_delete(repository.clone(), file_ids[20])
                         .await
-                        .expect("Failed to add a file");
-                }
-                let signature_to = state_to
-                    .serialize(repository.clone(), write_token)
-                    .await
-                    .expect("Failed to serialize to state");
-                let state_to = State::deserialize(repository.clone(), signature_to)
-                    .await
-                    .expect("Failed to deserialize state");
+                        .expect("Failed to delete a file");
+                    for (name, content) in [("added-a", 3000), ("added-b", 3001)] {
+                        state_to
+                            .node_add(
+                                repository.clone(),
+                                ROOT_NODE,
+                                file_node(name, file_content(content)),
+                                name,
+                            )
+                            .await
+                            .expect("Failed to add a file");
+                    }
+                    let signature_to = state_to
+                        .serialize(repository.clone(), write_token)
+                        .await
+                        .expect("Failed to serialize to state");
+                    let state_to = State::deserialize(repository.clone(), signature_to)
+                        .await
+                        .expect("Failed to deserialize state");
 
-                let tracker = Arc::new(StoreRequestTracker::default());
-                collect_new_fragments(
-                    repository.clone(),
-                    state_from.clone(),
-                    state_to.clone(),
-                    true,
-                    tracker.clone(),
-                )
+                    let fragments = collect_new_fragments(
+                        repository.clone(),
+                        state_from.clone(),
+                        state_to.clone(),
+                        true,
+                        Arc::new(StoreRequestTracker::default()),
+                    )
+                    .await
+                    .expect("Failed to collect fragments");
+
+                    for content in [2000, 3000, 3001] {
+                        assert!(
+                            fragments.contains(&file_content(content)),
+                            "Content {content} of a modified or added file was not collected"
+                        );
+                    }
+                    for index in 0..FILE_COUNT {
+                        assert!(
+                            !fragments.contains(&file_content(1000 + index)),
+                            "Content of file-{index:03} was collected, which the old revision already names"
+                        );
+                    }
+                }))
                 .await
-                .expect("Failed to collect fragments");
+                .expect("Test task failed");
+        }
 
-                assert!(
-                    tracker.requests() >= ADDED,
-                    "{} requests counted for {ADDED} added files",
-                    tracker.requests()
-                );
-                assert!(tracker.peak_in_flight() >= 1);
-            }))
-            .await
-            .expect("Test task failed");
+        /// Every content fragment a collection looks up in the store is counted as a lookup by the
+        /// tracker it is given, so each added file adds at least one lookup.
+        #[tokio::test]
+        async fn counts_its_fragment_lookups() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    let repository = fixture.repository.clone();
+                    let write_token = &fixture.write_token;
+
+                    let state_from = State::new();
+                    let signature_from = state_from
+                        .serialize(repository.clone(), write_token)
+                        .await
+                        .expect("Failed to serialize from state");
+
+                    let state_to = State::deserialize(repository.clone(), signature_from)
+                        .await
+                        .expect("Failed to deserialize state");
+                    const ADDED: u64 = 8;
+                    for index in 0..ADDED {
+                        let name = format!("added-{index}");
+                        state_to
+                            .node_add(
+                                repository.clone(),
+                                ROOT_NODE,
+                                file_node(&name, file_content(4000 + index)),
+                                &name,
+                            )
+                            .await
+                            .expect("Failed to add a file");
+                    }
+                    let signature_to = state_to
+                        .serialize(repository.clone(), write_token)
+                        .await
+                        .expect("Failed to serialize to state");
+                    let state_to = State::deserialize(repository.clone(), signature_to)
+                        .await
+                        .expect("Failed to deserialize state");
+
+                    let tracker = Arc::new(StoreRequestTracker::default());
+                    collect_new_fragments(
+                        repository.clone(),
+                        state_from.clone(),
+                        state_to.clone(),
+                        true,
+                        tracker.clone(),
+                    )
+                    .await
+                    .expect("Failed to collect fragments");
+
+                    assert!(
+                        tracker.lookups() >= ADDED,
+                        "{} lookups counted for {ADDED} added files",
+                        tracker.lookups()
+                    );
+                    assert!(tracker.peak_lookups_in_flight() >= 1);
+                }))
+                .await
+                .expect("Test task failed");
+        }
+
+        /// The tracker passed to the collection counts each metadata blob referenced by a changed
+        /// file metadata block as one metadata read, and records the peak of those reads in flight.
+        /// One block reads its blobs one at a time.
+        #[tokio::test]
+        async fn counts_its_metadata_reads() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    let repository = fixture.repository.clone();
+                    let write_token = &fixture.write_token;
+
+                    const CHANGED: u64 = 6;
+                    let state_from = State::new();
+                    let mut nodes = vec![];
+                    for index in 0..CHANGED {
+                        let name = format!("dir-{index}");
+                        let node = state_from
+                            .node_add(
+                                repository.clone(),
+                                ROOT_NODE,
+                                Node {
+                                    name_hash: hash_string(&name),
+                                    ..Default::default()
+                                },
+                                &name,
+                            )
+                            .await
+                            .expect("Failed to add a node");
+                        nodes.push(node);
+                    }
+                    let signature_from = state_from
+                        .serialize(repository.clone(), write_token)
+                        .await
+                        .expect("Failed to serialize from state");
+
+                    let state_to = State::deserialize(repository.clone(), signature_from)
+                        .await
+                        .expect("Failed to deserialize state");
+                    let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(nodes[0]));
+                    let metadata_block = state_to
+                        .block_file_metadata(repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block");
+                    for (index, &node) in nodes.iter().enumerate() {
+                        let metadata_node = node_to_file_metadata(node);
+                        assert_eq!(
+                            NodeFileMetadataBlock::index(metadata_node),
+                            block_index,
+                            "Every node must share one file metadata block"
+                        );
+                        let mut metadata = Metadata::new();
+                        metadata
+                            .set_address("payload", file_content(5000 + index as u64))
+                            .expect("Failed to set the metadata address");
+                        let hash = metadata
+                            .serialize(repository.clone())
+                            .await
+                            .expect("Failed to serialize the metadata");
+                        metadata_block
+                            .write()
+                            .node(NodeFileMetadata::index(metadata_node))
+                            .metadata = hash;
+                    }
+                    metadata_block.write().mark_dirty();
+                    state_to.block_file_metadata_modified(metadata_block, block_index);
+                    state_to.mark_dirty();
+                    let signature_to = state_to
+                        .serialize(repository.clone(), write_token)
+                        .await
+                        .expect("Failed to serialize to state");
+                    let state_to = State::deserialize(repository.clone(), signature_to)
+                        .await
+                        .expect("Failed to deserialize state");
+
+                    let tracker = Arc::new(StoreRequestTracker::default());
+                    collect_new_fragments(
+                        repository.clone(),
+                        state_from.clone(),
+                        state_to.clone(),
+                        true,
+                        tracker.clone(),
+                    )
+                    .await
+                    .expect("Failed to collect fragments");
+
+                    assert_eq!(tracker.metadata_reads(), CHANGED);
+                    assert_eq!(tracker.peak_metadata_reads_in_flight(), 1);
+                }))
+                .await
+                .expect("Test task failed");
+        }
     }
 
     /// Helper to create a Node with specific flags for testing
