@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use lore_base::error::InvalidPath;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
@@ -262,6 +263,9 @@ impl InstanceOperation for OsOperation {
     /// stat by path where the write captured none, and stats the file by path for the
     /// [`FileInfo`] it answers: the write takes its metadata on the open handle, and a
     /// filesystem that settles the stamp at close gives the file a later time.
+    ///
+    /// The directory above the file is created where the write finds it missing, so a file
+    /// written into a directory that is there costs no call on that directory.
     async fn write_node(
         &self,
         repository: Arc<RepositoryContext>,
@@ -269,12 +273,10 @@ impl InstanceOperation for OsOperation {
         path: &RelativePath,
     ) -> Result<FileInfo, FsError> {
         let path = self.absolute(path);
-        if let Some(parent) = path.parent() {
-            lore_io::IoDriver::global().create_dir_all(parent).await?;
-        }
-
         {
-            let (_, written) = write_addressed_content(repository, node.address, &path).await?;
+            let options = immutable::read_options_from_repository(&repository).creating_parent();
+            let (_, written) =
+                write_addressed_content(repository, node.address, &path, options).await?;
             let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
             util::fs::metadata_set_executable(&path, written.as_ref(), executable).await;
         }
@@ -290,7 +292,9 @@ impl InstanceOperation for OsOperation {
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         let path = self.absolute(path);
-        let (fragment, metadata) = write_addressed_content(repository, address, &path).await?;
+        let options = immutable::read_options_from_repository(&repository);
+        let (fragment, metadata) =
+            write_addressed_content(repository, address, &path, options).await?;
         Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
@@ -449,20 +453,22 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     }
 }
 
-/// Puts the content `address` names at `path`, with the fragment it came from and what the write
-/// left there where the write reported it.
+/// Puts the content `address` names at `path`, read with `options`, with the fragment it came
+/// from and what the write left there where the write reported it.
 ///
 /// The zero hash every empty file carries addresses nothing and leaves an empty file: the store
 /// answers for it without being read, there being no content to find.
-async fn write_addressed_content(
+///
+/// Returns [`immutable::read_into_file`]'s future with its error forwarded, without a future of
+/// its own.
+fn write_addressed_content(
     repository: Arc<RepositoryContext>,
     address: Address,
     path: &Path,
-) -> Result<(Fragment, Option<std::fs::Metadata>), FsError> {
-    let options = immutable::read_options_from_repository(&repository);
+    options: lore_storage::ReadOptions,
+) -> impl Future<Output = Result<(Fragment, Option<std::fs::Metadata>), FsError>> {
     immutable::read_into_file(repository, address, path, None, options)
-        .await
-        .forward_any::<FsError>("Failed to read file")
+        .map(|written| written.forward_any::<FsError>("Failed to read file"))
 }
 
 /// Carries the file at `from_path` to `to_path` without a rename, which is what a move between two

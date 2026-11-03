@@ -1377,7 +1377,10 @@ impl Drop for TemporaryFile {
     fn drop(&mut self) {
         if let Some(path) = self.path.take()
             && let Err(err) = std::fs::remove_file(&path)
-            && err.kind() != std::io::ErrorKind::NotFound
+            && !matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
         {
             lore_base::lore_warn!("failed to remove temporary file {}: {err}", path.display());
         }
@@ -1452,6 +1455,10 @@ pub fn read_into_file(
 /// `<path><temp_file_extension>` and renames, unless `options.direct_write` asks for the target to
 /// be written in place.
 ///
+/// Where `options.create_parent` asks for it, a write that finds the directory `path` goes in
+/// missing creates that directory, with its missing ancestors, and opens again at once. A
+/// directory that cannot be created fails the write. A directory that is there costs nothing.
+///
 /// A range starting past the end of the content selects nothing that exists, and `path` is left
 /// alone: the file is not opened, so a destination that was already there survives a request the
 /// caller got wrong. Nothing is written and no metadata comes back, and the caller decides what an
@@ -1502,17 +1509,30 @@ fn write_root_to_file(
             let mut temporary =
                 (!options.direct_write).then(|| TemporaryFile::guard(file_path.clone()));
 
+            let mut create_parent = options.create_parent;
             let file = loop {
-                match crate::defragment::open_file_write(file_path.as_path(), range.len()).await {
-                    Ok(file) => break file,
-                    Err(err) => {
-                        if !retry.wait().await {
-                            return Err(StorageError::internal_with_context(
-                                err,
-                                &format!("failed to open file: {}", path.display()),
-                            ));
-                        }
+                let directory_missing = {
+                    let err =
+                        match crate::defragment::open_file_write(file_path.as_path(), range.len())
+                            .await
+                        {
+                            Ok(file) => break file,
+                            Err(err) => err,
+                        };
+                    if create_parent && names_a_missing_directory(&err) {
+                        true
+                    } else if retry.wait().await {
+                        false
+                    } else {
+                        return Err(StorageError::internal_with_context(
+                            err,
+                            &format!("failed to open file: {}", path.display()),
+                        ));
                     }
+                };
+                if directory_missing {
+                    create_parent = false;
+                    create_parent_directory(path).await?;
                 }
             };
             let defrag_target = DefragmentSink::File {
@@ -1568,21 +1588,63 @@ fn write_root_to_file(
         } else {
             let mut retry = crate::retry(10, 10_000, 10);
             let buffer = cut_content(&buffer, range)?;
+            let mut create_parent = options.create_parent;
             let metadata = loop {
-                match write_all_to_file(path, buffer.clone(), options.sync_data).await {
-                    Ok(meta) => break meta,
-                    Err(err) => {
-                        if !retry.wait().await {
-                            return Err(StorageError::internal_with_context(
-                                err,
-                                &format!("write to file: {}", path.display()),
-                            ));
-                        }
+                let directory_missing = {
+                    let err = match write_all_to_file(path, buffer.clone(), options.sync_data).await
+                    {
+                        Ok(meta) => break meta,
+                        Err(err) => err,
+                    };
+                    if create_parent && names_a_missing_directory(&err) {
+                        true
+                    } else if retry.wait().await {
+                        false
+                    } else {
+                        return Err(StorageError::internal_with_context(
+                            err,
+                            &format!("write to file: {}", path.display()),
+                        ));
                     }
+                };
+                if directory_missing {
+                    create_parent = false;
+                    create_parent_directory(path).await?;
                 }
             };
             Ok(Some(metadata))
         }
+    }
+}
+
+/// Whether a failed open of a file names a directory on its path that is missing, or that is
+/// not a directory. Creating the directory the file goes in mends the first and reports the
+/// second.
+fn names_a_missing_directory(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// Creates the directory `path` goes in, with its missing ancestors.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn create_parent_directory(path: &Path) -> impl Future<Output = Result<(), StorageError>> + '_ {
+    async move {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        lore_io::IoDriver::global()
+            .create_dir_all(parent)
+            .await
+            .map_err(|err| {
+                StorageError::internal_with_context(
+                    err,
+                    &format!("creating the directory of {}", path.display()),
+                )
+            })
     }
 }
 

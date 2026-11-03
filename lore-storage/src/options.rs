@@ -116,6 +116,9 @@ pub struct ReadOptions {
     pub direct_write: bool,
     /// Force sync data to storage media after write
     pub sync_data: bool,
+    /// Create the directory a file read lands in, with its missing ancestors, where the write
+    /// finds it missing
+    pub create_parent: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
     pub priority: bool,
     /// A local miss answers `AddressNotFound` at once: the load never waits on another task's
@@ -140,6 +143,7 @@ impl Default for ReadOptions {
             cache: false,
             direct_write: false,
             sync_data: false,
+            create_parent: false,
             priority: false,
             never_wait: false,
             max_content_size: None,
@@ -181,6 +185,12 @@ impl ReadOptions {
 
     pub fn optional_cache(mut self, cache: bool) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// See [`ReadOptions::create_parent`].
+    pub fn creating_parent(mut self) -> Self {
+        self.create_parent = true;
         self
     }
 

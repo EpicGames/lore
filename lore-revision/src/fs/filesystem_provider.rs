@@ -681,8 +681,8 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
-    /// Write `node`'s content to `path`, creating the directory above it, applying the node's
-    /// mode, and reporting what the file looks like once written.
+    /// Write `node`'s content to `path`, creating the directory above it where it is missing,
+    /// applying the node's mode, and reporting what the file looks like once written.
     ///
     /// One call rather than four because the steps are never useful apart, and each one asked
     /// separately resolves the same name against the root again.

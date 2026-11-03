@@ -670,6 +670,100 @@ async fn a_written_node_answers_what_the_file_holds() {
         .await;
 }
 
+/// A node written below directories that are not there creates them, one level or several
+/// deep, whichever shape the content is stored in, and a node written into a directory that is
+/// there lands beside what it holds.
+#[tokio::test]
+async fn a_node_written_below_missing_directories_creates_them() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let content: Vec<u8> = (0..40 * 1024).map(|index| (index % 251) as u8).collect();
+
+            for (name, listed) in [
+                ("whole/file", false),
+                ("listed/file", true),
+                ("whole/deeper/below/file", false),
+                ("listed/deeper/below/file", true),
+                ("whole/beside", false),
+                ("listed/beside", true),
+            ] {
+                let node = stored_node(&repository, &content, listed, false).await;
+                let info = operation
+                    .write_node(repository.clone(), &node, &relative(name))
+                    .await
+                    .unwrap_or_else(|err| panic!("writing {name}: {err}"));
+
+                let path = dir.path().join(name);
+                assert_eq!(
+                    content,
+                    std::fs::read(&path).expect("read the file"),
+                    "{name} holds the node's content"
+                );
+                assert_eq!(
+                    FileInfo::from_metadata(&std::fs::metadata(&path).expect("stat the file")),
+                    info,
+                    "{name} answers what a stat reads"
+                );
+            }
+            for directory in ["whole", "listed"] {
+                let mut names: Vec<_> = std::fs::read_dir(dir.path().join(directory))
+                    .expect("list the directory")
+                    .map(|entry| entry.expect("an entry").file_name())
+                    .collect();
+                names.sort();
+                assert_eq!(
+                    names,
+                    ["beside", "deeper", "file"],
+                    "{directory} holds what was written and nothing else"
+                );
+            }
+        })
+        .await;
+}
+
+/// A node written where a file stands in for the directory above it fails at once, and leaves
+/// that file as it was.
+#[tokio::test]
+async fn a_node_written_below_a_file_fails() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let blocker = dir.path().join("blocker");
+            std::fs::write(&blocker, b"kept").expect("write the blocking file");
+            let content: Vec<u8> = (0..40 * 1024).map(|index| (index % 251) as u8).collect();
+
+            for listed in [false, true] {
+                let node = stored_node(&repository, &content, listed, false).await;
+                let path = relative("blocker/file");
+                let write = operation.write_node(repository.clone(), &node, &path);
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+                    .await
+                    .expect("the write fails without waiting out the retries");
+
+                assert!(result.is_err(), "a node cannot land below a file");
+                assert_eq!(
+                    std::fs::read(&blocker).expect("read the blocking file"),
+                    b"kept",
+                    "the file is left as it was"
+                );
+            }
+        })
+        .await;
+}
+
 /// A node without the executable bit clears it from the file it overwrites, whose mode the
 /// write keeps.
 #[cfg(unix)]

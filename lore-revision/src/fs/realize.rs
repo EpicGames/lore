@@ -1543,8 +1543,8 @@ pub fn realize_sidecar_file(
     }
 }
 
-/// Writes `node`'s content to `path`, creating the parent directory and applying the node's
-/// mode, and reports what the file looks like once written.
+/// Writes `node`'s content to `path`, creating the parent directory where it is missing and
+/// applying the node's mode, and reports what the file looks like once written.
 async fn write_node_to_path(
     repository: &Arc<RepositoryContext>,
     operation: &Arc<InstanceOperationImpl>,

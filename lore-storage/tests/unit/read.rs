@@ -1693,6 +1693,224 @@ async fn a_failed_defragment_leaves_no_temporary_file() {
     );
 }
 
+/// The four shapes a file read writes: one fragment, the empty content, a list staged beside the
+/// target, and a list written in place. Each is a name, an address, the content it reads to, and
+/// `direct_write`.
+async fn file_read_shapes(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    context: Context,
+) -> [(&'static str, Address, Vec<u8>, bool); 4] {
+    let whole = Bytes::from((0u8..=255).collect::<Vec<u8>>());
+    let whole_address = put_whole(store, partition, context, &whole).await;
+    let (list_address, list_content) = put_two_leaf_list(store, partition, context).await;
+    let empty = Address {
+        hash: Hash::default(),
+        context,
+    };
+    [
+        ("whole", whole_address, whole.to_vec(), false),
+        ("empty", empty, Vec::new(), false),
+        ("staged", list_address, list_content.clone(), false),
+        ("in-place", list_address, list_content, true),
+    ]
+}
+
+/// A file read asked to create its parent lands below directories that are not there, one level
+/// or several deep, and leaves no temporary file.
+#[tokio::test]
+async fn a_file_read_creating_its_parent_creates_the_missing_directories() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-missing-parent-");
+    let partition = Partition::from([0xA2; 16]);
+    let context = Context::from([0xA2; 16]);
+
+    for (shape, address, content, direct_write) in
+        file_read_shapes(&store, partition, context).await
+    {
+        for parent in ["one", "two/levels/deep"] {
+            let directory = PathBuf::from(target_dir.as_ref()).join(shape).join(parent);
+            let target = directory.join("content.bin");
+            let options = ReadOptions {
+                direct_write,
+                ..no_remote().creating_parent()
+            };
+            read_into_file(
+                store.clone(),
+                partition,
+                address,
+                target.as_path(),
+                ".~loretemp",
+                None,
+                options,
+                None,
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{shape} below {parent}: {err}"));
+
+            assert_eq!(
+                std::fs::read(&target).expect("read the target"),
+                content,
+                "{shape} below {parent} holds the content"
+            );
+            let names: Vec<_> = std::fs::read_dir(&directory)
+                .expect("list the created directory")
+                .map(|entry| entry.expect("an entry").file_name())
+                .collect();
+            assert_eq!(
+                names,
+                ["content.bin"],
+                "{shape} below {parent} leaves no temporary file"
+            );
+        }
+    }
+}
+
+/// A file read asked to create its parent below a file, over which no directory can be created,
+/// fails at once rather than retrying, and leaves the file as it was.
+#[tokio::test]
+async fn a_file_read_creating_its_parent_below_a_file_fails_at_once() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-file-parent-");
+    let partition = Partition::from([0xA3; 16]);
+    let context = Context::from([0xA3; 16]);
+    let blocker = PathBuf::from(target_dir.as_ref()).join("blocker");
+    std::fs::write(&blocker, b"kept").expect("write the blocking file");
+    let target = blocker.join("content.bin");
+
+    for (shape, address, _content, direct_write) in
+        file_read_shapes(&store, partition, context).await
+    {
+        let options = ReadOptions {
+            direct_write,
+            ..no_remote().creating_parent()
+        };
+        let read = read_into_file(
+            store.clone(),
+            partition,
+            address,
+            target.as_path(),
+            ".~loretemp",
+            None,
+            options,
+            None,
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .unwrap_or_else(|_| panic!("{shape} fails without waiting out the retries"));
+
+        assert!(result.is_err(), "{shape} cannot land below a file");
+        assert_eq!(
+            std::fs::read(&blocker).expect("read the blocking file"),
+            b"kept",
+            "{shape} leaves the file as it was"
+        );
+    }
+}
+
+/// A file read not asked to create its parent creates no directory: it keeps retrying the open
+/// of the missing one.
+#[tokio::test]
+async fn a_file_read_leaves_a_missing_parent_missing() {
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-no-parent-");
+    let partition = Partition::from([0xA4; 16]);
+    let context = Context::from([0xA4; 16]);
+    let whole = Bytes::from_static(b"whole content");
+    let address = put_whole(&store, partition, context, &whole).await;
+    let parent = PathBuf::from(target_dir.as_ref()).join("missing");
+    let target = parent.join("content.bin");
+
+    let read = read_into_file(
+        store,
+        partition,
+        address,
+        target.as_path(),
+        ".~loretemp",
+        None,
+        no_remote(),
+        None,
+    );
+    tokio::time::timeout(Duration::from_millis(300), read)
+        .await
+        .expect_err("the read keeps retrying the open of a missing directory");
+
+    assert!(!parent.exists(), "the read created the missing directory");
+}
+
+/// Reads asked to create their parent that run at once into one missing directory each land
+/// there, whichever of them creates it, and leave no temporary file.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_file_reads_creating_one_parent_all_land() {
+    const READS: usize = 16;
+
+    let (_store_dir, store) = make_test_store().await;
+    let target_dir = TempDir::new("lore-storage-read-shared-parent-");
+    let partition = Partition::from([0xA5; 16]);
+    let context = Context::from([0xA5; 16]);
+    let whole = Bytes::from((0u8..=255).collect::<Vec<u8>>());
+    let whole_address = put_whole(&store, partition, context, &whole).await;
+    let (list_address, list_content) = put_two_leaf_list(&store, partition, context).await;
+    let directory = PathBuf::from(target_dir.as_ref())
+        .join("shared")
+        .join("parent");
+
+    let mut reads = tokio::task::JoinSet::new();
+    for index in 0..READS {
+        let (address, content) = if index % 2 == 0 {
+            (whole_address, whole.to_vec())
+        } else {
+            (list_address, list_content.clone())
+        };
+        let store = store.clone();
+        let target = directory.join(format!("content-{index}.bin"));
+        lore_base::lore_spawn!(reads, async move {
+            let read = read_into_file(
+                store,
+                partition,
+                address,
+                target.as_path(),
+                ".~loretemp",
+                None,
+                no_remote().creating_parent(),
+                None,
+            )
+            .await;
+            (target, content, read)
+        });
+    }
+    while let Some(joined) = reads.join_next().await {
+        let (target, content, read) = joined.expect("the read task completes");
+        read.unwrap_or_else(|err| panic!("{}: {err}", target.display()));
+        assert_eq!(
+            std::fs::read(&target).expect("read the target"),
+            content,
+            "{} holds the content",
+            target.display()
+        );
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(&directory)
+        .expect("list the shared directory")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    let mut expected: Vec<String> = (0..READS)
+        .map(|index| format!("content-{index}.bin"))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        names, expected,
+        "the directory holds every target and no temporary file"
+    );
+}
+
 /// Regression for the tracker-dispatched read-after-write race: a reader
 /// that arrives while a leader holds the in-flight guard must wait for the
 /// terminal store entry instead of returning `AddressNotFound`. This mirrors
