@@ -161,6 +161,7 @@ mod replication_service_tests {
                 lore_revision::environment::EnvironmentConfig::default(),
                 None,
                 Arc::new(AllowAllRepositoryAuthorizer),
+                lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
             )?
             .with_tls_config(
                 Some(certs.server_cert_path.clone()),

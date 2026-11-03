@@ -175,3 +175,6 @@ history_step_size = 100
 
 # Parallel history-walk permits used by revision::diff3 to bound conflict resolution.
 # revision_diff_history_walk_concurrency = 24
+
+# Branches a v1 BranchList request loads from the store at once. Must be at least 1.
+# branch_list_concurrency = 100

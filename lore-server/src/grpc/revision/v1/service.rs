@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -78,6 +79,7 @@ pub struct LoreRevisionV1Service {
     acceleration: crate::grpc::server::RevisionListAcceleration,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
+    branch_list_concurrency: NonZeroUsize,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
@@ -94,6 +96,7 @@ impl LoreRevisionV1Service {
         acceleration: crate::grpc::server::RevisionListAcceleration,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
+        branch_list_concurrency: NonZeroUsize,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;
         let seconds_in_one_day = 86400f64;
@@ -126,6 +129,7 @@ impl LoreRevisionV1Service {
             acceleration,
             forwarded_requests,
             rpc_timeout,
+            branch_list_concurrency,
             instrument_provider,
             revision_list_instruments,
         }
@@ -221,6 +225,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             &self.forwarded_requests,
+            self.branch_list_concurrency,
         )
         .await
     }

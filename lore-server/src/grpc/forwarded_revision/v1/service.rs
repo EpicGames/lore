@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +45,7 @@ pub struct LoreForwardedRevisionV1Service {
     hook_dispatcher: Arc<HookDispatcher>,
     instrument_provider: ForwardedRevisionServiceInstrumentProvider,
     rpc_timeout: Duration,
+    branch_list_concurrency: NonZeroUsize,
 }
 
 impl LoreForwardedRevisionV1Service {
@@ -53,6 +55,7 @@ impl LoreForwardedRevisionV1Service {
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
+        branch_list_concurrency: NonZeroUsize,
     ) -> Self {
         let instrument_provider = ForwardedRevisionServiceInstrumentProvider;
         Self {
@@ -61,6 +64,7 @@ impl LoreForwardedRevisionV1Service {
             notification,
             hook_dispatcher,
             rpc_timeout,
+            branch_list_concurrency,
             instrument_provider,
         }
     }
@@ -129,6 +133,7 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
             request,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+            self.branch_list_concurrency,
         )
         .await
     }

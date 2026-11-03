@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,6 +92,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         environment: EnvironmentConfig,
         jwt_verifier: Option<JwtVerifier>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        branch_list_concurrency: NonZeroUsize,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -106,6 +108,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             environment,
             jwt_verifier,
             repository_authorizer,
+            branch_list_concurrency,
         }))
     }
 }
@@ -120,6 +123,7 @@ pub struct WantsTlsConfig {
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    branch_list_concurrency: NonZeroUsize,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -172,6 +176,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             environment: self.0.environment,
             jwt_verifier: self.0.jwt_verifier,
             repository_authorizer: self.0.repository_authorizer,
+            branch_list_concurrency: self.0.branch_list_concurrency,
             tls_config,
         }))
     }
@@ -187,6 +192,7 @@ pub struct WantsHttp2Config {
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    branch_list_concurrency: NonZeroUsize,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -230,6 +236,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.notification_sender.clone(),
                 self.0.hook_dispatcher.clone(),
                 rpc_timeout,
+                self.0.branch_list_concurrency,
             ),
         ));
 

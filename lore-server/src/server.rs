@@ -660,6 +660,10 @@ async fn launch_grpc_internal_server(
             settings.environment.clone().unwrap_or_default(),
             jwt_verifier,
             repository_authorizer,
+            settings.feature.as_ref().map_or(
+                crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
+                crate::grpc::server::FeatureSettings::branch_list_concurrency,
+            ),
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(

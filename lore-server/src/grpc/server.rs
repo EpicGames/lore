@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -212,6 +213,17 @@ pub struct FeatureSettings {
     /// holds an `Arc<State>` over a deserialised revision blob;
     /// the wall-clock benefit saturates well below 64.
     pub revision_diff_history_walk_concurrency: Option<usize>,
+    /// Number of branches the v1 `BranchList` handler loads at once.
+    /// Defaults to 100.
+    pub branch_list_concurrency: Option<NonZeroUsize>,
+}
+
+impl FeatureSettings {
+    /// The configured `branch_list_concurrency`, or its default when unset.
+    pub fn branch_list_concurrency(&self) -> NonZeroUsize {
+        self.branch_list_concurrency
+            .unwrap_or(crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY)
+    }
 }
 
 /// Toggles for `RevisionList` acceleration features. Resolved once at
@@ -756,6 +768,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             acceleration,
             self.0.forwarded_requests.clone(),
             rpc_timeout,
+            self.0.feature.branch_list_concurrency(),
         );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),
