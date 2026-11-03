@@ -75,6 +75,12 @@ The `[file]` table controls how the client writes files into the working tree. B
 | `direct_write` | Boolean | `false` | Write to target files directly instead of writing a temporary file and moving it into place. Writes may not be atomic, so an error can leave a file in an inconsistent state. |
 | `flush_write` | Boolean | `false` | Flush file data to disk after each write. Parsed from the config but not currently wired to any write path, so setting it has no effect today. |
 
+### `[sync]` table
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `prefetch_tree` | Boolean | `false` | Before a sync walks the target revision, fetch all of its tree blocks and name tables in bulk requests instead of one per block as the walk reaches it. This fetches the whole tree whatever the view, so turn it on for instances whose syncs walk most of a large tree. |
+
 ### Shared-store table
 
 A repository can point its immutable store at a *shared store* so working trees cloned from the same server store content only once on disk — deduplicated at the fragment level, across similar files and not just byte-identical ones. Those settings live in the `shared_store_to_use` table.

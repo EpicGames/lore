@@ -1371,6 +1371,11 @@ impl NodeBlock {
         }
     }
 
+    /// The address of the block's name table fragment, for prefetching it in bulk.
+    pub fn name_table_hash(&self) -> Hash {
+        self.read().lock.data.name_table
+    }
+
     pub async fn deserialize_nametable(
         &self,
         repository: Arc<RepositoryContext>,

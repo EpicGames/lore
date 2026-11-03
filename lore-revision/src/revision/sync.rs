@@ -894,6 +894,11 @@ pub(crate) async fn sync(
         }
     }
 
+    // The walk starts once the prefetched blocks are local, so it doesn't fetch them on demand too
+    if repository.prefetch_tree() {
+        let _ = state_target.prefetch_tree(repository.clone()).await;
+    }
+
     let cache_repository = repository.clone();
     let cache_state = state_target.clone();
     let cache_task = Some(lore_spawn!(async move {

@@ -4272,6 +4272,72 @@ impl State {
         Ok(tree)
     }
 
+    /// Fetches every node block of the state and every block's name table in bulk requests and
+    /// caches them. On demand each block costs two round trips under 256 permits, which leaves
+    /// the walk of a tree of millions of files waiting on the network for hours. It fetches the
+    /// whole tree whatever the view, so it is for syncs that walk most of it, and runs only when
+    /// the instance sets `[sync] prefetch_tree`. Fetch failures leave the walk to fetch on demand.
+    pub async fn prefetch_tree(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<(), StateError> {
+        let tree = self.tree(repository.clone()).await?;
+        let started = std::time::Instant::now();
+        if tree.hash_node.is_zero() {
+            return Ok(());
+        }
+        // The walk reads no block past the tree's block count, so neither does the prefetch
+        let block_count = tree.block_count as usize;
+        let addresses = self
+            .node_block_addresses(&repository, tree.hash_node, block_count)
+            .await?;
+        let block_address: Vec<Address> = addresses
+            .as_type_slice::<Hash>()
+            .iter()
+            .take(block_count)
+            .filter(|hash| !hash.is_zero())
+            .map(|&hash| Address::zero_context_hash(hash))
+            .collect();
+        let requested = block_address.len();
+        let fetched = immutable::cache(repository.clone(), block_address, false)
+            .await
+            .unwrap_or(0);
+        lore_debug!(
+            "Prefetched {fetched} of {requested} tree blocks in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+
+        // Each block names its children through a name table fragment of its own, read on
+        // demand when the walk enters the block. The blocks are local by now, so read them and
+        // fetch every name table in bulk as well.
+        let started = std::time::Instant::now();
+        use futures::StreamExt as _;
+        let name_address: Vec<Address> =
+            futures::stream::iter(0..block_count)
+                .map(|block_index| {
+                    let repository = repository.clone();
+                    async move {
+                        self.block(repository, block_index).await.ok() as Option<Arc<NodeBlock>>
+                    }
+                })
+                .buffer_unordered(256)
+                .filter_map(|block| async move {
+                    let hash = block?.name_table_hash();
+                    (!hash.is_zero()).then(|| Address::zero_context_hash(hash))
+                })
+                .collect()
+                .await;
+        let requested = name_address.len();
+        let fetched = immutable::cache(repository.clone(), name_address, false)
+            .await
+            .unwrap_or(0);
+        lore_debug!(
+            "Prefetched {fetched} of {requested} name tables in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        Ok(())
+    }
+
     /// Caches the state's own records in the local store, so the state reads without the remote,
     /// and with `file_metadata` every file metadata block, so staging and committing, which write
     /// to them, do too. The custom metadata a block names is not cached.

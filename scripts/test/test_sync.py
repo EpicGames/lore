@@ -790,6 +790,26 @@ def test_sync_records_modified_times_for_what_it_realizes(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_sync_prefetches_the_tree_only_when_the_instance_asks(new_lore_repo):
+    """Prefetching fetches the target's whole tree whatever the view, so a sync does it only
+    under `[sync] prefetch_tree = true`."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"root.txt": b"base"})
+    clone: Lore = repo.clone()
+
+    repo.write_commit_push("Second", {"root.txt": b"second"})
+    output = clone.sync(level="debug")
+    assert "Prefetched" not in output, output
+
+    with open(os.path.join(clone.dot_path(), "config.toml"), "a", encoding="utf-8") as config:
+        config.write("\n[sync]\nprefetch_tree = true\n")
+    repo.write_commit_push("Third", {"root.txt": b"third"})
+    output = clone.sync(level="debug")
+    assert "Prefetched" in output, output
+    assert _read_bytes(clone, "root.txt") == b"third"
+
+
+@pytest.mark.smoke
 def test_dry_run_sync_records_no_modified_times(new_lore_repo):
     """A dry run leaves the current revision where it was, so no modified time it takes
     describes the revision the working copy is on.

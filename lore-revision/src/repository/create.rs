@@ -332,6 +332,7 @@ pub(crate) async fn create_with_metadata(
         vfs: Some(options.vfs_options),
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
+        sync: None,
     };
     config
         .validate()

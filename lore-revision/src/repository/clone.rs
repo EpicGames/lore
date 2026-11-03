@@ -1079,6 +1079,7 @@ pub async fn clone(
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
         vfs: options.vfs_options.clone(),
+        sync: None,
     };
     repository_config
         .validate()

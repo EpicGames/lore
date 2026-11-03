@@ -187,6 +187,8 @@ pub struct RepositoryConfig {
     pub store: Option<StoreConfig>,
     pub file: Option<FileConfig>,
     pub vfs: Option<VfsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncConfig>,
 }
 
 impl RepositoryConfig {
@@ -326,6 +328,15 @@ impl Default for FileConfig {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct SyncConfig {
+    /// Fetch every tree block and name table of the target in bulk before a sync walks it,
+    /// rather than each as the walk reaches it. It fetches the whole tree whatever the view, so
+    /// it suits instances whose syncs walk most of a large tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_tree: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct SharedStoreToUseConfig {
     #[serde(alias = "use_global_store")]
     pub use_shared_store: Option<bool>,
@@ -390,6 +401,8 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
+    /// Prefetch a sync target's tree in bulk, from `[sync] prefetch_tree`
+    pub prefetch_tree: AtomicBool,
 }
 
 impl Default for RepositoryRuntimeSettings {
@@ -398,6 +411,7 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
+            prefetch_tree: AtomicBool::new(false),
         }
     }
 }
@@ -408,6 +422,7 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
+            prefetch_tree: AtomicBool::new(self.prefetch_tree.load(Ordering::Relaxed)),
         }
     }
 
@@ -422,6 +437,10 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.prefetch_tree.store(
+            source.prefetch_tree.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -1172,6 +1191,16 @@ impl RepositoryContext {
         self.settings
             .direct_file_write
             .store(direct, Ordering::Relaxed);
+    }
+
+    pub fn prefetch_tree(&self) -> bool {
+        self.settings.prefetch_tree.load(Ordering::Relaxed)
+    }
+
+    pub fn set_prefetch_tree(&self, prefetch: bool) {
+        self.settings
+            .prefetch_tree
+            .store(prefetch, Ordering::Relaxed);
     }
 
     pub async fn flush(&self, sync_data: bool) -> Result<(), RepositoryError> {
@@ -2666,6 +2695,13 @@ pub async fn load_and_connect_with_token(
     repository.set_disable_cache(!(global.cache() || config.is_swfs()));
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
+    repository.set_prefetch_tree(
+        config
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.prefetch_tree)
+            .unwrap_or_default(),
+    );
 
     if global.local() {
         repository.set_disable_upload(true);
