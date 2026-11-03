@@ -1667,30 +1667,36 @@ bitflags! {
         const Ignore = 0b1;
         const View = 0b10;
         const Full = 0b11;
-        /// The ignore slot does not exclude a node with something staged at or below it. Only a
-        /// walk's per-node queries read the bit; see [`FilterMode::at`].
-        const KeepStaged = 0b1000;
+        /// The ignore slot does not exclude a node the tree tracks: the ignore rules govern only
+        /// what is new to the tree. The slot is still stepped, so an untracked child of a
+        /// tracked, ignored directory is ignored. A walk clears the bit for each node the tree
+        /// does not hold; see [`FilterMode::at`].
+        const KeepTracked = 0b1000;
     }
 }
 bitflagsops!(FilterMode, u16);
 
 impl FilterMode {
-    /// The mode for staged content: the view, and the ignore rules where nothing is staged.
-    pub const STAGED: Self = Self::Full.union(Self::KeepStaged);
+    /// The mode for local state: the view, and the ignore rules for what the tree does not hold.
+    ///
+    /// A comparison of trees holds nothing untracked, so it asks [`at`](Self::at) whether
+    /// something is staged or marked dirty at or below a node instead: a subtree with nothing
+    /// changed in it has nothing to report, and an ignored one is pruned without being entered.
+    pub const TRACKED: Self = Self::Full.union(Self::KeepTracked);
 
-    /// The mode a walk through `self` asks about a node in, `staged` saying whether something is
-    /// staged at or below the node.
-    pub fn at(self, staged: bool) -> Self {
-        if staged {
+    /// The mode a walk through `self` asks about a node in, `tracked` saying whether the node is
+    /// one the tree tracks.
+    pub fn at(self, tracked: bool) -> Self {
+        if tracked {
             self
         } else {
-            self.difference(Self::KeepStaged)
+            self.difference(Self::KeepTracked)
         }
     }
 
     /// The slots that exclude.
     fn excluding(self) -> Self {
-        if self.contains(Self::KeepStaged) {
+        if self.contains(Self::KeepTracked) {
             self.difference(Self::Ignore)
         } else {
             self
@@ -1804,6 +1810,7 @@ impl Filter {
     /// [`should_descend`](Self::should_descend) for the lowercase path `states` were produced
     /// for.
     fn descends(&self, states: FilterStates, lowercase: &str, mode: FilterMode) -> bool {
+        let mode = mode.excluding();
         if !states.excluded(mode) || lowercase.is_empty() || lowercase == "." {
             return true;
         }
@@ -1822,6 +1829,44 @@ impl Filter {
     ) -> bool {
         !self.descends(parent, path.split_lowercase().0, mode)
             && self.child_emit_excludes(parent, path, true, mode).1
+    }
+
+    /// The mode a walk asks about `path` in, from `parent`: `mode` where `tracked` answers that the
+    /// tree tracks the node there, and `mode` without [`FilterMode::KeepTracked`] otherwise.
+    /// `tracked` is awaited only where `mode` carries the bit and the ignore rules would leave the
+    /// node out, so a walk reads nothing more for a node they keep.
+    pub async fn tracked_mode<E, F>(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        is_directory: bool,
+        mode: FilterMode,
+        tracked: impl FnOnce() -> F,
+    ) -> Result<FilterMode, E>
+    where
+        F: std::future::Future<Output = Result<bool, E>>,
+    {
+        let untracked = mode.at(false);
+        if !mode.contains(FilterMode::KeepTracked)
+            || !self
+                .child_excludes_tree(parent, path, is_directory, untracked)
+                .1
+        {
+            return Ok(untracked);
+        }
+        // Boxed: a cold path, which unboxed would sit in every walk future that asks.
+        Ok(mode.at(Box::pin(tracked()).await?))
+    }
+
+    /// [`emit_excludes_any_kind`](Self::emit_excludes_any_kind) without the event.
+    pub fn excludes_any_kind(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        mode: FilterMode,
+    ) -> bool {
+        !self.descends(parent, path.split_lowercase().0, mode)
+            && self.child_excludes_tree(parent, path, true, mode).1
     }
 
     /// The slot that stops a walk at `path`, or `None` when it descends. `path`
@@ -2012,6 +2057,9 @@ impl Filter {
     /// Ignore is consulted before view at each of those two points, so a path
     /// both slots exclude reports `Ignore`. A slot that settles at the parent is
     /// reported ahead of one that only excludes at the leaf.
+    ///
+    /// [`FilterMode::KeepTracked`] keeps the ancestors past the ignore slot as
+    /// well as the leaf, since every ancestor of a tracked path is tracked.
     fn exclude_reason(
         &self,
         path: &impl FilterPath,
@@ -2019,6 +2067,7 @@ impl Filter {
         mode: FilterMode,
         scope: Scope,
     ) -> Option<FilterReason> {
+        let mode = mode.excluding();
         if self.is_empty(mode) {
             return None;
         }

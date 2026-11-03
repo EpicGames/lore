@@ -2940,13 +2940,11 @@ mod tests {
         }
     }
 
-    /// A staging scan keeps a committed file the ignore file excludes below a directory removed from
-    /// the working tree, removing it being an explicit act, and stages the removal of the file
-    /// beside it, scanning the tree or the directory. A forced scan, which passes the ignore file,
-    /// stages the removal of both.
+    /// A staging scan stages the removal of a committed file the ignore file excludes below a
+    /// directory removed from the working tree, with the file beside it, scanning the tree or the
+    /// directory, forced or not: the tree tracks the file, so the ignore file has no say over it.
     #[tokio::test]
-    async fn a_stage_scan_keeps_what_the_ignore_file_excludes_below_a_removed_directory_unless_forced()
-     {
+    async fn a_stage_scan_stages_the_removal_of_a_tracked_file_the_ignore_file_excludes() {
         for name in [".", "Plugins/Foo"] {
             for force in [false, true] {
                 in_execution(async move {
@@ -2957,13 +2955,12 @@ mod tests {
                     .await;
                     std::fs::remove_dir_all(tempdir.join("Plugins/Foo")).expect("Delete failed");
                     stage_paths(&ruled, &tempdir, &[name], true, force).await;
-                    assert_eq!(
+                    assert!(
                         next_node(&ruled, "Plugins/Foo/Binaries/foo.dll")
                             .await
                             .is_staged_delete(),
-                        force,
-                        "a stage of {name}, forced {force}, got the removal of \
-                         Plugins/Foo/Binaries/foo.dll wrong"
+                        "a stage of {name}, forced {force}, left the removal of \
+                         Plugins/Foo/Binaries/foo.dll unstaged"
                     );
                     assert!(
                         next_node(&ruled, "Plugins/Foo/foo.uplugin")

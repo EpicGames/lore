@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::file::dirty::*;
+use lore_revision::filter::Filter;
 use lore_revision::filter::FilterStates;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
@@ -95,6 +96,105 @@ async fn a_path_below_an_ignored_directory_is_left_out_unread() {
         filesystem.file_infos(),
         "The call read the working tree for paths the filter leaves out whatever they hold"
     );
+}
+
+/// A layer's trees hold below its source what the filter names below its mount, so a path the
+/// layer tracks is looked up at the source spelling. Below the parent's ignored `lay/sub/`, which
+/// leaves out whatever a path below it holds, the tracked `debug.log` is still read from the
+/// working tree, while an untracked `new.log` beside it is left out unread.
+///
+/// Looking the mount spelling up in the layer's trees would find nothing, and leave out the
+/// tracked file with the untracked one.
+#[tokio::test]
+async fn a_tracked_layer_path_the_ignore_file_names_is_looked_up_below_the_source() {
+    let filesystem = Arc::new(TestFilesystemProvider::new());
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+    let mut filter = Filter::default();
+    filter
+        .ignore
+        .add_exclusion("/lay/sub/")
+        .expect("ignore rule");
+    let repository = Arc::new(RepositoryContext::new(
+        default_repository_creation_args(immutable_store, mutable_store)
+            .with_filesystem_provider(filesystem.clone())
+            .with_filter(Arc::new(filter)),
+    ));
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            // The layer's tree holds `src/sub/debug.log`; the layer is mounted at `lay/`.
+            let state = State::new();
+            let mut parent = ROOT_NODE;
+            for name in ["src", "sub"] {
+                let directory = Node {
+                    name_hash: lore_storage::hash::hash_string(name),
+                    ..Default::default()
+                };
+                parent = state
+                    .node_add(repository.clone(), parent, directory, name)
+                    .await
+                    .expect("adding a source directory");
+            }
+            let tracked = Node {
+                flags: NodeFlags::File.bits(),
+                name_hash: lore_storage::hash::hash_string("debug.log"),
+                ..Default::default()
+            };
+            state
+                .node_add(repository.clone(), parent, tracked, "debug.log")
+                .await
+                .expect("tracking the file");
+
+            let walk = DirtyWalk::new(
+                repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("beginning an operation"),
+                repository.clone(),
+                state.clone(),
+                state,
+                Arc::new(DirtyStats::default()),
+                None,
+            )
+            .await
+            .expect("reading the link registry");
+
+            let root = DirtyNodes {
+                current: ROOT_NODE,
+                staged: ROOT_NODE,
+            };
+            let reads = async |mount: &str, source: &str| {
+                let before = filesystem.file_infos();
+                dirty_named_path(
+                    &walk,
+                    root,
+                    &crate::helper::relative_path(source),
+                    &crate::helper::relative_path(mount),
+                )
+                .await
+                .expect("marking the path");
+                filesystem.file_infos() - before
+            };
+
+            assert_ne!(
+                0,
+                reads("lay/sub/debug.log", "src/sub/debug.log").await,
+                "The tracked layer file was left out by the parent's ignore rule"
+            );
+            assert_eq!(
+                0,
+                reads("lay/sub/new.log", "src/sub/new.log").await,
+                "An untracked file beside it was read past the ignore rule"
+            );
+            assert_eq!(
+                0,
+                reads("lay/sub/debug.log", "lay/sub/debug.log").await,
+                "The mount spelling was looked up in the layer's trees"
+            );
+        })
+        .await;
 }
 
 /// The repository tracks no links, so a listing yields none and the walk marks none: a link

@@ -503,20 +503,20 @@ fn a_view_of_reincluded_prefixes_with_excluded_extensions() {
     );
 }
 
-/// Every named mode other than [`FilterMode::KeepStaged`] keeps its bits through
-/// [`FilterMode::at`], so no mode can share the staged bit.
+/// Every named mode other than [`FilterMode::KeepTracked`] keeps its bits through
+/// [`FilterMode::at`], so no mode can share the tracked bit.
 #[test]
-fn a_mode_keeps_every_bit_but_the_staged_one_through_at() {
+fn a_mode_keeps_every_bit_but_the_tracked_one_through_at() {
     use bitflags::Flags;
 
     for flag in FilterMode::FLAGS {
-        if flag.name() == "KeepStaged" {
+        if flag.name() == "KeepTracked" {
             continue;
         }
         let mode = *flag.value();
         assert_eq!(mode.at(false), mode, "{}", flag.name());
         assert_eq!(
-            (mode | FilterMode::KeepStaged).at(false),
+            (mode | FilterMode::KeepTracked).at(false),
             mode,
             "{}",
             flag.name()
@@ -524,10 +524,11 @@ fn a_mode_keeps_every_bit_but_the_staged_one_through_at() {
     }
 }
 
-/// A staged node passes the ignore slot, which still folds it, so a child holding nothing staged
-/// inherits the exclusion. A whole-path query reads the staged mode as [`FilterMode::Full`].
+/// A tracked node passes the ignore slot, which still folds it, so an untracked child inherits the
+/// exclusion. A whole-path query, a descent and a question about any kind keep a tracked path's
+/// ancestors too, since every one of them is tracked.
 #[test]
-fn a_staged_node_passes_the_ignore_slot_and_its_unstaged_children_do_not() {
+fn a_tracked_node_passes_the_ignore_slot_and_its_untracked_children_do_not() {
     let mut filter = Filter::default();
     filter
         .ignore
@@ -537,25 +538,35 @@ fn a_staged_node_passes_the_ignore_slot_and_its_unstaged_children_do_not() {
     let child = path("bin/a.txt");
 
     let (states, excluded) =
-        filter.child_excludes_tree(FilterStates::ROOT, &bin, true, FilterMode::STAGED.at(true));
-    assert!(!excluded, "a staged directory passes the ignore slot");
+        filter.child_excludes_tree(FilterStates::ROOT, &bin, true, FilterMode::TRACKED.at(true));
+    assert!(!excluded, "a tracked directory passes the ignore slot");
     assert!(
         filter
-            .child_excludes_tree(FilterStates::ROOT, &bin, true, FilterMode::STAGED.at(false))
+            .child_excludes_tree(
+                FilterStates::ROOT,
+                &bin,
+                true,
+                FilterMode::TRACKED.at(false)
+            )
             .1,
-        "an unstaged directory does not"
+        "an untracked directory does not"
     );
     assert!(
         filter
-            .child_excludes_tree(states, &child, false, FilterMode::STAGED.at(false))
+            .child_excludes_tree(states, &child, false, FilterMode::TRACKED.at(false))
             .1,
-        "an unstaged child of the staged directory inherits the exclusion"
+        "an untracked child of the tracked directory inherits the exclusion"
     );
     assert!(
         !filter
-            .child_excludes_tree(states, &child, false, FilterMode::STAGED.at(true))
+            .child_excludes_tree(states, &child, false, FilterMode::TRACKED.at(true))
             .1,
-        "a staged child passes it"
+        "a tracked child passes it"
     );
-    assert!(filter.excludes_tree(&bin, true, FilterMode::STAGED));
+    assert!(!filter.excludes_tree(&child, false, FilterMode::TRACKED));
+    assert!(filter.excludes_tree(&child, false, FilterMode::TRACKED.at(false)));
+    assert!(filter.should_descend(states, &bin, FilterMode::TRACKED));
+    assert!(!filter.should_descend(states, &bin, FilterMode::TRACKED.at(false)));
+    assert!(!filter.excludes_any_kind(states, &child, FilterMode::TRACKED));
+    assert!(filter.excludes_any_kind(states, &child, FilterMode::TRACKED.at(false)));
 }

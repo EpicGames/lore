@@ -224,18 +224,72 @@ pub fn diff_subtree(
     changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> impl Future<Output = Result<DiffWalkStats, StateError>> {
+    // A repository's root carries no staged or dirty flag, so a walk rooted at one keeps it. A
+    // root only the from side holds is one the to side was built on, and one staged is tracked;
+    // where the root is only marked dirty, the to side's tree is asked whether it tracks it, on a
+    // cold path of its own, and only where the ignore rules would leave it out.
+    let changed = to.flags.contains(NodeFlags::Staged) || !to.mapping.node.is_valid_node_id();
+    if !changed
+        && filter_mode.contains(FilterMode::KeepTracked)
+        && to.flags.contains(NodeFlags::Dirty)
+    {
+        let to_filter = &to.mapping.repository.filter;
+        let (_, to_is_directory) = root_kinds(&from, &to);
+        if to_filter
+            .child_excludes_tree(
+                to_filter.parent_exclusion_states(&path),
+                &path,
+                to_is_directory,
+                filter_mode.at(false),
+            )
+            .1
+        {
+            let changes = changes.clone();
+            return Either::Right(Box::pin(async move {
+                let tracked = to
+                    .mapping
+                    .state
+                    .holds_tracked_change(&to.mapping.repository, to.mapping.node, to.flags)
+                    .await?;
+                seeded_subtree(from, to, path, graft, &changes, filter_mode, tracked).await
+            })
+                as std::pin::Pin<
+                    Box<dyn Future<Output = Result<DiffWalkStats, StateError>> + Send>,
+                >);
+        }
+    }
+    Either::Left(seeded_subtree(
+        from,
+        to,
+        path,
+        graft,
+        changes,
+        filter_mode,
+        changed,
+    ))
+}
+
+/// [`diff_subtree`] once whether the root holds a tracked change, `root_changed`, is settled.
+fn seeded_subtree(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    path: RelativePath,
+    graft: Option<Arc<GraftOracle>>,
+    changes: &ChangeSender,
+    filter_mode: FilterMode,
+    root_changed: bool,
+) -> impl Future<Output = Result<DiffWalkStats, StateError>> {
     let from_filter = &from.mapping.repository.filter;
     let to_filter = &to.mapping.repository.filter;
     let flags = DiffFlags::between(from_filter, to_filter);
     let kinds = root_kinds(&from, &to);
-    // A repository's root carries no staged flag, so a walk rooted at one keeps it.
     let (from_states, to_states, excluded) = seed_sides(
         from_filter,
         to_filter,
         &path,
         kinds,
         flags,
-        filter_mode.at(to.flags.contains(NodeFlags::Staged) || !to.mapping.node.is_valid_node_id()),
+        filter_mode.at(root_changed),
     );
     if excluded {
         lore_debug!("Excluded by filter: {}", path.as_str());
@@ -658,7 +712,22 @@ fn diff_subtree_node_walk(
                 &paths.from,
                 states.from,
                 filter_mode,
-                paired.is_some_and(|to_named_node| to_named_node.staged),
+                // The from side is the tree the to side was built on, so its node is tracked,
+                // and what is staged or marked on its counterpart is the change below it.
+                async |flags: NodeFlags| match paired {
+                    _ if flags.intersects(NodeFlags::Staged | NodeFlags::Dirty) => Ok(true),
+                    Some(to_named_node) => {
+                        to_nodes
+                            .state
+                            .holds_tracked_change(
+                                &to_nodes.repository,
+                                to_named_node.node,
+                                to_named_node.flags,
+                            )
+                            .await
+                    }
+                    None => Ok(false),
+                },
             )
             .await?
             else {
@@ -807,7 +876,12 @@ async fn add_change_for_solo_to_node(
         &paths.to,
         states.to,
         filter_mode,
-        false,
+        async |flags: NodeFlags| {
+            to_nodes
+                .state
+                .holds_tracked_change(&to_nodes.repository, to_named_node.node, flags)
+                .await
+        },
     )
     .await?
     else {
@@ -1135,6 +1209,19 @@ async fn add_change_for_paired_nodes(
         }
         drop(to_name);
 
+        // The to side passes the ignore rules where its tree tracks a change at or below the
+        // node, which is asked only where the rules would leave the node out.
+        let to_filter_mode = to_nodes
+            .repository
+            .filter
+            .tracked_mode(states.to, &subpath, !to_node.is_file(), filter_mode, || {
+                to_nodes.state.holds_tracked_change(
+                    &to_nodes.repository,
+                    to_named_node.node,
+                    NodeFlags::from_bits_retain(to_node.flags),
+                )
+            })
+            .await?;
         let (to_subtree_states, to_excludes_subtree) = to_subtree_verdict(
             &to_nodes.repository.filter,
             states.to,
@@ -1142,7 +1229,7 @@ async fn add_change_for_paired_nodes(
             from_type == LoreNodeType::File,
             to_type == LoreNodeType::File,
             flags,
-            filter_mode.at(is_staged),
+            to_filter_mode,
             stats,
         );
         if to_excludes_subtree {
@@ -1373,13 +1460,10 @@ async fn add_change_for_paired_nodes(
         } else {
             lore_trace!("Diff node {subpath} changed from {from_type:?} to {to_type:?}");
             stats.queried();
-            let (to_node_states, to_node_excluded) =
-                to_nodes.repository.filter.child_excludes_tree(
-                    states.to,
-                    &subpath,
-                    to_node.is_directory(),
-                    filter_mode.at(is_staged),
-                );
+            let (to_node_states, to_node_excluded) = to_nodes
+                .repository
+                .filter
+                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), to_filter_mode);
             add_change(
                 from.clone(),
                 to.clone(),
@@ -1455,7 +1539,7 @@ async fn find_sorted_children(
             from_nodes.children.push(StateNamedNode {
                 node: from.mapping.node,
                 name: node.name_hash,
-                staged: node.is_staged(),
+                flags: NodeFlags::from_bits_retain(node.flags),
             });
         }
 
@@ -1475,7 +1559,7 @@ async fn find_sorted_children(
             to_nodes.children.push(StateNamedNode {
                 node: to.mapping.node,
                 name: node.name_hash,
-                staged: node.is_staged(),
+                flags: NodeFlags::from_bits_retain(node.flags),
             });
         }
         directory_paths.from.pop();
@@ -1621,30 +1705,40 @@ async fn get_node_and_path(
 /// filter's verdict for it, and the child's own is returned alongside the node
 /// for the walk to carry below.
 ///
-/// The node is asked about in the mode [`FilterMode::at`] answers, staged where the node carries
-/// something staged or `staged` says its counterpart in a staged tree does.
-pub async fn get_filtered_node_and_path(
+/// The node is asked about in the mode [`FilterMode::at`] answers, past the ignore rules where
+/// `tracked` answers, from the node's flags, that its tree tracks a change at or below it. It is
+/// asked only where the rules would leave the node out.
+pub async fn get_filtered_node_and_path<F>(
     nodes: &StateChildrenNodes,
     node_id: NodeID,
     path: &RelativePath,
     parent_states: FilterStates,
     filter_mode: FilterMode,
-    staged: bool,
-) -> Result<Option<(NodeSearchResult, FilterStates)>, StateError> {
-    Ok(get_node_and_path(nodes, node_id, path)
-        .await?
-        .and_then(|result| {
-            let (states, excluded) = nodes.repository.filter.child_emit_excludes(
-                parent_states,
-                &result.path,
-                result.node.is_directory(),
-                filter_mode.at(staged || result.node.is_staged()),
-            );
-            if excluded {
-                lore_trace!("Path excluded by filter: {}", path);
-                None
-            } else {
-                Some((result, states))
-            }
-        }))
+    tracked: impl FnOnce(NodeFlags) -> F,
+) -> Result<Option<(NodeSearchResult, FilterStates)>, StateError>
+where
+    F: Future<Output = Result<bool, StateError>>,
+{
+    let Some(result) = get_node_and_path(nodes, node_id, path).await? else {
+        return Ok(None);
+    };
+    let filter = &nodes.repository.filter;
+    let is_directory = result.node.is_directory();
+    let flags = NodeFlags::from_bits_retain(result.node.flags);
+    let mode = filter
+        .tracked_mode(
+            parent_states,
+            &result.path,
+            is_directory,
+            filter_mode,
+            || tracked(flags),
+        )
+        .await?;
+    let (states, excluded) =
+        filter.child_emit_excludes(parent_states, &result.path, is_directory, mode);
+    if excluded {
+        lore_trace!("Path excluded by filter: {}", path);
+        return Ok(None);
+    }
+    Ok(Some((result, states)))
 }

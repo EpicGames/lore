@@ -4295,46 +4295,278 @@ mod tests {
         )
     }
 
-    /// Status lists a forced edit and delete below a directory an ignore rule names, also asked
-    /// about one path, and hides a file there that is only marked dirty, also asked about it.
+    /// Status lists a forced edit and delete below a directory an ignore rule names, and a file
+    /// there that is only marked dirty: all three are tracked, so the rule has no say over them.
+    /// The dirty file is marked through the ruled repository, which `lore dirty` does without
+    /// `--force` for a tracked path. Each is also asked about alone.
     #[tokio::test]
-    async fn status_lists_forced_changes_below_an_ignored_directory_and_hides_a_dirty_file() {
+    async fn status_lists_forced_and_dirty_changes_below_an_ignored_directory() {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
-                let (ruled, unruled, tempdir) = ignoring_repository(
+                let (ruled, _, tempdir) = ignoring_repository(
                     &["bin/edit.txt", "bin/gone.txt", "bin/dirty.txt"],
-                    "bin/\n",
+                    "bin/
+",
                 )
                 .await;
                 let root = tempdir.to_path_buf();
                 test_file_write(root.join("bin/dirty.txt").as_path(), b"marked");
-                file::dirty::dirty(unruled.clone(), path_arguments(&root, &["bin/dirty.txt"]))
+                file::dirty::dirty(ruled.clone(), path_arguments(&root, &["bin/dirty.txt"]))
                     .await
                     .expect("Dirty failed");
                 test_file_write(root.join("bin/edit.txt").as_path(), b"edited");
                 std::fs::remove_file(root.join("bin/gone.txt")).expect("Remove failed");
                 stage_paths(&ruled, &root, &["bin/edit.txt", "bin/gone.txt"], true, true).await;
 
-                let staged = vec![
+                let reported = vec![
                     ("D bin/gone.txt".to_string(), true),
+                    ("M bin/dirty.txt".to_string(), false),
                     ("M bin/edit.txt".to_string(), true),
                 ];
                 for scan in [false, true] {
                     assert_eq!(
                         status_reported(&ruled, None, scan).await,
-                        staged,
+                        reported,
                         "status with scan {scan}"
                     );
                 }
-                assert_eq!(
-                    status_reported(&ruled, Some(vec![relative_path("bin/edit.txt")]), false).await,
-                    staged[1..]
+                for (path, expected) in [("bin/dirty.txt", 1), ("bin/edit.txt", 2)] {
+                    assert_eq!(
+                        status_reported(&ruled, Some(vec![relative_path(path)]), false).await,
+                        reported[expected..=expected],
+                        "status of {path}"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Rebasing the staged state, as a sync or a branch switch does, carries a dirty mark on a
+    /// committed file below a directory an ignore rule names, and leaves out an add marked dirty
+    /// beside it under force: the tree tracks the file, so the rule has no say over it, and the add
+    /// is untracked. A rebase that dropped the mark would leave the edit unmarked and out of a
+    /// status that does not scan.
+    #[tokio::test]
+    async fn rebase_staged_state_carries_a_dirty_tracked_file_an_ignore_rule_names() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, _, tempdir) = ignoring_repository(&["bin/edit.txt"], "bin/\n").await;
+                let root = tempdir.to_path_buf();
+                test_file_write(root.join("bin/edit.txt").as_path(), b"edited");
+                file::dirty::dirty(ruled.clone(), path_arguments(&root, &["bin/edit.txt"]))
+                    .await
+                    .expect("Dirty failed");
+                test_file_write(root.join("bin/new.txt").as_path(), b"new");
+                LORE_CONTEXT
+                    .scope(
+                        forced_execution(),
+                        file::dirty::dirty(ruled.clone(), path_arguments(&root, &["bin/new.txt"])),
+                    )
+                    .await
+                    .expect("Forced dirty failed");
+
+                let (current, _) = lore_revision::instance::load_current_anchor_boxed(&ruled)
+                    .await
+                    .expect("Load current anchor failed");
+                let staged = lore_revision::instance::load_staged_revision(&ruled)
+                    .await
+                    .expect("Load staged anchor failed")
+                    .expect("Dirty should have anchored a staged state");
+
+                let rebased = lore_revision::state::rebase_staged_state(
+                    ruled.clone(),
+                    staged,
+                    current,
+                    false,
+                )
+                .await
+                .expect("Rebase failed")
+                .expect("The dirty tracked file should produce a rebased state");
+                let rebased = State::deserialize(ruled.clone(), rebased)
+                    .await
+                    .expect("Deserialize rebased state failed");
+                let edit = rebased
+                    .find_node(ruled.clone(), "bin/edit.txt")
+                    .await
+                    .expect("The rebased state holds bin/edit.txt");
+                assert!(
+                    edit.is_dirty_modify(),
+                    "bin/edit.txt should be dirty in the rebased state"
                 );
+                let new = rebased.find_node(ruled.clone(), "bin/new.txt").await.ok();
+                assert!(
+                    new.is_none_or(|node| !node.is_dirty_add()),
+                    "the untracked bin/new.txt was carried past the ignore rule: {new:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A dirty copy into a directory the ignore file names marks a new node, which the tree does
+    /// not track, so an ordinary status leaves it out and an ordinary stage stages nothing of it,
+    /// where a copy into a directory no rule names is reported and staged. A dirty move there keeps
+    /// the committed node it moves, which the tree tracks wherever it moves, so it is reported as a
+    /// move into a directory no rule names is.
+    #[tokio::test]
+    async fn a_dirty_copy_into_an_ignored_directory_stays_ignored_and_a_dirty_move_does_not() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, _, tempdir) = ignoring_repository(
+                    &[
+                        "bin/keep.txt",
+                        "copied.txt",
+                        "moved.txt",
+                        "plain/keep.txt",
+                        "other.txt",
+                    ],
+                    "bin/\n",
+                )
+                .await;
+                let root = tempdir.to_path_buf();
+                std::fs::copy(root.join("copied.txt"), root.join("bin/copy.txt"))
+                    .expect("Copy failed");
+                std::fs::rename(root.join("moved.txt"), root.join("bin/moved.txt"))
+                    .expect("Move failed");
+                let at = |path: &str| root.join(path).to_string_lossy().into_owned();
+                std::fs::copy(root.join("copied.txt"), root.join("plain/copy.txt"))
+                    .expect("Copy failed");
+                for to in ["bin/copy.txt", "plain/copy.txt"] {
+                    file::dirty::dirty_copy(ruled.clone(), at("copied.txt"), at(to))
+                        .await
+                        .expect("Dirty copy failed");
+                }
+                file::dirty::dirty_move(ruled.clone(), at("moved.txt"), at("bin/moved.txt"))
+                    .await
+                    .expect("Dirty move failed");
+
+                std::fs::rename(root.join("other.txt"), root.join("plain/other.txt"))
+                    .expect("Move failed");
+                file::dirty::dirty_move(ruled.clone(), at("other.txt"), at("plain/other.txt"))
+                    .await
+                    .expect("Dirty move failed");
+                let moves = [
+                    ("V moved.txt -> bin/moved.txt".to_string(), false),
+                    ("V other.txt -> plain/other.txt".to_string(), false),
+                ];
+                let copy = |staged: bool| ("A plain/copy.txt".to_string(), staged);
+                let reported = |staged: bool| {
+                    std::iter::once(copy(staged))
+                        .chain(moves.iter().cloned())
+                        .collect::<Vec<_>>()
+                };
                 assert_eq!(
-                    status_reported(&ruled, Some(vec![relative_path("bin/dirty.txt")]), false)
-                        .await,
-                    []
+                    status_reported(&ruled, None, false).await,
+                    reported(false),
+                    "status reported the copy into the ignored directory, or missed a move"
+                );
+                stage_paths(&ruled, &root, &["."], false, false).await;
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    reported(true),
+                    "stage staged the copy into the ignored directory, or treated the moves apart"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A forced dirty mark of a new file below a new directory the ignore file names leaves both
+    /// untracked: the directory the mark creates is a dirty add, as the file is, so an ordinary
+    /// status reports neither and an ordinary stage stages neither. Beside them, a new directory no
+    /// rule names is staged with the file marked in it, and not with the unmarked file the working
+    /// tree holds there too.
+    #[tokio::test]
+    async fn a_forced_dirty_add_below_a_new_ignored_directory_stays_ignored() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, _, tempdir) = ignoring_repository(&[], "build/\n").await;
+                let root = tempdir.to_path_buf();
+                for path in ["build/new.log", "plain/new.txt", "plain/other.txt"] {
+                    std::fs::create_dir_all(root.join(path).parent().expect("A parent"))
+                        .expect("Create directory failed");
+                    test_file_write(root.join(path).as_path(), path.as_bytes());
+                }
+                LORE_CONTEXT
+                    .scope(
+                        forced_execution(),
+                        file::dirty::dirty(
+                            ruled.clone(),
+                            path_arguments(&root, &["build/new.log", "plain/new.txt"]),
+                        ),
+                    )
+                    .await
+                    .expect("Forced dirty failed");
+
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    [
+                        ("A plain/".to_string(), false),
+                        ("A plain/new.txt".to_string(), false)
+                    ],
+                    "status reported the ignored directory or missed the marked file"
+                );
+
+                stage_paths(&ruled, &root, &["."], false, false).await;
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    [
+                        ("A plain/".to_string(), true),
+                        ("A plain/new.txt".to_string(), true)
+                    ],
+                    "stage staged the ignored directory or the unmarked file"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A commit of another file carries a dirty mark on a committed file below a directory an
+    /// ignore rule names onto the staged state it leaves, as it carries any mark it does not
+    /// commit.
+    #[tokio::test]
+    async fn a_commit_carries_a_dirty_tracked_file_an_ignore_rule_names() {
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
+                let (ruled, _, tempdir) =
+                    ignoring_repository(&["bin/edit.txt", "keep.txt"], "bin/\n").await;
+                let root = tempdir.to_path_buf();
+                test_file_write(root.join("bin/edit.txt").as_path(), b"edited");
+                file::dirty::dirty(ruled.clone(), path_arguments(&root, &["bin/edit.txt"]))
+                    .await
+                    .expect("Dirty failed");
+                test_file_write(root.join("keep.txt").as_path(), b"changed");
+                stage_paths(&ruled, &root, &["keep.txt"], true, false).await;
+                commit::commit_boxed(
+                    ruled.clone(),
+                    ruled
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Commit keep.txt".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+
+                let staged = lore_revision::instance::load_staged_revision(&ruled)
+                    .await
+                    .expect("Load staged anchor failed")
+                    .expect("The commit should leave the dirty mark staged-anchored");
+                let staged = State::deserialize(ruled.clone(), staged)
+                    .await
+                    .expect("Deserialize staged state failed");
+                let edit = staged
+                    .find_node(ruled.clone(), "bin/edit.txt")
+                    .await
+                    .expect("The staged state holds bin/edit.txt");
+                assert!(
+                    edit.is_dirty_modify(),
+                    "bin/edit.txt should stay dirty after the commit"
                 );
             }))
             .await
@@ -4405,7 +4637,7 @@ mod tests {
                 assert_eq!(reported, status_reported(&unruled, None, false).await);
                 assert_eq!(reported, vec![("D gen/".to_string(), true)]);
                 assert_eq!(
-                    staged_walk(&ruled, lore_revision::filter::FilterMode::STAGED)
+                    staged_walk(&ruled, lore_revision::filter::FilterMode::TRACKED)
                         .await
                         .0,
                     vec![("D".to_string(), "gen".to_string())]
@@ -4500,43 +4732,46 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// The comparison status runs against the staged state does not enter a directory an ignore
-    /// rule names where nothing below it is staged, however much is marked dirty there.
+    /// The comparison status runs against the staged state enters a directory an ignore rule
+    /// names only along what is staged or marked dirty below it: those are changes to tracked
+    /// files, which it lists as it would without the rule, and a subtree with nothing changed in
+    /// it is not entered however much it holds.
     #[tokio::test]
-    async fn the_staged_comparison_does_not_walk_an_ignored_directory_holding_nothing_staged() {
+    async fn the_staged_comparison_enters_an_ignored_directory_only_along_its_changes() {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
-                let (ruled, unruled, tempdir) =
-                    ignoring_repository(&["gen/a/f.txt", "gen/b/f.txt", "keep.txt"], "gen/\n")
-                        .await;
+                let (ruled, _, tempdir) = ignoring_repository(
+                    &["gen/a/f.txt", "gen/b/f.txt", "gen/c/f.txt", "keep.txt"],
+                    "gen/
+",
+                )
+                .await;
                 let root = tempdir.to_path_buf();
                 test_file_write(root.join("keep.txt").as_path(), b"edited");
                 stage_paths(&ruled, &root, &["keep.txt"], true, false).await;
                 std::fs::remove_dir_all(root.join("gen/a")).expect("Remove failed");
                 test_file_write(root.join("gen/b/f.txt").as_path(), b"edited");
                 file::dirty::dirty(
-                    unruled.clone(),
-                    LoreArray::from_vec(vec![LoreString::from(&root)]),
+                    ruled.clone(),
+                    path_arguments(&root, &["gen/a", "gen/b/f.txt"]),
                 )
                 .await
                 .expect("Dirty failed");
 
-                let (marked, entered) =
-                    staged_walk(&ruled, lore_revision::filter::FilterMode::View).await;
-                assert!(
-                    marked.len() > 3 && entered > 1,
-                    "the dirty marks below gen are there to walk into"
-                );
+                // A deleted directory is listed whole: its files are judged by their own flags in
+                // the current tree, which carries none, so the rule leaves them out of the list.
+                let (found, entered) =
+                    staged_walk(&ruled, lore_revision::filter::FilterMode::TRACKED).await;
                 assert_eq!(
-                    staged_walk(&ruled, lore_revision::filter::FilterMode::STAGED).await,
-                    (
-                        [".loreignore", "keep.txt", "seed.txt"]
-                            .map(|path| ("M".to_string(), path.to_string()))
-                            .to_vec(),
-                        1
-                    )
+                    found,
+                    [("D", "gen/a"), ("M", "gen/b/f.txt"), ("M", "keep.txt")]
+                        .map(|(action, path)| (action.to_string(), path.to_string()))
+                        .to_vec()
                 );
+                // The root, gen and gen/b: gen/a is listed as deleted without being entered, and
+                // gen/c holds nothing changed.
+                assert_eq!(entered, 3);
             }))
             .await
             .expect("Test task failed");
@@ -4565,7 +4800,7 @@ mod tests {
     }
 
     /// Unstaging a path takes back a staged change to it that an ignore rule matches, which
-    /// status lists.
+    /// status lists. The edit stays in the working tree, so the file is still listed, unstaged.
     #[tokio::test]
     async fn unstage_takes_back_a_staged_change_below_an_ignored_directory() {
         #[allow(clippy::disallowed_methods)]
@@ -4590,7 +4825,10 @@ mod tests {
                 )
                 .await
                 .expect("Unstage failed");
-                assert_eq!(status_reported(&ruled, None, false).await, []);
+                assert_eq!(
+                    status_reported(&ruled, None, false).await,
+                    vec![("M bin/sub/a.txt".to_string(), false)]
+                );
             }))
             .await
             .expect("Test task failed");

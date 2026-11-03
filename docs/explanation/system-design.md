@@ -1292,10 +1292,10 @@ obvious "I only work on this directory" case.
 #### 12.3 Ignore files: outbound filtering
 
 An *ignore file* (`.loreignore`) is an outbound filter declaring which paths the user does not
-want included in commits. Paths matching ignore rules are not staged, not committed, and not
-reported in status. A forced stage or a merge can still stage such a path; status lists it and the
-commit takes it. Build artifacts, editor temporary files, machine-local configuration: all
-typical inhabitants.
+want included in commits. Paths matching ignore rules that the tree does not already track are
+not staged, not committed, and not reported in status. A forced stage or a merge can still stage
+such a path; status lists it and the commit takes it. Build artifacts, editor temporary files,
+machine-local configuration: all typical inhabitants.
 
 Ignore is purely about *new* content. A file that is already part of the committed revision
 will keep flowing through inbound operations even if a later ignore rule would exclude it; the
@@ -1319,8 +1319,11 @@ The rule is simple: operations on *committed state* consult the view only; opera
   file has no say in what a reset restores or removes.
 - Operations on the working directory or staging area - staging, status, locking - filter
   through both. The view limits what the operation sees on disk; the ignore file then further
-  excludes things the user has declared shouldn't be staged. Status lists what is already
-  staged through the view alone, since that is what the next commit holds.
+  excludes things the user has declared shouldn't be staged. The ignore file is asked only about
+  paths the tree does not hold yet: a path already staged or committed, for example one staged
+  past the ignore file with `--force`, keeps flowing through staging and status like any other,
+  its deletion included. A working-tree entry of another kind at its path is new content
+  ([ADR-00027](../developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
 
 This split is what keeps `.loreignore` from breaking earlier history: a newly-added ignore
 rule does not retroactively excise committed files, because committed-state operations consult

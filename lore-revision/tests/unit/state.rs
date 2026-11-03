@@ -170,6 +170,16 @@ async fn null_repository() -> Arc<RepositoryContext> {
 
 /// [`null_repository`] whose ignore filter excludes `globs`.
 async fn null_repository_excluding(globs: &[&str]) -> Arc<RepositoryContext> {
+    null_repository_filtering(globs, &[]).await
+}
+
+/// [`null_repository`] whose view excludes `globs`.
+async fn null_repository_viewing(globs: &[&str]) -> Arc<RepositoryContext> {
+    null_repository_filtering(&[], globs).await
+}
+
+/// [`null_repository`] whose ignore filter excludes `ignore` and whose view excludes `view`.
+async fn null_repository_filtering(ignore: &[&str], view: &[&str]) -> Arc<RepositoryContext> {
     let immutable_store = lore_storage::local::immutable_store::create(
         None::<&str>,
         lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -187,8 +197,11 @@ async fn null_repository_excluding(globs: &[&str]) -> Arc<RepositoryContext> {
     .expect("in-memory mutable store");
 
     let mut filter = lore_revision::filter::Filter::default();
-    for glob in globs {
-        filter.ignore.add_exclusion(glob).expect("filter exclusion");
+    for glob in ignore {
+        filter.ignore.add_exclusion(glob).expect("ignore exclusion");
+    }
+    for glob in view {
+        filter.view.add_exclusion(glob).expect("view exclusion");
     }
 
     let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
@@ -789,7 +802,7 @@ async fn dirty_paths_are_recorded_depth_first_along_each_sibling_chain() {
         repository.clone(),
         ROOT_NODE,
         "alpha",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
 
@@ -842,9 +855,50 @@ async fn dirty_paths_are_recorded_depth_first_along_each_sibling_chain() {
     );
 }
 
+/// A new directory holding nodes is carried by them and records no path of its
+/// own, since re-applied it would mark everything the working tree holds below
+/// it, marked or not. An empty new directory has nothing to carry it, so it is
+/// recorded.
+#[tokio::test]
+async fn a_new_directory_is_recorded_only_where_it_is_empty() {
+    let repository = null_repository().await;
+    let state = State::new();
+
+    let added = add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "added",
+        NodeFlags::DirtyAdd,
+    )
+    .await;
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        added,
+        "leaf.txt",
+        NodeFlags::DirtyAdd | NodeFlags::File,
+    )
+    .await;
+    add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "empty",
+        NodeFlags::DirtyAdd,
+    )
+    .await;
+
+    assert_eq!(
+        walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+        vec!["added/leaf.txt", "empty"],
+        "the new directory is carried by its file, and the empty one by itself"
+    );
+}
+
 /// A directory that carries an action of its own and is also descended is
-/// recorded before anything below it: the action re-creates the directory the
-/// paths under it are re-applied into.
+/// recorded before anything below it, so its action is re-applied before the
+/// paths under it.
 #[tokio::test]
 async fn a_directory_is_recorded_before_the_paths_under_it() {
     let repository = null_repository().await;
@@ -863,7 +917,7 @@ async fn a_directory_is_recorded_before_the_paths_under_it() {
         repository.clone(),
         ROOT_NODE,
         "added",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     let inner = add_dirty_node(
@@ -871,7 +925,7 @@ async fn a_directory_is_recorded_before_the_paths_under_it() {
         repository.clone(),
         added,
         "inner",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     add_dirty_node(
@@ -1304,7 +1358,7 @@ async fn a_directory_is_recorded_before_it_is_descended() {
         repository.clone(),
         ROOT_NODE,
         "added",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     add_dirty_node(&state, repository.clone(), added, "leaf.txt", file).await;
@@ -1313,7 +1367,7 @@ async fn a_directory_is_recorded_before_it_is_descended() {
         repository.clone(),
         added,
         "deeper",
-        NodeFlags::DirtyAdd,
+        NodeFlags::DirtyModify,
     )
     .await;
     add_dirty_node(&state, repository.clone(), deeper, "deep.txt", file).await;
@@ -1450,11 +1504,11 @@ async fn a_staged_node_is_recorded_only_when_staged_nodes_are_wanted() {
     );
 }
 
-/// A path the filter excludes cannot be re-applied against a checkout that
+/// A path the view excludes cannot be re-applied against a checkout that
 /// never materializes it, so it is not recorded. `force` records it anyway.
 #[tokio::test]
 async fn a_filtered_path_is_recorded_only_under_force() {
-    let repository = null_repository_excluding(&["ignored.txt"]).await;
+    let repository = null_repository_viewing(&["ignored.txt"]).await;
     let state = State::new();
 
     for name in ["ignored.txt", "kept.txt"] {
@@ -1493,12 +1547,75 @@ async fn a_filtered_path_is_recorded_only_under_force() {
     );
 }
 
+/// The ignore file has no say over a node the tree tracks, one the revision it was built on holds,
+/// so a dirty mark on one is recorded below a directory the ignore file names. An add or a copy
+/// merely marked dirty there is not: the revision holds neither, and the ignore file leaves them
+/// out.
+#[tokio::test]
+async fn a_tracked_path_the_ignore_file_names_is_recorded_and_a_marked_add_or_copy_is_not() {
+    let repository = null_repository_excluding(&["build/"]).await;
+    let token = repository
+        .try_write_token()
+        .expect("a null context carries a write token");
+
+    let committed = State::new();
+    let build = add_dirty_node(
+        &committed,
+        repository.clone(),
+        ROOT_NODE,
+        "build",
+        NodeFlags::NoFlags,
+    )
+    .await;
+    let tracked = add_dirty_node(
+        &committed,
+        repository.clone(),
+        build,
+        "tracked.o",
+        NodeFlags::File,
+    )
+    .await;
+    committed.set_revision_number(1);
+    let revision = committed
+        .serialize(repository.clone(), token)
+        .await
+        .expect("serializing the committed revision");
+
+    let state = State::deserialize(repository.clone(), revision)
+        .await
+        .expect("deserializing the revision to build on");
+    state.reparent_onto(revision);
+    state
+        .node_mark_dirty(repository.clone(), tracked, NodeFlags::DirtyModify, true)
+        .await
+        .expect("marking the tracked file");
+    for (name, action) in [
+        ("new.o", NodeFlags::DirtyAdd),
+        ("copy.o", NodeFlags::DirtyCopy),
+    ] {
+        add_dirty_node(
+            &state,
+            repository.clone(),
+            build,
+            name,
+            action | NodeFlags::File,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        walk_dirty_paths(state, repository, DirtyWalkOptions::default()).await,
+        vec!["build/tracked.o"],
+        "the tracked file is carried, and the add and the copy beside it are not"
+    );
+}
+
 /// Excluding a directory prunes its subtree: the filter is asked about the
 /// directory before the walk descends into it, so a path below an excluded
 /// directory is never reached.
 #[tokio::test]
 async fn an_excluded_directory_is_not_descended() {
-    let repository = null_repository_excluding(&["build"]).await;
+    let repository = null_repository_viewing(&["build"]).await;
     let state = State::new();
 
     let build = add_dirty_node(

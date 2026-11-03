@@ -917,12 +917,38 @@ async fn unstage_node(
         .forward::<UnstageError>("Failed deserializing state node block")?;
     let mut node = block.node(node_index);
 
+    // Past the ignore rules where the staged tree tracks a change at or below the node, which it
+    // is asked only where the rules would leave the node out.
+    let force = execution_context().globals().force();
+    let mode = if force {
+        FilterMode::TRACKED
+    } else {
+        repository
+            .filter
+            .tracked_mode(
+                states,
+                &node_path,
+                !node.is_file(),
+                FilterMode::TRACKED,
+                async || {
+                    state_staged
+                        .holds_tracked_change(
+                            &repository,
+                            node_id,
+                            NodeFlags::from_bits_retain(node.flags),
+                        )
+                        .await
+                },
+            )
+            .await
+            .forward::<UnstageError>("Failed to read the revision the staged tree was built on")?
+    };
     let (child_states, excluded) = repository.filter.child_emit_excludes_unless_forced(
-        execution_context().globals().force(),
+        force,
         states,
         &node_path,
         !node.is_file(),
-        FilterMode::STAGED.at(node.is_staged()),
+        mode,
     );
     if excluded {
         lore_debug!("Node excluded by filter: {}", node_path.as_str());

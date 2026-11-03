@@ -1604,16 +1604,18 @@ def test_layer_stage_is_filtered_by_the_mount_path(new_lore_repo):
     """A rule naming the mount excludes what is below it from staging.
 
     Ignore rules are written against the working tree, so `thr/**` — which matches nothing the
-    layer repository spells — must still exclude the file the layer draws.
+    layer repository spells — must still exclude a new file below the mount. The file has to be
+    new: a rule has no say over one the layer already tracks (ADR-00027).
     """
     repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
 
     with repo.open_file(repo.ignore_file(), "w+") as out:
         out.write("thr/**\n")
-    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+    new_file = os.path.join("thr", "new_in_layer.txt")
+    with repo.open_file(new_file, mode="wb") as out:
         out.write(b"excluded by the mount rule")
 
-    staged = parse_jsonl(repo.stage(THR_MOUNT_FILE, json=True), "fileStageFile")
+    staged = parse_jsonl(repo.stage(new_file, json=True), "fileStageFile")
     assert staged == [], (
         f"Expected the rule on the mount path to exclude the file from `stage`, got: {staged}"
     )

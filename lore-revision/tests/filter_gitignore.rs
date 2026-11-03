@@ -1692,6 +1692,68 @@ fn a_forced_step_excludes_nothing_and_carries_no_verdict() {
     }
 }
 
+/// A path the tree tracks is past the ignore slot, and only the view drops it.
+///
+/// The states a tracked step hands back are both slots' all the same, so an
+/// untracked child of a tracked, ignored directory is still ignored while a
+/// tracked one beside it is kept.
+#[test]
+fn a_tracked_step_answers_to_the_view_alone() {
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+
+    let mut filter = Filter::default();
+    filter.ignore.add_exclusion("*.log").expect("exclusion");
+    filter.ignore.add_exclusion("build/").expect("exclusion");
+    filter.view.add_exclusion("binaries").expect("exclusion");
+
+    // Path, is a directory, excluded untracked, excluded tracked.
+    for (name, is_directory, untracked, tracked) in [
+        ("debug.log", false, true, false),
+        ("build", true, true, false),
+        ("binaries", true, true, true),
+        ("keep.txt", false, false, false),
+    ] {
+        let subject = path(name);
+        for (is_tracked, expected) in [(false, untracked), (true, tracked)] {
+            let (_, excluded) = filter.child_excludes_tree(
+                FilterStates::ROOT,
+                &subject,
+                is_directory,
+                FilterMode::TRACKED.at(is_tracked),
+            );
+            assert_eq!(
+                excluded, expected,
+                "{name} tracked {is_tracked} excluded {excluded}"
+            );
+        }
+    }
+
+    let (build_states, _) = filter.child_excludes_tree(
+        FilterStates::ROOT,
+        &path("build"),
+        true,
+        FilterMode::TRACKED.at(true),
+    );
+    let (_, untracked) = filter.child_excludes_tree(
+        build_states,
+        &path("build/new.txt"),
+        false,
+        FilterMode::TRACKED.at(false),
+    );
+    assert!(
+        untracked,
+        "an untracked file in an ignored directory stays ignored"
+    );
+    let (_, tracked) = filter.child_excludes_tree(
+        build_states,
+        &path("build/tracked.txt"),
+        false,
+        FilterMode::TRACKED.at(true),
+    );
+    assert!(!tracked, "a tracked file in an ignored directory is kept");
+}
+
 /// Folding a whole path and stepping down it one component at a time reach the
 /// same verdict.
 ///

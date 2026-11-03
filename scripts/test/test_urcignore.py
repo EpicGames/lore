@@ -20,7 +20,8 @@ def test_urcignore_committed_file(new_lore_repo):
     Scenario:
     1. Commit a file (data.bin) normally.
     2. Add a .loreignore rule that matches that file.
-    3. Verify outbound commands (status, stage) skip the ignored file.
+    3. Verify outbound commands (status, stage) still handle the file: the
+       ignore rules govern only what the tree does not track (ADR-00027).
     4. Verify inbound commands (sync, branch switch, revision diff between
        two revisions, restore) still handle the ignored-but-committed file.
     """
@@ -63,22 +64,25 @@ def test_urcignore_committed_file(new_lore_repo):
     repo.commit("Add ignore file excluding data.bin")
     repo.push()
 
-    # -- Outbound: status should NOT show data.bin as unstaged/untracked --
-    # Modify the ignored file on disk
+    # -- Outbound: status reports a change to the tracked file --
+    # Modify the ignored-but-committed file on disk
     with repo.open_file(committed_file, "w+b") as f:
         f.write(os.urandom(512))
 
     output = repo.repository_status(unstaged=True)
-    assert "data.bin" not in output, "status should not report ignored file data.bin"
-
-    # -- Outbound: stage should skip the ignored file --
-    repo.stage(scan=True)
-    output = repo.repository_status()
-    assert "data.bin" not in output, (
-        "stage should not have staged the ignored file data.bin"
+    assert "data.bin" in output, (
+        "status should report a change to ignored-but-committed file data.bin"
     )
 
-    # Reset the local modification so it doesn't interfere with sync
+    # -- Outbound: stage takes the change without --force --
+    repo.stage(scan=True)
+    output = repo.repository_status()
+    assert "data.bin" in output, (
+        "stage should have staged the change to ignored-but-committed file data.bin"
+    )
+
+    # Unstage and reset the local modification so it doesn't interfere with sync
+    repo.unstage(".")
     repo.file_reset()
 
     # -- Inbound: revision diff between two committed revisions should include data.bin --

@@ -143,8 +143,9 @@ pub type StateError = StateErrors;
 pub struct StateNamedNode {
     node: NodeID,
     name: u64,
-    /// Whether something is staged at or below the node.
-    staged: bool,
+    /// The node's flags, which say what is staged or marked at or below it and what kind it is,
+    /// for [`State::tracks`] and [`State::holds_tracked_change`].
+    flags: NodeFlags,
 }
 
 pub struct StateChildrenNodes {
@@ -440,6 +441,9 @@ pub struct State {
     /// are read for their header alone and never load a block, and held inline
     /// the array would make every `State` 11 KiB.
     block_loading: std::sync::OnceLock<Box<[tokio::sync::Semaphore]>>,
+    /// The revision this tree was built on, with its signature, read apart from this tree the
+    /// first time [`State::tracks`] asks about it.
+    base: parking_lot::Mutex<Option<(Hash, Arc<State>)>>,
 }
 
 impl std::fmt::Debug for State {
@@ -699,6 +703,7 @@ impl State {
                 block_deserialize: _,
                 metadata_deserialize: _,
                 block_loading: _,
+                base: _,
             } = state;
         };
         let state = Arc::<Self>::new_uninit();
@@ -717,6 +722,7 @@ impl State {
             (&raw mut (*fields).block_deserialize).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).metadata_deserialize).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).block_loading).write(std::sync::OnceLock::new());
+            (&raw mut (*fields).base).write(parking_lot::Mutex::new(None));
             state.assume_init()
         }
     }
@@ -2007,6 +2013,107 @@ impl State {
         } else {
             self.revision()
         }
+    }
+
+    /// Whether this tree tracks the node it holds at `id`, carrying `flags`: one it stages, or one the revision
+    /// it was built on holds, wherever this tree has since moved it. Everything else this tree
+    /// holds is only marked, as an add or a copy is, and the ignore rules apply to it
+    /// ([ADR-00027](../../docs/developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
+    ///
+    /// A tree shares its node IDs with the revision it was built on, so a node that revision
+    /// holds sits at the same ID, with the same type, in the revision's tree. The revision is read
+    /// apart from this tree, which a walk may be adding nodes to, the first time it is asked, and
+    /// kept for as long as this tree is built on it.
+    pub async fn tracks(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+        flags: NodeFlags,
+    ) -> Result<bool, StateError> {
+        if flags.contains(NodeFlags::Staged) || id == ROOT_NODE {
+            return Ok(true);
+        }
+        // Boxed: a walk reaches this only where the ignore rules would leave a node out, and
+        // unboxed the revision's read would sit in every walk future that asks.
+        Box::pin(self.base_holds(repository, id, flags.node_type())).await
+    }
+
+    /// Whether the revision this tree was built on holds a node of `node_type` at `id`.
+    async fn base_holds(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+        node_type: crate::interface::LoreNodeType,
+    ) -> Result<bool, StateError> {
+        self.base(repository)
+            .await?
+            .holds_node(repository, id, node_type)
+            .await
+    }
+
+    /// Whether this tree tracks the node it holds at `id`, carrying `flags`, as a directory where
+    /// `is_directory` says and as a file otherwise, a link counting as a directory. A working-tree
+    /// entry of the other kind at the node's path is new content.
+    pub async fn tracks_as(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+        flags: NodeFlags,
+        is_directory: bool,
+    ) -> Result<bool, StateError> {
+        Ok(flags.contains(NodeFlags::File) != is_directory
+            && self.tracks(repository, id, flags).await?)
+    }
+
+    /// Whether something this tree tracks is staged or marked dirty at or below the node it holds
+    /// at `id`, carrying `flags`. Staged and dirty marks propagate to the ancestors, so a node
+    /// carrying neither holds no change below it. A dirty mark on a node the tree does not track
+    /// counts only where it holds a staged one below it.
+    pub async fn holds_tracked_change(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+        flags: NodeFlags,
+    ) -> Result<bool, StateError> {
+        Ok(flags.contains(NodeFlags::Staged)
+            || (flags.contains(NodeFlags::Dirty) && self.tracks(repository, id, flags).await?))
+    }
+
+    /// The revision this tree was built on, read once for each revision it is built on.
+    async fn base(&self, repository: &Arc<RepositoryContext>) -> Result<Arc<State>, StateError> {
+        let revision = self.committed_revision();
+        let cached = self
+            .base
+            .lock()
+            .as_ref()
+            .filter(|(signature, _)| *signature == revision)
+            .map(|(_, base)| base.clone());
+        if let Some(base) = cached {
+            return Ok(base);
+        }
+        let base = State::deserialize(repository.clone(), revision).await?;
+        *self.base.lock() = Some((revision, base.clone()));
+        Ok(base)
+    }
+
+    /// Whether this tree holds a node of `node_type` at `id`.
+    pub(crate) async fn holds_node(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+        node_type: crate::interface::LoreNodeType,
+    ) -> Result<bool, StateError> {
+        if id == ROOT_NODE {
+            return Ok(true);
+        }
+        let block_index = NodeBlock::index(id);
+        if block_index >= self.tree(repository.clone()).await?.block_count as usize {
+            return Ok(false);
+        }
+        let block = self.block(repository.clone(), block_index).await?;
+        let reader = block.read();
+        let index = Node::index(id);
+        Ok(reader.is_node_in_use(index) && reader.node(index).node_type() == node_type)
     }
 
     pub fn set_revision_number(&self, revision_number: u64) {
@@ -3681,12 +3788,24 @@ impl State {
 
             if node_id == root_node && children.is_empty() && !path.is_empty() {
                 let node = self.node(repository.clone(), node_id).await?;
+                let tracked = node.is_dirty_add()
+                    && node.is_directory()
+                    && !force
+                    && self
+                        .tracks(
+                            &repository,
+                            node_id,
+                            NodeFlags::from_bits_retain(node.flags),
+                        )
+                        .await?;
                 if node.is_dirty_add()
                     && node.is_directory()
                     && (force
-                        || repository
-                            .filter
-                            .should_descend(states, &path, FilterMode::Full))
+                        || repository.filter.should_descend(
+                            states,
+                            &path,
+                            FilterMode::TRACKED.at(tracked),
+                        ))
                 {
                     result.push(path);
                 }
@@ -3707,15 +3826,38 @@ impl State {
                 };
                 let child_path = path.push_into_buf(&name).freeze();
 
-                // Don't carry forward dirty paths the view/ignore filter
-                // excludes; they can't be replayed against a checkout that
-                // never materializes them. --force bypasses the filter.
+                // Don't carry forward dirty paths the filter excludes; they
+                // can't be replayed against a checkout that never materializes
+                // them. --force bypasses the filter. The ignore slot has no say
+                // over a node the tree tracks, only over one it only marks, as
+                // an add or a copy.
+                let mode = if force {
+                    FilterMode::TRACKED
+                } else {
+                    repository
+                        .filter
+                        .tracked_mode(
+                            states,
+                            &child_path,
+                            !child.is_file(),
+                            FilterMode::TRACKED,
+                            async || {
+                                self.tracks(
+                                    &repository,
+                                    child_id,
+                                    NodeFlags::from_bits_retain(child.flags),
+                                )
+                                .await
+                            },
+                        )
+                        .await?
+                };
                 let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
                     force,
                     states,
                     &child_path,
                     !child.is_file(),
-                    FilterMode::Full,
+                    mode,
                 );
                 if excluded {
                     continue;
@@ -3737,9 +3879,12 @@ impl State {
                         result.extend(linked_paths);
                     }
                 } else if child.is_directory() {
-                    // A new (dirty-add) directory is itself a change to stage; an
-                    // empty one has no child files to carry it.
-                    if child.is_dirty_add() {
+                    // A new (dirty-add) directory is itself a change to stage. One
+                    // only marked, not staged, is that only where it is empty, with
+                    // no child to carry it: one holding nodes is carried by them,
+                    // and recorded itself it would stage everything the working
+                    // tree holds below it, marked or not.
+                    if child.is_dirty_add() && !marked_directory_carried_by_children(&child) {
                         result.push(child_path.clone());
                     }
                     // A dirty-delete directory is staged as the deletion of its
@@ -3898,6 +4043,36 @@ impl State {
     ) -> Result<NodeLink, StateError> {
         self.find_relative_node_link(repository, ROOT_NODE, path)
             .await
+    }
+
+    /// The kind this tree tracks `path` below `root` as ([`State::tracks`]): `Some` of whether a
+    /// filter asks about it as a directory, or `None` where the tree does not track it. The node is
+    /// read through any link the path crosses, and a path the tree cannot resolve is not tracked.
+    pub async fn relative_path_tracked_as(
+        self: &Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &str,
+    ) -> Result<Option<bool>, StateError> {
+        let Some(link) = self
+            .find_relative_node_link(repository.clone(), root, path)
+            .await
+            .ok()
+            .filter(NodeLink::is_valid)
+        else {
+            return Ok(None);
+        };
+        let Ok((repository, state)) = link.resolve(repository, self.clone()).await else {
+            return Ok(None);
+        };
+        let Ok(node) = state.node(repository.clone(), link.node).await else {
+            return Ok(None);
+        };
+        let flags = NodeFlags::from_bits_retain(node.flags);
+        Ok(state
+            .tracks(&repository, link.node, flags)
+            .await?
+            .then(|| !flags.contains(NodeFlags::File)))
     }
 
     pub async fn find_link_parent_node(
@@ -4102,7 +4277,7 @@ impl State {
                     StateNamedNode {
                         node: child_id,
                         name: child_node.name_hash,
-                        staged: child_node.is_staged(),
+                        flags: NodeFlags::from_bits_retain(child_node.flags),
                     },
                 );
             }
@@ -4981,8 +5156,21 @@ impl DirtyWalkOptions {
 /// `skip_staged` drops nodes that are also staged: their action belongs to the
 /// commit being written, and re-applying it would mark the committed content
 /// dirty again.
+///
+/// A new directory only marked and holding nodes is carried by them; see
+/// [`marked_directory_carried_by_children`].
 fn dirty_path_contributes(child: &Node, skip_staged: bool) -> bool {
-    child.action_bits() != 0 && !(skip_staged && child.is_staged())
+    child.action_bits() != 0
+        && !(skip_staged && child.is_staged())
+        && !marked_directory_carried_by_children(child)
+}
+
+/// Whether `node` is a new directory only marked dirty, not staged, whose children carry it.
+/// Recorded itself, it would be staged or re-marked whole, taking in everything the working tree
+/// holds below it, marked or not. A staged one is still recorded: its path is what stages the
+/// removal of what staging put below it.
+fn marked_directory_carried_by_children(node: &Node) -> bool {
+    node.is_dirty_add() && !node.is_staged() && node.is_directory() && node.child().is_some()
 }
 
 /// Whether a dirty node's children must be walked.
@@ -5223,13 +5411,37 @@ async fn collect_dirty_paths_linked(
 
         // Don't carry forward dirty paths that the view/ignore filter
         // excludes — they cannot be re-applied against a checkout that
-        // never materializes them. --force bypasses the filter.
+        // never materializes them. --force bypasses the filter. The ignore
+        // slot has no say over a node the tree tracks, only over one it only
+        // marks, as in `State::collect_dirty_paths`.
+        let mode = if options.force {
+            FilterMode::TRACKED
+        } else {
+            repository
+                .filter
+                .tracked_mode(
+                    level_states,
+                    &*parent_path,
+                    !child.is_file(),
+                    FilterMode::TRACKED,
+                    async || {
+                        state
+                            .tracks(
+                                &repository,
+                                child_id,
+                                NodeFlags::from_bits_retain(child.flags),
+                            )
+                            .await
+                    },
+                )
+                .await?
+        };
         let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
             options.force,
             level_states,
             &*parent_path,
             !child.is_file(),
-            FilterMode::Full,
+            mode,
         );
 
         let mut descended = false;
@@ -6639,8 +6851,17 @@ pub(crate) async fn diff_filesystem_queuing(
         Some(path) => {
             let filter = &repository_from.filter;
             let states = filter.parent_exclusion_states(path);
-            if filter.emit_excludes_any_kind(states, path, filter_mode) {
-                return Ok(ChangeStream::nothing());
+            // The tree is searched only for a path the filter would drop whatever it holds, since
+            // a path the tree tracks is past the ignore slot.
+            if filter.excludes_any_kind(states, path, filter_mode) {
+                let tracked = state_from
+                    .relative_path_tracked_as(repository_from.clone(), ROOT_NODE, path.as_str())
+                    .await?
+                    .is_some();
+                let mode = (filter_mode | FilterMode::KeepTracked).at(tracked);
+                if filter.emit_excludes_any_kind(states, path, mode) {
+                    return Ok(ChangeStream::nothing());
+                }
             }
             states
         }
@@ -9434,12 +9655,27 @@ fn add_change_hierarchy(
             };
             let appended = !child_name.is_empty();
             path.push(child_name);
-            let (child_states, excluded) = side.mapping.repository.filter.child_emit_excludes(
-                level.states,
-                &path,
-                child_node.is_directory(),
-                filter_mode.at(child_node.is_staged()),
-            );
+            let filter = &side.mapping.repository.filter;
+            let mode = filter
+                .tracked_mode(
+                    level.states,
+                    &path,
+                    child_node.is_directory(),
+                    filter_mode,
+                    async || {
+                        side.mapping
+                            .state
+                            .holds_tracked_change(
+                                &side.mapping.repository,
+                                child_id,
+                                NodeFlags::from_bits_retain(child_node.flags),
+                            )
+                            .await
+                    },
+                )
+                .await?;
+            let (child_states, excluded) =
+                filter.child_emit_excludes(level.states, &path, child_node.is_directory(), mode);
 
             if !excluded {
                 let child_path = path.clone().freeze();

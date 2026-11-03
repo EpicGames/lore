@@ -111,6 +111,33 @@ enum NamedRoot {
     Excluded,
 }
 
+/// `ctx`'s mode for its path asked about as a directory where `is_directory` says, where the from
+/// tree holds `node` there: past the ignore slot where that tree tracks the node as that kind.
+///
+/// Boxed by its callers: a named path asks it once, and only where the filter would leave the path
+/// out.
+async fn tracked_mode(
+    ctx: &FilesystemDiffContext,
+    node: Option<&Node>,
+    is_directory: bool,
+) -> Result<FilterMode, StateError> {
+    let tracked = match node {
+        Some(node) => {
+            ctx.from
+                .state
+                .tracks_as(
+                    &ctx.from.repository,
+                    ctx.from.node,
+                    NodeFlags::from_bits_retain(node.flags),
+                    is_directory,
+                )
+                .await?
+        }
+        None => false,
+    };
+    Ok((ctx.filter_mode | FilterMode::KeepTracked).at(tracked))
+}
+
 /// [`NamedRoot`] for `ctx`'s path, read from the working tree at `absolute_path`.
 ///
 /// The path is asked about as what the working tree holds there, else as the node the tree holds,
@@ -119,7 +146,8 @@ enum NamedRoot {
 /// from the working tree and is asked about as what it is, as the walk over the parent asks about a
 /// node its listing claims nothing for. The tree's node is read only where the listing leaves the
 /// answer open: where the working tree holds nothing, or the filter leaves out what it holds and
-/// keeps a node of the other kind.
+/// keeps a node of the other kind. A node the tree tracks is past the ignore slot as the kind it
+/// is, so the tree's node is read too where the filter would leave out what the working tree holds.
 ///
 /// The listing is read here and handed back to walk, so the caller's future holds it across no
 /// await of its own.
@@ -142,9 +170,14 @@ async fn named_root(
         crate::fs::os::PathListingResult::Directory { .. } => true,
         crate::fs::os::PathListingResult::File { .. } => false,
         crate::fs::os::PathListingResult::NotFound => {
-            let is_directory = Node::asked_as_directory(held().await.as_ref());
-            let (states, excluded) =
-                filter.child_emit_excludes(ctx.states, path, is_directory, ctx.filter_mode);
+            let node = held().await;
+            let is_directory = Node::asked_as_directory(node.as_ref());
+            let (states, excluded) = filter.child_emit_excludes(
+                ctx.states,
+                path,
+                is_directory,
+                Box::pin(tracked_mode(ctx, node.as_ref(), is_directory)).await?,
+            );
             return Ok(if excluded {
                 NamedRoot::Excluded
             } else {
@@ -152,16 +185,31 @@ async fn named_root(
             });
         }
     };
-    let (states, excluded) = filter.child_emit_excludes(ctx.states, path, listed, ctx.filter_mode);
+    let (states, excluded) = filter.child_excludes_tree(ctx.states, path, listed, ctx.filter_mode);
+    if !excluded {
+        return Ok(NamedRoot::Walk(states, listing));
+    }
+    let node = held().await;
+    let (states, excluded) = filter.child_emit_excludes(
+        ctx.states,
+        path,
+        listed,
+        Box::pin(tracked_mode(ctx, node.as_ref(), listed)).await?,
+    );
     if !excluded {
         return Ok(NamedRoot::Walk(states, listing));
     }
     drop(listing);
-    let (states, excluded) = filter.child_excludes_tree(ctx.states, path, !listed, ctx.filter_mode);
+    let (states, excluded) = filter.child_excludes_tree(
+        ctx.states,
+        path,
+        !listed,
+        Box::pin(tracked_mode(ctx, node.as_ref(), !listed)).await?,
+    );
     if excluded {
         return Ok(NamedRoot::Excluded);
     }
-    Ok(match held().await {
+    Ok(match node {
         Some(node) if Node::asked_as_directory(Some(&node)) != listed => NamedRoot::Missing(states),
         _ => NamedRoot::Excluded,
     })
@@ -957,7 +1005,7 @@ async fn diff_filesystem_directory(
                     children: vec![StateNamedNode {
                         node: *node_id,
                         name: node.name_hash,
-                        staged: node.is_staged(),
+                        flags: NodeFlags::from_bits_retain(node.flags),
                     }],
                 }
             }
@@ -1444,19 +1492,38 @@ async fn diff_filesystem_directory_walk(
 
         let entry = EntryPath::enter(&mut entry_buffer, item.name.as_str());
 
-        let (item_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
-            ctx.states,
-            entry.path(),
-            item.metadata.kind == StatKind::Directory,
-            ctx.filter_mode,
-        );
+        // Claimed before the filter is asked: a node the tree tracks as the kind the entry is is
+        // past the ignore slot, which the tree is asked only where the rules would leave the entry
+        // out. An entry the filter drops is left unclaimed, as before.
+        let claimed =
+            claim_named_child(node_list, node_list_found, item.name_hash, staging).await?;
+        let is_directory = item.metadata.kind == StatKind::Directory;
+        let filter = &ctx.from.repository.filter;
+        let mode = filter
+            .tracked_mode(
+                ctx.states,
+                entry.path(),
+                is_directory,
+                ctx.filter_mode | FilterMode::KeepTracked,
+                async || match claimed {
+                    Some(index) => {
+                        let named = &node_list.children[index];
+                        node_list
+                            .state
+                            .tracks_as(&node_list.repository, named.node, named.flags, is_directory)
+                            .await
+                    }
+                    None => Ok(false),
+                },
+            )
+            .await?;
+        let (item_states, excluded) =
+            filter.child_emit_excludes(ctx.states, entry.path(), is_directory, mode);
         if excluded {
             continue;
         }
 
-        let Some(current_index) =
-            claim_named_child(node_list, node_list_found, item.name_hash, staging).await?
-        else {
+        let Some(current_index) = claimed else {
             new_file_list.push((item, item_states));
             continue;
         };
@@ -2130,6 +2197,9 @@ async fn diff_filesystem_missing_nodes(
     changes: &ChangeSender,
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
+    // Every node here is one the tree holds, which is past the ignore slot: a tracked file the
+    // ignore file names is deleted like any other.
+    let deletion_mode = ctx.filter_mode & FilterMode::View;
     // Nodes that were not iterated are deleted in file system
     for (index, from_named_node) in node_list.children.iter().enumerate() {
         if node_list_found[index] {
@@ -2141,8 +2211,8 @@ async fn diff_filesystem_missing_nodes(
             from_named_node.node,
             &ctx.from.path,
             ctx.from_states,
-            ctx.filter_mode,
-            false,
+            deletion_mode,
+            async |_| Ok(false),
         )
         .await?
         else {
@@ -2188,7 +2258,7 @@ async fn diff_filesystem_missing_nodes(
                 &from_node.node,
                 &from_node.path,
                 from_node_states,
-                ctx.filter_mode,
+                deletion_mode,
                 ctx.intent,
                 changes,
                 &mut pending,
@@ -2265,7 +2335,7 @@ async fn diff_filesystem_missing_nodes(
             FileAction::Delete,
             change::Flags::None,
             changes,
-            ctx.filter_mode,
+            deletion_mode,
             from_node_states,
         )
         .await?;
@@ -2887,6 +2957,8 @@ async fn diff_filesystem_missing(
     link_mounts: &[LinkMountInfo],
 ) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();
+    // Everything deleted here is a node the tree holds, which is past the ignore slot.
+    let filter_mode = filter_mode & FilterMode::View;
 
     // Add delete changes for all nodes under the from node
     if from.node.is_valid_node_id() {

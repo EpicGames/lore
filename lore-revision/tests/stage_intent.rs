@@ -310,11 +310,26 @@ mod tests {
             .expect("Test task failed")
     }
 
-    /// A staged delete of a directory the working tree lost keeps the child the filter excludes and
-    /// the directory holding it: removing committed content the filter leaves out is for a forced
-    /// stage to do.
+    /// The deletes `reported` names, in order of path.
+    fn deletes(reported: Vec<(String, String)>) -> Vec<String> {
+        let mut paths: Vec<String> = reported
+            .into_iter()
+            .map(|(action, path)| {
+                assert_eq!(
+                    action, "D",
+                    "a removal reports only deletes, got one at {path}"
+                );
+                path
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A staged delete of a directory the working tree lost deletes a child the ignore file names
+    /// with the rest: the tree tracks the child, so the ignore file has no say over it.
     #[tokio::test]
-    async fn a_staged_delete_keeps_an_excluded_child() {
+    async fn a_staged_delete_deletes_a_tracked_child_the_ignore_file_names() {
         let (deleted, reported) = walk_after_removal(
             FilesystemDiffIntent::Stage(StageIntent::default()),
             &["dir/hidden.txt"],
@@ -325,19 +340,24 @@ mod tests {
         )
         .await;
         assert_eq!(
-            (deleted, reported),
+            (deleted, deletes(reported)),
             (
-                vec![false, false],
-                vec![("D".to_string(), "dir/shown.txt".to_string())]
+                vec![true, true],
+                vec![
+                    "dir".to_string(),
+                    "dir/hidden.txt".to_string(),
+                    "dir/shown.txt".to_string()
+                ]
             ),
-            "the file in view is deleted, and the excluded file and its directory stay"
+            "the directory is deleted with both files"
         );
     }
 
-    /// A staged delete keeps a directory the working tree lost whose content the filter excludes,
-    /// whether that content is a file directly below it or a directory deeper down.
+    /// A staged delete deletes a directory the working tree lost whose tracked content the ignore
+    /// file names, whether that content is a file directly below it or a directory deeper down.
     #[tokio::test]
-    async fn a_staged_delete_keeps_a_directory_holding_only_excluded_content() {
+    async fn a_staged_delete_deletes_a_directory_holding_only_tracked_content_the_ignore_file_names()
+     {
         let (deleted, reported) = walk_after_removal(
             FilesystemDiffIntent::Stage(StageIntent::default()),
             &["*.log", "/dir/sub/"],
@@ -348,14 +368,24 @@ mod tests {
         )
         .await;
         assert_eq!(
-            (deleted, reported),
-            (vec![false; 4], Vec::new()),
-            "nothing the filter excludes is deleted, nor the directory holding it"
+            (deleted, deletes(reported)),
+            (
+                vec![true; 4],
+                vec![
+                    "dir".to_string(),
+                    "dir/sub".to_string(),
+                    "dir/sub/y.txt".to_string(),
+                    "dir/x.log".to_string()
+                ]
+            ),
+            "everything the directory held is deleted with it"
         );
     }
 
+    /// A marking walk marks the removal of a tracked child the ignore file names, as a staging
+    /// walk deletes it.
     #[tokio::test]
-    async fn a_marking_delete_leaves_an_excluded_child_alone() {
+    async fn a_marking_delete_marks_a_tracked_child_the_ignore_file_names() {
         let (deleted, _) = walk_after_removal(
             FilesystemDiffIntent::MarkDirty,
             &["dir/hidden.txt"],
@@ -367,9 +397,56 @@ mod tests {
         .await;
         assert_eq!(
             deleted,
-            [false],
-            "a marking walk answers for the view alone"
+            [true],
+            "the ignore slot has no say over a tracked node"
         );
+    }
+
+    /// A file the tree holds is past the ignore slot, so a marking walk reports it modified,
+    /// while an untracked file the same rule names beside it stays out.
+    #[tokio::test]
+    async fn a_marking_walk_reports_a_tracked_file_the_ignore_file_names() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    repository_holding(immutable_store, mutable_store, &["*.log"], &["debug.log"])
+                        .await;
+                let repository = fixture.repository.clone();
+                force_commit_fixture(&fixture).await;
+
+                test_file_write(&fixture.path.join("debug.log"), b"modified since");
+                test_file_write(&fixture.path.join("new.log"), b"never tracked");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let changes = test_scan_with_intent(
+                    repository.clone(),
+                    staged,
+                    current,
+                    FilesystemDiffIntent::MarkDirty,
+                )
+                .await;
+
+                let tracked = changes
+                    .iter()
+                    .find(|change| change.path().as_str() == "debug.log")
+                    .expect("the walk must report the tracked file");
+                assert_eq!(FileAction::Keep, tracked.action);
+                assert!(
+                    tracked.flags.is_dirty(),
+                    "the tracked file must be reported modified"
+                );
+                assert!(
+                    !changes
+                        .iter()
+                        .any(|change| change.path().as_str() == "new.log"),
+                    "an untracked file the ignore file names must stay out"
+                );
+            }))
+            .await
+            .expect("Test task failed");
     }
 
     /// Ignore rules excluding `Engine` and re-including every `Build` directory below it, by a
@@ -743,10 +820,11 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// `stage --scan` keeps a directory the filter excludes that holds no children, which nothing
-    /// materializes, where the working tree lacks it.
+    /// `stage --scan` deletes a committed empty directory the ignore file names where the working
+    /// tree lacks it: the tree tracks it, so the ignore file has no say over it. A view keeps such a
+    /// directory, which nothing materializes; see `sync_views.rs`.
     #[tokio::test]
-    async fn a_scanning_stage_keeps_an_excluded_empty_directory() {
+    async fn a_scanning_stage_deletes_a_tracked_empty_directory_the_ignore_file_names() {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
@@ -773,8 +851,8 @@ mod tests {
                         NodeFlags::StagedDelete
                     )
                     .await,
-                    [false],
-                    "the excluded empty directory stays"
+                    [true],
+                    "the tracked empty directory is deleted"
                 );
             }))
             .await
