@@ -278,7 +278,7 @@ pub async fn existing_group_dirs(index_path: &Path, group_count: usize) -> Optio
         // A name that could be a group but whose metadata did not resolve may be a group that
         // is there, so it is not an absent one: the caller probes.
         let metadata = entry.metadata.as_ref()?;
-        if !metadata.is_dir() {
+        if metadata.kind != lore_io::StatKind::Directory {
             continue;
         }
         if let Some(flag) = existing.get_mut(group_index) {

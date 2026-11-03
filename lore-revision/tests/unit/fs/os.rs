@@ -170,7 +170,7 @@ fn a_listed_name_that_is_not_text_is_reported() {
 
     let listed = file_list_item(Ok(lore_io::DirEntry {
         file_name: name_that_is_not_text(),
-        metadata: Some(metadata),
+        metadata: Some(lore_io::Stat::from(&metadata)),
         is_symlink: false,
     }));
 
@@ -193,7 +193,7 @@ async fn list_path_describes_a_file_by_its_own_name() {
         panic!("a file must be described, not listed");
     };
     assert_eq!(item.name, "lonely.txt");
-    assert_eq!(item.metadata.len(), 4);
+    assert_eq!(item.metadata.len, 4);
 }
 
 #[tokio::test]

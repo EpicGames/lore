@@ -38,6 +38,10 @@ mod file;
 #[cfg(feature = "test-util")]
 pub mod file;
 #[cfg(all(target_family = "windows", not(feature = "test-util")))]
+mod find;
+#[cfg(all(target_family = "windows", feature = "test-util"))]
+pub mod find;
+#[cfg(all(target_family = "windows", not(feature = "test-util")))]
 mod iocp;
 #[cfg(all(target_family = "windows", feature = "test-util"))]
 pub mod iocp;

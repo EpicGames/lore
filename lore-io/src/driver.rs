@@ -483,8 +483,11 @@ impl IoDriver {
     /// walk.
     ///
     /// This is a driver operation rather than an inline `read_dir` because a listing is not one
-    /// syscall: it is `getdents` plus a stat per child, and a caller wanting the children's
-    /// metadata otherwise pays all of them on whatever thread polls it.
+    /// syscall: it is a read of the directory plus, on Unix, a stat per child, and a caller
+    /// wanting the children's metadata otherwise pays all of them on whatever thread polls it. On
+    /// Windows the children are described by the records of a directory search that queries
+    /// with a larger buffer, and only a symbolic link, or a name whose last-write time
+    /// `SystemTime` can't hold, is stat'd.
     pub async fn read_dir(&self, path: impl AsRef<Path>) -> std::io::Result<crate::DirStream> {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {

@@ -19,6 +19,7 @@ use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_io::StatKind;
 use tokio::sync::Semaphore;
 use tokio::task::JoinError;
 use tokio::task::JoinSet;
@@ -1446,7 +1447,7 @@ async fn diff_filesystem_directory_walk(
         let (item_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
             ctx.states,
             entry.path(),
-            item.metadata.is_dir(),
+            item.metadata.kind == StatKind::Directory,
             ctx.filter_mode,
         );
         if excluded {
@@ -1504,8 +1505,8 @@ async fn diff_filesystem_directory_walk(
         let was_directory = from_node.is_directory();
         let was_link = from_node.is_link();
 
-        let is_directory = item.metadata.is_dir();
-        let is_file = item.metadata.is_file();
+        let is_directory = item.metadata.kind == StatKind::Directory;
+        let is_file = item.metadata.kind == StatKind::File;
 
         let is_rename = from_match.renamed();
 
@@ -1553,7 +1554,7 @@ async fn diff_filesystem_directory_walk(
                     from_named_node.node,
                     from_node,
                     &entry.to_path(),
-                    &FileInfo::from_metadata(&item.metadata),
+                    &FileInfo::from_stat(&item.metadata),
                     changes,
                     stats,
                     ctx.filter_mode,
@@ -1570,7 +1571,7 @@ async fn diff_filesystem_directory_walk(
                 None
             };
 
-            let observed = FileInfo::from_metadata(&item.metadata);
+            let observed = FileInfo::from_stat(&item.metadata);
             let compare_result = compare_single_file_against_state(
                 &ctx.operation,
                 node_list.repository.clone(),
@@ -1921,7 +1922,7 @@ async fn diff_filesystem_matched_directory(
             from_named_node.node,
             &from_node,
             &item_path,
-            FileInfo::from_metadata(&item.metadata),
+            FileInfo::from_stat(&item.metadata),
             changes,
             ctx.intent,
             ctx.filter_mode,
@@ -2027,7 +2028,7 @@ async fn diff_filesystem_type_change(
         parent_node_id: Some(ctx.from.node),
         intent: ctx.intent,
         states: item_states,
-        observed: FileInfo::from_metadata(&item.metadata),
+        observed: FileInfo::from_stat(&item.metadata),
         insists: false,
     };
 
@@ -2321,7 +2322,11 @@ async fn tracked_child(
         .state
         .node(current_node_list.repository.clone(), node_id)
         .await?;
-    let agrees = types_agree(&node, item.metadata.is_file(), item.metadata.is_dir());
+    let agrees = types_agree(
+        &node,
+        item.metadata.kind == StatKind::File,
+        item.metadata.kind == StatKind::Directory,
+    );
     Ok(if agrees { node_id } else { INVALID_NODE })
 }
 
@@ -2418,7 +2423,7 @@ fn diff_filesystem_new_entries<'a>(
                 .push_into_buf(file.name.as_str())
                 .freeze();
 
-            let is_directory = file.metadata.is_dir();
+            let is_directory = file.metadata.kind == StatKind::Directory;
 
             if is_directory {
                 // A directory on disk with no `state_from` node that matches a
@@ -2608,7 +2613,7 @@ fn diff_filesystem_new_entries<'a>(
                 parent_node_id: Some(ctx.from.node),
                 intent: ctx.intent,
                 states: child_states,
-                observed: FileInfo::from_metadata(&file.metadata),
+                observed: FileInfo::from_stat(&file.metadata),
                 insists: false,
             };
 
@@ -2767,13 +2772,13 @@ async fn diff_filesystem_single_file(
         None
     };
 
-    let observed = FileInfo::from_metadata(&file_item.metadata);
+    let observed = FileInfo::from_stat(&file_item.metadata);
 
     // Staging decides on a node the tree holds before anything is compared, as the directory
     // walk does.
     let mut insisted = false;
     if let Some(stage) = ctx.intent.stage()
-        && file_item.metadata.is_file()
+        && file_item.metadata.kind == StatKind::File
         && let Some(node) = from_node
         && node.is_file()
     {
@@ -2808,7 +2813,7 @@ async fn diff_filesystem_single_file(
     // the file's presence on disk is the add. Skip the compare and emit
     // Add+Dirty directly.
     if ctx.intent.marks_dirty()
-        && file_item.metadata.is_file()
+        && file_item.metadata.kind == StatKind::File
         && ctx.from.node.is_valid_node_id()
         && !ctx.current.node.is_valid_node_id()
         && let Some(node) = from_node
@@ -2860,7 +2865,7 @@ async fn diff_filesystem_single_file(
         compare_result,
         &ctx.filesystem_path,
         None, // No rename detection for single file path
-        file_item.metadata.is_dir(),
+        file_item.metadata.kind == StatKind::Directory,
         changes,
         &stats,
         ctx.filter_mode,

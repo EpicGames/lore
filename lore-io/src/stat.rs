@@ -68,16 +68,34 @@ fn mode(_metadata: &std::fs::Metadata) -> Option<u32> {
 pub(crate) fn from_attribute_data(
     data: &windows_sys::Win32::Storage::FileSystem::WIN32_FILE_ATTRIBUTE_DATA,
 ) -> Option<Stat> {
+    from_attributes(
+        data.dwFileAttributes,
+        data.nFileSizeHigh,
+        data.nFileSizeLow,
+        data.ftLastWriteTime,
+    )
+}
+
+/// The `Stat` for Win32 file `attributes`, a size split into its high and low halves, and the
+/// time of the last write, or `None` where `SystemTime` cannot hold that time. A directory
+/// search's record carries these for the name it lists, as `GetFileAttributesExW` does for a
+/// path.
+#[cfg(target_family = "windows")]
+pub(crate) fn from_attributes(
+    attributes: u32,
+    size_high: u32,
+    size_low: u32,
+    written: windows_sys::Win32::Foundation::FILETIME,
+) -> Option<Stat> {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
 
-    let written = data.ftLastWriteTime;
     Some(Stat {
-        kind: if data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        kind: if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
             StatKind::Directory
         } else {
             StatKind::File
         },
-        len: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
+        len: (u64::from(size_high) << 32) | u64::from(size_low),
         modified: Some(system_time(
             (u64::from(written.dwHighDateTime) << 32) | u64::from(written.dwLowDateTime),
         )?),

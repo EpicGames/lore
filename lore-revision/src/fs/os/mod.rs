@@ -114,7 +114,7 @@ impl OsDirectoryListing {
                 Ok(Some(item)) => {
                     return Some(Ok(DirectoryEntry {
                         name: item.name,
-                        info: FileInfo::from_metadata(&item.metadata),
+                        info: FileInfo::from_stat(&item.metadata),
                         name_hash: item.name_hash,
                     }));
                 }
@@ -311,8 +311,8 @@ impl InstanceOperation for OsOperation {
 pub struct FileListItem {
     /// The name of the file/directory (not the full path).
     pub name: String,
-    /// Filesystem metadata (size, timestamps, permissions, etc.).
-    pub metadata: std::fs::Metadata,
+    /// What the name holds: its kind, size, modification time and permission bits.
+    pub metadata: lore_io::Stat,
     /// Pre-computed hash of the lowercase name for efficient lookups.
     pub name_hash: u64,
 }
@@ -379,7 +379,7 @@ pub fn file_list_item(
     let Some(metadata) = entry.metadata else {
         return Ok(None);
     };
-    if !metadata.is_file() && !metadata.is_dir() {
+    if metadata.kind == lore_io::StatKind::Other {
         return Ok(None);
     }
     let name = entry_name(entry.file_name)?;
@@ -425,11 +425,11 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
         return Ok(PathListingResult::Directory { listing });
     }
 
-    let Ok(metadata) = driver.metadata(path.as_path()).await else {
+    let Ok(metadata) = driver.stat(path.as_path()).await else {
         return Ok(PathListingResult::NotFound);
     };
 
-    if metadata.is_file() {
+    if metadata.kind == lore_io::StatKind::File {
         let file_name = match path.file_name() {
             Some(name) => entry_name(name.to_os_string())?,
             None => String::new(),

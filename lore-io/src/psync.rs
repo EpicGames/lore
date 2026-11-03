@@ -361,7 +361,7 @@ impl PsyncDriver {
 
     pub(crate) async fn read_dir(&self, path: PathBuf) -> std::io::Result<crate::DirStream> {
         SyscallPool::global()
-            .submit(move || Ok(crate::DirStream::start(std::fs::read_dir(path)?)))
+            .submit(move || crate::dir::open(path))
             .await
     }
 
@@ -580,7 +580,7 @@ fn is_pattern_unit(unit: u16) -> bool {
 /// there is room for one, and anything past even that is left to what `std`
 /// answers, since `std` prefixes on its own.
 #[cfg(target_family = "windows")]
-const PATH_UNITS: usize = 512;
+pub(crate) const PATH_UNITS: usize = 512;
 
 /// The path length a plain path call is defined for, terminator included. Past it
 /// the call fails on a path that is perfectly well there, which is a fact about
@@ -591,7 +591,7 @@ const MAX_PATH_UNITS: usize = 260;
 
 /// Why a path cannot be handed to a Win32 path call as it stands.
 #[cfg(target_family = "windows")]
-enum Unencodable {
+pub(crate) enum Unencodable {
     /// The path holds a null, which would end the path the call sees early and make it
     /// answer about a different one. No path a filesystem holds carries one.
     Null,
@@ -600,20 +600,22 @@ enum Unencodable {
     Long,
 }
 
-/// Writes `path` into `wide` as the null-terminated UTF-16 a Win32 path call takes.
+/// Writes `path` followed by `suffix` into `wide` as the null-terminated UTF-16 a Win32 path
+/// call takes.
 ///
 /// A path that arrives with the verbatim prefix is written as it is and is not held to
 /// `MAX_PATH`; one without it is, and rewriting it into a verbatim one is not this
-/// function's to do.
+/// function's to do. The limits hold for the whole of what is written, `suffix` included.
 #[cfg(target_family = "windows")]
-fn encode_wide_path(
+pub(crate) fn encode_wide_path(
     path: &std::path::Path,
+    suffix: &[u16],
     wide: &mut [u16; PATH_UNITS],
 ) -> Result<(), Unencodable> {
     use std::os::windows::ffi::OsStrExt;
 
     let mut length = 0;
-    for unit in path.as_os_str().encode_wide() {
+    for unit in path.as_os_str().encode_wide().chain(suffix.iter().copied()) {
         if length == wide.len() - 1 {
             return Err(Unencodable::Long);
         }
@@ -668,7 +670,7 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
     }
 
     let mut wide = [0u16; PATH_UNITS];
-    match encode_wide_path(path, &mut wide) {
+    match encode_wide_path(path, &[], &mut wide) {
         Ok(()) => {}
         Err(Unencodable::Null) => return Some(false),
         Err(Unencodable::Long) => return None,
@@ -702,14 +704,9 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
         found
     };
 
-    let end = found
-        .cFileName
-        .iter()
-        .position(|unit| *unit == 0)
-        .unwrap_or(found.cFileName.len());
     Some(
         name.encode_wide()
-            .eq(found.cFileName[..end].iter().copied()),
+            .eq(crate::find::record_name(&found).iter().copied()),
     )
 }
 
@@ -723,7 +720,7 @@ fn holds_name_exactly_impl(_path: &std::path::Path) -> Option<bool> {
 }
 
 /// What `std::fs::metadata` answers for `path`.
-fn std_stat(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+pub(crate) fn std_stat(path: &std::path::Path) -> std::io::Result<crate::Stat> {
     std::fs::metadata(path).map(|metadata| crate::Stat::from(&metadata))
 }
 
@@ -757,7 +754,7 @@ fn attribute_stat(path: &std::path::Path) -> Option<std::io::Result<crate::Stat>
         return None;
     }
     let mut wide = [0u16; PATH_UNITS];
-    encode_wide_path(path, &mut wide).ok()?;
+    encode_wide_path(path, &[], &mut wide).ok()?;
 
     let mut data = std::mem::MaybeUninit::<WIN32_FILE_ATTRIBUTE_DATA>::uninit();
     // SAFETY: the path is null-terminated, and the structure is writable for the size the
