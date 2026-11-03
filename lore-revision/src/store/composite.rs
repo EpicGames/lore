@@ -1571,14 +1571,34 @@ impl ImmutableStore for CompositeStore {
     }
 }
 
-fn count_result<T, E>(context: &'static str, counter: &Counter<u64>, result: &Result<T, E>) {
+fn count_result<T>(context: &'static str, counter: &Counter<u64>, result: &Result<T, StoreError>) {
     counter.add(
         1,
         &[
             KeyValue::new(METRICS_OPERATION_CONTEXT_ATTRIBUTE_NAME, context),
             KeyValue::new(METRICS_SUCCESS_ATTRIBUTE_NAME, result.is_ok()),
+            KeyValue::new("outcome", result_outcome(result)),
         ],
     );
+}
+
+/// A metric label for a store result: `ok`, or the snake-case name of the error variant.
+fn result_outcome<T>(result: &Result<T, StoreError>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(StoreError::AddressNotFound(_)) => "address_not_found",
+        Err(StoreError::PayloadNotFound(_)) => "payload_not_found",
+        Err(StoreError::SlowDown(_)) => "slow_down",
+        Err(StoreError::Oversized(_)) => "oversized",
+        Err(StoreError::NotFound(_)) => "not_found",
+        Err(StoreError::Disconnected(_)) => "disconnected",
+        Err(StoreError::NotAuthorized(_)) => "not_authorized",
+        Err(StoreError::NotAuthenticated(_)) => "not_authenticated",
+        Err(StoreError::Maintenance(_)) => "maintenance",
+        Err(StoreError::NoRemote(_)) => "no_remote",
+        Err(StoreError::NotSupported(_)) => "not_supported",
+        Err(StoreError::Internal(_)) => "internal",
+    }
 }
 
 static STORE_ATTRIBUTE: LazyLock<KeyValue> = LazyLock::new(|| KeyValue::new("store", "composite"));
