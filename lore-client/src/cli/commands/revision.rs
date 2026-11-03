@@ -254,6 +254,10 @@ pub struct RevisionDiffArgs {
     /// Path to a targets file
     #[clap(long, value_name = "file")]
     targets: Option<String>,
+
+    /// List changes to paths the repository's view excludes as well.
+    #[clap(long, action)]
+    no_view_filter: bool,
 }
 
 #[derive(Subcommand)]
@@ -1543,6 +1547,7 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
         revision_source: LoreString::from(&args.source),
         revision_target: LoreString::from(&args.target),
         paths,
+        no_view_filter: args.no_view_filter as u8,
     };
 
     let _pager = Pager::new();

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_revision::change::NodeChange;
+use lore_revision::filter::FilterMode;
 use lore_revision::link;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::diff::*;
@@ -99,7 +100,13 @@ async fn the_link_pin_diff_is_held_without_a_change() {
             ));
             let state = State::new();
 
-            let revision_diff = diff(repository.clone(), Hash::default(), Hash::default(), None);
+            let revision_diff = diff(
+                repository.clone(),
+                Hash::default(),
+                Hash::default(),
+                None,
+                FilterMode::View,
+            );
             let pin_diff = link::diff_link_pins(repository, &state, &state);
 
             assert!(

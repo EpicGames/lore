@@ -5107,6 +5107,9 @@ typedef struct lore_revision_diff_args_t {
   struct lore_string_t revision_target;
   // Repository-relative paths to restrict the diff to; empty for all
   struct lore_string_array_t paths;
+  // Flag to report changes to paths the repository's view excludes as well; by default the
+  // diff leaves them out, as a sync to the target would
+  uint8_t no_view_filter;
 } lore_revision_diff_args_t;
 
 // Arguments for finding revisions by metadata or revision number.

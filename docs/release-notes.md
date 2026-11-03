@@ -23,6 +23,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as
   `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A
   server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
+- C API: `lore_revision_diff_args_t` gains `no_view_filter`, changing its size; rebuild against the new `lore.h`. A
+  zero-initialized struct keeps today's behavior
 
 ### Features
 
@@ -34,6 +36,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
   window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
   unless set. Values below 2400 bytes are rejected at startup
+- `lore revision diff --no-view-filter` (C API: `no_view_filter` on `lore_revision_diff_args_t`) also lists changes to
+  paths the repository's view excludes
 
 ### Fixes & Improvements
 

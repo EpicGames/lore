@@ -10,6 +10,7 @@ use crate::change::NodeChange;
 use crate::diff;
 use crate::errors::*;
 use crate::event;
+use crate::filter::FilterMode;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
@@ -133,13 +134,15 @@ fn link_path_in_scope(link_path: &str, paths: Option<&[RelativePath]>) -> bool {
 }
 
 /// Calculate the difference between two revisions, as the set of changes that describe
-/// going from revision 'source' to revision 'target', optionally filtered by a set of paths
+/// going from revision 'source' to revision 'target', optionally filtered by a set of paths.
+/// `filter` decides which paths the walk leaves out; see [`diff::diff_revision_paths_filtered`].
 #[lore_macro::test_pub]
 pub(crate) async fn diff(
     repository: Arc<RepositoryContext>,
     source: Hash,
     target: Hash,
     paths: Option<Vec<RelativePath>>,
+    filter: FilterMode,
 ) -> Result<(), DiffError> {
     let state_source = State::deserialize(repository.clone(), source)
         .await
@@ -149,11 +152,12 @@ pub(crate) async fn diff(
         .forward::<DiffError>("deserializing target state")?;
 
     let (_, mut diff) = collect_stream_with_summary(|tx| {
-        diff::diff_revision_paths(
+        diff::diff_revision_paths_filtered(
             repository.clone(),
             state_source.clone(),
             state_target.clone(),
             paths.clone(),
+            filter,
             tx,
         )
     })
@@ -241,6 +245,7 @@ pub fn diff_boxed(
     source: Hash,
     target: Hash,
     paths: Option<Vec<RelativePath>>,
+    filter: FilterMode,
 ) -> crate::BoxFuture<'static, Result<(), DiffError>> {
-    Box::pin(diff(repository, source, target, paths))
+    Box::pin(diff(repository, source, target, paths, filter))
 }

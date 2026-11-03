@@ -967,6 +967,9 @@ pub struct LoreRevisionDiffArgs {
     pub revision_target: LoreString,
     /// Repository-relative paths to restrict the diff to; empty for all
     pub paths: LoreArray<LoreString>,
+    /// Flag to report changes to paths the repository's view excludes as well; by default the
+    /// diff leaves them out, as a sync to the target would
+    pub no_view_filter: u8,
 }
 
 /// Computes the file-level differences between two revisions.
@@ -1043,7 +1046,13 @@ async fn diff_impl(
         .forward::<revision::diff::DiffError>("invalid revision")?
     };
 
-    lore_revision::revision::diff::diff_boxed(repository, source_hash, target_hash, paths).await
+    let filter = if args.no_view_filter != 0 {
+        lore_revision::filter::FilterMode::empty()
+    } else {
+        lore_revision::filter::FilterMode::View
+    };
+    lore_revision::revision::diff::diff_boxed(repository, source_hash, target_hash, paths, filter)
+        .await
 }
 
 /// Arguments for cherry-picking a revision onto the current branch.

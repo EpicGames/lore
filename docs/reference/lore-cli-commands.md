@@ -1146,6 +1146,7 @@ Diff two revisions
 * `--target <revision_target>` — Target revision to compare, by default the current revision
 * `--path <PATH>` — Optional path in repository
 * `--targets <file>` — Path to a targets file
+* `--no-view-filter` — List changes to paths the repository's view excludes as well
 
 ## `lore revision find`
 
