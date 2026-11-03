@@ -2748,6 +2748,7 @@ dependencies = [
  "open",
  "opentelemetry",
  "parking_lot",
+ "pin-project",
  "prost-types",
  "quinn",
  "rand 0.9.5",

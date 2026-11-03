@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::pin::Pin;
+use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -15,6 +17,7 @@ mod topology_refresh;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_base::runtime::DetachingJoinSet;
 use lore_error_set::prelude::*;
@@ -27,9 +30,11 @@ use lore_telemetry::METRICS_SUCCESS_ATTRIBUTE_NAME;
 use lore_telemetry::observe::ObserveResult;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
+use pin_project::pin_project;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
-use tokio_util::sync::CancellationToken;
+use tokio::task::JoinError;
+use tokio::time::Sleep;
 
 use super::StoreObliterateStats;
 use crate::cluster::peer::PeerInfo;
@@ -477,8 +482,8 @@ pub struct CompositeStore {
     write_replicas: RwLock<Vec<ReplicationTarget>>,
     /// Durable read store
     durable: DurableTarget,
-    /// The delay applied to durable store operations so replicas are given a chance
-    /// to fulfill a request first
+    /// How long durable store reads wait for the read replicas to answer first. The wait ends
+    /// early once every read replica has missed or failed, and is skipped when there are none.
     durable_delay: Duration,
     /// Flag if local store is durable
     local_durable: bool,
@@ -511,29 +516,80 @@ pub struct ReevaluatePeersSummary {
 
 /// Container representing a typical composite store operation,
 /// where many requests are fanned out to durable and replica targets.
-struct CompositeOperation<T>
+///
+/// Replicas are spawned on the unpinned operation and results drained once it is pinned, so
+/// every replica is spawned before the first call to [`Self::next`].
+#[pin_project]
+struct CompositeOperation<H, D>
 where
-    T: 'static,
+    H: 'static,
 {
-    cancellation_token: CancellationToken,
-    queries: DetachingJoinSet<T>,
+    queries: DetachingJoinSet<(bool, Result<H, StoreError>)>,
+    /// The durable query. It remains unspawned until `deadline` passes or no remaining replica
+    /// query could settle the operation.
+    durable: Option<D>,
+    /// Started when the operation is built. `None` when there is no durable query.
+    #[pin]
+    deadline: Option<Sleep>,
 }
 
-impl<T> CompositeOperation<T> {
-    fn new() -> Self {
+impl<H, D> CompositeOperation<H, D>
+where
+    H: Send + 'static,
+    D: Future<Output = Result<H, StoreError>> + Send + 'static,
+{
+    /// `durable` is the durable query and how long it waits for the replicas to answer first.
+    fn new(durable: Option<(Duration, D)>) -> Self {
+        let (deadline, durable) = durable
+            .map(|(delay, query)| (tokio::time::sleep(delay), query))
+            .unzip();
         Self {
             queries: DetachingJoinSet::default(),
-            cancellation_token: CancellationToken::new(),
+            durable,
+            deadline,
         }
     }
-}
 
-impl<T> Drop for CompositeOperation<T>
-where
-    T: 'static,
-{
-    fn drop(&mut self) {
-        self.cancellation_token.cancel();
+    fn spawn_replica(
+        &mut self,
+        query: impl Future<Output = Result<H, StoreError>> + Send + 'static,
+    ) {
+        let queries = &mut self.queries;
+        lore_spawn!(queries, query.map(|result| (false, result)));
+    }
+
+    /// Waits for the next query to finish, yielding whether it came from the durable store
+    /// alongside its result.
+    ///
+    /// Asking for the next result once every replica result has been returned spawns the
+    /// durable query. Do not call this again after a result that settles the operation.
+    async fn next(
+        self: Pin<&mut Self>,
+    ) -> Option<Result<(bool, Result<H, StoreError>), JoinError>> {
+        let mut this = self.project();
+        loop {
+            let deadline = match this.deadline.as_mut().as_pin_mut() {
+                Some(deadline) if this.durable.is_some() => deadline,
+                _ => return this.queries.join_next().await,
+            };
+            let joined = tokio::select! {
+                // An already available replica result may settle the operation, so it takes
+                // precedence over a deadline that expires at the same time.
+                biased;
+                joined = this.queries.join_next() => joined,
+                () = deadline => None,
+            };
+            match joined {
+                Some(joined) => return Some(joined),
+                // The deadline passed, or every replica result has been returned.
+                None => {
+                    if let Some(query) = this.durable.take() {
+                        let queries = &mut *this.queries;
+                        lore_spawn!(queries, query.map(|result| (true, result)));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -692,16 +748,6 @@ impl CompositeStore {
         self.write_replicas.read().await.clone()
     }
 
-    /// At this given moment in time, how much should the durable store be delayed by?
-    /// The delay is pointless if there are no read replicas to take advantage of
-    async fn get_durable_delay_for_operation(&self) -> Duration {
-        if self.read_replicas.read().await.is_empty() {
-            Duration::ZERO
-        } else {
-            self.durable_delay
-        }
-    }
-
     /// Detached fan-out of a put to every write replica, skipped where a topology refresh holds the
     /// list: replicas accelerate reads rather than own content, so waiting on it is not worth a put.
     fn replicate_put(
@@ -726,47 +772,53 @@ impl CompositeStore {
         }
     }
 
+    /// Builds the fan-out of one read. `durable_query` builds the durable query from the durable
+    /// store, and `replica_query` builds the query sent to each read replica.
+    async fn fan_out_read<H, D, R>(
+        &self,
+        durable_query: impl FnOnce(Arc<dyn ImmutableStore>) -> D,
+        replica_query: impl Fn(Arc<dyn ImmutableStore>) -> R,
+    ) -> CompositeOperation<H, D>
+    where
+        H: Send + 'static,
+        D: Future<Output = Result<H, StoreError>> + Send + 'static,
+        R: Future<Output = Result<H, StoreError>> + Send + 'static,
+    {
+        let durable = (!self.local_durable)
+            .then(|| (self.durable_delay, durable_query(self.durable.store())));
+        let read_replicas = self.read_replicas.read().await;
+        let mut operation = CompositeOperation::new(durable);
+        for replica in read_replicas.iter() {
+            operation.spawn_replica(replica_query(replica.store()));
+        }
+        operation
+    }
+
     async fn get_from_remotes(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
     ) -> Result<CompositeGetOutput, StoreError> {
-        let mut fan_out = CompositeOperation::new();
-        let queries = &mut fan_out.queries;
-
-        if !self.local_durable {
-            let cancel_token = fan_out.cancellation_token.clone();
-            let delay = self.get_durable_delay_for_operation().await;
-            let durable_store = self.durable.store();
-            lore_spawn!(queries, async move {
-                tokio::time::sleep(delay).await;
-                if cancel_token.is_cancelled() {
-                    (true, Err(StoreError::internal("cancelled")))
-                } else {
-                    let durable_result = durable_store
+        let mut fan_out = pin!(
+            self.fan_out_read(
+                |store| async move {
+                    store
                         .get(partition, address)
                         .await
-                        .map(CompositeStoreHit::Durable);
-                    (true, durable_result)
-                }
-            });
-        }
-        {
-            let read_replicas = self.read_replicas.read().await;
-            for replica in read_replicas.iter() {
-                let replica_store = replica.store();
-                lore_spawn!(queries, async move {
-                    let replica_result = replica_store
+                        .map(CompositeStoreHit::Durable)
+                },
+                |store| async move {
+                    store
                         .get(partition, address)
                         .await
-                        .map(CompositeStoreHit::Replica);
-                    (false, replica_result)
-                });
-            }
-        }
+                        .map(CompositeStoreHit::Replica)
+                },
+            )
+            .await
+        );
 
         let mut error_to_return = StoreError::from(AddressNotFound::from(address));
-        while let Some(join_result) = queries.join_next().await {
+        while let Some(join_result) = fan_out.as_mut().next().await {
             let Ok((is_durable, query_result)) = join_result else {
                 continue;
             };
@@ -828,43 +880,27 @@ impl CompositeStore {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        let mut fan_out = CompositeOperation::new();
-        let queries = &mut fan_out.queries;
-
-        if !self.local_durable {
-            let cancel_token = fan_out.cancellation_token.clone();
-            let delay = self.get_durable_delay_for_operation().await;
-            let durable_store = self.durable.target.clone();
-            lore_spawn!(queries, async move {
-                tokio::time::sleep(delay).await;
-                if cancel_token.is_cancelled() {
-                    (true, Err(StoreError::internal("cancelled")))
-                } else {
-                    let durable_result = durable_store
+        let mut fan_out = pin!(
+            self.fan_out_read(
+                |store| async move {
+                    store
                         .get_metadata(partition, address)
                         .await
-                        .map(CompositeStoreHit::Durable);
-                    (true, durable_result)
-                }
-            });
-        }
-        {
-            let read_replicas = self.read_replicas.read().await;
-            for replica in read_replicas.iter() {
-                let replica_store = replica.target.clone();
-                lore_spawn!(queries, async move {
-                    let replica_result = replica_store
+                        .map(CompositeStoreHit::Durable)
+                },
+                |store| async move {
+                    store
                         .get_metadata(partition, address)
                         .await
-                        .map(CompositeStoreHit::Replica);
-                    (false, replica_result)
-                });
-            }
-        }
+                        .map(CompositeStoreHit::Replica)
+                },
+            )
+            .await
+        );
 
         let mut best_result = CompositeStoreHit::Miss(StoreGetData::default());
 
-        while let Some(join_result) = queries.join_next().await {
+        while let Some(join_result) = fan_out.as_mut().next().await {
             let Ok((is_durable, query_result)) = join_result else {
                 continue;
             };
@@ -1170,40 +1206,30 @@ impl ImmutableStore for CompositeStore {
                 .collect::<Vec<_>>(),
         );
 
-        let mut fan_out = CompositeOperation::new();
-        let queries = &mut fan_out.queries;
-
-        if !self.local_durable {
-            let cancel_token = fan_out.cancellation_token.clone();
-            let delay = self.get_durable_delay_for_operation().await;
-            let durable_store = self.durable.store();
-            let pending = pending.clone();
-            lore_spawn!(queries, async move {
-                tokio::time::sleep(delay).await;
-                if cancel_token.is_cancelled() {
-                    (true, Err(StoreError::internal("cancelled")))
-                } else {
-                    let mut scratch = vec![StoreMatchResult::default(); pending.len()];
-                    let outcome = durable_store.query(partition, &pending, &mut scratch).await;
-                    (true, outcome.map(|()| CompositeStoreHit::Durable(scratch)))
-                }
-            });
-        }
-        {
-            let read_replicas = self.read_replicas.read().await;
-            for replica in read_replicas.iter() {
-                let replica_store = replica.store();
-                let pending = pending.clone();
-                lore_spawn!(queries, async move {
-                    let mut scratch = vec![StoreMatchResult::default(); pending.len()];
-                    let outcome = replica_store.query(partition, &pending, &mut scratch).await;
-                    (false, outcome.map(|()| CompositeStoreHit::Replica(scratch)))
-                });
-            }
-        }
+        let mut fan_out = pin!(
+            self.fan_out_read(
+                |store| {
+                    let pending = pending.clone();
+                    async move {
+                        let mut scratch = vec![StoreMatchResult::default(); pending.len()];
+                        let outcome = store.query(partition, &pending, &mut scratch).await;
+                        outcome.map(|()| CompositeStoreHit::Durable(scratch))
+                    }
+                },
+                |store| {
+                    let pending = pending.clone();
+                    async move {
+                        let mut scratch = vec![StoreMatchResult::default(); pending.len()];
+                        let outcome = store.query(partition, &pending, &mut scratch).await;
+                        outcome.map(|()| CompositeStoreHit::Replica(scratch))
+                    }
+                },
+            )
+            .await
+        );
 
         let mut failure = None;
-        while let Some(join_result) = queries.join_next().await {
+        while let Some(join_result) = fan_out.as_mut().next().await {
             let (is_durable_result, resolved) = match join_result {
                 Ok(joined) => joined,
                 Err(error) => {

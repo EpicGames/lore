@@ -4473,6 +4473,7 @@ mod tests {
 
         use async_trait::async_trait;
         use bytes::Bytes;
+        use lore_base::error::SlowDown;
         use lore_base::runtime::LORE_CONTEXT;
         use lore_base::types::Address;
         use lore_base::types::Context;
@@ -4498,7 +4499,24 @@ mod tests {
         struct CountingStore {
             inner: Arc<dyn ImmutableStore>,
             get_count: AtomicU32,
+            get_metadata_count: AtomicU32,
             resolve_count: AtomicU32,
+            reads: Reads,
+        }
+
+        /// How a `CountingStore` answers the reads it counts.
+        #[derive(Clone, Copy)]
+        enum Reads {
+            /// Reads pass through to the wrapped store.
+            Answer,
+            /// Reads never complete, standing in for a replica too slow to answer.
+            Stall,
+            /// Reads fail with an internal error.
+            Fail,
+            /// Reads panic, failing the task that runs them.
+            Panic,
+            /// Reads fail with `SlowDown`, as an overloaded store does.
+            SlowDown,
         }
 
         impl std::fmt::Debug for CountingStore {
@@ -4512,7 +4530,26 @@ mod tests {
                 Self {
                     inner,
                     get_count: AtomicU32::new(0),
+                    get_metadata_count: AtomicU32::new(0),
                     resolve_count: AtomicU32::new(0),
+                    reads: Reads::Answer,
+                }
+            }
+
+            fn with_reads(inner: Arc<dyn ImmutableStore>, reads: Reads) -> Self {
+                Self {
+                    reads,
+                    ..Self::wrapping(inner)
+                }
+            }
+
+            async fn intercept_read(&self) -> Result<(), StoreError> {
+                match self.reads {
+                    Reads::Answer => Ok(()),
+                    Reads::Stall => std::future::pending().await,
+                    Reads::Fail => Err(StoreError::internal("replica read failed")),
+                    Reads::Panic => panic!("replica read panicked"),
+                    Reads::SlowDown => Err(StoreError::from(SlowDown)),
                 }
             }
         }
@@ -4534,6 +4571,8 @@ mod tests {
                 partition: Partition,
                 address: Address,
             ) -> Result<StoreGetData, StoreError> {
+                self.get_metadata_count.fetch_add(1, Ordering::SeqCst);
+                self.intercept_read().await?;
                 self.inner.clone().get_metadata(partition, address).await
             }
 
@@ -4544,6 +4583,7 @@ mod tests {
                 results: &mut [lore_storage::StoreMatchResult],
             ) -> Result<(), StoreError> {
                 self.resolve_count.fetch_add(1, Ordering::SeqCst);
+                self.intercept_read().await?;
                 self.inner
                     .clone()
                     .query(partition, addresses, results)
@@ -4556,6 +4596,7 @@ mod tests {
                 address: Address,
             ) -> Result<StoreGetData, StoreError> {
                 self.get_count.fetch_add(1, Ordering::SeqCst);
+                self.intercept_read().await?;
                 self.inner.clone().get(partition, address).await
             }
 
@@ -4658,18 +4699,22 @@ mod tests {
             .expect("should create in-memory store")
         }
 
-        async fn build_composite_with_read_replica(
+        async fn build_composite_with_read_replicas(
             durable: Arc<dyn ImmutableStore>,
-            replica: Arc<dyn ImmutableStore>,
+            replicas: Vec<Arc<dyn ImmutableStore>>,
             durable_delay: Duration,
         ) -> Arc<CompositeStore> {
+            let mut builder = CompositeStoreBuilder::default()
+                .with_local("local".to_string(), make_store().await)
+                .expect("local should work")
+                .with_durable("durable".to_string(), durable)
+                .expect("durable should work");
+            for (index, replica) in replicas.into_iter().enumerate() {
+                builder =
+                    builder.with_replica(format!("read-replica-{index}"), replica, true, false);
+            }
             Arc::new(
-                CompositeStoreBuilder::default()
-                    .with_local("local".to_string(), make_store().await)
-                    .expect("local should work")
-                    .with_durable("durable".to_string(), durable)
-                    .expect("durable should work")
-                    .with_replica("read-replica".to_string(), replica, true, false)
+                builder
                     .with_durable_delay(durable_delay)
                     .build()
                     .expect("build should work"),
@@ -4692,184 +4737,844 @@ mod tests {
             )
         }
 
-        /// When a read replica responds with a full match before the durable delay elapses,
-        /// the durable `get` should be cancelled — never invoked.
-        #[tokio::test]
-        async fn get_durable_not_called_when_replica_responds_within_delay() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
+        /// Long enough that an operation waiting it out fails the `PROMPTLY` bound below.
+        const LONG_DELAY: Duration = Duration::from_secs(60);
+        /// Generous bound for an operation that must not wait out `LONG_DELAY`.
+        const PROMPTLY: Duration = Duration::from_secs(10);
 
-                    let replica = make_store().await;
-                    replica
-                        .clone()
-                        .put(repository, address, fragment, Some(payload.clone()), false)
-                        .await
-                        .expect("put to replica failed");
+        async fn seeded_durable(
+            repository: Partition,
+            address: Address,
+            fragment: Fragment,
+            payload: Bytes,
+        ) -> Arc<CountingStore> {
+            let inner = make_store().await;
+            inner
+                .clone()
+                .put(repository, address, fragment, Some(payload), false)
+                .await
+                .expect("put to durable failed");
+            Arc::new(CountingStore::wrapping(inner))
+        }
 
-                    let durable_inner = make_store().await;
-                    durable_inner
-                        .clone()
-                        .put(repository, address, fragment, Some(payload.clone()), false)
-                        .await
-                        .expect("put to durable failed");
-                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
+        async fn missing_replicas() -> Vec<Arc<dyn ImmutableStore>> {
+            vec![make_store().await, make_store().await]
+        }
 
-                    let composite = build_composite_with_read_replica(
-                        durable.clone(),
-                        replica,
-                        Duration::from_millis(500),
-                    )
+        mod get {
+            use super::*;
+
+            /// When a read replica responds with a full match before the durable delay elapses,
+            /// the durable `get` is never started.
+            #[tokio::test]
+            async fn durable_not_called_when_replica_responds_within_delay() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let replica = make_store().await;
+                        replica
+                            .clone()
+                            .put(repository, address, fragment, Some(payload.clone()), false)
+                            .await
+                            .expect("put to replica failed");
+
+                        let durable_inner = make_store().await;
+                        durable_inner
+                            .clone()
+                            .put(repository, address, fragment, Some(payload.clone()), false)
+                            .await
+                            .expect("put to durable failed");
+                        let durable = Arc::new(CountingStore::wrapping(durable_inner));
+
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![replica],
+                            Duration::from_millis(500),
+                        )
+                        .await;
+
+                        let (got_fragment, got_payload) = composite
+                            .get(repository, address)
+                            .await
+                            .and_then(lore_storage::StoreGetData::into_payload)
+                            .expect("get should succeed via replica");
+
+                        assert_eq!(got_fragment.size_payload, fragment.size_payload);
+                        assert_eq!(got_payload, payload);
+                        // Gives a durable query spawned by mistake time to reach the store.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        assert_eq!(
+                            durable.get_count.load(Ordering::SeqCst),
+                            0,
+                            "durable get must not be called when replica responds within the delay window"
+                        );
+                    })
                     .await;
+            }
 
-                    let (got_fragment, got_payload) = composite
-                        .get(repository, address)
-                        .await
-                        .and_then(lore_storage::StoreGetData::into_payload)
-                        .expect("get should succeed via replica");
+            /// When there are no replicas the configured delay is bypassed entirely — the
+            /// durable store is queried immediately regardless of how large the delay is.
+            #[tokio::test]
+            async fn durable_not_delayed_when_no_replicas() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
 
-                    assert_eq!(got_fragment.size_payload, fragment.size_payload);
-                    assert_eq!(got_payload, payload);
-                    assert_eq!(
-                        durable.get_count.load(Ordering::SeqCst),
-                        0,
-                        "durable get must not be called when replica responds within the delay window"
-                    );
-                })
-                .await;
-        }
+                        let durable_inner = make_store().await;
+                        durable_inner
+                            .clone()
+                            .put(repository, address, fragment, Some(payload.clone()), false)
+                            .await
+                            .expect("put to durable failed");
+                        let durable = Arc::new(CountingStore::wrapping(durable_inner));
 
-        /// When there are no replicas the configured delay is bypassed entirely — the
-        /// durable store is queried immediately regardless of how large the delay is.
-        #[tokio::test]
-        async fn get_durable_not_delayed_when_no_replicas() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
+                        let composite =
+                            build_composite_no_replica(durable.clone(), LONG_DELAY).await;
 
-                    let durable_inner = make_store().await;
-                    durable_inner
-                        .clone()
-                        .put(repository, address, fragment, Some(payload.clone()), false)
-                        .await
-                        .expect("put to durable failed");
-                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
+                        let (got_fragment, got_payload) =
+                            tokio::time::timeout(PROMPTLY, composite.get(repository, address))
+                                .await
+                                .expect("get should not wait out the durable delay")
+                                .and_then(lore_storage::StoreGetData::into_payload)
+                                .expect("get should succeed via durable");
 
-                    // Use a large delay that would block the test if it were applied.
-                    let composite =
-                        build_composite_no_replica(durable.clone(), Duration::from_millis(500))
-                            .await;
-
-                    let (got_fragment, got_payload) = composite
-                        .get(repository, address)
-                        .await
-                        .and_then(lore_storage::StoreGetData::into_payload)
-                        .expect("get should succeed immediately via durable");
-
-                    assert_eq!(got_fragment.size_payload, fragment.size_payload);
-                    assert_eq!(got_payload, payload);
-                    assert_eq!(
-                        durable.get_count.load(Ordering::SeqCst),
-                        1,
-                        "durable get must be called when there are no replicas"
-                    );
-                })
-                .await;
-        }
-
-        /// When a read replica responds with `MatchFull` before the durable delay elapses,
-        /// the durable `exist` should be cancelled — never invoked.
-        #[tokio::test]
-        async fn resolve_durable_not_called_when_replica_responds_within_delay() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
-
-                    let replica = make_store().await;
-                    replica
-                        .clone()
-                        .put(repository, address, fragment, Some(payload.clone()), false)
-                        .await
-                        .expect("put to replica failed");
-
-                    let durable_inner = make_store().await;
-                    durable_inner
-                        .clone()
-                        .put(repository, address, fragment, Some(payload), false)
-                        .await
-                        .expect("put to durable failed");
-                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
-
-                    let composite = build_composite_with_read_replica(
-                        durable.clone(),
-                        replica,
-                        Duration::from_millis(500),
-                    )
+                        assert_eq!(got_fragment.size_payload, fragment.size_payload);
+                        assert_eq!(got_payload, payload);
+                        assert_eq!(
+                            durable.get_count.load(Ordering::SeqCst),
+                            1,
+                            "durable get must be called when there are no replicas"
+                        );
+                    })
                     .await;
+            }
 
-                    let match_result = lore_storage::immutable_store::query_one(
-                        &(composite as Arc<dyn ImmutableStore>),
-                        repository,
-                        address,
-                    )
-                    .await
-                    .expect("resolve should succeed via replica");
+            /// Once every read replica has missed, the durable `get` starts without waiting out the
+            /// delay.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            missing_replicas().await,
+                            LONG_DELAY,
+                        )
+                        .await;
 
-                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
-                    assert_eq!(
-                        durable.resolve_count.load(Ordering::SeqCst),
-                        0,
-                        "durable resolve must not be called when replica responds within the delay window"
-                    );
-                })
-                .await;
+                        let (_, got_payload) =
+                            tokio::time::timeout(PROMPTLY, composite.get(repository, address))
+                                .await
+                                .expect("get should not wait out the durable delay")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get should succeed via durable");
+
+                        assert_eq!(got_payload, payload);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A delay too long for the clock to represent still lets the durable `get` start once
+            /// every read replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_under_an_unrepresentable_delay() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            missing_replicas().await,
+                            Duration::MAX,
+                        )
+                        .await;
+
+                        let (_, got_payload) =
+                            tokio::time::timeout(PROMPTLY, composite.get(repository, address))
+                                .await
+                                .expect("get should not wait out the durable delay")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get should succeed via durable");
+
+                        assert_eq!(got_payload, payload);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica whose read fails counts as having finished, so the durable `get` starts
+            /// without waiting out the delay once the other replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_fails() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let failing: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Fail));
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, failing],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let (_, got_payload) =
+                            tokio::time::timeout(PROMPTLY, composite.get(repository, address))
+                                .await
+                                .expect("get should not wait out the durable delay")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get should succeed via durable");
+
+                        assert_eq!(got_payload, payload);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// While any read replica is still working on a request, the durable `get` waits out
+            /// the delay, even after the other replicas have missed.
+            #[tokio::test]
+            async fn durable_waits_out_delay_while_a_replica_is_outstanding() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let stalled: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Stall));
+                        let delay = Duration::from_millis(300);
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, stalled],
+                            delay,
+                        )
+                        .await;
+
+                        let started = std::time::Instant::now();
+                        let (_, got_payload) = composite
+                            .get(repository, address)
+                            .await
+                            .and_then(StoreGetData::into_payload)
+                            .expect("get should succeed via durable");
+
+                        assert!(
+                            started.elapsed() >= delay,
+                            "durable get must wait out the delay while a replica is outstanding"
+                        );
+                        assert_eq!(got_payload, payload);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica whose read task panics counts as having finished, so the durable `get`
+            /// starts without waiting out the delay once the other replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_panics() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let panicking: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Panic));
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, panicking],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let (_, got_payload) =
+                            tokio::time::timeout(PROMPTLY, composite.get(repository, address))
+                                .await
+                                .expect("get should not wait out the durable delay")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get should succeed via durable");
+
+                        assert_eq!(got_payload, payload);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica that answers `SlowDown` counts as having finished, so the durable `get`
+            /// starts without waiting out the delay once the other replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_slows_down() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let throttled: Arc<dyn ImmutableStore> = Arc::new(
+                            CountingStore::with_reads(make_store().await, Reads::SlowDown),
+                        );
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, throttled],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let (_, got_payload) =
+                            tokio::time::timeout(PROMPTLY, composite.get(repository, address))
+                                .await
+                                .expect("get should not wait out the durable delay")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get should succeed via durable");
+
+                        assert_eq!(got_payload, payload);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
         }
 
-        /// When there are no replicas the configured delay is bypassed entirely — the
-        /// durable store is queried immediately regardless of how large the delay is.
-        #[tokio::test]
-        async fn resolve_durable_not_delayed_when_no_replicas() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
+        mod get_metadata {
+            use super::*;
 
-                    let durable_inner = make_store().await;
-                    durable_inner
-                        .clone()
-                        .put(repository, address, fragment, Some(payload), false)
+            /// Once every read replica has missed, the durable `get_metadata` starts without
+            /// waiting out the delay.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            missing_replicas().await,
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let metadata = tokio::time::timeout(
+                            PROMPTLY,
+                            composite.get_metadata(repository, address),
+                        )
                         .await
-                        .expect("put to durable failed");
-                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
+                        .expect("get_metadata should not wait out the durable delay")
+                        .expect("get_metadata should succeed via durable");
 
-                    // Use a large delay that would block the test if it were applied.
-                    let composite =
-                        build_composite_no_replica(durable.clone(), Duration::from_millis(500))
-                            .await;
+                        assert_eq!(metadata.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
 
-                    let match_result = lore_storage::immutable_store::query_one(
-                        &(composite as Arc<dyn ImmutableStore>),
-                        repository,
-                        address,
-                    )
-                    .await
-                    .expect("resolve should succeed immediately via durable");
+            /// While any read replica is still working on a request, the durable `get_metadata`
+            /// waits out the delay, even after the other replicas have missed.
+            #[tokio::test]
+            async fn durable_waits_out_delay_while_a_replica_is_outstanding() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let stalled: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Stall));
+                        let delay = Duration::from_millis(300);
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, stalled],
+                            delay,
+                        )
+                        .await;
 
-                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
-                    assert_eq!(
-                        durable.resolve_count.load(Ordering::SeqCst),
-                        1,
-                        "durable resolve must be called when there are no replicas"
-                    );
-                })
-                .await;
+                        let started = std::time::Instant::now();
+                        let metadata = composite
+                            .get_metadata(repository, address)
+                            .await
+                            .expect("get_metadata should succeed via durable");
+
+                        assert!(
+                            started.elapsed() >= delay,
+                            "durable get_metadata must wait out the delay while a replica is outstanding"
+                        );
+                        assert_eq!(metadata.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica whose read fails counts as having finished, so the durable `get_metadata`
+            /// starts without waiting out the delay once the other replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_fails() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let failing: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Fail));
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, failing],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let metadata = tokio::time::timeout(
+                            PROMPTLY,
+                            composite.get_metadata(repository, address),
+                        )
+                        .await
+                        .expect("get_metadata should not wait out the durable delay")
+                        .expect("get_metadata should succeed via durable");
+
+                        assert_eq!(metadata.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica whose read task panics counts as having finished, so the durable
+            /// `get_metadata` starts without waiting out the delay once the other replica has
+            /// missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_panics() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let panicking: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Panic));
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, panicking],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let metadata = tokio::time::timeout(
+                            PROMPTLY,
+                            composite.get_metadata(repository, address),
+                        )
+                        .await
+                        .expect("get_metadata should not wait out the durable delay")
+                        .expect("get_metadata should succeed via durable");
+
+                        assert_eq!(metadata.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica that answers `SlowDown` counts as having finished, so the durable
+            /// `get_metadata` starts without waiting out the delay once the other replica has
+            /// missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_slows_down() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let throttled: Arc<dyn ImmutableStore> = Arc::new(
+                            CountingStore::with_reads(make_store().await, Reads::SlowDown),
+                        );
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, throttled],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let metadata = tokio::time::timeout(
+                            PROMPTLY,
+                            composite.get_metadata(repository, address),
+                        )
+                        .await
+                        .expect("get_metadata should not wait out the durable delay")
+                        .expect("get_metadata should succeed via durable");
+
+                        assert_eq!(metadata.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// When a read replica responds with a full match before the durable delay elapses,
+            /// the durable `get_metadata` is never started.
+            #[tokio::test]
+            async fn durable_not_called_when_replica_responds_within_delay() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let replica = make_store().await;
+                        replica
+                            .clone()
+                            .put(repository, address, fragment, Some(payload.clone()), false)
+                            .await
+                            .expect("put to replica failed");
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![replica],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let metadata = composite
+                            .get_metadata(repository, address)
+                            .await
+                            .expect("get_metadata should succeed via replica");
+
+                        assert_eq!(metadata.match_made, StoreMatch::MatchFull);
+                        // Gives a durable query spawned by mistake time to reach the store.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            /// When there are no replicas the durable `get_metadata` starts without waiting out the
+            /// delay.
+            #[tokio::test]
+            async fn durable_not_delayed_when_no_replicas() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let composite =
+                            build_composite_no_replica(durable.clone(), LONG_DELAY).await;
+
+                        let metadata = tokio::time::timeout(
+                            PROMPTLY,
+                            composite.get_metadata(repository, address),
+                        )
+                        .await
+                        .expect("get_metadata should not wait out the durable delay")
+                        .expect("get_metadata should succeed via durable");
+
+                        assert_eq!(metadata.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+        }
+
+        mod query {
+            use super::*;
+
+            /// When a read replica responds with `MatchFull` before the durable delay elapses,
+            /// the durable `query` is never started.
+            #[tokio::test]
+            async fn durable_not_called_when_replica_responds_within_delay() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let replica = make_store().await;
+                        replica
+                            .clone()
+                            .put(repository, address, fragment, Some(payload.clone()), false)
+                            .await
+                            .expect("put to replica failed");
+
+                        let durable_inner = make_store().await;
+                        durable_inner
+                            .clone()
+                            .put(repository, address, fragment, Some(payload), false)
+                            .await
+                            .expect("put to durable failed");
+                        let durable = Arc::new(CountingStore::wrapping(durable_inner));
+
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![replica],
+                            Duration::from_millis(500),
+                        )
+                        .await;
+
+                        let match_result = lore_storage::immutable_store::query_one(
+                            &(composite as Arc<dyn ImmutableStore>),
+                            repository,
+                            address,
+                        )
+                        .await
+                        .expect("resolve should succeed via replica");
+
+                        assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                        // Gives a durable query spawned by mistake time to reach the store.
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        assert_eq!(
+                            durable.resolve_count.load(Ordering::SeqCst),
+                            0,
+                            "durable resolve must not be called when replica responds within the delay window"
+                        );
+                    })
+                    .await;
+            }
+
+            /// When there are no replicas the configured delay is bypassed entirely — the
+            /// durable store is queried immediately regardless of how large the delay is.
+            #[tokio::test]
+            async fn durable_not_delayed_when_no_replicas() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable_inner = make_store().await;
+                        durable_inner
+                            .clone()
+                            .put(repository, address, fragment, Some(payload), false)
+                            .await
+                            .expect("put to durable failed");
+                        let durable = Arc::new(CountingStore::wrapping(durable_inner));
+
+                        let composite =
+                            build_composite_no_replica(durable.clone(), LONG_DELAY).await;
+
+                        let match_result = tokio::time::timeout(
+                            PROMPTLY,
+                            lore_storage::immutable_store::query_one(
+                                &(composite as Arc<dyn ImmutableStore>),
+                                repository,
+                                address,
+                            ),
+                        )
+                        .await
+                        .expect("query should not wait out the durable delay")
+                        .expect("query should succeed via durable");
+
+                        assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                        assert_eq!(
+                            durable.resolve_count.load(Ordering::SeqCst),
+                            1,
+                            "durable resolve must be called when there are no replicas"
+                        );
+                    })
+                    .await;
+            }
+
+            /// Once every read replica has missed, the durable `query` starts without waiting out
+            /// the delay.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            missing_replicas().await,
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let match_result = tokio::time::timeout(
+                            PROMPTLY,
+                            lore_storage::immutable_store::query_one(
+                                &(composite as Arc<dyn ImmutableStore>),
+                                repository,
+                                address,
+                            ),
+                        )
+                        .await
+                        .expect("query should not wait out the durable delay")
+                        .expect("query should succeed via durable");
+
+                        assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// While any read replica is still working on a request, the durable `query` waits out
+            /// the delay, even after the other replicas have missed.
+            #[tokio::test]
+            async fn durable_waits_out_delay_while_a_replica_is_outstanding() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let stalled: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Stall));
+                        let delay = Duration::from_millis(300);
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, stalled],
+                            delay,
+                        )
+                        .await;
+
+                        let started = std::time::Instant::now();
+                        let match_result = lore_storage::immutable_store::query_one(
+                            &(composite as Arc<dyn ImmutableStore>),
+                            repository,
+                            address,
+                        )
+                        .await
+                        .expect("query should succeed via durable");
+
+                        assert!(
+                            started.elapsed() >= delay,
+                            "durable query must wait out the delay while a replica is outstanding"
+                        );
+                        assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica whose read fails counts as having finished, so the durable `query` starts
+            /// without waiting out the delay once the other replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_fails() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let failing: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Fail));
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, failing],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let match_result = tokio::time::timeout(
+                            PROMPTLY,
+                            lore_storage::immutable_store::query_one(
+                                &(composite as Arc<dyn ImmutableStore>),
+                                repository,
+                                address,
+                            ),
+                        )
+                        .await
+                        .expect("query should not wait out the durable delay")
+                        .expect("query should succeed via durable");
+
+                        assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica whose read task panics counts as having finished, so the durable `query`
+            /// starts without waiting out the delay once the other replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_panics() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let panicking: Arc<dyn ImmutableStore> =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Panic));
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, panicking],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let match_result = tokio::time::timeout(
+                            PROMPTLY,
+                            lore_storage::immutable_store::query_one(
+                                &(composite as Arc<dyn ImmutableStore>),
+                                repository,
+                                address,
+                            ),
+                        )
+                        .await
+                        .expect("query should not wait out the durable delay")
+                        .expect("query should succeed via durable");
+
+                        assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A replica that answers `SlowDown` counts as having finished, so the durable `query`
+            /// starts without waiting out the delay once the other replica has missed.
+            #[tokio::test]
+            async fn durable_starts_once_every_replica_misses_or_slows_down() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let throttled: Arc<dyn ImmutableStore> = Arc::new(
+                            CountingStore::with_reads(make_store().await, Reads::SlowDown),
+                        );
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![make_store().await, throttled],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let match_result = tokio::time::timeout(
+                            PROMPTLY,
+                            lore_storage::immutable_store::query_one(
+                                &(composite as Arc<dyn ImmutableStore>),
+                                repository,
+                                address,
+                            ),
+                        )
+                        .await
+                        .expect("query should not wait out the durable delay")
+                        .expect("query should succeed via durable");
+
+                        assert_eq!(match_result.match_made, StoreMatch::MatchFull);
+                        assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
         }
     }
 }
