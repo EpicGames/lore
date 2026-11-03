@@ -9,13 +9,25 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
+use lore_base::types::Fragment;
+use lore_base::types::FragmentFlags;
+use lore_base::types::FragmentReference;
+use lore_revision::fs::filesystem_provider::FileInfo;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::*;
+use lore_revision::node::Node;
+use lore_revision::node::NodeFileMode;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
+use lore_storage::hash;
+use zerocopy::IntoBytes;
 
 use crate::fs::filesystem_provider::setup_test_execution;
+use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::working_tree_repository;
 
 fn temp_dir() -> lore_base::test_util::TempDir {
     lore_base::test_util::TempDir::new("lore-fs-os-test-")
@@ -576,4 +588,168 @@ async fn rename_refuses_a_destination_of_another_kind() {
         dir.path().join("to").is_dir(),
         "the destination must survive"
     );
+}
+
+/// Stores `payload` as one fragment with `flags`, standing for `size_content` bytes of
+/// content, and answers its address.
+async fn store_fragment(
+    repository: &Arc<RepositoryContext>,
+    payload: Vec<u8>,
+    flags: FragmentFlags,
+    size_content: u64,
+) -> Address {
+    let address = Address::zero_context_hash(hash::hash_slice(&payload));
+    lore_revision::immutable::store_raw_store_retry(
+        repository.immutable_store(),
+        repository.id,
+        address,
+        Fragment {
+            flags: flags.bits(),
+            size_payload: payload.len() as u32,
+            size_content,
+        },
+        Some(bytes::Bytes::from(payload)),
+    )
+    .await
+    .expect("store the fragment");
+    address
+}
+
+/// The content each fragment of a list [`stored_node`] stores holds, in bytes.
+const LEAF_LEN: usize = 16 * 1024;
+
+/// A file node holding `content`, stored as one fragment or, where `listed` asks for it, as a
+/// list of fragments, and carrying the executable bit where `executable` asks for it.
+///
+/// The two shapes reach the file differently: one fragment is written whole and its write
+/// captures the file's metadata, and a list streams into the file and captures none.
+async fn stored_node(
+    repository: &Arc<RepositoryContext>,
+    content: &[u8],
+    listed: bool,
+    executable: bool,
+) -> Node {
+    let mut node = file_node(content);
+    node.address = if listed {
+        let mut list = Vec::new();
+        for (index, leaf) in content.chunks(LEAF_LEN).enumerate() {
+            let leaf_address = store_fragment(
+                repository,
+                leaf.to_vec(),
+                FragmentFlags::empty(),
+                leaf.len() as u64,
+            )
+            .await;
+            list.push(FragmentReference {
+                hash: leaf_address.hash,
+                offset_content: (index * LEAF_LEN) as u64,
+            });
+        }
+        store_fragment(
+            repository,
+            list.as_slice().as_bytes().to_vec(),
+            FragmentFlags::PayloadFragmented,
+            content.len() as u64,
+        )
+        .await
+    } else {
+        store_fragment(
+            repository,
+            content.to_vec(),
+            FragmentFlags::empty(),
+            content.len() as u64,
+        )
+        .await
+    };
+    if executable {
+        node.mode = NodeFileMode::Executable.bits();
+    }
+    node
+}
+
+/// A written node answers what a stat of the file it left reads, whichever shape the content
+/// is stored in, and on Unix the file carries the executable bit the node does.
+#[tokio::test]
+async fn a_written_node_answers_what_the_file_holds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let content: Vec<u8> = (0..40 * 1024).map(|index| (index % 251) as u8).collect();
+
+            for (name, listed, executable) in [
+                ("whole", false, false),
+                ("whole.sh", false, true),
+                ("listed", true, false),
+                ("listed.sh", true, true),
+            ] {
+                let node = stored_node(&repository, &content, listed, executable).await;
+                let info = operation
+                    .write_node(repository.clone(), &node, &relative(name))
+                    .await
+                    .expect("writing the node");
+
+                let path = dir.path().join(name);
+                assert_eq!(
+                    content,
+                    std::fs::read(&path).expect("read the file"),
+                    "{name} holds the node's content"
+                );
+                assert_eq!(
+                    FileInfo::from_metadata(&std::fs::metadata(&path).expect("stat the file")),
+                    info,
+                    "{name} answers what a stat reads"
+                );
+                if cfg!(unix) {
+                    assert_eq!(
+                        Some(executable),
+                        info.executable(),
+                        "{name} carries the node's executable bit"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
+/// A node without the executable bit clears it from the file it overwrites, whose mode the
+/// write keeps.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_written_node_clears_an_executable_bit_it_does_not_carry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let path = dir.path().join("tool");
+            std::fs::write(&path, b"#!/bin/sh\n").expect("write the file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("set the file's mode");
+
+            let node = stored_node(&repository, b"plain content", false, false).await;
+            let info = operation
+                .write_node(repository.clone(), &node, &relative("tool"))
+                .await
+                .expect("writing the node");
+
+            let mode = std::fs::metadata(&path)
+                .expect("stat the file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o644, "the bit is cleared for everyone");
+            assert_eq!(Some(false), info.executable());
+        })
+        .await;
 }

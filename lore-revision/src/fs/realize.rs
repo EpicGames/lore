@@ -1454,7 +1454,7 @@ pub async fn realize_scratch_file(
             })?;
     }
 
-    if node.size > 0 {
+    let written = if node.size > 0 {
         let options = immutable::read_options_from_repository(&repository);
         immutable::read_into_file(repository, node.address, path, None, options)
             .await
@@ -1463,31 +1463,31 @@ pub async fn realize_scratch_file(
                     "Failed to sync file {}: {err}",
                     path.to_string_lossy()
                 ))
-            })?;
+            })?
+            .1
     } else {
-        lore_io::IoDriver::global()
-            .write_file_bytes(path, bytes::Bytes::new(), false)
-            .await
-            .map_err(|err| {
-                SyncError::internal(format!(
-                    "Failed to sync file {}: {err}",
-                    path.to_string_lossy()
-                ))
-            })?;
-    }
+        Some(
+            lore_io::IoDriver::global()
+                .write_file_bytes(path, bytes::Bytes::new(), false)
+                .await
+                .map_err(|err| {
+                    SyncError::internal(format!(
+                        "Failed to sync file {}: {err}",
+                        path.to_string_lossy()
+                    ))
+                })?,
+        )
+    };
 
-    let metadata = lore_io::IoDriver::global().metadata(path).await.ok();
-    if node.mode & NodeFileMode::Executable == NodeFileMode::Executable
-        && let Some(metadata) = &metadata
-    {
-        util::fs::metadata_set_executable(path, metadata, true).await;
+    if node.mode & NodeFileMode::Executable == NodeFileMode::Executable {
+        util::fs::metadata_set_executable(path, written.as_ref(), true).await;
     }
 
     lore_trace!(
-        "Realized file {} {} bytes (target file {} bytes) {}",
+        "Realized file {} {} bytes (target file {:?} bytes) {}",
         path.display(),
         node.size,
-        metadata.map_or(0, |metadata| metadata.len()),
+        written.as_ref().map(std::fs::Metadata::len),
         node.address.hash
     );
 

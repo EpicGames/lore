@@ -304,7 +304,7 @@ pub(crate) async fn write_file(
             if node_executable != util::fs::file_is_executable(&metadata) {
                 util::fs::metadata_set_executable(
                     destination.as_path(),
-                    &metadata,
+                    Some(&metadata),
                     node_executable,
                 )
                 .await;

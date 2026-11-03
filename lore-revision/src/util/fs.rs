@@ -41,32 +41,41 @@ const FILE_MODE_USER_EXEC: u32 = 0o100;
 #[cfg(not(target_family = "windows"))]
 const FILE_MODE_ALL_EXEC: u32 = 0o111;
 
-// On Windows we do not care about executable bit
+/// Does nothing: Windows has no executable bit.
 #[cfg(target_family = "windows")]
 pub async fn metadata_set_executable(
     _path: impl AsRef<Path>,
-    _metadata: &Metadata,
+    _metadata: Option<&Metadata>,
     _executable: bool,
 ) {
 }
 
+/// Gives the file at `path` the executable bit `executable` asks for, for user, group and
+/// others, starting from the mode in `metadata`, or from a stat of `path` where `metadata` is
+/// `None`. A file whose mode already matches is left as it is, and a stat or a change of mode
+/// that fails is logged as a warning.
 #[cfg(not(target_family = "windows"))]
-#[allow(unused_variables)]
 pub async fn metadata_set_executable(
     path: impl AsRef<Path>,
-    metadata: &Metadata,
+    metadata: Option<&Metadata>,
     executable: bool,
 ) {
     let path = path.as_ref();
-    let mut permissions = metadata.permissions();
-
-    let mode = if executable {
-        permissions.mode() | FILE_MODE_ALL_EXEC
-    } else {
-        permissions.mode() & !FILE_MODE_ALL_EXEC
+    let permissions = match metadata {
+        Some(metadata) => executable_permissions(metadata, executable),
+        None => match lore_io::IoDriver::global().metadata(path).await {
+            Ok(metadata) => executable_permissions(&metadata, executable),
+            Err(err) => {
+                lore_warn!("Failed to read the mode of {}: {err}", path.display());
+                return;
+            }
+        },
     };
-    permissions.set_mode(mode);
+    let Some(permissions) = permissions else {
+        return;
+    };
 
+    let mode = permissions.mode();
     let _ = lore_io::IoDriver::global()
         .set_permissions(path, permissions)
         .await
@@ -77,6 +86,24 @@ pub async fn metadata_set_executable(
                 path.to_path_buf().display()
             );
         });
+}
+
+/// The permissions that give a file with `metadata` the executable bit `executable` asks for,
+/// for user, group and others, or `None` where its mode already matches.
+#[cfg(not(target_family = "windows"))]
+fn executable_permissions(metadata: &Metadata, executable: bool) -> Option<std::fs::Permissions> {
+    let mut permissions = metadata.permissions();
+    let current = permissions.mode();
+    let mode = if executable {
+        current | FILE_MODE_ALL_EXEC
+    } else {
+        current & !FILE_MODE_ALL_EXEC
+    };
+    if mode == current {
+        return None;
+    }
+    permissions.set_mode(mode);
+    Some(permissions)
 }
 
 /// The mode to store on a node whose mode is `previous`: the observed executable bit

@@ -361,11 +361,7 @@ async fn working_executable(repository: &Arc<RepositoryContext>, path: &Relative
 #[cfg(target_family = "unix")]
 async fn make_working_executable(repository: &Arc<RepositoryContext>, path: &RelativePath) {
     let absolute = path.to_absolute_path(repository.require_path().expect("working tree"));
-    let metadata = lore_io::IoDriver::global()
-        .metadata(&absolute)
-        .await
-        .expect("working file metadata");
-    util::fs::metadata_set_executable(&absolute, &metadata, true).await;
+    util::fs::metadata_set_executable(&absolute, None, true).await;
 }
 
 /// A node addressing `content` and carrying the executable bit.

@@ -283,6 +283,10 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
+    /// Takes the mode for the executable bit from the metadata the write captured, or from a
+    /// stat by path where the write captured none, and stats the file by path for the
+    /// [`FileInfo`] it answers: the write takes its metadata on the open handle, and a
+    /// filesystem that settles the stamp at close gives the file a later time.
     async fn write_node(
         &self,
         repository: Arc<RepositoryContext>,
@@ -294,11 +298,11 @@ impl InstanceOperation for OsOperation {
             lore_io::IoDriver::global().create_dir_all(parent).await?;
         }
 
-        write_addressed_content(repository, node.address, &path).await?;
-
-        let written = lore_io::IoDriver::global().metadata(&path).await?;
-        let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-        util::fs::metadata_set_executable(&path, &written, executable).await;
+        {
+            let (_, written) = write_addressed_content(repository, node.address, &path).await?;
+            let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+            util::fs::metadata_set_executable(&path, written.as_ref(), executable).await;
+        }
         Ok(FileInfo::from_metadata(
             &lore_io::IoDriver::global().metadata(&path).await?,
         ))

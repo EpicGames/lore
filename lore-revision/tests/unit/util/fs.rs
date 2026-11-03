@@ -494,3 +494,68 @@ async fn an_unlink_leaves_a_directory_holding_entries_as_it_stands() {
         .mode();
     assert_eq!(mode & 0o777, 0o755, "the directory keeps its mode");
 }
+
+/// A file whose mode already carries the bit asked for is left as it is, whether its mode is
+/// read from the file or given. Setting a mode moves the file's change time even when the mode
+/// stays the same, so a matching mode must leave the time where it was. Asking for the other
+/// bit then moves it, which shows the clock had advanced far enough for a change to be seen.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_mode_that_already_matches_is_left_as_it_is() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let path = temp.path().join("plain");
+                std::fs::write(&path, b"plain").expect("write the file");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                    .expect("set the file's mode");
+                let before = std::fs::metadata(&path).expect("stat the file");
+                wait_for_change_time_past(temp.path(), &before);
+
+                metadata_set_executable(&path, None, false).await;
+                metadata_set_executable(&path, Some(&before), false).await;
+                let kept = std::fs::metadata(&path).expect("stat the file");
+                assert_eq!(
+                    (before.ctime(), before.ctime_nsec()),
+                    (kept.ctime(), kept.ctime_nsec()),
+                    "a matching mode leaves the file untouched"
+                );
+
+                metadata_set_executable(&path, Some(&before), true).await;
+                let changed = std::fs::metadata(&path).expect("stat the file");
+                assert_eq!(changed.mode() & 0o777, 0o755, "the bit is set for everyone");
+                assert_ne!(
+                    (before.ctime(), before.ctime_nsec()),
+                    (changed.ctime(), changed.ctime_nsec()),
+                    "a mode that differs is set"
+                );
+            },
+        )
+        .await;
+}
+
+/// Stamps a probe in `dir` until the filesystem gives it a later change time than `metadata`
+/// carries, so that a change made from then on moves the time a file carries.
+#[cfg(unix)]
+fn wait_for_change_time_past(dir: &Path, metadata: &std::fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+
+    let probe = dir.join("probe");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        std::fs::write(&probe, b"probe").expect("stamp the probe");
+        let stamped = std::fs::metadata(&probe).expect("stat the probe");
+        if (stamped.ctime(), stamped.ctime_nsec()) > (metadata.ctime(), metadata.ctime_nsec()) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the filesystem clock must advance"
+        );
+    }
+}
