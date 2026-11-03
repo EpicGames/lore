@@ -2443,6 +2443,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "hex",
+ "lore-aws",
  "lore-base",
  "lore-error-set",
  "lore-macro",

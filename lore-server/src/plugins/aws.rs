@@ -26,6 +26,8 @@ use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
 use lore_revision::lock::LockStore;
+use lore_revision::util::time::RetryPolicy;
+use lore_revision::util::time::RetrySettings;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use opentelemetry_sdk::resource::ResourceDetector;
@@ -108,6 +110,12 @@ pub struct AwsImmutableStorePluginConfig {
     #[serde(default = "default_slow_threshold")]
     pub dynamodb_slow_operation_threshold_millis: u64,
 
+    /// Backoff for resending the keys a `DynamoDB` batch read leaves unprocessed. `max_attempts`
+    /// counts resends; a read with keys still unprocessed after them fails. Unset, the client's
+    /// default applies.
+    #[serde(default)]
+    pub dynamodb_unprocessed_keys_retry: Option<RetrySettings>,
+
     /// Timeout in milliseconds for AWS operations.
     #[serde(default = "default_timeout")]
     pub timeout_millis: u64,
@@ -182,6 +190,12 @@ pub struct AwsLockStorePluginConfig {
     /// Slow operation threshold in milliseconds for `DynamoDB` operations.
     #[serde(default = "default_slow_threshold")]
     pub dynamodb_slow_operation_threshold_millis: u64,
+
+    /// Backoff for resending the keys a `DynamoDB` batch read leaves unprocessed. `max_attempts`
+    /// counts resends; a read with keys still unprocessed after them fails. Unset, the client's
+    /// default applies.
+    #[serde(default)]
+    pub dynamodb_unprocessed_keys_retry: Option<RetrySettings>,
 
     /// Timeout in milliseconds for AWS operations.
     #[serde(default = "default_timeout")]
@@ -297,6 +311,12 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                 .await
                 .with_slow_operation_threshold(
                     plugin_config.dynamodb_slow_operation_threshold_millis,
+                )
+                .maybe_unprocessed_keys_retry(
+                    plugin_config
+                        .dynamodb_unprocessed_keys_retry
+                        .as_ref()
+                        .map(RetryPolicy::from),
                 )
                 .dynamodb()
                 .ensure_table(&plugin_config.dynamodb_fragments_table)
@@ -510,6 +530,12 @@ impl LockStorePluginFactory for AwsLockStorePluginFactory {
                 .await
                 .with_slow_operation_threshold(
                     plugin_config.dynamodb_slow_operation_threshold_millis,
+                )
+                .maybe_unprocessed_keys_retry(
+                    plugin_config
+                        .dynamodb_unprocessed_keys_retry
+                        .as_ref()
+                        .map(RetryPolicy::from),
                 )
                 .dynamodb()
                 .ensure_table(&plugin_config.dynamodb_table);

@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::batch_get_item::BatchGetItemError;
+use aws_sdk_dynamodb::operation::batch_get_item::BatchGetItemOutput;
 use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
 use aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput;
 use aws_sdk_dynamodb::operation::describe_table::DescribeTableError;
@@ -27,7 +29,10 @@ use aws_sdk_dynamodb::types::Select;
 use aws_sdk_dynamodb::types::TransactWriteItem;
 // Convenience exports
 pub use aws_sdk_dynamodb::{Error as DynamoDbError, error, operation, primitives, types};
+use lore_base::retry::Retry;
+use lore_revision::util::time::RetryPolicy;
 use lore_telemetry::InstrumentProvider;
+use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::drop_record::DropRecord;
 use lore_telemetry::drop_time::DropTimeMs;
@@ -35,6 +40,7 @@ use lore_telemetry::observe::Observe;
 #[cfg(test)]
 use mockall::mock;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -60,7 +66,23 @@ const METRICS_NESTED_API_CALLS: &str = "nested_api_calls.total";
 const NESTED_CALL_VOLUMES: [f64; 11] = [1., 2., 3., 6., 10., 20., 40., 80., 100., 150., 200.];
 
 const METRICS_UNPROCESSED_RETRIES: &str = "unprocessed_retries.total";
-const UNPROCESSED_RETRIES_BOUNDARIES: [f64; 8] = [0., 1., 2., 4., 7., 12., 18., 25.];
+const UNPROCESSED_RETRIES_BOUNDARIES: [f64; 11] =
+    [0., 1., 2., 4., 7., 12., 18., 25., 30., 50., 100.];
+const METRICS_UNPROCESSED_EXHAUSTED: &str = "unprocessed_retries.exhausted";
+
+const DEFAULT_UNPROCESSED_KEYS_BACKOFF_START_MS: u64 = 50;
+const DEFAULT_UNPROCESSED_KEYS_BACKOFF_MAX_MS: u64 = 1_000;
+const DEFAULT_UNPROCESSED_KEYS_MAX_RESENDS: usize = 6;
+
+/// The default backoff for resending one `BatchGetItem` chunk's unprocessed keys. Its limit counts
+/// resends.
+pub fn default_unprocessed_keys_retry() -> RetryPolicy {
+    RetryPolicy::builder()
+        .with_initial_backoff_millis(DEFAULT_UNPROCESSED_KEYS_BACKOFF_START_MS)
+        .with_max_backoff_millis(DEFAULT_UNPROCESSED_KEYS_BACKOFF_MAX_MS)
+        .with_limit(DEFAULT_UNPROCESSED_KEYS_MAX_RESENDS)
+        .build()
+}
 
 const METRICS_QUERY_COUNT: &str = "query.accumulation.count";
 const METRICS_QUERY_SCANNED_ROWS: &str = "query.accumulation.scanned_count";
@@ -176,6 +198,7 @@ struct DynamoDbInstruments {
     operation_latency_histogram: Histogram<f64>,
     num_nested_api_calls_histogram: Histogram<u64>,
     unprocessed_retries_histogram: Histogram<u64>,
+    unprocessed_exhausted_counter: Counter<u64>,
     query_accumulation_count_histogram: Histogram<u64>,
     query_accumulation_scanned_rows_histogram: Histogram<u64>,
 }
@@ -194,6 +217,8 @@ impl InstrumentProvider for DynamoDbInstruments {
 pub struct DynamoDbImpl {
     client: aws_sdk_dynamodb::Client,
     slow_operation_duration: Duration,
+    /// The backoff for resending each `BatchGetItem` chunk's unprocessed keys.
+    unprocessed_keys_retry: RetryPolicy,
     instruments: DynamoDbInstruments,
 }
 
@@ -202,12 +227,14 @@ impl DynamoDbImpl {
         client: aws_sdk_dynamodb::Client,
         slow_operation_duration: Duration,
         metrics_attributes: Vec<KeyValue>,
+        unprocessed_keys_retry: RetryPolicy,
     ) -> Self {
         let instrument_provider = DynamoDbInstrumentProvider { metrics_attributes };
 
         Self {
             client,
             slow_operation_duration,
+            unprocessed_keys_retry,
 
             instruments: DynamoDbInstruments {
                 batch_size_histogram: instrument_provider
@@ -222,6 +249,8 @@ impl DynamoDbImpl {
                     METRICS_UNPROCESSED_RETRIES,
                     UNPROCESSED_RETRIES_BOUNDARIES.to_vec(),
                 ),
+                unprocessed_exhausted_counter: instrument_provider
+                    .counter(METRICS_UNPROCESSED_EXHAUSTED),
                 query_accumulation_count_histogram: instrument_provider
                     .length_histogram(METRICS_QUERY_COUNT, QUERY_ROWS.to_vec()),
                 query_accumulation_scanned_rows_histogram: instrument_provider
@@ -299,7 +328,7 @@ impl DynamoDbImpl {
     pub async fn batch_get_item(
         &self,
         table_name: &Arc<str>,
-        mut items: Vec<HashMap<String, AttributeValue>>,
+        items: Vec<HashMap<String, AttributeValue>>,
         consistent: bool,
     ) -> Result<Vec<HashMap<String, AttributeValue>>, AwsError<SdkError<BatchGetItemError>>> {
         let base_labels = {
@@ -324,95 +353,39 @@ impl DynamoDbImpl {
             self.instruments.num_nested_api_calls_histogram.clone(),
             &base_labels,
         );
-        let mut unprocessed_retries = DropRecord::new(
-            self.instruments.unprocessed_retries_histogram.clone(),
-            &base_labels,
-        );
+        num_api_calls.set(items.len().div_ceil(BATCH_GET_ITEM_MAX_COUNT) as u64);
+        let mut telemetry = BatchGetTelemetry {
+            latency: &self.instruments.operation_latency_histogram,
+            labels: &base_labels,
+            slow_operation_duration: self.slow_operation_duration,
+            resends: DropRecord::new(
+                self.instruments.unprocessed_retries_histogram.clone(),
+                &base_labels,
+            ),
+        };
+        let client = self.client.clone();
+        let send = move |request| {
+            client
+                .batch_get_item()
+                .set_request_items(Some(request))
+                .send()
+        };
 
-        let mut join_set = JoinSet::new();
-        let observe_fn = observe_aws_operation_callback(self.slow_operation_duration);
-        let histogram = self.instruments.operation_latency_histogram.clone();
-
-        // Dynamo has a cap on the number of items in a single batch, so we split the incoming items
-        // into separate calls and spawn them all off in parallel into a join set.
-        while !items.is_empty() {
-            num_api_calls.add(1);
-
-            let keys = items.split_off(items.len().saturating_sub(BATCH_GET_ITEM_MAX_COUNT));
-            let keys_and_attributes = KeysAndAttributes::builder()
-                .set_keys(Some(keys))
-                .consistent_read(consistent)
-                .build()
-                .map_err(|e| {
-                    tracing::warn!(
-                        "Failed to build keys and attributes for Dynamo batch get item: {e:?}."
-                    );
-                    AwsError::BatchRequestError
-                })?;
-            let size = keys_and_attributes.keys.len();
-
-            tracing::trace!("Sending batch of {} tasks to BatchGetItem", size);
-
-            lore_base::lore_spawn!(
-                join_set,
-                self.client
-                    .batch_get_item()
-                    .request_items(&**table_name, keys_and_attributes)
-                    .send()
-                    .observe(histogram.clone(), base_labels.clone(), observe_fn)
-                    .in_current_span()
-            );
+        let result = batch_get_chunks(
+            table_name,
+            items,
+            consistent,
+            send,
+            self.unprocessed_keys_retry,
+            &mut telemetry,
+        )
+        .await;
+        if matches!(result, Err(AwsError::UnprocessedKeys { .. })) {
+            self.instruments
+                .unprocessed_exhausted_counter
+                .add(1, &base_labels);
         }
-
-        let mut output = Vec::new();
-
-        // Consume the results as they come in. Note: we do not maintain the order of incoming
-        // items in the returned output.
-        while let Some(join_result) = join_set.join_next().await {
-            let result = join_result.map_err(|e| {
-                tracing::warn!("Failed to join BatchGetItem task: {e:?}");
-                AwsError::JoinError
-            })?;
-
-            match result.output {
-                Ok(o) => {
-                    if let Some(mut items) = o
-                        .responses
-                        .and_then(|mut responses| responses.remove(&**table_name))
-                    {
-                        tracing::trace!("Got output from BatchGetItem: {items:?}");
-                        output.append(&mut items);
-                    }
-
-                    // There are a variety of reasons that Dynamo might not process all keys in a
-                    // single request (e.g. if the size of the returned items is too large, or if
-                    // capacity is temporarily exceeded). If we got back any unprocessed keys create
-                    // a new task and add it back into the join set.
-                    if let Some(p) = o
-                        .unprocessed_keys
-                        .filter(|unprocessed| !unprocessed.is_empty())
-                    {
-                        unprocessed_retries.add(1);
-                        tracing::trace!(
-                            "Got unprocessed keys: {p:?}, re-submitting for next batch"
-                        );
-
-                        lore_base::lore_spawn!(
-                            join_set,
-                            self.client
-                                .batch_get_item()
-                                .set_request_items(Some(p))
-                                .send()
-                                .observe(histogram.clone(), base_labels.clone(), observe_fn)
-                                .in_current_span()
-                        );
-                    }
-                }
-                Err(e) => return Err(AwsError::sdk_error(e)),
-            }
-        }
-
-        Ok(output)
+        result
     }
 
     #[tracing::instrument(name = "DynamoDbImpl::put_item", skip_all)]
@@ -813,6 +786,148 @@ impl DynamoDbImpl {
     }
 }
 
+#[lore_macro::test_pub]
+struct BatchGetTelemetry<'a> {
+    /// Records the duration of each request, without the wait before a resend.
+    latency: &'a Histogram<f64>,
+    labels: &'a LabelArray,
+    slow_operation_duration: Duration,
+    /// Counts the resends across all chunks.
+    resends: DropRecord<'a>,
+}
+
+/// Reads `keys` from `table_name` with `BatchGetItem` through `send`, in chunks of at most
+/// [`BATCH_GET_ITEM_MAX_COUNT`] keys sent concurrently. Items come back in no particular order.
+///
+/// Each chunk uses its own `Retry` from `backoff` to resend unprocessed keys, so a throttled chunk
+/// waits without delaying the others. The read either returns every item that exists or fails. It
+/// never returns a partial result because a caller takes a missing item to mean the item does not
+/// exist.
+#[lore_macro::test_pub]
+async fn batch_get_chunks<S, F>(
+    table_name: &str,
+    mut keys: Vec<HashMap<String, AttributeValue>>,
+    consistent: bool,
+    send: S,
+    backoff: RetryPolicy,
+    telemetry: &mut BatchGetTelemetry<'_>,
+) -> Result<Vec<HashMap<String, AttributeValue>>, AwsError<SdkError<BatchGetItemError>>>
+where
+    S: Fn(HashMap<String, KeysAndAttributes>) -> F + Clone + Send + 'static,
+    F: Future<Output = Result<BatchGetItemOutput, SdkError<BatchGetItemError>>> + Send + 'static,
+{
+    let mut tasks = JoinSet::new();
+
+    while !keys.is_empty() {
+        let chunk = keys.split_off(keys.len().saturating_sub(BATCH_GET_ITEM_MAX_COUNT));
+        let request = KeysAndAttributes::builder()
+            .set_keys(Some(chunk))
+            .consistent_read(consistent)
+            .build()
+            .map_err(|e| {
+                tracing::warn!(error = ?e, "Failed to build keys and attributes for Dynamo batch get item");
+                AwsError::BatchRequestError
+            })?;
+        lore_base::lore_spawn!(
+            tasks,
+            send_chunk(
+                None,
+                send.clone(),
+                HashMap::from([(table_name.to_owned(), request)]),
+                backoff.retry(),
+                telemetry,
+            )
+            .in_current_span()
+        );
+    }
+
+    let mut output = Vec::new();
+
+    loop {
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
+        let (response, mut chunk_backoff) = joined.map_err(|e| {
+            tracing::warn!(error = ?e, "Failed to join BatchGetItem task");
+            AwsError::JoinError
+        })?;
+        let response = response.map_err(AwsError::sdk_error)?;
+
+        if let Some(mut items) = response
+            .responses
+            .and_then(|mut responses| responses.remove(table_name))
+        {
+            output.append(&mut items);
+        }
+
+        // DynamoDB leaves keys unprocessed when the response would be too large or the table's
+        // capacity is exceeded.
+        let Some(unprocessed) = response
+            .unprocessed_keys
+            .filter(|unprocessed| !unprocessed.is_empty())
+        else {
+            continue;
+        };
+
+        let Some(wait) = chunk_backoff.next_interval() else {
+            let remaining = unprocessed.values().map(|request| request.keys.len()).sum();
+            return Err(AwsError::UnprocessedKeys { remaining });
+        };
+
+        telemetry.resends.add(1);
+        tracing::trace!(keys = ?unprocessed, "Resending unprocessed BatchGetItem keys");
+
+        lore_base::lore_spawn!(
+            tasks,
+            send_chunk(
+                Some(wait),
+                send.clone(),
+                unprocessed,
+                chunk_backoff,
+                telemetry
+            )
+            .in_current_span()
+        );
+    }
+
+    Ok(output)
+}
+
+/// Sends one `BatchGetItem` request through `send` once `wait` is over, and hands back `backoff`
+/// for resending the request's unprocessed keys. The request's duration is recorded from the end
+/// of the wait.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn send_chunk<S, F>(
+    wait: Option<Duration>,
+    send: S,
+    request: HashMap<String, KeysAndAttributes>,
+    backoff: Retry,
+    telemetry: &BatchGetTelemetry<'_>,
+) -> impl Future<
+    Output = (
+        Result<BatchGetItemOutput, SdkError<BatchGetItemError>>,
+        Retry,
+    ),
+> + Send
++ 'static
+where
+    S: Fn(HashMap<String, KeysAndAttributes>) -> F + Send + 'static,
+    F: Future<Output = Result<BatchGetItemOutput, SdkError<BatchGetItemError>>> + Send + 'static,
+{
+    let latency = telemetry.latency.clone();
+    let labels = telemetry.labels.clone();
+    let observe_fn = observe_aws_operation_callback(telemetry.slow_operation_duration);
+    async move {
+        if let Some(wait) = wait {
+            tokio::time::sleep(wait).await;
+        }
+        let response = send(request).observe(latency, labels, observe_fn).await;
+        (response.output, backoff)
+    }
+}
+
 // We create an explicit mock, rather than relying on `automock` because we need to also mock a
 // `Clone` impl. The downside of this is that we must explicitly replicate any signatures from the
 // actual implementation into this block.
@@ -823,6 +938,7 @@ mock! {
             client: aws_sdk_dynamodb::Client,
             slow_operation_duration: Duration,
             metrics_attributes: Vec<KeyValue>,
+            unprocessed_keys_retry: RetryPolicy,
         ) -> Self;
 
         pub async fn table_exists(

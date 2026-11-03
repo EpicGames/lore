@@ -12,6 +12,7 @@ use aws_smithy_http_client::Connector;
 use aws_smithy_http_client::tls;
 use aws_smithy_http_client::tls::rustls_provider::CryptoMode;
 use aws_smithy_runtime_api::client::behavior_version::BehaviorVersion;
+use lore_revision::util::time::RetryPolicy;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use thiserror::Error;
@@ -21,6 +22,7 @@ use tracing::warn;
 
 use crate::aws_error::AwsError;
 use crate::dynamodb::DynamoDb;
+use crate::dynamodb::default_unprocessed_keys_retry;
 use crate::net_http_client::NetHttpClient;
 use crate::s3::S3;
 
@@ -190,6 +192,7 @@ impl AwsClientBuilder<WantsAwsConfig> {
             config: self.0.config.load().await,
             slow_operation_threshold: u64::MAX,
             metric_labels: vec![],
+            unprocessed_keys_retry: default_unprocessed_keys_retry(),
         })
     }
 }
@@ -198,11 +201,22 @@ pub struct WantsService {
     config: aws_config::SdkConfig,
     slow_operation_threshold: u64,
     metric_labels: Vec<KeyValue>,
+    unprocessed_keys_retry: RetryPolicy,
 }
 
 impl AwsClientBuilder<WantsService> {
     pub fn with_slow_operation_threshold(mut self, slow_operation_threshold_millis: u64) -> Self {
         self.0.slow_operation_threshold = slow_operation_threshold_millis;
+
+        self
+    }
+
+    /// Sets the backoff a `DynamoDB` client uses to resend each `BatchGetItem` chunk's unprocessed
+    /// keys, in place of [`default_unprocessed_keys_retry`]. Its limit counts resends.
+    pub fn maybe_unprocessed_keys_retry(mut self, retry: Option<RetryPolicy>) -> Self {
+        if let Some(retry) = retry {
+            self.0.unprocessed_keys_retry = retry;
+        }
 
         self
     }
@@ -222,6 +236,7 @@ impl AwsClientBuilder<WantsService> {
                 aws_sdk_dynamodb::Client::from_conf(ddb_config),
                 Duration::from_millis(self.0.slow_operation_threshold),
                 self.0.metric_labels,
+                self.0.unprocessed_keys_retry,
             ),
             tables: vec![],
         })

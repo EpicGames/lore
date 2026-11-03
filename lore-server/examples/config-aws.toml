@@ -50,6 +50,9 @@ dynamodb_fragment_state_table = "lore-fragment-state"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 2000
 dynamodb_timeout_millis = 15000
+# Backoff for resending the keys a batch read leaves unprocessed. max_attempts counts resends.
+# initial_backoff_ms, max_backoff_ms and max_attempts are required; jitter is optional.
+# dynamodb_unprocessed_keys_retry = { initial_backoff_ms = 50, max_backoff_ms = 1000, max_attempts = 6 }
 
 # Force write mode for debugging/profiling purposes, always overwrites data already present
 # force_write = false
@@ -68,3 +71,5 @@ dynamodb_table = "lore-locks"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 1000
+# As for the immutable store.
+# dynamodb_unprocessed_keys_retry = { initial_backoff_ms = 50, max_backoff_ms = 1000, max_attempts = 6 }

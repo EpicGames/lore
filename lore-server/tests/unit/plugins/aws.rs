@@ -1,11 +1,32 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
+use lore_revision::util::time::RetryPolicy;
+use lore_revision::util::time::RetrySettings;
 use lore_server::plugins::ImmutableStorePluginFactory;
 use lore_server::plugins::LockStorePluginFactory;
 use lore_server::plugins::MutableStorePluginFactory;
 use lore_server::plugins::PluginRegistry;
 use lore_server::plugins::aws::*;
 use tokio::runtime::Handle;
+
+const UNPROCESSED_KEYS_RETRY: &str = r#"
+    [dynamodb_unprocessed_keys_retry]
+    initial_backoff_ms = 20
+    max_backoff_ms = 30
+    max_attempts = 3
+    jitter = 0.0
+"#;
+
+/// The wait durations yielded by a retry built from `settings` until its limit is reached.
+fn waits(settings: &RetrySettings) -> Vec<Duration> {
+    let mut retry = RetryPolicy::from(settings).retry();
+    std::iter::from_fn(|| retry.next_interval()).collect()
+}
+
+/// The wait durations yielded by [`UNPROCESSED_KEYS_RETRY`], which has no jitter.
+const UNPROCESSED_KEYS_WAITS_MS: [u64; 3] = [20, 30, 30];
 
 #[test]
 fn test_immutable_store_factory_name() {
@@ -122,8 +143,9 @@ async fn test_config_deserialization_with_all_fields() {
             timeout_millis = 3000
             force_write = true
         "#;
+    let config_str = format!("{config_str}{UNPROCESSED_KEYS_RETRY}");
 
-    let config: toml::Value = toml::from_str(config_str).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
     let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
 
     assert_eq!(plugin_config.s3_bucket, "test-bucket");
@@ -146,6 +168,13 @@ async fn test_config_deserialization_with_all_fields() {
     assert_eq!(plugin_config.dynamodb_slow_operation_threshold_millis, 500);
     assert_eq!(plugin_config.timeout_millis, 3000);
     assert!(plugin_config.force_write);
+    let retry = plugin_config
+        .dynamodb_unprocessed_keys_retry
+        .expect("the unprocessed keys retry is configured");
+    assert_eq!(
+        waits(&retry),
+        UNPROCESSED_KEYS_WAITS_MS.map(Duration::from_millis)
+    );
 }
 
 /// A configuration written before this change points at the table holding fragment metadata,
@@ -214,6 +243,23 @@ async fn test_config_deserialization_with_defaults() {
     );
     assert_eq!(plugin_config.timeout_millis, 5000);
     assert!(!plugin_config.force_write);
+    assert!(plugin_config.dynamodb_unprocessed_keys_retry.is_none());
+}
+
+#[tokio::test]
+async fn test_lock_store_config_reads_the_unprocessed_keys_retry() {
+    let config_str = format!("dynamodb_table = \"locks\"\n{UNPROCESSED_KEYS_RETRY}");
+
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let plugin_config: AwsLockStorePluginConfig = config.try_into().unwrap();
+
+    let retry = plugin_config
+        .dynamodb_unprocessed_keys_retry
+        .expect("the unprocessed keys retry is configured");
+    assert_eq!(
+        waits(&retry),
+        UNPROCESSED_KEYS_WAITS_MS.map(Duration::from_millis)
+    );
 }
 
 #[tokio::test]

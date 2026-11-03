@@ -577,4 +577,197 @@ mod dynamo_tests {
         }
         Ok(())
     }
+
+    /// `BatchGetItem` against `DynamoDB` Local, on a table whose items together exceed the 16 MB
+    /// response limit, so the service itself leaves keys unprocessed.
+    mod batch_get_item_unprocessed_keys {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        use aws_sdk_dynamodb::types::AttributeDefinition;
+        use aws_sdk_dynamodb::types::AttributeValue;
+        use aws_sdk_dynamodb::types::BillingMode;
+        use aws_sdk_dynamodb::types::KeySchemaElement;
+        use aws_sdk_dynamodb::types::KeyType;
+        use aws_sdk_dynamodb::types::KeysAndAttributes;
+        use aws_sdk_dynamodb::types::ScalarAttributeType;
+        use lore_aws::aws_error::AwsError;
+        use lore_aws::dynamodb::DynamoDb;
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_revision::util::time::RetryPolicy;
+
+        use super::TestResult;
+        use crate::common::aws_common::dynamodb_client_with_unprocessed_keys_retry;
+        use crate::setup_execution;
+
+        const KEY_ATTRIBUTE: &str = "id";
+        const ITEMS: usize = 100;
+        const ITEM_BYTES: usize = 350_000;
+        const WAIT_MS: u64 = 300;
+
+        type Item = HashMap<String, AttributeValue>;
+
+        fn key(index: usize) -> Item {
+            HashMap::from([(
+                KEY_ATTRIBUTE.to_owned(),
+                AttributeValue::S(format!("k{index}")),
+            )])
+        }
+
+        fn keys() -> Vec<Item> {
+            (0..ITEMS).map(key).collect()
+        }
+
+        async fn client(resends: usize) -> Result<DynamoDb, Box<dyn std::error::Error>> {
+            let retry = RetryPolicy::builder()
+                .with_initial_backoff_millis(WAIT_MS)
+                .with_max_backoff_millis(WAIT_MS)
+                .with_limit(resends)
+                .build_with_jitter(0.0);
+            LORE_CONTEXT
+                .scope(setup_execution("test".to_string()), async move {
+                    dynamodb_client_with_unprocessed_keys_retry(
+                        "http://127.0.0.1:9090".to_string(),
+                        vec![],
+                        Some(retry),
+                    )
+                    .await
+                })
+                .await
+        }
+
+        /// Creates a table of [`ITEMS`] items of [`ITEM_BYTES`] each, too large to return in one
+        /// response.
+        async fn create_large_table(
+            dynamo: &DynamoDb,
+        ) -> Result<Arc<str>, Box<dyn std::error::Error>> {
+            let table = format!("unprocessed-keys-{}", uuid::Uuid::new_v4());
+            let client = dynamo.sdk_client();
+            client
+                .create_table()
+                .table_name(&table)
+                .billing_mode(BillingMode::PayPerRequest)
+                .attribute_definitions(
+                    AttributeDefinition::builder()
+                        .attribute_name(KEY_ATTRIBUTE)
+                        .attribute_type(ScalarAttributeType::S)
+                        .build()?,
+                )
+                .key_schema(
+                    KeySchemaElement::builder()
+                        .attribute_name(KEY_ATTRIBUTE)
+                        .key_type(KeyType::Hash)
+                        .build()?,
+                )
+                .send()
+                .await?;
+
+            let payload = "x".repeat(ITEM_BYTES);
+            for index in 0..ITEMS {
+                let mut item = key(index);
+                item.insert("payload".to_owned(), AttributeValue::S(payload.clone()));
+                client
+                    .put_item()
+                    .table_name(&table)
+                    .set_item(Some(item))
+                    .send()
+                    .await?;
+            }
+            Ok(table.into())
+        }
+
+        /// The resends needed to retrieve every item when each response's unprocessed keys are
+        /// resubmitted at once.
+        async fn resends_needed(
+            dynamo: &DynamoDb,
+            table: &str,
+        ) -> Result<usize, Box<dyn std::error::Error>> {
+            let mut request = HashMap::from([(
+                table.to_owned(),
+                KeysAndAttributes::builder()
+                    .set_keys(Some(keys()))
+                    .consistent_read(true)
+                    .build()?,
+            )]);
+            let mut resends = 0;
+            loop {
+                let response = dynamo
+                    .sdk_client()
+                    .batch_get_item()
+                    .set_request_items(Some(request))
+                    .send()
+                    .await?;
+                match response.unprocessed_keys {
+                    Some(unprocessed) if !unprocessed.is_empty() => {
+                        request = unprocessed;
+                        resends += 1;
+                    }
+                    _ => return Ok(resends),
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn returns_every_item_within_its_resends() -> TestResult {
+            let setup = client(0).await?;
+            let table = create_large_table(&setup).await?;
+            let resends = resends_needed(&setup, &table).await?;
+            assert!(
+                resends > 0,
+                "the service returned every item in one response"
+            );
+
+            let started = Instant::now();
+            let items = client(resends)
+                .await?
+                .batch_get_item(&table, keys(), true)
+                .await?;
+            let elapsed = started.elapsed();
+
+            assert_eq!(items.len(), ITEMS);
+            let waits = Duration::from_millis(WAIT_MS * resends as u64);
+            assert!(
+                elapsed >= waits,
+                "read took {elapsed:?}, under its {waits:?} of waits"
+            );
+            setup
+                .sdk_client()
+                .delete_table()
+                .table_name(&*table)
+                .send()
+                .await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn fails_when_keys_stay_unprocessed_after_its_resends() -> TestResult {
+            let setup = client(0).await?;
+            let table = create_large_table(&setup).await?;
+            let resends = resends_needed(&setup, &table).await?;
+            assert!(
+                resends > 0,
+                "the service returned every item in one response"
+            );
+
+            let error = client(resends - 1)
+                .await?
+                .batch_get_item(&table, keys(), true)
+                .await
+                .expect_err("a read one resend short never returns a partial result");
+
+            assert!(
+                matches!(error, AwsError::UnprocessedKeys { remaining } if remaining > 0),
+                "expected unprocessed keys, got {error:?}"
+            );
+            setup
+                .sdk_client()
+                .delete_table()
+                .table_name(&*table)
+                .send()
+                .await?;
+            Ok(())
+        }
+    }
 }

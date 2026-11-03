@@ -76,6 +76,7 @@ pub(crate) mod aws_common {
     use lore_aws::store::lock_store::*;
     use lore_aws::store::mutable_store::MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE;
     use lore_aws::store::mutable_store::MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE;
+    use lore_revision::util::time::RetryPolicy;
     use tracing::info;
     use tracing::warn;
 
@@ -514,6 +515,17 @@ pub(crate) mod aws_common {
         endpoint_url: String,
         tables: Vec<&str>,
     ) -> Result<DynamoDb, Box<dyn Error + 'static>> {
+        dynamodb_client_with_unprocessed_keys_retry(endpoint_url, tables, None).await
+    }
+
+    /// Connects to `DynamoDB` at `endpoint_url`, creating any of `tables` that is missing. The
+    /// client resends unprocessed `BatchGetItem` keys with `unprocessed_keys_retry`, or with the
+    /// client default when it is `None`.
+    pub(crate) async fn dynamodb_client_with_unprocessed_keys_retry(
+        endpoint_url: String,
+        tables: Vec<&str>,
+        unprocessed_keys_retry: Option<RetryPolicy>,
+    ) -> Result<DynamoDb, Box<dyn Error + 'static>> {
         let http_settings = HttpClientSettings::default();
 
         let creds = aws_sdk_dynamodb::config::Credentials::new(
@@ -531,6 +543,7 @@ pub(crate) mod aws_common {
             .endpoint(endpoint_url)
             .build_config()
             .await
+            .maybe_unprocessed_keys_retry(unprocessed_keys_retry)
             .dynamodb()
             .build()
             .await?;

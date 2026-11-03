@@ -17,6 +17,9 @@ pub enum AwsError<E> {
     BatchRequestError,
     #[error("Failed to join task")]
     JoinError,
+    /// A `BatchGetItem` chunk still has unprocessed keys after exhausting its resend limit.
+    #[error("a DynamoDB BatchGetItem chunk left {remaining} key(s) unprocessed after all resends")]
+    UnprocessedKeys { remaining: usize },
 }
 
 impl<E> AwsError<E> {

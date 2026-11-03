@@ -75,6 +75,8 @@ pub(crate) enum Fault {
     StateRead,
     StateReadTimeout,
     StateReadBroken,
+    /// Batch reads fail as if their keys were still unprocessed after the resend limit.
+    BatchReadUnprocessed,
     StateWrite,
     StateDelete,
     AssociationWrite,
@@ -450,6 +452,12 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     dynamodb
         .expect_batch_get_item()
         .returning(move |table, keys, _| {
+            if f.failing(Fault::BatchReadUnprocessed) {
+                return Err(AwsError::UnprocessedKeys {
+                    remaining: keys.len(),
+                });
+            }
+
             let storage = f.lock();
 
             // Routed by table, like the single-item read above. Reading the state table - and

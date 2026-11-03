@@ -477,12 +477,9 @@ const METRICS_SHARED_READS_METRIC_NAME: &str = "shared_reads";
 /// Lower bound on the obliteration drain, regardless of how the `DynamoDB` timeout is configured.
 const MIN_OBLITERATION_DRAIN_MILLIS: u64 = 100;
 
-/// Whether a `DynamoDB` failure means "ask again" rather than "here is your answer".
-///
-/// The SDK signals overload in several shapes — a client-side timeout, a dispatch failure before the
-/// request reached the service, an HTTP 429 or 5xx, or a service error whose code names throttling —
-/// and they all mean the same thing to a caller: no answer was obtained. Everything else is a real
-/// failure and is reported as one.
+/// Whether a `DynamoDB` failure indicates overload rather than another kind of failure. Overload
+/// means the store did not obtain a complete answer and the caller should ask again, however it
+/// was reported.
 ///
 /// Getting this wrong is not cosmetic. Reporting a failed read as not-found tells a caller the
 /// content is absent when we merely failed to look, and a not-found on a referenced hash is what
@@ -492,8 +489,12 @@ fn is_dynamodb_overloaded<E>(error: &AwsError<DynamoDbSdkError<E>>) -> bool
 where
     E: ProvideErrorMetadata,
 {
-    let AwsError::AwsSdkError(sdk_error) = error else {
-        return false;
+    let sdk_error = match error {
+        AwsError::AwsSdkError(sdk_error) => sdk_error,
+        // Keys still unprocessed after every resend mean the table couldn't serve the whole read,
+        // so the caller can ask again.
+        AwsError::UnprocessedKeys { .. } => return true,
+        _ => return false,
     };
 
     match &**sdk_error {
@@ -3546,6 +3547,25 @@ mod test {
             .expect_err("throttling is not an answer");
 
         assert!(error.is_slow_down(), "throttling must be retryable");
+    }
+
+    #[tokio::test]
+    async fn a_batch_read_left_unprocessed_asks_the_caller_to_retry() {
+        let fake = Fake::default();
+        fake.fail(Fault::BatchReadUnprocessed);
+        let addresses = [Address {
+            hash: random(),
+            context: random(),
+        }];
+        let mut results = [StoreMatchResult::default()];
+
+        let error = store(&fake)
+            .await
+            .query(random(), &addresses, &mut results)
+            .await
+            .expect_err("keys left unprocessed are not an answer");
+
+        assert!(error.is_slow_down(), "unprocessed keys must be retryable");
     }
 
     /// A failed read must never read as a miss. A caller told "not found" for a hash it references
