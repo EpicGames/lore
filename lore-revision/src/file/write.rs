@@ -300,15 +300,12 @@ pub(crate) async fn write_file(
                     .internal("Failed to write file")?,
             };
 
-            let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-            if node_executable != util::fs::file_is_executable(&metadata) {
-                util::fs::metadata_set_executable(
-                    destination.as_path(),
-                    Some(&metadata),
-                    node_executable,
-                )
-                .await;
-            }
+            util::fs::metadata_set_executable(
+                destination.as_path(),
+                Some(&metadata),
+                node.mode & NodeFileMode::Executable == NodeFileMode::Executable,
+            )
+            .await;
         }
     }
 

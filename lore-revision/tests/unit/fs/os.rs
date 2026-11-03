@@ -9,10 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::types::Address;
-use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
-use lore_base::types::FragmentReference;
 use lore_revision::fs::filesystem_provider::FileInfo;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
@@ -22,11 +19,11 @@ use lore_revision::node::Node;
 use lore_revision::node::NodeFileMode;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
-use lore_storage::hash;
-use zerocopy::IntoBytes;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::store_fragment;
+use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;
 
 fn temp_dir() -> lore_base::test_util::TempDir {
@@ -590,31 +587,6 @@ async fn rename_refuses_a_destination_of_another_kind() {
     );
 }
 
-/// Stores `payload` as one fragment with `flags`, standing for `size_content` bytes of
-/// content, and answers its address.
-async fn store_fragment(
-    repository: &Arc<RepositoryContext>,
-    payload: Vec<u8>,
-    flags: FragmentFlags,
-    size_content: u64,
-) -> Address {
-    let address = Address::zero_context_hash(hash::hash_slice(&payload));
-    lore_revision::immutable::store_raw_store_retry(
-        repository.immutable_store(),
-        repository.id,
-        address,
-        Fragment {
-            flags: flags.bits(),
-            size_payload: payload.len() as u32,
-            size_content,
-        },
-        Some(bytes::Bytes::from(payload)),
-    )
-    .await
-    .expect("store the fragment");
-    address
-}
-
 /// The content each fragment of a list [`stored_node`] stores holds, in bytes.
 const LEAF_LEN: usize = 16 * 1024;
 
@@ -629,37 +601,18 @@ async fn stored_node(
     listed: bool,
     executable: bool,
 ) -> Node {
-    let mut node = file_node(content);
-    node.address = if listed {
-        let mut list = Vec::new();
-        for (index, leaf) in content.chunks(LEAF_LEN).enumerate() {
-            let leaf_address = store_fragment(
-                repository,
-                leaf.to_vec(),
-                FragmentFlags::empty(),
-                leaf.len() as u64,
-            )
-            .await;
-            list.push(FragmentReference {
-                hash: leaf_address.hash,
-                offset_content: (index * LEAF_LEN) as u64,
-            });
-        }
-        store_fragment(
-            repository,
-            list.as_slice().as_bytes().to_vec(),
-            FragmentFlags::PayloadFragmented,
-            content.len() as u64,
-        )
-        .await
+    let mut node = if listed {
+        stored_as_list(repository, content, LEAF_LEN).await
     } else {
-        store_fragment(
+        let mut node = file_node(content);
+        node.address = store_fragment(
             repository,
-            content.to_vec(),
+            content,
             FragmentFlags::empty(),
             content.len() as u64,
         )
-        .await
+        .await;
+        node
     };
     if executable {
         node.mode = NodeFileMode::Executable.bits();

@@ -495,13 +495,14 @@ async fn an_unlink_leaves_a_directory_holding_entries_as_it_stands() {
     assert_eq!(mode & 0o777, 0o755, "the directory keeps its mode");
 }
 
-/// A file whose mode already carries the bit asked for is left as it is, whether its mode is
-/// read from the file or given. Setting a mode moves the file's change time even when the mode
-/// stays the same, so a matching mode must leave the time where it was. Asking for the other
-/// bit then moves it, which shows the clock had advanced far enough for a change to be seen.
+/// A file whose user bit already carries the executable bit asked for is left as it is, group
+/// and other bits included, whether its mode is read from the file or given. Setting a mode moves
+/// the file's change time even when the mode stays the same, so a matching bit must leave the
+/// time where it was. Clearing the bit then clears it for user, group and others and moves the
+/// time, which shows the clock had advanced far enough for a change to be seen.
 #[cfg(unix)]
 #[tokio::test]
-async fn a_mode_that_already_matches_is_left_as_it_is() {
+async fn a_file_whose_user_bit_already_matches_is_left_as_it_is() {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
@@ -510,29 +511,59 @@ async fn a_mode_that_already_matches_is_left_as_it_is() {
             crate::fs::filesystem_provider::setup_test_execution(),
             async {
                 let temp = temp_dir();
-                let path = temp.path().join("plain");
-                std::fs::write(&path, b"plain").expect("write the file");
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                let path = temp.path().join("tool");
+                std::fs::write(&path, b"tool").expect("write the file");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o744))
                     .expect("set the file's mode");
                 let before = std::fs::metadata(&path).expect("stat the file");
                 wait_for_change_time_past(temp.path(), &before);
 
-                metadata_set_executable(&path, None, false).await;
-                metadata_set_executable(&path, Some(&before), false).await;
+                set_executable(&path, None, true)
+                    .await
+                    .expect("set the bit");
+                set_executable(&path, Some(&before), true)
+                    .await
+                    .expect("set the bit");
                 let kept = std::fs::metadata(&path).expect("stat the file");
+                assert_eq!(kept.mode() & 0o777, 0o744, "the group and other bits stay");
                 assert_eq!(
                     (before.ctime(), before.ctime_nsec()),
                     (kept.ctime(), kept.ctime_nsec()),
-                    "a matching mode leaves the file untouched"
+                    "a matching user bit leaves the file untouched"
                 );
 
-                metadata_set_executable(&path, Some(&before), true).await;
+                set_executable(&path, Some(&before), false)
+                    .await
+                    .expect("clear the bit");
                 let changed = std::fs::metadata(&path).expect("stat the file");
-                assert_eq!(changed.mode() & 0o777, 0o755, "the bit is set for everyone");
+                assert_eq!(
+                    changed.mode() & 0o777,
+                    0o644,
+                    "the bit is cleared for everyone"
+                );
                 assert_ne!(
                     (before.ctime(), before.ctime_nsec()),
                     (changed.ctime(), changed.ctime_nsec()),
-                    "a mode that differs is set"
+                    "a differing user bit is set"
+                );
+            },
+        )
+        .await;
+}
+
+/// Setting the executable bit of a path that holds nothing fails rather than passing unnoticed.
+#[cfg(unix)]
+#[tokio::test]
+async fn setting_the_executable_bit_of_a_missing_file_fails() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                assert!(
+                    set_executable(temp.path().join("absent"), None, true)
+                        .await
+                        .is_err()
                 );
             },
         )

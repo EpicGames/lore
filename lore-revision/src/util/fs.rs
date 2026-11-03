@@ -23,7 +23,6 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::lore_debug;
 use crate::lore_trace;
-#[cfg(not(target_family = "windows"))]
 use crate::lore_warn;
 use crate::node::NodeFileMode;
 use crate::repository::DOT_LORE;
@@ -36,68 +35,73 @@ const FILE_MODE_USER_EXEC: u32 = 0o100;
 #[cfg(not(target_family = "windows"))]
 const FILE_MODE_ALL_EXEC: u32 = 0o111;
 
-/// Does nothing: Windows has no executable bit.
-#[cfg(target_family = "windows")]
-pub async fn metadata_set_executable(
-    _path: impl AsRef<Path>,
-    _metadata: Option<&Metadata>,
-    _executable: bool,
-) {
-}
-
-/// Gives the file at `path` the executable bit `executable` asks for, for user, group and
-/// others, starting from the mode in `metadata`, or from a stat of `path` where `metadata` is
-/// `None`. A file whose mode already matches is left as it is, and a stat or a change of mode
-/// that fails is logged as a warning.
-#[cfg(not(target_family = "windows"))]
+/// As [`set_executable`], logging a failure as a warning rather than returning it.
 pub async fn metadata_set_executable(
     path: impl AsRef<Path>,
     metadata: Option<&Metadata>,
     executable: bool,
 ) {
     let path = path.as_ref();
+    if let Err(err) = set_executable(path, metadata, executable).await {
+        lore_warn!(
+            "Failed to set the executable bit of {}: {err}",
+            path.display()
+        );
+    }
+}
+
+/// Does nothing: Windows has no executable bit.
+#[cfg(target_family = "windows")]
+pub async fn set_executable(
+    _path: impl AsRef<Path>,
+    _metadata: Option<&Metadata>,
+    _executable: bool,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Gives the file at `path` the executable bit `executable` asks for, for user, group and
+/// others, where the user's bit differs from it: the bit a revision stores, read as
+/// [`file_is_executable`] reads it. The mode comes from `metadata`, or from a stat of `path`
+/// where `metadata` is `None`.
+#[cfg(not(target_family = "windows"))]
+pub async fn set_executable(
+    path: impl AsRef<Path>,
+    metadata: Option<&Metadata>,
+    executable: bool,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
     let permissions = match metadata {
         Some(metadata) => executable_permissions(metadata, executable),
-        None => match lore_io::IoDriver::global().metadata(path).await {
-            Ok(metadata) => executable_permissions(&metadata, executable),
-            Err(err) => {
-                lore_warn!("Failed to read the mode of {}: {err}", path.display());
-                return;
-            }
-        },
+        None => executable_permissions(
+            &lore_io::IoDriver::global().metadata(path).await?,
+            executable,
+        ),
     };
-    let Some(permissions) = permissions else {
-        return;
-    };
-
-    let mode = permissions.mode();
-    let _ = lore_io::IoDriver::global()
-        .set_permissions(path, permissions)
-        .await
-        .map_err(|err| {
-            lore_warn!(
-                "Failed to set executable mode {} for {}: {err}",
-                mode,
-                path.to_path_buf().display()
-            );
-        });
+    match permissions {
+        Some(permissions) => {
+            lore_io::IoDriver::global()
+                .set_permissions(path, permissions)
+                .await
+        }
+        None => Ok(()),
+    }
 }
 
 /// The permissions that give a file with `metadata` the executable bit `executable` asks for,
-/// for user, group and others, or `None` where its mode already matches.
+/// for user, group and others, or `None` where the user's bit already matches.
 #[cfg(not(target_family = "windows"))]
 fn executable_permissions(metadata: &Metadata, executable: bool) -> Option<std::fs::Permissions> {
-    let mut permissions = metadata.permissions();
-    let current = permissions.mode();
-    let mode = if executable {
-        current | FILE_MODE_ALL_EXEC
-    } else {
-        current & !FILE_MODE_ALL_EXEC
-    };
-    if mode == current {
+    if file_is_executable(metadata) == executable {
         return None;
     }
-    permissions.set_mode(mode);
+    let mut permissions = metadata.permissions();
+    let mode = permissions.mode();
+    permissions.set_mode(if executable {
+        mode | FILE_MODE_ALL_EXEC
+    } else {
+        mode & !FILE_MODE_ALL_EXEC
+    });
     Some(permissions)
 }
 

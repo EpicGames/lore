@@ -1484,10 +1484,9 @@ pub async fn realize_scratch_file(
     }
 
     lore_trace!(
-        "Realized file {} {} bytes (target file {:?} bytes) {}",
+        "Realized file {} {} bytes {}",
         path.display(),
         node.size,
-        written.as_ref().map(std::fs::Metadata::len),
         node.address.hash
     );
 

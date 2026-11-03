@@ -215,32 +215,7 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
-        let path = self.absolute(path);
-        #[cfg(unix)]
-        {
-            let absolute_path = &path;
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await?;
-            let mut permissions = metadata.permissions();
-            let mode = permissions.mode();
-            if executable {
-                permissions.set_mode(mode | 0o111); // Add execute permission for user, group, others
-            } else {
-                permissions.set_mode(mode & !0o111); // Add execute permission for user, group, others
-            }
-            lore_io::IoDriver::global()
-                .set_permissions(&absolute_path, permissions)
-                .await?;
-        }
-
-        // No-op on Windows
-        #[cfg(not(unix))]
-        {
-            // Suppress unused variable warnings
-            let _ = path;
-            let _ = executable;
-        }
-
+        util::fs::set_executable(self.absolute(path), None, executable).await?;
         Ok(())
     }
 

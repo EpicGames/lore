@@ -26,6 +26,7 @@ use lore_storage::hash;
 use zerocopy::FromZeros;
 
 use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;
 use crate::repository::test_helpers::working_tree_repository_filtered;
 
@@ -529,44 +530,9 @@ async fn a_local_mode_is_not_reverted_over_the_incoming_content() {
     .await;
 }
 
-/// Store `content` under a fragment list cut at boundaries this build never cuts at,
-/// as a client of another version left it, and return the node addressing it.
-async fn stored_under_a_list(repository: &Arc<RepositoryContext>, content: &[u8]) -> Node {
-    use zerocopy::IntoBytes;
-
-    let mut list = Vec::new();
-    let mut offset = 0;
-    while offset < content.len() {
-        let end = (offset + 17 * 1024).min(content.len());
-        list.push(lore_base::types::FragmentReference {
-            hash: hash::hash_slice(&content[offset..end]),
-            offset_content: offset as u64,
-        });
-        offset = end;
-    }
-
-    let payload = bytes::Bytes::copy_from_slice(list.as_slice().as_bytes());
-    let address = lore_base::types::Address::zero_context_hash(hash::hash_slice(&payload));
-    lore_revision::immutable::store_raw_store_retry(
-        repository.immutable_store(),
-        repository.id,
-        address,
-        lore_base::types::Fragment {
-            flags: lore_base::types::FragmentFlags::PayloadFragmented.bits(),
-            size_payload: payload.len() as u32,
-            size_content: content.len() as u64,
-        },
-        Some(payload),
-    )
-    .await
-    .expect("store the fragment list");
-
-    let mut node = Node::new_zeroed();
-    node.flags = NodeFlags::File.bits();
-    node.address = address;
-    node.size = content.len() as u64;
-    node
-}
+/// A leaf length this build never cuts a fragment list at, as a client of another version left
+/// one.
+const FOREIGN_LEAF_LEN: usize = 17 * 1024;
 
 /// The reported shape: the current revision addresses the file as a fragment list some
 /// other version of the client cut, and the file is untouched. The list is what answers
@@ -581,7 +547,7 @@ async fn a_clean_file_addressed_as_a_list_is_overwritten() {
         let source_content = pseudo_random_bytes(150 * 1024, 1);
         write_working_file(&repository, &path, &content).await;
 
-        let listed = stored_under_a_list(&repository, &content).await;
+        let listed = stored_as_list(&repository, &content, FOREIGN_LEAF_LEN).await;
         assert_ne!(
             listed.address.hash,
             hash::hash_slice(&content),
