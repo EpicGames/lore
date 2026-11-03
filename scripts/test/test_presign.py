@@ -4,8 +4,10 @@ import hashlib
 import http.client
 import json
 import logging
+import random
 
 import pytest
+
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -82,3 +84,63 @@ def test_presign_vend_redeem_and_reject_head(
         redeem_response.status,
     )
     logger.info("local server log: %s", lore_local_server_config[0] / "server.log")
+
+
+@pytest.mark.smoke
+def test_presign_redeem_serves_a_byte_range(
+    new_lore_repo, request, lore_local_server_config, lore_main_server_ports
+):
+    repo: Lore = new_lore_repo("presign-range")
+    file_name = "presigned-range.bin"
+    contents = random.Random(1234).randbytes(4 * 1024 * 1024)
+
+    with repo.open_file(file_name, "wb+") as output_file:
+        output_file.write(contents)
+
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push(level="debug")
+
+    file_info = repo.file_info(file_name)[0]
+    status_output = repo.status()
+    repository_id = status_output.split("Repository ", 1)[1].splitlines()[0]
+    address = f"{file_info.hash}-{file_info.context}"
+    hostname = request.config.getoption("--lore-server-hostname")
+    port = lore_main_server_ports["http"]
+
+    connection = http.client.HTTPConnection(hostname, port)
+    connection.request(
+        "POST",
+        f"/v1/repository/{repository_id}/content/{address}/presign",
+        body=json.dumps({"ttl_seconds": 3600}),
+        headers={"content-type": "application/json"},
+    )
+    vend_response = connection.getresponse()
+    assert vend_response.status == 200
+    redemption_path = json.loads(vend_response.read())["url_suffix"]
+
+    start = 3 * 1024 * 1024 + 17
+    end = start + 65535
+    connection.request(
+        "GET", redemption_path, headers={"range": f"bytes={start}-{end}"}
+    )
+    range_response = connection.getresponse()
+    ranged_contents = range_response.read()
+    connection.close()
+
+    assert range_response.status == 206
+    assert (
+        range_response.getheader("content-range")
+        == f"bytes {start}-{end}/{len(contents)}"
+    )
+    assert range_response.getheader("accept-ranges") == "bytes"
+    assert ranged_contents == contents[start : end + 1]
+
+    logger.info(
+        "presign range: repository=%s address=%s range=%d-%d of %d bytes",
+        repository_id,
+        address,
+        start,
+        end,
+        len(contents),
+    )

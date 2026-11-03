@@ -4,6 +4,7 @@
 mod health_check;
 mod presign_token;
 mod presigned;
+mod range;
 mod repositories;
 mod security_headers;
 mod server;

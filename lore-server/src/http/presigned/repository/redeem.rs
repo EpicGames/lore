@@ -34,6 +34,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::http::log_http_error;
 use crate::http::presign_token::PresignTokenError;
 use crate::http::presign_token::verify;
+use crate::http::range::RangeRequest;
+use crate::http::range::advertise_ranges;
+use crate::http::range::content_range;
+use crate::http::range::range_request;
+use crate::http::range::set_content_range;
+use crate::http::range::unsatisfied_range;
 use crate::http::security_headers::apply_security_headers;
 use crate::http::server::ServerState;
 use crate::util::setup_execution;
@@ -154,14 +160,53 @@ pub async fn handler(
 
             let options = read_options_from_repository(&repository);
 
+            let (fragment, _) = immutable::load_raw(
+                repository.clone(),
+                parsed_address,
+                options.with_decompress(),
+            )
+            .await
+            .map_err(RedeemError::ReadStream)?;
+            let total = fragment.size_content;
+            let requested = range_request(&headers, total);
+
+            let mut response_headers = HeaderMap::new();
+            advertise_ranges(&mut response_headers);
+            apply_security_headers(&mut response_headers);
+            let range = match requested {
+                RangeRequest::Unsatisfiable => {
+                    set_content_range(
+                        &mut response_headers,
+                        unsatisfied_range(total).map_err(RedeemError::HeaderGeneration)?,
+                    );
+                    return Ok((
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        response_headers,
+                        Body::empty(),
+                    ));
+                }
+                RangeRequest::Partial(range) => Some(range),
+                RangeRequest::Full => None,
+            };
+            let status = match &range {
+                Some(range) => {
+                    set_content_range(
+                        &mut response_headers,
+                        content_range(range, total).map_err(RedeemError::HeaderGeneration)?,
+                    );
+                    StatusCode::PARTIAL_CONTENT
+                }
+                None => StatusCode::OK,
+            };
+            let read_range = range.map(|r| r.start as usize..r.end as usize);
+
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
             let content_length =
-                immutable::read_stream(repository, parsed_address, None, options, tx)
+                immutable::read_stream(repository, parsed_address, read_range, options, tx)
                     .await
                     .map_err(RedeemError::ReadStream)?;
 
-            let mut response_headers = HeaderMap::new();
             response_headers.insert(CONTENT_TYPE, content_type);
             if let Some(ce) = content_encoding {
                 response_headers.insert(
@@ -189,10 +234,8 @@ pub async fn handler(
                     .map_err(RedeemError::HeaderGeneration)?,
             );
 
-            apply_security_headers(&mut response_headers);
-
             let stream = ReceiverStream::new(rx);
-            Ok((StatusCode::OK, response_headers, Body::from_stream(stream)))
+            Ok((status, response_headers, Body::from_stream(stream)))
         })
         .await
 }

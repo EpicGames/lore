@@ -6,12 +6,20 @@ use std::time::UNIX_EPOCH;
 
 use axum::http::Method;
 use axum::http::StatusCode;
+use axum::http::header::ACCEPT_RANGES;
 use axum::http::header::ALLOW;
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::CONTENT_RANGE;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::RANGE;
 use axum_test::TestServer;
+use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Context;
 use lore_revision::fragment;
+use lore_revision::immutable;
 use lore_revision::lore::RepositoryId;
+use lore_revision::repository::RepositoryContext;
 use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::presign_token::CURRENT_TOKEN_VERSION;
@@ -23,6 +31,7 @@ use lore_server::http::server::PresignConfig;
 use lore_server::http::server::ServerHealth;
 use lore_server::http::server::ServerState;
 use lore_server::http::server::create_router;
+use lore_storage::WriteOptions;
 use rand::random;
 
 use crate::http::test_utils::content_type_policy;
@@ -421,4 +430,319 @@ async fn redeem_sets_security_headers() {
         response.headers().get("content-security-policy").unwrap(),
         "default-src 'none'; sandbox"
     );
+}
+
+/// Size of the content the range tests store. With 4 KiB chunks it is spread
+/// over many fragments, so a range crosses fragment boundaries.
+const RANGED_CONTENT_SIZE: usize = 1024 * 1024;
+
+/// Writes `RANGED_CONTENT_SIZE` random bytes as fragmented content, then
+/// redeems it with `range` as the request's `Range` header.
+async fn redeem_range(range: Option<&str>) -> (axum_test::TestResponse, Bytes) {
+    let ranges: Vec<&str> = range.into_iter().collect();
+    redeem_ranges_with(&ranges, valid_token).await
+}
+
+/// Like `redeem_range`, with every value in `ranges` sent as its own `Range`
+/// header and the token from `token(repository, address, config)`.
+async fn redeem_ranges_with(
+    ranges: &[&str],
+    token: fn(&str, &str, &PresignConfig) -> String,
+) -> (axum_test::TestResponse, Bytes) {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let ranges: Vec<String> = ranges.iter().map(|range| range.to_string()).collect();
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository_id = random::<RepositoryId>();
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let payload: Vec<u8> = (0..RANGED_CONTENT_SIZE).map(|_| random::<u8>()).collect();
+            let payload = Bytes::from(payload);
+            let address = immutable::write(
+                repository,
+                random::<Context>(),
+                payload.clone(),
+                WriteOptions::default().with_fixed_size_chunk(4096),
+            )
+            .await
+            .expect("Failed to write content");
+
+            let config = presign_config();
+            let repo_hex = format!("{repository_id}");
+            let address_str = format!("{address}");
+            let token = token(&repo_hex, &address_str, &config);
+            let server = build_test_server(immutable_store, mutable_store, config);
+
+            let mut request = server
+                .get(&format!("/v1/presigned/{repo_hex}/{address_str}"))
+                .add_query_param("token", token);
+            for range in ranges {
+                request = request.add_header(RANGE, range);
+            }
+            (request.await, payload)
+        })
+        .await
+}
+
+#[tokio::test]
+async fn redeem_serves_a_range_spanning_fragments_as_partial_content() {
+    let (response, payload) = redeem_range(Some("bytes=10000-209999")).await;
+
+    assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get(CONTENT_RANGE).unwrap(),
+        &format!("bytes 10000-209999/{RANGED_CONTENT_SIZE}")
+    );
+    assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "200000");
+    assert_eq!(response.as_bytes(), &payload[10000..210000]);
+}
+
+#[tokio::test]
+async fn redeem_serves_the_last_bytes_of_the_content() {
+    let (response, payload) = redeem_range(Some("bytes=-5000")).await;
+
+    assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get(CONTENT_RANGE).unwrap(),
+        &format!(
+            "bytes {}-{}/{RANGED_CONTENT_SIZE}",
+            RANGED_CONTENT_SIZE - 5000,
+            RANGED_CONTENT_SIZE - 1
+        )
+    );
+    assert_eq!(response.as_bytes(), &payload[RANGED_CONTENT_SIZE - 5000..]);
+}
+
+#[tokio::test]
+async fn redeem_serves_an_open_range_to_the_end() {
+    let (response, payload) = redeem_range(Some("bytes=1000000-")).await;
+
+    assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.as_bytes(), &payload[1_000_000..]);
+}
+
+#[tokio::test]
+async fn redeem_returns_416_for_a_range_past_the_end() {
+    let (response, _) = redeem_range(Some(&format!("bytes={RANGED_CONTENT_SIZE}-"))).await;
+
+    assert_eq!(response.status_code(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        response.headers().get(CONTENT_RANGE).unwrap(),
+        &format!("bytes */{RANGED_CONTENT_SIZE}")
+    );
+}
+
+#[tokio::test]
+async fn redeem_serves_the_whole_content_for_several_ranges() {
+    let (response, payload) = redeem_range(Some("bytes=0-9,100-109")).await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert!(response.headers().get(CONTENT_RANGE).is_none());
+    assert_eq!(response.as_bytes(), &payload[..]);
+}
+
+#[tokio::test]
+async fn redeem_advertises_byte_ranges() {
+    let (response, payload) = redeem_range(None).await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+    assert_eq!(response.as_bytes(), &payload[..]);
+}
+
+#[tokio::test]
+async fn redeem_keeps_the_protections_on_a_partial_response() {
+    let (response, _) = redeem_range(Some("bytes=0-99")).await;
+
+    assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert!(
+        response
+            .headers()
+            .get("cache-control")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("public, immutable, max-age=")
+    );
+}
+
+fn expired_token(repository_id: &str, address: &str, config: &PresignConfig) -> String {
+    let payload = PresignTokenPayload {
+        version: CURRENT_TOKEN_VERSION,
+        key_id: config.key_id.clone(),
+        repository: repository_id.to_string(),
+        address: address.to_string(),
+        expires_at: 1,
+        content_type: None,
+        content_encoding: None,
+        content_disposition: None,
+    };
+    sign(&payload, &config.hmac_key)
+}
+
+/// An address the range tests never store.
+const MISSING_ADDRESS: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
+
+#[tokio::test]
+async fn redeem_checks_the_token_before_the_range() {
+    let tokens: [fn(&str, &str, &PresignConfig) -> String; 4] = [
+        expired_token,
+        |repository, _, config| valid_token(repository, MISSING_ADDRESS, config),
+        |repository, address, config| {
+            let token = valid_token(repository, address, config);
+            let middle = token.len() / 2;
+            let flipped = if &token[middle..=middle] == "A" {
+                "B"
+            } else {
+                "A"
+            };
+            format!("{}{flipped}{}", &token[..middle], &token[middle + 1..])
+        },
+        |_, _, _| String::new(),
+    ];
+    for token in tokens {
+        for range in ["bytes=0-9", "bytes=99999999-"] {
+            let (response, _) = redeem_ranges_with(&[range], token).await;
+
+            assert_eq!(response.status_code(), StatusCode::UNAUTHORIZED, "{range}");
+            assert!(response.headers().get(CONTENT_RANGE).is_none(), "{range}");
+            assert!(response.headers().get(ACCEPT_RANGES).is_none(), "{range}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn redeem_returns_404_not_416_for_a_missing_address() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<RepositoryId>();
+            let config = presign_config();
+            let repo_hex = format!("{repository}");
+            let token = valid_token(&repo_hex, MISSING_ADDRESS, &config);
+            let server = build_test_server(immutable_store, mutable_store, config);
+
+            let response = server
+                .get(&format!("/v1/presigned/{repo_hex}/{MISSING_ADDRESS}"))
+                .add_query_param("token", token)
+                .add_header(RANGE, "bytes=99999999-")
+                .await;
+
+            assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+            assert!(response.headers().get(CONTENT_RANGE).is_none());
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn redeem_serves_the_first_and_the_last_byte() {
+    let last = RANGED_CONTENT_SIZE - 1;
+    for (range, start) in [
+        ("bytes=0-0".to_string(), 0),
+        (format!("bytes={last}-{last}"), last),
+    ] {
+        let (response, payload) = redeem_range(Some(&range)).await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::PARTIAL_CONTENT,
+            "{range}"
+        );
+        assert_eq!(
+            response.headers().get(CONTENT_LENGTH).unwrap(),
+            "1",
+            "{range}"
+        );
+        assert_eq!(response.as_bytes(), &payload[start..=start], "{range}");
+    }
+}
+
+#[tokio::test]
+async fn redeem_trims_an_end_at_the_limit_of_u64() {
+    let (response, payload) = redeem_range(Some("bytes=0-18446744073709551615")).await;
+
+    assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get(CONTENT_RANGE).unwrap(),
+        &format!("bytes 0-{}/{RANGED_CONTENT_SIZE}", RANGED_CONTENT_SIZE - 1)
+    );
+    assert_eq!(response.as_bytes(), &payload[..]);
+}
+
+#[tokio::test]
+async fn redeem_returns_416_for_a_start_at_the_limit_of_u64() {
+    let (response, _) = redeem_range(Some("bytes=18446744073709551615-")).await;
+
+    assert_eq!(response.status_code(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert!(response.as_bytes().is_empty());
+}
+
+#[tokio::test]
+async fn redeem_serves_the_whole_content_for_a_malformed_range() {
+    let flood = format!("bytes={}", vec!["0-0"; 10_000].join(","));
+    for range in [
+        "bytes=-5-10",
+        "bytes=+0-9",
+        "bytes=99999999999999999999-",
+        flood.as_str(),
+    ] {
+        let (response, payload) = redeem_range(Some(range)).await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert!(response.headers().get(CONTENT_RANGE).is_none());
+        assert_eq!(response.as_bytes(), &payload[..]);
+    }
+}
+
+#[tokio::test]
+async fn redeem_serves_the_whole_content_for_several_range_headers() {
+    let (response, payload) = redeem_ranges_with(&["bytes=0-9", "bytes=10-19"], valid_token).await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert!(response.headers().get(CONTENT_RANGE).is_none());
+    assert_eq!(response.as_bytes(), &payload[..]);
+}
+
+#[tokio::test]
+async fn redeem_coerces_a_disallowed_content_type_on_a_partial_response() {
+    let (response, _) = redeem_ranges_with(&["bytes=0-99"], |repository, address, config| {
+        token_with_content_type(repository, address, config, Some("text/html"))
+    })
+    .await;
+
+    assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+    assert_eq!(
+        response.headers().get("content-security-policy").unwrap(),
+        "default-src 'none'; sandbox"
+    );
+}
+
+#[tokio::test]
+async fn head_with_a_range_is_rejected() {
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let server = build_test_server(immutable_store, mutable_store, presign_config());
+
+    let response = server
+        .method(
+            Method::HEAD,
+            "/v1/presigned/not-a-repository/not-an-address",
+        )
+        .add_header(RANGE, "bytes=0-9")
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::METHOD_NOT_ALLOWED);
 }
