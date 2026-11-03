@@ -23,6 +23,8 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_revision::change::sort_by_path;
+    use lore_revision::diff::diff_revision_paths;
+    use lore_revision::diff::diff_revision_paths_filtered;
     use lore_revision::filter::FilterMode;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreEvent;
@@ -31,6 +33,7 @@ mod tests {
     use lore_revision::relay::EventDispatcher;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::state;
+    use lore_revision::util::collect_stream::collect_stream_with_summary;
     use lore_revision::util::path::RelativePath;
 
     include!("helper.rs");
@@ -298,6 +301,40 @@ mod tests {
             )
             .await
             .expect("Failed to diff the two revisions");
+            test_reported(&changes)
+        }
+
+        /// What the whole-tree revision diff over `repository` reports between the two revisions
+        /// through `filter`, coalesced and sorted.
+        async fn revision_changes(
+            &self,
+            repository: Arc<RepositoryContext>,
+            filter: FilterMode,
+        ) -> Vec<(String, String)> {
+            let older = self.older.clone();
+            let newer = self.newer.clone();
+            let (_, mut changes) = collect_stream_with_summary(|tx| {
+                diff_revision_paths_filtered(repository, older, newer, None, filter, tx)
+            })
+            .await
+            .expect("Failed to diff the two revisions");
+            sort_by_path(&mut changes);
+            test_reported(&changes)
+        }
+
+        /// What [`diff_revision_paths`] itself reports over `repository`.
+        async fn default_revision_changes(
+            &self,
+            repository: Arc<RepositoryContext>,
+        ) -> Vec<(String, String)> {
+            let older = self.older.clone();
+            let newer = self.newer.clone();
+            let (_, mut changes) = collect_stream_with_summary(|tx| {
+                diff_revision_paths(repository, older, newer, None, tx)
+            })
+            .await
+            .expect("Failed to diff the two revisions");
+            sort_by_path(&mut changes);
             test_reported(&changes)
         }
 
@@ -1015,6 +1052,96 @@ mod tests {
 
                 assert!(changes.is_empty(), "an excluded root reports nothing");
                 assert_eq!(announced, 1, "one answer is one exclusion");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A revision diff through the view leaves out the file the view excludes, and so does the
+    /// unfiltered entry point every existing caller uses.
+    #[tokio::test]
+    async fn a_revision_diff_through_the_view_leaves_out_an_excluded_change() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let repository = fixture.view(&[EXCLUDE_FILE]);
+
+                let changes = fixture
+                    .revision_changes(repository.clone(), FilterMode::View)
+                    .await;
+                assert!(
+                    !changes.iter().any(|(_, path)| path == FILE),
+                    "the view excludes {FILE}, so a diff through it must not report it: {changes:?}"
+                );
+                assert_eq!(
+                    fixture.default_revision_changes(repository).await,
+                    changes,
+                    "the entry point without a filter argument must keep diffing through the view"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Without a filter the revision diff reports what the revision changed whatever the local
+    /// view excludes: the same changes as over a repository whose view excludes nothing.
+    #[tokio::test]
+    async fn a_revision_diff_without_a_filter_reports_an_excluded_change() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+
+                let changes = fixture
+                    .revision_changes(fixture.view(&[EXCLUDE_FILE]), FilterMode::empty())
+                    .await;
+                assert!(
+                    changes.contains(&("M".to_string(), FILE.to_string())),
+                    "the revision rewrote {FILE}, which an unfiltered diff must report: {changes:?}"
+                );
+                assert_eq!(
+                    changes,
+                    fixture
+                        .revision_changes(fixture.view(&[]), FilterMode::View)
+                        .await,
+                    "an excluding view must change nothing about an unfiltered diff"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Without a filter a whole excluded directory is walked too, and its changed file reported.
+    #[tokio::test]
+    async fn a_revision_diff_without_a_filter_walks_an_excluded_directory() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let fixture = Fixture::create(immutable_store, mutable_store).await;
+                let repository = fixture.view(&[EXCLUDE_SUBDIRECTORY]);
+
+                let filtered = fixture
+                    .revision_changes(repository.clone(), FilterMode::View)
+                    .await;
+                assert!(
+                    !filtered.iter().any(|(_, path)| path.starts_with(SUBDIRECTORY)),
+                    "the view excludes {SUBDIRECTORY}, so a diff through it reports nothing under it: {filtered:?}"
+                );
+
+                let unfiltered = fixture
+                    .revision_changes(repository, FilterMode::empty())
+                    .await;
+                assert!(
+                    unfiltered.contains(&("M".to_string(), FILE.to_string())),
+                    "an unfiltered diff must report {FILE} under the excluded directory: {unfiltered:?}"
+                );
             }))
             .await
             .expect("Test task failed");
