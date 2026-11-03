@@ -11,6 +11,7 @@ use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_error_set::prelude::*;
+use lore_storage::CopyOutcome;
 use lore_transport::BranchPushResponse;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
@@ -1594,31 +1595,31 @@ async fn mark_durable(repository: &Arc<RepositoryContext>, address: Address, fra
 ///
 /// The source names no context because the query did not say which one the peer matched under —
 /// only that the partition holds the hash — and that is exactly what a zero source context asks
-/// for. A refusal costs the round trip and leaves the payload to be uploaded as before.
+/// for. A refusal costs the round trip and leaves the payload to be uploaded.
+#[lore_macro::test_pub]
 async fn duplicate_association(
     repository: &Arc<RepositoryContext>,
-    storage: &Arc<StorageSession>,
+    storage: &StorageSession,
     address: Address,
     stats: &PushStats,
-) -> bool {
-    if !storage.can_copy_from(repository.id).await {
-        return false;
-    }
-    if let Err(err) = storage
-        .copy(
-            repository.id,
-            Address::zero_context_hash(address.hash),
-            address.context,
-        )
-        .await
+) -> Result<bool, PushError> {
+    match lore_storage::remote_copy_retry(
+        storage,
+        repository.id,
+        Address::zero_context_hash(address.hash),
+        address.context,
+    )
+    .await
     {
-        lore_debug!("Copy of {address} refused ({err:?}), uploading instead");
-        return false;
+        CopyOutcome::Copied => {}
+        CopyOutcome::Refused => return Ok(false),
+        // The peer is still asking for back-off, and an upload would send it the whole payload.
+        CopyOutcome::Throttled => return Err(PushError::from(SlowDown)),
     }
 
     stats.copied();
     mark_stored_durable(repository, address).await;
-    true
+    Ok(true)
 }
 
 /// Mark the local entry for `address` durable, looking up the fragment it needs to write back.
@@ -1709,7 +1710,7 @@ pub(crate) async fn push_fragments(
         let stats = stats.clone();
         let progress = progress.clone();
         lore_spawn!(tasks, async move {
-            if duplicable && duplicate_association(&repository, &storage, address, &stats).await {
+            if duplicable && duplicate_association(&repository, &storage, address, &stats).await? {
                 return Ok(());
             }
 

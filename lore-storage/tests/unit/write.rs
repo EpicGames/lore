@@ -2550,3 +2550,223 @@ async fn lent_content_over_one_fragment_is_stored_fragmented() {
     let (lent, shared) = lent_and_shared_entries(&content).await;
     assert_eq!(lent, shared);
 }
+
+/// A write with a durable association in the local store as its copy source. The peer answers copy
+/// requests with `SlowDown`, a refusal, or success.
+mod copy_association {
+    use lore_storage::write_stats::FragmentWriteCounts;
+    use lore_storage::write_stats::FragmentWriteStats;
+    use lore_transport::ProtocolError;
+    use lore_transport::test_util::CopyingPeer;
+
+    use super::*;
+
+    /// What the peer was asked for while the write under test ran, and how that write ended.
+    struct Written {
+        result: StoreResult,
+        copies: usize,
+        puts: usize,
+        counts: FragmentWriteCounts,
+        stored: StoreMatchResult,
+    }
+
+    /// Stores content durably under one context of `partition`, then writes the same content under
+    /// another context of `partition`. The second write uses the first association as its copy
+    /// source.
+    async fn write_beside_a_durable_association(
+        partition: Partition,
+        seed: u8,
+        slow_downs: usize,
+        refusal: Option<ProtocolError>,
+    ) -> Written {
+        let (_dir, store) = make_test_store().await;
+        let peer = CopyingPeer::new(slow_downs, refusal);
+        let session = Arc::new(peer.session(partition));
+        let (partition, held, fragment, buffer) = make_input_in(partition, seed);
+        store_fragment(
+            store.clone(),
+            partition,
+            held,
+            fragment,
+            buffer.clone(),
+            false,
+            Some(session.clone()),
+            WriteContext::none(),
+            None,
+        )
+        .await
+        .expect("store the association to copy from");
+        let wanted = Address {
+            hash: held.hash,
+            context: Context::from([seed.wrapping_add(1); 16]),
+        };
+        let copies_before = peer.copies();
+        let puts_before = peer.puts();
+        let stats = Arc::new(FragmentWriteStats::default());
+
+        let result = store_fragment(
+            store.clone(),
+            partition,
+            wanted,
+            fragment,
+            buffer,
+            false,
+            Some(session),
+            WriteContext::counted(Some(stats.clone())),
+            None,
+        )
+        .await
+        .expect("a throttled or refused copy does not fail the write");
+
+        let stored = query_one(&store, partition, wanted)
+            .await
+            .expect("query the written association");
+        Written {
+            result,
+            copies: peer.copies() - copies_before,
+            puts: peer.puts() - puts_before,
+            counts: stats.snapshot(),
+            stored,
+        }
+    }
+
+    /// A copy the peer throttles and then accepts registers the association without its payload.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_copy_that_is_accepted_uploads_nothing() {
+        let written =
+            write_beside_a_durable_association(Partition::from([0xC1; 16]), 0xC1, 2, None).await;
+
+        assert_eq!(written.copies, 3);
+        assert_eq!(written.puts, 0);
+        assert_eq!(written.counts.remote_copy_writes, 1);
+        assert!(written.result.stored_durable);
+        assert_eq!(written.stored.match_made, StoreMatch::MatchFull);
+        assert!(written.stored.stored_durable);
+    }
+
+    /// If the peer throttles a copy until retries run out, no payload is uploaded. The payload stays
+    /// local without being marked durable, as when an upload runs out of retries.
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_throttled_through_every_retry_keeps_the_payload_local() {
+        let written =
+            write_beside_a_durable_association(Partition::from([0xC3; 16]), 0xC3, usize::MAX, None)
+                .await;
+
+        assert_eq!(written.copies, lore_storage::store_retry().limit() + 1);
+        assert_eq!(written.puts, 0);
+        assert_eq!(written.counts.remote_copy_writes, 0);
+        assert_eq!(written.counts.remote_upload_failed, 1);
+        assert!(!written.result.stored_durable);
+        assert!(written.result.stored_local);
+        assert_eq!(written.stored.match_made, StoreMatch::MatchFull);
+        assert!(!written.stored.stored_durable);
+    }
+
+    /// A copy refused for a reason other than throttling is not retried, and the payload is uploaded.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_copy_falls_back_to_uploading() {
+        let written = write_beside_a_durable_association(
+            Partition::from([0xC5; 16]),
+            0xC5,
+            0,
+            Some(ProtocolError::from(lore_base::error::NotFound)),
+        )
+        .await;
+
+        assert_eq!(written.copies, 1);
+        assert_eq!(written.puts, 1);
+        assert_eq!(written.counts.remote_copy_writes, 0);
+        assert_eq!(written.counts.remote_put_writes, 1);
+        assert!(written.result.stored_durable);
+        assert!(written.stored.stored_durable);
+    }
+
+    /// A refusal that follows throttling still falls back to uploading the payload.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_copy_that_is_then_refused_falls_back_to_uploading() {
+        let written = write_beside_a_durable_association(
+            Partition::from([0xC7; 16]),
+            0xC7,
+            2,
+            Some(ProtocolError::from(lore_base::error::NotFound)),
+        )
+        .await;
+
+        assert_eq!(written.copies, 3);
+        assert_eq!(written.puts, 1);
+        assert_eq!(written.counts.remote_copy_writes, 0);
+        assert_eq!(written.counts.remote_put_writes, 1);
+        assert!(written.result.stored_durable);
+        assert!(written.stored.stored_durable);
+    }
+}
+
+/// A copy the session's peer is asked for directly. The peer answers copy requests with
+/// `SlowDown`, a refusal, or success.
+mod remote_copy_retry {
+    use lore_base::error::NotFound;
+    use lore_storage::CopyOutcome;
+    use lore_storage::remote_copy_retry;
+    use lore_transport::ProtocolError;
+    use lore_transport::test_util::CopyingPeer;
+
+    use super::*;
+
+    fn own() -> Partition {
+        Partition::from([0xE1; 16])
+    }
+
+    fn source() -> Address {
+        Address {
+            hash: Hash::from([0xE2; 32]),
+            context: Context::from([0xE3; 16]),
+        }
+    }
+
+    /// Copies from `partition` into a fresh context on a peer whose responses are set by
+    /// `slow_downs` and `refusal`. Returns the outcome and the copy requests the peer received.
+    async fn copy_from(
+        partition: Partition,
+        slow_downs: usize,
+        refusal: Option<ProtocolError>,
+    ) -> (CopyOutcome, usize) {
+        let peer = CopyingPeer::new(slow_downs, refusal);
+        let session = peer.session(own());
+        let outcome =
+            remote_copy_retry(&session, partition, source(), Context::from([0xE4; 16])).await;
+        (outcome, peer.copies())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_throttled_copy_is_retried_until_accepted() {
+        assert_eq!(copy_from(own(), 2, None).await, (CopyOutcome::Copied, 3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_throttled_through_every_retry_is_reported_throttled() {
+        assert_eq!(
+            copy_from(own(), usize::MAX, None).await,
+            (
+                CopyOutcome::Throttled,
+                lore_storage::store_retry().limit() + 1
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_not_retried() {
+        assert_eq!(
+            copy_from(own(), 0, Some(ProtocolError::from(NotFound))).await,
+            (CopyOutcome::Refused, 1)
+        );
+    }
+
+    /// A source partition the connection holds no claim to is refused without asking the peer.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_partition_without_a_claim_is_refused_unasked() {
+        assert_eq!(
+            copy_from(Partition::from([0xE5; 16]), 0, None).await,
+            (CopyOutcome::Refused, 0)
+        );
+    }
+}

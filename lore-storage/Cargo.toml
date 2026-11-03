@@ -62,6 +62,10 @@ required-features = ["store-stress"]
 # The shared test temp-directory helper.
 lore-base = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
+# A session over a stub peer, with no live connection behind it.
+lore-transport = { workspace = true, features = ["test-util"] }
+# A paused clock, so retry back-off takes no real time.
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_family = "windows")'.dependencies]
 # `Win32_Storage_FileSystem` does not imply `Win32_Foundation`, and the packstore reads its error

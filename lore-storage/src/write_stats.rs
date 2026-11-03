@@ -92,7 +92,8 @@ pub struct FragmentWriteStats {
     /// Fragments written with no remote consulted, the caller having asked for a
     /// local-only write.
     local_only_writes: AtomicU64,
-    /// Fragments whose upload did not land, leaving them stored only locally.
+    /// Fragments stored only locally because the upload did not succeed, or the
+    /// peer throttled the copy and no upload was attempted.
     ///
     /// Not an error: the remote leg is best-effort and the write succeeds with the
     /// payload retained, for a later push to offer again. The payload is therefore
@@ -150,7 +151,7 @@ impl FragmentWriteStats {
         self.local_only_writes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A remote was consulted and the upload did not land.
+    /// A remote was consulted and did not take the fragment.
     pub fn remote_upload_failed(&self) {
         self.remote_upload_failed.fetch_add(1, Ordering::Relaxed);
     }
@@ -325,9 +326,10 @@ pub struct FragmentWriteCounts {
     /// asked for. Branch latest history is one such write, which the server does
     /// not store, so a commit against a remote has exactly one.
     pub local_only_writes: u64,
-    /// Fragments whose upload did not land, leaving them stored only locally for
-    /// a later push to offer again. Their payloads are counted under
-    /// `local_payload_writes` too, indistinguishably from those kept by request.
+    /// Fragments stored only locally for a later push to offer again. Either the
+    /// upload failed or the peer throttled the copy and no upload was attempted.
+    /// Their payloads also count toward `local_payload_writes`, which does not
+    /// distinguish them from payloads kept locally by request.
     pub remote_upload_failed: u64,
 }
 

@@ -510,10 +510,11 @@ async fn remote_put_retry(
 
 /// Unified fragment store: dedup -> load existing -> compress -> optional remote -> local store.
 ///
-/// When `remote_session` is `Some`, the session is used after compression to
-/// attempt a durable remote write via `session.put()`. The durable status
-/// affects the `PayloadStoredDurable` flag and whether the payload is cached
-/// locally (payload is always cached when not yet durable, as a safety net).
+/// When `remote_session` is `Some`, the fragment is made durable on the peer where
+/// possible, by duplicating an association the peer already holds or else by
+/// uploading the compressed payload. Durability affects the `PayloadStoredDurable`
+/// flag and whether the payload is cached locally. Until the fragment is durable,
+/// the payload is always cached locally so it isn't lost.
 ///
 /// For local-only storage, pass `None` for `remote_session`.
 ///
@@ -1040,46 +1041,66 @@ fn copy_source(resolved: &StoreMatchResult, address: Address) -> Option<CopySour
     })
 }
 
-/// Duplicate the association `source` names into `address` on the session's partition, reporting
-/// whether the peer now holds it durably.
-///
-/// A refusal is an outcome rather than an error — the source may be gone, the peer may never have
-/// had it, or the caller may hold no claim to its partition — and the upload the caller falls back
-/// to does everything this would have.
-async fn copy_association(
-    session: &Arc<StorageSession>,
-    source: CopySource,
-    address: Address,
-) -> bool {
-    if !session.can_copy_from(source.partition).await {
-        lore_base::lore_trace!(
-            "No claim to partition {} to copy {} from, uploading instead",
-            source.partition,
-            address.hash
-        );
-        return false;
-    }
+/// The outcome of asking a peer to duplicate an association it already holds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// The peer now holds the association durably.
+    Copied,
+    /// The request failed, the peer answered with something other than `SlowDown`, or the claim to
+    /// the source partition couldn't be confirmed. Uploading the payload has the same effect as
+    /// copying it.
+    Refused,
+    /// The peer was still answering `SlowDown` when the retries ran out.
+    Throttled,
+}
 
-    match session
-        .copy(source.partition, source.address, address.context)
-        .await
-    {
-        Ok(()) => {
-            REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);
+/// Ask the session's peer to duplicate the association `source_address` names in
+/// `source_partition` into `context` on the session's partition, without transferring a payload.
+///
+/// A `SlowDown` is retried with the same back-off as an upload.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn remote_copy_retry(
+    session: &StorageSession,
+    source_partition: Partition,
+    source_address: Address,
+    context: Context,
+) -> impl Future<Output = CopyOutcome> {
+    async move {
+        if !session.can_copy_from(source_partition).await {
             lore_base::lore_trace!(
-                "Copied {} from partition {} instead of uploading its payload",
-                address,
-                source.partition
+                "No claim to partition {source_partition} to copy {} into context {context} from",
+                source_address.hash
             );
-            true
+            return CopyOutcome::Refused;
         }
-        Err(err) => {
-            lore_base::lore_trace!(
-                "Copy of {} from partition {} refused ({err:?}), uploading instead",
-                address,
-                source.partition
-            );
-            false
+
+        let mut retry = crate::store_retry();
+        loop {
+            match session
+                .copy(source_partition, source_address, context)
+                .await
+            {
+                Ok(()) => return CopyOutcome::Copied,
+                Err(ref err) if err.is_slow_down() => {
+                    if !retry.wait().await {
+                        lore_base::lore_debug!(
+                            "Copy of {} into context {context} from partition {source_partition} still throttled after {} retries",
+                            source_address.hash,
+                            retry.counter()
+                        );
+                        return CopyOutcome::Throttled;
+                    }
+                }
+                Err(err) => {
+                    lore_base::lore_debug!(
+                        "Copy of {} into context {context} from partition {source_partition} refused ({err:?})",
+                        source_address.hash
+                    );
+                    return CopyOutcome::Refused;
+                }
+            }
         }
     }
 }
@@ -1114,10 +1135,10 @@ struct Placement {
     published: bool,
 }
 
-/// The "work" portion of [`store_fragment`]: optionally duplicate an association the peer already
-/// holds, else load existing local payload where its sizes check out
-/// ([`crate::read::check_payload_sizes`]) or compress the content, and upload, then write the
-/// terminal entry.
+/// Performs the work for [`store_fragment`]. Optionally duplicates an association the peer already
+/// holds. Otherwise, prepares a payload by loading an existing local payload whose sizes pass
+/// [`crate::read::check_payload_sizes`], or by compressing the content. Uploads the payload unless
+/// the peer throttled the copy, then writes the terminal entry.
 ///
 /// Returns where the payload ended up.
 ///
@@ -1147,6 +1168,7 @@ fn leader_body(
         let mut published = false;
         let stats = stats.as_deref();
         let mut registered_remotely = false;
+        let mut copy_throttled = false;
 
         if let Some(stats) = stats {
             stats.fragment_processed(&fragment);
@@ -1158,12 +1180,19 @@ fn leader_body(
             && let Some(session) = remote_session.as_ref()
             && let Some(source) = copy_source(&query, address)
         {
-            stored_durable = copy_association(session, source, address).await;
-            if stored_durable {
-                registered_remotely = true;
-                if let Some(stats) = stats {
-                    stats.remote_copy();
+            match remote_copy_retry(session, source.partition, source.address, address.context)
+                .await
+            {
+                CopyOutcome::Copied => {
+                    REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);
+                    stored_durable = true;
+                    registered_remotely = true;
+                    if let Some(stats) = stats {
+                        stats.remote_copy();
+                    }
                 }
+                CopyOutcome::Refused => {}
+                CopyOutcome::Throttled => copy_throttled = true,
             }
         }
 
@@ -1216,8 +1245,12 @@ fn leader_body(
             }
         }
 
-        // Remote upload if session provided and not already durable
-        if !stored_durable && let Some(session) = remote_session.clone() {
+        // The peer was still asking for back-off when the copy gave up, and an upload would send
+        // it the whole payload. Keep it local and not durable, as after a failed upload.
+        if !stored_durable
+            && !copy_throttled
+            && let Some(session) = remote_session.clone()
+        {
             stored_durable = match publish {
                 Some(key) => {
                     published = remote_put_resolved_retry(

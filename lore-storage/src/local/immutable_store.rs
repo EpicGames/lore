@@ -606,6 +606,8 @@ pub struct LocalImmutableStoreFailureGenerator {
     miss_fragment_writes: HashSet<Hash>,
     /// Hashes whose first write fails, from `LORE_REFUSE_FRAGMENT_WRITES`.
     refuse_fragment_writes: parking_lot::Mutex<HashSet<Hash>>,
+    /// Whether every copy returns `SlowDown`, set by `LORE_THROTTLE_COPIES=1`.
+    throttle_copies: bool,
 }
 
 #[cfg(feature = "failure_generator")]
@@ -2233,6 +2235,7 @@ impl LocalImmutableStore {
             refuse_fragment_writes: parking_lot::Mutex::new(
                 LocalImmutableStoreFailureGenerator::hashes_from_env("LORE_REFUSE_FRAGMENT_WRITES"),
             ),
+            throttle_copies: std::env::var("LORE_THROTTLE_COPIES").is_ok_and(|value| value == "1"),
         };
 
         // Target 70% percentage of max size by default if the given setting is invalid
@@ -6051,6 +6054,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         let _hold = self.hold(Intent::Write).await?;
+        #[cfg(feature = "failure_generator")]
+        if self.failure_generator.throttle_copies {
+            return Err(StoreError::from(SlowDown));
+        }
         // Hash is preserved across the copy; the destination address only differs in context.
         // Same hash → same bucket, so source and destination always live in one bucket — including
         // the same-partition different-context case used for in-partition payload dedup, and the
