@@ -380,7 +380,7 @@ mod tests {
 
                 let metadata =
                     std::fs::metadata(file_path.as_path()).expect("Failed to stat test file");
-                let (expected, _size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+                let expected = lore_revision::util::fs::file_mtime(&metadata);
                 assert_ne!(expected, 0, "test file has no usable modified time");
                 assert_eq!(
                     state::file_modified_time(repository.clone(), &relative_path).await,

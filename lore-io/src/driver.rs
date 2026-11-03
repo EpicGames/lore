@@ -5,10 +5,10 @@
 //! The backend surface is the set of operations [`DriverInner`]'s match arms call: `open`,
 //! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
 //! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
-//! `write_file_segments`, `write_file_segments_atomic`, `sync`, `metadata`, `file_metadata`,
-//! `holds_name_exactly`, `set_len`, `rename`, `copy`, `remove_file`, `create_dir_all`, `remove_dir`
-//! and `remove_dir_all`. A backend implements all twenty-three as inherent methods on its own
-//! type.
+//! `write_file_segments`, `sync`, `metadata`, `stat`, `file_metadata`, `holds_name_exactly`,
+//! `rename`, `copy`, `remove_file`, `read_dir`, `create_dir_all`, `set_permissions`,
+//! `remove_dir` and `remove_dir_all`. A backend implements all twenty-four as inherent methods on
+//! its own type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -392,6 +392,31 @@ impl IoDriver {
             DriverInner::Uring(driver) => driver.metadata(path).await,
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.metadata(path).await,
+        }
+    }
+
+    /// The kind, size, modification time and permission bits of what `path` names, with
+    /// links followed: what [`metadata`](Self::metadata) answers of them, for a caller that
+    /// needs no more.
+    ///
+    /// On Windows, `metadata` opens the path, queries the handle and closes it, and every
+    /// filter driver on the volume sees the open and the close. This queries an absolute path
+    /// with one `GetFileAttributesExW`, which opens no handle, and answers from it where the
+    /// path names nothing, or names no reparse point and carries a time `SystemTime` can hold.
+    /// The file system answers that query without an open, unless a filter driver declines it
+    /// and the system opens, queries and closes the file instead. Every other path answers as
+    /// `metadata` does.
+    ///
+    /// Takes the path by value so a caller building one for the call hands it over rather
+    /// than having it copied.
+    pub async fn stat(&self, path: impl Into<PathBuf>) -> std::io::Result<crate::Stat> {
+        let path = path.into();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.stat(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.stat(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.stat(path).await,
         }
     }
 

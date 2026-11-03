@@ -51,6 +51,10 @@ pub mod pool;
 mod psync;
 #[cfg(feature = "test-util")]
 pub mod psync;
+#[cfg(not(feature = "test-util"))]
+mod stat;
+#[cfg(feature = "test-util")]
+pub mod stat;
 #[cfg(target_os = "linux")]
 mod uring;
 
@@ -70,6 +74,8 @@ pub use iocp::IocpStats;
 pub use pool::PoolStats;
 pub use pool::requested_max_threads;
 pub use pool::set_max_threads;
+pub use stat::Stat;
+pub use stat::StatKind;
 #[cfg(target_os = "linux")]
 pub use uring::UringStats;
 

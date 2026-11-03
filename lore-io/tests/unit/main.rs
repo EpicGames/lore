@@ -11,3 +11,5 @@ mod driver;
 mod iocp;
 mod pool;
 mod psync;
+#[cfg(target_family = "windows")]
+mod stat;

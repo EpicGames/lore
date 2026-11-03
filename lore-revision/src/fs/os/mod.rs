@@ -141,8 +141,8 @@ impl InstanceOperation for OsOperation {
     /// `NotFound`, so both report a non-existent path.
     async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         let path = self.absolute(path);
-        match lore_io::IoDriver::global().metadata(path).await {
-            Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
+        match lore_io::IoDriver::global().stat(path).await {
+            Ok(stat) => Ok(FileInfo::from_stat(&stat)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
             Err(e)
                 if cfg!(target_family = "windows")

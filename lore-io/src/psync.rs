@@ -305,6 +305,10 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        SyscallPool::global().submit(move || stat_impl(&path)).await
+    }
+
     pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {
         SyscallPool::global()
             .submit(move || holds_name_exactly_impl(&path))
@@ -567,28 +571,76 @@ fn is_pattern_unit(unit: u16) -> bool {
     u8::try_from(unit).is_ok_and(|byte| matches!(byte, b'*' | b'?' | b'<' | b'>' | b'"'))
 }
 
-/// Units of path the lookup is willing to build.
+/// Units of path the Win32 path calls here are willing to build.
 ///
-/// A plain path is capped at `MAX_PATH` by the call itself: past that it wants
-/// the `\\?\` verbatim prefix, which is a rewrite of the path rather than a
+/// A plain path is capped at `MAX_PATH` by the calls themselves: past that they
+/// want the `\\?\` verbatim prefix, which is a rewrite of the path rather than a
 /// longer buffer - `lore_base::fs::win_path` does that, and lore-io does not
 /// depend on lore-base. A path that arrives already verbatim may be longer, so
-/// there is room for one, and anything past even that goes unanswered and is
-/// left to the directory read, which `std` prefixes on its own.
+/// there is room for one, and anything past even that is left to what `std`
+/// answers, since `std` prefixes on its own.
 #[cfg(target_family = "windows")]
 const PATH_UNITS: usize = 512;
 
-/// The path length the plain lookup is defined for, terminator included. Past it
+/// The path length a plain path call is defined for, terminator included. Past it
 /// the call fails on a path that is perfectly well there, which is a fact about
-/// the call and not about the name - so a longer path is declined rather than
+/// the call and not about the path - so a longer path is declined rather than
 /// answered, and only a verbatim one is carried through.
 #[cfg(target_family = "windows")]
 const MAX_PATH_UNITS: usize = 260;
 
+/// Why a path cannot be handed to a Win32 path call as it stands.
+#[cfg(target_family = "windows")]
+enum Unencodable {
+    /// The path holds a null, which would end the path the call sees early and make it
+    /// answer about a different one. No path a filesystem holds carries one.
+    Null,
+    /// The path holds [`PATH_UNITS`] units or more, or [`MAX_PATH_UNITS`] or more without the
+    /// verbatim prefix that lifts that limit.
+    Long,
+}
+
+/// Writes `path` into `wide` as the null-terminated UTF-16 a Win32 path call takes.
+///
+/// A path that arrives with the verbatim prefix is written as it is and is not held to
+/// `MAX_PATH`; one without it is, and rewriting it into a verbatim one is not this
+/// function's to do.
+#[cfg(target_family = "windows")]
+fn encode_wide_path(
+    path: &std::path::Path,
+    wide: &mut [u16; PATH_UNITS],
+) -> Result<(), Unencodable> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut length = 0;
+    for unit in path.as_os_str().encode_wide() {
+        if length == wide.len() - 1 {
+            return Err(Unencodable::Long);
+        }
+        if unit == 0 {
+            return Err(Unencodable::Null);
+        }
+        wide[length] = unit;
+        length += 1;
+    }
+    wide[length] = 0;
+
+    let verbatim = matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+    );
+    if !verbatim && length >= MAX_PATH_UNITS {
+        return Err(Unencodable::Long);
+    }
+    Ok(())
+}
+
 // `FindFirstFileExW` resolves the path and reports the name as the filesystem
 // holds it, which is compared in place: the caller wants a verdict, and building
 // an `OsString` to compare and drop is the allocation this exists to avoid.
-// `FindExInfoBasic` leaves the 8.3 name it would otherwise fill in unqueried.
+// `FindExInfoBasic` leaves the 8.3 name it would otherwise fill in unqueried. A
+// path holding a null names nothing, and one the call cannot take as it stands
+// says nothing about the name.
 #[cfg(target_family = "windows")]
 fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
     use std::os::windows::ffi::OsStrExt;
@@ -616,32 +668,10 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
     }
 
     let mut wide = [0u16; PATH_UNITS];
-    let mut length = 0;
-    for unit in path.as_os_str().encode_wide() {
-        // Longer than the lookup is built for, which says nothing about the name.
-        if length == wide.len() - 1 {
-            return None;
-        }
-        // An interior null would truncate the path the call sees, which would
-        // make it answer about a different path than the one it was handed -
-        // and no path a filesystem holds carries one.
-        if unit == 0 {
-            return Some(false);
-        }
-        wide[length] = unit;
-        length += 1;
-    }
-    wide[length] = 0;
-
-    // A path that arrives with the verbatim prefix is handed to the call as it
-    // is and is not held to `MAX_PATH`; one without it is, and rewriting it into
-    // a verbatim one is not this function's to do.
-    let verbatim = matches!(
-        path.components().next(),
-        Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
-    );
-    if !verbatim && length >= MAX_PATH_UNITS {
-        return None;
+    match encode_wide_path(path, &mut wide) {
+        Ok(()) => {}
+        Err(Unencodable::Null) => return Some(false),
+        Err(Unencodable::Long) => return None,
     }
 
     let mut found = std::mem::MaybeUninit::<WIN32_FIND_DATAW>::uninit();
@@ -690,6 +720,69 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
 #[cfg(not(any(target_os = "linux", target_family = "windows")))]
 fn holds_name_exactly_impl(_path: &std::path::Path) -> Option<bool> {
     None
+}
+
+/// What `std::fs::metadata` answers for `path`.
+fn std_stat(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    std::fs::metadata(path).map(|metadata| crate::Stat::from(&metadata))
+}
+
+#[cfg(not(target_family = "windows"))]
+fn stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    std_stat(path)
+}
+
+/// What [`attribute_stat`] answers for `path`, and what [`std_stat`] answers where it declines.
+#[cfg(target_family = "windows")]
+fn stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    attribute_stat(path).unwrap_or_else(|| std_stat(path))
+}
+
+/// What one `GetFileAttributesExW` answers for `path`, which it queries without a handle, or
+/// `None` where the answer could differ from what [`std_stat`] gives: for a relative path, which
+/// `std` resolves first; a path the call cannot take as it stands; a reparse point, which the call
+/// describes rather than what it links to; a time `SystemTime` cannot hold; and every failure
+/// but the name not being there, which the two report with the same code.
+#[lore_macro::test_pub]
+#[cfg(target_family = "windows")]
+fn attribute_stat(path: &std::path::Path) -> Option<std::io::Result<crate::Stat>> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::GetFileAttributesExW;
+    use windows_sys::Win32::Storage::FileSystem::GetFileExInfoStandard;
+    use windows_sys::Win32::Storage::FileSystem::WIN32_FILE_ATTRIBUTE_DATA;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut wide = [0u16; PATH_UNITS];
+    encode_wide_path(path, &mut wide).ok()?;
+
+    let mut data = std::mem::MaybeUninit::<WIN32_FILE_ATTRIBUTE_DATA>::uninit();
+    // SAFETY: the path is null-terminated, and the structure is writable for the size the
+    // standard information level fills in.
+    let queried = unsafe {
+        GetFileAttributesExW(
+            wide.as_ptr(),
+            GetFileExInfoStandard,
+            data.as_mut_ptr().cast(),
+        )
+    };
+    if queried == 0 {
+        let error = std::io::Error::last_os_error();
+        let absent = matches!(
+            error.raw_os_error(),
+            Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32
+        );
+        return absent.then_some(Err(error));
+    }
+    // SAFETY: the call succeeded, so it filled the structure in.
+    let data = unsafe { data.assume_init() };
+    if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return None;
+    }
+    crate::stat::from_attribute_data(&data).map(Ok)
 }
 
 #[cfg(target_family = "unix")]

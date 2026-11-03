@@ -2546,7 +2546,10 @@ mod is_file_modified_chunking_compat {
             std::fs::write(&path, &modified).expect("Failed to write large file");
 
             let metadata = std::fs::metadata(&path).expect("Failed to get metadata");
-            let (mtime, file_size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let (mtime, file_size) = (
+                lore_revision::util::fs::file_mtime(&metadata),
+                metadata.len(),
+            );
             let node = Node {
                 flags: NodeFlags::File.bits(),
                 size: size as u64,
@@ -2596,7 +2599,7 @@ mod is_file_modified_chunking_compat {
                 ..Default::default()
             };
 
-            let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let (mtime, size) = (lore_revision::util::fs::file_mtime(&metadata), metadata.len());
             let modified =
                 file_modification(
                     repository.clone(),
@@ -2642,7 +2645,7 @@ mod is_file_modified_chunking_compat {
                 ..Default::default()
             };
 
-            let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let (mtime, size) = (lore_revision::util::fs::file_mtime(&metadata), metadata.len());
             let modified =
                 file_modification(
                     repository.clone(),

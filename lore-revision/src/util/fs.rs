@@ -3,11 +3,7 @@
 use std::fs::Metadata;
 use std::future::Future;
 #[cfg(target_family = "unix")]
-use std::os::unix::fs::MetadataExt;
-#[cfg(target_family = "unix")]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -36,7 +32,6 @@ use crate::repository::is_reserved_node_name;
 use crate::util::time::Retry;
 use crate::util::time::RetryPolicy;
 
-#[cfg(not(target_family = "windows"))]
 const FILE_MODE_USER_EXEC: u32 = 0o100;
 #[cfg(not(target_family = "windows"))]
 const FILE_MODE_ALL_EXEC: u32 = 0o111;
@@ -126,25 +121,23 @@ pub fn mode_changed(from: u16, to: u16) -> bool {
 }
 
 pub fn file_mtime(metadata: &Metadata) -> u64 {
-    metadata
-        .modified()
-        .unwrap_or(std::time::SystemTime::now())
+    modified_millis(metadata.modified().ok())
+}
+
+/// Milliseconds from the Unix epoch to `modified`: to now where there is no time, and zero
+/// for a time before the epoch.
+pub fn modified_millis(modified: Option<std::time::SystemTime>) -> u64 {
+    modified
+        .unwrap_or_else(std::time::SystemTime::now)
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
-pub fn file_size(metadata: &Metadata) -> u64 {
-    #[cfg(target_family = "windows")]
-    let size = metadata.file_size();
-    #[cfg(target_family = "unix")]
-    let size = metadata.size();
-
-    size
-}
-
-pub fn file_mtime_and_size(metadata: &Metadata) -> (u64, u64) {
-    (file_mtime(metadata), file_size(metadata))
+/// Whether the permission bits `mode` carry the user's executable bit, `None` where there are
+/// no bits to read.
+pub fn mode_executable_observed(mode: Option<u32>) -> Option<bool> {
+    mode.map(|mode| mode & FILE_MODE_USER_EXEC != 0)
 }
 
 #[cfg(target_family = "windows")]
@@ -155,19 +148,6 @@ pub fn file_is_executable(_metadata: &Metadata) -> bool {
 #[cfg(target_family = "unix")]
 pub fn file_is_executable(metadata: &Metadata) -> bool {
     (metadata.permissions().mode() & FILE_MODE_USER_EXEC) != 0
-}
-
-/// Whether the file carries the executable bit, `None` where the platform has no such
-/// bit to read. [`file_is_executable`] answers `false` for both and cannot tell them
-/// apart, which a caller updating a node's mode needs.
-#[cfg(target_family = "windows")]
-pub fn file_executable_observed(_metadata: &Metadata) -> Option<bool> {
-    None
-}
-
-#[cfg(target_family = "unix")]
-pub fn file_executable_observed(metadata: &Metadata) -> Option<bool> {
-    Some(file_is_executable(metadata))
 }
 
 /// The case each directory prefix is held in on disk, resolved once for the

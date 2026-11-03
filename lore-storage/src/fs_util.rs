@@ -35,7 +35,7 @@ pub(crate) async fn exists(path: &Path) -> std::io::Result<bool> {
     if crate::test_util::take_directory_stat_failure() {
         return Err(std::io::Error::other("directory stat failed as asked"));
     }
-    match lore_io::IoDriver::global().metadata(path).await {
+    match lore_io::IoDriver::global().stat(path).await {
         Ok(_) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),

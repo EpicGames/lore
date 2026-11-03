@@ -9,6 +9,8 @@ use lore_base::test_util::TempDir;
 use lore_io::BackendKind;
 use lore_io::IoDriver;
 use lore_io::OpenOptions;
+use lore_io::Stat;
+use lore_io::StatKind;
 
 /// Every backend this build has, skipping one the machine cannot run. A kernel without
 /// `io_uring`, or a container that blocks `io_uring_setup`, must not fail the suite — but the
@@ -660,6 +662,171 @@ async fn holds_name_exactly_declines_a_path_beyond_max_path() {
             "the file itself must be there to be declined"
         );
         assert_eq!(driver.holds_name_exactly(path).await, None);
+    }
+}
+
+/// What `stat` answers for `path`, held against what `metadata` answers for it.
+async fn stat_and_metadata(driver: &IoDriver, path: &std::path::Path) -> (Stat, Stat) {
+    let stat = driver.stat(path).await.expect("stat");
+    let metadata = driver.metadata(path).await.expect("metadata");
+    (stat, Stat::from(&metadata))
+}
+
+/// A file and a directory stat as `metadata` describes them: the kind, the length, the
+/// modification time and the permission bits.
+#[tokio::test]
+async fn stat_answers_as_metadata_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-stat-");
+        driver
+            .write_file_bytes(dir.child("file"), Bytes::from(pattern(5000, 1)), false)
+            .await
+            .unwrap();
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+
+        let (file, expected) = stat_and_metadata(&driver, &dir.child("file")).await;
+        assert_eq!(file, expected, "{}", driver.backend_name());
+        assert_eq!(file.kind, StatKind::File);
+        assert_eq!(file.len, 5000);
+
+        let (directory, expected) = stat_and_metadata(&driver, &dir.child("directory")).await;
+        assert_eq!(directory, expected, "{}", driver.backend_name());
+        assert_eq!(directory.kind, StatKind::Directory);
+    }
+}
+
+/// A path holding nothing fails as `NotFound` with the OS code `metadata` reports, whether its
+/// own name or a directory above it is what is missing.
+#[tokio::test]
+async fn stat_reports_a_missing_path_as_not_found() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statmissing-");
+        for path in [dir.child("absent"), dir.child("absent").join("child")] {
+            let error = driver.stat(&path).await.expect_err("nothing is there");
+            let expected = driver.metadata(&path).await.expect_err("nothing is there");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "{} through {}",
+                path.display(),
+                driver.backend_name()
+            );
+            assert_eq!(
+                error.raw_os_error(),
+                expected.raw_os_error(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A file last written before the Unix epoch stats with the time `metadata` gives it. A
+/// filesystem that refuses to hold such a time skips the case.
+#[tokio::test]
+async fn stat_answers_a_time_before_the_unix_epoch_as_metadata_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statpreepoch-");
+        let path = dir.child("old");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"old"), false)
+            .await
+            .unwrap();
+        let before_epoch =
+            std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(400 * 86_400);
+        let stamped = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(before_epoch));
+        if let Err(error) = stamped {
+            eprintln!("skipping: the filesystem holds no time before 1970: {error}");
+            return;
+        }
+
+        let (stat, expected) = stat_and_metadata(&driver, &path).await;
+        assert_eq!(stat, expected, "{}", driver.backend_name());
+    }
+}
+
+/// A path holding a null names nothing a filesystem holds, and fails as `metadata` fails it.
+#[tokio::test]
+async fn stat_refuses_a_path_holding_a_null_as_metadata_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statnull-");
+        let path = dir.child("before\0after");
+        let stat = driver.stat(&path).await.expect_err("a null names nothing");
+        let metadata = driver
+            .metadata(&path)
+            .await
+            .expect_err("a null names nothing");
+        assert_eq!(stat.kind(), metadata.kind(), "{}", driver.backend_name());
+    }
+}
+
+/// Creates a link at `link` to the file at `target`, answering whether the platform let it:
+/// Windows creates one only with the privilege or developer mode to.
+fn file_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(target_family = "unix")]
+    let created = std::os::unix::fs::symlink(target, link);
+    #[cfg(target_family = "windows")]
+    let created = std::os::windows::fs::symlink_file(target, link);
+    created.is_ok()
+}
+
+/// A link stats as the file it names, and a link naming nothing fails as `NotFound`, as the
+/// name does when nothing is there.
+#[tokio::test]
+async fn stat_follows_a_link() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statlink-");
+        driver
+            .write_file_bytes(dir.child("target"), Bytes::from_static(b"held"), false)
+            .await
+            .unwrap();
+        if !file_link(&dir.child("target"), &dir.child("link"))
+            || !file_link(&dir.child("gone"), &dir.child("dangling"))
+        {
+            eprintln!("skipping: this machine creates no links");
+            return;
+        }
+
+        let (link, expected) = stat_and_metadata(&driver, &dir.child("link")).await;
+        assert_eq!(link, expected, "{}", driver.backend_name());
+        assert_eq!(link.kind, StatKind::File);
+        assert_eq!(link.len, 4);
+
+        let error = driver
+            .stat(dir.child("dangling"))
+            .await
+            .expect_err("a dangling link names nothing");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
+/// Past `MAX_PATH` a path answers whether or not it carries the verbatim prefix: a plain one is
+/// left to `metadata`, which prefixes it, and a verbatim one is queried as it stands.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn stat_answers_for_a_path_beyond_max_path() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statlong-");
+        let mut deep = dir.path().to_path_buf();
+        while deep.as_os_str().len() < 260 {
+            deep = deep.join("directory-with-a-name-long-enough-to-get-there");
+        }
+        driver.create_dir_all(&deep).await.unwrap();
+        let path = deep.join("Rock.mesh");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"data"), false)
+            .await
+            .unwrap();
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", path.display()));
+
+        for path in [path, verbatim] {
+            let (stat, expected) = stat_and_metadata(&driver, &path).await;
+            assert_eq!(stat, expected, "{}", path.display());
+            assert_eq!(stat.kind, StatKind::File);
+        }
     }
 }
 

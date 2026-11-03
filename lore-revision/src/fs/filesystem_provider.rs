@@ -83,18 +83,21 @@ pub enum FileInfo {
 }
 
 impl FileInfo {
+    /// What `metadata` measured at a path, read as [`from_stat`](Self::from_stat) reads it.
     pub fn from_metadata(metadata: &Metadata) -> Self {
-        if metadata.is_dir() {
-            return FileInfo::Directory;
-        }
-        if !metadata.is_file() {
-            return FileInfo::NotExist;
-        }
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(metadata);
-        FileInfo::File {
-            executable: crate::util::fs::file_executable_observed(metadata),
-            size,
-            mtime,
+        Self::from_stat(&lore_io::Stat::from(metadata))
+    }
+
+    /// What `stat` measured at a path.
+    pub fn from_stat(stat: &lore_io::Stat) -> Self {
+        match stat.kind {
+            lore_io::StatKind::Directory => FileInfo::Directory,
+            lore_io::StatKind::Other => FileInfo::NotExist,
+            lore_io::StatKind::File => FileInfo::File {
+                executable: crate::util::fs::mode_executable_observed(stat.mode),
+                size: stat.len,
+                mtime: crate::util::fs::modified_millis(stat.modified),
+            },
         }
     }
 
