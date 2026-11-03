@@ -42,6 +42,10 @@ class FileNotFound(NotFound):
     whether the path was never added or was deleted."""
 
 
+class AddressNotFound(NotFound):
+    """Raised when the store holds no content for an address, as after an obliterate."""
+
+
 class BranchBehindLatest(LoreException): ...
 
 
@@ -272,6 +276,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         SwfsOutsideServiceError,
     ),
     ("invalid arguments:", ImproperArgumentsError),
+    ("Address not found", AddressNotFound),
 ]
 
 

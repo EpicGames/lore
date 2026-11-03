@@ -6,7 +6,7 @@ import os
 import shutil
 
 import pytest
-from error_types import LoreException
+from error_types import AddressNotFound, LoreException
 
 from lore import Lore
 
@@ -172,22 +172,31 @@ def test_clone_and_sync_materialize_available_files_after_obliteration(
     new_lore_repo, scratch_dir
 ):
     repo: Lore = new_lore_repo("ObliterateContinue")
-    repo.write_commit_push("Base", {"base.txt": "base content\n"}, offline=True)
+    repo.write_commit_push(
+        "Base",
+        {"base.txt": "base content\n", "changed.txt": "changed in revision 1\n"},
+        offline=True,
+    )
     repo.push()
     older = repo.clone()
     available = {f"available-{i}.txt": f"available content {i}\n" for i in range(8)}
     removed = {"removed-one.txt": "removed one\n", "removed-two.txt": "removed two\n"}
-    repo.write_commit_push("Add files", available | removed, offline=True)
+    changed = {"changed.txt": "changed in revision 2\n"}
+    repo.write_commit_push("Add files", available | removed | changed, offline=True)
     repo.push()
-    for path in removed:
+    for path in [*removed, *changed]:
         info = repo.file_info(path)[0]
         repo.file_obliterate(address=f"{info.hash}-{info.context}")
 
     destination = scratch_dir("clone-after-obliterate")
-    with pytest.raises(LoreException) as clone_failure:
+    with pytest.raises(AddressNotFound) as clone_failure:
         repo.clone(path=destination, json=True)
-    with pytest.raises(LoreException) as sync_failure:
+    before_sync = older.revision_info(offline=True).revision
+    with pytest.raises(AddressNotFound) as sync_failure:
         older.sync("@2", json=True)
+    assert older.revision_info(offline=True).revision == before_sync, (
+        "a failed sync does not advance the recorded revision"
+    )
 
     for failure in (clone_failure, sync_failure):
         events = [
@@ -216,6 +225,10 @@ def test_clone_and_sync_materialize_available_files_after_obliteration(
                 assert materialized.read() == content
         for path in removed:
             assert not os.path.exists(os.path.join(root, path))
+    with open(os.path.join(older.path, "changed.txt")) as kept:
+        assert kept.read() == "changed in revision 1\n", (
+            "a failed sync keeps the old content of the file it could not write"
+        )
 
 
 @pytest.mark.smoke
@@ -240,3 +253,36 @@ def test_obliterate_dry_run_removes_nothing(new_lore_repo, scratch_dir):
     repo.file_obliterate(path="secret.txt")
 
     assert "Store match : 0" in repo.file_dump(path="secret.txt")
+
+
+@pytest.mark.smoke
+def test_obliterate_removes_only_the_addressed_instance(new_lore_repo):
+    """Obliterating one address keeps byte-identical content at other addresses, in the
+    same repository and in another one."""
+    shared = b"byte-identical wherever it lives"
+    repo_a: Lore = new_lore_repo()
+    repo_b: Lore = new_lore_repo()
+    repo_a.write_commit_push("seed a", {"twin.txt": shared, "sibling.txt": shared})
+    # Off the branch head, so the obliterate does not warn and leave the clone failing.
+    repo_a.write_commit_push("replace twin", {"twin.txt": b"different content now"})
+    repo_b.write_commit_push("seed b", {"twin.txt": shared})
+
+    target = repo_a.file_info("twin.txt", revision="main@1")[0]
+    sibling = repo_a.file_info("sibling.txt")[0]
+    other = repo_b.file_info("twin.txt")[0]
+    assert target.hash == sibling.hash == other.hash, (
+        "setup: identical content shares a hash"
+    )
+
+    output = repo_a.file_obliterate(address=f"{target.hash}-{target.context}")
+    assert "Obliterated 1 fragments" in output, output
+
+    # Through a clone: obliterate leaves working files alone, so only the store tells.
+    with open(os.path.join(repo_a.clone().path, "sibling.txt"), "rb") as kept:
+        assert kept.read() == shared, (
+            "the same content elsewhere in the repository survives"
+        )
+    with open(os.path.join(repo_b.clone().path, "twin.txt"), "rb") as kept:
+        assert kept.read() == shared, (
+            "the same content in another repository survives"
+        )
