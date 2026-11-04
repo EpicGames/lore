@@ -69,7 +69,7 @@ def wrap(rustc, arguments):
         )
         os.environ["RUSTC_BOOTSTRAP"] = "1"
         arguments = [*arguments, "-Zprint-type-sizes"]
-    os.execv(rustc, [rustc, *arguments])
+    os.execvp(rustc, [rustc, *arguments])
 
 
 def parse(paths):
