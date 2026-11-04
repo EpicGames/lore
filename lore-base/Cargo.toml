@@ -12,25 +12,34 @@ test = false
 [[bin]]
 name = "lore-stamp"
 path = "src/bin/lore-stamp.rs"
+required-features = ["native"]
 
 [features]
-trace_log = []
+default = ["native"]
+# OS services and the threaded runtime are unavailable in Workers Wasm.
+# Without this feature the crate exposes the portable domain types and errors.
+native = [
+    "dep:backtrace", "dep:libc", "dep:parking_lot", "dep:directories",
+    "dep:chrono", "dep:lore-io", "dep:pin-project", "dep:tokio",
+    "rand/os_rng", "rand/small_rng", "rand/std_rng", "rand/thread_rng", "uuid/v4", "uuid/v7",
+]
+trace_log = ["native"]
 # The shared test temp-directory helper in src/test_util.rs. Crates whose tests
 # need scratch space on disk enable it from their dev-dependencies, so it stays
 # out of every normal build.
-test-util = ["dep:tempfile"]
+test-util = ["native", "dep:tempfile"]
 # Tells build.rs to compile the rpmalloc C code with -mcpu=neoverse-512tvb.
-neoverse-512tvb = []
+neoverse-512tvb = ["native"]
 
 [dependencies]
 # allocator
-backtrace = { version = "0.3.75", default-features = false, features = ["std"] }
-libc = { workspace = true }
-parking_lot = { workspace = true }
+backtrace = { version = "0.3.75", default-features = false, features = ["std"], optional = true }
+libc = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 zerocopy = { workspace = true }
 
 # directories
-directories = { workspace = true }
+directories = { workspace = true, optional = true }
 
 # error
 hex = { workspace = true }
@@ -42,22 +51,23 @@ bitcode = { workspace = true }
 bitflags = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
-rand = { workspace = true }
+# Match the workspace versions while withholding OS randomness from portable builds.
+rand = { version = "0.9.2", default-features = false, features = ["std"] }
 # Built only when `test-util` is on, so it stays out of normal builds. It is a
 # normal optional dependency rather than a dev-dependency because a dependent
 # enabling the feature compiles lore-base normally, and a normal build cannot see
 # dev-dependencies.
 tempfile = { workspace = true, optional = true }
 serde = { workspace = true }
-uuid = { workspace = true, features = ["zerocopy"] }
+uuid = { version = "1.18.1", default-features = false, features = ["zerocopy"] }
 
 # log
-chrono = { workspace = true }
+chrono = { workspace = true, optional = true }
 
 # runtime
-lore-io = { workspace = true }
-pin-project = { workspace = true }
-tokio = { workspace = true }
+lore-io = { workspace = true, optional = true }
+pin-project = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
 
 # tests
 lore-macro = { workspace = true }

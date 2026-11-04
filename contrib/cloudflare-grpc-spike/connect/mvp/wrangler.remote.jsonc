@@ -1,0 +1,19 @@
+{
+  // Isolated, unauthenticated experiment. Do not put private data here.
+  "name": "lore-worker-mvp-spike",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-08",
+  "build": { "cwd": "mvp", "command": "cargo build --locked --release --target wasm32-unknown-unknown --manifest-path core/Cargo.toml" },
+  "workers_dev": false,
+  "routes": [{ "pattern": "lore-mvp.gasparina.work", "custom_domain": true }],
+  "r2_buckets": [{ "binding": "FRAGMENTS", "bucket_name": "lore-worker-mvp-spike-20261104" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "MUTABLE", "class_name": "MutablePartition" },
+      { "name": "CATALOG", "class_name": "RepositoryCatalog" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MutablePartition", "RepositoryCatalog"] }],
+  "observability": { "enabled": true },
+  "upload_source_maps": true
+}

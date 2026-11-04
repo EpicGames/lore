@@ -758,6 +758,16 @@ mod validate_response {
     }
 
     #[test]
+    fn rejects_non_fragmented_content_larger_than_u32() {
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: 100,
+            size_content: 1_u64 << 32,
+        };
+        assert!(validate_fragment_response(&fragment).is_err());
+    }
+
+    #[test]
     fn rejects_fragmented_and_compressed_combo() {
         let fragment = Fragment {
             flags: (FragmentFlags::PayloadFragmented | FragmentFlags::PayloadCompressedLZ4).into(),

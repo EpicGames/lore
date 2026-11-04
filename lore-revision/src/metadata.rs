@@ -41,7 +41,7 @@ use crate::util::path::make_absolute;
 /// A single entry larger than this is refused when it is set, since no amount of
 /// removing other keys could make it fit. The total is checked when the metadata
 /// is serialized, which is the only point at which it is known.
-pub const METADATA_MAX_SIZE: usize = 1024 * 1024;
+pub use lore_base::metadata::METADATA_MAX_SIZE;
 
 #[error_set]
 pub enum MetadataErrors {
@@ -351,9 +351,6 @@ pub struct MetadataHeader {
     /// Format version of the metadata layout.
     pub version: u32,
 }
-
-const MAGIC: u32 = 0x6D657461; // 'meta'
-const VERSION: u32 = 1;
 
 /// Metadata item
 #[repr(C)]
@@ -902,9 +899,6 @@ impl Metadata {
         value: &[u8],
         value_type: MetadataType,
     ) -> Result<(), MetadataError> {
-        let header_size = std::mem::size_of::<u32>() * 2;
-        let item_size = std::mem::size_of::<u32>() * 3;
-
         let entry_size = Self::stored_size(key.len(), value.len());
         if entry_size > METADATA_MAX_SIZE {
             return Err(MetadataError::from(Oversized {
@@ -916,140 +910,8 @@ impl Metadata {
             }));
         }
 
-        self.set_header()?;
-
-        let mut offset = header_size;
-        while offset < self.buffer.len() {
-            let buffer = self.buffer.as_mut();
-            let raw_pointer = unsafe { buffer.as_ptr().add(offset).cast::<MetadataItem>() };
-            let item: MetadataItem = unsafe { raw_pointer.read_unaligned() };
-
-            let key_length = item.key_length as usize;
-            let value_length = item.value_length as usize;
-            let start_offset = offset;
-            offset += item_size;
-
-            let key_data = unsafe { buffer.as_ptr().add(offset) };
-            let key_slice = unsafe { std::slice::from_raw_parts(key_data, key_length) };
-            offset += key_length;
-
-            if key == key_slice {
-                if value_length == value.len() {
-                    unsafe {
-                        let tag = value_type as u32;
-                        std::ptr::copy_nonoverlapping(
-                            std::ptr::addr_of!(tag).cast::<u8>(),
-                            buffer
-                                .as_mut_ptr()
-                                .add(start_offset + std::mem::size_of::<u32>() * 2),
-                            std::mem::size_of::<u32>(),
-                        );
-                        std::ptr::copy_nonoverlapping(
-                            value.as_ptr(),
-                            buffer.as_mut_ptr().add(offset),
-                            value.len(),
-                        );
-                    }
-                    return Ok(());
-                }
-
-                // Erase the current key-value pair by moving remaining items
-                let block_size = item_size + key_length + value_length;
-                let next_offset = start_offset + block_size;
-                if buffer.len() > next_offset {
-                    unsafe {
-                        std::ptr::copy(
-                            buffer.as_mut_ptr().add(next_offset),
-                            buffer.as_mut_ptr().add(start_offset),
-                            self.buffer.len() - next_offset,
-                        );
-                    }
-                    self.buffer.truncate(self.buffer.len() - block_size);
-                } else {
-                    self.buffer.truncate(start_offset);
-                }
-
-                break;
-            }
-
-            offset += value_length;
-        }
-
-        let block_size = item_size + key.len() + value.len();
-        let current_size = self.buffer.len();
-        let next_size = current_size + block_size;
-        if next_size > self.buffer.capacity() {
-            // reserve takes "additional bytes to insert", so always pass
-            // the block size (or a minimum 4KiB slab) regardless of the
-            // current slack between len and capacity.
-            self.buffer.reserve(std::cmp::max(block_size, 4000));
-        }
-
-        let item = MetadataItem {
-            key_length: key.len() as u32,
-            value_length: value.len() as u32,
-            value_type: value_type as u32,
-        };
-        let item_pointer = unsafe {
-            self.buffer
-                .as_mut_ptr()
-                .add(current_size)
-                .cast::<MetadataItem>()
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                std::ptr::addr_of!(item).cast::<u8>(),
-                item_pointer.cast::<u8>(),
-                item_size,
-            );
-        }
-        offset = current_size + item_size;
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                key.as_ptr(),
-                self.buffer.as_mut_ptr().add(offset),
-                key.len(),
-            );
-        }
-        offset += key.len();
-
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                value.as_ptr(),
-                self.buffer.as_mut_ptr().add(offset),
-                value.len(),
-            );
-        }
-
-        unsafe { self.buffer.set_len(next_size) };
-
-        Ok(())
-    }
-
-    fn set_header(&mut self) -> Result<(), MetadataError> {
-        if self.is_empty() {
-            self.buffer.reserve(4000);
-
-            let header_size = std::mem::size_of::<u32>() * 2;
-            let header = MetadataHeader {
-                magic: MAGIC,
-                version: VERSION,
-            };
-            let header_pointer = self.buffer.as_mut_ptr().cast::<MetadataHeader>();
-
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    std::ptr::addr_of!(header).cast::<u8>(),
-                    header_pointer.cast::<u8>(),
-                    header_size,
-                );
-            }
-
-            unsafe { self.buffer.set_len(header_size) };
-        }
-
-        Ok(())
+        lore_base::metadata::set_encoded(&mut self.buffer, key, value, value_type as u32)
+            .map_err(MetadataError::internal)
     }
 
     /// Establish that the buffer is a metadata blob this build can read, and
@@ -1063,56 +925,7 @@ impl Metadata {
     /// instead of read past.
     #[lore_macro::test_pub]
     fn check_buffer(&self) -> Result<(), MetadataError> {
-        let buffer_size = self.buffer.len();
-        if buffer_size == 0 {
-            return Ok(());
-        }
-
-        let header_size = std::mem::size_of::<u32>() * 2;
-        let item_size = std::mem::size_of::<u32>() * 3;
-        if header_size > buffer_size {
-            return Err(MetadataError::internal("bad metadata header"));
-        }
-
-        let buffer = self.buffer.as_ref();
-        let raw_pointer = buffer.as_ptr().cast::<MetadataHeader>();
-        let header: MetadataHeader = unsafe { raw_pointer.read_unaligned() };
-        if header.magic != MAGIC {
-            return Err(MetadataError::internal("bad metadata header"));
-        }
-        if header.version != VERSION {
-            // Handle version change when modifying VERSION.
-            return Err(MetadataError::internal("bad metadata header"));
-        }
-
-        // Each bound is checked against the room left before it is consumed, so
-        // `offset` only ever lands on or before the end and the subtractions
-        // cannot wrap.
-        let mut offset = header_size;
-        while offset < buffer_size {
-            if item_size > buffer_size - offset {
-                return Err(MetadataError::internal("truncated metadata entry"));
-            }
-            // SAFETY: the entry header fits, as just checked.
-            let item: MetadataItem = unsafe {
-                buffer
-                    .as_ptr()
-                    .add(offset)
-                    .cast::<MetadataItem>()
-                    .read_unaligned()
-            };
-            offset += item_size;
-
-            let payload = item.key_length as usize + item.value_length as usize;
-            if payload > buffer_size - offset {
-                return Err(MetadataError::internal(
-                    "metadata entry overruns the buffer",
-                ));
-            }
-            offset += payload;
-        }
-
-        Ok(())
+        lore_base::metadata::check_buffer(&self.buffer).map_err(MetadataError::internal)
     }
 
     /// Visit every entry this build can read, in stored order.

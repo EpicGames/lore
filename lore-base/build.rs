@@ -4,6 +4,9 @@ use std::env;
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::var_os("CARGO_FEATURE_NATIVE").is_none() {
+        return Ok(());
+    }
     let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("No manifest dir set");
     let native_dir = Path::join(Path::new(&crate_dir), "native");
 

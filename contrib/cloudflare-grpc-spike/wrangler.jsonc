@@ -1,0 +1,7 @@
+{
+  "name": "lore-grpc-transport-spike",
+  "main": "build/index.js",
+  "compatibility_date": "2026-10-08",
+  "build": { "command": "worker-build --release" },
+  "observability": { "enabled": true }
+}

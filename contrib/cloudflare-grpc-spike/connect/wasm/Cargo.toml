@@ -1,0 +1,13 @@
+[package]
+name = "lore-fragment-flags-spike"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lore-base = { path = "../../../../lore-base", default-features = false }

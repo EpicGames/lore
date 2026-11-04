@@ -1,0 +1,16 @@
+{
+  "name": "lore-worker-mvp-local",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-08",
+  "build": { "cwd": "mvp", "command": "cargo build --locked --release --target wasm32-unknown-unknown --manifest-path core/Cargo.toml" },
+  "workers_dev": false,
+  "r2_buckets": [{ "binding": "FRAGMENTS", "bucket_name": "lore-worker-mvp-local" }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "MUTABLE", "class_name": "MutablePartition" },
+      { "name": "CATALOG", "class_name": "RepositoryCatalog" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["MutablePartition", "RepositoryCatalog"] }],
+  "observability": { "enabled": true }
+}

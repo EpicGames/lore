@@ -1,0 +1,14 @@
+name = "lore-tcp-grpc-spike"
+main = "build/index.js"
+compatibility_date = "2026-09-02"
+compatibility_flags = ["new_module_registry"]
+workers_dev = false
+
+[build]
+command = "worker-build --emscripten --release"
+
+# This is a local listener. Public TCP ingress requires separate provisioning.
+[[connect]]
+protocol = "tcp"
+address = "127.0.0.1"
+port = 7000

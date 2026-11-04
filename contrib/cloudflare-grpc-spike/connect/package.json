@@ -1,0 +1,17 @@
+{
+  "name": "lore-connect-grpc-spike",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "protoc -I ../../../lore-proto/proto --plugin=protoc-gen-es=./node_modules/.bin/protoc-gen-es --es_out=src/gen --es_opt=target=js,import_extension=js lore/environment/v1/environment.proto lore/model/v1/model.proto lore/storage/v1/storage.proto lore/repository/v1/repository.proto lore/revision/v1/revision.proto"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "2.12.0",
+    "@connectrpc/connect": "2.1.1",
+    "@noble/hashes": "2.4.0",
+    "fzstd": "0.1.1"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.12.0"
+  }
+}

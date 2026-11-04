@@ -1,0 +1,29 @@
+[package]
+name = "lore-cloudflare-tcp-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+bytes = "1"
+h2 = "0.4"
+http = "1"
+js-sys = "0.3.107"
+tokio = { version = "1", default-features = false, features = ["rt", "macros", "net", "io-util"] }
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+worker = { git = "https://github.com/cloudflare/workers-rs", rev = "606f27fd93efc698f575ab7e84c6be66e5535468", features = ["experimental_tokio"] }
+
+[profile.release]
+opt-level = "s"
+
+# Match the experimental workers-rs incoming TCP example.
+[patch."https://github.com/guybedford/libc"]
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+[patch.crates-io]
+libc = { git = "https://github.com/rust-lang/libc", branch = "libc-0.2" }
+tokio = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+tokio-macros = { git = "https://github.com/guybedford/tokio", tag = "1.53.1-cf.emscripten" }
+mio = { git = "https://github.com/guybedford/mio", tag = "1.2.3-cf.emscripten" }

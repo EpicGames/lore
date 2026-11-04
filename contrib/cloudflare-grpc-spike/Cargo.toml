@@ -1,0 +1,27 @@
+[package]
+name = "lore-cloudflare-grpc-spike"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Keep this feasibility experiment independent of Lore's native workspace.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+futures-util = "0.3"
+prost = "0.14"
+worker = "0.8"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "logging", "ring"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = { version = "=0.14.6", default-features = false, features = ["codegen", "router", "server", "tls-native-roots", "tls-webpki-roots"] }
+tonic-prost = "=0.14.6"
+
+[build-dependencies]
+prost-build = "0.14"

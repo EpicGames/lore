@@ -106,10 +106,12 @@ carries_no_text!(
     f32,
     f64,
     bool,
-    crate::log::LoreLogLevel,
     crate::types::Address,
     crate::types::Context,
     crate::types::Hash,
     crate::types::KeyType,
     crate::types::Partition,
 );
+
+#[cfg(feature = "native")]
+carries_no_text!(crate::log::LoreLogLevel);

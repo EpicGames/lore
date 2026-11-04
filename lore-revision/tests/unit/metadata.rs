@@ -2,6 +2,38 @@
 // SPDX-License-Identifier: MIT
 use lore_revision::metadata::*;
 
+#[test]
+fn metadata_wire_format_and_replacement_order_are_stable() {
+    let mut metadata = Metadata::new();
+    metadata
+        .set_typed("a", b"one", MetadataType::String)
+        .unwrap();
+    metadata
+        .set_typed("b", &[1], MetadataType::Boolean)
+        .unwrap();
+    metadata
+        .set_typed("a", b"two", MetadataType::Binary)
+        .unwrap();
+    let expected = [
+        0x61, 0x74, 0x65, 0x6d, 1, 0, 0, 0, 1, 0, 0, 0, 3, 0, 0, 0, 255, 0, 0, 0, b'a', b't', b'w',
+        b'o', 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, b'b', 1,
+    ];
+    if cfg!(target_endian = "little") {
+        assert_eq!(&metadata.buffer[..], expected);
+    }
+    metadata
+        .set_typed("a", b"longer", MetadataType::String)
+        .unwrap();
+    let mut rewritten = Metadata::new();
+    rewritten
+        .set_typed("b", &[1], MetadataType::Boolean)
+        .unwrap();
+    rewritten
+        .set_typed("a", b"longer", MetadataType::String)
+        .unwrap();
+    assert_eq!(metadata.buffer, rewritten.buffer);
+}
+
 /// A number that names no type is refused rather than defaulted: a buffer
 /// carrying one was written by something that disagrees with this build
 /// about what tags mean, and guessing would hand the caller a value of the

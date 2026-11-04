@@ -1,0 +1,11 @@
+{
+  "name": "lore-connect-grpc-spike",
+  "main": "src/index.js",
+  "compatibility_date": "2026-10-08",
+  "build": { "command": "npm run generate" },
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "lore-connect.gasparina.work", "custom_domain": true }
+  ],
+  "observability": { "enabled": true }
+}

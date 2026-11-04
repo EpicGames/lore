@@ -15,7 +15,6 @@ use crate::Fragment;
 use crate::FragmentFlags;
 use crate::FragmentReference;
 use crate::Partition;
-use crate::TypedBytes;
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
 use crate::errors::Maintenance;
@@ -230,12 +229,7 @@ pub(crate) fn refuse_put(
 #[lore_macro::test_pub]
 #[inline]
 fn fragment_metadata_is_valid(fragment: &Fragment) -> bool {
-    fragment.flags & !FragmentFlags::all().bits() == 0
-        && fragment.flags
-            & FragmentFlags::PayloadCompressed.bits()
-            & !FRAGMENT_FLAGS_DEFINED_COMPRESSORS
-            == 0
-        && fragment_is_consistent(fragment)
+    lore_base::types::fragment_metadata_is_valid(fragment)
 }
 
 /// Whether nothing `fragment` says contradicts what this build knows, as one expression: no
@@ -359,58 +353,17 @@ pub fn validate_fragment_list(
 ) -> Result<(), StoreError> {
     debug_assert!(fragment.flags & FragmentFlags::PayloadFragmented.bits() != 0);
 
-    let ref_size = std::mem::size_of::<FragmentReference>();
-
-    if !(fragment.size_payload as usize).is_multiple_of(ref_size) {
-        return Err(StoreError::internal(format!(
-            "fragmented fragment size_payload {} is not a multiple of FragmentReference size {ref_size}",
-            fragment.size_payload
-        )));
-    }
-
-    if payload.len() != fragment.size_payload as usize {
-        return Err(StoreError::internal(format!(
-            "fragmented fragment payload length {} does not match size_payload {}",
-            payload.len(),
-            fragment.size_payload
-        )));
-    }
-
-    let aligned = payload.clone().to_aligned::<FragmentReference>();
-    let references = aligned.as_type_slice::<FragmentReference>();
-
-    if references.len() < 2 {
-        return Err(StoreError::internal(format!(
-            "fragmented fragment has fewer than 2 references ({})",
-            references.len()
-        )));
-    }
-
-    for i in 1..references.len() {
-        if references[i].offset_content <= references[i - 1].offset_content {
-            return Err(StoreError::internal(format!(
-                "fragmented fragment offsets are not strictly increasing at index {i}"
-            )));
-        }
-    }
-
-    let first = references[0].offset_content;
-    let last = references[references.len() - 1].offset_content;
-
-    let content_end = first.checked_add(fragment.size_content).ok_or_else(|| {
-        StoreError::internal(format!(
-            "fragmented fragment first offset {first} + size_content {} overflows u64",
-            fragment.size_content
-        ))
-    })?;
-
-    if last >= content_end {
-        return Err(StoreError::internal(format!(
-            "fragmented fragment last offset {last} is outside content window [{first}, {content_end})"
-        )));
-    }
-
-    Ok(())
+    use lore_base::types::FragmentListError;
+    lore_base::types::validate_fragment_reference_list(fragment, payload).map_err(|error| {
+        StoreError::internal(match error {
+            FragmentListError::SizeNotMultiple { size, reference_size } => format!("fragmented fragment size_payload {size} is not a multiple of FragmentReference size {reference_size}"),
+            FragmentListError::PayloadLength { length, size } => format!("fragmented fragment payload length {length} does not match size_payload {size}"),
+            FragmentListError::TooFew { count } => format!("fragmented fragment has fewer than 2 references ({count})"),
+            FragmentListError::OffsetsNotIncreasing { index } => format!("fragmented fragment offsets are not strictly increasing at index {index}"),
+            FragmentListError::WindowOverflow { first, size } => format!("fragmented fragment first offset {first} + size_content {size} overflows u64"),
+            FragmentListError::OffsetOutsideWindow { last, first, end } => format!("fragmented fragment last offset {last} is outside content window [{first}, {end})"),
+        })
+    })
 }
 
 pub struct BehaviorFlags {

@@ -326,6 +326,99 @@ pub struct FragmentReference {
     pub offset_content: u64,
 }
 
+/// The protocol ingress checks shared by the native storage server and
+/// platforms that cannot build the native storage/runtime dependencies.
+pub fn fragment_metadata_is_valid(fragment: &Fragment) -> bool {
+    let flags = fragment.flags;
+    let compressed = flags & FragmentFlags::PayloadCompressed.bits();
+    let defined_compressors = (FragmentFlags::PayloadCompressedLZ4
+        | FragmentFlags::PayloadCompressedOodle2
+        | FragmentFlags::PayloadCompressedZstd)
+        .bits();
+    let server_managed =
+        (FragmentFlags::PayloadObliteration | FragmentFlags::PayloadDoNotReplicate).bits();
+    let fragmented = flags & FragmentFlags::PayloadFragmented.bits() != 0;
+    let payload = u64::from(fragment.size_payload);
+    flags & !FragmentFlags::all().bits() == 0
+        && compressed & !defined_compressors == 0
+        && flags & server_managed == 0
+        && compressed & compressed.wrapping_sub(1) == 0
+        && (compressed == 0 || !fragmented)
+        && payload != 0
+        && payload <= FRAGMENT_SIZE_THRESHOLD as u64
+        && payload <= fragment.size_content
+        && (fragmented || fragment.size_content <= FRAGMENT_SIZE_THRESHOLD as u64)
+        && (compressed != 0 || fragmented || payload == fragment.size_content)
+}
+
+/// Errors reported when validating a fragmented ingress payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragmentListError {
+    SizeNotMultiple { size: u32, reference_size: usize },
+    PayloadLength { length: usize, size: u32 },
+    TooFew { count: usize },
+    OffsetsNotIncreasing { index: usize },
+    WindowOverflow { first: u64, size: u64 },
+    OffsetOutsideWindow { last: u64, first: u64, end: u64 },
+}
+
+/// Check the reference list of an already-validated fragmented ingress payload.
+/// Read the native-endian representation without requiring alignment, as the
+/// native `FragmentReference` representation does.
+pub fn validate_fragment_reference_list(
+    fragment: &Fragment,
+    payload: &[u8],
+) -> Result<(), FragmentListError> {
+    let reference_size = std::mem::size_of::<FragmentReference>();
+    if !(fragment.size_payload as usize).is_multiple_of(reference_size) {
+        return Err(FragmentListError::SizeNotMultiple {
+            size: fragment.size_payload,
+            reference_size,
+        });
+    }
+    if payload.len() != fragment.size_payload as usize {
+        return Err(FragmentListError::PayloadLength {
+            length: payload.len(),
+            size: fragment.size_payload,
+        });
+    }
+    if payload.len() / reference_size < 2 {
+        return Err(FragmentListError::TooFew {
+            count: payload.len() / reference_size,
+        });
+    }
+    let mut offsets = payload.chunks_exact(reference_size).map(|reference| {
+        u64::from_ne_bytes(
+            reference[32..40]
+                .try_into()
+                .expect("reference size checked"),
+        )
+    });
+    let first = offsets.next().expect("at least two references");
+    let mut previous = first;
+    for (index, next) in offsets.enumerate() {
+        if next <= previous {
+            return Err(FragmentListError::OffsetsNotIncreasing { index: index + 1 });
+        }
+        previous = next;
+    }
+    let end =
+        first
+            .checked_add(fragment.size_content)
+            .ok_or(FragmentListError::WindowOverflow {
+                first,
+                size: fragment.size_content,
+            })?;
+    if previous >= end {
+        return Err(FragmentListError::OffsetOutsideWindow {
+            last: previous,
+            first,
+            end,
+        });
+    }
+    Ok(())
+}
+
 /// Lightweight sanity validator for a [`Fragment`] received from a remote peer
 /// on the read path.
 ///
@@ -368,7 +461,7 @@ pub fn validate_fragment_response(fragment: &Fragment) -> Result<(), &'static st
     // single buffer on read (directly for uncompressed, via decompression
     // for compressed). Only fragmented reference lists legitimately point
     // at arbitrarily large content.
-    if !is_fragmented && (fragment.size_content as usize) > FRAGMENT_SIZE_THRESHOLD {
+    if !is_fragmented && fragment.size_content > FRAGMENT_SIZE_THRESHOLD as u64 {
         return Err(
             "non-fragmented fragment response size_content exceeds FRAGMENT_SIZE_THRESHOLD",
         );
@@ -669,6 +762,7 @@ impl AsRef<[u8]> for FragmentReference {
     }
 }
 
+#[cfg(feature = "native")]
 pub trait ZeroHeapAlloc<SelfType = Self>
 where
     SelfType: zerocopy::FromBytes,
@@ -693,6 +787,7 @@ where
     }
 }
 
+#[cfg(feature = "native")]
 pub trait CloneHeapAlloc: zerocopy::IntoBytes + zerocopy::Immutable {
     /// Heap this type's boxed clones are taken from, or `None` for the global
     /// allocator. Same contract as [`ZeroHeapAlloc::heap_allocator`].
@@ -1052,7 +1147,9 @@ impl<'de> Deserialize<'de> for Address {
     }
 }
 
+#[cfg(feature = "native")]
 impl ZeroHeapAlloc for Fragment {}
+#[cfg(feature = "native")]
 impl CloneHeapAlloc for Fragment {}
 
 impl From<Address> for AddressNotFound {
