@@ -3,9 +3,11 @@ lep: 2026-10-19-instance-move-and-delete
 title: Instance move and delete commands
 authors:
   - Matthew Hoffman
+  - Zack Neyland
 status: Accepted
 created: 2026-10-19
-updated: 2026-10-28
+updated: 2026-11-03
+discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1113
 ---
 
 # Instance move and delete commands
@@ -18,7 +20,9 @@ the instance on disk, or its virtual mount for an SWFS instance, and keeps the r
 commands support the global `--dry-run` flag, which runs the same validation without changing anything. They hold the
 repository's stores and directory lock only for their short registration steps, never while they rename or delete, so
 they also work on Windows, where a directory with open files cannot be renamed or deleted. When another reader has the
-instance's files open, they retry the rename or delete with backoff for a bounded time before failing.
+instance's files open, they retry the rename or delete with backoff for a bounded time before failing. Delete renames a
+regular instance's directory aside before removing it, so its path is free early, and removes it at background disk
+priority.
 
 ## Motivation
 
@@ -37,6 +41,10 @@ A command that does the work must also leave a usable state when it fails part-w
 `instance list` naming a path that holds nothing. A delete must work on Windows, where a process cannot delete a
 directory that holds files it still has open, such as the repository's lock and store files.
 
+A large instance also takes minutes to delete. An instance of millions of files is millions of unlinks, and at normal
+disk priority they compete with every interactive program on the machine for as long as the delete runs, while the
+instance's path stays occupied by a directory that is no longer an instance.
+
 ## Goals / Non-Goals
 
 ### Goals
@@ -50,6 +58,8 @@ directory that holds files it still has open, such as the repository's lock and 
 - Work on Windows.
 - Report configuration problems under the global `--dry-run` flag without changing the instance.
 - Behave the same when the service runs the command for a caller in another process, including for relative paths.
+- Free a deleted regular instance's path before its files are gone, and delete a large instance without holding the
+  disk from interactive programs.
 
 ### Non-Goals
 
@@ -72,10 +82,10 @@ The CLI gains two subcommands under `lore repository instance`:
 - `delete` deletes the instance named by `--repository`.
 
 The C API gains `lore_repository_instance_move` and `lore_repository_instance_delete`, each with an asynchronous
-variant. Each reports progress as events: `InstanceMoveBegin` and `InstanceMoveComplete` for a move, and
-`InstanceDeleteBegin`, `InstanceDeleteProgress` and `InstanceDeleteComplete` for a delete. The delete progress events
-carry a phase, exported in the header as `lore_instance_delete_phase_t` with the values
-`LORE_INSTANCE_DELETE_PHASE_DEREGISTERING`, `…_UNMOUNTING` and `…_DELETING_FILES`. The event types live in [
+variant. Each reports progress as events: `RepositoryInstanceMoveBegin` and `RepositoryInstanceMoveComplete` for a move, and
+`RepositoryInstanceDeleteBegin`, `RepositoryInstanceDeleteProgress` and `RepositoryInstanceDeleteComplete` for a delete. The delete progress events
+carry a phase, exported in the header as `lore_repository_instance_delete_phase_t` with the values
+`LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DEREGISTERING`, `…_UNMOUNTING` and `…_DELETING_FILES`. The event types live in [
 `instance.rs`](../../lore-revision/src/instance.rs).
 
 Neither command defines its own dry-run option. They honor the global `dry_run` setting, which the CLI exposes as
@@ -97,8 +107,8 @@ in it. A finished command in the service process can also keep the instance's st
 ten seconds by default. Rather than fail at once, each command reissues the file step that was refused, with
 exponential backoff, until the reader lets go or a fixed number of attempts is spent:
 
-- **The steps retried.** The rename of a regular instance's directory, and the removal of the instance directory or of
-  an SWFS instance's external directory. A removal that is reissued continues from what the previous attempt left. The
+- **The steps retried.** The rename of a regular instance's directory, by move or by delete's rename aside, and the
+  removal of the instance directory or of an SWFS instance's external directory. A removal that is reissued continues from what the previous attempt left. The
   SWFS remount is not a file operation and is not retried. The registration steps already wait for the per-path write
   token, and are not retried either.
 - **The errors retried.** Only errors that say the files are in use, so that the step can succeed once they are
@@ -146,17 +156,35 @@ The registration is written last, so a move that fails at step 3 leaves the inst
 ### Delete
 
 1. **Validate**, in dry-run and real mode alike: the working-directory check on Windows, the config and shared-store
-   check as in move, and for SWFS that the service is running and holds the instance mounted at its path.
+   check as in move, for SWFS that the service is running and holds the instance mounted at its path, and for a
+   regular instance whether its directory is a mount point and, where it is not, that the sibling name the rename
+   aside uses is free.
 2. **Deregister.** If the instance uses a shared store, the command opens the instance as a repository, removes its
    registration and anchor keys, flushes, and closes it. Deleting the directory removes a registry kept in the
    instance's own local store, so the command skips this step for such instances. The command closes the instance before
    it deletes anything, so no lock or store file is open.
 3. **Unmount** an SWFS instance, closing its interface.
 4. **Delete the files**: the external directory for an SWFS instance, the instance directory otherwise, retrying while
-   they are in use.
+   they are in use. A regular instance's directory is first renamed aside, to a sibling `<name>.deleting-<instance ID>`
+   in the same parent directory, where `<instance ID>` is the hex form of the identifier in `.lore/instance`, so its
+   path holds nothing as soon as the rename lands, and the command then deletes the sibling. The rename is retried
+   while the files are in use, like any rename here, and a rename still refused after the retries fails the delete
+   before anything is removed. Only where the instance directory is itself a mount point, which validation detects by
+   comparing the device of the directory with that of its parent (the volume serial number on Windows), does it delete
+   the directory in place, since no rename of a mount point can succeed.
+5. **Delete at background disk priority.** The thread that removes the files lowers its own disk priority for the
+   removal and restores it afterwards: `setiopolicy_np` with `IOPOL_THROTTLE` on macOS, `ioprio_set` at the lowest
+   best-effort level on Linux, and `THREAD_MODE_BACKGROUND_BEGIN` on Windows, which also lowers the thread's CPU and
+   memory priority. Where the system refuses, the removal runs at normal priority. An SWFS instance's external
+   directory is removed the same way.
+
+Measured on an instance of 5.0 million files, about 350 GB, on an Apple M3 Max with its internal SSD (APFS, macOS
+26.6), with a release build of a prototype and the tree outside Spotlight's index: five deletes took 330 to 445 s,
+while Lore commands in another instance and a build ran normally.
 
 The command removes the registration before the files. If the delete then fails, the error names what is left (the
-instance directory, or the SWFS external directory) and tells the user to delete it by hand. If the instance cannot be
+directory renamed aside, the instance directory where the rename was not possible, or the SWFS external directory) and
+tells the user to delete it by hand. If the instance cannot be
 opened to deregister it, the command stops before it changes anything.
 
 ### Unsaved work
@@ -182,8 +210,9 @@ Doing it right needs at least:
 ### Dry run
 
 Under the global `--dry-run` flag, each command runs its validation, emits its events, and stops. A move emits
-`InstanceMoveBegin` and `InstanceMoveComplete`. A delete emits `InstanceDeleteBegin` with its dry-run field set, the
-progress events for the steps it would take, and `InstanceDeleteComplete`. The CLI labels the output as a dry run.
+`RepositoryInstanceMoveBegin` and `RepositoryInstanceMoveComplete`. A delete emits `RepositoryInstanceDeleteBegin` with its dry-run field set, the
+progress events for the steps it would take, and `RepositoryInstanceDeleteComplete`. The CLI labels the output as a dry run. A dry
+run of a delete checks that the sibling name for the rename aside is free, and renames nothing.
 
 ## Compatibility
 
@@ -196,9 +225,17 @@ progress events for the steps it would take, and `InstanceDeleteComplete`. The C
 - **On-disk format** — N/A: the commands write the same registration records and anchor keys that `update-path` and
   `instance prune` already write. Delete zeroes those keys and leaves the old registration blob in the immutable store
   until store garbage collection.
-- **CLI and public API** — Adds the two subcommands and the C API functions and events described under Surface. Nothing
-  existing changes. The C header gains the `lore_instance_delete_phase_t` type and its values. It adds no unprefixed
-  identifiers.
+- **CLI and public API** — Adds the two subcommands and the C API functions and events described under Surface. The C
+  header gains the `lore_repository_instance_delete_phase_t` type and its values. It adds no unprefixed identifiers. The rename
+  aside changes what a caller of `instance delete`, which shipped in v0.12.0, observes. When the command returns, the
+  files are deleted as before, but the instance's path is free earlier, from the rename on. A delete that fails part
+  way leaves what remains under `<name>.deleting-<instance ID>` rather than at the instance's path, and the error names
+  that directory. The rename happens within the `DeletingFiles` phase, so the phases and events are unchanged. This is
+  not a breaking change: no call that succeeded before fails, and a caller that waits for the command still finds the
+  files gone when it returns.
+- **The `<name>.deleting-<instance ID>` name** — A new directory name beside the instance while a delete runs, visible to
+  a parent instance's status, to file watchers and to backup tools. Scripts that clean up after a failed delete can
+  rely on the name.
 
 ## Non-Functional Considerations
 
@@ -206,22 +243,33 @@ progress events for the steps it would take, and `InstanceDeleteComplete`. The C
   neither the repository lock nor a write token, so a command that opens the instance during a move or delete can race
   with it. Recording the path (move) and deregistering (delete) each take the per-path write token for their own short
   step. After deregistration releases the token and lock, a second process can open the instance before the files are
-  deleted. This proposal accepts that gap. See Unresolved Questions. A reader that only has files open while the rename
-  or delete runs delays it rather than failing it, for up to about fifteen seconds (see
+  deleted. For a regular instance the rename aside narrows that gap to the time between deregistration and the
+  rename: after the rename nothing is left at the path to open. A write command that opens the instance inside the gap
+  registers it again (`register_instance_and_migrate_anchors` in
+  [`repository.rs`](../../lore-revision/src/repository.rs)), and prune retires that registration once the path is
+  gone. On Linux and macOS, a process that already holds files of the instance open keeps them through the rename; on
+  Windows open files refuse the rename, which is retried. For an SWFS instance, and where the rename is not possible,
+  this proposal accepts the whole gap. A reader that only has files open while the rename or delete runs delays it
+  rather than failing it, for up to about fifteen seconds (see
   [Retrying while files are in use](#retrying-while-files-are-in-use)).
 - **Memory** — Preserved. The commands buffer only paths and registry records.
 - **Statelessness** — The service's mount manager is the only state the commands change: they add, remove and replace
-  its mounts for SWFS instances. Outside a service, the commands keep no state.
+  its mounts for SWFS instances. Outside a service, the commands keep no state. The background disk priority belongs to
+  the thread that removes the files, and that thread restores its earlier priority before it runs other work.
+- **Latency** — A delete at background priority runs longer when other programs use the disk, and the caller waits for
+  the whole removal, within the `DeletingFiles` phase.
 - **Determinism** — Preserved. The commands never change an instance's identifier or any history. The recorded path is
   the cleaned absolute form that `update-path` records.
 - **Durability and crash consistency** — A move and a delete are sequences of steps, not one atomic operation, and each
   registry write is flushed before the next step starts. A crash between a move's rename and its registration leaves the
   registry naming the old path, which `lore repository update-path` or `instance prune` repairs. A crash between a
-  delete's deregistration and its file deletion leaves files that nothing lists, which the user deletes by hand. A move
+  delete's deregistration and its file deletion leaves files that nothing lists, at the instance's path or under
+  `<name>.deleting-<instance ID>` beside it, which the user deletes by hand. A move
   writes the registration last, so a failure before the rename leaves it correct. A delete removes it first, so no
   failure leaves a registration for files that are gone.
 - **Availability** — A regular instance's files are unavailable only while the rename runs. An SWFS instance is
-  unmounted between the close of the old mount and the new mount, so reads of its files fail during that window.
+  unmounted between the close of the old mount and the new mount, so reads of its files fail during that window. A
+  deleted regular instance's path is empty from the rename aside on.
 
 ## Migration Plan
 
@@ -233,7 +281,11 @@ The commands add no new authority: they act on local files with the invoking use
 user can already change through `update-path` and `instance prune`.
 
 Delete removes the directory of the repository it opened, never a path read from the registry, so a crafted registry
-record cannot redirect it.
+record cannot redirect it. The sibling it renames that directory to is named from the hex form of the 16-byte
+instance identifier, so the name cannot climb out of the parent directory, and validation refuses a sibling name that
+is already taken. A directory created under that name after validation is one the rename replaces only where it is
+empty, as a rename onto an empty directory does on Linux and macOS, so a delete never removes entries it did not
+rename there.
 
 Both commands read one value from the repository directory itself: the instance identifier in `.lore/instance`. An
 instance counts as SWFS when an external directory exists for that identifier, but a directory can name any identifier.
@@ -282,8 +334,13 @@ from the immutable store. That blob stays until store garbage collection, as whe
 - **Risk:** A permission problem on Windows reports access denied, as an open file does, so a move or delete that can
   never succeed is reported only after the retries are spent. — *mitigation:* accepted. The delay is bounded, and only
   a step that would fail anyway pays it.
-- **Risk:** A second process opens the instance in the gap between deregistration and deletion. — *mitigation:*
-  accepted. See Unresolved Questions.
+- **Risk:** A second process opens the instance in the gap between deregistration and deletion, and registers it
+  again. — *mitigation:* the rename aside narrows the gap for a regular instance, and `instance prune` retires the
+  registration once the path is gone. Accepted for an SWFS instance, which has no directory at its path to rename, and
+  where the rename is not possible.
+- **Risk:** A crash or a failed delete leaves `<name>.deleting-<instance ID>` beside the instance's old path. —
+  *mitigation:* the instance is already deregistered, and the directory is plain files the user deletes by hand. The
+  error of a failed delete names it; after a crash, the name beside the old path says what it is.
 - **Risk:** A crafted `.lore/instance` file makes a command treat a checkout as another SWFS instance. —
   *mitigation:* both commands require the service to hold the directory's path as a mount of the instance the file
   names before they act on an SWFS instance, and fail otherwise. See Security Considerations.
@@ -300,6 +357,7 @@ from the immutable store. That blob stays until store garbage collection, as whe
 - Delete does not warn about uncommitted changes or unpushed commits, so it can destroy work that has not been saved.
 - A rename or delete that fails because the files are in use, or on Windows because access is denied, is reported only
   after about fifteen seconds of retries.
+- A delete at background disk priority takes longer on a busy machine, and the caller waits for all of it.
 
 ## Alternatives Considered
 
@@ -332,6 +390,29 @@ Make delete a plain directory removal and rely on a later prune to retire the re
 *Rejected because:* the deleted instance would stay listed until someone runs prune, and prune keeps an SWFS instance's
 external directory while the SWFS configuration remains.
 
+### Rename aside before deregistering
+
+Rename the directory first, then open it at the renamed path to remove its registration, which would close the gap
+for a regular instance.
+
+*Rejected because:* it changes the files before the registration step. A deregistration that fails, such as when the
+instance cannot be opened, would have to rename the directory back, and a rename back that fails leaves the instance
+registered at a path that holds nothing, the state this proposal orders its steps to avoid.
+
+### Delete in place at normal priority
+
+The behaviour before this amendment.
+
+*Rejected because:* the path stays occupied for the whole removal, minutes for a large instance, and the removal
+competes with interactive programs for the disk throughout.
+
+### Return before the files are deleted
+
+Rename aside, then remove the files in the background after the command returns.
+
+*Rejected because:* a caller could not tell when the space comes back or whether the removal failed, and a process
+that exits, such as the CLI, would stop the removal part way.
+
 ## Prior Art
 
 Git's [`git worktree move` and `git worktree remove`](https://git-scm.com/docs/git-worktree) relocate and delete a
@@ -341,8 +422,7 @@ a command that does the whole operation, plus a repair step for the manual path.
 
 ## Unresolved Questions
 
-- Should delete close the gap between deregistration and deletion, for example by renaming the instance directory aside
-  and deleting that? The rename would also fail early on Windows if another process has files open there. SWFS would
-  need a different approach.
-- Should a move across volumes copy and then delete, or keep failing with the manual-move instruction?
-- What does an older service report when it receives a command variant it does not know? See Compatibility.
+None. A move across volumes keeps failing with the manual-move instruction, as Non-Goals states. An older service
+sent a command variant it does not know fails to decode it and drops the connection, and the client reports "Lore
+service closed connection without sending a result" (`lore/src/remote/call.rs`); the handshake ADR-00025 proposes
+would turn that into a clear refusal.
