@@ -233,8 +233,8 @@ async fn a_name_is_held_only_in_the_case_variation_on_disk() {
     );
     assert_eq!(
         operation.holds_name_exactly(&relative("Test.file.")).await,
-        verdict(false),
-        "a trailing dot names a file that is not there"
+        Some(false),
+        "no node may be named with a trailing dot, so every platform holds it in no spelling"
     );
     assert_eq!(
         operation
@@ -844,6 +844,70 @@ async fn a_written_node_clears_an_executable_bit_it_does_not_carry() {
                 .mode();
             assert_eq!(mode & 0o777, 0o644, "the bit is cleared for everyone");
             assert_eq!(Some(false), info.executable());
+        })
+        .await;
+}
+
+/// An operation creates, writes and removes nothing at a path that reaches anywhere but an entry
+/// below its root on some platform: one that steps up, one that opens with a Windows drive, which
+/// on this platform names a place inside the root, and one that names the root itself.
+#[tokio::test]
+async fn an_operation_touches_nothing_at_a_path_that_leaves_its_root() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let root = dir.path().join("root");
+            std::fs::create_dir(&root).expect("create the root");
+            let operation = os_operation(&root).await;
+
+            let up = RelativePath::new().join("..").join("escape");
+            let drive = RelativePath::new().join("Q:").join("planted");
+            for (path, lands) in [(&up, dir.path().join("escape")), (&drive, root.join("Q:"))] {
+                assert!(
+                    operation
+                        .create_dir_all(path)
+                        .await
+                        .is_err_and(|err| err.is_invalid_path()),
+                    "{path} must be refused"
+                );
+                assert!(
+                    operation
+                        .write_file(path, bytes::Bytes::from_static(b"planted"))
+                        .await
+                        .is_err_and(|err| err.is_invalid_path()),
+                    "{path} must be refused"
+                );
+                assert!(!lands.exists(), "nothing lands at {}", lands.display());
+            }
+
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, b"kept").expect("write the file outside the root");
+            let kept = root.join("kept");
+            std::fs::write(&kept, b"kept").expect("write the file in the root");
+            let up = RelativePath::new().join("..").join("victim");
+            let itself = RelativePath::new().join(".");
+            assert!(
+                operation
+                    .remove(&up)
+                    .await
+                    .is_err_and(|err| err.is_invalid_path()),
+                "{up} must be refused"
+            );
+            assert!(
+                operation
+                    .remove_recursive(&itself)
+                    .await
+                    .is_err_and(|err| err.is_invalid_path()),
+                "{itself} must be refused"
+            );
+            for file in [&victim, &kept] {
+                assert_eq!(
+                    std::fs::read(file).expect("read the file"),
+                    b"kept",
+                    "{} is left as it was",
+                    file.display()
+                );
+            }
         })
         .await;
 }

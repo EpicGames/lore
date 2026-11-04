@@ -2906,7 +2906,8 @@ async fn merge_file_in_view(
         // the mergeable files from unresolvable conflicts
         let absolute_path = change_from
             .path()
-            .to_absolute_path(repository.require_path()?);
+            .to_absolute_path(repository.require_path()?)
+            .forward::<SyncError>("placing the merged file below the root")?;
         if has_theirs && operation.infer_is_diffable(change_to.path()).await? {
             lore_trace!(
                 "Merge identified text file for merge: {}",

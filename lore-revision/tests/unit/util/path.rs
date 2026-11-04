@@ -414,6 +414,70 @@ mod repository_relative_path {
     }
 }
 
+/// A path of `components`, joined without the checks a parsed path is held to, as a tree's names
+/// are.
+fn joined(components: &[&str]) -> RelativePath {
+    components
+        .iter()
+        .fold(RelativePath::new(), |path, component| path.join(component))
+}
+
+/// A path is placed below the root only where it names an entry below it on every platform, so
+/// one that starts at a root, or holds a component no node may be named, is refused.
+#[test]
+fn a_path_that_leaves_the_root_on_any_platform_has_no_absolute_path() {
+    let root = std::path::Path::new("root");
+    for components in [
+        &["C:"][..],
+        &["C:", "Temp", "planted.bat"],
+        &["C:.."],
+        &["a", "C:", "b"],
+        &["a", "C:x"],
+        &[".."],
+        &["a", ".."],
+        &["a", "..", "..", "escape"],
+        &["/etc", "passwd"],
+        &["a\\..\\..\\escape"],
+        &["."],
+        &["a", "..."],
+        &[" "],
+        &["a", "file::$DATA"],
+        &[".lore", "config.toml"],
+        &["sub", "LORE~1"],
+        &["sub.", "x"],
+        &["a", "name "],
+    ] {
+        let path = joined(components);
+        assert!(
+            path.to_absolute_path(root).is_err(),
+            "{path} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_path_below_the_root_has_the_absolute_path_it_names() {
+    let root = std::path::Path::new("root");
+    for components in [
+        &[][..],
+        &["a"],
+        &["a", "b.txt"],
+        &[".hidden"],
+        &["a..b"],
+        &[".loreignore"],
+        &["notes:draft"],
+        &["logs", "12:00.log"],
+        &["File::Spec.3pm"],
+    ] {
+        let path = joined(components);
+        assert_eq!(
+            path.to_absolute_path(root).expect("a path below the root"),
+            root.join(path.as_str()),
+            "{path}"
+        );
+    }
+}
+
 /// The lowercase view has to narrow with the one it mirrors, or a filter would fold a
 /// parent against a name the path no longer holds.
 #[test]
@@ -472,6 +536,38 @@ mod a_user_path_through_the_dot_directory {
     #[test]
     fn a_name_that_merely_begins_with_it_is_accepted() {
         for candidate in ["/a/b/.loreignore", "/a/b/.urcignore", "/a/b/.lorebak/x"] {
+            assert!(
+                RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_ok(),
+                "{candidate} must be accepted"
+            );
+        }
+    }
+
+    /// No node carries a name Windows reads as a drive, a stream alias or the dot directory, so
+    /// a user path through one is refused as the dot directory is, and one through any other
+    /// colon is a path like any other.
+    #[test]
+    fn is_refused_through_a_name_no_node_carries() {
+        for candidate in [
+            "/a/b/sub/C:",
+            "/a/b/sub/file::$DATA",
+            "/a/b/dir:$I30:$INDEX_ALLOCATION/x",
+            "/a/b/.lore./config.toml",
+            "/a/b/.lore:stream",
+            "/a/b/LORE~1/id",
+            "/a/b/sub./x",
+            "/a/b/name ",
+        ] {
+            assert!(
+                RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_err(),
+                "{candidate} must be refused"
+            );
+        }
+        for candidate in [
+            "/a/b/notes:draft",
+            "/a/b/logs/12:00.log",
+            "/a/b/File::Spec.3pm",
+        ] {
             assert!(
                 RelativePath::new_from_user_path(Path::new("/a/b"), candidate).is_ok(),
                 "{candidate} must be accepted"

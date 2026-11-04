@@ -85,8 +85,9 @@ pub struct OsOperation {
 impl OsOperation {
     /// Where `path` is on disk, under the root the operation was opened on -- the top-level
     /// repository every link and layer in it shares.
-    fn absolute(&self, path: &RelativePath) -> PathBuf {
+    fn absolute(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
         path.to_absolute_path(&self.filesystem_root)
+            .forward::<FsError>("placing a path below the filesystem root")
     }
 
     /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
@@ -95,7 +96,7 @@ impl OsOperation {
         &self,
         path: &RelativePath,
     ) -> Result<(), FsError> {
-        util::fs::unlink_recursive_keeping_repositories(&self.absolute(path)).await?;
+        util::fs::unlink_recursive_keeping_repositories(&self.absolute(path)?).await?;
         Ok(())
     }
 }
@@ -142,7 +143,7 @@ impl InstanceOperation for OsOperation {
     /// A path mid-deletion stats as `PermissionDenied` on Windows rather than
     /// `NotFound`, so both report a non-existent path.
     async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         match lore_io::IoDriver::global().stat(path).await {
             Ok(stat) => Ok(FileInfo::from_stat(&stat)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
@@ -162,14 +163,17 @@ impl InstanceOperation for OsOperation {
         self.file_info(path).await
     }
 
+    /// A path through a name no node may carry, which the root is refused for, is held in no
+    /// spelling.
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
-        lore_io::IoDriver::global()
-            .holds_name_exactly(self.absolute(path))
-            .await
+        let Ok(path) = self.absolute(path) else {
+            return Some(false);
+        };
+        lore_io::IoDriver::global().holds_name_exactly(path).await
     }
 
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
             OsDirectoryListing {
                 entries: lore_io::IoDriver::global().read_dir(path).await?,
@@ -181,7 +185,9 @@ impl InstanceOperation for OsOperation {
         &self,
         path: &RelativePath,
     ) -> Result<lore_storage::ContentSource<'static>, FsError> {
-        Ok(lore_storage::ContentSource::owned_file(self.absolute(path)))
+        Ok(lore_storage::ContentSource::owned_file(
+            self.absolute(path)?,
+        ))
     }
 
     /// Measures the file the operation's root holds at `path` against the stored object's own
@@ -202,7 +208,7 @@ impl InstanceOperation for OsOperation {
         previous_size: u64,
         established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
-        let source = lore_storage::ContentSource::owned_file(self.absolute(path));
+        let source = lore_storage::ContentSource::owned_file(self.absolute(path)?);
         let matched = crate::immutable::file_matches(
             repository,
             previous,
@@ -217,18 +223,18 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
-        util::fs::set_executable(self.absolute(path), None, executable).await?;
+        util::fs::set_executable(self.absolute(path)?, None, executable).await?;
         Ok(())
     }
 
     async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         lore_io::IoDriver::global().create_dir_all(path).await?;
         Ok(())
     }
 
     async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         lore_io::IoDriver::global()
             .write_file_bytes(path, contents, false)
             .await?;
@@ -236,26 +242,26 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
-        let (from, to) = (self.absolute(from), self.absolute(to));
+        let (from, to) = (self.absolute(from)?, self.absolute(to)?);
         rename_unifying(&from, &to).await?;
         Ok(())
     }
 
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         util::fs::unlink(path).await?;
         Ok(())
     }
 
     async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         util::fs::unlink_recursive(path).await?;
         Ok(())
     }
 
     async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
         lore_io::IoDriver::global()
-            .remove_dir(self.absolute(path))
+            .remove_dir(self.absolute(path)?)
             .await?;
         Ok(())
     }
@@ -273,7 +279,7 @@ impl InstanceOperation for OsOperation {
         node: &Node,
         path: &RelativePath,
     ) -> Result<FileInfo, FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         {
             let options = immutable::read_options_from_repository(&repository).creating_parent();
             let (_, written) =
@@ -292,7 +298,7 @@ impl InstanceOperation for OsOperation {
         address: Address,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         let options = immutable::read_options_from_repository(&repository);
         let (fragment, metadata) =
             write_addressed_content(repository, address, &path, options).await?;
@@ -305,7 +311,10 @@ impl InstanceOperation for OsOperation {
         destination_path: &RelativePath,
     ) -> Result<(), FsError> {
         lore_io::IoDriver::global()
-            .copy(self.absolute(source_path), self.absolute(destination_path))
+            .copy(
+                self.absolute(source_path)?,
+                self.absolute(destination_path)?,
+            )
             .await?;
         Ok(())
     }

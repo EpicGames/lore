@@ -221,7 +221,8 @@ async fn diff_filesystem_subtree_impl(
 ) -> Result<FilesystemDiffStats, StateError> {
     let absolute_path = ctx
         .filesystem_path
-        .to_absolute_path(ctx.from.repository.require_path()?);
+        .to_absolute_path(ctx.from.repository.require_path()?)
+        .forward::<StateError>("placing the walked directory below the root")?;
     let listing = if ctx.asks_path {
         match named_root(&ctx, absolute_path).await? {
             NamedRoot::Walk(states, listing) => {
@@ -1910,8 +1911,10 @@ async fn diff_filesystem_matched_directory(
         });
     let uncommitted = ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id();
     if uncommitted {
-        let probe = nested_probe
-            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+        let probe = ctx
+            .filesystem_path
+            .to_absolute_path_cached(repository_root, nested_probe)
+            .forward::<StateError>("placing the walked directory below the root")?;
         if is_nested_repository_root(probe, item.name.as_str()).await {
             lore_trace!("Discarding zombie entry for nested repository root {item_path}");
             return Ok(false);
@@ -2136,8 +2139,10 @@ async fn diff_filesystem_type_change(
     // directory holds none.
     let reports_without_node = !replacement.is_valid_node_id() && !ctx.intent.marks_dirty();
     let nested_root = is_directory && reports_without_node && {
-        let probe = nested_probe
-            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+        let probe = ctx
+            .filesystem_path
+            .to_absolute_path_cached(repository_root, nested_probe)
+            .forward::<StateError>("placing the walked directory below the root")?;
         is_nested_repository_root(probe, item.name.as_str()).await
     };
     if nested_root {
@@ -2602,8 +2607,10 @@ fn diff_filesystem_new_entries<'a>(
                     .await?;
                     continue 'new_file_iter;
                 }
-                let probe = nested_probe
-                    .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+                let probe = ctx
+                    .filesystem_path
+                    .to_absolute_path_cached(repository_root, nested_probe)
+                    .forward::<StateError>("placing the walked directory below the root")?;
                 if is_nested_repository_root(probe, file.name.as_str()).await {
                     lore_trace!("Skipping nested repository root {child_file_path}");
                     continue 'new_file_iter;

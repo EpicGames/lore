@@ -89,7 +89,8 @@ async fn write_working_file(
 ) {
     lore_io::IoDriver::global()
         .write_file_bytes(
-            path.to_absolute_path(repository.require_path().expect("working tree")),
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
             bytes::Bytes::copy_from_slice(content),
             false,
         )
@@ -349,7 +350,9 @@ async fn a_target_side_change_the_tree_already_holds_is_dropped() {
 /// The executable bit the working tree holds at `path`.
 #[cfg(target_family = "unix")]
 async fn working_executable(repository: &Arc<RepositoryContext>, path: &RelativePath) -> bool {
-    let absolute = path.to_absolute_path(repository.require_path().expect("working tree"));
+    let absolute = path
+        .to_absolute_path(repository.require_path().expect("working tree"))
+        .expect("a path below the root");
     let metadata = lore_io::IoDriver::global()
         .metadata(absolute)
         .await
@@ -361,7 +364,9 @@ async fn working_executable(repository: &Arc<RepositoryContext>, path: &Relative
 /// user running `chmod +x` leaves: a bit no revision gave the file.
 #[cfg(target_family = "unix")]
 async fn make_working_executable(repository: &Arc<RepositoryContext>, path: &RelativePath) {
-    let absolute = path.to_absolute_path(repository.require_path().expect("working tree"));
+    let absolute = path
+        .to_absolute_path(repository.require_path().expect("working tree"))
+        .expect("a path below the root");
     util::fs::metadata_set_executable(&absolute, None, true).await;
 }
 
@@ -699,7 +704,9 @@ async fn plugin_tree(repository: &Arc<RepositoryContext>, files: &[(&str, &[u8])
 async fn write_working_files(repository: &Arc<RepositoryContext>, files: &[(&str, &[u8])]) {
     for (path, content) in files {
         let path = relative(path);
-        let absolute = path.to_absolute_path(repository.require_path().unwrap());
+        let absolute = path
+            .to_absolute_path(repository.require_path().unwrap())
+            .expect("a path below the root");
         lore_io::IoDriver::global()
             .create_dir_all(absolute.parent().unwrap())
             .await
@@ -710,7 +717,11 @@ async fn write_working_files(repository: &Arc<RepositoryContext>, files: &[(&str
 
 async fn working_file(repository: &Arc<RepositoryContext>, path: &str) -> Vec<u8> {
     lore_io::IoDriver::global()
-        .read_file_bytes(relative(path).to_absolute_path(repository.require_path().unwrap()))
+        .read_file_bytes(
+            relative(path)
+                .to_absolute_path(repository.require_path().unwrap())
+                .expect("a path below the root"),
+        )
         .await
         .unwrap()
         .to_vec()
@@ -718,7 +729,11 @@ async fn working_file(repository: &Arc<RepositoryContext>, path: &str) -> Vec<u8
 
 async fn working_path_exists(repository: &Arc<RepositoryContext>, path: &str) -> bool {
     lore_io::IoDriver::global()
-        .metadata(relative(path).to_absolute_path(repository.require_path().unwrap()))
+        .metadata(
+            relative(path)
+                .to_absolute_path(repository.require_path().unwrap())
+                .expect("a path below the root"),
+        )
         .await
         .is_ok()
 }
@@ -1163,7 +1178,11 @@ async fn a_deleted_directory_keeps_entries_of_another_type_under_a_case_variant_
         let file = "Plugin/source";
         write_working_files(&repository, &[(VARIANT, &content), (file, b"mine")]).await;
         lore_io::IoDriver::global()
-            .create_dir_all(relative(directory).to_absolute_path(dir.path()))
+            .create_dir_all(
+                relative(directory)
+                    .to_absolute_path(dir.path())
+                    .expect("a path below the root"),
+            )
             .await
             .unwrap();
 

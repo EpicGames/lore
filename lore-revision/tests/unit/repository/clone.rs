@@ -20,12 +20,15 @@ use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::OsFilesystem;
 use lore_revision::node::BLOCK_NODE_COUNT;
 use lore_revision::node::Node;
+use lore_revision::node::NodeBlock;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::clone::*;
 use lore_revision::repository::prefetch::StopWhen;
 use lore_revision::stage::stage_single_node;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
+use lore_storage::hash::hash_string;
 use zerocopy::FromZeros;
 
 use crate::fs::filesystem_provider::setup_test_execution;
@@ -649,6 +652,89 @@ async fn clone_continues_after_a_missing_file() {
                 assert_eq!(std::fs::read(temp.path().join(name)).unwrap(), b"");
             }
             assert_eq!(stats.complete.file_complete.load(Ordering::Relaxed), 2);
+        })
+        .await;
+}
+
+/// A revision can hold a node named for a Windows drive, which a writer that skips the name rules
+/// stores. A clone skips the node, so nothing is created for it, and writes its siblings. On
+/// Windows the name would take the path out of the working tree.
+#[tokio::test]
+async fn a_clone_skips_a_node_named_for_a_drive() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-drive-name-");
+            let repository = working_tree_repository(temp.path()).await;
+            let empty_file = Node {
+                address: Default::default(),
+                ..file_node(b"")
+            };
+            let state = State::new();
+            for (name, node) in [
+                ("alpha", empty_file),
+                ("drive", empty_directory_node()),
+                ("omega", empty_file),
+            ] {
+                stage_single_node(
+                    repository.clone(),
+                    state.clone(),
+                    relative_path(name),
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::Full,
+                )
+                .await
+                .expect("stage the node");
+            }
+
+            let planted = state
+                .find_subnode(repository.clone(), ROOT_NODE, hash_string("drive"))
+                .await
+                .expect("the placeholder resolves");
+            let block_index = NodeBlock::index(planted);
+            let block = state
+                .block_with_nametable(repository.clone(), block_index)
+                .await
+                .expect("the block reads back");
+            {
+                let mut writer = block.write();
+                let node = writer.node(Node::index(planted));
+                let (offset, length) = (node.name_offset, node.name_length);
+                node.name_hash = hash_string("C:");
+                let (offset, length) = writer
+                    .node_name_store_unchecked("C:", offset, length)
+                    .expect("the unchecked store accepts the name");
+                let node = writer.node(Node::index(planted));
+                node.name_offset = offset;
+                node.name_length = length;
+                writer.mark_dirty();
+            }
+            state.block_modified(block, block_index);
+
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+            clone_in_path(ctx)
+                .await
+                .expect("clone past the planted node");
+
+            let mut names: Vec<_> = std::fs::read_dir(temp.path())
+                .expect("list the working tree")
+                .map(|entry| entry.expect("an entry").file_name())
+                .filter(|name| name != ".lore")
+                .collect();
+            names.sort();
+            assert_eq!(names, ["alpha", "omega"]);
         })
         .await;
 }

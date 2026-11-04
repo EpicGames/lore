@@ -258,7 +258,8 @@ async fn write_working_file(
     let path = lore_revision::util::path::RelativePathBuf::new().push_and_freeze(name);
     lore_io::IoDriver::global()
         .write_file_bytes(
-            path.to_absolute_path(repository.require_path().expect("working tree")),
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
             bytes::Bytes::copy_from_slice(content),
             false,
         )
@@ -308,7 +309,10 @@ async fn what_one_comparison_established_answers_the_next() {
     ));
 
     lore_io::IoDriver::global()
-        .remove_file(path.to_absolute_path(repository.require_path().expect("working tree")))
+        .remove_file(
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
+        )
         .await
         .expect("remove working file");
 
@@ -360,7 +364,10 @@ async fn a_file_removed_between_comparisons_reads_as_unreadable() {
     ));
 
     lore_io::IoDriver::global()
-        .remove_file(path.to_absolute_path(repository.require_path().expect("working tree")))
+        .remove_file(
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
+        )
         .await
         .expect("remove working file");
 
@@ -457,7 +464,8 @@ async fn an_unfragmented_file_is_decided_by_its_own_hash() {
     edited[content.len() / 2] ^= 0xff;
     lore_io::IoDriver::global()
         .write_file_bytes(
-            path.to_absolute_path(repository.require_path().expect("working tree")),
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
             bytes::Bytes::from(edited),
             false,
         )

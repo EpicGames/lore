@@ -950,7 +950,9 @@ impl StageDescent {
             absolute_path: if base.path.is_empty() {
                 repository_root.to_path_buf()
             } else {
-                base.path.to_absolute_path(repository_root)
+                base.path
+                    .to_absolute_path(repository_root)
+                    .forward::<StageError>("placing the staged path below the root")?
             },
             states: base.repository.filter.exclusion_states(&relative_path),
             relative_path,

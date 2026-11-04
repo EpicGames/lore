@@ -23,13 +23,32 @@ use lore_storage::hash::hash_string;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_store_create;
 
-/// The repository's own directory, in the spellings a filesystem that folds case treats as one.
-const RESERVED_NAMES: [&str; 8] = [
-    ".urc", ".URC", ".Urc", ".uRC", ".lore", ".LORE", ".Lore", ".lOrE",
+/// The repository's own directory, in the spellings a filesystem that folds case treats as one,
+/// and in those Windows resolves to it: with trailing dots and spaces, as its 8.3 short name, and
+/// with a stream after a colon.
+const RESERVED_NAMES: [&str; 18] = [
+    ".urc",
+    ".URC",
+    ".Urc",
+    ".uRC",
+    ".lore",
+    ".LORE",
+    ".Lore",
+    ".lOrE",
+    ".lore.",
+    ".LORE ",
+    ".lore. .",
+    ".urc..",
+    "LORE~1",
+    "lore~2",
+    "Urc~1",
+    "lore~1.",
+    ".lore:stream",
+    "LORE~1:x",
 ];
 
 /// Names that share a prefix, a suffix or every letter with a reserved one without being it.
-const UNRESERVED_NAMES: [&str; 10] = [
+const UNRESERVED_NAMES: [&str; 17] = [
     ".urcignore",
     ".loreignore",
     "urc",
@@ -40,10 +59,17 @@ const UNRESERVED_NAMES: [&str; 10] = [
     ".lore.bak",
     "..urc",
     ".ｕrc",
+    "lore.x",
+    "lore~",
+    "lore~x",
+    "lore~1x",
+    "xlore~1",
+    ".lore~1",
+    "lore:x",
 ];
 
 #[test]
-fn the_reserved_names_are_matched_in_any_ascii_case() {
+fn the_reserved_names_are_matched_in_every_spelling() {
     for name in RESERVED_NAMES {
         assert!(is_reserved_node_name(name), "{name:?} is reserved");
     }

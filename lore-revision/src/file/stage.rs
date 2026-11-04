@@ -1281,7 +1281,10 @@ pub async fn stage_move(
         // Make sure the target parent node exist
         let mut parent_path = to_path.clone();
         parent_path.pop();
-        let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
+        let parent_absolute_path =
+            parent_path
+                .to_absolute_path(repository.require_path()?)
+                .forward::<StageError>("placing the move target's parent below the root")?;
         lore_debug!(
             "New parent node path: {}/ ({})",
             parent_path,

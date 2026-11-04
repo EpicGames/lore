@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
+use lore_base::error::InvalidPath;
 use lore_base::error::LocalModifications;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
@@ -48,6 +49,7 @@ use crate::util::path::RelativePath;
 pub enum FsError {
     FileNotFound,
     InvalidArguments,
+    InvalidPath,
     LocalModifications,
 }
 

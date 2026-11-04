@@ -982,14 +982,18 @@ mod tests {
     #[test]
     fn to_absolute_path_basic() {
         let path = RelativePath::new_from_initial_path("foo/bar").unwrap();
-        let abs = path.to_absolute_path("/repo");
+        let abs = path
+            .to_absolute_path("/repo")
+            .expect("a path below the root");
         assert_eq!(abs, Path::new("/repo/foo/bar"));
     }
 
     #[test]
     fn to_absolute_path_empty() {
         let path = RelativePath::new();
-        let abs = path.to_absolute_path("/repo");
+        let abs = path
+            .to_absolute_path("/repo")
+            .expect("a path below the root");
         assert_eq!(abs, Path::new("/repo/"));
     }
 

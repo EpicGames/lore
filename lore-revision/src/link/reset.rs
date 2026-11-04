@@ -36,7 +36,9 @@ pub(crate) async fn reset_staged_add_link(
         node: link_node_id,
     } = at;
     let link_id = staged_link_node.linked_node().repository;
-    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
+    let absolute_path = link_path
+        .to_absolute_path(repository.require_path()?)
+        .forward::<LinkError>("placing the link below the root")?;
     let dry_run = execution_context().globals().dry_run();
 
     if !dry_run {

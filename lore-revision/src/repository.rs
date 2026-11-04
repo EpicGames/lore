@@ -1457,14 +1457,51 @@ pub const SERVICE: &str = "service";
 pub const DOT_URCIGNORE: &str = ".urcignore";
 pub const DOT_LOREIGNORE: &str = ".loreignore";
 
-/// Whether `name` is the repository's own directory, in any ASCII case.
+/// Whether `name` is the repository's own directory: in any ASCII case, with the trailing dots and
+/// spaces Windows drops, as the 8.3 short name Windows gives it, such as `LORE~1`, or with a stream
+/// of it after a colon, such as `.lore::$INDEX_ALLOCATION`.
 ///
 /// No node carries such a name: a writer refuses it, a per-node read refuses it, and a walk
 /// skips the node, so content in a revision never stands in for the control directory, on a
 /// filesystem that folds case as much as on one that does not.
+///
+/// Every such spelling opens with the directory's name or its short name, so a name opening with
+/// neither is answered from its first bytes.
 #[inline]
 pub fn is_reserved_node_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(DOT_URC) || name.eq_ignore_ascii_case(DOT_LORE)
+    let name = name.as_bytes();
+    [DOT_URC, DOT_LORE].into_iter().any(|dot| {
+        strip_prefix_ignore_ascii_case(name, dot.as_bytes())
+            .or_else(|| strip_short_name(name, dot.trim_start_matches('.').as_bytes()))
+            .is_some_and(names_the_stem_on_windows)
+    })
+}
+
+/// `name` past `prefix`, which it opens with in any ASCII case.
+fn strip_prefix_ignore_ascii_case<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let (head, tail) = name.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(tail)
+}
+
+/// `name` past the 8.3 short name Windows makes from `stem`, which it opens with: the stem, a
+/// tilde and a number, in any ASCII case.
+fn strip_short_name<'a>(name: &'a [u8], stem: &[u8]) -> Option<&'a [u8]> {
+    let tail = strip_prefix_ignore_ascii_case(name, stem)?.strip_prefix(b"~")?;
+    let digits = tail.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    (digits > 0).then_some(&tail[digits..])
+}
+
+/// Whether Windows reads a name ending in `tail` as the name before it, or as a stream of it:
+/// `tail` is dots and spaces, then anything after a colon.
+fn names_the_stem_on_windows(tail: &[u8]) -> bool {
+    for &byte in tail {
+        match byte {
+            b':' => return true,
+            b'.' | b' ' => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 pub const SALT_URC: &[u8] = b"urc";

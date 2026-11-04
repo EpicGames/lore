@@ -43,6 +43,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
 use crate::state::State;
 use crate::state::StateError;
+use crate::util::path::resolves_elsewhere;
 
 /// Identifier of a node within a revision tree.
 pub type NodeID = u32;
@@ -1105,10 +1106,11 @@ pub enum NodeNameError {
     Oversized,
 }
 
-/// The content rules a name is held to on both the read and the write path: no traversal, no
-/// separator, no leading NUL, and not the repository's own directory in any ASCII case.
+/// The content rules a name is held to on both the read and the write path, alike on every
+/// platform: nothing a filesystem resolves elsewhere, no leading NUL, and not the repository's own
+/// directory in any spelling.
 fn validate_node_name(name: &str) -> Result<(), NodeNameError> {
-    if name == ".." || name.starts_with('\0') || name.bytes().any(|b| b == b'/' || b == b'\\') {
+    if name.starts_with('\0') || resolves_elsewhere(name) {
         return Err(InvalidArguments {
             reason: format!("invalid node name: {name}"),
         }

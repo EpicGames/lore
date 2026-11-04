@@ -18,6 +18,71 @@ pub enum PathError {
     InvalidPath,
 }
 
+/// Whether `text` opens with a drive designator, a character and a colon, which Windows reads as
+/// a drive, absolute or relative to that drive's current directory.
+pub fn starts_with_drive(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some() && chars.next() == Some(':')
+}
+
+/// Whether a filesystem on some platform resolves `name` to somewhere other than an entry of its
+/// own: across a separator; to a drive, where it opens with a character and a colon; or, on
+/// Windows, to another entry, where it ends in a dot or a space, which Windows drops, or in a
+/// colon, or names a `$` stream type, as `a.` and `a::$DATA` name the file `a` and `...` the
+/// directory holding it.
+///
+/// Any other colon opens a named stream of a file beside it on NTFS, or a name NTFS refuses.
+pub fn resolves_elsewhere(name: &str) -> bool {
+    let mut scan = NameScan::default();
+    name.bytes().any(|byte| scan.refuses(byte)) || refuses_ends(name)
+}
+
+/// Whether `path`, joined below a directory, reaches anywhere but an entry below it on some
+/// platform: from a root, or through a component no node may be named, one that
+/// [`resolves_elsewhere`] or that is the repository's own directory.
+fn leaves_its_root(path: &str) -> bool {
+    if path.starts_with('/') {
+        return true;
+    }
+    let mut start = 0;
+    let mut scan = NameScan::default();
+    for (index, byte) in path.bytes().chain(*b"/").enumerate() {
+        if byte == b'/' {
+            let component = &path[start..index];
+            if refuses_ends(component) || is_reserved_node_name(component) {
+                return true;
+            }
+            scan = NameScan::default();
+            start = index + 1;
+        } else if scan.refuses(byte) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the ends of `name` make it resolve elsewhere: a drive at its start, or a dot, a space
+/// or a colon at its end.
+fn refuses_ends(name: &str) -> bool {
+    starts_with_drive(name) || matches!(name.as_bytes().last(), Some(b'.' | b' ' | b':'))
+}
+
+/// One pass over a name's bytes, answering [`resolves_elsewhere`] for what lies between its ends.
+#[derive(Default)]
+struct NameScan {
+    after_colon: bool,
+}
+
+impl NameScan {
+    /// Takes the name's next byte, and answers whether that byte makes the name resolve
+    /// elsewhere: a separator, or a `$` after a colon.
+    fn refuses(&mut self, byte: u8) -> bool {
+        let refused = byte == b'/' || byte == b'\\' || (self.after_colon && byte == b'$');
+        self.after_colon = byte == b':';
+        refused
+    }
+}
+
 /// Resolves `path` against the working directory of the call in progress, or
 /// against this process's own when the call did not name one.
 ///
@@ -81,8 +146,8 @@ pub fn is_path_inside_repository(repository_path: &Path, candidate: &str) -> boo
 /// root, or through a dot directory at any depth, which holds a repository's own state rather
 /// than content the tree tracks.
 ///
-/// The dot directory is matched in any ASCII case, as it is on a filesystem that folds case. A
-/// path that cannot be resolved is held nowhere either. A caller dispatching on this reaches such
+/// The dot directory is matched in every spelling [`is_reserved_node_name`] answers for, such as
+/// `.LORE` on a filesystem that folds case. A path that cannot be resolved is held nowhere either. A caller dispatching on this reaches such
 /// a path directly, which asks nothing of the repository.
 pub fn repository_relative_path(repository_path: &Path, candidate: &str) -> Option<RelativePath> {
     RelativePath::new_from_user_path(repository_path, candidate).ok()
@@ -630,8 +695,36 @@ impl RelativePath {
         RelativePathBuf::relative_to_root(repository_path, mount_path).map(|p| p.freeze())
     }
 
-    pub fn to_absolute_path(&self, repository_path: impl AsRef<Path>) -> PathBuf {
-        repository_path.as_ref().join(self.as_str())
+    /// Where the path is below `repository_path`.
+    ///
+    /// Refuses a path that reaches anywhere else on some platform, whatever names a tree let in:
+    /// one that starts at a root, and one through a component no node may be named, such as a
+    /// step up, a drive or the repository's own directory.
+    pub fn to_absolute_path(
+        &self,
+        repository_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, PathError> {
+        let path = self.as_str();
+        if leaves_its_root(path) {
+            return Err(InvalidPath {
+                path: path.to_owned(),
+            }
+            .into());
+        }
+        Ok(repository_path.as_ref().join(path))
+    }
+
+    /// [`Self::to_absolute_path`], held in `cache` and placed there only where `cache` holds
+    /// none, so a walk that never asks for it allocates nothing.
+    pub fn to_absolute_path_cached<'a>(
+        &self,
+        repository_path: &Path,
+        cache: &'a mut Option<PathBuf>,
+    ) -> Result<&'a mut PathBuf, PathError> {
+        match cache {
+            Some(path) => Ok(path),
+            None => Ok(cache.insert(self.to_absolute_path(repository_path)?)),
+        }
     }
 
     pub fn join(&self, suffix: impl AsRef<str>) -> RelativePath {
@@ -1108,14 +1201,13 @@ impl RelativePathBuf {
     /// and the canonical separator are what nearly every path already holds, and
     /// establishing that costs no string of its own.
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePathBuf, PathError> {
-        let name = name.as_ref();
-        if name.len() >= 2 && name.as_bytes()[1] == b':' {
+        let name = name.as_ref().trim_matches('/');
+        if starts_with_drive(name) {
             return Err(InvalidPath {
                 path: name.to_string(),
             }
             .into());
         }
-        let name = name.trim_matches('/');
         let name = if name.contains('\\') || name.contains("//") {
             let mut rewritten = name.replace('\\', "/");
             collapse_separators(&mut rewritten);
@@ -1159,15 +1251,20 @@ impl RelativePathBuf {
     /// Construct from a user-provided path relative to a repository path.
     /// Makes the user path absolute if needed, then computes the relative portion.
     ///
-    /// A path through the repository's own directory, in any ASCII case and at any depth, is an
-    /// invalid path: no node carries that name, so the tree holds nothing there, and a lookup by
-    /// it would otherwise reach a node a revision holds under that name.
+    /// A path through the repository's own directory, in any spelling and at any depth, or
+    /// through a name a filesystem resolves elsewhere, such as a drive, is an invalid path: no
+    /// node carries such a name, so the tree holds nothing there, and a lookup by it would
+    /// otherwise reach a node a revision holds under that name.
     pub fn new_from_user_path(
         repository_path: &Path,
         user_path: &str,
     ) -> Result<RelativePathBuf, PathError> {
         let path = Self::relative_to_root(repository_path, user_path)?;
-        if path.path.split('/').any(is_reserved_node_name) {
+        if path
+            .path
+            .split('/')
+            .any(|name| is_reserved_node_name(name) || resolves_elsewhere(name))
+        {
             return Err(InvalidPath { path: path.path }.into());
         }
         Ok(path)

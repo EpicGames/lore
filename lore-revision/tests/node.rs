@@ -422,9 +422,17 @@ mod tests {
     }
 
     /// Names no writer may store. `node_name_store` is the enforcement point, so
-    /// none of these can reach a name table through the API at all.
-    const PATH_TRAVERSAL_NAMES: [&str; 9] = [
+    /// none of these can reach a name table through the API at all. A name ending
+    /// in a dot, a space or a colon, a drive and a stream type are refused on every
+    /// platform: on Windows they name another file, the directory holding them, or
+    /// a place outside the working tree.
+    const PATH_TRAVERSAL_NAMES: [&str; 24] = [
         "..",
+        ".",
+        "...",
+        " ",
+        ". .",
+        ".. ",
         "../something",
         "..\\something",
         "/etc/passwd",
@@ -433,6 +441,16 @@ mod tests {
         "a/b",
         "a/",
         "a/\\..",
+        "C:",
+        "c:..",
+        "C:x",
+        "file:",
+        "file.",
+        "name ",
+        "file: .",
+        "file::$DATA",
+        "dir:$I30:$INDEX_ALLOCATION",
+        ".lore::$INDEX_ALLOCATION",
     ];
 
     #[test]
@@ -481,7 +499,16 @@ mod tests {
 
     #[test]
     fn node_name_accepts_valid_names() {
-        let valid_names = ["valid_file.txt", ".hidden", "...", ".", "a", "hello world"];
+        let valid_names = [
+            "valid_file.txt",
+            ".hidden",
+            "a",
+            "a.b",
+            "hello world",
+            "notes:draft",
+            "12:00.log",
+            "File::Spec.3pm",
+        ];
 
         for name in &valid_names {
             let block = NodeBlock::new_zeroed();

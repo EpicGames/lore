@@ -688,8 +688,8 @@ fn make_removable(absolute_path: &Path) -> crate::BoxFuture<'_, ()> {
 }
 
 /// Removes what `absolute_path` holds as [`unlink_recursive`] does, but keeps each nested
-/// repository in it, a directory holding `.lore`, and each entry named `.lore` or `.urc`, as
-/// [`is_reserved_node_name`] answers, with the directories leading to them. A legacy `.urc` is no
+/// repository in it, a directory holding `.lore`, and each entry [`is_reserved_node_name`] answers
+/// for, such as `.lore` or `.urc`, with the directories leading to them. A legacy `.urc` is no
 /// boundary, as `state::is_nested_repository_root` describes, so the entries beside it go. A failed
 /// removal is retried once after [`make_removable`].
 pub async fn unlink_recursive_keeping_repositories(absolute_path: &Path) -> tokio::io::Result<()> {

@@ -1549,7 +1549,8 @@ async fn purge_path(
         }
         let mut parent = relative_path
             .parent_path()
-            .to_absolute_path(repository_root);
+            .to_absolute_path(repository_root)
+            .forward::<ResetError>("placing the purged path's parent below the root")?;
         if state::is_nested_repository_root(&mut parent, relative_path.name()).await {
             lore_trace!("Leaving nested repository {relative_path} in place");
             return Ok(());
@@ -1941,8 +1942,9 @@ async fn reset_walk_directory(
 /// `node_children_names` names the children the revision holds, each of them settled by the
 /// walk already, restored or, where the view excludes it, removed. It is sorted here to be
 /// matched against each filesystem entry by binary search. The temporary file a write in progress
-/// holds beside a child the revision holds is left alone. An entry named `.lore` or `.urc`, and a
-/// nested repository, a directory holding `.lore`, are left in place at any depth, with the
+/// holds beside a child the revision holds is left alone. An entry [`is_reserved_node_name`]
+/// answers for, such as `.lore` or `.urc`, and a nested repository, a directory holding `.lore`,
+/// are left in place at any depth, with the
 /// directories leading to them. What stands at a layer mount
 /// is left to the layer's own walk, whatever its kind, and a directory on the way to one is
 /// purged around it.
@@ -2023,8 +2025,16 @@ async fn purge_untracked_children(
             continue;
         }
         if is_directory {
-            let probe =
-                probe.get_or_insert_with(|| directory_path.to_absolute_path(repository_root));
+            let probe = match directory_path
+                .to_absolute_path_cached(repository_root, &mut probe)
+                .forward::<ResetError>("placing the purged directory below the root")
+            {
+                Ok(probe) => probe,
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            };
             if state::is_nested_repository_root(probe, name).await {
                 lore_trace!("Leaving nested repository {child_path} in place");
                 continue;
