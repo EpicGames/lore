@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use lore_base::error::AddressNotFound;
+use lore_base::error::Disconnected;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
@@ -55,6 +56,22 @@ fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
 
     assert!(error.is_address_not_found(), "{error:?}");
     assert!(error.translated() == LoreError::AddressNotFound);
+}
+
+/// An offer the peer refuses onto a branch holding revisions the local history does not is a
+/// divergence. Any other failure keeps its own variant.
+#[test]
+fn a_refused_offer_is_divergent_only_onto_a_diverged_branch() {
+    let refused = || PushError::internal("remote rejected the request");
+
+    let error = refused_offer(refused(), true);
+    assert!(error.is_divergent(), "{error:?}");
+
+    let error = refused_offer(refused(), false);
+    assert!(error.is_internal(), "{error:?}");
+
+    let error = refused_offer(PushError::from(Disconnected), true);
+    assert!(error.is_disconnected(), "{error:?}");
 }
 
 /// What the push does with a fragment is decided entirely by the status byte the peer answered

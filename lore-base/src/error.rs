@@ -273,6 +273,16 @@ pub struct MountsBusy {
     pub paths: String,
 }
 
+#[derive(Debug, Clone, Error, FfiError)]
+#[error(
+    "Can't push the link at {path} (branch {branch}): the remote branch has newer revisions than yours"
+)]
+#[ffi_code(52)]
+pub struct LinkDivergent {
+    pub path: String,
+    pub branch: String,
+}
+
 // ---------------------------------------------------------------------------
 // Already exists (56–63)
 //

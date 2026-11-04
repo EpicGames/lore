@@ -191,6 +191,15 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             MountsBusy { paths: text() }.ffi_code(),
         ),
         (
+            "LinkDivergent",
+            Group::RepositoryState,
+            LinkDivergent {
+                path: text(),
+                branch: text(),
+            }
+            .ffi_code(),
+        ),
+        (
             "AlreadyLinked",
             Group::AlreadyExists,
             AlreadyLinked.ffi_code(),

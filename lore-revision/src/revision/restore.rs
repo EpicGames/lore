@@ -522,7 +522,7 @@ pub(crate) async fn restore(
             execution_context().push_stats(),
         )
         .await
-        .forward::<RestoreError>("querying missing fragments from server")?;
+        .forward_any::<RestoreError>("querying missing fragments from server")?;
 
         let mut push_task = lore_spawn!({
             let repository = repository.clone();
@@ -544,7 +544,7 @@ pub(crate) async fn restore(
                 }
             }
         };
-        result.forward::<RestoreError>("pushing fragments to remote")?;
+        result.forward_any::<RestoreError>("pushing fragments to remote")?;
 
         LoreEvent::RevisionRestoreFragmentEnd(LoreRevisionRestoreFragmentEndEventData {
             fragments: stats.complete(),

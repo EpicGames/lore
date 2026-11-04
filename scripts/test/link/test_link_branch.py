@@ -3,6 +3,7 @@
 import re
 
 import pytest
+from error_types import LinkDivergedError
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
@@ -746,6 +747,27 @@ def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
         "Push must report the parent as neither a link nor a layer, the layer as "
         f"a layer, and the link as a link, got {kinds}"
     )
+
+
+@pytest.mark.smoke
+def test_link_push_onto_a_moved_link_branch_fails_as_diverged(new_lore_repo):
+    """A link push onto a linked branch that moved on fails as a diverged link.
+
+    Linked `main` moves on from another clone, so the commit made through the
+    mount is not a fast-forward of it.
+    """
+    parent, link_repo = make_parent_with_link(new_lore_repo)
+    link_repo.clone().write_commit_push(
+        "Move linked main", {"linked.txt": "moved on upstream\n"}
+    )
+
+    mounted_file = f"{DEFAULT_LINK_MOUNT}/linked.txt"
+    parent.write_files({mounted_file: "edited through the mount\n"})
+    parent.stage(mounted_file)
+    parent.commit("Edit through the mount")
+
+    with pytest.raises(LinkDivergedError):
+        parent.push()
 
 
 @pytest.mark.smoke

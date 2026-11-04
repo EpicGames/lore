@@ -4510,7 +4510,7 @@ async fn merge_into_link(
             execution_context().push_stats(),
         )
         .await
-        .forward::<MergeError>("querying fragments")?;
+        .forward_any::<MergeError>("querying fragments")?;
 
         push_fragments(
             repository.clone(),
@@ -4519,7 +4519,7 @@ async fn merge_into_link(
             stats,
         )
         .await
-        .forward::<MergeError>("pushing fragments")?;
+        .forward_any::<MergeError>("pushing fragments")?;
 
         let response = revision_protocol
             .branch_push(target_branch, signature, false, false)
@@ -4881,7 +4881,7 @@ pub async fn merge_into(
             execution_context().push_stats(),
         )
         .await
-        .forward::<MergeError>("querying fragments")?;
+        .forward_any::<MergeError>("querying fragments")?;
 
         let mut push_task = lore_spawn!({
             let repository = repository.clone();
@@ -4903,7 +4903,7 @@ pub async fn merge_into(
                 }
             }
         };
-        result.forward::<MergeError>("pushing fragments")?;
+        result.forward_any::<MergeError>("pushing fragments")?;
 
         LoreEvent::BranchMergeIntoFragmentEnd(LoreBranchMergeIntoFragmentEndEventData {
             fragments: stats.complete(),

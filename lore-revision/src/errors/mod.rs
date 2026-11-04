@@ -42,6 +42,7 @@ pub(crate) use lore_base::error::InvalidArguments;
 pub(crate) use lore_base::error::InvalidNodeHierarchy;
 pub(crate) use lore_base::error::InvalidPath;
 pub(crate) use lore_base::error::LayerNotFound;
+pub(crate) use lore_base::error::LinkDivergent;
 pub(crate) use lore_base::error::LinkNotFound;
 pub(crate) use lore_base::error::LinkPathNotFound;
 pub(crate) use lore_base::error::LocalModifications;
