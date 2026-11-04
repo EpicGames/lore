@@ -6,8 +6,8 @@ use std::sync::LazyLock;
 
 use parking_lot::RwLock;
 
-use crate::fs::swfs::mount_manager::MountManager;
-use crate::fs::swfs::mount_manager::MountManagerError;
+use crate::fs::mount_manager::MountManager;
+use crate::fs::mount_manager::MountManagerError;
 
 static MOUNT_MANAGER_STATE: LazyLock<RwLock<MountManagerState>> =
     LazyLock::new(|| RwLock::new(MountManagerState::make_global()));

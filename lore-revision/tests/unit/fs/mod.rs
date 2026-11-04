@@ -3,6 +3,7 @@
 
 pub(crate) mod filesystem_provider;
 mod hold;
+mod mount_manager;
 mod os;
 mod realize;
 mod swfs;

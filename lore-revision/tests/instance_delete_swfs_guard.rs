@@ -11,7 +11,7 @@ use std::sync::Arc;
 use lore_base::env::CallEnvironment;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
-use lore_revision::fs::swfs::mount_manager_state::MountManagerState;
+use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::external_dir::external_lore_dir;
 use lore_revision::instance::InstanceId;
 use lore_revision::instance::instance_delete;

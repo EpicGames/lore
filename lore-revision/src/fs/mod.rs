@@ -8,6 +8,8 @@
 pub mod filesystem_provider;
 pub mod hold;
 pub mod invalid_filesystem_provider;
+pub mod mount_manager;
+pub mod mount_manager_state;
 pub mod os;
 pub mod realize;
 pub mod swfs;

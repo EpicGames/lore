@@ -12,7 +12,7 @@ use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::event::LoreServiceMessageEventData;
 use lore_revision::event::LoreServiceStatusEventData;
-use lore_revision::fs::swfs::mount_manager_state::MountManagerState;
+use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;

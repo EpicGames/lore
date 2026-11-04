@@ -9,7 +9,7 @@ use std::path::Path;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_base::test_util::TempFile;
-use lore_revision::fs::swfs::mount_manager::MountManager;
+use lore_revision::fs::mount_manager::MountManager;
 use lore_revision::global::external_dir::external_dir_for_instance;
 use lore_revision::instance::InstanceId;
 use lore_revision::instance::register_instance;

@@ -33,7 +33,7 @@ use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event::EventError;
-use crate::fs::swfs::mount_manager_state::MountManagerState;
+use crate::fs::mount_manager_state::MountManagerState;
 use crate::global::external_dir::check_for_external_lore_dir;
 use crate::global::external_dir::external_dir_for_instance;
 use crate::hash;
@@ -1187,7 +1187,7 @@ fn require_own_mount(
     is_swfs: bool,
     path: &str,
     action: &str,
-) -> Result<Option<Arc<crate::fs::swfs::mount_manager::MountManager>>, InstanceError> {
+) -> Result<Option<Arc<crate::fs::mount_manager::MountManager>>, InstanceError> {
     let mount_manager = MountManagerState::mount_manager();
     let mounted = match &mount_manager {
         Some(mount_manager) => mount_manager

@@ -34,7 +34,7 @@ directory being an ordinary one.
 Neither procedure is available for an SWFS instance. An SWFS instance keeps its `.lore` in an external directory under
 the global data directory (see [`external_dir.rs`](../../lore-revision/src/global/external_dir.rs)), and its checkout
 path is a virtual mount owned by the Lore service (see [
-`mount_manager.rs`](../../lore-revision/src/fs/swfs/mount_manager.rs)). There is no directory for the user to move or
+`mount_manager.rs`](../../lore-revision/src/fs/mount_manager.rs)). There is no directory for the user to move or
 delete, and moving the registered path alone leaves SWFS mounted at the old path.
 
 A command that does the work must also leave a usable state when it fails part-way. A failed move must not leave

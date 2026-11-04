@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-License-Identifier: MIT
+
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;

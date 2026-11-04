@@ -149,6 +149,7 @@ mod swfs_impl {
 
     use super::*;
     use crate::event::LoreErrorDetail;
+    use crate::fs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::api_interface::swfs_api::SWFSCallbacks;
     use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
     use crate::fs::swfs::api_interface::swfs_api::SWFSHandle;
@@ -163,7 +164,6 @@ mod swfs_impl {
     use crate::fs::swfs::api_interface::swfs_api::swfsIsBusy;
     use crate::fs::swfs::api_interface::swfs_api::swfsThaw;
     use crate::fs::swfs::file::SwfsFileArray;
-    use crate::fs::swfs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::mount_resources::MountResources;
     use crate::fs::swfs::mount_resources::SwfsWorkError;
     use crate::fs::swfs::paths::SwfsPath;

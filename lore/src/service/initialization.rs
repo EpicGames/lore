@@ -9,7 +9,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
 use lore_revision::event::LoreErrorDetail;
-use lore_revision::fs::swfs::mount_manager_state::MountManagerState;
+use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::lore::execution_context;
 use lore_revision::service_state::ServiceStateImpl;
 

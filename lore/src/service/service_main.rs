@@ -10,7 +10,7 @@ use lore_base::lore_spawn_blocking;
 use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
 use lore_revision::event::EventError;
-use lore_revision::fs::swfs::mount_manager_state::MountManagerState;
+use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::service_state::ServiceStateImpl;
 
 use crate::interface::LoreGlobalArgs;
