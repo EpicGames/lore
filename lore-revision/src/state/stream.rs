@@ -44,6 +44,10 @@ pub(crate) async fn emit(
 /// taking them one at a time is for; a walk held to one at a time spends its parallelism waiting.
 const CHANGE_LOOKAHEAD: NonZeroUsize = NonZeroUsize::new(1000).expect("a nonzero literal");
 
+/// How many changes [`ChangeStream::collect`] gathers per chunk. A power of two, so the first
+/// chunk, grown by doubling, ends at exactly this capacity.
+const COLLECT_CHUNK: usize = 1 << 16;
+
 /// The changes a diff finds, as it finds them, and what the walk reports once it ends.
 ///
 /// Owns the walk as well as its output. Dropping this closes the channel, so the walk unwinds at
@@ -121,13 +125,33 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
     /// Drains as the walk produces, so the lookahead never holds a walk against a caller that is
     /// collecting. A caller that wants what the walk reported reads the changes with
     /// [`next`](Self::next) and then asks [`finish`](Self::finish).
+    ///
+    /// The changes are gathered in chunks of [`COLLECT_CHUNK`] and moved into one list of exactly
+    /// their number once the walk ends. A list grown by doubling holds up to twice the changes'
+    /// size, and three times it while it moves to its last allocation; a tree of millions of
+    /// files makes that gigabytes.
     pub async fn collect(self) -> Result<Vec<NodeChange>, StateError> {
         let ChangeStream { mut changes, walk } = self;
-        let mut collected = Vec::new();
+        let mut full_chunks: Vec<Vec<NodeChange>> = Vec::new();
+        let mut chunk = Vec::new();
         while let Some(change) = changes.recv().await {
-            collected.push(change);
+            if chunk.len() == COLLECT_CHUNK {
+                full_chunks.push(std::mem::replace(
+                    &mut chunk,
+                    Vec::with_capacity(COLLECT_CHUNK),
+                ));
+            }
+            chunk.push(change);
         }
         joined(walk).await?;
+        if full_chunks.is_empty() {
+            return Ok(chunk);
+        }
+        let mut collected = Vec::with_capacity(full_chunks.len() * COLLECT_CHUNK + chunk.len());
+        for full_chunk in full_chunks {
+            collected.extend(full_chunk);
+        }
+        collected.extend(chunk);
         Ok(collected)
     }
 

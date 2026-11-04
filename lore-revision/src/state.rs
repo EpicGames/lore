@@ -9596,8 +9596,10 @@ impl HierarchyLevel {
 /// steps from.
 ///
 /// Descent is an explicit stack of [`HierarchyLevel`] rather than a box per node, so the walk runs
-/// at a fixed call depth. Changes are emitted depth first in sibling order: a directory's change
-/// precedes its level, and its next sibling follows once that level is done.
+/// at a fixed call depth. A child directory is handed to a task of its own while
+/// [`hierarchy_task_semaphore`] allows, so a hierarchy of millions of nodes is walked on every core
+/// rather than one; once the budget is spent, the levels stack here as before. A directory's change
+/// precedes everything below it, but siblings walked by different tasks interleave.
 ///
 /// Children are named on one path buffer, which holds the path of the directory being walked and
 /// keeps [`RelativePath::COMPONENT_ROOM`] free beyond it. A child's name is a read lock on its node
@@ -9641,73 +9643,160 @@ fn add_change_hierarchy(
             Err(err) => return Err(err),
         }
 
-        let mut path = side
-            .mapping
-            .path
-            .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
-        let mut levels = vec![HierarchyLevel::open(side, side.mapping.node, false, states).await?];
-        while let Some(level) = levels.last_mut() {
-            let Some((child_id, child_node, child_name)) = level.children.next().await? else {
-                if levels.pop().is_some_and(|done| done.appended) {
-                    path.pop();
-                }
-                continue;
-            };
-            let appended = !child_name.is_empty();
-            path.push(child_name);
-            let filter = &side.mapping.repository.filter;
-            let mode = filter
-                .tracked_mode(
-                    level.states,
-                    &path,
-                    child_node.is_directory(),
-                    filter_mode,
-                    async || {
-                        side.mapping
-                            .state
-                            .holds_tracked_change(
-                                &side.mapping.repository,
-                                child_id,
-                                NodeFlags::from_bits_retain(child_node.flags),
-                            )
-                            .await
-                    },
-                )
-                .await?;
-            let (child_states, excluded) =
-                filter.child_emit_excludes(level.states, &path, child_node.is_directory(), mode);
+        // Walked in a helper so an early `?` still joins the tasks it spawned.
+        let mut tasks = JoinSet::new();
+        let walked = walk_hierarchy(
+            side,
+            other,
+            action,
+            changes,
+            filter_mode,
+            states,
+            &mut tasks,
+        )
+        .await;
+        let joined = lore_base::lore_drain_tasks!(tasks, StateError::internal("Task failure"));
+        walked.and(joined)
+    }
+}
 
-            if !excluded {
-                let child_path = path.clone().freeze();
-                emit(changes, || {
-                    let absent = other.invalid(child_path.clone());
-                    let child = side.from_child(child_id, &child_node, child_path);
-                    let (from, to) = match action {
-                        FileAction::Delete => (child, absent),
-                        _ => (absent, child),
-                    };
-                    NodeChange {
-                        action,
-                        flags: compute_change_flags(&child_node),
-                        from,
-                        to,
-                    }
-                })
-                .await?;
-            }
+/// Budget for hierarchy walks live at once beyond the one each caller awaits: one per worker thread.
+///
+/// Its own budget rather than the diff walk's. A hierarchy walk holds the node blocks of every
+/// level it stands in, and walks beyond the workers only park holding them: deleting a 5M-entry
+/// tree took 73 s on one task and 12.9 s on 16, with the same peak, while 32 tasks
+/// were no faster and held 0.7 GB more, and the diff walk's 1000 held 2.3 GB more.
+static HIERARCHY_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-            // TODO(UCS-11623): Check if the target link repository has no local changes - if so,
-            // do not iterate and show each link file as added. Otherwise, recurse in and compare
-            // against file system and/or staged state in link
-            if !excluded && child_node.is_directory() {
-                levels.push(HierarchyLevel::open(side, child_id, appended, child_states).await?);
-                path.reserve(1 + RelativePath::COMPONENT_ROOM);
-            } else if appended {
+fn hierarchy_task_semaphore() -> &'static Arc<Semaphore> {
+    HIERARCHY_TASK_SEMAPHORE.get_or_init(|| {
+        Arc::new(Semaphore::new(
+            lore_base::runtime::default_worker_threads().max(1),
+        ))
+    })
+}
+
+/// [`add_change_hierarchy`] for the directory `from` or `to` names, in a task of its own holding
+/// `permit` from [`hierarchy_task_semaphore`].
+///
+/// Boxed, since the walk it runs spawns more of these.
+#[allow(clippy::too_many_arguments)]
+fn spawned_hierarchy(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    action: change::FileAction,
+    changes: ChangeSender,
+    filter_mode: FilterMode,
+    states: FilterStates,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send>> {
+    Box::pin(async move {
+        let result = add_change_hierarchy(from, to, action, &changes, filter_mode, states).await;
+        drop(permit);
+        result
+    })
+}
+
+/// The walk of [`add_change_hierarchy`] below `side`, spawning into `tasks`.
+#[allow(clippy::too_many_arguments)]
+async fn walk_hierarchy(
+    side: &NodeChangeState,
+    other: &NodeChangeState,
+    action: change::FileAction,
+    changes: &ChangeSender,
+    filter_mode: FilterMode,
+    states: FilterStates,
+    tasks: &mut JoinSet<Result<(), StateError>>,
+) -> Result<(), StateError> {
+    let mut path = side
+        .mapping
+        .path
+        .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
+    let mut levels = vec![HierarchyLevel::open(side, side.mapping.node, false, states).await?];
+    while let Some(level) = levels.last_mut() {
+        let Some((child_id, child_node, child_name)) = level.children.next().await? else {
+            if levels.pop().is_some_and(|done| done.appended) {
                 path.pop();
             }
+            continue;
+        };
+        let appended = !child_name.is_empty();
+        path.push(child_name);
+        let filter = &side.mapping.repository.filter;
+        let mode = filter
+            .tracked_mode(
+                level.states,
+                &path,
+                child_node.is_directory(),
+                filter_mode,
+                async || {
+                    side.mapping
+                        .state
+                        .holds_tracked_change(
+                            &side.mapping.repository,
+                            child_id,
+                            NodeFlags::from_bits_retain(child_node.flags),
+                        )
+                        .await
+                },
+            )
+            .await?;
+        let (child_states, excluded) =
+            filter.child_emit_excludes(level.states, &path, child_node.is_directory(), mode);
+
+        if !excluded {
+            let child_path = path.clone().freeze();
+            emit(changes, || {
+                let absent = other.invalid(child_path.clone());
+                let child = side.from_child(child_id, &child_node, child_path);
+                let (from, to) = match action {
+                    FileAction::Delete => (child, absent),
+                    _ => (absent, child),
+                };
+                NodeChange {
+                    action,
+                    flags: compute_change_flags(&child_node),
+                    from,
+                    to,
+                }
+            })
+            .await?;
         }
-        Ok(())
+
+        // TODO(UCS-11623): Check if the target link repository has no local changes - if so,
+        // do not iterate and show each link file as added. Otherwise, recurse in and compare
+        // against file system and/or staged state in link
+        if !excluded && child_node.is_directory() {
+            if let Ok(permit) = hierarchy_task_semaphore().clone().try_acquire_owned() {
+                let child = side.from_child(child_id, &child_node, path.clone().freeze());
+                let absent = other.invalid(child.mapping.path.clone());
+                let (from, to) = match action {
+                    FileAction::Delete => (child, absent),
+                    _ => (absent, child),
+                };
+                let changes = changes.clone();
+                lore_spawn!(
+                    tasks,
+                    spawned_hierarchy(from, to, action, changes, filter_mode, child_states, permit)
+                );
+                if appended {
+                    path.pop();
+                }
+            } else {
+                levels.push(HierarchyLevel::open(side, child_id, appended, child_states).await?);
+                path.reserve(1 + RelativePath::COMPONENT_ROOM);
+            }
+        } else if appended {
+            path.pop();
+        }
+        while let Some(joined) = tasks.try_join_next() {
+            joined
+                .internal("Task failure")
+                .map_err(StateError::from)
+                .flatten()?;
+        }
     }
+    Ok(())
 }
 
 fn node_discard_recurse<F>(

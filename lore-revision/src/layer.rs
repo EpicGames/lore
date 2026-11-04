@@ -1045,7 +1045,8 @@ async fn sync_in_operation(
         sync::sync_verify_filesystem(
             repository_target.clone(),
             Arc::new(sync::SyncVerifyArgs {
-                changes: changes.clone(),
+                // Moved in, so verification filters it in place.
+                changes,
                 repository_current,
                 operation: operation.clone(),
                 current: current_tree,

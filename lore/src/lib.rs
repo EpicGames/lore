@@ -26,6 +26,8 @@ pub mod storage;
 mod util;
 
 use interface::LoreString;
+pub use lore_base::allocator::memory_stats_requested;
+pub use lore_base::allocator::memory_summary;
 pub use lore_base::lore_spawn;
 pub use lore_base::lore_spawn_blocking;
 pub use lore_base::version::LORE_LIBRARY_VERSION;

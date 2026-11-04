@@ -1784,13 +1784,42 @@ async fn diff_in_order(
         .collect()
 }
 
-/// A directory added or deleted as a whole is emitted depth first along each sibling chain,
-/// and a link below it is emitted without what it holds.
+/// Asserts that `emitted` holds what `expected` names, as often, and names every directory
+/// before what it holds. A path named twice, as an unnamed directory is under its parent's
+/// name, is held to that at its first.
 ///
-/// Adding a node prepends it, so each level's chain is the reverse of the order its children
-/// are added in here.
+/// A hierarchy is walked by several tasks at once, so siblings come in no fixed order.
+fn assert_emitted_parents_first(
+    emitted: Vec<(FileAction, String)>,
+    expected: &[(FileAction, String)],
+    message: &str,
+) {
+    let by_path = |changes: &mut Vec<(FileAction, String)>| {
+        changes.sort_by(|lhs, rhs| (&lhs.1, lhs.0 as u16).cmp(&(&rhs.1, rhs.0 as u16)));
+    };
+    let mut sorted = emitted.clone();
+    by_path(&mut sorted);
+    let mut wanted = expected.to_vec();
+    by_path(&mut wanted);
+    assert_eq!(sorted, wanted, "{message}");
+    for (index, (_, path)) in emitted.iter().enumerate() {
+        if emitted[..index].iter().any(|(_, earlier)| earlier == path) {
+            continue;
+        }
+        let below = format!("{path}/");
+        assert!(
+            emitted[..index]
+                .iter()
+                .all(|(_, earlier)| !earlier.starts_with(&below)),
+            "{message}: {path} came after something it holds, in {emitted:?}"
+        );
+    }
+}
+
+/// A directory added or deleted as a whole is emitted before what it holds, and a link below
+/// it is emitted without what it holds.
 #[tokio::test]
-async fn a_hierarchy_is_emitted_depth_first_along_each_sibling_chain() {
+async fn a_hierarchy_is_emitted_parents_first() {
     let repository = null_repository().await;
     let empty = State::new();
     let tree = State::new();
@@ -1838,10 +1867,12 @@ async fn a_hierarchy_is_emitted_depth_first_along_each_sibling_chain() {
             .iter()
             .map(|path| (action, path.to_string()))
             .collect();
-        assert_eq!(
+        assert_emitted_parents_first(
             diff_in_order(repository.clone(), from, to).await,
-            expected,
-            "a {action:?} emits each directory before what it holds, and nothing a link holds"
+            &expected,
+            &format!(
+                "a {action:?} emits each directory before what it holds, and nothing a link holds"
+            ),
         );
     }
 }
@@ -1894,10 +1925,10 @@ async fn siblings_after_an_excluded_or_unnamed_child_are_named_under_their_paren
     .iter()
     .map(|path| (FileAction::Add, path.to_string()))
     .collect();
-    assert_eq!(
+    assert_emitted_parents_first(
         diff_in_order(repository, State::new(), tree).await,
-        expected,
-        "nothing under the excluded directory is emitted, and every sibling keeps the prefix"
+        &expected,
+        "nothing under the excluded directory is emitted, and every sibling keeps the prefix",
     );
 }
 

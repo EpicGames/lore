@@ -78,6 +78,25 @@ static STANDARD_ALLOCATOR: std::alloc::System = std::alloc::System;
 /// allocation through the global allocator, unless an external allocator was set before it.
 static TRACKING_ALLOCATIONS: AtomicU8 = AtomicU8::new(0);
 
+/// Tracking bit for counting the bytes held and their peak, which `LORE_MEMORY_STATS` sets. Counts
+/// what callers request through the global allocator, whichever allocator serves it, so it reports
+/// under rpmalloc as well, whose own statistics are compiled out of release builds. The `GrowVec`
+/// and node block heaps are allocated from directly, and [`memory_summary`] reports them apart.
+const MEASURE: u8 = 4;
+static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PEAK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn measure_add(size: usize) {
+    let live = LIVE_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
+}
+
+#[inline]
+fn measure_sub(size: usize) {
+    LIVE_BYTES.fetch_sub(size, Ordering::Relaxed);
+}
+
 pub fn set_external_allocator(allocator: ExternalAllocator) -> bool {
     let mut was_set = false;
     let extern_allocator = EXTERN_ALLOCATOR.get_or_init(|| {
@@ -90,11 +109,28 @@ pub fn set_external_allocator(allocator: ExternalAllocator) -> bool {
             was_set = true;
             extern_allocator
         });
+        // Selected before any allocation, so every byte counted as held is also counted freed.
+        if was_set {
+            measure_from_environment();
+        }
     }
     was_set
 }
 
+/// Sets [`MEASURE`] where `LORE_MEMORY_STATS` asks for it, when the global allocator is selected:
+/// counting from the first allocation keeps what is freed within what was counted as held. Reads
+/// the environment without allocating.
+fn measure_from_environment() {
+    unsafe {
+        let measure = libc::getenv(c"LORE_MEMORY_STATS".as_ptr().cast());
+        if !measure.is_null() && *measure != 0 && libc::strcmp(measure, c"0".as_ptr().cast()) != 0 {
+            TRACKING_ALLOCATIONS.fetch_or(MEASURE, Ordering::Relaxed);
+        }
+    }
+}
+
 fn default_allocator() -> &'static (dyn GlobalAlloc + Sync) {
+    measure_from_environment();
     unsafe {
         let allocator = libc::getenv(c"LORE_ALLOCATOR".as_ptr().cast());
         if !allocator.is_null() && !libc::strstr(allocator, c"tracking".as_ptr().cast()).is_null() {
@@ -192,6 +228,45 @@ pub fn node_block_allocator_stats() -> RpmallocHeapStatistics {
     }
 }
 
+/// Whether `LORE_MEMORY_STATS` asks for memory reports: at each sync phase and when a command ends.
+///
+/// The allocator is rpmalloc, whose memory the operating system's malloc tools (`heap`, Instruments,
+/// `MallocStackLogging`) do not see, so this is how a run reports what it used. For call stacks, run
+/// with `LORE_ALLOCATOR=system` under those tools, or with `LORE_ALLOCATOR=tracking`.
+pub fn memory_stats_requested() -> bool {
+    static REQUESTED: OnceLock<bool> = OnceLock::new();
+    *REQUESTED.get_or_init(|| {
+        std::env::var_os("LORE_MEMORY_STATS").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+/// One line describing what the allocator and its dedicated heaps hold now, and the global
+/// allocator's peak, in MiB.
+///
+/// Under `LORE_ALLOCATOR=system` or an external allocator rpmalloc holds nothing and the figures are
+/// zero; the process's resident size is what the operating system reports then.
+pub fn memory_summary() -> String {
+    const MIB: usize = 1024 * 1024;
+    let global = rpmalloc_global_stats();
+    let growvec = growvec::memory_stats();
+    let node_blocks = node_block_allocator_stats();
+    format!(
+        "memory: held {} MiB (peak {}); rpmalloc active {} MiB (peak {}), mapped {} MiB (peak {}), committed {} MiB, huge allocations peak {} MiB, heaps {}; growvec used {} MiB of {} MiB allocated; node blocks {} MiB allocated",
+        LIVE_BYTES.load(Ordering::Relaxed) / MIB,
+        PEAK_BYTES.load(Ordering::Relaxed) / MIB,
+        global.active / MIB,
+        global.active_peak / MIB,
+        global.mapped / MIB,
+        global.mapped_peak / MIB,
+        global.committed / MIB,
+        global.huge_alloc_peak / MIB,
+        global.heap_count,
+        growvec.used_bytes / MIB,
+        growvec.allocated_bytes / MIB,
+        node_blocks.allocated_bytes / MIB,
+    )
+}
+
 pub fn rpmalloc_global_stats() -> RpmallocGlobalStatistics {
     let mut stats = RpmallocGlobalStatistics::default();
     unsafe {
@@ -211,13 +286,22 @@ unsafe impl GlobalAlloc for LoreAllocator {
         };
         let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
         if tracking != 0 && !ptr.is_null() {
-            tracking::track_alloc(tracking, ptr, layout.size());
+            if (tracking & MEASURE) != 0 {
+                measure_add(layout.size());
+            }
+            if (tracking & !MEASURE) != 0 {
+                tracking::track_alloc(tracking, ptr, layout.size());
+            }
         }
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if (TRACKING_ALLOCATIONS.load(Ordering::Relaxed) & tracking::TRACK) != 0 && !ptr.is_null() {
+        let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
+        if (tracking & MEASURE) != 0 && !ptr.is_null() {
+            measure_sub(layout.size());
+        }
+        if (tracking & tracking::TRACK) != 0 && !ptr.is_null() {
             tracking::track_dealloc(ptr);
         }
         unsafe {
@@ -235,7 +319,12 @@ unsafe impl GlobalAlloc for LoreAllocator {
         };
         let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
         if tracking != 0 && !ptr.is_null() {
-            tracking::track_alloc(tracking, ptr, layout.size());
+            if (tracking & MEASURE) != 0 {
+                measure_add(layout.size());
+            }
+            if (tracking & !MEASURE) != 0 {
+                tracking::track_alloc(tracking, ptr, layout.size());
+            }
         }
         ptr
     }
@@ -247,7 +336,11 @@ unsafe impl GlobalAlloc for LoreAllocator {
                 .realloc(ptr, layout, new_size)
         };
         let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
-        if tracking != 0 {
+        if (tracking & MEASURE) != 0 && !new_ptr.is_null() {
+            measure_add(new_size);
+            measure_sub(layout.size());
+        }
+        if (tracking & !MEASURE) != 0 {
             tracking::track_realloc(tracking, ptr, new_ptr, layout.size());
         }
         new_ptr

@@ -252,12 +252,22 @@ pub async fn realize_state(
     let force = globals.force();
     let dry_run = globals.dry_run();
 
+    if lore_base::allocator::memory_stats_requested() {
+        lore_debug!(
+            "After the delta, {} changes: {}",
+            changes.len(),
+            lore_base::allocator::memory_summary()
+        );
+    }
+
     let options = Arc::new(options);
     let changes = Arc::new(changes);
     let changes = if !changes.is_empty() && !force && !options.reset {
         lore_info!("Verifying {} changes with local file system", changes.len());
+        // The list is moved in, so verification can filter it in place and the realize step never
+        // holds a second list of the same millions of changes.
         verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
-            changes: changes.clone(),
+            changes,
             repository_current: repository_current.clone(),
             operation: operation.clone(),
             current: NodeMapping::root(repository_current.clone(), state_current.clone()),
@@ -267,6 +277,14 @@ pub async fn realize_state(
     } else {
         changes
     };
+
+    if lore_base::allocator::memory_stats_requested() {
+        lore_debug!(
+            "After verification, {} changes to realize: {}",
+            changes.len(),
+            lore_base::allocator::memory_summary()
+        );
+    }
 
     realize_changes(
         repository_target,
@@ -278,6 +296,13 @@ pub async fn realize_state(
         stats,
     )
     .await?;
+
+    if lore_base::allocator::memory_stats_requested() {
+        lore_debug!(
+            "After realizing: {}",
+            lore_base::allocator::memory_summary()
+        );
+    }
 
     Ok(())
 }
@@ -291,12 +316,31 @@ pub fn verify_filesystem_for_changes(
     args: Arc<SyncVerifyArgs>,
 ) -> impl Future<Output = Result<Arc<Vec<NodeChange>>, SyncError>> {
     async move {
+        // Each task answers with the flags its change is realized with, or nothing where it is not:
+        // verification only ever adds flags. The list to realize is the original filtered in place,
+        // so a large sync holds the changes once.
         let mut failure = None;
         let mut tasks = JoinSet::new();
-        let mut changes = Vec::with_capacity(args.changes.len());
+        let mut verdicts: Vec<Option<change::Flags>> = vec![None; args.changes.len()];
         let stats = Arc::new(SyncVerifyStats::default());
         let incoming = Arc::new(IncomingMoves::new(args.changes.clone()));
-        for change in args.changes.iter() {
+        let record = |verdicts: &mut Vec<Option<change::Flags>>,
+                      failure: &mut Option<SyncError>,
+                      result: Result<
+            Result<Option<(usize, change::Flags)>, SyncError>,
+            tokio::task::JoinError,
+        >| {
+            match result
+                .internal("Recursion task failed")
+                .map_err(SyncError::from)
+                .flatten()
+            {
+                Ok(Some((index, flags))) => verdicts[index] = Some(flags),
+                Ok(None) => {}
+                Err(err) => *failure = failure.take().or(Some(err)),
+            }
+        };
+        for (index, change) in args.changes.iter().enumerate() {
             lore_spawn!(tasks, {
                 let forward_changes = args.options.forward_changes;
                 let force_hash_check = args.options.force_hash_check;
@@ -322,26 +366,13 @@ pub fn verify_filesystem_for_changes(
                     )
                     .await?;
 
-                    Ok(realize.then_some(change))
+                    Ok(realize.then_some((index, change.flags)))
                 }
             });
             while tasks.len() > MAX_CONCURRENT_TREE_TASKS
                 && let Some(result) = tasks.join_next().await
             {
-                match result
-                    .internal("Recursion task failed")
-                    .map_err(SyncError::from)
-                    .flatten()
-                {
-                    Ok(change) => {
-                        if let Some(change) = change {
-                            changes.push(change);
-                        }
-                    }
-                    Err(err) => {
-                        failure = failure.or(Some(err));
-                    }
-                }
+                record(&mut verdicts, &mut failure, result);
             }
 
             if failure.is_some() {
@@ -350,27 +381,33 @@ pub fn verify_filesystem_for_changes(
         }
         // Wait for the remaining tasks
         while let Some(result) = tasks.join_next().await {
-            match result
-                .internal("Recursion task failed")
-                .map_err(SyncError::from)
-                .flatten()
-            {
-                Ok(change) => {
-                    if let Some(change) = change {
-                        changes.push(change);
-                    }
-                }
-                Err(err) => {
-                    failure = failure.or(Some(err));
-                }
-            }
+            record(&mut verdicts, &mut failure, result);
         }
 
         if let Some(err) = failure {
             return Err(err);
         }
 
-        // Re-sort after parallel verification which collects results in completion order.
+        // The moves hold a reference to the list; with them dropped, the list is taken back without
+        // a copy where this holds the only reference to it, which a caller that moves its list in
+        // gives it.
+        drop(incoming);
+        let original = match Arc::try_unwrap(args) {
+            Ok(args) => Arc::try_unwrap(args.changes).unwrap_or_else(|shared| (*shared).clone()),
+            Err(args) => (*args.changes).clone(),
+        };
+        // Collecting a filtered `into_iter` of the same type reuses its allocation.
+        let mut changes: Vec<NodeChange> = original
+            .into_iter()
+            .zip(verdicts)
+            .filter_map(|(mut change, verdict)| {
+                verdict.map(|flags| {
+                    change.flags = flags;
+                    change
+                })
+            })
+            .collect();
+
         // Parent directories must appear before their children so that directory renames
         // in the realize path complete before child file operations are spawned.
         change::sort_by_path(&mut changes);

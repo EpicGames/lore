@@ -94,6 +94,10 @@ pub fn client_main() -> ExitCode {
 
     lore::shutdown();
 
+    if lore::memory_stats_requested() {
+        crate::eprintln!("{}", lore::memory_summary());
+    }
+
     if cli.time {
         crate::println!("Executed in {:.2}s", time_start.elapsed().as_secs_f32());
     }
