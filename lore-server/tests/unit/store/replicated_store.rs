@@ -234,8 +234,10 @@ mod regenerate_client {
             .await;
     }
 
+    /// A store operation runs on the current client while a regeneration waits for its
+    /// replacement to connect.
     #[tokio::test]
-    async fn regenerate_client_doesnt_block_client() {
+    async fn query_completes_while_regeneration_waits_for_a_new_client() {
         let execution =
             lore_server::util::setup_execution("test", String::default(), String::default());
         LORE_CONTEXT
@@ -243,8 +245,24 @@ mod regenerate_client {
                 let (tx, rx) = mpsc::channel(1);
                 let factory = ChannelFactory { rx: rx.into() };
 
+                let partition: Partition = rand::random();
+                let (_, address, _) = lore_revision::fragment::generate_random();
+                let expected = StoreMatchResult {
+                    match_made: StoreMatch::MatchFull,
+                    partition,
+                    context: lore_base::types::Context::default(),
+                    stored_local: true,
+                    stored_durable: true,
+                };
+                let mut client = make_mock_client();
+                client.expect_query().return_once(move |_| {
+                    Ok(QueryResponse {
+                        results: vec![expected],
+                    })
+                });
+
                 // allow 1 creation for initialization
-                tx.send(Ok(make_mock_client())).await.unwrap();
+                tx.send(Ok(client)).await.unwrap();
                 let store = ReplicatedStore::new(
                     Arc::new(factory),
                     make_client_container_config(),
@@ -260,15 +278,21 @@ mod regenerate_client {
                 );
 
                 tokio::pin!(regen);
-                select! {
-                    _ = &mut regen => {panic!("regen should not finish at this point");},
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {},
-                }
+                assert!(
+                    futures::poll!(&mut regen).is_pending(),
+                    "regen should wait for the factory"
+                );
 
-                // we have proven that the client regeneration is hanging,
-                // now prove we can still read the client for use in a potential store operation
                 assert!(store.client_container.is_healthy());
-                let _ = store.client_container.client().read().await;
+                let mut matches = vec![StoreMatchResult::default()];
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    store.clone().query(partition, &[address], &mut matches),
+                )
+                .await
+                .expect("the query should not wait for the regeneration")
+                .expect("the query should succeed");
+                assert_eq!(matches, vec![expected]);
 
                 // unblock the regen future
                 tx.send(Ok(make_mock_client())).await.unwrap();
@@ -398,14 +422,12 @@ mod handle_service_response {
                 .await
                 .expect("Creation should work");
 
-                let start_epoch = store.client_container.epoch();
+                let (meta, _) = store.client_container.request_client(None);
+                let start_epoch = meta.client_epoch;
                 let error = handle_service_response::<(), MockClient>(
                     Err(ReplicationStoreClientError::ConnectionFailed),
                     store.clone(),
-                    ServiceRequestMeta {
-                        client_epoch: start_epoch,
-                        address: None,
-                    },
+                    meta.clone(),
                 )
                 .unwrap_err();
                 assert!(matches!(error, StoreError::Internal(_)));
@@ -416,6 +438,19 @@ mod handle_service_response {
 
                 // unblock and observe new client regenerated
                 tx.send(Ok(make_mock_client())).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(store.client_container.is_healthy());
+                assert_eq!(store.client_container.epoch(), start_epoch + 1);
+
+                // Reporting the replaced client's failure again leaves its successor in place. A
+                // regeneration would mark the client unhealthy and wait on the empty factory.
+                let error = handle_service_response::<(), MockClient>(
+                    Err(ReplicationStoreClientError::ConnectionFailed),
+                    store.clone(),
+                    meta,
+                )
+                .unwrap_err();
+                assert!(matches!(error, StoreError::Internal(_)));
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 assert!(store.client_container.is_healthy());
                 assert_eq!(store.client_container.epoch(), start_epoch + 1);

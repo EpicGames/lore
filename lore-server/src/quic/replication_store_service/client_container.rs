@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lore_base::types::Address;
 use lore_revision::util::time::RetryPolicy;
 use lore_telemetry::LabelArray;
 use lore_telemetry::observe::observe_result;
@@ -17,7 +17,7 @@ use lore_transport::quic::client::ConnectionStats;
 use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
 use lore_transport::quic::client::TransportConfig;
 use opentelemetry::KeyValue;
-use tokio::sync::RwLock;
+use parking_lot::RwLock;
 use tokio::sync::Semaphore;
 use tracing::error;
 
@@ -25,6 +25,7 @@ use crate::quic::replication_store_service::DEFAULT_CLIENT_MESSAGE_LIMIT;
 use crate::quic::replication_store_service::client::CommandBehavior;
 use crate::quic::replication_store_service::client::DEFAULT_MAX_BYTES_BANDWIDTH_PER_SEC;
 use crate::quic::replication_store_service::client::ReplicationStoreClient;
+use crate::quic::replication_store_service::client::ServiceRequestMeta;
 use crate::quic::replication_store_service::client::StoreClient;
 
 pub enum GenerateClientReason {
@@ -98,13 +99,19 @@ impl ClientFactory for QuicClientFactory {
     }
 }
 
+struct CurrentClient<ClientType: StoreClient> {
+    /// The number of regenerations up to and including the one that swapped this client in. A
+    /// failure on `client` is reported with this epoch.
+    epoch: u64,
+    client: Arc<ClientType>,
+}
+
 pub struct ClientContainer<ClientType: StoreClient> {
     client_factory: Arc<dyn ClientFactory<Output = ClientType>>,
     generate_client_semaphore: Semaphore,
     regenerate_retry_policy: RetryPolicy,
 
-    client: RwLock<ClientType>,
-    client_epoch: AtomicU64,
+    current: RwLock<CurrentClient<ClientType>>,
     is_client_healthy: AtomicBool,
 
     connection_lost_sleep: Duration,
@@ -127,8 +134,10 @@ where
         let container = ClientContainer {
             client_factory,
             generate_client_semaphore: Semaphore::new(1),
-            client: client.into(),
-            client_epoch: 0.into(),
+            current: RwLock::new(CurrentClient {
+                epoch: 0,
+                client: Arc::new(client),
+            }),
             is_client_healthy: true.into(),
             regenerate_retry_policy: config.regenerate_retry_policy,
             connection_lost_sleep: config.connection_lost_sleep,
@@ -137,19 +146,31 @@ where
     }
 
     pub fn epoch(&self) -> u64 {
-        self.client_epoch.load(Ordering::Relaxed)
+        self.current.read().epoch
     }
 
     pub fn is_healthy(&self) -> bool {
         self.is_client_healthy.load(Ordering::Relaxed)
     }
 
-    pub fn client(&self) -> &RwLock<ClientType> {
-        &self.client
+    /// Returns the current client for a request and the metadata used to report a request
+    /// failure. The metadata contains the returned client's epoch. Hold the client for one
+    /// request only: a replaced client stays open until every clone of it is dropped.
+    pub fn request_client(
+        &self,
+        address: Option<Address>,
+    ) -> (ServiceRequestMeta, Arc<ClientType>) {
+        let current = self.current.read();
+        let meta = ServiceRequestMeta {
+            client_epoch: current.epoch,
+            address,
+        };
+        (meta, current.client.clone())
     }
 
     pub async fn connection_stats(&self) -> Option<ConnectionStats> {
-        self.client.read().await.connection_stats().await
+        let client = self.current.read().client.clone();
+        client.connection_stats().await
     }
 
     /// Caution: the concrete QUIC client requires an execution context
@@ -166,7 +187,7 @@ where
 
         // depending on task scheduling, someone might have already reconnected a client
         // by the time our task got scheduled to do its reconnect, so guard against that
-        if self.client_epoch.load(Ordering::Relaxed) != expected_epoch {
+        if self.epoch() != expected_epoch {
             return Ok(false);
         }
 
@@ -210,13 +231,21 @@ where
                 }
             };
 
-            let mut client_write = self.client.write().await;
-            // Swap the new client in, then release the write lock before the old
-            // client drops so lookups aren't blocked behind the swap.
-            let _old_client = std::mem::replace(&mut *client_write, new_client);
-            drop(client_write);
+            let new_client = Arc::new(new_client);
+            // Release the write lock before dropping the old client. If this is its last
+            // reference, closing it must not block lookups.
+            let _old_client = {
+                let mut current = self.current.write();
+                let epoch = current.epoch + 1;
+                std::mem::replace(
+                    &mut *current,
+                    CurrentClient {
+                        epoch,
+                        client: new_client,
+                    },
+                )
+            };
 
-            self.client_epoch.fetch_add(1, Ordering::Relaxed);
             self.is_client_healthy.store(true, Ordering::Relaxed);
 
             Ok(true)

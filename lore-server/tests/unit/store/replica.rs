@@ -335,14 +335,12 @@ mod handle_service_response {
                 .expect("Creation should work");
                 let replica = Arc::new(replica);
 
-                let start_epoch = replica.client_container.epoch();
+                let (meta, _) = replica.client_container.request_client(None);
+                let start_epoch = meta.client_epoch;
                 let error = handle_service_response::<(), MockClient>(
                     Err(ReplicationStoreClientError::ConnectionFailed),
                     replica.clone(),
-                    ServiceRequestMeta {
-                        client_epoch: start_epoch,
-                        address: None,
-                    },
+                    meta.clone(),
                 )
                 .unwrap_err();
                 assert!(matches!(error, StoreError::Internal(_)));
@@ -353,6 +351,19 @@ mod handle_service_response {
 
                 // unblock and observe new client regenerated
                 tx.send(Ok(make_mock_client())).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                assert!(replica.client_container.is_healthy());
+                assert_eq!(replica.client_container.epoch(), start_epoch + 1);
+
+                // Reporting the replaced client's failure again leaves its successor in place. A
+                // regeneration would mark the client unhealthy and wait on the empty factory.
+                let error = handle_service_response::<(), MockClient>(
+                    Err(ReplicationStoreClientError::ConnectionFailed),
+                    replica.clone(),
+                    meta,
+                )
+                .unwrap_err();
+                assert!(matches!(error, StoreError::Internal(_)));
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 assert!(replica.client_container.is_healthy());
                 assert_eq!(replica.client_container.epoch(), start_epoch + 1);

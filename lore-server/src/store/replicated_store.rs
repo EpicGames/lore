@@ -146,8 +146,7 @@ where
                     let Some(store) = weak.upgrade() else {
                         break;
                     };
-                    let client = store.client_container.client().read().await;
-                    let stats = client.connection_stats().await;
+                    let stats = store.client_container.connection_stats().await;
                     if let Some(stats) = stats {
                         quic_instruments.observe(&stats);
                     }
@@ -194,12 +193,8 @@ where
         partition: Partition,
         addresses: Vec<Address>,
     ) -> Result<QueryResponse, StoreError> {
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: None,
-        };
+        let (meta, client) = self.client_container.request_client(None);
 
-        let store = self.clone();
         let service_result = async move {
             let context = execution_context();
             let request = Query {
@@ -212,7 +207,6 @@ where
                 },
                 addresses,
             };
-            let client = store.client_container.client().read().await;
             client.query(request).await
         }
         .observe(
@@ -305,12 +299,8 @@ where
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(address));
 
-        let store = self.clone();
         let service_result = async move {
             let context = execution_context();
             let request = GetMetadata {
@@ -323,7 +313,6 @@ where
                 },
                 address,
             };
-            let client = store.client_container.client().read().await;
             client.get_metadata(request).await
         }
         .observe(
@@ -348,12 +337,8 @@ where
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(address));
 
-        let store = self.clone();
         let service_result = async move {
             let context = execution_context();
             let request = Get {
@@ -366,7 +351,6 @@ where
                 },
                 address,
             };
-            let client = store.client_container.client().read().await;
             client.get(request).await
         }
         .observe(
@@ -394,12 +378,8 @@ where
         payload: Option<Bytes>,
         force: bool,
     ) -> Result<(), StoreError> {
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(address));
 
-        let store = self.clone();
         let service_result = async move {
             // The remote server may be running composite store with write replication enabled.
             // We want to avoid scenarios where the recipient server replicates to its peers
@@ -407,7 +387,6 @@ where
             // replication behaviour as we were the first recipient of the payload
             fragment.flags |= FragmentFlags::PayloadDoNotReplicate;
             let request = make_put_message(partition, address, fragment, payload, force)?;
-            let client = store.client_container.client().read().await;
             client.put(request).await
         }
         .observe(
@@ -433,12 +412,8 @@ where
         address: Address,
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(address));
 
-        let store = self.clone();
         let service_result = async move {
             let context = execution_context();
             let request = Obliterate {
@@ -451,7 +426,6 @@ where
                 },
                 address,
             };
-            let client = store.client_container.client().read().await;
             client.obliterate(request).await
         }
         .observe(
@@ -523,12 +497,8 @@ where
         destination_context: Context,
         behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(source_address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(source_address));
 
-        let store = self.clone();
         let service_result = async move {
             let context = execution_context();
             let request = ImmutableCopy {
@@ -549,7 +519,6 @@ where
                 // the replication behaviour as we were the first recipient of the payload
                 do_not_replicate: true,
             };
-            let client = store.client_container.client().read().await;
             client.copy(request).await
         }
         .observe(

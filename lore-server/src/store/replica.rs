@@ -129,8 +129,7 @@ where
                     let Some(store) = weak.upgrade() else {
                         break;
                     };
-                    let client = store.client_container.client().read().await;
-                    let stats = client.connection_stats().await;
+                    let stats = store.client_container.connection_stats().await;
                     if let Some(stats) = stats {
                         quic_instruments.observe(&stats);
                     }
@@ -169,12 +168,9 @@ where
         repository: Partition,
         addresses: Vec<Address>,
     ) -> Result<QueryResponse, StoreError> {
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: None,
-        };
+        let (meta, client) = self.client_container.request_client(None);
 
-        let service_result = async {
+        let service_result = async move {
             let context = execution_context();
             let request = Query {
                 header: ReplicationHeader {
@@ -186,7 +182,6 @@ where
                 },
                 addresses,
             };
-            let client = self.client_container.client().read().await;
             client.local_query(request).await
         }
         .observe(
@@ -280,12 +275,8 @@ where
             return Err(StoreError::internal("client is unhealthy"));
         }
 
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(address));
 
-        let store = self.clone();
         let service_result = async move {
             let context = execution_context();
             let request = GetMetadata {
@@ -298,7 +289,6 @@ where
                 },
                 address,
             };
-            let client = store.client_container.client().read().await;
             client.local_get_metadata(request).await
         }
         .observe(
@@ -325,14 +315,9 @@ where
             return Err(StoreError::internal("client is unhealthy"));
         }
 
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(address));
 
-        let replica = self.clone();
-        let client = replica.client_container.client().read().await;
-        let service_result = async {
+        let service_result = async move {
             let context = execution_context();
             let request = Get {
                 header: ReplicationHeader {
@@ -373,14 +358,9 @@ where
             return Err(StoreError::internal("client is unhealthy"));
         }
 
-        let meta = ServiceRequestMeta {
-            client_epoch: self.client_container.epoch(),
-            address: Some(address),
-        };
+        let (meta, client) = self.client_container.request_client(Some(address));
 
-        let replica = self.clone();
-        let client = replica.client_container.client().read().await;
-        let service_result = async {
+        let service_result = async move {
             let request = make_put_message(repository, address, fragment, payload, force)?;
             client.local_put(request).await?;
             Ok(())
