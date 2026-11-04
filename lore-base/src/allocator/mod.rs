@@ -73,9 +73,13 @@ unsafe impl GlobalAlloc for ExternalAllocator {
 static EXTERN_ALLOCATOR: OnceLock<ExternalAllocator> = OnceLock::new();
 static SELECTED_ALLOCATOR: OnceLock<&'static (dyn GlobalAlloc + Sync)> = OnceLock::new();
 static STANDARD_ALLOCATOR: std::alloc::System = std::alloc::System;
-/// The allocation tracking options in effect, any combination of [`tracking::COUNT`] and
-/// [`tracking::TRACK`]. `tracking` in `LORE_ALLOCATOR` enables [`tracking::TRACK`] from the first
-/// allocation through the global allocator, unless an external allocator was set before it.
+/// The allocation tracking options in effect, any combination of [`tracking::COUNT`],
+/// [`tracking::TRACK`] and [`MEASURE`]. `tracking` in `LORE_ALLOCATOR` enables [`tracking::TRACK`]
+/// from the first allocation through the global allocator, unless an external allocator was set
+/// before it.
+///
+/// The global allocator's paths test the whole word before any one option, so with none enabled an
+/// allocation, a free and a reallocation each spend one branch on tracking, whatever options exist.
 static TRACKING_ALLOCATIONS: AtomicU8 = AtomicU8::new(0);
 
 /// Tracking bit for counting the bytes held and their peak, which `LORE_MEMORY_STATS` sets. Counts
@@ -298,11 +302,13 @@ unsafe impl GlobalAlloc for LoreAllocator {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
-        if (tracking & MEASURE) != 0 && !ptr.is_null() {
-            measure_sub(layout.size());
-        }
-        if (tracking & tracking::TRACK) != 0 && !ptr.is_null() {
-            tracking::track_dealloc(ptr);
+        if tracking != 0 && !ptr.is_null() {
+            if (tracking & MEASURE) != 0 {
+                measure_sub(layout.size());
+            }
+            if (tracking & tracking::TRACK) != 0 {
+                tracking::track_dealloc(ptr);
+            }
         }
         unsafe {
             SELECTED_ALLOCATOR
@@ -336,12 +342,14 @@ unsafe impl GlobalAlloc for LoreAllocator {
                 .realloc(ptr, layout, new_size)
         };
         let tracking = TRACKING_ALLOCATIONS.load(Ordering::Relaxed);
-        if (tracking & MEASURE) != 0 && !new_ptr.is_null() {
-            measure_add(new_size);
-            measure_sub(layout.size());
-        }
-        if (tracking & !MEASURE) != 0 {
-            tracking::track_realloc(tracking, ptr, new_ptr, layout.size());
+        if tracking != 0 {
+            if (tracking & MEASURE) != 0 && !new_ptr.is_null() {
+                measure_add(new_size);
+                measure_sub(layout.size());
+            }
+            if (tracking & !MEASURE) != 0 {
+                tracking::track_realloc(tracking, ptr, new_ptr, layout.size());
+            }
         }
         new_ptr
     }
