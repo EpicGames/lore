@@ -803,6 +803,242 @@ async fn stat_follows_a_link() {
     }
 }
 
+/// A file and a directory are described by `symlink_stat` as `symlink_metadata` describes them,
+/// and as `stat` describes them.
+#[tokio::test]
+async fn symlink_stat_answers_a_file_and_a_directory_as_stat_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstat-");
+        driver
+            .write_file_bytes(dir.child("file"), Bytes::from(pattern(5000, 1)), false)
+            .await
+            .unwrap();
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+
+        for name in ["file", "directory"] {
+            let path = dir.child(name);
+            let described = driver.symlink_stat(&path).await.expect("symlink_stat");
+            let expected = Stat::from(&std::fs::symlink_metadata(&path).expect("symlink_metadata"));
+            assert_eq!(
+                expected,
+                described,
+                "{name} through {}",
+                driver.backend_name()
+            );
+            assert_eq!(
+                driver.stat(&path).await.expect("stat"),
+                described,
+                "{name} through {}",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
+/// A path holding nothing fails `symlink_stat` as `NotFound`, with the OS code
+/// `symlink_metadata` reports.
+#[tokio::test]
+async fn symlink_stat_reports_a_missing_path_as_not_found() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstatmissing-");
+        let path = dir.child("absent");
+        let error = driver
+            .symlink_stat(&path)
+            .await
+            .expect_err("nothing is there");
+        let expected = std::fs::symlink_metadata(&path).expect_err("nothing is there");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            error.raw_os_error(),
+            expected.raw_os_error(),
+            "{}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// A symbolic link is described as the name it is, not as what it names, and one naming nothing
+/// is described too. On Unix a symbolic link is `Other`; on Windows one made to a directory is a
+/// `Directory` and one made to a file a `File`, as their attributes give.
+#[tokio::test]
+async fn symlink_stat_describes_a_symbolic_link_itself() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstatlink-");
+        driver
+            .write_file_bytes(dir.child("target"), Bytes::from_static(b"held"), false)
+            .await
+            .unwrap();
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+        if !file_link(&dir.child("target"), &dir.child("file-link"))
+            || !directory_link(&dir.child("directory"), &dir.child("directory-link"))
+            || !file_link(&dir.child("gone"), &dir.child("dangling"))
+        {
+            eprintln!("skipping: this machine creates no links");
+            return;
+        }
+
+        let expected = if cfg!(target_family = "windows") {
+            [
+                ("file-link", StatKind::File),
+                ("directory-link", StatKind::Directory),
+                ("dangling", StatKind::File),
+            ]
+        } else {
+            [
+                ("file-link", StatKind::Other),
+                ("directory-link", StatKind::Other),
+                ("dangling", StatKind::Other),
+            ]
+        };
+        for (name, kind) in expected {
+            let described = driver
+                .symlink_stat(dir.child(name))
+                .await
+                .expect("the symbolic link is there");
+            assert_eq!(
+                kind,
+                described.kind,
+                "{name} through {}",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
+/// A junction, which Windows creates without a privilege, is described as the directory its
+/// attributes say it is made as.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn symlink_stat_describes_a_junction_as_a_directory() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstatjunction-");
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+        junction(&dir.child("junction"), &dir.child("directory"));
+
+        let described = driver
+            .symlink_stat(dir.child("junction"))
+            .await
+            .expect("the junction is there");
+        assert_eq!(
+            StatKind::Directory,
+            described.kind,
+            "{}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// A directory is made writable by its owner, its group and other bits left as they are, and a
+/// symbolic link to a directory is refused, the directory it stands for left as it is.
+#[tokio::test]
+#[cfg(target_family = "unix")]
+async fn make_owner_writable_adds_the_owners_write_and_refuses_a_symbolic_link() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-ownerwritable-");
+        let directory = dir.child("directory");
+        let target = dir.child("target");
+        let link = dir.child("link");
+        driver.create_dir_all(&directory).await.unwrap();
+        driver.create_dir_all(&target).await.unwrap();
+        std::os::unix::fs::symlink(&target, &link).expect("create the link");
+        for path in [&directory, &target] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+                .expect("set the directory's mode");
+        }
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("stat the directory")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        driver
+            .make_owner_writable(&directory)
+            .await
+            .expect("make the directory writable by its owner");
+        driver
+            .make_owner_writable(&link)
+            .await
+            .expect_err("a symbolic link is refused");
+
+        assert_eq!(0o755, mode(&directory), "{}", driver.backend_name());
+        assert_eq!(0o555, mode(&target), "{}", driver.backend_name());
+    }
+}
+
+/// Making a junction writable clears the junction's own read-only attribute and leaves the
+/// read-only directory it stands for as it is.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn make_owner_writable_clears_a_junctions_own_attribute_and_leaves_its_target() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-clearreadonly-");
+        let target = dir.child("directory");
+        let link = dir.child("junction");
+        driver.create_dir_all(&target).await.unwrap();
+        junction(&link, &target);
+        mark_read_only_itself(&link);
+        let mut permissions = std::fs::metadata(&target)
+            .expect("stat the directory")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&target, permissions).expect("make the directory read-only");
+        let readonly_itself = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .expect("read the name itself")
+                .permissions()
+                .readonly()
+        };
+        assert!(readonly_itself(&link), "the junction is read-only itself");
+
+        driver
+            .make_owner_writable(&link)
+            .await
+            .expect("clear the junction's attribute");
+
+        assert!(
+            !readonly_itself(&link),
+            "the junction's own attribute is clear through {}",
+            driver.backend_name()
+        );
+        assert!(
+            std::fs::metadata(&target)
+                .expect("stat the directory")
+                .permissions()
+                .readonly(),
+            "the directory stays read-only through {}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// Creates a junction at `link` to the directory `target`, which Windows does without a privilege.
+#[cfg(target_family = "windows")]
+fn junction(link: &std::path::Path, target: &std::path::Path) {
+    let created = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("run mklink");
+    assert!(created.status.success(), "mklink /J failed: {created:?}");
+}
+
+/// Sets the read-only attribute of the name `path` itself, a junction's on the junction.
+#[cfg(target_family = "windows")]
+fn mark_read_only_itself(path: &std::path::Path) {
+    let marked = std::process::Command::new("cmd")
+        .args(["/C", "attrib", "+r"])
+        .arg(path)
+        .arg("/L")
+        .output()
+        .expect("run attrib");
+    assert!(marked.status.success(), "attrib +r /L failed: {marked:?}");
+}
+
 /// Past `MAX_PATH` a path answers whether or not it carries the verbatim prefix: a plain one is
 /// left to `metadata`, which prefixes it, and a verbatim one is queried as it stands.
 #[tokio::test]

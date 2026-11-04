@@ -5,10 +5,10 @@
 //! The backend surface is the set of operations [`DriverInner`]'s match arms call: `open`,
 //! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
 //! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
-//! `write_file_segments`, `sync`, `metadata`, `stat`, `file_metadata`, `holds_name_exactly`,
-//! `rename`, `copy`, `remove_file`, `read_dir`, `create_dir_all`, `set_permissions`,
-//! `remove_dir` and `remove_dir_all`. A backend implements all twenty-four as inherent methods on
-//! its own type.
+//! `write_file_segments`, `sync`, `metadata`, `stat`, `symlink_stat`, `file_metadata`,
+//! `holds_name_exactly`, `rename`, `copy`, `remove_file`, `read_dir`, `create_dir_all`,
+//! `set_permissions`, `make_owner_writable`, `remove_dir` and `remove_dir_all`. A backend
+//! implements all twenty-six as inherent methods on its own type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -420,6 +420,37 @@ impl IoDriver {
         }
     }
 
+    /// The kind, size, modification time and permission bits of what `path` names itself, a
+    /// symbolic link described rather than followed: what `std::fs::symlink_metadata` answers of
+    /// them, but for the kind on Windows.
+    ///
+    /// The kind is the one the name gives: on Unix a symbolic link is [`StatKind::Other`], as
+    /// `std` has it. On Windows the kind is taken from the name's file attributes, so a symbolic
+    /// link or junction made to a directory is a [`StatKind::Directory`] and one made to a file a
+    /// [`StatKind::File`], as Windows removes and renames them, where `std` types each as a
+    /// symbolic link.
+    ///
+    /// On Windows this is one `GetFileAttributesExW`, which opens no handle and follows no
+    /// reparse point, for an absolute path the call can take and whose time `SystemTime` can
+    /// hold. Every other path answers as `std::fs::symlink_metadata` does.
+    ///
+    /// Takes the path by value so a caller building one for the call hands it over rather
+    /// than having it copied.
+    ///
+    /// [`StatKind::Other`]: crate::StatKind::Other
+    /// [`StatKind::Directory`]: crate::StatKind::Directory
+    /// [`StatKind::File`]: crate::StatKind::File
+    pub async fn symlink_stat(&self, path: impl Into<PathBuf>) -> std::io::Result<crate::Stat> {
+        let path = path.into();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.symlink_stat(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.symlink_stat(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.symlink_stat(path).await,
+        }
+    }
+
     /// Whether the filesystem holds `path` spelled exactly the way it is given.
     ///
     /// A case-insensitive filesystem keeps one spelling of a name and answers a
@@ -532,6 +563,27 @@ impl IoDriver {
             DriverInner::Uring(driver) => driver.set_permissions(path, permissions).await,
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.set_permissions(path, permissions).await,
+        }
+    }
+
+    /// Makes what `path` names itself writable by its owner, for a removal its permissions
+    /// refused: on Unix it adds the owner's write permission to a directory, which removing the
+    /// entries the directory holds needs, and on Windows it clears the read-only attribute, which
+    /// keeps a directory from being removed.
+    ///
+    /// The name is opened without following a symbolic link and changed through the handle, so
+    /// nothing a link stands for is changed, where [`set_permissions`](Self::set_permissions)
+    /// follows the link: on Unix a name that is not a directory itself fails, and on Windows a
+    /// symbolic link or junction has its own attribute cleared. A name already writable is left
+    /// as it is.
+    pub async fn make_owner_writable(&self, path: impl Into<PathBuf>) -> std::io::Result<()> {
+        let path = path.into();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.make_owner_writable(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.make_owner_writable(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.make_owner_writable(path).await,
         }
     }
 

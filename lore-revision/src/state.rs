@@ -7489,9 +7489,9 @@ pub(crate) async fn is_nested_repository_root(parent: &mut std::path::PathBuf, n
     parent.push(name);
     parent.push(DOT_LORE);
     let nested = lore_io::IoDriver::global()
-        .metadata(parent.as_path())
+        .stat(parent.as_path())
         .await
-        .is_ok_and(|metadata| metadata.is_dir());
+        .is_ok_and(|stat| stat.kind == lore_io::StatKind::Directory);
     parent.pop();
     parent.pop();
     nested
@@ -7956,8 +7956,8 @@ async fn stamp_probe(path: &std::path::Path) -> Option<u64> {
         .write_file_bytes(path, bytes::Bytes::from_static(&[0u8]), false)
         .await
         .ok()?;
-    let metadata = driver.metadata(path).await.ok()?;
-    Some(crate::util::fs::file_mtime(&metadata))
+    let modified = driver.stat(path).await.ok()?.modified;
+    Some(crate::util::fs::modified_millis(modified))
 }
 
 /// [`filesystem_stamp_now`], as the floor below which an operation records times: a file

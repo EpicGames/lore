@@ -80,13 +80,13 @@ pub async fn hash(
         })
         .await?
     } else {
-        let metadata = lore_io::IoDriver::global()
-            .metadata(path.as_ref())
+        let stat = lore_io::IoDriver::global()
+            .stat(path.as_ref())
             .await
             .map_err(|err| InvalidArguments {
                 reason: format!("path does not exist or is not accessible: {err}"),
             })?;
-        let size = hashed_file_size(FileInfo::from_metadata(&metadata))?;
+        let size = hashed_file_size(FileInfo::from_stat(&stat))?;
         let hash = immutable::hash_file(
             repository.clone(),
             &lore_storage::ContentSource::file(path.as_ref()),

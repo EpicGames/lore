@@ -453,8 +453,8 @@ fn only_a_file_carries_a_mode() {
     assert_eq!(0, mode_from_observed(false, None, EXEC));
 }
 
-/// An unlink keeps what it reads of the path's metadata, not the metadata, across the
-/// removal it awaits.
+/// An unlink holds no `Metadata` across the removal it awaits: the stat it decides by is reduced
+/// to the kind, and the permissions a retry needs are read in a boxed future of their own.
 #[cfg(target_os = "linux")]
 #[test]
 fn an_unlink_holds_no_metadata() {
@@ -568,6 +568,425 @@ async fn setting_the_executable_bit_of_a_missing_file_fails() {
             },
         )
         .await;
+}
+
+/// An unlink removes a file and an empty directory, and answers a path that holds nothing as
+/// already removed.
+#[tokio::test]
+async fn an_unlink_removes_a_file_and_an_empty_directory() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let file = temp.path().join("file");
+                let directory = temp.path().join("directory");
+                std::fs::write(&file, b"removed").expect("write the file");
+                std::fs::create_dir(&directory).expect("create the directory");
+
+                unlink(&file).await.expect("the file is removed");
+                unlink(&directory).await.expect("the directory is removed");
+                unlink(temp.path().join("absent"))
+                    .await
+                    .expect("a path holding nothing is removed");
+
+                assert!(!file.exists(), "the file is gone");
+                assert!(!directory.exists(), "the directory is gone");
+            },
+        )
+        .await;
+}
+
+/// A recursive unlink removes a directory with all it holds, and a file on its own.
+#[tokio::test]
+async fn a_recursive_unlink_removes_a_tree_and_a_file() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let tree = temp.path().join("tree");
+                let file = temp.path().join("file");
+                std::fs::create_dir_all(tree.join("nested")).expect("create the tree");
+                std::fs::write(tree.join("nested").join("leaf"), b"removed")
+                    .expect("write the leaf");
+                std::fs::write(&file, b"removed").expect("write the file");
+
+                unlink_recursive(&tree).await.expect("the tree is removed");
+                unlink_recursive(&file).await.expect("the file is removed");
+
+                assert!(!tree.exists(), "the tree is gone");
+                assert!(!file.exists(), "the file is gone");
+            },
+        )
+        .await;
+}
+
+/// A directory whose mode keeps its entries from being removed is made writable by its owner and
+/// removed by the retry. A privileged process, which the mode does not keep, has no retry to
+/// show.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recursive_unlink_retries_a_directory_its_mode_keeps() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let directory = temp.path().join("kept");
+                std::fs::create_dir(&directory).expect("create the directory");
+                std::fs::write(directory.join("entry"), b"kept").expect("write the entry");
+                let _locked = LockedDirectory::new(&directory, 0o555);
+                if !mode_keeps_entries(&directory) {
+                    return;
+                }
+
+                unlink_recursive(&directory)
+                    .await
+                    .expect("the retry removes the directory");
+
+                assert!(!directory.exists(), "the directory is gone");
+            },
+        )
+        .await;
+}
+
+/// A tree whose retry still fails is left as the retry made it: its top directory writable by
+/// its owner alone, and the directory below it as it was, nothing made writable by others.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_recursive_unlink_retry_adds_only_the_owners_write_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let top = temp.path().join("top");
+                let below = top.join("below");
+                std::fs::create_dir_all(&below).expect("create the tree");
+                std::fs::write(below.join("entry"), b"kept").expect("write the entry");
+                let _below = LockedDirectory::new(&below, 0o555);
+                let _top = LockedDirectory::new(&top, 0o555);
+                if !mode_keeps_entries(&below) {
+                    return;
+                }
+
+                assert!(
+                    unlink_recursive(&top).await.is_err(),
+                    "the entry below keeps the tree"
+                );
+
+                let mode = |path: &Path| {
+                    std::fs::metadata(path)
+                        .expect("the directory stays")
+                        .permissions()
+                        .mode()
+                        & 0o777
+                };
+                assert_eq!(
+                    0o755,
+                    mode(&top),
+                    "the top directory gains its owner's write"
+                );
+                assert_eq!(0o555, mode(&below), "the directory below keeps its mode");
+            },
+        )
+        .await;
+}
+
+/// A symbolic link standing where a directory was is removed as a link, by an unlink and a
+/// recursive unlink alike, and the directory it stands for keeps its entry and its mode.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unlink_removes_a_symbolic_link_to_a_directory_and_leaves_the_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let target = temp.path().join("target");
+                let link = temp.path().join("link");
+                let recursive_link = temp.path().join("recursive-link");
+                std::fs::create_dir(&target).expect("create the directory");
+                std::fs::write(target.join("entry"), b"kept").expect("write the entry");
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+                    .expect("set the directory's mode");
+                std::os::unix::fs::symlink(&target, &link).expect("create the link");
+                std::os::unix::fs::symlink(&target, &recursive_link)
+                    .expect("create the second link");
+
+                unlink(&link).await.expect("the link is removed");
+                unlink_recursive(&recursive_link)
+                    .await
+                    .expect("the second link is removed");
+
+                assert!(
+                    std::fs::symlink_metadata(&link).is_err(),
+                    "the link is gone"
+                );
+                assert!(
+                    std::fs::symlink_metadata(&recursive_link).is_err(),
+                    "the second link is gone"
+                );
+                assert_eq!(
+                    Some(b"kept".to_vec()),
+                    std::fs::read(target.join("entry")).ok(),
+                    "the directory keeps its entry"
+                );
+                let mode = std::fs::metadata(&target)
+                    .expect("the directory stays")
+                    .permissions()
+                    .mode();
+                assert_eq!(0o755, mode & 0o777, "the directory keeps its mode");
+            },
+        )
+        .await;
+}
+
+/// A symbolic link naming nothing is removed, not taken for a path holding nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unlink_removes_a_dangling_symbolic_link() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let link = temp.path().join("dangling");
+                std::os::unix::fs::symlink(temp.path().join("gone"), &link)
+                    .expect("create the link");
+
+                unlink(&link).await.expect("the link is removed");
+
+                assert!(
+                    std::fs::symlink_metadata(&link).is_err(),
+                    "the link is gone"
+                );
+            },
+        )
+        .await;
+}
+
+/// A file whose directory's mode keeps it is refused and keeps its own mode: a file's own
+/// permissions never decide its removal on Unix, so nothing is retried and nothing is made
+/// writable.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unlink_leaves_the_mode_of_a_file_its_directory_keeps() {
+    use std::os::unix::fs::PermissionsExt;
+
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let directory = temp.path().join("kept");
+                let file = directory.join("file");
+                std::fs::create_dir(&directory).expect("create the directory");
+                std::fs::write(&file, b"kept").expect("write the file");
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+                    .expect("set the file's mode");
+                let _locked = LockedDirectory::new(&directory, 0o555);
+                if !mode_keeps_entries(&directory) {
+                    return;
+                }
+
+                assert!(unlink(&file).await.is_err(), "the file is not removed");
+                let mode = std::fs::metadata(&file)
+                    .expect("the file stays")
+                    .permissions()
+                    .mode();
+                assert_eq!(0o644, mode & 0o777, "the file keeps its mode");
+            },
+        )
+        .await;
+}
+
+/// A directory a test sets to a mode that keeps its entries, given back its owner's full access
+/// when dropped, so the scratch space holding it is removed however the test ends.
+#[cfg(unix)]
+struct LockedDirectory(std::path::PathBuf);
+
+#[cfg(unix)]
+impl LockedDirectory {
+    fn new(directory: &Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+            .expect("set the directory's mode");
+        LockedDirectory(directory.to_path_buf())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for LockedDirectory {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Whether the mode of `directory` keeps this process from adding an entry to it, which it does
+/// not for a privileged process.
+#[cfg(unix)]
+fn mode_keeps_entries(directory: &Path) -> bool {
+    let probe = directory.join("probe");
+    if std::fs::write(&probe, b"probe").is_err() {
+        return true;
+    }
+    std::fs::remove_file(&probe).expect("remove the probe");
+    false
+}
+
+/// A read-only empty directory, which Windows refuses to remove, is made writable and removed by
+/// the retry.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_unlink_retries_a_read_only_empty_directory() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let directory = temp.path().join("read-only");
+                std::fs::create_dir(&directory).expect("create the directory");
+                let mut permissions = std::fs::metadata(&directory)
+                    .expect("stat the directory")
+                    .permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&directory, permissions)
+                    .expect("make the directory read-only");
+
+                unlink(&directory)
+                    .await
+                    .expect("the retry removes the directory");
+
+                assert!(!directory.exists(), "the directory is gone");
+            },
+        )
+        .await;
+}
+
+/// A junction, live or naming a directory that is gone, is removed as a link by an unlink and a
+/// recursive unlink alike, and the directory a live one stands for keeps its entry.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_unlink_removes_a_junction_and_leaves_the_directory() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let target = temp.path().join("target");
+                let gone = temp.path().join("gone");
+                std::fs::create_dir(&target).expect("create the directory");
+                std::fs::write(target.join("entry"), b"kept").expect("write the entry");
+                std::fs::create_dir(&gone).expect("create the directory to remove");
+                let links = ["live", "recursive-live", "dangling", "recursive-dangling"]
+                    .map(|name| temp.path().join(name));
+                for (link, to) in links.iter().zip([&target, &target, &gone, &gone]) {
+                    junction(link, to);
+                }
+                std::fs::remove_dir(&gone).expect("remove the directory two junctions name");
+
+                unlink(&links[0])
+                    .await
+                    .expect("the live junction is removed");
+                unlink_recursive(&links[1])
+                    .await
+                    .expect("the second live junction is removed");
+                unlink(&links[2])
+                    .await
+                    .expect("the dangling junction is removed");
+                unlink_recursive(&links[3])
+                    .await
+                    .expect("the second dangling junction is removed");
+
+                for link in &links {
+                    assert!(
+                        std::fs::symlink_metadata(link).is_err(),
+                        "{} is gone",
+                        link.display()
+                    );
+                }
+                assert_eq!(
+                    Some(b"kept".to_vec()),
+                    std::fs::read(target.join("entry")).ok(),
+                    "the directory keeps its entry"
+                );
+            },
+        )
+        .await;
+}
+
+/// A junction whose own read-only attribute refuses its removal is removed by the retry, which
+/// clears the junction's attribute, and the read-only directory it stands for stays read-only
+/// with its entry.
+#[cfg(windows)]
+#[tokio::test]
+async fn an_unlink_removes_a_read_only_junction_and_leaves_its_target_read_only() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            crate::fs::filesystem_provider::setup_test_execution(),
+            async {
+                let temp = temp_dir();
+                let target = temp.path().join("target");
+                let link = temp.path().join("junction");
+                std::fs::create_dir(&target).expect("create the directory");
+                std::fs::write(target.join("entry"), b"kept").expect("write the entry");
+                junction(&link, &target);
+                let marked = std::process::Command::new("cmd")
+                    .args(["/C", "attrib", "+r"])
+                    .arg(&link)
+                    .arg("/L")
+                    .output()
+                    .expect("run attrib");
+                assert!(marked.status.success(), "attrib +r /L failed: {marked:?}");
+                let mut permissions = std::fs::metadata(&target)
+                    .expect("stat the directory")
+                    .permissions();
+                permissions.set_readonly(true);
+                std::fs::set_permissions(&target, permissions)
+                    .expect("make the directory read-only");
+
+                unlink(&link).await.expect("the retry removes the junction");
+
+                assert!(
+                    std::fs::symlink_metadata(&link).is_err(),
+                    "the junction is gone"
+                );
+                assert!(
+                    std::fs::metadata(&target)
+                        .expect("the directory stays")
+                        .permissions()
+                        .readonly(),
+                    "the directory stays read-only"
+                );
+                assert_eq!(
+                    Some(b"kept".to_vec()),
+                    std::fs::read(target.join("entry")).ok(),
+                    "the directory keeps its entry"
+                );
+            },
+        )
+        .await;
+}
+
+/// Creates a junction at `link` to the directory `target`, which Windows does without a privilege.
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    let created = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("run mklink");
+    assert!(created.status.success(), "mklink /J failed: {created:?}");
 }
 
 /// Stamps a probe in `dir` until the filesystem gives it a later change time than `metadata`

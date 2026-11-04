@@ -16,7 +16,7 @@ fn an_attribute_query_answers_a_file_and_a_directory() {
     let file = dir.child("file");
     std::fs::write(&file, b"held").expect("write the file");
 
-    let answered = attribute_stat(&file)
+    let answered = attribute_stat(&file, true)
         .expect("the query answers a file")
         .expect("the file is there");
     assert_eq!(
@@ -24,7 +24,7 @@ fn an_attribute_query_answers_a_file_and_a_directory() {
         answered
     );
 
-    let directory = attribute_stat(dir.path())
+    let directory = attribute_stat(dir.path(), true)
         .expect("the query answers a directory")
         .expect("the directory is there");
     assert_eq!(StatKind::Directory, directory.kind);
@@ -36,7 +36,7 @@ fn an_attribute_query_answers_a_missing_name() {
     let dir = lore_base::test_util::TempDir::new("lore-io-attribute-");
     let absent = dir.child("absent");
 
-    let error = attribute_stat(&absent)
+    let error = attribute_stat(&absent, true)
         .expect("the query answers a missing name")
         .expect_err("nothing is there");
     let expected = std::fs::metadata(&absent).expect_err("nothing is there");
@@ -48,8 +48,8 @@ fn an_attribute_query_answers_a_missing_name() {
 #[test]
 fn an_attribute_query_declines_what_std_answers_differently() {
     let dir = lore_base::test_util::TempDir::new("lore-io-attribute-");
-    assert!(attribute_stat(Path::new("relative")).is_none());
-    assert!(attribute_stat(&dir.path().join("long".repeat(80))).is_none());
+    assert!(attribute_stat(Path::new("relative"), true).is_none());
+    assert!(attribute_stat(&dir.path().join("long".repeat(80)), true).is_none());
 
     let target = dir.child("target");
     std::fs::write(&target, b"held").expect("write the target");
@@ -58,7 +58,33 @@ fn an_attribute_query_declines_what_std_answers_differently() {
         eprintln!("skipping the link: this machine creates no links");
         return;
     }
-    assert!(attribute_stat(&link).is_none());
+    assert!(attribute_stat(&link, true).is_none());
+}
+
+/// Not following a reparse point, the attribute query answers a symbolic link as the name it is:
+/// a link made to a file as a `File`, whose time is the link's own.
+#[test]
+fn an_attribute_query_not_following_answers_a_symbolic_link_itself() {
+    let dir = lore_base::test_util::TempDir::new("lore-io-attribute-");
+    let target = dir.child("target");
+    std::fs::write(&target, b"held").expect("write the target");
+    let link = dir.child("link");
+    if std::os::windows::fs::symlink_file(&target, &link).is_err() {
+        eprintln!("skipping: this machine creates no links");
+        return;
+    }
+
+    let described = attribute_stat(&link, false)
+        .expect("the query answers a symbolic link")
+        .expect("the symbolic link is there");
+    assert_eq!(StatKind::File, described.kind);
+    assert_eq!(
+        std::fs::symlink_metadata(&link)
+            .expect("read the link")
+            .modified()
+            .ok(),
+        described.modified
+    );
 }
 
 /// A file time converts to the `SystemTime` `std` gives for it, and one past what `SystemTime`

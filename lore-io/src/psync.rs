@@ -309,6 +309,12 @@ impl PsyncDriver {
         SyscallPool::global().submit(move || stat_impl(&path)).await
     }
 
+    pub(crate) async fn symlink_stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        SyscallPool::global()
+            .submit(move || symlink_stat_impl(&path))
+            .await
+    }
+
     pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {
         SyscallPool::global()
             .submit(move || holds_name_exactly_impl(&path))
@@ -356,6 +362,12 @@ impl PsyncDriver {
     ) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || std::fs::set_permissions(path, permissions))
+            .await
+    }
+
+    pub(crate) async fn make_owner_writable(&self, path: PathBuf) -> std::io::Result<()> {
+        SyscallPool::global()
+            .submit(move || make_owner_writable_impl(&path))
             .await
     }
 
@@ -719,6 +731,49 @@ fn holds_name_exactly_impl(_path: &std::path::Path) -> Option<bool> {
     None
 }
 
+/// Adds the owner's write permission to the directory `path` names itself, through a handle that
+/// `O_NOFOLLOW` keeps from opening a symbolic link and `O_DIRECTORY` from opening anything but a
+/// directory.
+#[cfg(target_family = "unix")]
+fn make_owner_writable_impl(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let mode = directory.metadata()?.permissions().mode();
+    if mode & 0o200 != 0 {
+        return Ok(());
+    }
+    directory.set_permissions(std::fs::Permissions::from_mode((mode & 0o7777) | 0o200))
+}
+
+/// Clears the read-only attribute of the name `path` through a handle opened without following a
+/// reparse point, as `std` sets permissions on a name it does not follow.
+#[cfg(target_family = "windows")]
+fn make_owner_writable_impl(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut permissions = file.metadata()?.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    file.set_permissions(permissions)
+}
+
 /// What `std::fs::metadata` answers for `path`.
 pub(crate) fn std_stat(path: &std::path::Path) -> std::io::Result<crate::Stat> {
     std::fs::metadata(path).map(|metadata| crate::Stat::from(&metadata))
@@ -729,20 +784,41 @@ fn stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
     std_stat(path)
 }
 
-/// What [`attribute_stat`] answers for `path`, and what [`std_stat`] answers where it declines.
+/// What [`attribute_stat`] answers for `path`, following a reparse point, and what [`std_stat`]
+/// answers where it declines.
 #[cfg(target_family = "windows")]
 fn stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
-    attribute_stat(path).unwrap_or_else(|| std_stat(path))
+    attribute_stat(path, true).unwrap_or_else(|| std_stat(path))
 }
 
-/// What one `GetFileAttributesExW` answers for `path`, which it queries without a handle, or
-/// `None` where the answer could differ from what [`std_stat`] gives: for a relative path, which
-/// `std` resolves first; a path the call cannot take as it stands; a reparse point, which the call
-/// describes rather than what it links to; a time `SystemTime` cannot hold; and every failure
-/// but the name not being there, which the two report with the same code.
+/// What `std::fs::symlink_metadata` answers for `path`, the name itself.
+#[cfg(not(target_family = "windows"))]
+fn symlink_stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    std::fs::symlink_metadata(path).map(|metadata| crate::Stat::from(&metadata))
+}
+
+/// What [`attribute_stat`] answers for `path`, the name itself, and where it declines what
+/// `std::fs::symlink_metadata` answers, with the kind the name's attributes give.
+#[cfg(target_family = "windows")]
+fn symlink_stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    use std::os::windows::fs::MetadataExt;
+
+    attribute_stat(path, false).unwrap_or_else(|| {
+        std::fs::symlink_metadata(path).map(|metadata| crate::Stat {
+            kind: crate::stat::attribute_kind(metadata.file_attributes()),
+            ..crate::Stat::from(&metadata)
+        })
+    })
+}
+
+/// What one `GetFileAttributesExW` answers for `path`, which it queries without a handle and
+/// without following a reparse point, or `None` where the answer could differ from what `std`
+/// gives: for a relative path, which `std` resolves first; a path the call cannot take as it
+/// stands; a reparse point where `follow` asks for what it stands for; a time `SystemTime` cannot
+/// hold; and every failure but the name not being there, which the two report with the same code.
 #[lore_macro::test_pub]
 #[cfg(target_family = "windows")]
-fn attribute_stat(path: &std::path::Path) -> Option<std::io::Result<crate::Stat>> {
+fn attribute_stat(path: &std::path::Path, follow: bool) -> Option<std::io::Result<crate::Stat>> {
     use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
     use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
@@ -776,7 +852,7 @@ fn attribute_stat(path: &std::path::Path) -> Option<std::io::Result<crate::Stat>
     }
     // SAFETY: the call succeeded, so it filled the structure in.
     let data = unsafe { data.assume_init() };
-    if data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    if follow && data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return None;
     }
     crate::stat::from_attribute_data(&data).map(Ok)

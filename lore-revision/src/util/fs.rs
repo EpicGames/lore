@@ -527,234 +527,171 @@ pub fn filesystem_path_fork<'a>(
     Box::pin(async move { filesystem_path(operation, &base, &find_path, None).await })
 }
 
-/// Removes the file or empty directory at `absolute_path`, retrying once after clearing its
-/// read-only flag, and answers `Ok` for a path that does not exist or whose metadata cannot be
-/// read. A directory holding entries is not retried.
-pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
-    let absolute_path = absolute_path.as_ref();
-    lore_trace!("Deleting {}", absolute_path.display());
-    let (is_dir, mut permissions) = match lore_io::IoDriver::global().metadata(absolute_path).await
-    {
-        Ok(metadata) => (metadata.is_dir(), metadata.permissions()),
-        Err(err) => {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after metadata query: {}",
-                    absolute_path.display()
-                );
-            } else {
-                lore_debug!(
-                    "Delete metadata query failed for {}: {}",
-                    absolute_path.display(),
-                    err
-                );
-            }
-            return Ok(());
-        }
-    };
-
-    if is_dir {
-        if let Err(err) = lore_io::IoDriver::global().remove_dir(absolute_path).await {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing recursively {}: {}",
-                    absolute_path.display(),
-                    err
-                );
-                return Ok(());
-            }
-            if err.kind() == tokio::io::ErrorKind::DirectoryNotEmpty {
-                return Err(err);
-            }
-            lore_debug!(
-                "Error deleting directory {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global().remove_dir(absolute_path).await {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove recursively with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting directory with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        }
-    } else {
-        if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing file with write permissions: {}",
-                    absolute_path.display()
-                );
-                return Ok(());
-            }
-            lore_debug!(
-                "Error deleting file {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove file with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting file with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        }
-        lore_trace!("Deleted file {}", absolute_path.display(),);
-    }
-
-    Ok(())
+/// Removes the file or empty directory at `absolute_path`, a symbolic link as a link, retrying
+/// once where [`Removal::retries`] says a retry can succeed, and answers `Ok` for a path that does
+/// not exist or cannot be stat'd.
+pub fn unlink<P: AsRef<Path>>(absolute_path: P) -> impl Future<Output = tokio::io::Result<()>> {
+    unlink_as(absolute_path, Removal::EmptyDirectory)
 }
 
-pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
-    let absolute_path = absolute_path.as_ref();
-    lore_trace!("Deleting {}", absolute_path.display());
-    let metadata = lore_io::IoDriver::global().metadata(absolute_path).await;
+/// Removes the file, or the directory and everything below it, at `absolute_path`, a symbolic
+/// link as a link, retrying once where [`Removal::retries`] says a retry can succeed, and answers
+/// `Ok` for a path that does not exist or cannot be stat'd.
+pub fn unlink_recursive<P: AsRef<Path>>(
+    absolute_path: P,
+) -> impl Future<Output = tokio::io::Result<()>> {
+    unlink_as(absolute_path, Removal::Tree)
+}
 
-    if let Err(err) = metadata {
-        if err.kind() == tokio::io::ErrorKind::NotFound {
-            lore_trace!(
-                "Path does not exist anymore after metadata query: {}",
-                absolute_path.display()
-            );
+/// Removes what `absolute_path` names, a directory as `directory` says and anything else as a
+/// file, through [`unlink_retrying`].
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn unlink_as<P: AsRef<Path>>(
+    absolute_path: P,
+    directory: Removal,
+) -> impl Future<Output = tokio::io::Result<()>> {
+    async move {
+        let Some(is_dir) = removal_is_dir(absolute_path.as_ref()).await else {
             return Ok(());
-        } else {
-            lore_trace!(
-                "Delete metadata query failed for {}: {}",
-                absolute_path.display(),
-                err
-            );
-            return Ok(());
-        }
+        };
+        let removal = if is_dir { directory } else { Removal::File };
+        unlink_retrying(absolute_path.as_ref(), removal).await
     }
+}
 
-    let metadata = metadata.unwrap();
-    if metadata.is_dir() {
-        if let Err(err) = lore_io::IoDriver::global()
-            .remove_dir_all(absolute_path)
+/// Whether the name `absolute_path` is a directory, which decides how a removal removes it, or
+/// `None` for a path that does not exist or cannot be stat'd, which a removal takes as nothing to
+/// remove. A symbolic link is not followed, so a removal takes the link and leaves what it stands
+/// for: on Unix a link is removed as a file, and on Windows a link made to a directory is removed
+/// as a directory, which removes the link alone.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn removal_is_dir(absolute_path: &Path) -> impl Future<Output = Option<bool>> + '_ {
+    async move {
+        lore_trace!("Deleting {}", absolute_path.display());
+        match lore_io::IoDriver::global()
+            .symlink_stat(absolute_path)
             .await
         {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing recursively {}: {}",
+            Ok(stat) => Some(stat.kind == lore_io::StatKind::Directory),
+            Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+                lore_trace!("Path to delete does not exist: {}", absolute_path.display());
+                None
+            }
+            Err(err) => {
+                lore_debug!(
+                    "Stat of path to delete {} failed: {}",
                     absolute_path.display(),
                     err
                 );
-                return Ok(());
-            }
-            lore_debug!(
-                "Error deleting directory {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global()
-                .remove_dir_all(absolute_path)
-                .await
-            {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove recursively with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting directory with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
+                None
             }
         }
-        lore_trace!("Recursively deleted directory {}", absolute_path.display(),);
-    } else {
-        if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing file with write permissions: {}",
-                    absolute_path.display()
-                );
-                return Ok(());
-            }
-            lore_debug!(
-                "Error deleting file {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove file with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting file with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        }
-        lore_trace!("Deleted file {}", absolute_path.display(),);
     }
+}
 
-    Ok(())
+/// What a removal removes, which decides the call that removes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A file.
+    File,
+    /// An empty directory. One that holds entries is not retried, since no retry can let it be
+    /// removed.
+    EmptyDirectory,
+    /// A directory and everything below it.
+    Tree,
+}
+
+impl Removal {
+    /// Whether a refused removal can succeed after [`make_removable`]: on Windows every removal,
+    /// a read-only attribute refusing a directory's, and on Unix only a tree's, since there a
+    /// name's own permissions decide nothing but whether a directory's entries can go.
+    fn retries(self) -> bool {
+        cfg!(target_family = "windows") || self == Removal::Tree
+    }
+}
+
+/// Removes what `absolute_path` names as `removal` says, retrying once after [`make_removable`]
+/// where [`Removal::retries`] says a retry can succeed, and answers `Ok` for a path that is
+/// already gone.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn unlink_retrying(
+    absolute_path: &Path,
+    removal: Removal,
+) -> impl Future<Output = tokio::io::Result<()>> + '_ {
+    async move {
+        let mut retry = false;
+        loop {
+            if retry {
+                make_removable(absolute_path).await;
+            }
+            let removed = match removal {
+                Removal::File => lore_io::IoDriver::global().remove_file(absolute_path).await,
+                Removal::EmptyDirectory => {
+                    lore_io::IoDriver::global().remove_dir(absolute_path).await
+                }
+                Removal::Tree => {
+                    lore_io::IoDriver::global()
+                        .remove_dir_all(absolute_path)
+                        .await
+                }
+            };
+            match removed {
+                Ok(()) => {
+                    lore_trace!("Deleted {}", absolute_path.display());
+                    return Ok(());
+                }
+                Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+                    lore_trace!("Path to delete does not exist: {}", absolute_path.display());
+                    return Ok(());
+                }
+                Err(err)
+                    if retry
+                        || !removal.retries()
+                        || (removal == Removal::EmptyDirectory
+                            && err.kind() == tokio::io::ErrorKind::DirectoryNotEmpty) =>
+                {
+                    lore_debug!("Error deleting {}: {}", absolute_path.display(), err);
+                    return Err(err);
+                }
+                Err(err) => {
+                    lore_debug!(
+                        "Error deleting {}: {} - retry after making it removable",
+                        absolute_path.display(),
+                        err
+                    );
+                }
+            }
+            retry = true;
+        }
+    }
+}
+
+/// Makes the name `absolute_path` itself writable by its owner, for a failed removal to retry, as
+/// [`lore_io::IoDriver::make_owner_writable`] does: on Unix a directory gains its owner's write
+/// permission, and on Windows the read-only attribute is cleared, a symbolic link never followed.
+/// A name that cannot be changed is left as it is.
+///
+/// Only a failed removal retries, a cold path, so the change is boxed: inline, it would make every
+/// removal's future as large as its own.
+fn make_removable(absolute_path: &Path) -> crate::BoxFuture<'_, ()> {
+    Box::pin(async move {
+        let _ = lore_io::IoDriver::global()
+            .make_owner_writable(absolute_path)
+            .await;
+    })
 }
 
 /// Removes what `absolute_path` holds as [`unlink_recursive`] does, but keeps each nested
 /// repository in it, a directory holding `.lore`, and each entry named `.lore` or `.urc`, as
 /// [`is_reserved_node_name`] answers, with the directories leading to them. A legacy `.urc` is no
 /// boundary, as `state::is_nested_repository_root` describes, so the entries beside it go. A failed
-/// removal is retried once after clearing the read-only flag of `absolute_path`.
+/// removal is retried once after [`make_removable`].
 pub async fn unlink_recursive_keeping_repositories(absolute_path: &Path) -> tokio::io::Result<()> {
     let driver = lore_io::IoDriver::global();
     let Err(err) = driver
@@ -768,17 +705,11 @@ pub async fn unlink_recursive_keeping_repositories(absolute_path: &Path) -> toki
         return Ok(());
     };
     lore_debug!(
-        "Error deleting {}: {} - retry after setting write permission",
+        "Error deleting {}: {} - retry after making it removable",
         absolute_path.display(),
         err
     );
-    let Ok(metadata) = driver.metadata(absolute_path).await else {
-        return Err(err);
-    };
-    let mut permissions = metadata.permissions();
-    #[allow(clippy::permissions_set_readonly_false)]
-    permissions.set_readonly(false);
-    let _ = driver.set_permissions(absolute_path, permissions).await;
+    make_removable(absolute_path).await;
     driver
         .remove_dir_all_keeping(absolute_path, DOT_LORE, is_reserved_node_name)
         .await

@@ -4,21 +4,23 @@
 
 use std::time::SystemTime;
 
-/// What a path names, with links followed.
+/// What a path names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatKind {
     File,
     Directory,
-    /// Anything else a filesystem holds: a device, a socket, a pipe.
+    /// Anything else a filesystem holds: a device, a socket, a pipe, and a symbolic link that
+    /// [`IoDriver::symlink_stat`](crate::IoDriver::symlink_stat) describes on Unix.
     Other,
 }
 
-/// The kind, size, modification time and permission bits of what a path names, with links
-/// followed.
+/// The kind, size, modification time and permission bits of what a path names.
 ///
-/// [`IoDriver::stat`](crate::IoDriver::stat) answers it. Each field is what
-/// [`std::fs::Metadata`] holds for it, which `From` takes it from, so the two agree on any path
-/// both describe.
+/// [`IoDriver::stat`](crate::IoDriver::stat) answers it with symbolic links followed, and
+/// [`IoDriver::symlink_stat`](crate::IoDriver::symlink_stat) for the name itself. Each field is
+/// what [`std::fs::Metadata`] holds for it, which `From` takes it from, so the two agree on any
+/// path both describe, but for the kind `symlink_stat` gives a symbolic link on Windows, which it
+/// takes from the link's file attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stat {
     pub kind: StatKind,
@@ -61,9 +63,8 @@ fn mode(_metadata: &std::fs::Metadata) -> Option<u32> {
     None
 }
 
-/// What `GetFileAttributesExW` reports for a path that names no reparse point, and so names
-/// what it reports on rather than a link to it. `None` where `SystemTime` cannot hold the time
-/// of the last write.
+/// What `GetFileAttributesExW` reports for a path: the name itself, a reparse point described
+/// rather than followed. `None` where `SystemTime` cannot hold the time of the last write.
 #[cfg(target_family = "windows")]
 pub(crate) fn from_attribute_data(
     data: &windows_sys::Win32::Storage::FileSystem::WIN32_FILE_ATTRIBUTE_DATA,
@@ -87,20 +88,27 @@ pub(crate) fn from_attributes(
     size_low: u32,
     written: windows_sys::Win32::Foundation::FILETIME,
 ) -> Option<Stat> {
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
-
     Some(Stat {
-        kind: if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-            StatKind::Directory
-        } else {
-            StatKind::File
-        },
+        kind: attribute_kind(attributes),
         len: (u64::from(size_high) << 32) | u64::from(size_low),
         modified: Some(system_time(
             (u64::from(written.dwHighDateTime) << 32) | u64::from(written.dwLowDateTime),
         )?),
         mode: None,
     })
+}
+
+/// The kind Win32 file `attributes` give: a directory where they carry the directory bit, which a
+/// symbolic link or junction made to a directory carries too, and a file otherwise.
+#[cfg(target_family = "windows")]
+pub(crate) fn attribute_kind(attributes: u32) -> StatKind {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+    if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        StatKind::Directory
+    } else {
+        StatKind::File
+    }
 }
 
 /// The `SystemTime` `std` gives for a file time of `intervals`, which counts 100-nanosecond

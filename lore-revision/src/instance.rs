@@ -862,7 +862,7 @@ async fn path_staleness(path: &str, instance_id: InstanceId) -> InstanceStalenes
         return InstanceStaleness::Active;
     }
     let io = lore_io::IoDriver::global();
-    match io.metadata(path).await {
+    match io.stat(path).await {
         Ok(_) => {}
         Err(err) if is_absent(&err) => return InstanceStaleness::PathMissing,
         Err(_) => return InstanceStaleness::Active,

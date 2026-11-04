@@ -19,6 +19,7 @@ use lore_base::error::InvalidPath;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::prelude::*;
+use lore_io::StatKind;
 
 use super::filesystem_provider::DirectoryEntry;
 use super::filesystem_provider::DirectoryListing;
@@ -280,8 +281,8 @@ impl InstanceOperation for OsOperation {
             let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
             util::fs::metadata_set_executable(&path, written.as_ref(), executable).await;
         }
-        Ok(FileInfo::from_metadata(
-            &lore_io::IoDriver::global().metadata(&path).await?,
+        Ok(FileInfo::from_stat(
+            &lore_io::IoDriver::global().stat(path).await?,
         ))
     }
 
@@ -492,9 +493,11 @@ async fn copy_and_unlink(from_path: &Path, to_path: &Path) -> std::io::Result<()
 /// A directory hands each child over under these same rules, a child whose name the destination
 /// also holds recursing again, before it goes; a destination that is not there is created to take
 /// them. A `from_path` and `to_path` of different kinds are refused, there being no move that
-/// leaves one of them.
+/// leaves one of them. On Windows a directory renamed onto a file is the exception: the system's
+/// rename replaces the file with the directory.
 ///
 /// Boxed because it recurses.
+#[lore_macro::test_pub]
 fn rename_unifying<'a>(
     from_path: &'a Path,
     to_path: &'a Path,
@@ -511,15 +514,15 @@ fn rename_unifying<'a>(
             return Ok(());
         }
 
-        let from_metadata = driver.metadata(from_path).await?;
-        let to_metadata = match driver.metadata(to_path).await {
-            Ok(metadata) => Some(metadata),
+        let from_kind = driver.stat(from_path).await?.kind;
+        let to_kind = match driver.stat(to_path).await {
+            Ok(stat) => Some(stat.kind),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(err),
         };
 
-        if let Some(to_metadata) = &to_metadata
-            && from_metadata.is_dir() != to_metadata.is_dir()
+        if let Some(to_kind) = to_kind
+            && (from_kind == StatKind::Directory) != (to_kind == StatKind::Directory)
         {
             return Err(tokio::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -527,8 +530,8 @@ fn rename_unifying<'a>(
             ));
         }
 
-        if from_metadata.is_file() {
-            if to_metadata.is_some() {
+        if from_kind == StatKind::File {
+            if to_kind.is_some() {
                 driver.remove_file(to_path).await?;
                 if driver.rename(from_path, to_path).await.is_ok() {
                     return Ok(());
@@ -536,7 +539,7 @@ fn rename_unifying<'a>(
             }
             copy_and_unlink(from_path, to_path).await?;
         } else {
-            if to_metadata.is_none() {
+            if to_kind.is_none() {
                 driver.create_dir_all(to_path).await?;
             }
             // The listing is drained before the directory goes, so nothing is still walking it.

@@ -45,6 +45,27 @@ async fn virtual_immutable_size_is_its_declared_size() {
     assert_eq!(source.size().await.expect("a declared size"), 42);
 }
 
+/// A file's size is its length, and a path that holds nothing has no size.
+#[tokio::test]
+async fn a_file_size_is_its_length() {
+    let file = lore_base::test_util::TempFile::with_contents("content-size-", b"twelve bytes");
+    let missing = lore_base::test_util::TempDir::new("content-size-missing-");
+
+    assert_eq!(
+        ContentSource::file(file.path())
+            .size()
+            .await
+            .expect("a file's size"),
+        12
+    );
+    assert!(
+        ContentSource::file(&missing.child("absent"))
+            .size()
+            .await
+            .is_err()
+    );
+}
+
 /// Opening or reading virtual content fails at once as an argument error, with no back-off.
 #[tokio::test]
 async fn virtual_immutable_open_and_read_all_are_invalid_arguments() {

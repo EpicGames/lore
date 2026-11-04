@@ -471,6 +471,53 @@ async fn infer_is_conflicted_reads_the_content_at_the_path() {
         .await;
 }
 
+/// A file is not moved onto a directory: the rename is refused as unsupported and both keep what
+/// they hold.
+#[tokio::test]
+async fn rename_refuses_a_file_onto_a_directory() {
+    let dir = temp_dir();
+    let file = dir.path().join("file");
+    let directory = dir.path().join("directory");
+    std::fs::write(&file, b"kept").expect("write the file");
+    std::fs::create_dir(&directory).expect("create the directory");
+    std::fs::write(directory.join("entry"), b"kept").expect("write the entry");
+
+    let refused = rename_unifying(&file, &directory)
+        .await
+        .expect_err("a file is not moved onto a directory");
+
+    assert_eq!(std::io::ErrorKind::Unsupported, refused.kind());
+    assert_eq!(Some(b"kept".to_vec()), std::fs::read(&file).ok());
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(directory.join("entry")).ok()
+    );
+}
+
+/// A directory is not moved onto a file on Unix, whose rename refuses it: the rename is refused as
+/// unsupported and both keep what they hold.
+#[tokio::test]
+#[cfg(unix)]
+async fn rename_refuses_a_directory_onto_a_file() {
+    let dir = temp_dir();
+    let file = dir.path().join("file");
+    let directory = dir.path().join("directory");
+    std::fs::write(&file, b"kept").expect("write the file");
+    std::fs::create_dir(&directory).expect("create the directory");
+    std::fs::write(directory.join("entry"), b"kept").expect("write the entry");
+
+    let refused = rename_unifying(&directory, &file)
+        .await
+        .expect_err("a directory is not moved onto a file");
+
+    assert_eq!(std::io::ErrorKind::Unsupported, refused.kind());
+    assert_eq!(Some(b"kept".to_vec()), std::fs::read(&file).ok());
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(directory.join("entry")).ok()
+    );
+}
+
 /// A move between two filesystems is no rename, so the content is copied and the source
 /// unlinked, whether or not the destination is already taken. The source is reached through a
 /// link, the two paths an operation names lying under one root.

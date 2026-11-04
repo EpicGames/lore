@@ -99,9 +99,9 @@ impl<'a> ContentSource<'a> {
         }
         let path = self.host_path();
         lore_io::IoDriver::global()
-            .metadata(path)
+            .stat(path)
             .await
-            .map(|metadata| metadata.len())
+            .map(|stat| stat.len)
             .map_err(|err| {
                 StorageError::internal_with_context(
                     err,
