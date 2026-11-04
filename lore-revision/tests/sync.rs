@@ -18,6 +18,7 @@ mod tests {
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
     use lore_revision::node::NodeFlags;
+    use lore_revision::node::ROOT_NODE;
     use lore_revision::repository;
     use lore_revision::revision::sync;
     use lore_revision::revision::sync::SyncOptions;
@@ -972,6 +973,55 @@ mod tests {
                     fs::metadata(other_file_path.as_path())
                         .expect("Failed to find first file as expected")
                         .is_file()
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The node a scan recorded for an untracked file leaves the staged tree once an ignore rule
+    /// excludes the file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scanned_untracked_entry_drops_out_once_ignored() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                test_file_write(instance.path.join("seed.txt").as_path(), b"seed");
+                test_commit_tree(&instance, "First").await;
+
+                test_file_write(instance.path.join("built.log").as_path(), b"log");
+
+                let (current, staged) = test_anchor_states(&instance.repository).await;
+                test_scan(instance.repository.clone(), staged.clone(), current.clone()).await;
+                assert!(
+                    !children_named(&instance.repository, &staged, ROOT_NODE, "built.log")
+                        .await
+                        .is_empty(),
+                    "the scan records the untracked file"
+                );
+
+                let ignoring = test_filter_context(
+                    &instance,
+                    immutable_store,
+                    mutable_store,
+                    &["built.log"],
+                    &[],
+                );
+                test_scan(ignoring, staged.clone(), current).await;
+                assert!(
+                    children_named(&instance.repository, &staged, ROOT_NODE, "built.log")
+                        .await
+                        .is_empty(),
+                    "its node leaves the staged tree once the file is ignored"
                 );
             }))
             .await

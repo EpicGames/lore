@@ -2216,6 +2216,29 @@ async fn diff_filesystem_missing_nodes(
         )
         .await?
         else {
+            // A node an earlier scan added that the filter now excludes leaves the tree when it was
+            // never committed, as staging drops it. A staged add the filter excludes was forced,
+            // so it stays.
+            if ctx.intent.marks_dirty() {
+                let node = node_list
+                    .state
+                    .node(node_list.repository.clone(), from_named_node.node)
+                    .await?;
+                if node.is_dirty_add()
+                    && !node.is_staged()
+                    && crate::stage::drops_cleanly(
+                        &ctx.current.state,
+                        &node_list.repository,
+                        &node_list.state,
+                        from_named_node.node,
+                        &node,
+                    )
+                    .await
+                    .forward::<StateError>("Failed to check a filtered node")?
+                {
+                    pending_discards.push(from_named_node.node);
+                }
+            }
             continue;
         };
 

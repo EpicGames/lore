@@ -403,7 +403,7 @@ async fn is_committed(
 /// Whether `node`, which the staged tree holds at `id`, and its subtree can leave the staged tree
 /// instead of being staged for delete: none of it is committed, a link or a merge entry, which
 /// carry a registry entry and flags only a staged delete settles.
-async fn drops_cleanly(
+pub(crate) async fn drops_cleanly(
     committed: &State,
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -2138,7 +2138,8 @@ async fn unclaimed_child(
         repository
             .filter
             .child_emit_excludes(states, &filter_path, !node.is_file(), mode);
-    if excluded {
+    // A staged add the filter excludes was forced, so it stays
+    if excluded && node.is_staged() {
         lore_trace!("Node excluded by filter: {}", filter_path.as_str());
         return Ok(None);
     }
@@ -2148,6 +2149,11 @@ async fn unclaimed_child(
     {
         lore_trace!("Node was never committed, dropping it: {filter_path}");
         queue.push(child);
+        return Ok(None);
+    }
+
+    if excluded {
+        lore_trace!("Node excluded by filter: {}", filter_path.as_str());
         return Ok(None);
     }
     Ok(Some((filter_path, child_states, held)))
