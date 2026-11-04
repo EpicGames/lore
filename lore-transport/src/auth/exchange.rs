@@ -25,6 +25,7 @@ use lore_credential::insecure_decode_token;
 use lore_credential::token_store;
 use lore_credential::token_store::Refreshed;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
+use lore_credential::unsigned_identity_token;
 use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
@@ -588,6 +589,30 @@ pub async fn exchange_custom_resource(
     Ok(token)
 }
 
+/// The authentication and authorization tokens, and the identity, for a server that
+/// advertises no authentication: one unsigned token naming `identity` in both slots. A server
+/// with `server.trust_unsigned_identity` records the caller under that identity, and any
+/// other server without authentication ignores it. `None` when there is an auth endpoint, no
+/// identity, or a supplied credential, which then takes the usual path.
+pub(crate) fn unsigned_identity_tokens(
+    auth_endpoint: &AuthEndpoint,
+    identity: &str,
+    identity_token: &str,
+    access_token: &str,
+) -> Option<(String, String, String)> {
+    if !auth_endpoint.is_none()
+        || identity.is_empty()
+        || !identity_token.is_empty()
+        || !access_token.is_empty()
+    {
+        return None;
+    }
+    let token = unsigned_identity_token(identity)
+        .inspect_err(|err| lore_warn!("Could not encode an unsigned identity token: {err}"))
+        .ok()?;
+    Some((token.clone(), token, identity.to_string()))
+}
+
 /// Resolves an identity and obtains authentication/authorization tokens.
 ///
 /// Returned tuple: (`authentication_token`, `authorization_token`, `resolved_identity`)
@@ -605,6 +630,12 @@ pub async fn auth_exchange(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
+    if let Some(tokens) =
+        unsigned_identity_tokens(auth_endpoint, identity, identity_token, access_token)
+    {
+        return tokens;
+    }
+
     if !identity.is_empty() {
         return auth_exchange_for_identity(
             auth_endpoint,
@@ -775,6 +806,12 @@ pub async fn auth_exchange_custom_resource(
     identity_token: &str,
     access_token: &str,
 ) -> (String, String, String) {
+    if let Some(tokens) =
+        unsigned_identity_tokens(auth_endpoint, identity, identity_token, access_token)
+    {
+        return tokens;
+    }
+
     if !identity.is_empty() {
         return auth_exchange_custom_resource_for_identity(
             auth_endpoint,

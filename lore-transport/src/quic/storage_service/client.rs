@@ -62,6 +62,7 @@ use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::auth::AuthEndpoint;
+use crate::auth::exchange::unsigned_identity_tokens;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
@@ -377,13 +378,24 @@ impl StorageClient {
     /// The authorization a session start for `partition` presents, read at each start because the
     /// server checks storage authorization there: an access token the newest call supplied, as it
     /// is, or the authorization the newest credentials exchange for, which the cache or the token
-    /// store may serve. Empty when there is none, as for a server without authentication or after
-    /// a failed exchange.
+    /// store may serve. For a server without authentication, the unsigned token naming the
+    /// identity that [`unsigned_identity_tokens`] gives. Empty when there is none, or after a failed
+    /// exchange.
     async fn authorization(&self, partition: Partition) -> Authorization {
-        if self.auth_endpoint.is_none() {
-            return Authorization::default();
-        }
         let (identity_token, access_token) = self.credentials.tokens();
+        if self.auth_endpoint.is_none() {
+            return Authorization {
+                token: unsigned_identity_tokens(
+                    &self.auth_endpoint,
+                    &self.identity,
+                    &identity_token,
+                    &access_token,
+                )
+                .map(|(_, token, _)| token)
+                .unwrap_or_default(),
+                exchanged_with: None,
+            };
+        }
         let (_, token, _) = crate::auth::exchange::auth_exchange(
             &self.auth_endpoint,
             &self.recipient_domain,

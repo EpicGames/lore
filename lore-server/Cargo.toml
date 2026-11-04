@@ -84,6 +84,7 @@ tonic-prost-build = { workspace = true }
 # The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-credential = { workspace = true }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 http-body = "1.0.1"

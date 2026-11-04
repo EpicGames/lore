@@ -18,6 +18,7 @@ use http::Response;
 use lore_base::types::Context as LoreContext;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::Grants;
 use lore_server::authnz::repository_authorizer::PartitionGrants;
@@ -650,7 +651,7 @@ mod behind_the_interceptor {
     #[tokio::test]
     async fn the_authorizer_sees_the_claims_the_interceptor_verified() {
         let authorizer = RecordingAuthorizer::new(false);
-        let interceptor = JWTInterceptor::new(Some(&JwtVerifier {
+        let interceptor = JWTInterceptor::new(TokenVerification::Verify(JwtVerifier {
             jwk_service: Arc::new(CachedJWKService),
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),

@@ -9,6 +9,7 @@ use bytes::Bytes;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::ALLOW_ALL_ACTIONS;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
@@ -33,7 +34,7 @@ async fn service() -> StorageService {
     // The legacy tier answers an access token from its `resources` claim, so
     // the URL is never reached.
     StorageService::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AuthClientAuthorizer::new(
             "https://auth.invalid".to_string(),
         )),
@@ -145,7 +146,7 @@ async fn connect_without_a_verifier_stores_the_allow_all_grants() {
     let (immutable_store, mutable_store, _execution) =
         test_store_create().await.expect("Failed to create stores");
     let service = StorageService::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AllowAllRepositoryAuthorizer),
         immutable_store.clone(),
         immutable_store,

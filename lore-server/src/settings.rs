@@ -206,6 +206,12 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
     let Some(auth) = auth else {
         return Ok(());
     };
+    if settings.server.trust_unsigned_identity {
+        return Err(config::ConfigError::Message(
+            "server.trust_unsigned_identity applies only to a server without [server.auth]"
+                .to_string(),
+        ));
+    }
     if auth.jwt_issuer.is_empty() {
         return Err(config::ConfigError::Message(
             "server.auth.jwt_issuer must not be empty".to_string(),
@@ -653,6 +659,11 @@ where
 //#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
+    /// Without `[server.auth]`, take the caller's identity from an unsigned
+    /// bearer token. Anyone can claim any identity, so this only names
+    /// callers; it grants nothing. Refused at load beside `[server.auth]`.
+    #[serde(default)]
+    pub trust_unsigned_identity: bool,
     pub grpc: Option<GrpcSettings>,
     /// One block per public gRPC service; an absent table enables every
     /// service.

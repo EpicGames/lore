@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -26,7 +27,7 @@ fn make_service(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> StorageServiceV4 {
     StorageServiceV4::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
         immutable_store.clone(),
         immutable_store.clone(),
@@ -276,7 +277,7 @@ mod authorized_session {
         let (immutable_store, mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
         StorageServiceV4::new(
-            Arc::new(Some(verifier())),
+            Arc::new(TokenVerification::Verify(verifier())),
             Arc::new(AuthClientAuthorizer::new(
                 "https://auth.invalid".to_string(),
             )),
@@ -506,7 +507,7 @@ mod authorized_session {
         let (immutable_store, mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
         let service = StorageServiceV4::new(
-            Arc::new(Some(verifier())),
+            Arc::new(TokenVerification::Verify(verifier())),
             Arc::new(CountingAuthorizer {
                 watched: repo_a,
                 source_checks: source_checks.clone(),
@@ -578,4 +579,52 @@ async fn session_start_without_a_verifier_stores_the_allow_all_grants() {
             ALLOW_ALL_ACTIONS.iter().map(ToString::to_string).collect()
         ))
     );
+}
+
+#[tokio::test]
+async fn session_start_trusting_unsigned_identity_names_the_caller_without_a_token() {
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let service = StorageServiceV4::new(
+        Arc::new(TokenVerification::TrustUnsigned),
+        Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+        immutable_store.clone(),
+        immutable_store,
+        mutable_store,
+        Arc::new(UserAgentFilter::default()),
+    );
+    let start = |auth_token: Vec<u8>| {
+        service.run_request_handler(
+            AttributeMap::default().into(),
+            ParsedStorageRequestV4::AuthorizeStart {
+                repository: random(),
+                correlation_id: "corr".to_string(),
+                auth_token,
+            },
+        )
+    };
+
+    let token = lore_credential::unsigned_identity_token("alice").expect("encodes");
+    let response = start(token.into_bytes()).await.expect("session start");
+    let session_id = u32::from_le_bytes(response[0][..4].try_into().unwrap());
+    let session = service.session_map.get(session_id).unwrap();
+    assert_eq!(session.user_id, "alice");
+    assert!(session.token.is_none());
+    drop(session);
+
+    let response = start(vec![]).await.expect("a token is not required");
+    let session_id = u32::from_le_bytes(response[0][..4].try_into().unwrap());
+    assert!(
+        service
+            .session_map
+            .get(session_id)
+            .unwrap()
+            .user_id
+            .is_empty()
+    );
+
+    let error = start(b"not.a.jwt".to_vec())
+        .await
+        .expect_err("a malformed token is refused");
+    assert!(matches!(error, MessageHandleError::AuthorizationFailure(_)));
 }

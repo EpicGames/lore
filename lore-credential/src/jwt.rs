@@ -182,6 +182,37 @@ pub fn insecure_decode_token(
     jsonwebtoken::decode::<JWTUserInfo>(token, &key, &validation)
 }
 
+/// The `iss` and `aud` of an [`unsigned_identity_token`].
+pub const UNSIGNED_IDENTITY_ISSUER: &str = "lore-unsigned-identity";
+
+/// `exp` of an [`unsigned_identity_token`], 3000-01-01: the token proves nothing, so there
+/// is nothing for an expiry to limit.
+const UNSIGNED_IDENTITY_EXPIRES: u64 = 32_503_680_000;
+
+/// A token that names `identity` to a server with `server.trust_unsigned_identity`. Its
+/// HS256 signature uses an empty key and proves nothing: `jsonwebtoken` refuses
+/// `alg: none` when it reads the header, so the token carries a real algorithm to stay
+/// readable by [`insecure_decode_token`] and the server.
+pub fn unsigned_identity_token(identity: &str) -> Result<String, jsonwebtoken::errors::Error> {
+    let issued_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let claims = serde_json::json!({
+        "iss": UNSIGNED_IDENTITY_ISSUER,
+        "aud": [UNSIGNED_IDENTITY_ISSUER],
+        "sub": identity,
+        "name": identity,
+        "preferred_username": identity,
+        "iat": issued_at,
+        "exp": UNSIGNED_IDENTITY_EXPIRES,
+    });
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(&[]),
+    )
+}
+
 /// The user a token names. `None` when the token is not a JWT with the standard claims, or
 /// names no identity (see [`JWTUserInfo::identity`]).
 pub fn user_info_from_token(token: String) -> Option<UserInfo> {

@@ -15,7 +15,7 @@ use lore_storage::StoreError;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::responses;
@@ -120,7 +120,7 @@ pub trait Message: Debug + Send + Sync {
     async fn handle_auth(
         &self,
         _context: Arc<AttributeMap>,
-        _jwt_verifier: Arc<Option<JwtVerifier>>,
+        _token_verification: Arc<TokenVerification>,
         _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         Err(MessageHandleError::NotImplemented)

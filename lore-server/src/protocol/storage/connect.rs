@@ -10,7 +10,8 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
+use crate::auth::jwt::decode_unsigned_identity;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
@@ -62,7 +63,7 @@ impl Message for Connect {
     async fn handle_auth(
         &self,
         context: Arc<AttributeMap>,
-        jwt_verifier: Arc<Option<JwtVerifier>>,
+        token_verification: Arc<TokenVerification>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         // Make sure a correlation ID exists
@@ -93,7 +94,7 @@ impl Message for Connect {
             return Err(MessageHandleError::AlreadyConnected);
         }
 
-        if let Some(jwt_verifier) = jwt_verifier.as_ref() {
+        if let Some(jwt_verifier) = token_verification.verifier() {
             match self.auth_token.as_ref() {
                 Some(auth_token) => {
                     let authorization = jwt_verifier
@@ -128,19 +129,31 @@ impl Message for Connect {
                     return Err(MessageHandleError::MissingToken);
                 }
             }
-        } else if let Some(grants) = repository_authorizer
-            .granted_access(None, self.repository)
-            .await
-            .map_err(|status| {
-                MessageHandleError::AuthorizationFailure(status.message().to_string())
-            })?
-        {
-            // Enumerated without a token too, so each command is a set lookup
-            // rather than an authorizer call.
-            context.insert(PartitionGrants {
-                repository_id: self.repository,
-                grants,
-            });
+        } else {
+            if let TokenVerification::TrustUnsigned = *token_verification
+                && let Some(auth_token) = self.auth_token.as_deref().filter(|t| !t.is_empty())
+            {
+                let claims = decode_unsigned_identity(auth_token)
+                    .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                if let Some(span) = context.get::<tracing::Span>() {
+                    span.record(USER_ID, claims.identity());
+                }
+                context.insert(claims);
+            }
+            if let Some(grants) = repository_authorizer
+                .granted_access(None, self.repository)
+                .await
+                .map_err(|status| {
+                    MessageHandleError::AuthorizationFailure(status.message().to_string())
+                })?
+            {
+                // Enumerated without a token too, so each command is a set lookup
+                // rather than an authorizer call.
+                context.insert(PartitionGrants {
+                    repository_id: self.repository,
+                    grants,
+                });
+            }
         }
 
         // A first connect, or a reconnect to the same repository; the

@@ -72,6 +72,7 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::oidc::advertised_oidc;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
@@ -465,7 +466,7 @@ async fn launch_grpc_server(
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     repository_catalog: Arc<dyn RepositoryCatalog>,
     settings: Settings,
@@ -491,7 +492,7 @@ async fn launch_grpc_server(
     info!(
         "Starting Lore GRPC Server: {}, Auth: {} Locks: {}",
         &addr,
-        jwt_verifier.as_ref().map_or("disabled", |_| "enabled"),
+        token_verification.describe(),
         if locks { "enabled" } else { "disabled" },
     );
 
@@ -552,7 +553,11 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier, repository_authorizer, repository_catalog)?
+        .with_token_verification(
+            token_verification,
+            repository_authorizer,
+            repository_catalog,
+        )?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -715,7 +720,7 @@ async fn launch_http_server(
     settings: LoreHttpServerSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
@@ -723,7 +728,7 @@ async fn launch_http_server(
         settings,
         immutable_store,
         mutable_store,
-        jwt_verifier,
+        token_verification,
         repository_authorizer,
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -787,7 +792,7 @@ impl QuicPublicStreamHandler {
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         limits: AdmissionLimits,
         user_agent_filter: Arc<UserAgentFilter>,
@@ -798,11 +803,11 @@ impl QuicPublicStreamHandler {
             |immutable_store: Arc<dyn ImmutableStore>,
              local_store: Arc<dyn ImmutableStore>,
              mutable_store: Arc<dyn MutableStore>,
-             jwt_verifier: Option<JwtVerifier>,
+             token_verification: TokenVerification,
              repository_authorizer: Arc<dyn RepositoryAuthorizer>| {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let storage_protocol = StorageService::new(
-                        Arc::new(jwt_verifier.clone()),
+                        Arc::new(token_verification.clone()),
                         repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
@@ -822,7 +827,7 @@ impl QuicPublicStreamHandler {
                 immutable_store.clone(),
                 local_store.clone(),
                 mutable_store.clone(),
-                jwt_verifier.clone(),
+                token_verification.clone(),
                 repository_authorizer.clone(),
             ),
         );
@@ -830,14 +835,14 @@ impl QuicPublicStreamHandler {
             let immutable_store = immutable_store.clone();
             let local_store = local_store.clone();
             let mutable_store = mutable_store.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             service_store.add_service(
                 StorageClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
-                        Arc::new(jwt_verifier.clone()),
+                        Arc::new(token_verification.clone()),
                         repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
@@ -2124,6 +2129,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         }
         None => None,
     };
+    let token_verification = TokenVerification::new(
+        jwt_verifier.clone(),
+        settings.server.trust_unsigned_identity,
+    )?;
 
     if let Some(auth) = settings.server.auth.as_ref() {
         let auth_url = settings
@@ -2234,7 +2243,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let lock_store = lock_store.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let repository_catalog = repository_catalog.clone();
             let settings = settings.clone();
@@ -2253,7 +2262,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 local_immutable_store,
                 mutable_store,
                 lock_store,
-                jwt_verifier,
+                token_verification,
                 repository_authorizer,
                 repository_catalog,
                 settings,
@@ -2341,7 +2350,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
@@ -2374,7 +2383,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
             info!(
                 "Lore Public QUIC Server: Auth: {}",
-                jwt_verifier.as_ref().map_or("no", |_| "yes")
+                token_verification.describe()
             );
 
             launch_quinn_server(
@@ -2383,7 +2392,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     immutable_store,
                     local_immutable_store,
                     mutable_store,
-                    jwt_verifier,
+                    token_verification,
                     repository_authorizer,
                     limits,
                     user_agent_filter,
@@ -2491,7 +2500,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     lore_http_settings,
                     immutable_store,
                     mutable_store,
-                    jwt_verifier,
+                    token_verification,
                     repository_authorizer,
                     shutdown_rx,
                 )

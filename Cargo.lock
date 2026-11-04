@@ -2801,6 +2801,7 @@ dependencies = [
  "jsonwebtoken",
  "lore-aws",
  "lore-base",
+ "lore-credential",
  "lore-error-set",
  "lore-hashicorp",
  "lore-macro",

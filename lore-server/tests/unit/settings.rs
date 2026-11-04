@@ -590,6 +590,41 @@ fn auth_with_issuer_and_audience_passes_validation() {
     validate_auth_config(&settings).expect("a complete [server.auth] must validate");
 }
 
+#[test]
+fn trust_unsigned_identity_beside_server_auth_fails_validation() {
+    let mut settings = settings_with_auth_keys(
+        r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+
+            [environment.endpoint]
+            auth_url = "ucs-auth://auth.example.com"
+        "#,
+    )
+    .expect("a complete [server.auth] must parse");
+    settings.server.trust_unsigned_identity = true;
+    validate_auth_config(&settings)
+        .expect_err("trust_unsigned_identity with [server.auth] must fail validation");
+}
+
+#[test]
+fn trust_unsigned_identity_without_server_auth_passes_validation() {
+    let config = r#"
+        [server]
+        runtime_shutdown_timeout_seconds = 0
+        trust_unsigned_identity = true
+
+        [immutable_store]
+        mode = "local"
+
+        [mutable_store]
+        mode = "local"
+    "#;
+    let settings: Settings = toml::from_str(config).expect("must parse");
+    assert!(settings.server.trust_unsigned_identity);
+    validate_auth_config(&settings).expect("trust_unsigned_identity alone must validate");
+}
+
 /// The loader reads `user_url` from `[environment.endpoint]` for the catalog
 /// selection, so `repository_catalog = "user_service"` loads with it and is
 /// refused without it.

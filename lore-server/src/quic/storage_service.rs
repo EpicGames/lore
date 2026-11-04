@@ -29,7 +29,7 @@ use tracing::debug;
 use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
@@ -469,7 +469,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 }
 
 pub struct StorageService {
-    jwt_verifier: Arc<Option<JwtVerifier>>,
+    token_verification: Arc<TokenVerification>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -478,14 +478,14 @@ pub struct StorageService {
 
 impl StorageService {
     pub fn new(
-        jwt_verifier: Arc<Option<JwtVerifier>>,
+        token_verification: Arc<TokenVerification>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self {
-            jwt_verifier,
+            token_verification,
             repository_authorizer,
             immutable_store,
             local_store,
@@ -530,7 +530,7 @@ impl QuicService for StorageService {
                 request
                     .handle_auth(
                         context,
-                        self.jwt_verifier.clone(),
+                        self.token_verification.clone(),
                         self.repository_authorizer.clone(),
                     )
                     .await

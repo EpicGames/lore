@@ -88,6 +88,7 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | --- | --- | --- |
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
+| `server.trust_unsigned_identity` | `false` | Without `[server.auth]`, take the caller's identity from an unsigned bearer token on gRPC, HTTP and QUIC. See [Unsigned identity](#unsigned-identity). The server refuses to start if it is set beside `[server.auth]`. |
 
 ### Advertised endpoints
 
@@ -469,6 +470,12 @@ client_id = "lore-cli"
 scopes = ["openid", "offline_access"]
 resource_template = "https://lore.example.com/partitions/{id}"
 ```
+
+#### Unsigned identity
+
+Without `[server.auth]`, the server records every caller as `<unknown>`, so a lock or a notification can't tell one user from another. With `server.trust_unsigned_identity = true`, the server reads the identity from a bearer token without checking its signature or the values of `iss`, `aud` and `exp`. The token must still carry `iss`, `sub`, `aud`, `iat` and `exp`. It takes the `identity` claim, or `sub` when there is none, as other deployments do. A client sends such a token when the server advertises no authentication and the call has an identity, from `--identity` or the repository or global configuration. A request without a token is still accepted as `<unknown>`. A token that doesn't decode or names no identity is refused: with `UNAUTHENTICATED` on gRPC, with `401` on HTTP, and as an authorization failure on QUIC.
+
+The identity names the caller and grants nothing: permissions stay as described above for a server without `[server.auth]`. Any caller can claim any identity, and hooks receive the token's `is_service_account` claim as given. No caller holds `owner` or `admin`, so only a caller naming the lock's owner can release it: `lore --identity <owner> lock release <path>`. A lock that a client without an identity took is owned by `<unknown>`.
 
 ## Store settings
 

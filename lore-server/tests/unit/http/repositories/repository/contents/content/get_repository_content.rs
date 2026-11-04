@@ -17,6 +17,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_revision::fragment;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::server::LoreHttpServerSettings;
 use lore_server::http::server::ServerHealth;
@@ -37,7 +38,7 @@ async fn test_server_is_up_and_listening() {
             let test_shared_state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
+                token_verification: TokenVerification::Ignore,
                 repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                 max_file_size: 100,
                 presign_config: None,
@@ -64,7 +65,7 @@ async fn test_address_in_wrong_format() {
             let test_shared_state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
+                token_verification: TokenVerification::Ignore,
                 repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                 max_file_size: 100,
                 presign_config: None,
@@ -92,7 +93,7 @@ async fn test_address_not_found() {
             let test_shared_state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
+                token_verification: TokenVerification::Ignore,
                 repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                 max_file_size: 100,
                 presign_config: None,
@@ -137,7 +138,7 @@ async fn test_address_returned_correctly() {
             let test_shared_state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
+                token_verification: TokenVerification::Ignore,
                 repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                 max_file_size: 100,
                 presign_config: None,
@@ -181,7 +182,7 @@ async fn test_address_returned_correctly_with_headers() {
             let test_shared_state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
+                token_verification: TokenVerification::Ignore,
                 repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                 max_file_size: 100,
                 presign_config: None,
@@ -242,7 +243,7 @@ async fn test_address_works_with_jwt_verifier_and_good_token() {
             let test_shared_state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
+                token_verification: TokenVerification::Ignore,
                 repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                 max_file_size: 100,
                 presign_config: None,

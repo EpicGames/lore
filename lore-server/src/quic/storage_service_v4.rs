@@ -18,7 +18,8 @@ use lore_transport::quic::storage_service::command_name;
 use tracing::Span;
 use tracing::debug;
 
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
+use crate::auth::jwt::decode_unsigned_identity;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
@@ -93,7 +94,7 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
 
 #[lore_macro::test_pub]
 pub struct StorageServiceV4 {
-    jwt_verifier: Arc<Option<JwtVerifier>>,
+    token_verification: Arc<TokenVerification>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -104,7 +105,7 @@ pub struct StorageServiceV4 {
 
 impl StorageServiceV4 {
     pub fn new(
-        jwt_verifier: Arc<Option<JwtVerifier>>,
+        token_verification: Arc<TokenVerification>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
@@ -112,7 +113,7 @@ impl StorageServiceV4 {
         user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         Self {
-            jwt_verifier,
+            token_verification,
             repository_authorizer,
             immutable_store,
             local_store,
@@ -196,7 +197,7 @@ impl QuicService for StorageServiceV4 {
                 let grants;
                 let mut token = None;
 
-                if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
+                if let Some(jwt_verifier) = self.token_verification.verifier() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
                         MessageHandleError::AuthorizationFailure(format!(
                             "invalid token encoding: {err}"
@@ -227,6 +228,17 @@ impl QuicService for StorageServiceV4 {
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 } else {
+                    if let TokenVerification::TrustUnsigned = *self.token_verification
+                        && !auth_token.is_empty()
+                    {
+                        let claims = std::str::from_utf8(&auth_token)
+                            .map_err(|err| err.to_string())
+                            .and_then(|token| {
+                                decode_unsigned_identity(token).map_err(|err| err.to_string())
+                            })
+                            .map_err(MessageHandleError::AuthorizationFailure)?;
+                        user_id = claims.identity().to_string();
+                    }
                     // Enumerated without a token too, so each command is a set
                     // lookup rather than an authorizer call.
                     grants = self

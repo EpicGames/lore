@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
@@ -51,7 +52,7 @@ async fn test_handle() {
         message
             .handle_auth(
                 context.clone(),
-                Arc::new(None),
+                Arc::new(TokenVerification::Ignore),
                 Arc::new(AllowAllRepositoryAuthorizer),
             )
             .await
@@ -59,6 +60,48 @@ async fn test_handle() {
     );
 
     assert_eq!(repository, *context.get::<RepositoryId>().unwrap());
+}
+
+#[tokio::test]
+async fn trusting_unsigned_identity_names_the_caller_without_a_verified_token() {
+    let message = Connect {
+        repository: random::<RepositoryId>(),
+        auth_token: Some(lore_credential::unsigned_identity_token("alice").expect("encodes")),
+    };
+    let context = Arc::new(AttributeMap::default());
+
+    message
+        .handle_auth(
+            context.clone(),
+            Arc::new(TokenVerification::TrustUnsigned),
+            Arc::new(AllowAllRepositoryAuthorizer),
+        )
+        .await
+        .expect("an unsigned token is accepted");
+
+    assert_eq!(
+        context.get::<AuthorizationToken>().unwrap().identity(),
+        "alice"
+    );
+    assert!(context.get::<RawToken>().is_none());
+}
+
+#[tokio::test]
+async fn trusting_unsigned_identity_refuses_a_malformed_token() {
+    let message = Connect {
+        repository: random::<RepositoryId>(),
+        auth_token: Some("not.a.jwt".to_string()),
+    };
+
+    let error = message
+        .handle_auth(
+            Arc::new(AttributeMap::default()),
+            Arc::new(TokenVerification::TrustUnsigned),
+            Arc::new(AllowAllRepositoryAuthorizer),
+        )
+        .await
+        .expect_err("a malformed token is refused");
+    assert!(matches!(error, MessageHandleError::AuthorizationFailure(_)));
 }
 
 #[test]
@@ -83,7 +126,7 @@ async fn test_set_repository_already_set() {
         message
             .handle_auth(
                 context,
-                Arc::new(None),
+                Arc::new(TokenVerification::Ignore),
                 Arc::new(AllowAllRepositoryAuthorizer)
             )
             .await
@@ -109,7 +152,7 @@ async fn test_set_repository_already_set_value_matched() {
         message
             .handle_auth(
                 context,
-                Arc::new(None),
+                Arc::new(TokenVerification::Ignore),
                 Arc::new(AllowAllRepositoryAuthorizer)
             )
             .await
@@ -137,7 +180,7 @@ async fn a_rejected_reconnect_leaves_the_existing_token_alone() {
     let result = message
         .handle_auth(
             context.clone(),
-            Arc::new(None),
+            Arc::new(TokenVerification::Ignore),
             Arc::new(AllowAllRepositoryAuthorizer),
         )
         .await;
@@ -203,12 +246,12 @@ mod authorized_connect {
         }
     }
 
-    fn verifier() -> Arc<Option<JwtVerifier>> {
+    fn verifier() -> Arc<TokenVerification> {
         let mut jwk_service = MockTestJWKService::new();
         jwk_service
             .expect_get_key()
             .returning(|_| Ok((DecodingKey::from_secret(SIGNING_SECRET.as_ref()), ALGORITHM)));
-        Arc::new(Some(JwtVerifier {
+        Arc::new(TokenVerification::Verify(JwtVerifier {
             jwk_service: Arc::new(jwk_service),
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),

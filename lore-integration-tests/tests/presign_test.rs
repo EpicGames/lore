@@ -106,7 +106,7 @@ mod presign_tests {
         let state = ServerState {
             immutable_store,
             mutable_store,
-            jwt_verifier: None,
+            token_verification: lore_server::auth::jwt::TokenVerification::Ignore,
             repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
             max_file_size: 10 * 1024 * 1024,
             presign_config: Some(test_presign_config()),

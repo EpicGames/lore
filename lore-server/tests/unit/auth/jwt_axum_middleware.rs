@@ -23,6 +23,7 @@ use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
@@ -125,7 +126,7 @@ async fn the_shared_authorizer_decides_the_repository_path() {
             let state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: Some(verifier()),
+                token_verification: TokenVerification::Verify(verifier()),
                 repository_authorizer: authorizer,
                 max_file_size: 100,
                 presign_config: None,
@@ -187,7 +188,7 @@ async fn any_grant_reads_and_put_needs_write() {
             let state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: Some(verifier()),
+                token_verification: TokenVerification::Verify(verifier()),
                 repository_authorizer: Arc::new(AuthClientAuthorizer::new(
                     "https://auth.invalid".to_string(),
                 )),
@@ -247,11 +248,11 @@ async fn presign_needs_presign() {
                 .put(repository.into(), address, fragment, Some(payload), false)
                 .await
                 .expect("Failed to put data in immutable store");
-            let server = |jwt_verifier, repository_authorizer| {
+            let server = |token_verification, repository_authorizer| {
                 let state = ServerState {
                     immutable_store: immutable_store.clone(),
                     mutable_store: mutable_store.clone(),
-                    jwt_verifier,
+                    token_verification,
                     repository_authorizer,
                     max_file_size: 100,
                     presign_config: Some(presign_config()),
@@ -267,7 +268,7 @@ async fn presign_needs_presign() {
             let url = format!("/v1/repository/{repository}/content/{address}/presign");
 
             let legacy = server(
-                Some(verifier()),
+                TokenVerification::Verify(verifier()),
                 Arc::new(AuthClientAuthorizer::new(
                     "https://auth.invalid".to_string(),
                 )),
@@ -289,9 +290,76 @@ async fn presign_needs_presign() {
                 assert_eq!(response.status_code(), status, "presign with {action}");
             }
 
-            let no_auth = server(None, Arc::new(AllowAllRepositoryAuthorizer));
+            let no_auth = server(
+                TokenVerification::Ignore,
+                Arc::new(AllowAllRepositoryAuthorizer),
+            );
             let response = no_auth.post(&url).json(&json!({})).await;
             assert_eq!(response.status_code(), HttpStatusCode::OK);
+        })
+        .await;
+}
+
+/// The identity the middleware handed down, and whether a raw token came with it.
+async fn caller(request: axum::extract::Request) -> String {
+    let identity = request
+        .extensions()
+        .get::<Option<AuthorizationToken>>()
+        .cloned()
+        .flatten()
+        .map_or_else(|| "-".to_string(), |claims| claims.identity().to_string());
+    let raw = request
+        .extensions()
+        .get::<lore_server::authnz::repository_authorizer::RawToken>()
+        .is_some();
+    format!("{identity} raw={raw}")
+}
+
+#[tokio::test]
+async fn trusting_unsigned_identity_names_the_caller_without_a_verified_token() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let state = ServerState {
+                immutable_store,
+                mutable_store,
+                token_verification: TokenVerification::TrustUnsigned,
+                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
+                max_file_size: 100,
+                presign_config: None,
+            };
+            let app = axum::Router::new()
+                .route("/{repository_id}", axum::routing::get(caller))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    lore_server::auth::jwt_axum_middleware::jwt_axum_verify_authorization,
+                ))
+                .with_state(state);
+            let server = TestServer::new(app).unwrap();
+            let url = format!("/{}", random::<Context>());
+            let auth_header = HeaderName::from_static("authorization");
+            let token = lore_credential::unsigned_identity_token("alice").expect("encodes");
+
+            let named = server
+                .get(&url)
+                .add_header(
+                    auth_header.clone(),
+                    HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+                )
+                .await;
+            named.assert_status_ok();
+            assert_eq!(named.text(), "alice raw=false");
+
+            let anonymous = server.get(&url).await;
+            anonymous.assert_status_ok();
+            assert_eq!(anonymous.text(), "- raw=false");
+
+            let malformed = server
+                .get(&url)
+                .add_header(auth_header, HeaderValue::from_static("Bearer not.a.jwt"))
+                .await;
+            malformed.assert_status(HttpStatusCode::UNAUTHORIZED);
         })
         .await;
 }

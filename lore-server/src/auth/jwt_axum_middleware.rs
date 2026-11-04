@@ -18,6 +18,8 @@ use serde::Deserialize;
 use tracing::Span;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::TokenVerification;
+use crate::auth::jwt::decode_unsigned_identity;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
@@ -37,51 +39,72 @@ pub async fn jwt_axum_verify_authorization(
     mut request: Request,
     next: Next,
 ) -> Response {
-    if let Some(jwt_verifier) = state.jwt_verifier {
-        if let Some(accesstoken) = extract_bearer_token(&request) {
-            if let Ok(user_info) = jwt_verifier.verify_token(&accesstoken).await {
-                let repository: lore_revision::lore::RepositoryId =
-                    Context::from_str(params.repository_id.as_str())
-                        .unwrap_or_default()
-                        .into();
-                let token = VerifiedToken {
-                    raw: &accesstoken,
-                    claims: &user_info,
-                };
-                if let Ok(grants) = state
-                    .repository_authorizer
-                    .granted_access(Some(&token), repository)
-                    .await
-                {
-                    Span::current().record(USER_ID, user_info.identity());
-                    if let Some(grants) = grants {
-                        request.extensions_mut().insert(PartitionGrants {
-                            repository_id: repository,
-                            grants,
-                        });
-                    }
-                    // Set `user_info` as a request extension so it can be used down the stack
-                    request.extensions_mut().insert(RawToken(accesstoken));
-                    request.extensions_mut().insert(Some(user_info));
-
-                    return next.run(request).await;
-                }
+    let jwt_verifier = match state.token_verification {
+        TokenVerification::Verify(jwt_verifier) => jwt_verifier,
+        TokenVerification::TrustUnsigned => {
+            let claims = match extract_bearer_token(&request)
+                .as_deref()
+                .map(decode_unsigned_identity)
+            {
+                None => None,
+                Some(Ok(claims)) => Some(claims),
+                Some(Err(_)) => return unauthorized(),
+            };
+            if let Some(claims) = &claims {
+                Span::current().record(USER_ID, claims.identity());
             }
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::empty())
-                .unwrap()
-        } else {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .body(Body::empty())
-                .unwrap()
+            request.extensions_mut().insert(claims);
+            return next.run(request).await;
         }
+        TokenVerification::Ignore => {
+            let no_user_info: Option<AuthorizationToken> = None;
+            request.extensions_mut().insert(no_user_info);
+            return next.run(request).await;
+        }
+    };
+    if let Some(accesstoken) = extract_bearer_token(&request) {
+        if let Ok(user_info) = jwt_verifier.verify_token(&accesstoken).await {
+            let repository: lore_revision::lore::RepositoryId =
+                Context::from_str(params.repository_id.as_str())
+                    .unwrap_or_default()
+                    .into();
+            let token = VerifiedToken {
+                raw: &accesstoken,
+                claims: &user_info,
+            };
+            if let Ok(grants) = state
+                .repository_authorizer
+                .granted_access(Some(&token), repository)
+                .await
+            {
+                Span::current().record(USER_ID, user_info.identity());
+                if let Some(grants) = grants {
+                    request.extensions_mut().insert(PartitionGrants {
+                        repository_id: repository,
+                        grants,
+                    });
+                }
+                // Set `user_info` as a request extension so it can be used down the stack
+                request.extensions_mut().insert(RawToken(accesstoken));
+                request.extensions_mut().insert(Some(user_info));
+
+                return next.run(request).await;
+            }
+        }
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::empty())
+            .unwrap()
     } else {
-        let no_user_info: Option<AuthorizationToken> = None;
-        request.extensions_mut().insert(no_user_info);
-        next.run(request).await
+        unauthorized()
     }
+}
+
+fn unauthorized() -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn extract_bearer_token(request: &Request) -> Option<String> {

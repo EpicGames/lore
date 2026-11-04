@@ -71,6 +71,92 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
     assert_eq!(identity, "alice");
 }
 
+#[tokio::test]
+async fn no_auth_endpoint_with_an_identity_sends_an_unsigned_identity_token() {
+    let (authentication_token, authorization_token, identity) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        RepositoryId::default(),
+        "",
+        "",
+    )
+    .await;
+
+    assert_eq!(authentication_token, authorization_token);
+    assert_eq!(
+        lore_credential::identity_from_token(&authorization_token),
+        "alice"
+    );
+    assert_eq!(identity, "alice");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_without_an_identity_sends_no_token() {
+    let tokens = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "",
+        RepositoryId::default(),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(tokens, (String::new(), String::new(), String::new()));
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_a_supplied_access_token_over_an_unsigned_one() {
+    let (_, authorization_token, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id"),
+        "",
+        "supplied-authz",
+    )
+    .await;
+    assert_eq!(authorization_token, "supplied-authz");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_an_unsigned_identity_token_for_a_custom_resource() {
+    let (_, authorization_token, identity) = auth_exchange_custom_resource(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        "some-resource",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(
+        lore_credential::identity_from_token(&authorization_token),
+        "alice"
+    );
+    assert_eq!(identity, "alice");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_a_supplied_identity_token_over_an_unsigned_one() {
+    let (authentication_token, _, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        RepositoryId::default(),
+        "supplied-authn",
+        "",
+    )
+    .await;
+    assert_ne!(
+        lore_credential::identity_from_token(&authentication_token),
+        "alice",
+        "the supplied token is not replaced with an unsigned one"
+    );
+}
+
 /// Without one, the same call fails: nothing about the short circuit above
 /// leaks into the normal path.
 #[tokio::test]

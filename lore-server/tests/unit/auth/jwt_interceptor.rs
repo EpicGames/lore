@@ -17,6 +17,7 @@ use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::JwtVerifier;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::auth::jwt_interceptor::*;
 use lore_server::authnz::repository_authorizer::RawToken;
 use serde_json::json;
@@ -52,7 +53,7 @@ impl JWKService for CachedJWKService {
 }
 
 fn interceptor() -> JWTInterceptor {
-    JWTInterceptor::new(Some(&JwtVerifier {
+    JWTInterceptor::new(TokenVerification::Verify(JwtVerifier {
         jwk_service: Arc::new(CachedJWKService),
         jwt_issuer: None,
         jwt_audience: Some(vec!["Lore".to_string()]),
@@ -197,7 +198,7 @@ fn a_request_with_no_bearer_token_is_unauthenticated() {
 /// verified caller.
 #[test]
 fn without_a_verifier_every_request_passes_untouched() {
-    let mut interceptor = JWTInterceptor::new(None);
+    let mut interceptor = JWTInterceptor::new(TokenVerification::Ignore);
 
     let request = interceptor
         .call(tonic::Request::new(()))
@@ -234,4 +235,88 @@ fn a_token_failing_on_its_own_claims_is_refused() {
         .expect_err("an expired token is denied");
     assert_eq!(status.code(), tonic::Code::PermissionDenied);
     assert_eq!(status.message(), "Not allowed");
+}
+
+#[test]
+fn trusting_unsigned_identity_names_the_caller_without_a_verified_token() {
+    let token = lore_credential::unsigned_identity_token("alice").expect("encodes");
+
+    let request = JWTInterceptor::new(TokenVerification::TrustUnsigned)
+        .call(request_with(&token, None))
+        .expect("an unsigned token is accepted");
+
+    let claims = request
+        .extensions()
+        .get::<AuthorizationToken>()
+        .expect("the claims name the caller");
+    assert_eq!(claims.identity(), "alice");
+    assert!(
+        request.extensions().get::<RawToken>().is_none(),
+        "without a raw token, authorization sees no verified token"
+    );
+}
+
+#[test]
+fn trusting_unsigned_identity_takes_the_identity_claim_over_sub() {
+    let token = encode_token(&json!({
+        "iss": "anyone",
+        "sub": "service-account-1",
+        "identity": "bob",
+        "aud": "anything",
+        "iat": 1,
+        "exp": 1,
+    }));
+
+    let request = JWTInterceptor::new(TokenVerification::TrustUnsigned)
+        .call(request_with(&token, None))
+        .expect("signature, audience and expiry are not checked");
+
+    let claims = request.extensions().get::<AuthorizationToken>().unwrap();
+    assert_eq!(claims.identity(), "bob");
+}
+
+#[test]
+fn trusting_unsigned_identity_passes_a_request_without_a_token() {
+    let request = JWTInterceptor::new(TokenVerification::TrustUnsigned)
+        .call(tonic::Request::new(()))
+        .expect("a token is not required");
+    assert!(request.extensions().get::<AuthorizationToken>().is_none());
+}
+
+#[test]
+fn trusting_unsigned_identity_refuses_a_malformed_token() {
+    let nameless = encode_token(&json!({
+        "iss": "anyone",
+        "sub": "",
+        "aud": "anything",
+        "iat": 1,
+        "exp": 1,
+    }));
+    for token in ["not.a.jwt", nameless.as_str()] {
+        let status = JWTInterceptor::new(TokenVerification::TrustUnsigned)
+            .call(request_with(token, None))
+            .expect_err("a token that names no one is refused");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+}
+
+#[test]
+fn a_verifier_refuses_an_unsigned_identity_token() {
+    let token = lore_credential::unsigned_identity_token("alice").expect("encodes");
+
+    let status = interceptor()
+        .call(request_with(&token, None))
+        .expect_err("an unsigned token never verifies");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+}
+
+#[test]
+fn token_verification_refuses_a_verifier_with_unsigned_identity() {
+    let verifier = JwtVerifier {
+        jwk_service: Arc::new(CachedJWKService),
+        jwt_issuer: None,
+        jwt_audience: None,
+        jwt_typ: None,
+    };
+    assert!(TokenVerification::new(Some(verifier), true).is_err());
 }

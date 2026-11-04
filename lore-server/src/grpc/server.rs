@@ -43,7 +43,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::lock_service::LoreLockService;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::jwt_interceptor::JWTInterceptor;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
@@ -666,9 +666,9 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         )
     }
 
-    pub fn with_jwt_verifier(
+    pub fn with_token_verification(
         self,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         repository_catalog: Arc<dyn RepositoryCatalog>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
@@ -739,7 +739,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
 
         let mut admin_svc = self.0.admin_svc;
-        admin_svc.set_auth(jwt_verifier.clone(), repository_authorizer.clone());
+        admin_svc.set_auth(
+            token_verification.verifier().cloned(),
+            repository_authorizer.clone(),
+        );
         admin_svc.set_rpc_timeout(rpc_timeout);
 
         let storage_svc = LoreStorageService::new(
@@ -804,8 +807,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         let notification_service = self.0.notification_service;
 
-        let authenticated = jwt_verifier.is_some();
-        let jwt_interceptor = JWTInterceptor::new(jwt_verifier.as_ref());
+        let authenticated = token_verification.verifier().is_some();
+        let jwt_interceptor = JWTInterceptor::new(token_verification);
 
         if check_enabled(&services.admin_service, "admin_service") {
             router = router.add_service(AdminServiceServer::new(admin_svc));

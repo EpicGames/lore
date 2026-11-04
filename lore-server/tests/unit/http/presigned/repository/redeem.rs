@@ -12,6 +12,7 @@ use axum_test::TestServer;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::fragment;
 use lore_revision::lore::RepositoryId;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::presign_token::CURRENT_TOKEN_VERSION;
 use lore_server::http::presign_token::PresignTokenPayload;
@@ -66,7 +67,7 @@ fn build_test_server(
     let state = ServerState {
         immutable_store,
         mutable_store,
-        jwt_verifier: None,
+        token_verification: TokenVerification::Ignore,
         repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
         max_file_size: 100,
         presign_config: Some(config),

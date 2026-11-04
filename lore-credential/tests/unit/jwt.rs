@@ -152,3 +152,12 @@ fn an_empty_or_non_string_identity_names_no_one() {
         assert!(identity_from_token(&token_with_claims(&claims)).is_empty());
     }
 }
+
+#[test]
+fn an_unsigned_identity_token_names_its_identity() {
+    let token = lore_credential::unsigned_identity_token("alice").expect("encodes");
+
+    let info = user_info_from_token(token).expect("decodes");
+    assert_eq!(info.id, "alice");
+    assert_eq!(info.preferred_username, "alice");
+}

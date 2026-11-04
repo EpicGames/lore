@@ -358,8 +358,8 @@ mod storage_copy_on_write_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(
-                    None,
+                .with_token_verification(
+                    lore_server::auth::jwt::TokenVerification::Ignore,
                     Arc::new(AllowAllRepositoryAuthorizer),
                     repository_catalog,
                 )

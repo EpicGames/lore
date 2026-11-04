@@ -5,6 +5,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::security_headers::ContentTypePolicy;
 use lore_server::http::server::LoreHttpServerSettings;
@@ -41,7 +42,7 @@ async fn mint_with_policy(
             let state = ServerState {
                 immutable_store,
                 mutable_store,
-                jwt_verifier: None,
+                token_verification: TokenVerification::Ignore,
                 repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                 max_file_size: 100,
                 presign_config: Some(presign_config_with_policy(policy)),
