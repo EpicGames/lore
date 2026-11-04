@@ -1517,6 +1517,38 @@ async fn stage_delete_node(
     Ok(Some(node))
 }
 
+/// Stages the delete of the node at `node_id` that a node of another kind replaces, dropping its
+/// registry entry where it links the repository `link`. Apart from the scan, so the scan's future
+/// holds no room for the registry edit.
+#[allow(clippy::too_many_arguments)]
+async fn stage_delete_replaced(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    relative_path: RelativePath,
+    node_id: NodeID,
+    link: Option<RepositoryId>,
+    node_flags: NodeFlags,
+    stats: Arc<StageStats>,
+    link_tracker: Option<Arc<crate::link::LinkTracker>>,
+) -> Result<(), StageError> {
+    if let Some(link) = link {
+        state
+            .link_remove_if_present(repository.clone(), link, node_id)
+            .await
+            .forward::<StageError>("Failed to remove link")?;
+    }
+    stage_delete(
+        repository,
+        state,
+        relative_path,
+        node_id,
+        node_flags,
+        stats,
+        link_tracker,
+    )
+    .await
+}
+
 pub(crate) async fn stage_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -2932,20 +2964,24 @@ pub(crate) async fn stage_node_from_metadata(
 
             lore_trace!("Found node {} with flags 0x{:x}", found_node_id, node.flags);
 
-            if (node.is_link() && !info.is_dir())
-                || (node.is_directory() && !info.is_dir())
-                || (node.is_file() && info.is_dir())
-            {
-                // Type mismatch, stage the current node for delete and add a new new node
+            // A link mounts as a directory: a file replaces it, and so does a directory once the
+            // link is staged for delete.
+            let retype = if node.is_link() {
+                node.is_staged_delete() || !info.is_dir()
+            } else {
+                node.is_file() == info.is_dir()
+            };
+            if retype {
                 lore_debug!(
-                    "Directory/file different, stage delete of node {} and recreate new node",
+                    "Node kind differs, stage delete of node {} and recreate new node",
                     found_node_id
                 );
-                stage_delete(
+                stage_delete_replaced(
                     repository.clone(),
                     state.clone(),
-                    relative_path.clone(),
+                    relative_path.join(name.as_str()),
                     found_node_id,
+                    node.is_link().then(|| node.address.context.into()),
                     options.node_flags,
                     stats.clone(),
                     link_tracker.clone(),

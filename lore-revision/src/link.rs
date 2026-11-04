@@ -1703,6 +1703,7 @@ pub(crate) async fn realize_resolved_link_pin(
             link_context,
             pin.new_signature,
             diff,
+            false,
         )
         .await
     })
@@ -1713,15 +1714,27 @@ pub(crate) async fn realize_resolved_link_pin(
 ///
 /// A filesystem holds one operation at a time, and a link context shares its parent's provider, so
 /// the realize takes the caller's rather than opening a second one on a frozen filesystem.
+///
+/// `overwrite_local` realizes the pin over local changes to the files it changes, which are
+/// otherwise refused.
 pub(crate) async fn realize_link_pin_change_in_operation(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
     pin_change: LinkPinRealizeTarget,
+    overwrite_local: bool,
 ) -> Result<(), LinkError> {
     let pin = ResolvedLinkPin::resolve(&link_context, pin_change).await?;
     let diff = link_pin_diff(&link_context, &pin).await?;
-    realize_link_pin_diff(operation, repository, link_context, pin.new_signature, diff).await
+    realize_link_pin_diff(
+        operation,
+        repository,
+        link_context,
+        pin.new_signature,
+        diff,
+        overwrite_local,
+    )
+    .await
 }
 
 /// Diffs the pinned subtree between the two pins, spelled from the mount path.
@@ -1772,10 +1785,11 @@ async fn realize_link_pin_diff(
     link_context: Arc<RepositoryContext>,
     new_sig: Hash,
     diff: LinkPinDiff,
+    overwrite_local: bool,
 ) -> Result<(), LinkError> {
     let LinkPinDiff { changes, current } = diff;
 
-    let changes = if !changes.is_empty() {
+    let changes = if !changes.is_empty() && !overwrite_local {
         lore_info!(
             "Verifying {} link changes with local file system",
             changes.len()

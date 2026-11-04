@@ -1196,7 +1196,7 @@ mod tests {
                         fixture.repository.clone(),
                         &fixture.write_token,
                         LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
-                        file::unstage::UnstageOptions { single_node: false },
+                        file::unstage::UnstageOptions::default(),
                     )
                     .await
                     .expect("Unstage failed");
@@ -1447,7 +1447,7 @@ mod tests {
                         fixture.repository.clone(),
                         &fixture.write_token,
                         LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
-                        file::unstage::UnstageOptions { single_node: false },
+                        file::unstage::UnstageOptions::default(),
                     )
                     .await
                     .expect("Unstage failed");
@@ -2414,7 +2414,7 @@ mod tests {
                     repository.clone(),
                     write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
-                    file::unstage::UnstageOptions { single_node: false },
+                    file::unstage::UnstageOptions::default(),
                 )
                 .await
                 .expect("Unstage failed");
@@ -2535,7 +2535,7 @@ mod tests {
                     LoreArray::from_vec(vec![LoreString::from(
                         path.join("staged.txt").to_string_lossy().as_ref(),
                     )]),
-                    file::unstage::UnstageOptions { single_node: false },
+                    file::unstage::UnstageOptions::default(),
                 )
                 .await
                 .expect("Unstage failed");
@@ -2642,7 +2642,7 @@ mod tests {
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("file.txt").to_string_lossy().as_ref(),
                     )]),
-                    file::unstage::UnstageOptions { single_node: false },
+                    file::unstage::UnstageOptions::default(),
                 )
                 .await
                 .expect("Unstage failed");

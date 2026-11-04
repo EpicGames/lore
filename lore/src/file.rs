@@ -845,7 +845,7 @@ fn unstage_local(
         args,
         unstage,
         move |repository, token, args| async move {
-            let options = UnstageOptions { single_node: false };
+            let options = UnstageOptions::default();
             file::unstage::unstage(repository, &token, args.paths, options).await
         },
     )

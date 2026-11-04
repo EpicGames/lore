@@ -14,6 +14,7 @@ use lore_proto::lore::thin_client::v1::revision_tree_request;
 use lore_revision::branch;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
+use lore_revision::interface::LoreNodeType;
 use lore_revision::link::LinkPinChange;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
@@ -221,12 +222,10 @@ pub(super) async fn identifier_for_signature(
 /// Maps internal `NodeFlags` to the v1 `NodeType` enum used by
 /// `TreeNode` and `DiffChange`.
 pub(super) fn node_flags_to_node_type(flags: NodeFlags) -> thin_client_v1::NodeType {
-    if flags.contains(NodeFlags::File) {
-        thin_client_v1::NodeType::File
-    } else if flags.contains(NodeFlags::Link) {
-        thin_client_v1::NodeType::Link
-    } else {
-        thin_client_v1::NodeType::Directory
+    match flags.node_type() {
+        LoreNodeType::File => thin_client_v1::NodeType::File,
+        LoreNodeType::Link => thin_client_v1::NodeType::Link,
+        LoreNodeType::Directory => thin_client_v1::NodeType::Directory,
     }
 }
 

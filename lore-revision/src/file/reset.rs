@@ -366,7 +366,7 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
     }
 
     for layer in walk.layer_walks.iter() {
-        if let Err(err) = clear_layer_mount(&walk.operation, &walk.stats, &layer.mount).await {
+        if let Err(err) = clear_for_directory(&walk.operation, &walk.stats, &layer.mount).await {
             return wrap_path_error(&walk.operation, &layer.mount, err)
                 .await
                 .err();
@@ -398,16 +398,17 @@ async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
     None
 }
 
-/// Deletes what stands at a layer's mount where it is no directory, so the layer's walk puts the
-/// layer's directory back, as a reset deletes a directory standing where it restores a file.
-async fn clear_layer_mount(
+/// Deletes what stands at `path` where it is no directory, so the walk can put a directory back
+/// there, as a reset deletes a directory standing where it restores a file. The delete is boxed: a
+/// walk meets it only where the working tree replaced a directory.
+async fn clear_for_directory(
     operation: &InstanceOperationImpl,
     stats: &Arc<ResetStats>,
-    mount: &RelativePath,
+    path: &RelativePath,
 ) -> Result<(), ResetError> {
-    match operation.file_info(mount).await {
+    match operation.file_info(path).await {
         Ok(info) if info.exists() && !info.is_dir() => {
-            reset_delete_path(operation, stats, mount, false, false).await
+            Box::pin(reset_delete_path(operation, stats, path, false, false)).await
         }
         _ => Ok(()),
     }
@@ -923,7 +924,7 @@ async fn reset_staged_links_under_paths(
         if reset_all
             || relative_user_paths
                 .iter()
-                .any(|p| p.covers(&relative_link.as_str()))
+                .any(|p| p.covers_ignore_case(&relative_link))
         {
             matched.push(LoreString::from(absolute));
         }
@@ -938,7 +939,10 @@ async fn reset_staged_links_under_paths(
         repository,
         token,
         LoreArray::from_vec(matched),
-        UnstageOptions::default(),
+        UnstageOptions {
+            discard_local: true,
+            ..Default::default()
+        },
     ))
     .await
     .forward::<ResetError>("Failed to reset staged link nodes")?;
@@ -1753,7 +1757,8 @@ async fn reset_walk_node(
 /// Walk the children of a directory node, dispatching each to
 /// `reset_walk_node`. Subdirectory walks are gated by the `directory_inflight`
 /// counter: spawn when under `RESET_DIRECTORY_MAX`, run inline (degrade to
-/// sync) once over. A directory the revision holds with no children is created
+/// sync) once over. A file standing at the directory's path is deleted first. A
+/// directory the revision holds with no children is created
 /// here unless the view excludes it, and purge (when enabled) runs for every
 /// directory once its child walks have completed. The purge is boxed, so a walk
 /// that does not purge holds no room for it.
@@ -1774,6 +1779,10 @@ async fn reset_walk_directory(
         file_tx,
     } = ctx;
     lore_trace!("Resetting directory: {}", directory_path.as_str());
+
+    if !directory_path.is_empty() {
+        clear_for_directory(&operation, &stats, &directory_path).await?;
+    }
 
     let mut child_node_iter = node.child();
 

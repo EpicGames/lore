@@ -4897,6 +4897,19 @@ impl State {
         .await
     }
 
+    /// [`Self::link_remove`] for a link the registry may not hold.
+    pub(crate) async fn link_remove_if_present(
+        &self,
+        repository: Arc<RepositoryContext>,
+        link_id: RepositoryId,
+        local_node: NodeID,
+    ) -> Result<(), StateError> {
+        match self.link_remove(repository, link_id, local_node).await {
+            Err(err) if err.is_link_not_found() => Ok(()),
+            result => result,
+        }
+    }
+
     pub fn force_rehash_names(&self) {
         self.runtime.write().rehash_node_names = true;
     }

@@ -4,7 +4,7 @@ import json
 import os
 
 import pytest
-from error_types import LoreException
+from error_types import LocalChanges, LoreException
 from link_helpers import assert_crr_clean, make_parent_with_link, make_repo
 from lore_parsers import parse_status_json
 
@@ -473,6 +473,80 @@ def test_link_reset_staged_remove(new_lore_repo):
         assert main_repo.compare_file(
             source_repo, p, other_file_path=source_relative
         ), f"Restored content of {p} must match source repo content"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("staged", [True, False], ids=["staged", "unstaged"])
+def test_link_reset_puts_back_a_link_a_file_replaced(new_lore_repo, staged):
+    """`reset` of a link whose mount a file replaced puts the link back, in the registry and
+    on disk, whether the file was staged or not."""
+    linked = {"shared/linked.txt": "linked\n", "shared/sub/deep.txt": "deep\n"}
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo,
+        "shared",
+        {path.removeprefix("shared/"): content for path, content in linked.items()},
+    )
+
+    parent.rmtree("shared")
+    parent.write_files({"shared": "file\n"})
+    if staged:
+        parent.stage("shared", scan=True)
+    parent.reset("shared")
+
+    assert_crr_clean(
+        parent,
+        expected_files_present=[],
+        expected_files_absent=[],
+        expected_link_registry={link_repo.get_id(): True},
+    )
+    for path, content in linked.items():
+        with parent.open_file(path) as f:
+            assert f.read() == content, f"{path} must hold the linked content"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("change", "refused"),
+    [
+        ("add-edited", True),
+        ("add-untracked", False),
+        ("replaced", True),
+        ("removed-then-folder", False),
+        ("added-then-replaced", False),
+    ],
+)
+def test_link_unstage_keeps_local_work_at_the_mount(new_lore_repo, change, refused):
+    """`unstage` of a staged link change keeps the local work standing at the mount: it refuses
+    where restoring the link would overwrite that work, and otherwise leaves it in place."""
+    parent = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
+    link_repo = make_repo(new_lore_repo, {"linked.txt": "linked\n"})
+    parent.link_add("shared", link_repo.get_id(), "/")
+    if change in ("replaced", "removed-then-folder"):
+        parent.commit("Add link")
+        parent.push()
+
+    local = {
+        "add-edited": "shared/linked.txt",
+        "add-untracked": "shared/own.txt",
+        "replaced": "shared",
+        "removed-then-folder": "shared/own.txt",
+        "added-then-replaced": "shared",
+    }[change]
+    if change == "removed-then-folder":
+        parent.link_remove("shared")
+    if local == "shared":
+        parent.rmtree("shared")
+    parent.write_files({local: "local\n"})
+    if change in ("replaced", "removed-then-folder", "added-then-replaced"):
+        parent.stage("shared", scan=True)
+
+    if refused:
+        with pytest.raises(LocalChanges):
+            parent.unstage("shared")
+    else:
+        parent.unstage("shared")
+    with parent.open_file(local) as f:
+        assert f.read() == "local\n", f"unstage must keep {local}"
 
 
 @pytest.mark.smoke

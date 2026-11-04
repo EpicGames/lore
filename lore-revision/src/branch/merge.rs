@@ -1963,14 +1963,14 @@ async fn graft_unregister_deleted_links(
         .iter()
         .filter(|change| change.action == FileAction::Delete && change.from.is_link())
     {
-        crate::fs::realize::remove_link_registry_entry(
-            repository,
-            state_staged,
-            deleted.from.address.context.into(),
-            deleted.from.mapping.node,
-        )
-        .await
-        .forward::<MergeError>("removing adopted link")?;
+        state_staged
+            .link_remove_if_present(
+                repository.clone(),
+                deleted.from.address.context.into(),
+                deleted.from.mapping.node,
+            )
+            .await
+            .forward::<MergeError>("removing adopted link")?;
     }
     Ok(())
 }

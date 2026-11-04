@@ -224,3 +224,22 @@ def test_link_remove_of_committed_link_deletes_the_mount_directory(new_lore_repo
     assert not parent_repo.file_exists(link_path), (
         "Removing a committed link must delete the mount directory"
     )
+
+
+@pytest.mark.smoke
+def test_link_remove_then_replace_at_the_mount_commits(new_lore_repo):
+    """Removing a link and staging a folder at its mount commits both in one revision."""
+    replacement = {"shared/a.txt": "folder\n", "shared/sub/b.txt": "nested\n"}
+    parent, _ = make_parent_with_link(new_lore_repo, "shared")
+
+    parent.link_remove("shared")
+    parent.write_files(replacement)
+    parent.stage("shared", scan=True)
+    parent.commit("Replace the link")
+    parent.push()
+
+    clone = parent.clone()
+    for path, content in replacement.items():
+        with clone.open_file(path) as f:
+            assert f.read() == content, f"{path} must hold the replacement content"
+    assert "No links found" in clone.link_list()

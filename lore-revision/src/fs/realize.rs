@@ -1778,13 +1778,14 @@ async fn realize_changes_delete(
                 .forward::<SyncError>("Failed to stage change")?;
 
                 if is_link {
-                    remove_link_registry_entry(
-                        &change.from.mapping.repository,
-                        &state_stage,
-                        change.from.address.context.into(),
-                        node_link.node,
-                    )
-                    .await?;
+                    state_stage
+                        .link_remove_if_present(
+                            change.from.mapping.repository.clone(),
+                            change.from.address.context.into(),
+                            node_link.node,
+                        )
+                        .await
+                        .forward::<SyncError>("Failed to remove link from the link registry")?;
                 }
             }
         }
@@ -2111,27 +2112,6 @@ pub(crate) async fn stage_link_registry_entry(
         })
 }
 
-/// Drop a deleted link node's [`LinkReference`](crate::state::LinkReference)
-/// from the staged state's link registry.
-pub(crate) async fn remove_link_registry_entry(
-    repository: &Arc<RepositoryContext>,
-    state_stage: &Arc<State>,
-    link_id: RepositoryId,
-    node_id: NodeID,
-) -> Result<(), SyncError> {
-    match state_stage
-        .link_remove(repository.clone(), link_id, node_id)
-        .await
-    {
-        Ok(()) => {
-            lore_debug!("Removed link {link_id} node {node_id} from the link registry");
-            Ok(())
-        }
-        Err(err) if err.is_link_not_found() => Ok(()),
-        Err(err) => Err(err).forward::<SyncError>("Failed to remove link from the link registry"),
-    }
-}
-
 /// Whether the rename a move was realized by left the destination holding the content it should, so
 /// that writing it from the immutable store would replace it with the same bytes.
 ///
@@ -2249,6 +2229,7 @@ fn realize_link_pin_change_boxed(
         repository,
         link_context,
         target,
+        false,
     ))
 }
 

@@ -366,11 +366,10 @@ mod tests {
         .await;
     }
 
-    /// A dry run reset leaves alone a directory the working tree turned into a file. Checked in a
-    /// dry run only: the reset itself fails to put the directory back, writing its files under
-    /// the file that holds its path.
+    /// A reset puts back a directory the working tree turned into a file, which a dry run leaves
+    /// alone.
     #[tokio::test]
-    async fn a_dry_run_reset_of_a_directory_turned_file_leaves_it_alone() {
+    async fn a_reset_puts_back_a_directory_turned_file_a_dry_run_leaves_alone() {
         with_fixture(async |fixture| {
             let path = fixture.path.clone();
             let directory = path.join("directory");
@@ -385,7 +384,11 @@ mod tests {
                 .expect("Failed to delete directory");
             test_file_write(&directory.join("was_directory"), b"local");
 
-            assert_dry_run_reset_leaves_the_working_tree(&fixture, &["directory"]).await;
+            let after = assert_dry_run_reset_writes_nothing(&fixture, &["directory"]).await;
+            assert_eq!(
+                after.get("directory/was_directory/file.txt"),
+                Some(&Some(b"committed".to_vec()))
+            );
         })
         .await;
     }

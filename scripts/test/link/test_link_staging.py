@@ -863,3 +863,21 @@ def test_link_status_lists_staged_changes_below_an_ignored_mount(new_lore_repo):
     assert entries.get("vendor/lib/linked.txt", {}).get("flagStaged") is True, (
         f"status lists {entries}"
     )
+
+
+@pytest.mark.smoke
+def test_link_stage_a_file_written_over_the_mount_replaces_the_link(new_lore_repo):
+    """Staging a plain file where the mount was replaces the link with it, and a clone holds the
+    file and no link."""
+    parent, _ = make_parent_with_link(new_lore_repo, "shared")
+
+    parent.rmtree("shared")
+    parent.write_files({"shared": "file\n"})
+    parent.stage("shared", scan=True)
+    parent.commit("Replace the link with a file")
+    parent.push()
+
+    clone = parent.clone()
+    with clone.open_file("shared") as f:
+        assert f.read() == "file\n", "shared must hold the replacement file"
+    assert "No links found" in clone.link_list()
