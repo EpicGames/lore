@@ -1,0 +1,195 @@
+---
+lep: 2026-11-03-instance-local-modified-time-records
+title: Instance-local modified-time records
+authors:
+  - Zack Neyland
+status: Draft
+created: 2026-11-03
+updated: 2026-11-03
+discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1110
+---
+
+# Instance-local modified-time records
+
+## Summary
+
+Lore records, for each file in a working tree, the modification time at which the file last held its
+revision's content, so a scan can skip hashing a file whose time has not moved. This proposal moves those
+records out of the shared mutable store and into the instance's own Lore directory (`.lore/`). Records only
+one instance reads stop growing the store every instance on it loads, and a copy of the instance's
+directory carries records that already describe its files.
+[ADR-00027](../developing/decisions/00027-instance-local-modified-time-records.md) records the decision.
+
+## Motivation
+
+- **The records are per instance but live in shared state.** The mutable store keys each record by a hash
+  of the salt, the instance and the lowercased path (`file_modified_time_key` in
+  `lore-revision/src/state.rs`). No other instance reads them.
+- **They grow the shared store with every file of every instance.** One record is a 16-byte partition, a
+  32-byte key and a 32-byte value (`MutableStoreEntry`, `lore-storage/src/local/mutable_store.rs`) plus a
+  4-byte index entry, 84 bytes in all, and Lore keeps one per file. The working tree of a large game
+  repository measured here holds 1,096,884 records, one per file (its 3.9 million directories have none),
+  so about 92 MB per instance. A command loads the store's buckets on use and a flush rewrites whole buckets (`MutableStoreBucket` in the same file; retention between uses is opt-in, per
+  [ADR-00024](../developing/decisions/00024-store-locks-held-per-span-contain-the-repository-lock.md)), so
+  every instance on the store pays for every other instance's records.
+- **A copy given an identity of its own cannot use them.** The records name the instance ID, so a directory
+  copied and given a new instance ID has no records that apply to it, and its first `lore status --scan`
+  hashes every file.
+
+## Goals / Non-Goals
+
+### Goals
+
+- An instance's new modified-time records add nothing to the shared store.
+- A copy of an instance's directory starts with records that describe its files.
+- Neither an upgraded client nor, after a downgrade, an older one trusts a record for content the path no
+  longer holds.
+
+### Non-Goals
+
+- SWFS instances. Their mount presents the recorded times to applications, so their records stay in the
+  store as today.
+- In-memory instances. Their records would outlive the store, and so the revision, they describe, so they
+  stay in the store as today.
+- Giving a copy a new instance identity. The
+  [copy-on-write instance clone](2026-10-31-copy-on-write-instance-clone.md) proposal does that.
+- Restoring a file's committed modification time on sync, for build systems that want the original
+  timestamp. Instance-local records do not preclude it.
+- Moving anchors or the instance registry. Other instances read them, so they stay in the mutable store as
+  [ADR-00014](../developing/decisions/00014-anchor-tracking-in-mutable-store.md) decided.
+
+## Proposed Design
+
+- **Records live in the instance.** An instance whose working tree is a directory keeps its records in
+  `.lore/records/`. A record holds the same fact as today, that the path held the current revision's
+  content at that modification time, under a key derived from the lowercased path and never the instance:
+  16 bytes of key and 8 of time. (Goal 1.)
+- **A copy inherits them.** Because the key does not name the instance, the records in a copied `.lore/`
+  describe the copy's files, as long as the copy keeps modification times. A lookup that falls back to the
+  store copies the record it finds into `.lore/`, so records an older client wrote reach a copy too once a
+  scan has read them. (Goal 2.)
+- **The store is a fallback that does not go stale.** A lookup that finds no record in `.lore/` reads the
+  record an older client wrote in the store. Copying such a record into `.lore/` leaves it in the store,
+  since it still describes the path's content. When an upgraded client records a new time for a path, or
+  clears it, it also zeroes that path's store record if one exists. A store record therefore either still
+  describes the path's content or answers nothing, for this client and for an older one after a downgrade.
+  The cost is a store lookup for each time recorded or cleared, and one store write per path whose content
+  changes while an older client's record of it remains; a new instance makes no such writes. (Goal 3.)
+- **Records are advisory.** A record that is missing or cannot be read costs one hash, never a wrong
+  answer, as today.
+
+## Compatibility
+
+- **Wire format** — N/A: no message or fragment changes.
+- **Client/server protocols** — N/A: the server and the client-to-service IPC are unchanged.
+- **On-disk format** — New directory `.lore/records/`. Its files start with a magic number and a format
+  version. A client that does not recognize the version treats the records as absent, hashes, and replaces
+  them when it next writes the records back. An
+  older client ignores the directory and reads only the store. After a downgrade it hashes the files whose
+  records moved to `.lore/` and finds the rest in the store as before. It does not misread a file, since an
+  upgraded client zeroes every store record it makes stale, apart from the crash case under Durability.
+- **`.lore/` contents** — Backup and copy tools see the new directory, about 24 bytes per file of the
+  working tree. Copying it with the working tree, keeping modification times, is what lets a copy skip
+  hashing.
+- **CLI and public API** — N/A: no command, output or API changes.
+
+## Non-Functional Considerations
+
+- **Concurrency** — Commands still take the store locks, and the repository lock inside them, as
+  ADR-00024 orders. A new instance's records add nothing to the buckets they load and rewrite under the
+  store lock. The entries older clients wrote, zeroed or not, stay in those buckets.
+- **Memory** — The records grow with the number of files, as they do today: 24 bytes per record in
+  `.lore/records/`, against 84 bytes per record in the store: 26 MB for the 1,096,884 records of the working tree
+  measured here, which the store would hold as about 92 MB. A command
+  loads only the parts of the records the paths it visits reach.
+- **Statelessness** — The loaded records belong to the instance's repository lock, which the process
+  caches and shares between commands that hold it at once (`REPOSITORY_LOCK_CACHE` in
+  `lore-revision/src/repository.rs`). In the Lore service they therefore live while any command in the
+  instance runs, and Lore writes them back when the last holder releases the lock.
+- **Determinism** — Preserved: records change only which files a scan hashes, never its result.
+- **Durability** — A crash before Lore writes the records back loses the records written since the lock was
+  taken. A lost record costs a hash. The `.lore/` records and the store's zeroing are written separately, so
+  a crash between them can leave an older client's store record for content the path no longer holds; it
+  answers only if the file's time is set back to the recorded one, and an upgraded client never reads it
+  once the path has a record of its own.
+
+## Migration Plan
+
+N/A — no breaking changes, no migration required. Records an older client wrote stay readable in the store
+as the fallback, and stop answering as the paths they describe change; their 84-byte entries stay in the
+buckets, as zeroed keys do today.
+
+## Security Considerations
+
+No change to the trust model. The records are in the instance's own directory, with the user's
+permissions, and state only modification times. A crafted or foreign `.lore/records/` can make a changed
+file with a matching time look unchanged, but writing it takes the same access as editing the working tree
+itself, and a store record can do the same today. A record file whose structure does not parse is treated
+as absent.
+
+## Privacy Considerations
+
+Less data in shared state: an instance's new records, which carry hashed paths and times, stay in its own
+directory. Records an older client wrote stay in the shared store, even after the instance is deleted, as
+they do today: deleting an instance removes only its registration and anchor keys
+(`remove_instance_keys` in `lore-revision/src/instance.rs`).
+
+## Risks and Assumptions
+
+**Assumptions**
+
+- **Assumption:** no other instance needs another instance's modified-time records — *invalidated if:* a
+  feature reads them across instances.
+
+**Risks**
+
+- **Risk:** a copy that does not keep modification times inherits records that never match —
+  *mitigation:* a record that does not match costs a hash, so the copy scans as a fresh instance does today.
+- **Risk:** an older and an upgraded client alternate on one instance, and the older one writes store
+  records the upgraded one no longer reads first — *mitigation:* the upgraded client's own records win for
+  the paths it has written; for the rest, an older client's store record describes what it saw, which is
+  the guarantee records have today.
+- **Risk:** records for paths the tree no longer holds accumulate in `.lore/records/` — *mitigation:*
+  clearing a path removes its record; what remains is bounded by the paths the instance has held.
+
+## Drawbacks
+
+- Records exist in two places, `.lore/records/` and the store fallback, for as long as an instance still
+  has records an older client wrote.
+
+## Alternatives Considered
+
+### Keep the records in the store and copy them for a new instance
+
+*Rejected because:* a copy of the 1.1-million-file instance measured here would write 1.1 million records
+under the exclusive store lock, and the store would still grow by about 92 MB per instance.
+
+### Move every record out of the store on upgrade
+
+The first upgraded command moves the instance's records into `.lore/` and zeroes them in the store.
+
+*Rejected because:* for the instance measured here that is 1.1 million store reads and writes under the store
+lock in one command, whatever that command was meant to do. Moving each record as its path is read
+or changed spreads the same work across the commands that touch it.
+
+### Keep the records in a per-instance store file
+
+Give each instance its own mutable store in `.lore/` for its records.
+
+*Rejected because:* the mutable store's entry costs 84 bytes per record against 24, and it carries buckets
+and a partition the records do not need.
+
+## Prior Art
+
+- Git keeps the equivalent per working tree: each worktree's index under `$GIT_DIR/worktrees/<id>/` caches
+  file times ([git-worktree](https://git-scm.com/docs/git-worktree)). Git's index also records inode and
+  device numbers, so a copied tree forces a refresh; keying records on the path and time alone is what lets
+  a copy here skip hashing.
+- Mercurial keeps the same cache per working directory, in `.hg/dirstate`.
+
+## Unresolved Questions
+
+- Should deleting or pruning an instance also remove its records from the store, which no client does
+  today?
+- Can a client skip the store lookup for each time it records in an instance that has never held store
+  records, given that a downgrade can add them back?
