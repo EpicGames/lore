@@ -424,13 +424,22 @@ on Linux so does the run's main process ending.
 which the run then uses in place of starting one:
 
 ```bash
-LORE_SERVICE_SOCKET=lore_service-smoke LORE_GLOBAL_PATH=$(mktemp -d) \
+service_dir=$(mktemp -d)
+LORE_SERVICE_SOCKET=lore_service-smoke LORE_GLOBAL_PATH=$service_dir \
+    LORE_AUTH_PATH=$service_dir LORE_AUTH_STORE=fallback \
     target/release/lore service run &
 LORE_TEST_SERVICE_SOCKET=lore_service-smoke uv run pytest scripts/test/ -m smoke -n 4
 ```
 
 Each call carries the test's `LORE_GLOBAL_PATH` and `LORE_AUTH_PATH`, which the
 service reads in place of its own, so the tests stay isolated from each other.
+No process in a run uses the machine's token store or the OS keyring: each test
+keeps its token store and key in its own directory, and each worker stands in
+for the machine's settings and credentials with a temporary directory of its
+own, so runs side by side share neither. A call doesn't carry
+`LORE_AUTH_STORE`, and outside a call the service reads its own paths, so start
+it as the harness starts its shared service: with a directory of its own for
+both paths and `LORE_AUTH_STORE=fallback`.
 
 ### Per-test timeout
 

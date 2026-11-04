@@ -73,6 +73,11 @@ def lore_test_env(global_dir: str) -> dict[str, str]:
     # developer or CI already exports would win and the command would read
     # that store.
     env["LORE_AUTH_PATH"] = global_dir
+    # Keep the token store's key in that directory as well, as the Rust tests
+    # do, rather than in the OS keyring: a headless run started over ssh holds a
+    # session keyring that is revoked when the login ends, and a live keyring
+    # would share one key across every test.
+    env["LORE_AUTH_STORE"] = "fallback"
     return env
 
 

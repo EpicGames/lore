@@ -852,7 +852,7 @@ MACHINE_SETTINGS_PREFIX = "lore_machine_settings_"
 
 
 def _sandbox_machine_settings(config):
-    """Keeps the machine's Lore settings out of this run.
+    """Keeps the machine's Lore settings and credentials out of this run.
 
     A developer who turns the service on for their own use — `[service]
     use_automatically` and an executable, in the user-level config — would
@@ -861,13 +861,20 @@ def _sandbox_machine_settings(config):
     is most of a crate's tests failing at once; here it reaches anything invoking
     Lore that is not a `Lore` object, whose own environment already isolates.
 
-    Both are set on this process's environment, since every subprocess in the
+    The token store is the machine's too. A command started from this
+    environment rather than a test's would otherwise read and write the
+    developer's credentials and OS keyring, which every run on the machine
+    shares.
+
+    These are set on this process's environment, since every subprocess in the
     suite starts from a copy of it, and the tests that load `liblore` in process
     read it directly with no environment of their own to isolate them.
 
     A test that wants the service turns it back on in its own environment, which
     is a copy of this one — see `LORE_SERVICE_ENVIRONMENT`. Under xdist each
-    worker configures separately and so gets a directory of its own.
+    worker configures separately and so gets a directory of its own. That also
+    keeps two workers from creating the token store's key at the same time:
+    nothing locks the store from reading the key to writing a new one.
     """
     os.environ["LORE_USE_SERVICE"] = "0"
     # Not the per-test global directory, which each `Lore` sets for itself. This
@@ -876,6 +883,10 @@ def _sandbox_machine_settings(config):
     machine_settings = tempfile.mkdtemp(prefix=MACHINE_SETTINGS_PREFIX)
     config.add_cleanup(lambda: shutil.rmtree(machine_settings, ignore_errors=True))
     os.environ["LORE_GLOBAL_PATH"] = machine_settings
+    # The token store and its key go beside it, as `lore_test_env` keeps each
+    # test's.
+    os.environ["LORE_AUTH_PATH"] = machine_settings
+    os.environ["LORE_AUTH_STORE"] = "fallback"
     logger.info("Standing in for the machine's Lore settings with %s", machine_settings)
 
 
