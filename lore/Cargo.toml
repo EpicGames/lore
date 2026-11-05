@@ -43,7 +43,6 @@ windows-sys = { workspace = true, features = [
 [features]
 default = []
 oodle = ["lore-revision/oodle"]
-swfs = ["lore-revision/swfs"]
 test-util = []
 # The `revision_tree_bench` example, built only on demand.
 revision-tree-bench = ["test-util", "lore-base/test-util"]

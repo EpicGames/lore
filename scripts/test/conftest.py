@@ -141,14 +141,14 @@ def pytest_addoption(parser):
         default=False,
         help=(
             "Run the tests that mount a repository through SWFS. Off by "
-            "default, because mounting needs two things the harness cannot "
-            "arrange for itself: a client built with `--features swfs` "
-            "against SWFS_LIB_DIR, and the epicvfs filesystem driver started, "
-            "which takes an elevated session. Neither is visible from the "
-            "outside -- the binary reports no feature list -- and a run "
-            "without them does not fail, it hangs: the SWFS library parks the "
-            "service process when it cannot reach the driver, so the client "
-            "waiting on it blocks until the per-test timeout kills the worker."
+            "default, because mounting needs something the harness cannot "
+            "arrange for itself: the epicvfs filesystem driver started, which "
+            "takes an elevated session. Every x86-64 Windows client links the "
+            "SWFS library, but the driver is not visible from the outside, "
+            "and a run without it does not fail, it hangs: the SWFS library "
+            "parks the service process when it cannot reach the driver, so "
+            "the client waiting on it blocks until the per-test timeout kills "
+            "the worker."
         ),
     )
 

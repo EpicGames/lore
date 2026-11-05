@@ -1,7 +1,7 @@
 //! This module wraps the SWFS C API. Code that requires the SWFS library to be linked is
-//! conditionally compiled based on the "swfs" feature.
-//! The `SwfsInterface` type will always have the same interface, but if the "swfs" feature is
-//! unavailable it will return a `SwfsInterfaceError`.
+//! conditionally compiled for x86-64 Windows, the only target SWFS is available on.
+//! The `SwfsInterface` type will always have the same interface, but on other targets it will
+//! return a `SwfsInterfaceError`.
 //! The `swfs_api` module will always contain the C API's types even if the library isn't linked.
 pub mod swfs_api;
 
@@ -91,12 +91,12 @@ impl Drop for SwfsInterface {
     }
 }
 
-/// Logic elsewhere should prevent an `SwfsInterface` from being constructed if the "swfs" feature
-/// isn't available, but have this in case of logic errors.
-#[cfg(not(feature = "swfs"))]
+/// Logic elsewhere should prevent an `SwfsInterface` from being constructed on a target SWFS
+/// isn't available on, but have this in case of logic errors.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 impl SwfsInterface {
     fn no_swfs_error() -> SwfsInterfaceError {
-        SwfsInterfaceError::internal("SWFS feature not enabled")
+        SwfsInterfaceError::internal("SWFS is only available on x86-64 Windows")
     }
 
     pub fn resources(&self) -> &MountResources {
@@ -135,7 +135,7 @@ impl SwfsInterface {
     }
 }
 
-#[cfg(feature = "swfs")]
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod swfs_impl {
     use std::ffi::CStr;
     use std::ffi::c_char;
@@ -176,7 +176,8 @@ mod swfs_impl {
             &self.resources
         }
 
-        pub async fn freeze(&self, token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
+        #[allow(clippy::unused_async)]
+        pub async fn freeze(&self, _token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
             let handle = self.handle().forward::<SwfsWorkError>("Unable to freeze")?;
             if unsafe {
                 swfsFreeze(
@@ -331,7 +332,7 @@ mod swfs_impl {
             let file = unsafe { &mut *file };
             let file_name = unsafe { CStr::from_ptr(file.path).to_string_lossy() };
             let out_buffer = unsafe {
-                &mut *slice_from_raw_parts_mut(out_buffer as *mut u8, num_bytes_to_read as usize)
+                &mut *slice_from_raw_parts_mut(out_buffer.cast::<u8>(), num_bytes_to_read as usize)
             };
             let read_result = self
                 .resources
@@ -374,17 +375,22 @@ mod swfs_impl {
             }
         }
 
+        #[allow(clippy::unused_self)]
         fn notify_write(&self, _file: *mut SWFSFile) {}
+        #[allow(clippy::unused_self)]
         fn notify_create(&self, _file: *mut SWFSFile) {}
+        #[allow(clippy::unused_self)]
         fn notify_move(&self, _old_file: *mut SWFSFile, _new_file: *mut SWFSFile) {}
+        #[allow(clippy::unused_self)]
         fn notify_delete(&self, _file: *mut SWFSFile) {}
 
+        #[allow(clippy::unused_self)]
         fn freeze_callback(
             &self,
-            user_data: *mut ::std::os::raw::c_void,
-            start_buff: *mut swfs_ubyte,
-            num_bytes: usize,
-            out_num_buff_bytes: *mut usize,
+            _user_data: *mut ::std::os::raw::c_void,
+            _start_buff: *mut swfs_ubyte,
+            _num_bytes: usize,
+            _out_num_buff_bytes: *mut usize,
         ) -> *mut swfs_ubyte {
             // `start_buff` is an array of `SWFSFile` objects. By default, all files are frozen.
             // Setting the `mod_flag` will cause that file to not be frozen.

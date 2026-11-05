@@ -103,7 +103,6 @@ failure_generator = []
 seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
-swfs = []
 test-util = []
 # The node operation bench, run by hand: `cargo run --release -p lore-revision --example
 # state_bench --features state-bench`. Naming the feature keeps `cargo test` and builds of all

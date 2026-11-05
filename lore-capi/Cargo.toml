@@ -25,7 +25,6 @@ regex = "1.11.1"
 [features]
 default = []
 oodle = ["lore-library/oodle"]
-swfs = ["lore-library/swfs"]
 
 [lints]
 workspace = true

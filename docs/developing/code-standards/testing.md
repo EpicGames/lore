@@ -404,17 +404,18 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 
 ### Running the SWFS tests
 
-`test_swfs.py` skips its mounting tests unless `--swfs` says to run them,
-because two of their preconditions are arranged outside the harness and neither
-is visible from it:
+`test_swfs.py` skips its mounting tests unless `--swfs` says to run them. They
+run on Windows and need two preconditions, the second of which is arranged
+outside the harness and not visible from it:
 
-1. A client built with the `swfs` feature, which links the SWFS library named by
-   `SWFS_LIB_DIR`: `cargo build --release -p lore-client --features swfs`. The
-   binary reports no feature list, so nothing can ask it whether it has one.
-2. The `epicvfs` filesystem driver loaded. It installs from `EpicVFS.exe` and is
-   demand-start, and the SWFS library starts it through the service control
-   manager, which takes an elevated session — `sc query epicvfs` reporting
-   `STOPPED` means the next mount will try and fail.
+1. The SWFS library, which every x86-64 Windows build links: `swfs_d.lib` for a
+   `dev` profile build and `swfs.lib` for any other. It is read from
+   `lore-revision/native/swfs/win64` unless `SWFS_LIB_DIR` names another
+   directory.
+2. The `epicvfs` filesystem driver running. It installs from `EpicVFS.exe` and is
+   demand-start, and the SWFS library does not start it: start it from an
+   elevated session with `sc start epicvfs`. `sc query epicvfs` reporting
+   `STOPPED` means the next mount will hang, as the next paragraph describes.
 
 Without the driver a mount does not fail, it hangs: the SWFS library parks the
 service process, so the client relaying to it blocks until the per-test timeout
