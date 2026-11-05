@@ -3,167 +3,102 @@
 Release notes for the open source Lore project. Releases before v0.8.4 predate this file; see the
 [GitHub releases](https://github.com/EpicGames/lore/releases) page for the published record.
 
-## Nightly
+## v0.13.0 (Nov 5th 2026) [#2160]
 
 ### Breaking changes
 
-- `lore.user.v1`: `PartitionList`, `PartitionAdd` and `PartitionRemove` are removed from `UserService`.
-  `RepositoryRegistryService` replaces them
-- `lore-server`: with `user_url` set, the server lists, registers and unregisters repositories through
-  `lore.user.v1.RepositoryRegistryService` at `user_url` instead of the `UserService` partition RPCs. The
-  directory at `user_url` must serve `RepositoryRegistryService` before the server is upgraded. Servers without
-  `user_url` are not affected
-- `lore-server`: with authorization configured, operations that change a partition check for the `write` permission.
-  Any permission on a partition still allows reading it, but no longer allows writing. Servers without authorization
-  configured allow every caller to read, write and administer repositories
-- `lore-server`: changing branch protection, through branch protect and unprotect or by setting the `protect` key in
-  branch metadata, needs `owner` or `admin` on the repository, or `write` for its creator. Previously anyone with
-  access to the repository could set the branch protection rules
-- `lore-server`: vending a presigned URL needs the `presign` permission on the repository instead of the
-  `is_service_account` token claim. Servers without authorization configured still allow every caller to vend
-- Server hooks: `Hook::pre_handler` is now `async`, so a pre-handler can call other services without blocking a worker
-  thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout
-  (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of
-  `INTERNAL`
-- A client connected to a `lores://` remote refuses to connect, failing with `NotSupported`, if the server advertises a
-  storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as
-  `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A
-  server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
-- Ignore and view rules match paths as `.gitignore` does. A character class or a `**` inside a name matches within one
-  path component, so `!/Engine/Content**` re-includes `Engine/Content` but not its contents; use `!/Engine/Content`. A
-  file with a re-inclusion that starts with a `**` component, such as `!/**/a/b`, fails to load
-- `lore sync --reset` and `lore branch switch --reset` leave untracked files in place, and restore and delete only what
-  the revision tracks, including committed files an ignore rule matches. `lore reset --purge` deletes untracked files
-- `lore reset` does not consult the ignore file. It restores committed files an ignore rule matches, and `--purge`
-  deletes untracked files whether or not an ignore rule matches them, as well as committed files the view excludes
+- `lore.user.v1`: `PartitionList`, `PartitionAdd` and `PartitionRemove` are removed from `UserService`. `RepositoryRegistryService` replaces them
+- `lore-server`: with `user_url` set, the server lists, registers and unregisters repositories through `lore.user.v1.RepositoryRegistryService` at `user_url` instead of the `UserService` partition RPCs. The directory at `user_url` must serve `RepositoryRegistryService` before the server is upgraded. Servers without `user_url` are not affected
+- `lore-server`: with authorization configured, operations that change a partition check for the `write` permission. Any permission on a partition still allows reading it, but no longer allows writing. Servers without authorization configured allow every caller to read, write and administer repositories
+- `lore-server`: changing branch protection, through branch protect and unprotect or by setting the `protect` key in branch metadata, needs `owner` or `admin` on the repository, or `write` for its creator. Previously anyone with access to the repository could set the branch protection rules
+- `lore-server`: vending a presigned URL needs the `presign` permission on the repository instead of the `is_service_account` token claim. Servers without authorization configured still allow every caller to vend
+- Server hooks: `Hook::pre_handler` is now `async`, so a pre-handler can call other services without blocking a worker thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of `INTERNAL`
+- A client connected to a `lores://` remote refuses to connect, failing with `NotSupported`, if the server advertises a storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
+- Ignore and view rules match paths as `.gitignore` does. A character class or a `**` inside a name matches within one path component, so `!/Engine/Content**` re-includes `Engine/Content` but not its contents; use `!/Engine/Content`. A file with a re-inclusion that starts with a `**` component, such as `!/**/a/b`, fails to load
+- `lore sync --reset` and `lore branch switch --reset` leave untracked files in place, and restore and delete only what the revision tracks, including committed files an ignore rule matches. `lore reset --purge` deletes untracked files
+- `lore reset` does not consult the ignore file. It restores committed files an ignore rule matches, and `--purge` deletes untracked files whether or not an ignore rule matches them, as well as committed files the view excludes
+- `lore-revision`: `.loreignore` applies only to paths the tree doesn't track yet. A committed file an ignore rule matches, such as one staged with `--force`, keeps flowing through like any other: `lore status --scan` and `lore status` report changes to it, `lore stage` and `lore dirty` pick them up without `--force`, and removing it, or the directory holding it, from the working tree stages its deletion. Previously only a change already staged was listed, and an unforced `lore stage` kept a removed file the ignore file names. New files the ignore file names are still left out, including a copy marked with `lore dirty copy` until it is staged, as is a directory that replaces a tracked file, or the reverse, where the rules exclude it. A file moved with `lore dirty move` stays tracked at its new path. See [ADR-00027](../developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)
+- `lore-revision`: a failed link push exits with its error's code rather than 255, and with the new code 52 (`LinkDivergent`) when the linked branch has newer revisions on the remote. Scripts should test a failed push for any non-zero code.
+- `lore-revision`: Names Windows reads as something else are refused on every platform and skipped where a revision already holds one, so a clone or sync on Windows writes nothing outside the working tree: a drive (`C:`, `a:b`), a name ending in a dot, a space or a colon (`file.`, `...`), a stream type (`file::$DATA`), and the `.lore` directory's short name (`LORE~1`). Rename such a file or add it to `.loreignore`. Other names with a colon, such as `12:00.log`, are unaffected.
 
 ### Features
 
-- When stdout is not a terminal, a command's progress bar prints a plain progress line every 30 seconds instead of
-  drawing nothing. `LORE_PROGRESS_INTERVAL` sets the interval in seconds; 0 turns the lines off
-- `lore.user.v1` gains `RepositoryRegistryService` (`RepositoryList`, `RepositoryRegister`, `RepositoryUnregister`),
-  served at `user_url`.
-- `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
-  `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
-- QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
-  1 MiB initial congestion window. The same default applies to connections to the remote of a replicated store
-  configured under `[immutable_store.replicated]` or as a composite tier in `replicated` mode. Set the window with
-  `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A periodically refreshed connection starts
-  with a window at least this large
-- `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
-  window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
-  unless set. Values below 2400 bytes are rejected at startup
-- The `AuthUserToken` event (C API: `lore_auth_user_token_event_data_t`) reports when the stored OIDC refresh token
-  stops working, in `refresh_expires`, and whether one is stored, in `refreshable`. The deadline comes from the
-  refresh token's lifetime in seconds in the token response: `refresh_token_expires_in` (GitHub, Azure AD, Google),
-  else `refresh_expires_in` (Keycloak). If the provider returns a refresh token, but does not return a refresh token
-  expiration time, the value is `0`, with `refreshable` set. `session_valid` is set while the token has not
-  expired, or while a stored refresh token can still renew it.
-  `lore_auth_local_user_info` and `lore auth info` emit both `AuthUserInfo` and `AuthUserToken` for an identity with a
-  stored token. `AuthUserToken` carries the token only with `with_identity_token`, and an empty `token` without it.
-- `lore auth login --reuse-session` (C API: `reuse_session` in `lore_auth_login_interactive_args_t`) returns the stored
-  login when its session is still valid, as `session_valid` reports it, and starts no new login
-- On Linux, the server's QUIC endpoints serve on several UDP sockets bound to their port, so clients spread across
-  their receive buffers: `num_sockets` in `[server.quic]` and `[server.quic_internal]`, by default 16, capped at the
-  processor count, and 4 for the internal endpoint. `num_listeners` is now optional and defaults to 1 per socket
+- When stdout is not a terminal, a command's progress bar prints a plain progress line every 30 seconds instead of drawing nothing. `LORE_PROGRESS_INTERVAL` sets the interval in seconds; 0 turns the lines off
+- `lore.user.v1` gains `RepositoryRegistryService` (`RepositoryList`, `RepositoryRegister`, `RepositoryUnregister`), served at `user_url`.
+- `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
+- QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a 1 MiB initial congestion window. The same default applies to connections to the remote of a replicated store configured under `[immutable_store.replicated]` or as a composite tier in `replicated` mode. Set the window with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A periodically refreshed connection starts with a window at least this large
+- `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default unless set. Values below 2400 bytes are rejected at startup
+- The `AuthUserToken` event (C API: `lore_auth_user_token_event_data_t`) reports when the stored OIDC refresh token stops working, in `refresh_expires`, and whether one is stored, in `refreshable`. The deadline comes from the refresh token's lifetime in seconds in the token response: `refresh_token_expires_in` (GitHub, Azure AD, Google), else `refresh_expires_in` (Keycloak). If the provider returns a refresh token, but does not return a refresh token expiration time, the value is `0`, with `refreshable` set. `session_valid` is set while the token has not expired, or while a stored refresh token can still renew it. `lore_auth_local_user_info` and `lore auth info` emit both `AuthUserInfo` and `AuthUserToken` for an identity with a stored token. `AuthUserToken` carries the token only with `with_identity_token`, and an empty `token` without it.
+- `lore auth login --reuse-session` (C API: `reuse_session` in `lore_auth_login_interactive_args_t`) returns the stored login when its session is still valid, as `session_valid` reports it, and starts no new login
+- On Linux, the server's QUIC endpoints serve on several UDP sockets bound to their port, so clients spread across their receive buffers: `num_sockets` in `[server.quic]` and `[server.quic_internal]`, by default 16, capped at the processor count, and 4 for the internal endpoint. `num_listeners` is now optional and defaults to 1 per socket
 - Server QUIC sockets ask for a 512 KiB receive buffer, as client sockets do
+- `lore-server`: The `server.trust_unsigned_identity` setting lets a server without `[server.auth]` take the caller's identity from an unsigned bearer token on gRPC, HTTP and QUIC, so locks and notifications name the user instead of `<unknown>`. The identity grants no permissions. The server refuses to start with the setting beside `[server.auth]`.
+- `lore`: Against a server that advertises no authentication, the client sends an unsigned token naming its identity when one is set, from `--identity` or the configuration.
+- `lore-revision`: `[sync] prefetch_tree = true` in an instance's `config.toml` makes a sync fetch the target's tree blocks and name tables in bulk requests instead of one per block as the walk reaches it. It fetches the whole tree whatever the view, so it is off by default
 
 ### Fixes & Improvements
 
-- `lore-server`: a storage copy reports a slow-down from the store as `SlowDown` over QUIC and `RESOURCE_EXHAUSTED`
-  over gRPC, rather than as an internal error. The legacy `urc.rpc` gRPC get, put and copy streams report a slow-down
-  as `RESOURCE_EXHAUSTED` as well
-- When a storage copy receives a slow-down response, the client backs off and retries the copy, as it does an upload.
-  If the server is still throttling when the retries run out, the client doesn't upload the payload. A write keeps it
-  locally without marking it durable, as when an upload runs out of retries, and `lore push` fails with a slow-down
-  error. The client used to upload the full payload straight away
-- gRPC connections over TLS fall back to the bundled webpki roots when no certificates load from the OS trust store,
-  as QUIC connections already did. They used to fail with `NativeCertsNotFound` before reaching the server
-- `lore-server`: `[server.quic_internal]` sizes the flow-control windows of every connection it accepts for a 220 ms
-  round trip, up from 100 ms. Replication connections to `OtherRegion` peers use the same value. A peer in a distant
-  region can keep more than twice as much data in flight. Set the endpoint's value with `transport_rtt`
-- `RelativePath` keeps its view offsets in 32 bits, 24 bytes inline rather than 40. On a 5-million-change sync this
-  lowers the memory held after the diff from 2.9 to 2.7 GiB and the peak resident size from 3.9 to 3.8 GB
-- `lore repository instance prune` keeps an instance whose instance file cannot be read on filesystems that report an
-  empty directory's size as zero, such as Btrfs: reading a directory as a file fails instead of reading as empty
-- `lore-server`: repository create and delete return `INVALID_ARGUMENT` for the all-zero repository id. This id
-  identifies the namespace-root partition holding the repository name table
+- `lore-server`: a storage copy reports a slow-down from the store as `SlowDown` over QUIC and `RESOURCE_EXHAUSTED` over gRPC, rather than as an internal error. The legacy `urc.rpc` gRPC get, put and copy streams report a slow-down as `RESOURCE_EXHAUSTED` as well
+- When a storage copy receives a slow-down response, the client backs off and retries the copy, as it does an upload. If the server is still throttling when the retries run out, the client doesn't upload the payload. A write keeps it locally without marking it durable, as when an upload runs out of retries, and `lore push` fails with a slow-down error. The client used to upload the full payload straight away
+- gRPC connections over TLS fall back to the bundled webpki roots when no certificates load from the OS trust store, as QUIC connections already did. They used to fail with `NativeCertsNotFound` before reaching the server
+- `lore-server`: `[server.quic_internal]` sizes the flow-control windows of every connection it accepts for a 220 ms round trip, up from 100 ms. Replication connections to `OtherRegion` peers use the same value. A peer in a distant region can keep more than twice as much data in flight. Set the endpoint's value with `transport_rtt`
+- `RelativePath` keeps its view offsets in 32 bits, 24 bytes inline rather than 40. On a 5-million-change sync this lowers the memory held after the diff from 2.9 to 2.7 GiB and the peak resident size from 3.9 to 3.8 GB
+- `lore repository instance prune` keeps an instance whose instance file cannot be read on filesystems that report an empty directory's size as zero, such as Btrfs: reading a directory as a file fails instead of reading as empty
+- `lore-server`: repository create and delete return `INVALID_ARGUMENT` for the all-zero repository id. This id identifies the namespace-root partition holding the repository name table
 - `lore-revision`: links and layers name both sides of a mount the same way, `mount_path` and `source_path`. No behaviour change
-- `lore-server` times each branch push in five phases: prepare, verify, fast-forward merge, commit and respond
-  (`lore.branch_push.phase_duration`). A push dropped before it returns, such as by the handler timeout or a server
-  shutting down, counts the phase it was in (`lore.branch_push.cancelled_phase`). Fragment verification also times its
-  tree walk and existence checks (`lore.branch_push.verify_collect_duration`,
-  `lore.branch_push.verify_exist_duration`). Each push also records its compare-and-swap attempts to store the new
-  head (`lore.branch_push.store_latest_attempts`) and the size of its fast-forward merge
-  (`lore.branch_push.fast_forward_merge_changes`), and logs the breakdown of a push that is cut off, fails or takes
-  10s or more at info
-- A revision named by number, such as `<branch>@<number>`, resolves from the first page the remote returns for it,
-  rather than walking the branch's history back from its latest revision one page at a time
-- Following a branch's history through the remote no longer takes the revisions a page holds above the one it was
-  asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the
-  revision two branches share could answer with one of them, newer than the one they really share
-- On Windows, a Lore service started while another serves the same socket exits without serving, as it does on Linux
-  and macOS. It used to take the socket over and leave the first service running unreachable, holding its SWFS mounts
-  until killed, so commands that each started a service at the same moment could leave one behind per extra command
-- A branch push reads each mutable store key once, loads the branch alongside the pushed revision, and checks the
-  branch name while it verifies the revision's fragments rather than before, so a push spends fewer store round trips
-  before it moves the branch. A push the server refuses because the branch is protected no longer reinstates the name
-  of a deleted branch first
-- The deprecated `urc.rpc` `BranchPush` RPC treats a missing or deleted branch as `lore.revision.v1` `BranchPush`
-  does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch
-  reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with
-  `NOT_FOUND`
-- `lore clone`, a whole-tree `lore diff` and `lore status --scan` skip the directories a view such as `*`, `!/*`
-  excludes, and `lore clone` does not create them
-- `lore sync --view` stores the view file as written, as `lore clone --view` does, so a rule escaped as `\!name` stays
-  a literal name and `lore status --scan` does not report that file deleted
-- Under a view re-including paths such as `!*/Saved/Config/`, `lore clone`, `lore sync`, `lore branch switch`,
-  `lore layer add` and `lore reset` create a directory the view excludes only for content the view keeps below it,
-  and `lore sync` and `lore branch switch` remove one they leave empty. A layer's mount directory and the parent
-  directories of a dependency clone's targets stand whatever the view
-- `lore stage --scan` and `lore status --scan` add a directory the view or the ignore file excludes, or delete one the
-  view excludes, only along with content below it, also under rules such as `/Engine/` and `!/Engine/**/Build/`, and so does
-  `lore stage --scan <directory>`. `lore --force stage --scan` adds such a directory whatever it holds
-- The Lore service closes its SWFS mounts when it exits, however it is stopped. It used to leave them to EpicVFS,
-  which kept a device for each one and could not be stopped afterwards: `sc stop EpicVFS` stayed in `STOP_PENDING`
-  until the machine restarted
-- `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and
-  `lore push --fast-forward-merge` report a conflict for a file both sides change when its path holds glob characters
-  such as `[` and `]`
-- A layer's `lore sync --reset` and `lore branch switch --reset` discard local edits in the mount, as they do in the
-  parent repository
+- `lore-server` times each branch push in five phases: prepare, verify, fast-forward merge, commit and respond (`lore.branch_push.phase_duration`). A push dropped before it returns, such as by the handler timeout or a server shutting down, counts the phase it was in (`lore.branch_push.cancelled_phase`). Fragment verification also times its tree walk and existence checks (`lore.branch_push.verify_collect_duration`, `lore.branch_push.verify_exist_duration`). Each push also records its compare-and-swap attempts to store the new head (`lore.branch_push.store_latest_attempts`) and the size of its fast-forward merge (`lore.branch_push.fast_forward_merge_changes`), and logs the breakdown of a push that is cut off, fails or takes 10s or more at info
+- A revision named by number, such as `<branch>@<number>`, resolves from the first page the remote returns for it, rather than walking the branch's history back from its latest revision one page at a time
+- Following a branch's history through the remote no longer takes the revisions a page holds above the one it was asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the revision two branches share could answer with one of them, newer than the one they really share
+- On Windows, a Lore service started while another serves the same socket exits without serving, as it does on Linux and macOS. It used to take the socket over and leave the first service running unreachable, holding its SWFS mounts until killed, so commands that each started a service at the same moment could leave one behind per extra command
+- A branch push reads each mutable store key once, loads the branch alongside the pushed revision, and checks the branch name while it verifies the revision's fragments rather than before, so a push spends fewer store round trips before it moves the branch. A push the server refuses because the branch is protected no longer reinstates the name of a deleted branch first
+- The deprecated `urc.rpc` `BranchPush` RPC treats a missing or deleted branch as `lore.revision.v1` `BranchPush` does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with `NOT_FOUND`
+- `lore clone`, a whole-tree `lore diff` and `lore status --scan` skip the directories a view such as `*`, `!/*` excludes, and `lore clone` does not create them
+- `lore sync --view` stores the view file as written, as `lore clone --view` does, so a rule escaped as `\!name` stays a literal name and `lore status --scan` does not report that file deleted
+- Under a view re-including paths such as `!*/Saved/Config/`, `lore clone`, `lore sync`, `lore branch switch`, `lore layer add` and `lore reset` create a directory the view excludes only for content the view keeps below it, and `lore sync` and `lore branch switch` remove one they leave empty. A layer's mount directory and the parent directories of a dependency clone's targets stand whatever the view
+- `lore stage --scan` and `lore status --scan` add a directory the view or the ignore file excludes, or delete one the view excludes, only along with content below it, also under rules such as `/Engine/` and `!/Engine/**/Build/`, and so does `lore stage --scan <directory>`. `lore --force stage --scan` adds such a directory whatever it holds
+- The Lore service closes its SWFS mounts when it exits, however it is stopped. It used to leave them to EpicVFS, which kept a device for each one and could not be stopped afterwards: `sc stop EpicVFS` stayed in `STOP_PENDING` until the machine restarted
+- `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and `lore push --fast-forward-merge` report a conflict for a file both sides change when its path holds glob characters such as `[` and `]`
+- A layer's `lore sync --reset` and `lore branch switch --reset` discard local edits in the mount, as they do in the parent repository
 - `lore reset --purge` deletes the untracked files in a layer's mount and leaves the layer's unchanged files in place
 - `lore reset` keeps nested repositories, wherever they are in the working tree
-- `lore stage --scan` leaves out a file an ignore file excludes where a re-inclusion reaches below a directory of the
-  file's name, such as `Game/Saved/direct.log` under `Saved/` and `!*/Saved/*/Keep/`
-- `lore stage` stages no deletion of the files a view leaves out of a sparse working tree, with or without `--force`,
-  whether it scans, names a path or finds their directory removed from the working tree. Where a removed directory
-  holds a staged add, it takes the add back. `lore file dirty` of a directory marks no deletion of the files the view
-  leaves out
-- `lore status` and `lore stage` report and stage the removal of a tracked file the working tree replaced with a
-  directory an ignore rule excludes, such as `src/Intermediate` under `Intermediate/`, and leave out what the directory
-  holds. `lore diff` of a path one revision holds a file at and the next a directory lists what the directory holds
-  where the rules keep the directory and ignore a file of its name, such as under `Intermediate` and `!Intermediate/`
-- `lore stage`, `lore diff`, `lore file dirty`, `lore lock` and `lore status` apply a directory-only ignore rule such
-  as `Intermediate/` to directories only, so a file named `Intermediate` is tracked like any other file, and
-  `lore unstage` applies a directory-only view rule to directories only
+- `lore stage --scan` leaves out a file an ignore file excludes where a re-inclusion reaches below a directory of the file's name, such as `Game/Saved/direct.log` under `Saved/` and `!*/Saved/*/Keep/`
+- `lore stage` stages no deletion of the files a view leaves out of a sparse working tree, with or without `--force`, whether it scans, names a path or finds their directory removed from the working tree. Where a removed directory holds a staged add, it takes the add back. `lore file dirty` of a directory marks no deletion of the files the view leaves out
+- `lore status` and `lore stage` report and stage the removal of a tracked file the working tree replaced with a directory an ignore rule excludes, such as `src/Intermediate` under `Intermediate/`, and leave out what the directory holds. `lore diff` of a path one revision holds a file at and the next a directory lists what the directory holds where the rules keep the directory and ignore a file of its name, such as under `Intermediate` and `!Intermediate/`
+- `lore stage`, `lore diff`, `lore file dirty`, `lore lock` and `lore status` apply a directory-only ignore rule such as `Intermediate/` to directories only, so a file named `Intermediate` is tracked like any other file, and `lore unstage` applies a directory-only view rule to directories only
 - `lore status` lists and `lore unstage` takes back staged changes to paths an ignore rule matches
-- After a merge under a sparse view, diffs and file history list the files it adds, moves and deletes in out-of-view
-  directories, and `lore link list` reflects the links it adds, moves and removes there
+- After a merge under a sparse view, diffs and file history list the files it adds, moves and deletes in out-of-view directories, and `lore link list` reflects the links it adds, moves and removes there
 - `lore revision info --delta` lists a directory a merge brings in as added, with or without a view
-- `lore clone`, `lore sync` and `lore stage --scan` skip a directory no re-inclusion can reach, such as `Game/Saved/Logs`
-  under `Saved/`, `!*/Saved/Config/`
-- A rename that changes only the case of a name, such as `Build.cs` to `build.cs`, commits without `--force`, and
-  `lore sync`, `lore branch switch`, `lore branch merge` and `lore push --fast-forward-merge` apply it. This holds for
-  renames committed with this release or later
-- `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and
-  `lore push --fast-forward-merge` keep both changes where one side moves a file, or a directory holding it, and the
-  other edits the file, with or without the same move: the edit lands where the move put the file. Edits of a file on
-  both sides conflict, whether or not either side moved it, as do a delete of a file against a move of it and two
-  moves of a file to different names
-- `lore sync`, `lore branch merge` and `lore link update` delete a directory the revision deletes, and
-  `lore link remove` a link, when an unchanged file in it is spelled in another case than in the revision. The first
-  three also delete a directory the revision deletes when the revision moves a file out of it
+- `lore clone`, `lore sync` and `lore stage --scan` skip a directory no re-inclusion can reach, such as `Game/Saved/Logs` under `Saved/`, `!*/Saved/Config/`
+- A rename that changes only the case of a name, such as `Build.cs` to `build.cs`, commits without `--force`, and `lore sync`, `lore branch switch`, `lore branch merge` and `lore push --fast-forward-merge` apply it. This holds for renames committed with this release or later
+- `lore branch merge`, `lore branch diff`, `lore sync`, `lore revision cherry-pick`, `lore revision revert` and `lore push --fast-forward-merge` keep both changes where one side moves a file, or a directory holding it, and the other edits the file, with or without the same move: the edit lands where the move put the file. Edits of a file on both sides conflict, whether or not either side moved it, as do a delete of a file against a move of it and two moves of a file to different names
+- `lore sync`, `lore branch merge` and `lore link update` delete a directory the revision deletes, and `lore link remove` a link, when an unchanged file in it is spelled in another case than in the revision. The first three also delete a directory the revision deletes when the revision moves a file out of it
+- `lore-aws`: concurrent requests for the same fragment share one `DynamoDB` read on the AWS immutable store. This covers association checks in put, copy, get and metadata lookups, and state reads in put and metadata lookups. A write by the same server to the association or the state ends the shared read, so a request to that server that starts after the write still sees it. A write by another server does not end it. `urc.store.immutable.aws.shared_reads` counts these reads by `read` (`exists` or `state`), `role` (`leader` for a request that read for itself, `follower` for one that shared a read in flight) and `context` (the operation)
+- `lore-server` metrics: `BranchPush` records metadata blob reads for changed file metadata blocks during fragment verification. Under `lore.branch_push`, `metadata_reads` counts these reads per push, and `peak_metadata_reads_in_flight` records the maximum number of concurrent reads. The log line for slow, cancelled or failed pushes includes the same counts.
+- `lore-revision`: a composite store read that misses locally goes to the durable store as soon as every read replica has missed, failed or been throttled, rather than after the full `[immutable_store.composite] durable_store_delay_ms`. The delay only holds back a durable read while a read replica is still working on it
+- `lore-revision`: a file that `lore sync`, `lore branch switch`, `lore reset` or a merge writes into the working tree takes one stat after the write instead of two, unless it is stored as a fragment list on Linux or macOS. Its executable bit is set or cleared for user, group and others only where the user's bit differs from the one the revision holds, as `lore clone` and `lore file write` already decide it, so a file whose user bit matches keeps the group and other bits it has.
+- `lore-revision`: `lore status --scan`, `lore stage --scan` and `lore sync --reset` are faster under a view or ignore file of about a thousand rules or more: each path is checked only against the rules that can apply to it, found by its leading directories. A view or ignore file holding thousands of paths in one directory also loads faster. Under a view of 6,342 rules over 450,000 files, a scan takes a seventh of the CPU time.
+- `lore-revision`: a failed link push names the link (mount, repository and branch) and keeps the remote's reason.
+- `glob-match`: a view or ignore rule whose fixed start or end differs from a path's, such as `/Game/**/*.uasset` against `Engine/Source/x.cpp`, fails without a full match. A query against a 100-rule ignore file takes a fifth of the time, and `lore status --scan` under a view of 6,342 rules over 450,000 files takes about 11 s instead of 157 s.
+- `lore-revision`: collecting a diff's changes holds no spare capacity. On a 5-million-change sync this lowers the memory held after the diff from 3.9 to 3.0 GiB and the peak resident size from 4.9 to 4.6 GB
+- `lore-revision`: a sync's verification keeps one list of changes and filters it in place. `LORE_MEMORY_STATS=1` reports the bytes the global allocator holds and their peak, and what the GrowVec and node block heaps hold, at exit, and logs them at debug level at each phase of a sync
+- `lore-revision`: a sync that adds or deletes a whole directory walks it on every core. On a 5-million-entry delete the diff takes 13 s instead of 73 s, at the same memory
+- `lore-server`: `lore.revision.v1.RevisionService/BranchList` loads up to 100 branches from the store at once instead of one after another, so listing a repository with hundreds of branches takes a fraction of the time. Branches are streamed in no particular order.
+- `lore-server`: `[feature] branch_list_concurrency` sets how many branches a BranchList request loads at once. It defaults to 100 and must be at least 1.
+- `lore-io`: on Windows, reading a directory queries the file system with a larger buffer, so a wide directory takes fewer queries, each of which every filesystem filter driver, such as antivirus, also sees. Every directory the library reads is read this way: the working-tree scans of `lore status --scan` and `lore stage --scan`, `lore stage` and `lore file dirty` on a directory, `lore reset --purge`, `lore link add`, directory renames in the working tree, and the local immutable store's index, among others. A directory is read as before when its path is relative, or when its search pattern, the path with `\*` appended, is longer than `MAX_PATH` (260 UTF-16 units with the terminator) without the `\\?\` prefix, or 512 units or longer with it.
+- `lore-io`: on Windows, checking the type, size and modification time of a named path takes one query, which the file system answers without opening the file, where it took an open, a query and a close that every filesystem filter driver, such as antivirus, also saw. A filter driver that declines the query has the system open, query and close the file within that one call instead. Paths are checked this way for each dirty-marked or named file, as `lore status`, `lore stage`, `lore commit`, `lore reset`, `lore diff` and `lore sync` do; for each file `lore sync`, `lore branch switch`, `lore reset` and `lore branch merge` write or delete, and each move a rename can't make; for each file compared with stored content; for each directory a walk checks for a nested repository; and by `lore file write`, `lore file hash` and the local immutable and mutable stores. A symbolic link or other reparse point takes that query and then the open, query and close, except for a deletion, which checks the link itself with the query alone, and a path of `MAX_PATH` or more without the `\\?\` prefix is checked as before.
+- `lore-revision`: a file that `lore sync`, `lore branch switch`, `lore reset` or a merge writes into the working tree no longer asks the file system to create the directory it goes in first. That cost every file a failed `mkdir` and a stat of a directory that was already there, and on Windows a `CreateDirectoryW` and an open, query and close of the directory that every filesystem filter driver also saw. The directory is now created only where the write finds it missing, such as below a directory the view excludes.
+- `lore-aws`: Fixed `DynamoDB` batch reads resending unprocessed keys immediately and without limit while a table is throttled. Each batch of up to 100 keys now waits before resending its unprocessed keys. By default, waits start at about 50 ms and double up to about 1 s, and a batch gives up after 6 resends. A read that gives up fails rather than returning the items it got. The immutable store answers `SlowDown`, as it does when `DynamoDB` throttles a request outright. The lock store reports an internal error. `urc.aws.dynamodb.unprocessed_retries.exhausted` counts the reads that give up, labelled by `table_name` and `context`. `urc.aws.dynamodb.unprocessed_retries.total` gains buckets at 30, 50 and 100.
+- `lore-server`: The AWS immutable store and lock store plugins take an optional `dynamodb_unprocessed_keys_retry` table to override these defaults. Its fields are `initial_backoff_ms`, `max_backoff_ms`, `max_attempts` and `jitter`. `max_attempts` counts resends.
+- `lore-revision`: Fixed a removal that failed on Unix making what it named, or the directory a symbolic link there stood for, writable by everyone, while still failing. A removal takes a symbolic link as the link and does not follow it: `lore sync`, `lore branch switch`, `lore reset` and `lore branch merge` remove a symbolic link standing where a tracked directory was without changing the mode of the directory it stands for, though a file the revision tracks below the link is still removed through it, and they remove a symbolic link that names nothing instead of leaving it in place. On Unix, a failed removal of a file or an empty directory is not retried, since its own mode never refuses it, and a failed recursive removal is retried after adding only the owner's write permission to the directory itself, never through a symbolic link. On Windows, a failed removal is retried after clearing the read-only attribute of the name itself, a symbolic link's or junction's own rather than that of what it stands for.
+- `lore-server`: Fixed replicated store and replica requests stalling while the replication client is refreshed or reconnected. A refresh waited for every request in flight and held back new ones until then, so one slow request could block the store until it finished. Requests in flight now finish on the old client, and new requests use the new client as soon as it connects.
+- `lore-server`: Fixed delayed reconnection after a connection to a replication peer failed. Reconnection sometimes happened only after further requests failed. A request that started during a refresh could run on the new client while recording the old one, so its failure was ignored as already handled.
+- `lore-revision`: Fixed `lore status --scan` and `lore stage` keeping an untracked entry an earlier scan recorded after an ignore rule excludes it
+- `lore-revision`: Fixed `lore stage` and the replay of dirty marks after a sync, a branch switch or a commit taking in every file of a new directory where only some were marked, such as after `lore status --scan dir/a.txt` with `dir/b.txt` beside it. A new directory that is only marked is staged along with the files marked in it, and on its own only where it is empty. A directory `lore dirty --force` creates above a new file is untracked, as the file is, so `lore status` no longer lists it below a directory the ignore file names
+- `lore-revision`: Fixed staging a file over a link leaving the link's registry entry behind, so a clone listed a link at a path holding a file. Staging the file now removes the link.
+- `lore-revision`: Fixed a folder staged where `lore link remove` had removed a link failing with `Link not found` and being left out of the commit. The removal and the folder or file replacing it now commit together.
+- `lore-revision`: Fixed `lore reset` of a committed folder or link failing with `File exists` or `Not a directory` where a file stands at its path. Reset of a link a file replaced now puts the link back.
+- `lore-revision`: Fixed `lore unstage` of a staged link add or removal deleting or overwriting work at the mount. It refuses where the work is a local change to a file the link holds or a file standing at the mount, and points at `lore reset`. Files the link does not hold stay at the mount.
+- `lore-revision`: Fixed `lore unstage` of a path whose type change is staged unstaging only the added node, and panicking where the replaced node was a link that was never committed.
 
 ## v0.12.0 (Oct 26th 2026) [#1966]
 
