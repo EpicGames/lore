@@ -3734,6 +3734,35 @@ mod tests {
                     node.is_dirty_modify(),
                     "carried.txt should be dirty in the rebased state"
                 );
+
+                // Same size, so only the content tells it apart
+                std::fs::write(path.join("carried.txt"), b"ORIGINAL").expect("Write failed");
+                let rebased_revision = lore_revision::state::rebase_staged_state(
+                    repository.clone(),
+                    staged_revision,
+                    current_revision,
+                    false,
+                )
+                .await
+                .expect("Rebase failed");
+                assert!(
+                    rebased_revision.is_some(),
+                    "A file differing in content alone should stay dirty"
+                );
+
+                std::fs::write(path.join("carried.txt"), b"original").expect("Write failed");
+                let rebased_revision = lore_revision::state::rebase_staged_state(
+                    repository.clone(),
+                    staged_revision,
+                    current_revision,
+                    false,
+                )
+                .await
+                .expect("Rebase failed");
+                assert_eq!(
+                    rebased_revision, None,
+                    "A file holding the current content should leave nothing to stage"
+                );
             }))
             .await
             .expect("Test task failed");

@@ -44,6 +44,7 @@ use crate::revision::sync::SyncOptions;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::NodeMapping;
+use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -929,7 +930,9 @@ pub fn list_staged_boxed(
     Box::pin(list_staged(repository))
 }
 
-/// Carries the layer's mount to `state_target`, and to the view `repository_target` holds.
+/// Carries the layer's mount to `state_target`, and to the view `repository_target` holds,
+/// answering the modified times it collected, which are true once the layer's current revision
+/// is stored at `state_target`.
 ///
 /// `repository_current` is the layer context the mount stands under, which is `repository_target`
 /// itself for a sync carrying the mount between revisions under one view.
@@ -941,11 +944,11 @@ pub async fn sync(
     mount_path: RelativePath,
     source_path: RelativePath,
     options: SyncOptions,
-) -> Result<(), LayerError> {
+) -> Result<RecordedModifiedTimes, LayerError> {
     let filesystem = repository_target.file_system();
     with_operation(filesystem, async |operation| {
         sync_in_operation(
-            operation,
+            operation.clone(),
             repository_current,
             repository_target,
             state_current,
@@ -954,7 +957,8 @@ pub async fn sync(
             source_path,
             options,
         )
-        .await
+        .await?;
+        Ok(operation.take_modified_times())
     })
     .await
 }
@@ -962,7 +966,7 @@ pub async fn sync(
 /// Realizes the layer's target state over its mount, within `operation`, and removes the
 /// directories below the mount that the view excludes and the realize left empty.
 #[allow(clippy::too_many_arguments)]
-async fn sync_in_operation(
+pub(crate) async fn sync_in_operation(
     operation: Arc<InstanceOperationImpl>,
     repository_current: Arc<RepositoryContext>,
     repository_target: Arc<RepositoryContext>,

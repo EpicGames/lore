@@ -5621,14 +5621,17 @@ impl State {
 /// - Anchor's tree has no dirty descendants: drop the anchor so the next
 ///   load falls back to the new current.
 /// - Anchor's tree has dirty descendants: drop the anchor, then re-apply
-///   each dirty path against the new current via [`crate::file::dirty::dirty`].
-///   Only dirty nodes carry over; the prior staged merkle tree is discarded.
+///   each dirty path against the new current via [`crate::file::dirty::dirty`],
+///   comparing files where `realized`. Only dirty nodes carry over; the prior
+///   staged merkle tree is discarded.
 ///
-/// Wraps [`rebase_staged_state`] with the instance anchor I/O.
+/// Wraps [`rebase_staged_state_in`] with the instance anchor I/O.
 pub async fn rebase_staged_anchor(
     repository: Arc<RepositoryContext>,
+    operation: &Arc<InstanceOperationImpl>,
     new_current_signature: Hash,
     force: bool,
+    realized: bool,
 ) -> Result<(), StateError> {
     let Some(old_staged_signature) = crate::instance::load_staged_revision(&repository)
         .await
@@ -5644,11 +5647,14 @@ pub async fn rebase_staged_anchor(
 
     let _ = crate::instance::delete_staged_anchor(&repository).await;
 
-    let Some(rebased_signature) = rebase_staged_state(
+    let Some(rebased_signature) = rebase_staged_state_in(
+        operation,
         repository.clone(),
         old_staged_signature,
         new_current_signature,
         force,
+        realized,
+        None,
     )
     .await?
     else {
@@ -5662,7 +5668,15 @@ pub async fn rebase_staged_anchor(
     Ok(())
 }
 
-/// Rebase a staged state onto a new current revision, touching no anchors.
+/// Where a layer's tree stands in the working tree: its names below `source` are held below
+/// `mount`.
+pub(crate) struct LayerPaths<'a> {
+    pub source: &'a RelativePath,
+    pub mount: &'a RelativePath,
+}
+
+/// Rebase a staged state onto a new current revision, touching no anchors, reading the working
+/// tree through a filesystem operation of its own.
 ///
 /// Returns the signature of the rebased state, leaving persistence to the
 /// caller, or `None` when nothing needs staging on top of the new current.
@@ -5674,11 +5688,42 @@ pub async fn rebase_staged_anchor(
 /// no longer holds. A status asks the same filter and so reports nothing of a
 /// flag carried there, until the view widens again and it surfaces as a local
 /// change to a file nothing touched.
+#[cfg(feature = "test-util")]
 pub async fn rebase_staged_state(
     repository: Arc<RepositoryContext>,
     old_staged_signature: Hash,
     new_current_signature: Hash,
     force: bool,
+) -> Result<Option<Hash>, StateError> {
+    crate::fs::filesystem_provider::with_operation(repository.file_system(), async |operation| {
+        rebase_staged_state_in(
+            &operation,
+            repository.clone(),
+            old_staged_signature,
+            new_current_signature,
+            force,
+            true,
+            None,
+        )
+        .await
+    })
+    .await
+}
+
+/// [`rebase_staged_state`] reading the working tree through `operation`, for the tree of the
+/// layer `layer` places, or the repository's own where `None`.
+///
+/// `realized` states that the working tree holds the new current revision and the modified times
+/// recorded on the way are stored. A dirty path the working tree then agrees with is dropped:
+/// its marker was left by a change the sync or switch overwrote.
+pub(crate) async fn rebase_staged_state_in(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    old_staged_signature: Hash,
+    new_current_signature: Hash,
+    force: bool,
+    realized: bool,
+    layer: Option<LayerPaths<'_>>,
 ) -> Result<Option<Hash>, StateError> {
     let old_staged_state = State::deserialize(repository.clone(), old_staged_signature).await?;
     let has_dirty = old_staged_state
@@ -5707,12 +5752,45 @@ pub async fn rebase_staged_state(
         return Ok(None);
     }
 
+    let root = RelativePath::default();
+    let (source, paths, mask) = match layer {
+        None => {
+            let paths = dirty_paths
+                .into_iter()
+                .map(|path| (path.clone(), path))
+                .collect::<Vec<_>>();
+            let layers = crate::layer::list(repository.clone())
+                .await
+                .forward::<StateError>("Failed to list layers")?;
+            let mask = (!layers.is_empty()).then(|| Arc::new(crate::layer::mount_paths(&layers)));
+            (&root, paths, mask)
+        }
+        // A path outside the source is one the layer does not draw into the working tree.
+        Some(layer) => {
+            let paths = dirty_paths
+                .iter()
+                .filter_map(|path| {
+                    let below = path.below_ignore_case(layer.source)?;
+                    Some((
+                        RelativePath::new_from_clean_parts(below, ""),
+                        layer.mount.join(below),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            (layer.source, paths, None)
+        }
+    };
+
     let state_current = State::deserialize(repository.clone(), new_current_signature).await?;
-    let signature = crate::file::dirty::dirty_relative_paths_in(
+    let signature = crate::file::dirty::dirty_drawn_paths_in(
+        operation,
         repository,
         state_current.clone(),
         state_current,
-        dirty_paths,
+        source,
+        &paths,
+        mask,
+        realized,
     )
     .await
     .forward::<StateError>("Failed to apply dirty paths during staged rebase")?;

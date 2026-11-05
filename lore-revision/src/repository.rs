@@ -53,6 +53,7 @@ use crate::filter;
 use crate::filter::Filter;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
+use crate::fs::filesystem_provider::with_operation;
 use crate::fs::mount_manager_state::MountManagerState;
 use crate::fs::os::OsFilesystem;
 use crate::global::GlobalConfig;
@@ -3297,12 +3298,23 @@ pub async fn branch_switch(
             .await
             .forward::<RepositoryError>("Failed to serialize repository anchor")?;
 
+        // The sync above rebased the staged anchor. A bare switch runs none, and leaves the working
+        // tree on the previous revision.
         if global.force() {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
-        } else {
-            state::rebase_staged_anchor(repository.clone(), branch_signature, false)
+        } else if options.bare {
+            with_operation::<_, RepositoryError, _>(repository.file_system(), async |operation| {
+                state::rebase_staged_anchor(
+                    repository.clone(),
+                    &operation,
+                    branch_signature,
+                    false,
+                    false,
+                )
                 .await
-                .forward::<RepositoryError>("Failed to rebase staged anchor")?;
+                .forward::<RepositoryError>("Failed to rebase staged anchor")
+            })
+            .await?;
         }
 
         if branch_location == LoreBranchLocation::Remote {
@@ -3646,6 +3658,7 @@ async fn layer_branch_switch(
     let global = context.globals();
 
     let mut layer_updates: Vec<(RepositoryId, String, Hash)> = Vec::new();
+    let mut layer_times = Vec::new();
 
     for (layer, layer_repository) in layers {
         // Check for uncommitted staged changes in layer
@@ -3833,9 +3846,9 @@ async fn layer_branch_switch(
                 ..Default::default()
             };
 
-            if let Err(err) = Box::pin(layer::sync(
+            let modified_times = match Box::pin(layer::sync(
                 layer_repository.clone(),
-                layer_repository,
+                layer_repository.clone(),
                 layer_current,
                 layer_target,
                 mount_path.clone(),
@@ -3844,11 +3857,15 @@ async fn layer_branch_switch(
             ))
             .await
             {
-                lore_warn!("Failed to sync layer {}: {err}", layer.repository);
-                continue;
-            }
+                Ok(modified_times) => modified_times,
+                Err(err) => {
+                    lore_warn!("Failed to sync layer {}: {err}", layer.repository);
+                    continue;
+                }
+            };
 
             layer_updates.push((layer.repository, layer.target_path.clone(), layer_revision));
+            layer_times.push((layer_repository, modified_times));
         }
     }
 
@@ -3860,6 +3877,9 @@ async fn layer_branch_switch(
     layer::store_layer_current_batch(repository.clone(), token, &batch)
         .await
         .forward::<RepositoryError>("Failed to switch branch in layer")?;
+    for (layer_repository, modified_times) in layer_times {
+        modified_times.store(layer_repository).await;
+    }
 
     Ok(())
 }

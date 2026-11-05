@@ -314,6 +314,7 @@ async fn dirty_into_layer(
 ///
 /// Reads the working tree through one filesystem operation, finalized as having changed
 /// nothing, the markers it leaves being state alone.
+#[cfg(feature = "test-util")]
 #[lore_macro::test_pub]
 pub(crate) async fn dirty_relative_paths_in(
     repository: Arc<RepositoryContext>,
@@ -346,27 +347,62 @@ async fn dirty_relative_paths_in_masked(
     paths: Vec<RelativePath>,
     mask: Option<Arc<Vec<String>>>,
 ) -> Result<Hash, DirtyError> {
+    dirty_drawn_paths_in(
+        operation,
+        repository,
+        state_current,
+        state_staged,
+        &RelativePath::default(),
+        &paths
+            .into_iter()
+            .map(|path| (path.clone(), path))
+            .collect::<Vec<_>>(),
+        mask,
+        false,
+    )
+    .await
+}
+
+/// [`dirty_relative_paths_in_masked`] for a tree drawn from `source_path`, each of `paths` pairing
+/// the names below `source_path` with the working-tree path that holds them.
+///
+/// `compare` marks a file the working tree and the current revision both hold only where its
+/// content differs, for a caller whose recorded modified times speak for the current revision.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn dirty_drawn_paths_in(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    source_path: &RelativePath,
+    paths: &[(RelativePath, RelativePath)],
+    mask: Option<Arc<Vec<String>>>,
+    compare: bool,
+) -> Result<Hash, DirtyError> {
     let current_revision = state_current.revision();
 
-    let walk = DirtyWalk::new(
+    let mut walk = DirtyWalk::new(
         operation.clone(),
         repository.clone(),
-        state_current.clone(),
-        state_staged.clone(),
+        state_current,
+        state_staged,
         Arc::new(DirtyStats::default()),
         mask,
     )
     .await?;
+    walk.compare = compare;
     let root = DirtyNodes {
         current: ROOT_NODE,
         staged: ROOT_NODE,
     };
+    let source_root = dirty_nodes_below(&walk, root, source_path).await;
 
-    for relative_path in paths.iter() {
-        dirty_named_path(&walk, root, relative_path, relative_path).await?;
+    for (names, path) in paths {
+        dirty_named_path(&walk, source_root, names, path).await?;
     }
     repin_dirty_links(&walk).await?;
 
+    let state_staged = &walk.state_staged;
     let stats = &walk.stats;
     let modify = stats.modify_count.load(Ordering::Relaxed);
     let add = stats.add_count.load(Ordering::Relaxed);
@@ -412,6 +448,9 @@ struct DirtyWalk {
     mask: Option<Arc<Vec<String>>>,
     link_references: Vec<LinkReference>,
     linked: parking_lot::Mutex<Vec<(LinkReference, Arc<DirtyWalk>)>>,
+    /// Whether a file both the working tree and the current revision hold is marked only where it
+    /// differs.
+    compare: bool,
 }
 
 impl DirtyWalk {
@@ -437,6 +476,7 @@ impl DirtyWalk {
             mask,
             link_references,
             linked: Default::default(),
+            compare: false,
         })
     }
 
@@ -686,17 +726,17 @@ async fn linked_walk(
                 .await
                 .forward::<DirtyError>("Failed to deserialize linked state")?
         };
-        let linked = Arc::new(
-            DirtyWalk::new(
-                walk.operation.clone(),
-                repository,
-                state_current,
-                state_staged,
-                walk.stats.clone(),
-                None,
-            )
-            .await?,
-        );
+        let mut linked = DirtyWalk::new(
+            walk.operation.clone(),
+            repository,
+            state_current,
+            state_staged,
+            walk.stats.clone(),
+            None,
+        )
+        .await?;
+        linked.compare = walk.compare;
+        let linked = Arc::new(linked);
         walk.linked.lock().push((reference, linked.clone()));
         linked
     };
@@ -899,6 +939,10 @@ async fn dirty_path(
         )
         .await?;
     } else if exists_on_disk && in_current_revision {
+        if walk.compare && file_matches_current(walk, nodes.current, relative_path, &info).await? {
+            return Ok(());
+        }
+
         // File on disk + in revision -> Modify
         lore_trace!("Dirty modify: {}", relative_path.as_str());
         let node_id = staged_node.unwrap_or(nodes.current);
@@ -973,6 +1017,40 @@ async fn dirty_path(
     }
 
     Ok(())
+}
+
+/// Whether the file at `path`, which `info` describes, holds what the current revision's node
+/// `current` holds, as `status --scan` would answer.
+///
+/// The comparison is boxed: only a walk that compares takes it, and inline its future would be
+/// held by every step of every walk.
+async fn file_matches_current(
+    walk: &DirtyWalk,
+    current: NodeID,
+    path: &RelativePath,
+    info: &FileInfo,
+) -> Result<bool, DirtyError> {
+    let node = walk
+        .state_current
+        .node(walk.repository.clone(), current)
+        .await
+        .forward::<DirtyError>("Failed to get current node")?;
+    if !node.is_file() || info.mode_differs_from(node.mode) {
+        return Ok(false);
+    }
+    let modification = Box::pin(crate::state::file_modified_against_node(
+        walk.repository.clone(),
+        &node,
+        info.mtime(),
+        info.size(),
+        path,
+        true,
+        &walk.operation,
+        &lore_storage::ContentHashes::default(),
+    ))
+    .await
+    .forward::<DirtyError>("Failed to compare a file to the current revision")?;
+    Ok(!modification.is_modified())
 }
 
 /// Mark a node as Dirty+Delete, recursing into directory children.

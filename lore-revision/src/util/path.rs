@@ -897,6 +897,12 @@ impl RelativePath {
             .then(|| self.as_str()[ancestor.len()..].trim_start_matches('/'))
     }
 
+    /// [`below`](Self::below) comparing names case-insensitively, as node lookup does, and
+    /// answering the names as this path spells them.
+    pub fn below_ignore_case(&self, ancestor: &RelativePath) -> Option<&str> {
+        strip_lowercase_prefix(self.as_str(), ancestor.as_lowercase_str())
+    }
+
     /// [`overlaps`](Self::overlaps) on the lowercased form, for the same reason
     /// as [`covers_ignore_case`](Self::covers_ignore_case).
     pub fn overlaps_ignore_case(&self, other: &RelativePath) -> bool {

@@ -976,9 +976,15 @@ pub(crate) async fn sync(
 
             modified_times.store(repository.clone()).await;
 
-            state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
-                .await
-                .forward::<SyncError>("Failed to rebase staged anchor")?;
+            state::rebase_staged_anchor(
+                repository.clone(),
+                &operation,
+                revision,
+                force && !view_change,
+                true,
+            )
+            .await
+            .forward::<SyncError>("Failed to rebase staged anchor")?;
 
             if let Some(view_file) = view_file {
                 sync_store_view(&repository, view_file).await?;
@@ -1226,50 +1232,73 @@ async fn sync_layers(
             layer_target.revision_number()
         );
 
-        // TODO(mjansson): Sync disjoint layers in parallel
-        Box::pin(layer::sync(
-            layer_repository_current,
-            layer_repository_target.clone(),
-            layer_current,
-            layer_target,
-            mount_path.clone(),
-            source_path.clone(),
-            options.clone(),
-        ))
-        .await
-        .forward::<SyncError>("Failed to synchornize a layer")?;
-
         // Rebasing a layer that did not move would drop its staged content: a
         // purely staged state has no dirty children, so the rebase finds nothing
         // to carry forward and clears the pin.
-        let staged = if execution_context().globals().dry_run() || layer_revision == layer.current {
-            None
-        } else if layer.staged.is_zero() || layer.staged == layer.current {
-            Some(Hash::default())
-        } else {
-            Some(
-                state::rebase_staged_state(
-                    layer_repository_target,
-                    layer.staged,
+        let dry_run = execution_context().globals().dry_run();
+        let moved = !dry_run && layer_revision != layer.current;
+        let rebases = moved && !layer.staged.is_zero() && layer.staged != layer.current;
+
+        // TODO(mjansson): Sync disjoint layers in parallel
+        with_operation::<_, SyncError, _>(
+            layer_repository_target.file_system(),
+            async |operation| {
+                Box::pin(layer::sync_in_operation(
+                    operation.clone(),
+                    layer_repository_current,
+                    layer_repository_target.clone(),
+                    layer_current,
+                    layer_target,
+                    mount_path.clone(),
+                    source_path.clone(),
+                    options.clone(),
+                ))
+                .await
+                .forward::<SyncError>("Failed to synchornize a layer")?;
+                let modified_times = operation.take_modified_times();
+
+                layer::store_layer_current(
+                    repository_target.clone(),
+                    token,
+                    mount_path.as_str(),
+                    layer.repository,
                     layer_revision,
-                    execution_context().globals().force() && !view_moved,
+                    moved.then_some(Hash::default()),
                 )
                 .await
-                .forward::<SyncError>("Failed to rebase layer staged state")?
-                .unwrap_or_default(),
-            )
-        };
+                .forward::<SyncError>("Failed to synchornize a layer")?;
+                modified_times.store(layer_repository_target.clone()).await;
 
-        layer::store_layer_current(
-            repository_target.clone(),
-            token,
-            mount_path.as_str(),
-            layer.repository,
-            layer_revision,
-            staged,
+                if rebases
+                    && let Some(staged) = state::rebase_staged_state_in(
+                        &operation,
+                        layer_repository_target.clone(),
+                        layer.staged,
+                        layer_revision,
+                        execution_context().globals().force() && !view_moved,
+                        true,
+                        Some(state::LayerPaths {
+                            source: &source_path,
+                            mount: &mount_path,
+                        }),
+                    )
+                    .await
+                    .forward::<SyncError>("Failed to rebase layer staged state")?
+                {
+                    layer::store_layer_staged(
+                        repository_target.clone(),
+                        token,
+                        mount_path.as_str(),
+                        layer.repository,
+                        staged,
+                    )
+                    .await
+                    .forward::<SyncError>("Failed to synchornize a layer")?;
+                }
+                Ok(())
+            },
         )
-        .await
-        .forward::<SyncError>("Failed to synchornize a layer")?;
+        .await?;
     }
 
     Ok(())

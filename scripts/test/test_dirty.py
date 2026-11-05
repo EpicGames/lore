@@ -389,7 +389,9 @@ def test_dirty_ignore_in_a_directory_that_does_not_exist(new_lore_repo):
 
     entries = get_status_files(repo)
     paths = sorted(entry.get("path") for entry in entries)
-    assert paths == ["base.txt"], f"Expected only the real change marked, got: {entries}"
+    assert paths == ["base.txt"], (
+        f"Expected only the real change marked, got: {entries}"
+    )
 
 
 # ===========================================================================
@@ -3058,3 +3060,54 @@ def test_scan_records_mtime_after_hash_check(new_lore_repo):
         f"the established match must be recorded, sparing the next scan, got {summary}"
     )
     assert summary["mtimeMatches"] == 2, summary
+
+
+@pytest.mark.smoke
+def test_switch_drops_the_dirty_markers_of_what_it_restores(new_lore_repo):
+    """A switch that restores what a scan recorded as deleted leaves no marker on
+    it, and keeps the marker of each local change it leaves in place."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Initial commit",
+        {
+            "restored.txt": "one\n",
+            "edited.txt": "edited\n",
+            "folder/changed.txt": "one\n",
+            "folder/missing.txt": "missing\n",
+        },
+    )
+    repo.branch_create("feature")
+    repo.write_commit_push(
+        "Change on feature", {"restored.txt": "two\n", "folder/changed.txt": "two\n"}
+    )
+    repo.branch_switch("main")
+
+    repo.remove_file("restored.txt")
+    # Same size, so only the content tells it apart.
+    repo.write_files({"edited.txt": "EDITED\n"})
+    repo.rmtree("folder")
+    repo.status(scan=True)
+    assert _dirty_entries(repo) == [
+        ("edited.txt", "file", "keep"),
+        ("folder", "directory", "delete"),
+        ("restored.txt", "file", "delete"),
+    ], "setup: the scan must mark every change"
+
+    repo.branch_switch("feature")
+
+    with repo.open_file("restored.txt", "r") as input_file:
+        assert input_file.read() == "two\n", "the switch must restore the file"
+    with repo.open_file("folder/changed.txt", "r") as input_file:
+        assert input_file.read() == "two\n", "the switch must restore the folder"
+    assert _dirty_entries(repo) == [
+        ("edited.txt", "file", "keep"),
+        ("folder/missing.txt", "file", "delete"),
+    ], "only the local changes the switch left in place may stay marked"
+
+
+def _dirty_entries(repo: Lore) -> list[tuple[str, str, str]]:
+    return [
+        (to_posix(entry["path"]), entry.get("type"), entry.get("action"))
+        for entry in get_status_files(repo)
+        if entry.get("flagDirty")
+    ]

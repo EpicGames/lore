@@ -3302,3 +3302,49 @@ def test_layer_status_lists_staged_changes_below_an_ignored_mount(new_lore_repo)
     assert [(e.get("path"), e.get("action"), e.get("flagStaged")) for e in entries] == [
         ("vendor/x/a.txt", "keep", True)
     ], f"status lists {entries}"
+
+
+@pytest.mark.smoke
+def test_sync_drops_the_dirty_marker_of_a_layer_file_it_restores(new_lore_repo):
+    """A sync that restores a layer file a scan recorded as deleted leaves no
+    marker on it, and keeps the marker of a layer file it did not touch. The
+    layer's source `Src/` differs in case from the `src/` its tree holds."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(
+        None, {"src/restored.txt": b"one", "src/edited.txt": b"edited"}
+    )
+    repo.layer_add("mnt", layer_repo, "Src/")
+
+    other = repo.clone(name=repo.name + "_other")
+    other.write_commit_push(None, {MAIN_FILE: b"main content v2"})
+    layer_repo.write_commit_push(None, {"src/restored.txt": b"two"})
+
+    repo.remove_file("mnt/restored.txt")
+    repo.write_files({"mnt/edited.txt": b"edited locally"})
+    repo.status(scan=True)
+    assert _marked(repo) == [
+        ("mnt/edited.txt", "keep", True),
+        ("mnt/restored.txt", "delete", True),
+    ], "setup: the scan must mark both layer files"
+
+    repo.sync()
+
+    with repo.open_file("mnt/restored.txt", "rb") as f:
+        assert f.read() == b"two", "the sync must restore the layer file"
+    assert _marked(repo) == [("mnt/edited.txt", "keep", True)], (
+        "only the layer file the sync left alone may stay marked, as modified"
+    )
+    summary = parse_status_summary_json(repo.status(scan=True, json=True))
+    assert summary["hashChecks"] == 0, (
+        f"the times the sync recorded must answer for the files it wrote, got {summary}"
+    )
+
+
+def _marked(repo: Lore) -> list[tuple[str, str, bool]]:
+    return [
+        (entry.get("path"), entry.get("action"), entry.get("flagDirty"))
+        for entry in parse_status_json(repo.status(json=True))
+    ]
