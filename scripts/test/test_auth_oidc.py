@@ -500,8 +500,8 @@ def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
     operation, with the refresh token the login brought. The provider rotates
     it, so the store holds the new one: the refresh after the next expiry
     presents that, and the provider, which revokes the login when a consumed
-    refresh token comes back, still answers. Each refresh token's deadline
-    replaces the one before, and `auth info` reports the last."""
+    refresh token comes back, still answers. `auth info` refreshes too, and
+    reports the new token and the new refresh token's deadline."""
     provider = oidc_env.provider
     provider.token_lifetime = -60
     provider.refresh_token_lifetime = 86400
@@ -516,6 +516,7 @@ def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
     time.sleep(4)
     provider.token_lifetime = 3600
     provider.refresh_token_lifetime = 172800
+    login = repo.auth_user_token_event()
     seed_and_commit(repo)
     repo.push()
 
@@ -526,17 +527,19 @@ def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
     ]
     assert len(provider.valid_refresh_tokens()) == 1
     assert_user_logged_in(repo, provider)
-    login = repo.auth_user_token_event()
     assert login["refreshable"] is True
     assert login["sessionValid"] is True
+    assert abs(login["expires"] - (time.time() + 3600) * 1000) < 60_000
     assert abs(login["refreshExpires"] - (time.time() + 172800) * 1000) < 60_000
 
 
 @pytest.mark.smoke
 def test_a_refused_refresh_token_is_presented_once(oidc_env, make_repo):
-    """A refresh token the provider refuses fails the operation as an expired
-    login did before, and is dropped: the next operation asks the provider
-    nothing more."""
+    """A refresh token the provider refuses fails the operation as not
+    authenticated, and is dropped: the next operation asks the provider
+    nothing more. A call naming the identity fails the same way. `auth info`
+    still reports the stored login, no longer refreshable, and `auth logout`
+    removes it."""
     provider = oidc_env.provider
     provider.token_lifetime = -60
     repo = make_repo()
@@ -544,9 +547,18 @@ def test_a_refused_refresh_token_is_presented_once(oidc_env, make_repo):
     provider.revoke_refresh_tokens()
 
     for _ in range(2):
-        with pytest.raises(LoreException):
+        with pytest.raises(NotAuthenticatedError):
             repo.repository_create()
 
+    assert len(refreshes(provider)) == 1
+    with pytest.raises(NotAuthenticatedError):
+        repo.repository_info(repo.remote_path, identity=provider.user.user_id)
+    repo.repository_create(offline=True, identity=provider.user.user_id)
+    login = repo.auth_user_token_event()
+    assert login["refreshable"] is False
+    assert login["sessionValid"] is False
+    repo.run(urc_args=["auth", "logout"])
+    assert provider.user.user_id not in repo.run(urc_args=["auth", "list"])
     assert len(refreshes(provider)) == 1
 
 

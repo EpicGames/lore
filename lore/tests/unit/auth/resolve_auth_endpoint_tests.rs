@@ -23,19 +23,20 @@ fn repository_with_config(label: &str, config: Option<&str>) -> lore_base::test_
 // repository config or the network.
 #[tokio::test]
 async fn returns_explicit_endpoint_verbatim() {
-    let endpoint = resolve_auth_endpoint("ucs-auth://auth.example.com", "/does/not/exist", "")
-        .await
-        .expect("an explicit endpoint should resolve");
+    let (endpoint, remote) =
+        resolve_auth_endpoint("ucs-auth://auth.example.com", "/does/not/exist")
+            .await
+            .expect("an explicit endpoint should resolve");
     assert_eq!(endpoint, "ucs-auth://auth.example.com");
+    assert!(remote.is_none());
 }
 
 // Run outside a repository with no explicit endpoint, the answer names the actual
-// problem — there is no repository here to read a remote from — rather than the
-// generic "requires a configured auth endpoint", which reads as though something
-// needs configuring when the fix is to run this from a repository or pass an endpoint.
+// problem: there is no repository here to read a remote from, and the fix is to run
+// this from a repository or pass an endpoint.
 #[tokio::test]
 async fn missing_repository_is_repository_not_found() {
-    let err = resolve_auth_endpoint("", "/does/not/exist", "")
+    let err = resolve_auth_endpoint("", "/does/not/exist")
         .await
         .expect_err("a missing endpoint must be an error");
 
@@ -53,7 +54,7 @@ async fn missing_repository_is_repository_not_found() {
 async fn repository_without_a_remote_is_no_remote() {
     let root = repository_with_config("empty-remote", Some("remote_url = \"\"\n"));
 
-    let err = resolve_auth_endpoint("", &root.display().to_string(), "")
+    let err = resolve_auth_endpoint("", &root.display().to_string())
         .await
         .expect_err("a repository with no remote must be an error");
 
@@ -66,7 +67,7 @@ async fn repository_without_a_remote_is_no_remote() {
 async fn repository_with_no_remote_key_is_no_remote() {
     let root = repository_with_config("absent-remote", Some("identity = \"me\"\n"));
 
-    let err = resolve_auth_endpoint("", &root.display().to_string(), "")
+    let err = resolve_auth_endpoint("", &root.display().to_string())
         .await
         .expect_err("a repository with no remote must be an error");
 

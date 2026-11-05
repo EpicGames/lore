@@ -30,11 +30,13 @@ type Authorize = Box<dyn Fn(&str, usize) -> &'static str + Send + Sync>;
 /// Answers a refresh grant for the refresh token presented.
 type Refresh = Box<dyn Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync>;
 
-/// Hands out the authorization `authorize` names, and counts the exchanges. Refreshes are
-/// answered by `refresh`, and refused without one.
+/// Hands out the authorization `authorize` names, or fails every exchange with `exchange_error`,
+/// and counts the exchanges. Refreshes are answered by `refresh`, and fail as `Internal` without
+/// one.
 pub(crate) struct StubAuthentication {
     exchanges: AtomicUsize,
     authorize: Authorize,
+    exchange_error: Option<fn() -> ProtocolError>,
     refresh: Option<Refresh>,
     refresh_delay: std::time::Duration,
     presented: parking_lot::Mutex<Vec<String>>,
@@ -47,6 +49,7 @@ impl StubAuthentication {
         Arc::new(Self {
             exchanges: AtomicUsize::new(0),
             authorize: Box::new(authorize),
+            exchange_error: None,
             refresh: None,
             refresh_delay: std::time::Duration::ZERO,
             presented: parking_lot::Mutex::default(),
@@ -75,8 +78,22 @@ impl StubAuthentication {
                     AUTHZ_TWO
                 }
             }),
+            exchange_error: None,
             refresh: Some(Box::new(refresh)),
             refresh_delay: delay,
+            presented: parking_lot::Mutex::default(),
+        })
+    }
+
+    /// A stub that fails every exchange with the error `exchange_error` makes, and every refresh
+    /// as `Internal`.
+    pub(crate) fn failing_exchanges(exchange_error: fn() -> ProtocolError) -> Arc<Self> {
+        Arc::new(Self {
+            exchanges: AtomicUsize::new(0),
+            authorize: Box::new(|_, _| ""),
+            exchange_error: Some(exchange_error),
+            refresh: None,
+            refresh_delay: std::time::Duration::ZERO,
             presented: parking_lot::Mutex::default(),
         })
     }
@@ -102,6 +119,9 @@ impl Authentication for StubAuthentication {
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         let served = self.exchanges.fetch_add(1, Ordering::AcqRel);
+        if let Some(exchange_error) = self.exchange_error {
+            return Err(exchange_error());
+        }
         Ok(AuthorizationToken {
             token: (self.authorize)(authn_token, served).to_string(),
             expires_ms: 0,

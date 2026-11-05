@@ -318,10 +318,15 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 
 /// Resolve user identities to display names from locally stored JWT tokens.
 ///
-/// Decodes cached JWT tokens to extract display names without contacting the
-/// auth service. For user IDs without a local token, returns the raw user
-/// ID. For remote resolution with proper authorization, use
-/// `lore_auth_user_info` which queries the remote authentication service.
+/// Decodes cached JWT tokens to extract display names. For user IDs without a
+/// local token, returns the raw user ID. For remote resolution with proper
+/// authorization, use `lore_auth_user_info` which queries the remote
+/// authentication service.
+///
+/// When `auth_endpoint` is empty, the call reads it from the repository's
+/// remote, and first refreshes an expired stored token unless the call
+/// supplies a token. The refresh contacts the auth service and replaces the
+/// stored tokens; a refused or failed refresh removes the stored refresh token.
 ///
 /// Every identity is answered with an `AUTH_USER_INFO` event, and an identity
 /// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
@@ -332,7 +337,7 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// additionally emits one `AUTH_IDENTITY` event carrying the
 /// repository-scoped authorization (access) token for the current user. A
 /// valid cached token is reused. Otherwise a token exchange is performed
-/// against the auth service, so this variant can contact the network.
+/// against the auth service.
 ///
 /// # Events
 ///

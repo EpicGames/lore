@@ -212,6 +212,12 @@ async fn resolve_auth_endpoint(
         return Ok((endpoint, parsed));
     }
 
+    remote_auth_endpoint(remote_url).await
+}
+
+/// The auth endpoint the server at `remote_url` advertises, and the parsed `remote_url`. Read
+/// from the server's environment without authenticating, so it resolves with no usable token.
+pub async fn remote_auth_endpoint(remote_url: &str) -> Result<(AuthEndpoint, Url), LoginError> {
     let (parsed_remote, protocol) =
         lore_transport::parse(remote_url).forward::<LoginError>("parsing remote URL")?;
 

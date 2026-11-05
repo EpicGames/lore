@@ -15,6 +15,8 @@ use base64::prelude::BASE64_STANDARD;
 use base64::prelude::Engine as _;
 use lore_base::directories::project_directory;
 use lore_base::env::AUTH_PATH_VAR;
+use lore_base::error::Disconnected;
+use lore_base::error::NotAuthenticated;
 use lore_base::error::TokenNotFound;
 use lore_base::fs::lock::FSLock;
 use lore_base::lore_debug;
@@ -55,6 +57,13 @@ const ENCRYPTION_KEY_TARGET: &str = "tokenstore_encryption_key";
 #[error_set]
 pub enum TokenStoreError {
     TokenNotFound,
+}
+
+#[error_set]
+pub enum RefreshError {
+    TokenNotFound,
+    NotAuthenticated,
+    Disconnected,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1044,29 +1053,36 @@ pub enum Refreshed<E> {
 /// stored token other than `expired` has been replaced already, and is returned without a grant.
 /// An answer naming another identity is refused.
 ///
-/// Returns `TokenStoreError::TokenNotFound` when there is no refresh token to present.
+/// Fails with `TokenNotFound` when there is no refresh token to present, with
+/// `NotAuthenticated` when the grant was [`Refreshed::Refused`] or [`Refreshed::Failed`], and
+/// with `Disconnected` when it was [`Refreshed::Unsent`].
 pub async fn refresh_user_token<E, F, Fut>(
     auth_endpoint: &str,
     identity: &str,
     expired: &str,
     refresh: F,
-) -> Result<String, TokenStoreError>
+) -> Result<String, RefreshError>
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: std::error::Error + HasTrace + Send + Sync + 'static,
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Refreshed<E>>,
 {
     let auth_endpoint = auth_endpoint.trim_end_matches('/');
-    let key = get_token_encryption_key().await?;
+    let key = get_token_encryption_key()
+        .await
+        .forward::<RefreshError>("reading the token encryption key")?;
 
     let mut store = cached_token_map().await;
-    let guard = lock_token_map().await?;
+    let guard = lock_token_map()
+        .await
+        .forward::<RefreshError>("locking the token store")?;
     reload_token_map(&guard, &mut store);
 
     let Some(entry) = identity_entry(&mut store, auth_endpoint, identity) else {
         return Err(TokenNotFound.into());
     };
-    let current = open_token(&key, &entry.token)?;
+    let current =
+        open_token(&key, &entry.token).forward::<RefreshError>("opening the stored token")?;
     if current != expired {
         lore_debug!("The token of {identity} at {auth_endpoint} was replaced already");
         return Ok(current);
@@ -1075,7 +1091,8 @@ where
         return Err(TokenNotFound.into());
     };
     let presented_refresh_expires = std::mem::take(&mut entry.refresh_expires);
-    let refresh_token = open_token(&key, &sealed_refresh_token)?;
+    let refresh_token = open_token(&key, &sealed_refresh_token)
+        .forward::<RefreshError>("opening the stored refresh token")?;
     if let Some(map) = store.as_ref()
         && let Err(err) = store_token_map(&guard, map)
     {
@@ -1083,14 +1100,14 @@ where
             entry.refresh_token = Some(sealed_refresh_token);
             entry.refresh_expires = presented_refresh_expires;
         }
-        return Err(err);
+        return Err(err.forward::<RefreshError>("removing the refresh token before the grant"));
     }
 
     lore_debug!("Refreshing the token of {identity} at {auth_endpoint}");
     let refreshed = refresh(refresh_token).await;
 
     let Some(entry) = identity_entry(&mut store, auth_endpoint, identity) else {
-        return Err(TokenStoreError::internal(
+        return Err(RefreshError::internal(
             "Token store entry vanished while the store was locked",
         ));
     };
@@ -1106,10 +1123,14 @@ where
                 Ok(claims) if claims.identity() == Some(identity) => {
                     let mut acceptable_root_domains = claims.acceptable_root_domains();
                     acceptable_root_domains.push(get_domain_or_empty(auth_endpoint));
-                    entry.token = seal_token(&key, &token)?;
+                    entry.token = seal_token(&key, &token)
+                        .forward::<RefreshError>("sealing the refreshed token")?;
                     entry.acceptable_root_domains = acceptable_root_domains;
                     entry.refresh_token = match refresh_token {
-                        Some(refresh_token) => Some(seal_token(&key, &refresh_token)?),
+                        Some(refresh_token) => Some(
+                            seal_token(&key, &refresh_token)
+                                .forward::<RefreshError>("sealing the new refresh token")?,
+                        ),
                         None => Some(sealed_refresh_token),
                     };
                     entry.refresh_expires = refresh_expires;
@@ -1118,31 +1139,38 @@ where
                     }
                     Ok(token)
                 }
-                _ => Err(TokenStoreError::internal(format!(
+                _ => Err(RefreshError::internal(format!(
                     "The refreshed token for {identity} at {auth_endpoint} does not name them"
                 ))),
             }
         }
-        Refreshed::Refused(source) => Err(TokenStoreError::internal_with_context(
-            source,
-            "The issuer refused the refresh token",
-        )),
-        Refreshed::Unsent(source) => {
-            entry.refresh_token = Some(sealed_refresh_token);
-            entry.refresh_expires = presented_refresh_expires;
-            Err(TokenStoreError::internal_with_context(
-                source,
-                "Failed to send the refresh token grant",
+        // The chained error keeps the grant error's trace, not its message, so the message is
+        // logged here.
+        Refreshed::Refused(source) => {
+            lore_debug!("The issuer refused the refresh token of {identity}: {source}");
+            Err(RefreshError::NotAuthenticated(
+                NotAuthenticated.chain_err_from(source, "The issuer refused the refresh token"),
             ))
         }
-        Refreshed::Failed(source) => Err(TokenStoreError::internal_with_context(
-            source,
-            "Failed to refresh the token",
-        )),
+        Refreshed::Unsent(source) => {
+            lore_debug!("The refresh grant for {identity} was not sent: {source}");
+            entry.refresh_token = Some(sealed_refresh_token);
+            entry.refresh_expires = presented_refresh_expires;
+            Err(RefreshError::Disconnected(Disconnected.chain_err_from(
+                source,
+                "Failed to send the refresh token grant",
+            )))
+        }
+        Refreshed::Failed(source) => {
+            lore_warn!("Failed to refresh the token of {identity} at {auth_endpoint}: {source}");
+            Err(RefreshError::NotAuthenticated(
+                NotAuthenticated.chain_err_from(source, "Failed to refresh the token"),
+            ))
+        }
     };
 
     if let Some(map) = store.as_ref() {
-        store_token_map(&guard, map)?;
+        store_token_map(&guard, map).forward::<RefreshError>("storing the grant's answer")?;
     }
     result
 }

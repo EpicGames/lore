@@ -21,7 +21,7 @@ use url::Url;
 use crate::auth;
 use crate::auth::AuthEndpoint;
 use crate::auth::AuthMode;
-use crate::auth::exchange::auth_exchange;
+use crate::auth::exchange::auth_exchange_for_stored_identity;
 use crate::auth::user_directory::UserDirectory;
 use crate::error::ProtocolError;
 use crate::grpc;
@@ -450,54 +450,22 @@ async fn connect_impl(
     if !auth_endpoint.is_none() {
         // Ensure we are authenticated if there is an auth url defined in the environment
         if identity.is_empty() {
-            let (_, _, resolved) = auth_exchange(
+            let (_, _, resolved) =
+                auth_exchange_for_stored_identity(&auth_endpoint, &remote_domain, "", repository)
+                    .await
+                    .forward::<ProtocolError>("resolving a stored identity")?;
+            identity = resolved;
+        } else if identity_token.is_empty() && access_token.is_empty() {
+            // Only authentication is checked here. The repository's authorization is
+            // exchanged where it is used, so its refusal is handled there.
+            auth_exchange_for_stored_identity(
                 &auth_endpoint,
                 &remote_domain,
-                "",
-                repository,
-                &identity_token,
-                &access_token,
-            )
-            .await;
-            identity = resolved;
-
-            if identity.is_empty() {
-                let has_identities =
-                    lore_credential::token_store::load_identities(&auth_endpoint.url)
-                        .await
-                        .is_ok_and(|ids| !ids.is_empty());
-                if has_identities {
-                    return Err(ProtocolError::from(lore_base::error::NotAuthorized));
-                }
-                return Err(ProtocolError::from(lore_base::error::NotAuthenticated));
-            }
-        } else if access_token.is_empty() {
-            // With an access token there is no authentication token to find:
-            // the caller authorizes with what they supplied, and the services
-            // that need an authentication token fail where they use it rather
-            // than failing the whole connection here.
-            lore_credential::token_store::load_user_token(
-                &auth_endpoint.url,
                 &identity,
-                lore_credential::token_store::tokens_only_for_recipient_domain(
-                    remote_domain.clone(),
-                ),
-                &identity_token,
-                &access_token,
+                RepositoryId::default(),
             )
             .await
-            .map_err(|err| {
-                // A configured identity with no stored token is the normal
-                // logged-out state (login saves the identity to the repo
-                // config; logout removes only the tokens) — report it as
-                // NotAuthenticated rather than an internal failure.
-                if err.is_token_not_found() {
-                    lore_debug!("No token stored for identity {identity} at {auth_endpoint}");
-                    ProtocolError::from(lore_base::error::NotAuthenticated)
-                } else {
-                    ProtocolError::internal_with_context(err, "loading user token")
-                }
-            })?;
+            .forward::<ProtocolError>("authenticating the given identity")?;
         }
     }
 

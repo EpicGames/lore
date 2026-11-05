@@ -4,6 +4,7 @@ use lore_base::types::RepositoryId;
 use lore_credential::token_store;
 use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::exchange::*;
+use lore_transport::error::ProtocolError;
 
 use super::stub::AUTHN_ONE;
 use super::stub::AUTHN_TWO;
@@ -1068,4 +1069,330 @@ async fn a_cancelled_caller_does_not_stop_the_refresh() {
     let (authentication_token, _, _) = authenticate().await;
     assert_eq!(authentication_token, AUTHN_ONE);
     assert_eq!(stub.presented(), ["refresh-1"]);
+}
+
+fn a_repository() -> RepositoryId {
+    "aabbccdd00112233aabbccdd8899aabb"
+        .parse()
+        .expect("a valid repository id")
+}
+
+/// Every identity and repository combination [`auth_exchange_for_stored_identity`] is asked
+/// with: any stored identity or the one named, and with or without a repository.
+fn identity_and_repository_cases() -> [(&'static str, RepositoryId); 4] {
+    [
+        ("", RepositoryId::default()),
+        ("", a_repository()),
+        ("alice", RepositoryId::default()),
+        ("alice", a_repository()),
+    ]
+}
+
+async fn store_expired_login(auth_url: &str, user: &str, refresh_token: Option<&str>) {
+    token_store::store_user_token_and_refresh_token(
+        auth_url,
+        user,
+        &jwt(user, "example.com", EXPIRED),
+        vec!["example.com".to_owned()],
+        refresh_token,
+        0,
+        None,
+    )
+    .await
+    .expect("store the login");
+}
+
+#[tokio::test]
+async fn a_stored_login_whose_refresh_is_refused_is_not_authenticated() {
+    for (case, (identity, repository)) in identity_and_repository_cases().into_iter().enumerate() {
+        let auth_url = format!("oidc+https://dead-session-{case}.test.invalid");
+        store_expired_login(&auth_url, "alice", Some("refresh-1")).await;
+        let stub =
+            StubAuthentication::refreshing(|_| Err(lore_base::error::NotAuthenticated.into()));
+        let endpoint = AuthEndpoint::new(auth_url.clone(), stub.clone());
+
+        let err = auth_exchange_for_stored_identity(&endpoint, "example.com", identity, repository)
+            .await
+            .expect_err("no identity resolves");
+
+        assert!(err.is_not_authenticated(), "{auth_url}: {err}");
+        assert_eq!(stub.presented(), ["refresh-1"], "{auth_url}");
+        assert_eq!(stub.exchanges(), 0, "{auth_url}");
+    }
+}
+
+#[tokio::test]
+async fn an_expired_stored_login_without_a_refresh_token_is_not_authenticated() {
+    for (case, (identity, repository)) in identity_and_repository_cases().into_iter().enumerate() {
+        let auth_url = format!("oidc+https://expired-no-refresh-{case}.test.invalid");
+        store_expired_login(&auth_url, "alice", None).await;
+        let endpoint = AuthEndpoint::new(auth_url.clone(), StubAuthentication::new(|_, _| ""));
+
+        let err = auth_exchange_for_stored_identity(&endpoint, "example.com", identity, repository)
+            .await
+            .expect_err("no identity resolves");
+
+        assert!(err.is_not_authenticated(), "{auth_url}: {err}");
+    }
+}
+
+/// A refresh grant that could not be sent keeps the refresh token, so the session is not over:
+/// the failure is `Disconnected`, and the next attempt presents the same refresh token.
+#[tokio::test]
+async fn an_unsent_refresh_is_disconnected() {
+    for (case, (identity, repository)) in identity_and_repository_cases().into_iter().enumerate() {
+        let auth_url = format!("oidc+https://refresh-unsent-{case}.test.invalid");
+        store_expired_login(&auth_url, "alice", Some("refresh-1")).await;
+        let stub = StubAuthentication::refreshing(|_| Err(lore_base::error::Disconnected.into()));
+        let endpoint = AuthEndpoint::new(auth_url.clone(), stub.clone());
+
+        for _ in 0..2 {
+            let err =
+                auth_exchange_for_stored_identity(&endpoint, "example.com", identity, repository)
+                    .await
+                    .expect_err("no identity resolves");
+            assert!(err.is_disconnected(), "{auth_url}: {err}");
+        }
+        assert_eq!(stub.presented(), ["refresh-1", "refresh-1"], "{auth_url}");
+    }
+}
+
+#[tokio::test]
+async fn no_stored_identity_is_not_authenticated() {
+    let endpoint = AuthEndpoint::new(
+        "oidc+https://no-identity.test.invalid".to_string(),
+        StubAuthentication::new(|_, _| ""),
+    );
+
+    let err = auth_exchange_for_stored_identity(&endpoint, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity resolves");
+    assert!(err.is_not_authenticated(), "{err}");
+}
+
+#[tokio::test]
+async fn a_given_identity_without_a_stored_login_is_not_authenticated() {
+    const AUTH_URL: &str = "oidc+https://given-identity.test.invalid";
+    token_store::store_user_token(AUTH_URL, "alice", AUTHN_ONE, vec!["example.com".to_owned()])
+        .await
+        .expect("store the login");
+    let endpoint = AuthEndpoint::new(
+        AUTH_URL.to_string(),
+        StubAuthentication::new(|_, _| AUTHZ_ONE),
+    );
+
+    let err =
+        auth_exchange_for_stored_identity(&endpoint, "example.com", "bob", RepositoryId::default())
+            .await
+            .expect_err("bob has no login");
+    assert!(err.is_not_authenticated(), "{err}");
+}
+
+/// A login that the remote's domain may not be sent is no credential for that remote.
+#[tokio::test]
+async fn a_stored_login_for_another_domain_is_not_authenticated() {
+    const AUTH_URL: &str = "oidc+https://other-domain-login.test.invalid";
+    token_store::store_user_token(
+        AUTH_URL,
+        "alice",
+        &jwt("alice", "elsewhere.test.invalid", 2_000_000_000),
+        vec!["elsewhere.test.invalid".to_owned()],
+    )
+    .await
+    .expect("store the login");
+    let stub = StubAuthentication::new(|_, _| AUTHZ_ONE);
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    let err = auth_exchange_for_stored_identity(&endpoint, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity resolves");
+    assert!(err.is_not_authenticated(), "{err}");
+    assert_eq!(stub.exchanges(), 0);
+}
+
+/// A name, the error the exchange fails with, and the check the resulting error must pass.
+type ExchangeFailureCase = (
+    &'static str,
+    fn() -> ProtocolError,
+    fn(&ExchangeError) -> bool,
+);
+
+/// The exchange's own answer decides the failure: a refusal of the repository is
+/// `NotAuthorized`, a refusal of the login token (one revoked at the issuer) is
+/// `NotAuthenticated`, and an unreachable auth service is `Disconnected`.
+#[tokio::test]
+async fn a_failed_repository_exchange_keeps_its_kind() {
+    let cases: [ExchangeFailureCase; 3] = [
+        (
+            "refused",
+            || lore_base::error::NotAuthorized.into(),
+            ExchangeError::is_not_authorized,
+        ),
+        (
+            "revoked",
+            || lore_base::error::NotAuthenticated.into(),
+            ExchangeError::is_not_authenticated,
+        ),
+        (
+            "unreachable",
+            || lore_base::error::Disconnected.into(),
+            ExchangeError::is_disconnected,
+        ),
+    ];
+    for (name, exchange_error, expected) in cases {
+        for identity in ["", "alice"] {
+            let auth_url = format!(
+                "oidc+https://exchange-{name}-{}.test.invalid",
+                identity.len()
+            );
+            token_store::store_user_token(
+                &auth_url,
+                "alice",
+                AUTHN_ONE,
+                vec!["example.com".to_owned()],
+            )
+            .await
+            .expect("store the login");
+            let stub = StubAuthentication::failing_exchanges(exchange_error);
+            let endpoint = AuthEndpoint::new(auth_url.clone(), stub.clone());
+
+            let err = auth_exchange_for_stored_identity(
+                &endpoint,
+                "example.com",
+                identity,
+                a_repository(),
+            )
+            .await
+            .expect_err("no identity is authorized");
+            assert!(expected(&err), "{auth_url}: {err}");
+            assert_eq!(stub.exchanges(), 1, "{auth_url}");
+
+            let (authentication_token, _, resolved) = auth_exchange_for_stored_identity(
+                &endpoint,
+                "example.com",
+                identity,
+                RepositoryId::default(),
+            )
+            .await
+            .expect("the identity authenticates");
+            assert_eq!(authentication_token, AUTHN_ONE, "{auth_url}");
+            assert_eq!(resolved, "alice", "{auth_url}");
+        }
+    }
+}
+
+/// With several stored identities, one that cannot authenticate does not hide another's refusal,
+/// nor stop another from being picked.
+#[tokio::test]
+async fn a_dead_identity_does_not_hide_another_identitys_answer() {
+    const REFUSED: &str = "oidc+https://mixed-refused.test.invalid";
+    store_expired_login(REFUSED, "alice", None).await;
+    token_store::store_user_token(REFUSED, "bob", AUTHN_TWO, vec!["example.com".to_owned()])
+        .await
+        .expect("store bob's login");
+    let refusing = AuthEndpoint::new(
+        REFUSED.to_string(),
+        StubAuthentication::failing_exchanges(|| lore_base::error::NotAuthorized.into()),
+    );
+    let err = auth_exchange_for_stored_identity(&refusing, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity is authorized");
+    assert!(err.is_not_authorized(), "{err}");
+
+    const REFUSED_FIRST: &str = "oidc+https://mixed-refused-first.test.invalid";
+    token_store::store_user_token(
+        REFUSED_FIRST,
+        "bob",
+        AUTHN_TWO,
+        vec!["example.com".to_owned()],
+    )
+    .await
+    .expect("store bob's login");
+    store_expired_login(REFUSED_FIRST, "alice", None).await;
+    let refusing = AuthEndpoint::new(
+        REFUSED_FIRST.to_string(),
+        StubAuthentication::failing_exchanges(|| lore_base::error::NotAuthorized.into()),
+    );
+    let err = auth_exchange_for_stored_identity(&refusing, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity is authorized");
+    assert!(err.is_not_authorized(), "{err}");
+
+    const AUTHORIZED: &str = "oidc+https://mixed-authorized.test.invalid";
+    store_expired_login(AUTHORIZED, "alice", None).await;
+    token_store::store_user_token(AUTHORIZED, "bob", AUTHN_TWO, vec!["example.com".to_owned()])
+        .await
+        .expect("store bob's login");
+    let authorizing = AuthEndpoint::new(
+        AUTHORIZED.to_string(),
+        StubAuthentication::new(|_, _| AUTHZ_TWO),
+    );
+    let tokens = auth_exchange_for_stored_identity(&authorizing, "example.com", "", a_repository())
+        .await
+        .expect("bob is authorized");
+    assert_eq!(
+        tokens,
+        (AUTHN_TWO.to_owned(), AUTHZ_TWO.to_owned(), "bob".to_owned())
+    );
+}
+
+/// A grant that failed after it may have reached the issuer drops the refresh token, so the
+/// session is over.
+#[tokio::test]
+async fn a_failed_refresh_is_not_authenticated() {
+    const AUTH_URL: &str = "oidc+https://refresh-failed-answer.test.invalid";
+    store_expired_login(AUTH_URL, "alice", Some("refresh-1")).await;
+    let stub = StubAuthentication::refreshing(|_| {
+        Err(ProtocolError::internal("the answer could not be read"))
+    });
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    for _ in 0..2 {
+        let err = auth_exchange_for_stored_identity(
+            &endpoint,
+            "example.com",
+            "",
+            RepositoryId::default(),
+        )
+        .await
+        .expect_err("no identity resolves");
+        assert!(err.is_not_authenticated(), "{err}");
+    }
+    assert_eq!(stub.presented(), ["refresh-1"]);
+}
+
+/// The partition exchange refreshes an expired login first, and a grant that could not be sent
+/// fails the exchange as `Disconnected`, for the repository and for a custom resource alike.
+#[tokio::test]
+async fn an_exchange_whose_refresh_is_unsent_is_disconnected() {
+    const AUTH_URL: &str = "oidc+https://refresh-exchange-unsent.test.invalid";
+    store_expired_login(AUTH_URL, "alice", Some("refresh-1")).await;
+    let stub = StubAuthentication::refreshing(|_| Err(lore_base::error::Disconnected.into()));
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    let err = exchange(
+        &endpoint,
+        "alice",
+        a_repository(),
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect_err("the refresh was not sent");
+    assert!(err.is_disconnected(), "{err}");
+
+    let err = exchange_custom_resource(
+        &endpoint,
+        "alice",
+        "urc-user-service",
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect_err("the refresh was not sent");
+    assert!(err.is_disconnected(), "{err}");
+    assert_eq!(stub.presented(), ["refresh-1", "refresh-1"]);
+    assert_eq!(stub.exchanges(), 0);
 }
