@@ -75,6 +75,26 @@ async fn push_revision(
     revision_number: u64,
     files: &[(&str, &[u8])],
 ) -> Hash {
+    push_merge_revision(
+        repository,
+        branch_id,
+        parent,
+        Hash::default(),
+        revision_number,
+        files,
+    )
+    .await
+}
+
+/// `push_revision` with a second parent, as a merge revision has.
+async fn push_merge_revision(
+    repository: &Arc<RepositoryContext>,
+    branch_id: BranchId,
+    parent: Hash,
+    parent_other: Hash,
+    revision_number: u64,
+    files: &[(&str, &[u8])],
+) -> Hash {
     let write_token = get_write_token();
     let mut metadata = Metadata::new();
     metadata.set_branch(branch_id).expect("set branch");
@@ -84,6 +104,7 @@ async fn push_revision(
         .expect("serialize metadata");
     let state = state::State::new();
     state.set_parent_self(parent);
+    state.set_parent_other(parent_other);
     state.set_revision_number(revision_number);
     state.set_metadata_hash(metadata_hash);
     for (name, bytes) in files {
@@ -914,6 +935,151 @@ async fn three_way_clean_merge_has_base_but_no_conflicts() {
         );
     }))
     .await;
+}
+
+/// Builds main with a change after branch B's branch point, then merges B
+/// back into main. Returns B's tip and the merge revision, so B's tip is an
+/// ancestor of the merge only through the merge's second parent (UCS-25014).
+async fn push_branch_merged_into_main(repository: &Arc<RepositoryContext>) -> (Hash, Hash) {
+    let main = create_branch(repository, "main", vec![]).await;
+    let main_rev1 = push_revision(
+        repository,
+        main,
+        Hash::default(),
+        1,
+        &[("shared.txt", b"base".as_slice())],
+    )
+    .await;
+    let branch_b = create_branch(
+        repository,
+        "branch_b",
+        vec![BranchPoint {
+            branch: main,
+            revision: main_rev1,
+        }],
+    )
+    .await;
+    let b_rev = push_revision(
+        repository,
+        branch_b,
+        main_rev1,
+        1,
+        &[
+            ("shared.txt", b"base".as_slice()),
+            ("only_b.txt", b"b-content".as_slice()),
+        ],
+    )
+    .await;
+    let main_rev2 = push_revision(
+        repository,
+        main,
+        main_rev1,
+        2,
+        &[
+            ("shared.txt", b"base".as_slice()),
+            ("only_main.txt", b"main-content".as_slice()),
+        ],
+    )
+    .await;
+    let merge_rev = push_merge_revision(
+        repository,
+        main,
+        main_rev2,
+        b_rev,
+        3,
+        &[
+            ("shared.txt", b"base".as_slice()),
+            ("only_b.txt", b"b-content".as_slice()),
+            ("only_main.txt", b"main-content".as_slice()),
+        ],
+    )
+    .await;
+    (b_rev, merge_rev)
+}
+
+/// Runs `RevisionDiff(from, to)` over the merge history and returns the
+/// header and each change as `(path, action)`.
+async fn diff_over_merge_history(
+    from: fn(Hash, Hash) -> Hash,
+    to: fn(Hash, Hash) -> Hash,
+) -> (thin_client_v1::RevisionDiffHeader, Vec<(String, i32)>) {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (b_rev, merge_rev) = push_branch_merged_into_main(&repository_context).await;
+
+        let response = handler(
+            make_request(
+                repository,
+                QueryFrom::SignatureFrom(from(b_rev, merge_rev).into()),
+                QueryTo::SignatureTo(to(b_rev, merge_rev).into()),
+                false,
+            ),
+            immutable_store,
+            mutable_store,
+            allow_all(),
+            RevisionDiffConfig::default(),
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("handler ok");
+
+        let mut items = collect(response)
+            .await
+            .into_iter()
+            .map(|r| r.expect("stream item"));
+        let header = match items.next().and_then(|item| item.payload) {
+            Some(Payload::Header(h)) => h,
+            other => panic!("expected header first, got {other:?}"),
+        };
+        let changes = items
+            .filter_map(|item| match item.payload {
+                Some(Payload::Change(c)) => Some((c.path, c.action)),
+                Some(Payload::Conflict(c)) => panic!("unexpected conflict {c:?}"),
+                _ => None,
+            })
+            .collect();
+        (header, changes)
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn from_merged_into_to_diffs_two_way() {
+    let (header, changes) =
+        diff_over_merge_history(|b_rev, _merge| b_rev, |_b_rev, merge| merge).await;
+
+    assert!(header.signature_base.is_none(), "expected 2-way");
+    assert_eq!(
+        changes,
+        vec![(
+            "only_main.txt".to_string(),
+            thin_client_v1::Action::Add as i32
+        )],
+    );
+}
+
+#[tokio::test]
+async fn to_merged_into_from_diffs_two_way() {
+    let (header, changes) =
+        diff_over_merge_history(|_b_rev, merge| merge, |b_rev, _merge| b_rev).await;
+
+    assert!(header.signature_base.is_none(), "expected 2-way");
+    assert_eq!(
+        changes,
+        vec![(
+            "only_main.txt".to_string(),
+            thin_client_v1::Action::Delete as i32
+        )],
+    );
 }
 
 fn make_partition_id() -> RepositoryId {

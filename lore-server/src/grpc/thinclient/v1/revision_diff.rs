@@ -104,7 +104,8 @@ impl Default for RevisionDiffConfig {
 /// * **3-way** otherwise. The common ancestor is found via the
 ///   branches' stacks (then `find_branch_point` as a fallback). When
 ///   no common ancestor exists, the call fails with
-///   `FAILED_PRECONDITION`.
+///   `FAILED_PRECONDITION`. When the common ancestor is one of the two
+///   revisions, the diff falls back to **2-way**.
 ///
 /// Identical revisions short-circuit to an OK header-only stream with
 /// `_base` unset.
@@ -495,6 +496,19 @@ async fn run_three_way(
         return Err(Status::failed_precondition(
             "RevisionDiff: no common ancestor between revisions",
         ));
+    }
+
+    // One side is an ancestor of the other, for example through a merge's
+    // second parent, which the branch checks in `stream_diff` do not see.
+    // The 3-way walk only reports target changes at paths the source changed,
+    // so it would drop them here; the 2-way diff is the correct answer.
+    if base == from_sig || base == to_sig {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            %base,
+            "RevisionDiff: base is one side → 2-way",
+        );
+        return run_two_way(repository, from_sig, from_id, to_sig, to_id, tx).await;
     }
 
     let base_id = identifier_for_signature(repository, base).await?;
