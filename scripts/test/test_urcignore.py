@@ -419,3 +419,73 @@ def test_urcignore_legacy_fallback(new_lore_repo):
     assert "legacy.tmp" in output, (
         ".urcignore must no longer be consulted once .loreignore exists"
     )
+
+
+def _without_warnings(output: str) -> str:
+    """`output` without the warnings Lore logs, which name paths of their own."""
+    return "\n".join(
+        line for line in output.splitlines() if not line.startswith("[Warn]")
+    )
+
+
+@pytest.mark.smoke
+def test_instance_ignore_rules(new_lore_repo):
+    """
+    The `ignore` file in the instance's Lore directory excludes entries from
+    the working-directory operations as `.loreignore` does, tracked files
+    included, without being committed: an untracked file under a rule drops
+    out of `status --scan`, an edit to a tracked file under it is hidden from
+    status, diff and a scanning stage, and `--force stage` still stages it. A
+    `!` line is skipped with a warning naming it.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_files(
+        {
+            "Binaries/Win64/tool.exe": "tracked\n",
+            "notes.txt": "tracked\n",
+        }
+    )
+    repo.stage(scan=True)
+    repo.commit("Commit files before the instance ignore rules")
+
+    with open(os.path.join(repo.dot_path(), "ignore"), "w") as f:
+        f.write("# build outputs\n\nBinaries/\n!Binaries/Win64/\n")
+    repo.write_files(
+        {
+            "Binaries/Mac/editor": "untracked\n",
+            "Binaries/Win64/tool.exe": "edited\n",
+            "notes.txt": "edited\n",
+        }
+    )
+
+    output = repo.status(scan=True)
+    # Windows paths print with either separator, so compare them with forward slashes
+    ignore_path = os.path.join(repo.dot_path(), "ignore").replace("\\", "/")
+    warning = f"Skipping line 4 of {ignore_path}, !Binaries/Win64/"
+    assert warning in output.replace("\\", "/"), (
+        f"no warning names the skipped re-inclusion:\n{output}"
+    )
+    entries = _without_warnings(output)
+    assert "Binaries" not in entries, (
+        f"status --scan reports entries the instance ignore file excludes:\n{output}"
+    )
+    assert "notes.txt" in entries, "status --scan should report notes.txt"
+
+    diff = _without_warnings(repo.diff())
+    assert "notes.txt" in diff, "diff should report notes.txt"
+    assert "tool.exe" not in diff, (
+        f"diff reports an edit under an instance ignore rule:\n{diff}"
+    )
+
+    repo.stage(scan=True)
+    output = _without_warnings(repo.status())
+    verify_operations_in_status(output, [(Operation.MODIFY, "notes.txt")])
+    assert "Binaries" not in output, (
+        f"a scanning stage staged entries the instance ignore file excludes:\n{output}"
+    )
+    assert ".lore" not in output, "the instance ignore file must never be staged"
+
+    repo.stage("Binaries/Win64/tool.exe", force=True)
+    verify_operations_in_status(
+        repo.status(), [(Operation.MODIFY, "Binaries/Win64/tool.exe")]
+    )

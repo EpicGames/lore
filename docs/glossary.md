@@ -170,7 +170,7 @@ Also see: address, BLAKE3, partition.
 
 ### Ignore file
 
-An outbound filter (`.loreignore`) declaring which paths are excluded from staging and committing. It applies only to new content; a file already in the committed revision keeps flowing through until explicitly removed.
+An outbound filter (`.loreignore`) declaring which paths are excluded from staging and committing. It applies only to new content; a file already in the committed revision keeps flowing through until explicitly removed. An instance can add exclusions of its own in `ignore` in its Lore directory, which is never committed.
 
 Compare to: view filter.
 

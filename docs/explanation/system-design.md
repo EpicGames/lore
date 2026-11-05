@@ -1302,6 +1302,11 @@ will keep flowing through inbound operations even if a later ignore rule would e
 ignore rule does not retroactively eject committed files. Removing such a file from the
 revision is a separate explicit act.
 
+An instance can add rules of its own in `ignore`, in its Lore directory (`.lore/ignore` for a
+regular instance). They use the syntax of `.loreignore`, apply after its rules and wherever it
+applies, and are never committed, so they suit what only one working tree produces. They can only
+exclude: Lore skips a `!` re-inclusion there with a warning.
+
 #### 12.4 FilterMode: which filter applies when
 
 Views and ignores answer different questions and apply at different times. Lore makes the

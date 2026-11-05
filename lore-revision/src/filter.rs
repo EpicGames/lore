@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -244,6 +245,42 @@ pub fn load(
     })
 }
 
+/// [`load`], with the exclusions in the instance's own ignore file at
+/// `instance_ignore_path` after the rules of the repository's.
+///
+/// The instance's file is read as [`load_filter`] reads one: a file that cannot
+/// be read adds no rules, and one that cannot be decoded is an error. Its rules
+/// can only exclude: a `!` re-inclusion is skipped with a warning naming the line,
+/// so the file never brings back what the repository ignores.
+pub fn load_with_instance_ignore(
+    ignore_path: impl AsRef<Path>,
+    instance_ignore_path: impl AsRef<Path>,
+    view_path: impl AsRef<Path>,
+) -> Result<Filter, FilterError> {
+    let mut filter = load(ignore_path, view_path)?;
+    let path = instance_ignore_path.as_ref();
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(filter);
+    };
+    let text = decode_filter(&bytes, path)?;
+    for (line, negated, glob) in authored_rules(&text) {
+        if negated {
+            lore_warn!(
+                "Skipping line {line} of {}, !{glob}: an instance's ignore rules cannot re-include",
+                path.display()
+            );
+            continue;
+        }
+        filter
+            .ignore
+            .add_exclusion(glob)
+            .map_err(|error| InvalidArguments {
+                reason: format!("{}: line {line}: {error}", path.display()),
+            })?;
+    }
+    Ok(filter)
+}
+
 pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
     Ok(Filter {
         ignore: FilterInstance::default(),
@@ -281,26 +318,11 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
 /// and a UTF-16 file has to be transcoded before it has lines at all;
 /// [`decode_text_for_parsing`] names the encodings accepted.
 pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterError> {
-    let text = decode_text_for_parsing(bytes).map_err(|error| InvalidArguments {
-        reason: format!("{}: {}", path.display(), error.reason),
-    })?;
+    let text = decode_filter(bytes, path)?;
     let mut filter = FilterInstance::default();
     let mut has_include = false;
     let mut has_exclude = false;
-    for line in text.lines() {
-        let mut glob = line.trim();
-        if glob.is_empty() || glob.starts_with('#') {
-            continue;
-        }
-
-        let negated = glob.starts_with('!');
-        glob = &glob[usize::from(negated)..];
-
-        // Allow exclamation marks in path/file names through escape backslash
-        if glob.starts_with("\\!") {
-            glob = &glob[1..];
-        }
-
+    for (_, negated, glob) in authored_rules(&text) {
         if negated {
             filter.add_inclusion(glob)?;
             has_include = true;
@@ -316,6 +338,36 @@ pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterE
         );
     }
     Ok(filter)
+}
+
+/// Decodes the bytes of a filter file, naming `path` in the error.
+fn decode_filter<'a>(bytes: &'a [u8], path: &Path) -> Result<Cow<'a, str>, FilterError> {
+    Ok(
+        decode_text_for_parsing(bytes).map_err(|error| InvalidArguments {
+            reason: format!("{}: {}", path.display(), error.reason),
+        })?,
+    )
+}
+
+/// The rules authored in a filter file's text: the 1-based line number of each,
+/// whether a leading `!` makes it a re-inclusion, and its glob. Blank lines and
+/// `#` comments are skipped.
+fn authored_rules(text: &str) -> impl Iterator<Item = (usize, bool, &str)> {
+    text.lines().enumerate().filter_map(|(index, line)| {
+        let mut glob = line.trim();
+        if glob.is_empty() || glob.starts_with('#') {
+            return None;
+        }
+
+        let negated = glob.starts_with('!');
+        glob = &glob[usize::from(negated)..];
+
+        // Allow exclamation marks in path/file names through escape backslash
+        if glob.starts_with("\\!") {
+            glob = &glob[1..];
+        }
+        Some((index + 1, negated, glob))
+    })
 }
 
 /// How many components a non-empty relative path has.

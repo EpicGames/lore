@@ -1456,6 +1456,9 @@ pub const CONFIG: &str = "config.toml";
 pub const SERVICE: &str = "service";
 pub const DOT_URCIGNORE: &str = ".urcignore";
 pub const DOT_LOREIGNORE: &str = ".loreignore";
+/// The instance's own ignore rules, in its Lore directory. They only exclude, and are never
+/// committed.
+pub const INSTANCE_IGNORE: &str = "ignore";
 
 /// Whether `name` is the repository's own directory: in any ASCII case, with the trailing dots and
 /// spaces Windows drops, as the 8.3 short name Windows gives it, such as `LORE~1`, or with a stream
@@ -3072,9 +3075,13 @@ pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryEr
         }
     }
 
-    let view_path = get_dot_lore_path(root_path)?.join(VIEW_FILTER);
-    let filter = filter::load(&ignore_path, &view_path)
-        .forward::<RepositoryError>("Failed to load repository filter")?;
+    let dot_path = get_dot_lore_path(root_path)?;
+    let filter = filter::load_with_instance_ignore(
+        &ignore_path,
+        dot_path.join(INSTANCE_IGNORE),
+        dot_path.join(VIEW_FILTER),
+    )
+    .forward::<RepositoryError>("Failed to load repository filter")?;
     Ok(Arc::new(filter))
 }
 

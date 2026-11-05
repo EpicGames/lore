@@ -1771,4 +1771,137 @@ mod tests {
             "the ignore slot no longer excludes the temporary extension"
         );
     }
+
+    /// The warnings logged while a test runs, which [`record_warning`] collects.
+    static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn record_warning(level: lore_revision::lore_base::log::LoreLogLevel, _: &str, message: &str) {
+        if level == lore_revision::lore_base::log::LoreLogLevel::Warn {
+            WARNINGS.lock().expect("warnings").push(message.to_string());
+        }
+    }
+
+    /// A filter loaded from a repository ignore file holding `repository` and an
+    /// instance ignore file holding `instance`.
+    fn instance_filter(
+        dir: &TempDir,
+        repository: &[u8],
+        instance: &[u8],
+    ) -> Result<lore_revision::filter::Filter, lore_revision::filter::FilterError> {
+        let ignore = dir.child("loreignore");
+        test_file_write(&ignore, repository);
+        let instance_ignore = dir.child("ignore");
+        test_file_write(&instance_ignore, instance);
+        lore_revision::filter::load_with_instance_ignore(
+            &ignore,
+            &instance_ignore,
+            dir.child("view"),
+        )
+    }
+
+    /// An instance's ignore rules exclude on top of the repository's, in the same
+    /// syntax: blank lines and `#` comments are skipped, and `\!` escapes a name
+    /// starting with `!`.
+    #[test]
+    fn instance_ignore_rules_exclude_after_the_repositorys() {
+        let dir = TempDir::new("lore-filter-instance-ignore-");
+        let filter = instance_filter(
+            &dir,
+            b"/out\n",
+            b"# build outputs\n\n/binaries/mac\n  *.obj  \n\\!bang\n",
+        )
+        .expect("load");
+
+        for (path, is_directory) in [
+            ("out", true),
+            ("binaries/mac", true),
+            ("binaries/mac/editor", false),
+            ("game/unit.obj", false),
+            ("!bang", false),
+            (".lore", true),
+        ] {
+            assert!(
+                filter.excludes(&probe_path(path), is_directory, FilterMode::Ignore),
+                "{path} is not excluded"
+            );
+        }
+        for (path, is_directory) in [
+            ("binaries/win64", true),
+            ("# build outputs", false),
+            ("bang", false),
+        ] {
+            assert!(
+                !filter.excludes(&probe_path(path), is_directory, FilterMode::Ignore),
+                "{path} is excluded"
+            );
+        }
+    }
+
+    /// A `!` line in an instance's ignore file is skipped with a warning naming
+    /// the file and the line, so it cannot bring back what the repository
+    /// ignores; the lines around it still apply.
+    #[test]
+    fn instance_ignore_rules_skip_a_reinclusion_with_a_warning() {
+        lore_revision::lore_base::log::set_log_callback(Some(record_warning));
+        let dir = TempDir::new("lore-filter-instance-ignore-reinclude-");
+        let filter =
+            instance_filter(&dir, b"*.log\n", b"/build\n!important.log\n/cache\n").expect("load");
+        lore_revision::lore_base::log::set_log_callback(None);
+
+        assert!(
+            filter.excludes(&probe_path("important.log"), false, FilterMode::Ignore),
+            "the instance's file re-included what the repository ignores"
+        );
+        for path in ["build", "cache"] {
+            assert!(
+                filter.excludes(&probe_path(path), true, FilterMode::Ignore),
+                "{path} is not excluded"
+            );
+        }
+
+        let file = dir.child("ignore").display().to_string();
+        let warnings = WARNINGS.lock().expect("warnings");
+        assert!(
+            warnings.iter().any(|warning| warning.contains(&file)
+                && warning.contains("line 2")
+                && warning.contains("!important.log")),
+            "no warning names line 2 of {file}: {warnings:?}"
+        );
+    }
+
+    /// An instance ignore file that cannot be read adds no rules, as an absent
+    /// one does, while one that cannot be decoded fails the load with an error
+    /// naming it.
+    #[test]
+    fn instance_ignore_file_errors_follow_the_repository_ignore_file() {
+        let dir = TempDir::new("lore-filter-instance-ignore-errors-");
+        let ignore = dir.child("loreignore");
+        test_file_write(&ignore, b"/out\n");
+        let view = dir.child("view");
+        let baseline = lore_revision::filter::load(&ignore, &view).expect("load");
+
+        let unreadable = dir.child("directory");
+        std::fs::create_dir(&unreadable).expect("create directory");
+        for instance_ignore in [dir.child("absent"), unreadable] {
+            let filter =
+                lore_revision::filter::load_with_instance_ignore(&ignore, &instance_ignore, &view)
+                    .expect("an unreadable instance ignore file loads");
+            assert_eq!(
+                filter.ignore.len(),
+                baseline.ignore.len(),
+                "{} added rules",
+                instance_ignore.display()
+            );
+        }
+
+        let mut invalid_utf8 = b"/build\n".to_vec();
+        invalid_utf8.extend([0xC3, 0x28, b'\n']);
+        let error = instance_filter(&dir, b"/out\n", &invalid_utf8)
+            .expect_err("an undecodable instance ignore file is refused");
+        let file = dir.child("ignore").display().to_string();
+        assert!(
+            error.to_string().contains(&file),
+            "the error does not name {file}: {error}"
+        );
+    }
 }
