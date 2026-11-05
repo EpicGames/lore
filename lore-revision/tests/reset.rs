@@ -944,6 +944,87 @@ mod tests {
         .await;
     }
 
+    /// A reset that fails at a later path still discards the dirty add an earlier path's reset
+    /// replaced, so the staged state it stores holds the committed node under the name.
+    #[tokio::test]
+    async fn a_failing_reset_discards_the_dirty_add_an_earlier_path_replaced() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            let paths = |relative: &[&str]| {
+                LoreArray::from_vec(
+                    relative
+                        .iter()
+                        .map(|relative| LoreString::from(path(relative).to_string_lossy().as_ref()))
+                        .collect(),
+                )
+            };
+            test_file_write(&path("entry"), b"committed");
+            test_file_write(&path("staged.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            std::fs::remove_file(path("entry")).expect("Failed to delete file");
+            test_directory_create(&path("entry"));
+            test_file_write(&path("entry/inner.txt"), b"inner");
+            let scan = StageOptions {
+                scan: true,
+                ..Default::default()
+            };
+            file::stage::stage(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["entry"]),
+                scan,
+            )
+            .await
+            .expect("Stage failed");
+            file::unstage::unstage(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["."]),
+                Default::default(),
+            )
+            .await
+            .expect("Unstage failed");
+            test_file_write(&path("staged.txt"), b"modified");
+            file::stage::stage(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["staged.txt"]),
+                scan,
+            )
+            .await
+            .expect("Stage failed");
+
+            reset::reset(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["entry", "staged.txt"]),
+                LoreString::default(),
+                ResetOptions::default(),
+            )
+            .await
+            .expect_err("A reset of a staged file must fail");
+
+            let (current, staged, _) =
+                state::State::deserialize_current_and_staged(fixture.repository.clone())
+                    .await
+                    .expect("Failed to deserialize the states");
+            let staged = staged.expect("The staged file keeps a staged state");
+            let node = |state: Arc<state::State>| {
+                let repository = fixture.repository.clone();
+                async move {
+                    state
+                        .find_node_link(repository, "entry")
+                        .await
+                        .expect("The states hold entry")
+                        .node
+                }
+            };
+            assert_eq!(node(staged).await, node(current).await);
+        })
+        .await;
+    }
+
     /// A reset naming an empty committed directory below a directory an ignore rule excludes
     /// creates it, as a reset consults the view alone.
     #[tokio::test]

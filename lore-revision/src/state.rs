@@ -3361,6 +3361,34 @@ impl State {
         .await
     }
 
+    /// The dirty adds among the children of `parent_node`, each with its name hash. Empty where
+    /// the state holds no `parent_node`, or it is not dirty, as a dirty child marks every
+    /// ancestor but the root.
+    pub(crate) async fn node_dirty_add_children(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+    ) -> Result<Vec<(NodeID, u64)>, StateError> {
+        let mut dirty_adds = Vec::new();
+        if !parent_node.is_valid_or_root_node_id() {
+            return Ok(dirty_adds);
+        }
+        let Ok(parent) = self.node(repository.clone(), parent_node).await else {
+            return Ok(dirty_adds);
+        };
+        if !parent.is_directory() || (parent_node != ROOT_NODE && !parent.is_dirty()) {
+            return Ok(dirty_adds);
+        }
+        self.walk_children(repository, parent_node, &parent, None, |child_id, child| {
+            if child.is_dirty_add() {
+                dirty_adds.push((child_id, child.name_hash));
+            }
+            None::<()>
+        })
+        .await?;
+        Ok(dirty_adds)
+    }
+
     /// [`Self::node_children`], and the name hash each of them carries, which
     /// the walk has already read.
     pub async fn node_children_with_name_hash(
@@ -3662,13 +3690,6 @@ impl State {
         Ok(false)
     }
 
-    /// Clear the dirty flags on `node_id` and propagate the clear up the parent
-    /// chain: each ancestor with no remaining dirty children also has its dirty
-    /// flags cleared. Staged flags are preserved (see [`Node::clear_dirty_flags`]).
-    ///
-    /// This is the inverse of [`node_mark_dirty`](Self::node_mark_dirty) and is
-    /// used both by the filesystem scan when a tracked file is found unmodified
-    /// and by `status --check-dirty` when a dirty flag turns out to be stale.
     /// Clear `node_id`'s staged flags, leaving the dirty ones as they are.
     ///
     /// The node alone: an ancestor's staged bits stand for a sibling's action as much as for
@@ -3697,6 +3718,11 @@ impl State {
         Ok(())
     }
 
+    /// Clear the dirty flags on `node_id` and propagate the clear up the parent
+    /// chain: each ancestor with no remaining dirty children also has its dirty
+    /// flags cleared. Staged flags are preserved (see [`Node::clear_dirty_flags`]).
+    ///
+    /// This is the inverse of [`node_mark_dirty`](Self::node_mark_dirty).
     pub async fn node_clear_dirty(
         &self,
         repository: Arc<RepositoryContext>,

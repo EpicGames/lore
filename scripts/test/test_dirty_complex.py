@@ -6906,6 +6906,35 @@ def test_reset_dirty_delete_nested_restores(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
+def test_reset_discards_the_unstaged_add_that_replaced_a_path(new_lore_repo):
+    """A path replaced by one of the other kind, staged and unstaged, leaves the
+    replacement a dirty add beside the original. Resetting the path, or the
+    directory holding it, restores the original and discards the add."""
+    repo: Lore = new_lore_repo()
+    commit_base(repo, {"shared/a.txt": "committed\n", "entry": "committed\n"})
+
+    repo.rmtree("shared")
+    repo.write_files({"shared": "file\n"})
+    repo.remove_file("entry")
+    repo.write_files({"entry/inner.txt": "inner\n"})
+    repo.stage(scan=True, offline=True)
+    repo.unstage(".", offline=True)
+    repo.remove_file("shared")
+
+    repo.reset("shared", offline=True)
+    assert {to_posix(e["path"]).split("/")[0] for e in get_status_files(repo)} == {"entry"}
+
+    repo.reset(".", offline=True)
+    with repo.open_file("shared/a.txt", "r") as f:
+        assert f.read() == "committed\n"
+    with repo.open_file("entry", "r") as f:
+        assert f.read() == "committed\n"
+    assert get_status_files(repo) == []
+    assert get_status_files_twice(repo, scan=True) == []
+    assert not has_staged_anchor(repo)
+
+
 # ---------------------------------------------------------------------------
 # commit of a STAGED change; the dump reflects the committed change
 # ---------------------------------------------------------------------------

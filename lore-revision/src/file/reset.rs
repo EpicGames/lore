@@ -44,7 +44,6 @@ use crate::node;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeID;
-use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
@@ -198,6 +197,9 @@ pub struct ResetStats {
 
     /// The mounts a purge leaves to each layer's own walk, none where the reset does not purge.
     layer_mounts: Vec<RelativePath>,
+
+    /// The dirty adds the walks drop, discarded once every walk has drained.
+    discards: state::WalkDiscards,
 }
 
 impl Default for ResetStats {
@@ -211,6 +213,7 @@ impl Default for ResetStats {
             file_inflight_count: AtomicU64::new(0),
             directory_inflight: AtomicU64::new(0),
             layer_mounts: Vec::new(),
+            discards: state::WalkDiscards::default(),
         }
     }
 }
@@ -330,13 +333,25 @@ struct ResetWalk {
     file_tx: mpsc::Sender<ResetFileWorkItem>,
 }
 
-/// Walk each path in turn, handing every file it reaches to the consumer.
-///
-/// Reports the first failure, having stopped at it: a path the user named and a target that
-/// cannot be resolved are both refusals, and the paths after one are left alone rather than
-/// half-applied. A path that does not name anything inside the repository is reported
-/// ignored and skipped.
+/// Walk each path in turn, handing every file it reaches to the consumer, and discard the dirty
+/// adds the walks dropped, also after a failure.
 async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
+    let failure = reset_walk_paths(&walk).await;
+    let discarded = walk
+        .stats
+        .discards
+        .apply()
+        .await
+        .forward::<ResetError>("Discarding the dirty adds the reset dropped")
+        .err();
+    failure.or(discarded)
+}
+
+/// Walk each path in turn, reporting the first failure, having stopped at it: a path the user
+/// named and a target that cannot be resolved are both refusals, and the paths after one are
+/// left alone rather than half-applied. A path that does not name anything inside the
+/// repository is reported ignored and skipped.
+async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
     for relative_path in walk.paths.iter() {
         let walked = match walk.target.state_for(&walk.repository, relative_path).await {
             Ok(state_target) => {
@@ -1347,14 +1362,22 @@ async fn reset_walk_named_path(
                 .await
                 .forward::<ResetError>("Failed to find node")?;
 
+            let replacement = replacing_dirty_add(
+                &current_state_staged,
+                &target_repository,
+                node_link.node,
+                node.name_hash,
+            )
+            .await?;
+
             reset_walk_node(
                 ResetContext {
                     operation: operation.clone(),
-                    repository: target_repository,
+                    repository: target_repository.clone(),
                     state_target: target_state_current,
-                    state_staged: current_state_staged,
+                    state_staged: current_state_staged.clone(),
                     options,
-                    stats,
+                    stats: stats.clone(),
                     file_tx,
                 },
                 relative_path,
@@ -1363,7 +1386,14 @@ async fn reset_walk_named_path(
                 node,
                 parent_states,
             )
-            .await
+            .await?;
+
+            if let Some(replacement) = replacement {
+                stats
+                    .discards
+                    .queue(current_state_staged, target_repository, vec![replacement]);
+            }
+            Ok(())
         }
         Err(e) if e.is_node_not_found() => {
             // A path absent from the target revision is one of: a file committed
@@ -1398,62 +1428,11 @@ async fn reset_walk_named_path(
                         "Reset dirty add {}, discarding staged node and keeping the file",
                         relative_path.as_str()
                     );
-
-                    let block_index = NodeBlock::index(staged_link.node);
-                    let node_index = Node::index(staged_link.node);
-                    let block = state_staged
-                        .block(repository.clone(), block_index)
-                        .await
-                        .forward::<ResetError>("Failed to get staged block")?;
-                    {
-                        let mut writer = block.write();
-                        writer.node(node_index).clear_all_change_flags();
-                        writer.mark_dirty();
-                    }
-                    state_staged.block_modified(block.clone(), block_index);
-                    state_staged.mark_dirty();
-
-                    crate::state::node_discard_patch(
+                    stats.discards.queue(
                         state_staged.clone(),
                         repository.clone(),
-                        staged_link.node,
-                        |_discarded_node_id, _flags| {},
-                    )
-                    .await
-                    .forward::<ResetError>("Failed to discard reset dirty add node")?;
-
-                    // Dirty parent cleanup
-                    let mut parent_id = staged_node.parent;
-                    while parent_id.is_valid_node_id() {
-                        if state_staged
-                            .node_has_dirty_children(repository.clone(), parent_id)
-                            .await
-                            .forward::<ResetError>("Failed to check dirty children")?
-                        {
-                            break;
-                        }
-                        let parent_block_index = NodeBlock::index(parent_id);
-                        let parent_node_index = Node::index(parent_id);
-                        let parent_block = state_staged
-                            .block(repository.clone(), parent_block_index)
-                            .await
-                            .forward::<ResetError>("Failed to get parent block")?;
-                        let parent_node = parent_block.node(parent_node_index);
-                        let next_parent = parent_node.parent;
-                        let dirtied = {
-                            let mut writer = parent_block.write();
-                            writer.node(parent_node_index).clear_dirty_flags();
-                            writer.mark_dirty()
-                        };
-                        if dirtied {
-                            state_staged.block_modified(parent_block, parent_block_index);
-                            state_staged.mark_dirty();
-                        }
-                        if parent_id == ROOT_NODE {
-                            break;
-                        }
-                        parent_id = next_parent;
-                    }
+                        vec![staged_link.node],
+                    );
                 } else if !delete_path {
                     let (_, excluded) = repository.filter.child_emit_excludes_unless_forced(
                         execution_context().globals().force(),
@@ -1474,6 +1453,54 @@ async fn reset_walk_named_path(
         }
         Err(err) => Err(err).forward::<ResetError>("Failed to find node"),
     }
+}
+
+/// The dirty add standing beside `node_id` in `state_staged` under the same name, which took its
+/// place on disk. Only a deleted node is replaced, and the add is linked after it, so it lies
+/// ahead of `node_id` in the chain.
+async fn replacing_dirty_add(
+    state_staged: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    name_hash: u64,
+) -> Result<Option<NodeID>, ResetError> {
+    let Ok(staged_node) = state_staged.node(repository.clone(), node_id).await else {
+        return Ok(None);
+    };
+    if !staged_node.is_dirty_delete() {
+        return Ok(None);
+    }
+    let Some(sibling) = state_staged
+        .find_subnode_added_since(
+            repository.clone(),
+            staged_node.parent,
+            Some(node_id),
+            name_hash,
+        )
+        .await
+        .forward::<ResetError>("Failed to search the staged siblings")?
+    else {
+        return Ok(None);
+    };
+    let sibling_node = state_staged
+        .node(repository.clone(), sibling)
+        .await
+        .forward::<ResetError>("Failed to find staged node")?;
+    Ok(sibling_node.is_dirty_add().then_some(sibling))
+}
+
+/// `dirty_adds` is sorted by name hash.
+fn replaced_dirty_adds(
+    dirty_adds: &[(NodeID, u64)],
+    node_id: NodeID,
+    name_hash: u64,
+) -> impl Iterator<Item = NodeID> + '_ {
+    let start = dirty_adds.partition_point(|&(_, hash)| hash < name_hash);
+    dirty_adds[start..]
+        .iter()
+        .take_while(move |&&(_, hash)| hash == name_hash)
+        .filter(move |&&(id, _)| id != node_id)
+        .map(|&(id, _)| id)
 }
 
 /// Removes `relative_path` from the working tree, counted against the tally `is_directory`
@@ -1615,48 +1642,10 @@ async fn reset_walk_node(
 
         // Clear Dirty flag if set (reset restores file to current revision)
         if staged_node.is_dirty() {
-            let dirtied = {
-                let mut block_writer = staged_block.write();
-                block_writer.node(node_index).clear_dirty_flags();
-                block_writer.mark_dirty()
-            };
-            if dirtied {
-                state_staged.block_modified(staged_block, block_index);
-                state_staged.mark_dirty();
-            }
-
-            // Dirty parent cleanup
-            let mut parent_id = staged_node.parent;
-            while parent_id.is_valid_node_id() {
-                if state_staged
-                    .node_has_dirty_children(repository.clone(), parent_id)
-                    .await
-                    .forward::<ResetError>("Failed to check dirty children")?
-                {
-                    break;
-                }
-                let parent_block_index = NodeBlock::index(parent_id);
-                let parent_node_index = Node::index(parent_id);
-                let parent_block = state_staged
-                    .block(repository.clone(), parent_block_index)
-                    .await
-                    .forward::<ResetError>("Failed to get parent block")?;
-                let parent_node = parent_block.node(parent_node_index);
-                let next_parent = parent_node.parent;
-                let dirtied = {
-                    let mut block_writer = parent_block.write();
-                    block_writer.node(parent_node_index).clear_dirty_flags();
-                    block_writer.mark_dirty()
-                };
-                if dirtied {
-                    state_staged.block_modified(parent_block, parent_block_index);
-                    state_staged.mark_dirty();
-                }
-                if parent_id == ROOT_NODE {
-                    break;
-                }
-                parent_id = next_parent;
-            }
+            state_staged
+                .node_clear_dirty(repository.clone(), node_id)
+                .await
+                .forward::<ResetError>("Failed to clear the dirty flags")?;
         }
     }
 
@@ -1808,6 +1797,12 @@ async fn reset_walk_directory(
     let mut node_children_names: Vec<String> = vec![];
     let mut failure: Option<ResetError> = None;
     let mut cycle = SiblingCycleGuard::new(node_id);
+    let mut dirty_adds = state_staged
+        .node_dirty_add_children(repository.clone(), node_id)
+        .await
+        .forward::<ResetError>("Listing the staged children")?;
+    dirty_adds.sort_unstable_by_key(|&(_, name_hash)| name_hash);
+    let mut replaced = Vec::new();
 
     while let Some(child_node_id) = child_node_iter {
         let Ok(child_node) = state_target.node(repository.clone(), child_node_id).await else {
@@ -1825,19 +1820,31 @@ async fn reset_walk_directory(
             break;
         }
 
-        let Some(child_node_name) = state_target
+        let child_node_name = match state_target
             .node_name_clone_or_skip(repository.clone(), child_node_id)
             .await
-            .forward::<ResetError>("Failed to get node name")?
-        else {
-            child_node_iter = child_node.sibling();
-            continue;
+            .forward::<ResetError>("Failed to get node name")
+        {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                child_node_iter = child_node.sibling();
+                continue;
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
         };
 
         let child_node_path = directory_path.join(&child_node_name);
         if options.purge {
             node_children_names.push(child_node_name.clone());
         }
+        replaced.extend(replaced_dirty_adds(
+            &dirty_adds,
+            child_node_id,
+            child_node.name_hash,
+        ));
 
         if child_node.is_directory() || child_node.is_link() {
             // Directory/link work recurses; gate via directory_inflight.
@@ -1916,10 +1923,12 @@ async fn reset_walk_directory(
             .flatten();
         failure = failure.or(inner.err());
     }
-
     if let Some(err) = failure {
         return Err(err);
     }
+    stats
+        .discards
+        .queue(state_staged, repository.clone(), replaced);
 
     if !options.purge {
         return Ok(());
