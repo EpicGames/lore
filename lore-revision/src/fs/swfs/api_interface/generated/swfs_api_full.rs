@@ -9,8 +9,11 @@ pub const SWFSReleaseNumber: u32 = 3;
 pub const SWFSCustomization: u32 = 0;
 pub const SWFSBuildNumber: u32 = 0;
 pub const SWFS_MAX_PATH: u32 = 32768;
-pub const SWFS_MAX_FILENAME_LENGTH: u32 = 255;
+pub const SWFS_MAX_FILENAME_UTF16: u32 = 255;
+pub const SWFS_MAX_FILENAME_LENGTH: u32 = 765;
 pub const SWFS_BUFF_ALIGN_LG2: u32 = 16;
+pub const SWFS_MIN_COMMIT_LG2: u32 = 16;
+pub const SWFS_MAX_COMMIT_LG2: u32 = 30;
 pub type swfs_ubyte = ::std::os::raw::c_uchar;
 pub type swfs_utf8 = ::std::os::raw::c_char;
 pub type swfs_utf16 = u16;
@@ -27,6 +30,7 @@ pub const SWFSResult_Enum_SWFSResult_BufferTooSmall: SWFSResult_Enum = -21474836
 pub const SWFSResult_Enum_SWFSResult_VirtualFileReadFailed: SWFSResult_Enum = -2147483644;
 pub const SWFSResult_Enum_SWFSResult_ThawPathConflict: SWFSResult_Enum = -2147483643;
 pub const SWFSResult_Enum_SWFSResult_RangeNotAligned: SWFSResult_Enum = -2147483642;
+pub const SWFSResult_Enum_SWFSResult_DataCorruption: SWFSResult_Enum = -2147483641;
 pub type SWFSResult_Enum = ::std::os::raw::c_int;
 pub const SWFSNodeModFlag_NewNode: swfs_u32 = 1;
 pub const SWFSNodeModFlag_ChangeFlags: swfs_u32 = 2;
@@ -159,6 +163,69 @@ pub const SWFSInitFlag_IncludeInspection: swfs_u32 = 1;
 pub const SWFSInitFlag_DontRunDriver: swfs_u32 = 2;
 pub const SWFSInitFlag_ReadOnly: swfs_u32 = 4;
 pub const SWFSInitFlag_TryBackupBlockOnDataCorruption: swfs_u32 = 8;
+pub const SWFSInitFlag_BlockHashes: swfs_u32 = 16;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SWFSCommitLg2 {
+    pub nodes: swfs_u32,
+    pub node_metadata: swfs_u32,
+    pub block_idx_tbl: swfs_u32,
+    pub block_idx_tbl_free: swfs_u32,
+    pub free_blocks: swfs_u32,
+    pub backing_file_handles: swfs_u32,
+    pub block_hashes: swfs_u32,
+    pub mod_list: swfs_u32,
+    pub mod_list_deletions: swfs_u32,
+    pub name_index: swfs_u32,
+    pub frozen_nodes: swfs_u32,
+    pub thaw: swfs_u32,
+    pub reconcile: swfs_u32,
+    pub tombstones: swfs_u32,
+    pub moved_dirs: swfs_u32,
+    pub deferred_frees: swfs_u32,
+    pub source_aliases: swfs_u32,
+    pub scratch: swfs_u32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of SWFSCommitLg2"][::std::mem::size_of::<SWFSCommitLg2>() - 72usize];
+    ["Alignment of SWFSCommitLg2"][::std::mem::align_of::<SWFSCommitLg2>() - 4usize];
+    ["Offset of field: SWFSCommitLg2::nodes"]
+        [::std::mem::offset_of!(SWFSCommitLg2, nodes) - 0usize];
+    ["Offset of field: SWFSCommitLg2::node_metadata"]
+        [::std::mem::offset_of!(SWFSCommitLg2, node_metadata) - 4usize];
+    ["Offset of field: SWFSCommitLg2::block_idx_tbl"]
+        [::std::mem::offset_of!(SWFSCommitLg2, block_idx_tbl) - 8usize];
+    ["Offset of field: SWFSCommitLg2::block_idx_tbl_free"]
+        [::std::mem::offset_of!(SWFSCommitLg2, block_idx_tbl_free) - 12usize];
+    ["Offset of field: SWFSCommitLg2::free_blocks"]
+        [::std::mem::offset_of!(SWFSCommitLg2, free_blocks) - 16usize];
+    ["Offset of field: SWFSCommitLg2::backing_file_handles"]
+        [::std::mem::offset_of!(SWFSCommitLg2, backing_file_handles) - 20usize];
+    ["Offset of field: SWFSCommitLg2::block_hashes"]
+        [::std::mem::offset_of!(SWFSCommitLg2, block_hashes) - 24usize];
+    ["Offset of field: SWFSCommitLg2::mod_list"]
+        [::std::mem::offset_of!(SWFSCommitLg2, mod_list) - 28usize];
+    ["Offset of field: SWFSCommitLg2::mod_list_deletions"]
+        [::std::mem::offset_of!(SWFSCommitLg2, mod_list_deletions) - 32usize];
+    ["Offset of field: SWFSCommitLg2::name_index"]
+        [::std::mem::offset_of!(SWFSCommitLg2, name_index) - 36usize];
+    ["Offset of field: SWFSCommitLg2::frozen_nodes"]
+        [::std::mem::offset_of!(SWFSCommitLg2, frozen_nodes) - 40usize];
+    ["Offset of field: SWFSCommitLg2::thaw"][::std::mem::offset_of!(SWFSCommitLg2, thaw) - 44usize];
+    ["Offset of field: SWFSCommitLg2::reconcile"]
+        [::std::mem::offset_of!(SWFSCommitLg2, reconcile) - 48usize];
+    ["Offset of field: SWFSCommitLg2::tombstones"]
+        [::std::mem::offset_of!(SWFSCommitLg2, tombstones) - 52usize];
+    ["Offset of field: SWFSCommitLg2::moved_dirs"]
+        [::std::mem::offset_of!(SWFSCommitLg2, moved_dirs) - 56usize];
+    ["Offset of field: SWFSCommitLg2::deferred_frees"]
+        [::std::mem::offset_of!(SWFSCommitLg2, deferred_frees) - 60usize];
+    ["Offset of field: SWFSCommitLg2::source_aliases"]
+        [::std::mem::offset_of!(SWFSCommitLg2, source_aliases) - 64usize];
+    ["Offset of field: SWFSCommitLg2::scratch"]
+        [::std::mem::offset_of!(SWFSCommitLg2, scratch) - 68usize];
+};
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct SWFSInit {
@@ -171,10 +238,12 @@ pub struct SWFSInit {
     pub num_write_threads: ::std::os::raw::c_int,
     pub callbacks: SWFSCallbacks,
     pub log_path: *const ::std::os::raw::c_char,
+    pub driver_cache_mb: swfs_u32,
+    pub commit_lg2: SWFSCommitLg2,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of SWFSInit"][::std::mem::size_of::<SWFSInit>() - 112usize];
+    ["Size of SWFSInit"][::std::mem::size_of::<SWFSInit>() - 192usize];
     ["Alignment of SWFSInit"][::std::mem::align_of::<SWFSInit>() - 8usize];
     ["Offset of field: SWFSInit::name"][::std::mem::offset_of!(SWFSInit, name) - 0usize];
     ["Offset of field: SWFSInit::write_dir"][::std::mem::offset_of!(SWFSInit, write_dir) - 8usize];
@@ -188,6 +257,10 @@ const _: () = {
         [::std::mem::offset_of!(SWFSInit, num_write_threads) - 40usize];
     ["Offset of field: SWFSInit::callbacks"][::std::mem::offset_of!(SWFSInit, callbacks) - 48usize];
     ["Offset of field: SWFSInit::log_path"][::std::mem::offset_of!(SWFSInit, log_path) - 104usize];
+    ["Offset of field: SWFSInit::driver_cache_mb"]
+        [::std::mem::offset_of!(SWFSInit, driver_cache_mb) - 112usize];
+    ["Offset of field: SWFSInit::commit_lg2"]
+        [::std::mem::offset_of!(SWFSInit, commit_lg2) - 116usize];
 };
 pub type SWFSDataCBFn = ::std::option::Option<
     unsafe extern "C" fn(

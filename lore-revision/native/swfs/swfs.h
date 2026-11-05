@@ -1,7 +1,7 @@
 #ifndef SWFS_H_
 #define SWFS_H_
 
-#define SWFSDate    "2026-07-20"    
+#define SWFSDate    "2026-07-20"
 #define SWFSCopyright "Copyright (C) 1994-2026, Epic Game Tools, Inc."
 
 #define SWFSVersion     "2026.07"
@@ -39,7 +39,11 @@ typedef void *				SWFSHandle;
 #endif //__cplusplus
 
 #define SWFS_MAX_PATH				32768
-#define SWFS_MAX_FILENAME_LENGTH	255
+//the longest name of a file or directory: what Windows allows in one path component, 255 UTF-16 units.  Names are UTF-8 in
+//this API, and a unit takes at most 3 bytes of it (a character outside the BMP is 2 units and 4 bytes), so a name is at most
+//SWFS_MAX_FILENAME_LENGTH bytes; it has to satisfy both
+#define SWFS_MAX_FILENAME_UTF16		255
+#define SWFS_MAX_FILENAME_LENGTH	(SWFS_MAX_FILENAME_UTF16 * 3)
 
 SWFS_API_START
 
@@ -57,8 +61,14 @@ typedef enum {
 	SWFSResult_BufferNotAligned,				//IO buffers must be aligned to 2^SWFS_BUFF_ALIGN_LG2 bytes (64kb)
 	SWFSResult_BufferTooSmall,					//IO buffers must hold what the callback's first call asked for: the range read, rounded up to whole blocks
 	SWFSResult_VirtualFileReadFailed,			//the read_file callback returned fewer bytes than the file's size says exist
-	SWFSResult_ThawPathConflict,				//a swfsThaw() path runs through an existing file ("x\y" with x a file), or names one thing as both a file and a directory.  That path is skipped: existing nodes are never replaced
+	SWFSResult_ThawPathConflict,				//a swfsThaw() entry, or the source's listing at the end of the thaw, would turn an existing file into a directory or a
+												//directory into a file ("x\y" with x a file, say), and what is there has something of the user's (a change the client
+												//has not seen, or a file or directory the user made or moved): the entry is skipped and the local node kept.  One that
+												//is the source's own, unchanged here, is replaced and nothing is reported.  Also a list that names one thing as both a
+												//file and a directory: the first entry wins
 	SWFSResult_RangeNotAligned,					//swfsReadFrozenFile()'s offset and num_bytes must be multiples of 2^SWFS_BUFF_ALIGN_LG2 bytes (64kb)
+	SWFSResult_DataCorruption,					//a data block's bytes do not match the hash recorded for them (SWFSInitFlag_BlockHashes).  Fatal, unless
+												//SWFSInitFlag_TryBackupBlockOnDataCorruption is set: then it is reported through the callback and the read goes on
 } SWFSResult_Enum;
 
 
@@ -170,6 +180,37 @@ static const swfs_u32 SWFSInitFlag_IncludeInspection				= 1;
 static const swfs_u32 SWFSInitFlag_DontRunDriver					= 2;	//used for tools that don't want to mount a drive but want it loaded
 static const swfs_u32 SWFSInitFlag_ReadOnly							= 4;	//drive is mounted but no writes can happen.  No backing store is created
 static const swfs_u32 SWFSInitFlag_TryBackupBlockOnDataCorruption	= 8;	//a write was corrupted.  BACKUP swfs_datablock_* files before using this
+static const swfs_u32 SWFSInitFlag_BlockHashes						= 16;	//keep an XXH3-64 hash of every data block and check it on every read (src/state/block_hashes.inl).
+																			//Honoured only when the store is CREATED: a store has hashes for its whole life or never does.  Set
+																			//on an existing store without them, or left off for one that has them, it logs a warning and the
+																			//store's own setting is used
+
+//How much of a state table's address space is committed at a time, as lg2 of bytes: SWFS_MIN_COMMIT_LG2 (16, 64 KiB) to
+//SWFS_MAX_COMMIT_LG2 (30, 1 GiB), or 0 for the default given beside each.  Every table reserves its whole range at
+//swfsInit() and commits its first step then, so a large step is commit charge from the start; a small one is more
+//commits as the table grows.  The memory is only resident once touched either way
+#define SWFS_MIN_COMMIT_LG2		16
+#define SWFS_MAX_COMMIT_LG2		30
+typedef struct {
+	swfs_u32					nodes;					//20  the node table
+	swfs_u32					node_metadata;			//20  names and file info
+	swfs_u32					block_idx_tbl;			//20  every file's block indices
+	swfs_u32					block_idx_tbl_free;		//16  the block index table's free list
+	swfs_u32					free_blocks;			//20  the free block stack
+	swfs_u32					backing_file_handles;	//16  a handle per data file
+	swfs_u32					block_hashes;			//16  SWFSInitFlag_BlockHashes: the hashes, their blocks' states, replay's bitmap
+	swfs_u32					mod_list;				//16  the modified-node list and its positions
+	swfs_u32					mod_list_deletions;		//16  the deletions kept for the next thaw
+	swfs_u32					name_index;				//16  the directory name index
+	swfs_u32					frozen_nodes;			//22  a freeze's node table, list and copy buffers
+	swfs_u32					thaw;					//22  a thaw's lists
+	swfs_u32					reconcile;				//20  a thaw's source reconcile
+	swfs_u32					tombstones;				//16  what went from the source while frozen (entries and names)
+	swfs_u32					moved_dirs;				//16  directories moved while frozen
+	swfs_u32					deferred_frees;			//16  nodes whose freeing waits for the thaw
+	swfs_u32					source_aliases;			//16  renamed source files' source paths (entries and paths)
+	swfs_u32					scratch;				//20  the work thread's and the client's scratch stacks
+} SWFSCommitLg2;
 
 typedef struct {
 	const swfs_utf8 *			name;
@@ -178,7 +219,7 @@ typedef struct {
 	swfs_u32					flags;
 	swfs_u32					log_flags;
 
-	const swfs_utf8 *			shared_memory_name;		//optional.  Set if you want to share memory for external tools
+	const swfs_utf8 *			shared_memory_name;		//optional.  Set if you want to share memory for external tools (at most 200 bytes)
 
 	int							num_write_threads;		//data writes go through a pool of this many threads; anything below 1 is taken as 1 (synchronous)
 	SWFSCallbacks				callbacks;
@@ -189,10 +230,20 @@ typedef struct {
 	//swfsInit()'s error_callback, log_flags and (if it was the first) log_path are in force.  swfsInit()/swfsClose()
 	//can be called any number of times in a process
 	const char *				log_path;
+
+	//optional: the driver's data cache for this mount, in MiB; 0 takes the default (SWFS_DRIVER_CACHE_SIZE, 64 MiB).  Locked
+	//nonpaged memory, mapped into this process too: the driver allocates it at the first read or write and gives it back
+	//after 60 s without one, rounded up to whole 16 MiB slabs.  swfsInit() fails (a fatal error) when this is more than
+	//half of the machine's physical memory or more than 65536 (64 GiB, the driver's 4096 slabs).  When the allocation
+	//still fails (memory in use elsewhere), that read or write fails with STATUS_INSUFFICIENT_RESOURCES.
+	swfs_u32					driver_cache_mb;
+
+	//optional: the state tables' commit steps (SWFSCommitLg2 above); any left 0 take their defaults
+	SWFSCommitLg2				commit_lg2;
 } SWFSInit;
 
 //To use: call 2x. Once with start_buff == NULL to ask for a buffer of num_bytes, and once with
-//start_buff set to fill with data.  Set *out_num_buff_bytes to how many bytes were actually allocated 
+//start_buff set to fill with data.  Set *out_num_buff_bytes to how many bytes were actually allocated
 //and NULL on the second call
 typedef swfs_ubyte *SWFSDataCBFn(SWFSHandle swfs_handle, void *user_data, swfs_ubyte *start_buff, size_t num_bytes, size_t *out_num_buff_bytes);
 
@@ -202,15 +253,12 @@ SWFS_API_FN	void		swfsInit				(SWFSInit *init, SWFSHandle *out_swfs_handle);
 //a client still writing through the mount is given 10 s, then what it has not finished is lost
 SWFS_API_FN	void		swfsClose				(SWFSHandle swfs_handle);
 SWFS_API_FN bool		swfsIsBusy				(SWFSHandle swfs_handle);
-//Also writes the driver's cached data back first, so the list and the snapshot include every write that completed
-//before the call (same 10 s bound as swfsClose() against a client that keeps writing)
 SWFS_API_FN	bool		swfsFreeze				(SWFSHandle swfs_handle, SWFSDataCBFn *cb_fn, void *cb_user_data);		//cb_fn is called once with a linked list of SWFSFile *.  Set mod_flags bit SWFSNodeModFlag_DontFreeze for each file you don't want included in a freeze. SWFS owns the data, do not free it
 //files: a linked list of what the client committed to the source, by path, in the source's terms (a directory has
-//FILE_ATTRIBUTE_DIRECTORY in finfo.attrs; a deletion is named by the path swfsGetModifiedFileList() reported it under).
 //A named file takes the source's state and comes off the modified list.  A named directory is relisted against the
 //source: its unmodified files are refreshed, names the source added or removed come and go - but nothing below it is
 //committed: a modified file in it, held by the freeze or not, stays modified until a thaw names the file itself.  A name the user
-//touched while frozen keeps the swfs version.  NULL names nothing: the freeze ends and the list is as it was
+//touched while frozen keeps the swfs version.  NULL names nothing: the freeze ends and the list is as it was.
 SWFS_API_FN	bool		swfsThaw				(SWFSHandle swfs_handle, const SWFSFile *files);
 SWFS_API_FN bool		swfsIsFrozen			(SWFSHandle swfs_handle);
 SWFS_API_FN swfs_u32	swfsGetFrozenFileList	(SWFSHandle swfs_handle, SWFSDataCBFn *cb_fn, void *cb_user_data);

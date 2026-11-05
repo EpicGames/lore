@@ -156,8 +156,14 @@ impl InstanceOperation for SwfsOperation {
         Ok(())
     }
 
+    /// Removes `path` by naming it as holding nothing in the thaw, which drops it. A removal
+    /// through the mount would be the user's own deletion, which SWFS keeps over every later
+    /// thaw, so a later operation could not write the path again. A path the mount holds
+    /// nothing at goes to the OS, since naming it would make SWFS create an empty file there.
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
-        self.os.remove(path).await?;
+        if !self.os.untracked_file_info(path).await?.exists() {
+            return self.os.remove(path).await;
+        }
         self.record_written(path);
         Ok(())
     }
