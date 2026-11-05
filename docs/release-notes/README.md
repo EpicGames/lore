@@ -29,6 +29,8 @@ Copy [`_template.md`](_template.md) to `docs/release-notes/<summary>.md`:
   such as `lore-server`. Continuation
   lines are indented by two spaces, and there are no blank lines between bullets. Remove the
   template's comments.
+- Describe the effect that a user, an operator or an integrator sees: the command, the behaviour,
+  the result. Leave out crate-internal functions and types, byte sizes and mechanics.
 
 Later work on the same change edits the same note.
 

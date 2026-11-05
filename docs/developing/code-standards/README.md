@@ -15,7 +15,7 @@ Per-language, per-area conventions for error handling, logging, task spawning, t
 - [Async futures](async-futures.md). What a future holds across its awaits, when to box, how to spawn, and how future sizes are tested and measured.
 - [Testing](testing.md). Unit tests in each crate's `tests/unit/`, the `test-util` feature for what they cannot reach, async and smoke test patterns, and the test-independence rules that keep them isolated.
 - [Comments and documentation](comments.md). Rust doc-comment expectations and when a code comment earns its place.
-- [Code review](code-review.md). How to review a change: the guidance to review against, irreversible changes to escalate, and performance issues to look for.
+- [Code review](code-review.md). How to review a change: the guidance to review against, irreversible changes to escalate, performance issues to look for, and how to report findings.
 
 ## Suggested starting points
 

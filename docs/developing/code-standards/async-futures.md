@@ -23,7 +23,7 @@ A future awaited inline is part of its parent's state, so a byte a callee holds 
 
 ## 1. Allocation
 
-- Do not add a heap allocation per call or per item to reduce a future or a frame. Reduce what the future holds.
+- Don't add a heap allocation to reduce a future or a frame on a path that runs per item: per fragment, file, node, request, or connection. Reduce what the future holds. Once per client command or C API call isn't per item.
 - Box only a cold path: a cache miss, an error or recovery path, a rarely taken branch. State in the function's doc comment that the path is cold.
 - Remove a box whose future fits in its parent's largest state. The box costs an allocation and saves nothing.
 - Use `async fn`, or `fn` returning `impl Future`, in a trait that is never used as `dyn`. `#[async_trait]` boxes every call.

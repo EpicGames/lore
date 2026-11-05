@@ -85,7 +85,9 @@ For large or cross-cutting changes, check whether a [Lore Enhancement Proposal](
 
 ### Code standards
 
-Read the full code standards in [`docs/developing/code-standards/`](docs/developing/code-standards/) before writing your first line.
+Read the full code standards in [`docs/developing/code-standards/`](docs/developing/code-standards/) before writing your first line. Performance comes first, including the number and size of allocations: see the [performance checks](docs/developing/code-standards/code-review.md#performance). Your change is reviewed against [code-review.md](docs/developing/code-standards/code-review.md), so read it before you write the change as well.
+
+AI tools follow [`AGENTS.md`](AGENTS.md) and the skills in `.claude/skills/`, which route to the same standards.
 
 ### Formatting and linting
 
@@ -137,14 +139,15 @@ Because the MIT license doesn't include an express patent grant, the DCO sign-of
 
 1. Fork the repository.
 2. Make your changes and ensure all tests pass and linting is clean.
-3. Add or update tests for the behavior you're changing.
-4. If the change affects what Lore does (client, server, API, protocol or stored data), add a release note to [`docs/release-notes/`](docs/release-notes/README.md) rather than editing `docs/release-notes.md`.
-5. Open a pull request targeting `main`. The PR description should cover:
+3. Add or update tests for the behavior you're changing, as [What a change tests](docs/developing/code-standards/testing.md#what-a-change-tests) describes. A bug fix comes with a test that fails without it.
+4. Check your change against [code-review.md](docs/developing/code-standards/code-review.md) before you open the pull request.
+5. If the change affects what Lore does (client, server, API, protocol or stored data), add a release note to [`docs/release-notes/`](docs/release-notes/README.md) rather than editing `docs/release-notes.md`.
+6. Open a pull request targeting `main`. The PR description should cover:
    - **What:** what does this PR do?
    - **Why:** what problem does it solve? Link to the GitHub Issue.
    - **How:** a brief description of your approach, especially if non-obvious.
    - **Testing:** how did you verify the change works?
-6. Every commit must include `Signed-off-by:` as described above.
+7. Every commit must include `Signed-off-by:` as described above.
 
 Keep PRs focused. One logical change per PR.
 

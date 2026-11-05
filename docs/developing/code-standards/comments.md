@@ -21,11 +21,25 @@ These rules apply to every comment, wherever it appears.
   before it, with words such as *no longer*, *now*, *used to*, *instead of* or *doesn't grow*. The commit
   message carries that history.
 - Comments shouldn't be used to group functions into sections.
-- Comments shouldn't be used for code that is self-explanatory from the code itself.
-- Comments can be used to document complex logic and dependencies between different code sections.
+- Document complex logic, and dependencies between sections of code, in the doc comment of the function or
+  type that holds them.
+- Use the terms the [glossary](../../glossary.md) defines, with the substitutions in
+  [Lore vocabulary, not Git-isms](../doc-standards/canon/language.md#lore-vocabulary-not-git-isms): `latest`,
+  not `head`; `working tree`, not `working copy`. The same applies to identifiers, log and error messages, and
+  CLI output. A new term goes into the glossary in the same change.
+- Check each claim a comment makes against the code it documents. A comment the code contradicts is a defect.
 
-Keep comments as short as possible. Use clear language in the active voice. Avoid metaphors and slang.
+Keep comments as short as possible. Use clear, formal language in the active voice. Avoid metaphors and slang.
 Keep the language suitable for non-native English speakers.
+
+## Comments inside a function
+
+A comment inside a function body explains why the code is written this way, where the code can't show it: an
+ordering a later edit must keep, a limit of a dependency, a case that looks wrong but isn't. Never comment what
+a line or a block does.
+
+When a block needs explaining, move it into a helper function whose name says what it does, and document the
+helper with a doc comment.
 
 ## The interface crate
 

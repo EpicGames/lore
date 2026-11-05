@@ -24,6 +24,17 @@ Then split by what you are checking:
 
 Assert on outcomes, not on wording. Check `Ok` or `Err` and the error variant, never a substring of the message. Message text is presentation: it changes for readability and the test fails for no reason, or it stops matching a real regression and passes for no reason.
 
+### What a change tests
+
+A change must come with its tests. Write them with the code, not after review.
+
+- **A fix must carry a test that fails without it.** A defect found in use or in review gets a unit test that reproduces it, or a smoke test when it shows only across the binaries.
+- **Each behavior a change adds or changes must have a test.** In business logic, that includes each new branch, limit, and error path. Trivial code needs none, as above.
+- **Confirm each new test fails without its change.** A test that passes either way gives no assurance.
+- **Test each variant the change reaches.** Where code dispatches over filesystem providers (`StaticDispatchInstanceOperation::Os` and `Swfs`), stores, or platforms, test each variant the change touches. Where a variant can't run in the suite, the change's description says which and why.
+- **Test a bound the code relies on past its limit.** A limit on memory, concurrency, or batch size gets a test with more input than the limit, which checks that the limit holds.
+- **Extend the existing harness.** Build on the fixtures the test's binary already has, such as `test_store_create`, `TestOperation`, and the smoke fixtures `new_lore_repo` and `scratch_dir`, rather than a setup of your own. A fixture a second test needs goes beside the others.
+
 ### The tiers
 
 Cheapest first. Cost tracks how much must be standing before the test can run.
@@ -197,7 +208,7 @@ Used this way the feature adds access and nothing else: wider visibility, access
 
 **Frameworks:** `tokio`, `mockall`, `async-trait`
 
-All async tests use the `LORE_CONTEXT.scope()` pattern:
+Every async test in a crate that depends on `lore-base` runs its body in `LORE_CONTEXT.scope()`, so the code under test has the execution context it has in production:
 
 ```rust
 #[tokio::test]
@@ -506,14 +517,15 @@ Wall-clock benchmarks on a shared machine vary by more than the regressions wort
 ## 7. Best practices
 
 1. **Target risk, not line count** — spend test effort on business logic; leave plumbing and trivial code with few or no tests.
-2. **All Lore commands must have smoke tests** in `scripts/test/`.
-3. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
-4. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
-5. **Poll instead of sleeping** for async state; reserve fixed sleeps for time-based behavior or sub-20ms task startup.
-6. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
+2. **Test every fix and every behavior change** with a test that fails without it (see [What a change tests](#what-a-change-tests)).
+3. **All Lore commands must have smoke tests** in `scripts/test/`.
+4. **Use `LORE_CONTEXT.scope()`** for every async Rust test in a crate that depends on `lore-base`.
+5. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
+6. **Poll instead of sleeping** for async state; reserve fixed sleeps for time-based behavior or sub-20ms task startup.
+7. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
    a test creates outside its repository — both remove what they hand out.
-7. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
-8. **Use `offline=True`** for operations that don't need the server.
-9. **Feature-gate integration tests** that require external dependencies.
-10. **Put Rust unit tests in `tests/unit/`**, with `[lib] test = false`. Give a test its own `tests/*.rs` binary only when it needs its own process, and reach private items only through the `test-util` feature, usually with `#[lore_macro::test_pub]`.
-11. **Build and run tests on a release build**, one test or a full suite, unit and smoke alike (see [Build profile](#build-profile)).
+8. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
+9. **Use `offline=True`** for operations that don't need the server.
+10. **Feature-gate integration tests** that require external dependencies.
+11. **Put Rust unit tests in `tests/unit/`**, with `[lib] test = false`. Give a test its own `tests/*.rs` binary only when it needs its own process, and reach private items only through the `test-util` feature, usually with `#[lore_macro::test_pub]`.
+12. **Build and run tests on a release build**, one test or a full suite, unit and smoke alike (see [Build profile](#build-profile)).
