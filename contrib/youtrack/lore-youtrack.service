@@ -1,0 +1,26 @@
+# Copyright 2026 RedRatInHat
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Lore to YouTrack revision bridge
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=lore-youtrack
+WorkingDirectory=/opt/lore/contrib/youtrack
+Environment=LORE_GLOBAL_PATH=/var/lib/lore-youtrack/global
+EnvironmentFile=-/etc/lore-youtrack/secrets.env
+ExecStart=/usr/bin/python3 -m lore_youtrack --config /etc/lore-youtrack/bridge.toml run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lore-youtrack
+
+[Install]
+WantedBy=multi-user.target

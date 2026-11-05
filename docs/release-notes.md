@@ -26,6 +26,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Features
 
+- `contrib/youtrack`: optional Python bridge for YouTrack Generic VCS. Reads remote revision
+  ancestry through a bare Lore clone, persists delivery state in SQLite, and reconciles
+  uncertain HTTP outcomes without automatically replaying commit commands. See
+  `contrib/youtrack/README.md` in this fork for setup and tested compatibility
 - `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
   `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
 - QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a

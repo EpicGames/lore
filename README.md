@@ -127,6 +127,11 @@ We believe a truly open ecosystem is built collectively using open standards. Lo
 
 <sub><a href="#readme-top">(back to top)</a></sub>
 
+## Optional integrations in this fork
+
+- [YouTrack bridge](contrib/youtrack/README.md) — export reachable Lore revisions to
+  YouTrack Generic VCS with a persistent delivery ledger and read-only reconciliation.
+
 ## Contributing
 
 Contributions of every kind are welcome — code, documentation, bug reports, and reviews. Start with [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow, then read the [Code of Conduct](CODE_OF_CONDUCT.md) and the project [governance model](GOVERNANCE.md). New to the codebase? The [`good-first-issue`](https://github.com/EpicGames/lore/labels/good-first-issue) label is a good place to start.

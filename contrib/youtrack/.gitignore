@@ -1,0 +1,6 @@
+# Operator state and credentials belong outside the monitored repository.
+*.sqlite3
+*.sqlite3-*
+*.sqlite3.lock
+*.local.toml
+secrets.env
