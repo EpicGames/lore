@@ -32,6 +32,7 @@ Merkle
 lede
 Perforce-isms
 [Rr]ebase
+[Uu]nserved
 
 # English words missing from Vale's bundled Hunspell dictionary:
 allowlist
@@ -118,6 +119,7 @@ bitmasks
 composable
 [Dd]eduplicat(ion|ing)
 deps
+interleavings
 lookups
 modularization
 multiplatform

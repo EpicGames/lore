@@ -81,6 +81,22 @@ fn a_path_below_a_partial_name_match_is_nothing() {
     );
 }
 
+/// A path is strictly below an ancestor whatever the case of either, as node lookups ignore
+/// case; the ancestor itself, a case-only respelling of it and a name that merely shares its
+/// prefix are not below it, and nothing is below an empty ancestor.
+#[test]
+fn a_path_strictly_below_an_ancestor_is_found_case_aside() {
+    let path = |name: &str| RelativePath::new_from_clean_parts(name, "");
+    assert!(path("a/b").is_below_ignore_case(&path("a")));
+    assert!(path("A/b").is_below_ignore_case(&path("a")));
+    assert!(path("ä/b").is_below_ignore_case(&path("Ä")));
+    assert!(!path("a").is_below_ignore_case(&path("a")));
+    assert!(!path("A").is_below_ignore_case(&path("a")));
+    assert!(!path("ab/x").is_below_ignore_case(&path("a")));
+    assert!(!path("a").is_below_ignore_case(&path("a/b")));
+    assert!(!path("a").is_below_ignore_case(&RelativePath::new()));
+}
+
 #[test]
 fn a_pushed_component_carries_into_the_lowercase_form() {
     let mut path = RelativePathBuf::new();

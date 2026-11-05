@@ -270,6 +270,82 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// Unstaging a staged modification of a file puts the current revision's size and mode back
+    /// into its node, while another file stays staged.
+    #[tokio::test]
+    async fn unstage_restores_a_modified_files_size_and_mode() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                test_file_write(&instance.path.join("a.txt"), b"short");
+                test_file_write(&instance.path.join("b.txt"), b"other");
+                let committed = test_commit_tree(&instance, "First").await;
+                let repository = instance.repository.clone();
+                let committed_a = committed
+                    .find_node_link(repository.clone(), "a.txt")
+                    .await
+                    .expect("a.txt");
+                let committed_a = committed
+                    .node(repository.clone(), committed_a.node)
+                    .await
+                    .expect("a.txt");
+                test_file_write(&instance.path.join("a.txt"), b"a longer content");
+                test_file_write(&instance.path.join("b.txt"), b"other content");
+                file::stage::stage(
+                    repository.clone(),
+                    &instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&instance.path)]),
+                    StageOptions {
+                        scan: true,
+                        ..StageOptions::default()
+                    },
+                )
+                .await
+                .expect("Failed to stage the changes");
+
+                unstage::unstage(
+                    repository.clone(),
+                    &instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        instance.path.join("a.txt").as_path(),
+                    )]),
+                    UnstageOptions::default(),
+                )
+                .await
+                .expect("Failed to unstage a.txt");
+
+                let staged = lore_revision::instance::load_staged_revision(&repository)
+                    .await
+                    .expect("Failed to load the staged revision")
+                    .expect("b.txt keeps a staged revision");
+                let staged = state::State::deserialize(repository.clone(), staged)
+                    .await
+                    .expect("Failed to deserialize the staged state");
+                let link = staged
+                    .find_node_link(repository.clone(), "a.txt")
+                    .await
+                    .expect("a.txt");
+                let a = staged
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("a.txt");
+                assert!(!a.is_staged(), "a.txt is unstaged, flags {:#x}", a.flags);
+                assert_eq!(
+                    (a.size, a.mode),
+                    (committed_a.size, committed_a.mode),
+                    "a.txt takes the current revision's size and mode back"
+                );
+            })
+            .await;
+    }
+
     /// Unstaging a staged file a directory-only view rule names unstages it: the view is asked
     /// about the path as the file the tree holds there. The ignore file leaves out no staged node.
     #[tokio::test]

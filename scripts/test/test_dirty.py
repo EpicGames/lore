@@ -7,13 +7,12 @@ scan (--scan) setting dirty flags, and cross-operation sequences.
 All tests use --json structured output to validate event data.
 """
 
-import json
 import logging
 import os
 
 import pytest
 from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
-from test_utils import to_posix
+from test_utils import has_staged_anchor, to_posix
 
 from lore import Lore
 
@@ -61,22 +60,6 @@ def find_status_entry(entries: list[dict], path: str) -> dict | None:
         if to_posix(entry.get("path", "")) == target:
             return entry
     return None
-
-
-def has_staged_anchor(repo: Lore) -> bool:
-    """Check whether the repository has a staged revision."""
-    output = repo.status(json=True, offline=True)
-    zero_hash = "0" * 64
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        data = event.get("data", {})
-        revision_staged = data.get("revisionStaged", "")
-        if revision_staged and revision_staged != zero_hash:
-            return True
-    return False
 
 
 # ===========================================================================

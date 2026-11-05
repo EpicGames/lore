@@ -195,7 +195,7 @@ mod tests {
                 for pass in 0..1000 {
                     let to_add = rng.random_range(1..BLOCK_NODE_COUNT);
                     for _ in 0..to_add {
-                        let mut block_writer = block.write();
+                        let mut block_writer = block.write_for_tests();
                         let node_index = block_writer.grab_node_unused(0);
                         if node_index == INVALID_NODE {
                             continue;
@@ -223,7 +223,7 @@ mod tests {
                     to_delete = to_delete.saturating_sub(1);
                     if to_delete > 0 {
                         for _ in 0..to_delete {
-                            let mut block_writer = block.write();
+                            let mut block_writer = block.write_for_tests();
                             let node_index = rng.random_range(0..block_writer.node_count());
                             let node = block_writer.node(node_index);
                             if node.flags & NodeFlags::Discarded != 0 {
@@ -421,6 +421,40 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A v0 record whose inline name length runs past the 43 bytes its name holds is refused,
+    /// never read past the name.
+    #[tokio::test]
+    async fn a_v0_inline_name_longer_than_its_record_is_refused() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository = Arc::new(RepositoryContext::new(
+                    default_repository_creation_args(immutable_store, mutable_store),
+                ));
+                let state = State::new();
+                let mut refused = Vec::new();
+                for length in [NODE_NAME_LIMIT + 1, 100] {
+                    let mut block_v0 = NodeBlockDataV0::new_from_heap_zeroed();
+                    block_v0.node_count = 2;
+                    block_v0.node[1].flags = NodeFlags::File.bits();
+                    block_v0.node[1].name_string[NODE_NAME_LIMIT] = length as u8;
+                    let converted =
+                        NodeBlock::convert_block_v0(repository.clone(), &state, block_v0).await;
+                    refused.push(converted.is_err_and(|error| error.is_internal()));
+                }
+                assert_eq!(
+                    refused,
+                    [true, true],
+                    "inline name lengths of 44 and 100 are refused"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// Names no writer may store. `node_name_store` is the enforcement point, so
     /// none of these can reach a name table through the API at all. A name ending
     /// in a dot, a space or a colon, a drive and a stream type are refused on every
@@ -458,7 +492,7 @@ mod tests {
         for name in &PATH_TRAVERSAL_NAMES {
             let block = NodeBlock::new_zeroed();
             let err = block
-                .write()
+                .write_for_tests()
                 .node_name_store(name, 0, 0)
                 .expect_err("node_name_store should reject name");
             assert!(
@@ -513,7 +547,7 @@ mod tests {
         for name in &valid_names {
             let block = NodeBlock::new_zeroed();
             let node_index = {
-                let mut writer = block.write();
+                let mut writer = block.write_for_tests();
                 let idx = writer.grab_node_unused(0) as usize;
                 let (offset, length) = writer
                     .node_name_store(name, 0, 0)
@@ -550,7 +584,7 @@ mod tests {
     fn node_name_rejects_out_of_bounds() {
         let block = NodeBlock::new_zeroed();
         let node_index = {
-            let mut writer = block.write();
+            let mut writer = block.write_for_tests();
             let idx = writer.grab_node_unused(0) as usize;
             let node = writer.node(idx);
             node.name_offset = 9999;
@@ -741,7 +775,7 @@ mod tests {
         );
         let block = NodeBlock::new_zeroed();
         let (_, _) = block
-            .write()
+            .write_for_tests()
             .node_name_store("a-file.txt", 0, 0)
             .expect("small name should succeed");
     }
@@ -752,7 +786,7 @@ mod tests {
         use lore_revision::node::NODE_NAME_MAX_SIZE;
 
         let block = NodeBlock::new_zeroed();
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         // Fill the buffer with the longest name a single node may carry, until
         // one more of them would cross NODE_NAME_MAX_SIZE.
         let chunk = "A".repeat(MAX_NODE_NAME_LEN);
@@ -774,7 +808,7 @@ mod tests {
         use lore_revision::node::MAX_NODE_NAME_LEN;
 
         let block = NodeBlock::new_zeroed();
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         // The bound itself is storable; one byte past it is not.
         let (_, length) = writer
             .node_name_store("a".repeat(MAX_NODE_NAME_LEN).as_str(), 0, 0)
@@ -790,7 +824,7 @@ mod tests {
     #[test]
     fn node_name_store_validates_a_reused_slot() {
         let block = NodeBlock::new_zeroed();
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         // A rename takes the in-place reuse path, which must validate too.
         let (offset, length) = writer
             .node_name_store("original", 0, 0)
@@ -810,7 +844,7 @@ mod tests {
         // We confirm that once a slot exists and the new name fits, repeated
         // stores don't grow the buffer.
         let block = NodeBlock::new_zeroed();
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         // First append creates the slot at offset 0.
         let (offset0, length0) = writer
             .node_name_store("seed-entry", 0, 0)
@@ -826,5 +860,197 @@ mod tests {
             .expect("slot reuse should succeed regardless of cap");
         assert_eq!(new_offset, offset0);
         assert_eq!(new_length, 1);
+    }
+
+    /// The local-content flag a dirty mark sets is stored with the node, and a later mark setting
+    /// other extension flags replaces it.
+    #[tokio::test]
+    async fn the_local_content_flag_survives_serialize_and_deserialize() {
+        use lore_revision::node::NodeExtFlags;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::state::Ext;
+        use lore_revision::state::Mark;
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    rand::random::<RepositoryId>(),
+                )
+                .await;
+                let repository = instance.repository.clone();
+                let state = State::new();
+                let file = Node {
+                    flags: NodeFlags::File.bits(),
+                    name_hash: hash_string("out.o"),
+                    ..Default::default()
+                };
+                let cached = state
+                    .node_add(repository.clone(), ROOT_NODE, file, "out.o")
+                    .await
+                    .expect("add the file node");
+                let deleted = state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            flags: NodeFlags::File.bits(),
+                            name_hash: hash_string("gone.txt"),
+                            ..Default::default()
+                        },
+                        "gone.txt",
+                    )
+                    .await
+                    .expect("add the second file node");
+                for node in [cached, deleted] {
+                    state
+                        .node_mark(
+                            &repository,
+                            node,
+                            Mark::dirty(
+                                NodeFlags::DirtyAdd,
+                                Ext::Set(NodeExtFlags::LocalContent),
+                                true,
+                            ),
+                        )
+                        .await
+                        .expect("mark with the local-content flag");
+                }
+                state
+                    .node_mark(
+                        &repository,
+                        deleted,
+                        Mark::dirty(
+                            NodeFlags::DirtyDelete,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            true,
+                        ),
+                    )
+                    .await
+                    .expect("mark deleted");
+
+                let signature = state
+                    .serialize(repository.clone(), &instance.write_token)
+                    .await
+                    .expect("serialize");
+                let loaded = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("deserialize");
+
+                let node = loaded.node(repository.clone(), cached).await.expect("node");
+                assert!(node.is_dirty_add());
+                assert_eq!(node.ext_flags(), NodeExtFlags::LocalContent);
+                let node = loaded.node(repository, deleted).await.expect("node");
+                assert!(node.is_dirty_delete());
+                assert_eq!(node.ext_flags(), NodeExtFlags::NoFlags);
+            })
+            .await;
+    }
+
+    #[test]
+    fn clearing_the_dirty_flags_clears_the_local_content_flag() {
+        use lore_revision::node::NodeExtFlags;
+
+        let mut node = Node {
+            flags: (NodeFlags::File | NodeFlags::DirtyModify).bits(),
+            ext_flags: NodeExtFlags::LocalContent.bits(),
+            ..Default::default()
+        };
+        node.clear_dirty_flags();
+        assert_eq!(node.ext_flags(), NodeExtFlags::NoFlags);
+
+        node.flags = (NodeFlags::File | NodeFlags::DirtyAdd).bits();
+        node.ext_flags = NodeExtFlags::LocalContent.bits();
+        node.clear_all_change_flags();
+        assert_eq!(node.ext_flags(), NodeExtFlags::NoFlags);
+    }
+
+    /// A save repacks the name table of a block that appended names and freed slots since its
+    /// load, and the repack drops the names of its free slots alone: a Discarded slot off the free
+    /// list, a detached record or a slot an attach holds between its grab and its publish, keeps
+    /// its name, as does a live one. Two free slots apart from each other, so the walk follows the
+    /// list past its head.
+    #[test]
+    fn a_save_repack_drops_only_the_names_of_free_slots() {
+        let block = NodeBlock::new_zeroed();
+        let names = [
+            "live",
+            "detached",
+            "freed",
+            "in-flight",
+            "freed-too",
+            "after",
+        ];
+        let mut indices = Vec::new();
+        {
+            let mut writer = block.write_for_tests();
+            for name in names {
+                let index = Node::index(writer.grab_node_unused(1));
+                let (offset, length) = writer.node_name_store(name, 0, 0).expect("the name stores");
+                let node = writer.node(index);
+                node.flags = NodeFlags::File.bits();
+                node.name_offset = offset;
+                node.name_length = length;
+                indices.push(index);
+            }
+            writer.node(indices[1]).flags |= NodeFlags::Discarded.bits();
+            writer.node(indices[3]).flags = NodeFlags::Discarded.bits();
+            writer.discard_node(1, indices[2]);
+            writer.discard_node(1, indices[4]);
+        }
+        drop(block.saving_for_tests());
+        let kept = [0, 1, 3, 5];
+        for at in kept {
+            assert_eq!(
+                block.node_name_clone(indices[at]).expect("the name reads"),
+                names[at],
+                "slot {at} keeps its name"
+            );
+        }
+        assert_eq!(
+            block.read().clone_name_table().len(),
+            kept.iter().map(|&at| names[at].len()).sum::<usize>(),
+            "the free slots' names go"
+        );
+    }
+
+    /// A free list whose count runs past its tail onto a live slot, as a broken list has it, ends
+    /// the repack's walk there: the live slot keeps its name.
+    #[test]
+    fn a_repack_stops_its_free_list_walk_at_a_slot_that_is_not_discarded() {
+        let block = NodeBlock::new_zeroed();
+        let names = ["live", "freed", "after"];
+        let mut indices = Vec::new();
+        {
+            let mut writer = block.write_for_tests();
+            for name in names {
+                let index = Node::index(writer.grab_node_unused(1));
+                let (offset, length) = writer.node_name_store(name, 0, 0).expect("the name stores");
+                let node = writer.node(index);
+                node.flags = NodeFlags::File.bits();
+                node.name_offset = offset;
+                node.name_length = length;
+                indices.push(index);
+            }
+            writer.discard_node(1, indices[1]);
+            writer.node(indices[1]).sibling = indices[2] as u32;
+            writer.node_block().node_unused_count += 1;
+            writer.node_name_repack();
+        }
+        for at in [0, 2] {
+            assert_eq!(
+                block.node_name_clone(indices[at]).expect("the name reads"),
+                names[at],
+                "slot {at} keeps its name"
+            );
+        }
+        assert_eq!(
+            block.read().clone_name_table().len(),
+            names[0].len() + names[2].len(),
+            "the free slot's name goes"
+        );
     }
 }

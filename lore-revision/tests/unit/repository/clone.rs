@@ -698,7 +698,7 @@ async fn a_clone_skips_a_node_named_for_a_drive() {
                 .await
                 .expect("the block reads back");
             {
-                let mut writer = block.write();
+                let mut writer = block.write_for_tests();
                 let node = writer.node(Node::index(planted));
                 let (offset, length) = (node.name_offset, node.name_length);
                 node.name_hash = hash_string("C:");
@@ -710,7 +710,7 @@ async fn a_clone_skips_a_node_named_for_a_drive() {
                 node.name_length = length;
                 writer.mark_dirty();
             }
-            state.block_modified(block, block_index);
+            state.block_modified_for_tests(block, block_index);
 
             let ctx = CloneContext {
                 operation: repository

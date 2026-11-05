@@ -19,6 +19,7 @@ use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
+use lore_revision::node::NodeExtFlags;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
@@ -26,6 +27,8 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::stage::StageCaseChange;
 use lore_revision::stage::StageOptions;
 use lore_revision::state;
+use lore_revision::state::Ext;
+use lore_revision::state::Mark;
 use lore_revision::state::State;
 use parking_lot::Mutex;
 
@@ -154,9 +157,13 @@ async fn mark_locally(
         .await
         .expect("the marked path")
         .node;
-    held.node_mark_dirty(repository.clone(), node, flags, true)
-        .await
-        .expect("mark the node dirty");
+    held.node_mark(
+        repository,
+        node,
+        Mark::dirty(flags, Ext::Set(NodeExtFlags::NoFlags), true),
+    )
+    .await
+    .expect("mark the node dirty");
 }
 
 /// Adds to `held` a local node named `name` below the root, a file where `file` and a directory
@@ -430,15 +437,20 @@ async fn a_local_addition_in_a_directory_the_target_deletes_passes_the_check() {
                 dir,
                 Node {
                     flags: NodeFlags::File.bits(),
+                    name_hash: lore_storage::hash::hash_string("added.txt"),
                     ..Node::default()
                 },
                 "added.txt",
             )
             .await
             .expect("add a file");
-        held.node_mark_dirty(repository.clone(), added, NodeFlags::DirtyAdd, true)
-            .await
-            .expect("mark the addition");
+        held.node_mark(
+            &repository,
+            added,
+            Mark::dirty(NodeFlags::DirtyAdd, Ext::Set(NodeExtFlags::NoFlags), true),
+        )
+        .await
+        .expect("mark the addition");
         check(
             &repository,
             &held,

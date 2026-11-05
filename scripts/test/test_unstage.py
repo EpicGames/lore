@@ -1,32 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-import json
 import logging
 import os
 
 import pytest
-from test_utils import to_posix
+from test_utils import has_staged_anchor, to_posix
 from lore_parsers import parse_jsonl, parse_status_json
 
 from lore import Lore
 
 logger = logging.getLogger(__name__)
-
-
-def has_staged_anchor(repo: Lore) -> bool:
-    """Check whether the repository has a staged revision by querying status."""
-    output = repo.status(json=True, offline=True)
-    zero_hash = "0" * 64
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        data = event.get("data", {})
-        revision_staged = data.get("revisionStaged", "")
-        if revision_staged and revision_staged != zero_hash:
-            return True
-    return False
 
 
 @pytest.mark.smoke

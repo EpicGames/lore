@@ -444,7 +444,7 @@ async fn modify_rejects_a_deleted_node() {
         .await
         .expect("the block must be readable");
     block
-        .write()
+        .write_for_tests()
         .discard_node(block_index, Node::index(node_id));
 
     let (status, events) = run_modify(handle, vec![entry(10, node_id)]).await;
@@ -692,11 +692,11 @@ async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
                 .await
                 .expect("the block must be readable");
             block
-                .write()
+                .write_for_tests()
                 .discard_node(block_index, Node::index(node_id));
 
             let result = apply_plan(
-                internal.state_for_tests(),
+                internal.claim_shared().await,
                 internal.repository_context.clone(),
                 planned,
             )
@@ -721,6 +721,81 @@ async fn a_target_deleted_after_validation_fails_the_batch_as_internal() {
         batch_outcomes(&events),
         vec![(CALL_ID, LoreErrorCode::Internal)],
         "the batch terminal must carry the failure, not report success"
+    );
+    release(handle, store_handle_id);
+}
+
+/// A target staged for deletion after validation is refused when the batch reaches it, under
+/// the lock its rewrite takes: the entry reports internal and the node stays staged for deletion,
+/// where a rewrite and its forced staged mark would have taken the deletion off it.
+#[tokio::test]
+async fn a_target_staged_for_deletion_after_validation_fails_the_batch_as_internal() {
+    let partition = Partition::from([0x2eu8; 16]);
+    let (handle, store_handle_id) = load_handle("modify-staged-deleted", partition).await;
+    let node_id = seed(
+        handle,
+        "data.bin",
+        LoreNodeType::File,
+        address(1, file_id()),
+    )
+    .await;
+
+    let still_deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = still_deleted.clone();
+    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let status = revision_tree_call(
+        LoreGlobalArgs::default(),
+        make_callback(sink.clone()),
+        handle,
+        CALL_ID,
+        modify,
+        |_: &u64| {},
+        async move |internal: Arc<RevisionTreeInternal>, call_id: u64| {
+            let entries = vec![entry(10, node_id)];
+            let planned = plan_entries(
+                &internal.state_for_tests(),
+                &internal.repository_context,
+                &entries,
+            )
+            .await?;
+
+            internal
+                .state_for_tests()
+                .node_delete(internal.repository_context.clone(), node_id)
+                .await
+                .expect("the delete stages");
+
+            let result = apply_plan(
+                internal.claim_shared().await,
+                internal.repository_context.clone(),
+                planned,
+            )
+            .await;
+            let node = internal
+                .state_for_tests()
+                .node(internal.repository_context.clone(), node_id)
+                .await
+                .expect("the node reads");
+            observed.store(
+                node.is_staged_delete(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            emit_batch_complete(call_id, batch_error_code(&result));
+            result
+        },
+    )
+    .await;
+
+    assert_ne!(status, 0, "a target staged for deletion must fail the call");
+    let events = sink.lock().unwrap().clone();
+    assert_eq!(
+        modify_outcomes(&events),
+        vec![(10, INVALID_NODE, LoreErrorCode::Internal)],
+        "the entry must report internal rather than land"
+    );
+    assert!(
+        still_deleted.load(std::sync::atomic::Ordering::Relaxed),
+        "the node stays staged for deletion"
     );
     release(handle, store_handle_id);
 }

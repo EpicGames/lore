@@ -328,7 +328,7 @@ impl<'a> Resolver<'a> {
 /// Refuses `changes` where one would remove or replace a local change in the held State `paths`
 /// resolves, unless `options` keeps or overwrites local changes, which skips the check. A local
 /// deletion refuses nothing, and no content is compared. The held State marks the ancestors of
-/// each local change dirty, as `State::node_mark_dirty` does.
+/// each local change dirty, as `State::node_mark` does.
 pub async fn check(
     paths: &mut Resolver<'_>,
     changes: &[NodeChange],

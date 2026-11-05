@@ -137,7 +137,6 @@ pub async fn clear_file(
 
     if dirtied {
         state.block_file_metadata_modified(metadata_block, block_index);
-        state.mark_dirty();
     }
 
     // Serialize the new current state

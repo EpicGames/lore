@@ -80,6 +80,8 @@ use crate::stage;
 use crate::stage::StageError;
 use crate::state;
 use crate::state::LinkMergeEntry;
+use crate::state::LinkPin;
+use crate::state::Mark;
 use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
@@ -1798,7 +1800,6 @@ async fn graft_copy_file_metadata(
     };
     if dirtied {
         state_staged.block_file_metadata_modified(staged_block, block_index);
-        state_staged.mark_dirty();
     }
     Ok(())
 }
@@ -1807,6 +1808,7 @@ async fn graft_copy_file_metadata(
 ///
 /// An overwrite keeps the node's ID, slot and sibling position, and does not
 /// take the single-permit slot allocator that `node_add` holds.
+#[lore_macro::test_pub]
 async fn graft_overwrite_node(
     repository: Arc<RepositoryContext>,
     state_staged: Arc<State>,
@@ -1819,18 +1821,39 @@ async fn graft_overwrite_node(
         .block(repository.clone(), block_index)
         .await
         .forward::<MergeError>("loading graft overwrite block")?;
-    let dirtied = {
-        let mut block_writer = block.write();
-        let node = block_writer.node(node_index);
-        node.address = source_node.address;
-        node.size = source_node.size;
-        node.mode = source_node.mode;
-        node.take_mount_source(source_node);
-        block_writer.mark_dirty()
+    // A link overwritten by a link takes the source's whole pin, its node in the linked State
+    // included (H17); any other node the source's content.
+    let (place, link, resized) = {
+        let staged = block.node(node_index);
+        (
+            (staged.parent, staged.name_hash),
+            staged.is_link() && source_node.is_link(),
+            (staged.size, staged.mode) != (source_node.size, source_node.mode),
+        )
     };
-    if dirtied {
-        state_staged.block_modified(block, block_index);
-        state_staged.mark_dirty();
+    if link {
+        state_staged
+            .node_set_link_target_in(
+                &block,
+                staged_id,
+                LinkPin::Whole {
+                    address: source_node.address,
+                    child: source_node.child,
+                },
+            )
+            .forward::<MergeError>("repinning grafted link")?;
+        if resized {
+            state_staged.node_change_in_place(&block, staged_id, place, |held| {
+                held.set_size(source_node.size);
+                held.set_mode(source_node.mode);
+                true
+            });
+        }
+    } else {
+        state_staged.node_change_in_place(&block, staged_id, place, |held| {
+            held.overwrite_content(source_node.address, source_node.size, source_node.mode);
+            true
+        });
     }
 
     // `StagedMerge` holds the `Staged` bit and no action bit. That is what a
@@ -1838,7 +1861,11 @@ async fn graft_overwrite_node(
     // staged state must match it. `node_mark` also marks the parent
     // directories, so the commit recomputes them.
     state_staged
-        .node_mark(repository, staged_id, NodeFlags::StagedMerge, true)
+        .node_mark(
+            &repository,
+            staged_id,
+            Mark::staged(NodeFlags::StagedMerge, true),
+        )
         .await
         .forward::<MergeError>("staging grafted node")?;
     Ok(())
@@ -1861,13 +1888,21 @@ async fn graft_stage_ancestors(
             return Ok(());
         }
         state_staged
-            .node_mark(repository.clone(), directory, NodeFlags::StagedMerge, false)
+            .node_mark(
+                &repository,
+                directory,
+                Mark::staged(NodeFlags::StagedMerge, false),
+            )
             .await
             .forward::<MergeError>("staging adopted node ancestor")?;
         directory = node.parent;
     }
     state_staged
-        .node_mark(repository, ROOT_NODE, NodeFlags::Staged, false)
+        .node_mark(
+            &repository,
+            ROOT_NODE,
+            Mark::staged(NodeFlags::Staged, false),
+        )
         .await
         .forward::<MergeError>("staging adopted node ancestor")
 }
@@ -1940,9 +1975,9 @@ async fn graft_move_node(
     let parent = crate::fs::realize::relink_moved_node(
         &state_staged,
         &repository,
-        change,
         from_path,
         from.node,
+        change.path(),
         true,
     )
     .await
@@ -2122,10 +2157,9 @@ async fn apply_graft_copy(
         }
         state_staged
             .node_mark(
-                repository.clone(),
+                &repository,
                 staged.node,
-                NodeFlags::StagedDelete | NodeFlags::StagedMerge,
-                true,
+                Mark::staged(NodeFlags::StagedDelete | NodeFlags::StagedMerge, true),
             )
             .await
             .forward::<MergeError>("staging adopted delete")?;
@@ -3520,7 +3554,7 @@ pub async fn merge_unresolve(
             .block(repository.clone(), block_index)
             .await
             .forward::<MergeError>("deserializing block")?;
-        let mut node = block.node(node_index);
+        let node = block.node(node_index);
         if !node.is_staged_merge() {
             emit_path_ignore(path.as_str()).await;
             lore_debug!("Ignoring invalid path, node is not a staged merge: {path}");
@@ -3532,43 +3566,18 @@ pub async fn merge_unresolve(
             continue;
         }
 
-        let resolved_bit = NodeFlags::StagedMergeResolved ^ NodeFlags::StagedMergeConflict;
-
-        let was_modified = if node.is_staged_merge_resolved() {
-            node.flags &= !resolved_bit;
-
-            true
-        } else {
-            false
-        };
+        state_staged.node_change_in_place(
+            &block,
+            node_link.node,
+            (node.parent, node.name_hash),
+            |content| content.set_merge_resolved(false),
+        );
 
         lore_debug!(
             "Conflicted {}, node flags {:?}",
             relative_path.as_str(),
-            node.flags
+            block.node(node_index).flags
         );
-
-        let dirtied = {
-            let mut block_writer = block.write();
-            if was_modified {
-                let write_node = block_writer.node(node_index);
-                *write_node = node;
-            }
-            block_writer.node(node_index).flags &= !resolved_bit;
-            block_writer.mark_dirty()
-        };
-
-        if dirtied {
-            state_staged.block_modified(block.clone(), block_index);
-            state_staged.mark_dirty();
-        }
-
-        let flags = NodeFlags::from_bits_truncate(node.flags);
-
-        state_staged
-            .node_mark(repository.clone(), node_link.node, flags, false)
-            .await
-            .forward::<MergeError>("marking node")?;
 
         match merge_type {
             MergeType::CherryPick => {
@@ -3719,7 +3728,7 @@ async fn resolve_single_file(
         .block(repository.clone(), block_index)
         .await
         .forward::<MergeError>("deserializing block")?;
-    let mut node = block.node(node_index);
+    let node = block.node(node_index);
     if !node.is_staged_merge() {
         lore_warn!(
             "Ignoring invalid path, node is not a staged merge: {}",
@@ -3749,41 +3758,18 @@ async fn resolve_single_file(
         return Ok(());
     }
 
-    let was_modified = if node.is_staged_merge_unresolved() {
-        node.flags |= NodeFlags::StagedMergeResolved;
-
-        true
-    } else {
-        false
-    };
+    state_staged.node_change_in_place(
+        &block,
+        node_link.node,
+        (node.parent, node.name_hash),
+        |content| content.set_merge_resolved(true),
+    );
 
     lore_debug!(
         "Resolved {}, node flags {:?}",
         relative_path.as_str(),
-        node.flags
+        block.node(node_index).flags
     );
-
-    let dirtied = {
-        let mut block_writer = block.write();
-        if was_modified {
-            let write_node = block_writer.node(node_index);
-            *write_node = node;
-        }
-        block_writer.node(node_index).flags |= NodeFlags::StagedMergeResolved;
-        block_writer.mark_dirty()
-    };
-
-    if dirtied {
-        state_staged.block_modified(block.clone(), block_index);
-        state_staged.mark_dirty();
-    }
-
-    let flags = NodeFlags::from_bits_truncate(node.flags);
-
-    state_staged
-        .node_mark(repository.clone(), node_link.node, flags, false)
-        .await
-        .forward::<MergeError>("marking node")?;
 
     match merge_type {
         MergeType::CherryPick => {
@@ -4234,7 +4220,6 @@ fn merge_metadata_task(
 
             if dirtied {
                 state_staged.block_file_metadata_modified(metadata_block, metadata_block_index);
-                state_staged.mark_dirty();
             }
 
             lore_trace!("Merged metadata for {}", path);

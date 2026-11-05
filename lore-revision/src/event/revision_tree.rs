@@ -50,9 +50,10 @@ pub struct LoreRevisionTreeResolvePathCompleteEventData {
     pub error_code: LoreErrorCode,
 }
 
-/// Per-child event from `list_children`. One event is emitted per entry;
-/// the caller correlates entries by `id` and detects end-of-list via the
-/// trailing `Complete` event.
+/// Per-child event from `list_children`, one per child the listing reaches;
+/// moves and deletions on the same handle beside the listing may have a child
+/// reported twice (`lore_revision_tree_list_children`). The caller correlates
+/// entries by `id` and detects end-of-list via the trailing `Complete` event.
 #[repr(C)]
 #[derive(Clone, Debug, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
@@ -214,7 +215,7 @@ pub struct LoreRevisionTreeDeleteCompleteEventData {
     /// Correlation id of the entry this reports, not of the call.
     pub entry_id: u64,
     /// How many nodes the entry's subtree removed, staged and discarded
-    /// together. Zero on failure, since nothing was removed.
+    /// together. Zero on failure, whatever part of the subtree was removed.
     pub node_count: u64,
     /// The outcome of the call.
     pub error_code: LoreErrorCode,

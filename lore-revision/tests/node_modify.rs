@@ -13,6 +13,8 @@ mod tests {
     use lore_base::types::Hash;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::state::Content;
+    use lore_revision::state::Rewrite;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
@@ -64,7 +66,7 @@ mod tests {
     /// hash take the new values while the file id stays put, because a caller
     /// replacing bytes supplies no context.
     #[tokio::test]
-    async fn node_modify_rewrites_content_and_keeps_the_file_id() {
+    async fn node_rewrite_rewrites_content_and_keeps_the_file_id() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
@@ -86,12 +88,15 @@ mod tests {
                     .expect("adding the file must succeed");
 
                 state
-                    .node_modify(
-                        repository.clone(),
+                    .node_rewrite(
+                        &repository,
                         node_id,
-                        0o600,
-                        4096,
-                        address(2, Context::default()),
+                        &Content {
+                            mode: 0o600,
+                            size: 4096,
+                            address: address(2, Context::default()),
+                        },
+                        Rewrite::Plain,
                     )
                     .await
                     .expect("modifying a file must succeed");
@@ -124,7 +129,7 @@ mod tests {
     /// A caller that does supply a file id is recording a different identity for
     /// the path, and gets it.
     #[tokio::test]
-    async fn node_modify_takes_a_supplied_file_id() {
+    async fn node_rewrite_takes_a_supplied_file_id() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
@@ -146,12 +151,15 @@ mod tests {
 
                 let replacement = file_id();
                 state
-                    .node_modify(
-                        repository.clone(),
+                    .node_rewrite(
+                        &repository,
                         node_id,
-                        0o644,
-                        10,
-                        address(2, replacement),
+                        &Content {
+                            mode: 0o644,
+                            size: 10,
+                            address: address(2, replacement),
+                        },
+                        Rewrite::Plain,
                     )
                     .await
                     .expect("modifying a file must succeed");
@@ -172,7 +180,7 @@ mod tests {
     /// A directory's size and address are derived at commit and a link's address
     /// is its target, so neither holds content a caller can rewrite.
     #[tokio::test]
-    async fn node_modify_refuses_a_directory_and_a_link() {
+    async fn node_rewrite_refuses_a_directory_and_a_link() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
@@ -207,12 +215,15 @@ mod tests {
                         .await
                         .expect("the node must read back before the attempt");
                     let refused = state
-                        .node_modify(
-                            repository.clone(),
+                        .node_rewrite(
+                            &repository,
                             node_id,
-                            0o600,
-                            4096,
-                            address(9, Context::default()),
+                            &Content {
+                                mode: 0o600,
+                                size: 4096,
+                                address: address(9, Context::default()),
+                            },
+                            Rewrite::Plain,
                         )
                         .await;
                     assert!(
@@ -238,7 +249,7 @@ mod tests {
     /// back as an ordinary directory. Writing content into one would be lost the
     /// moment the allocator hands the slot out again.
     #[tokio::test]
-    async fn node_modify_refuses_a_deleted_node() {
+    async fn node_rewrite_refuses_a_deleted_node() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
@@ -264,16 +275,19 @@ mod tests {
                     .await
                     .expect("the block must be readable");
                 block
-                    .write()
+                    .write_for_tests()
                     .discard_node(block_index, Node::index(node_id));
 
                 let refused = state
-                    .node_modify(
-                        repository.clone(),
+                    .node_rewrite(
+                        &repository,
                         node_id,
-                        0o600,
-                        4096,
-                        address(2, Context::default()),
+                        &Content {
+                            mode: 0o600,
+                            size: 4096,
+                            address: address(2, Context::default()),
+                        },
+                        Rewrite::Plain,
                     )
                     .await;
                 let reason = refused
@@ -294,7 +308,7 @@ mod tests {
     /// The root is the tree itself, not a leaf, and the invalid sentinel names
     /// no node at all. Both are refused before any block is read.
     #[tokio::test]
-    async fn node_modify_refuses_the_root_and_the_invalid_sentinel() {
+    async fn node_rewrite_refuses_the_root_and_the_invalid_sentinel() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
 
@@ -306,12 +320,15 @@ mod tests {
 
                 for (node_id, label) in [(ROOT_NODE, "root"), (INVALID_NODE, "invalid sentinel")] {
                     let refused = state
-                        .node_modify(
-                            repository.clone(),
+                        .node_rewrite(
+                            &repository,
                             node_id,
-                            0o600,
-                            4096,
-                            address(2, Context::default()),
+                            &Content {
+                                mode: 0o600,
+                                size: 4096,
+                                address: address(2, Context::default()),
+                            },
+                            Rewrite::Plain,
                         )
                         .await;
                     let Err(error) = refused else {

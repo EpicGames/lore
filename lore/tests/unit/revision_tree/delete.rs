@@ -52,7 +52,7 @@ enum CapturedEvent {
     DeleteComplete(u64, u64, LoreErrorCode),
     BatchComplete(u64, LoreErrorCode),
     Child(NodeID, u32, u32),
-    NodeInfo(NodeID, u32, u32),
+    NodeInfo(NodeID, u32, u32, Address),
     Other(u32),
 }
 
@@ -76,7 +76,7 @@ impl CapturedEvent {
                 Self::Child(data.node_id, data.kind, data.staged_action)
             }
             LoreEvent::RevisionTreeNodeInfo(data) => {
-                Self::NodeInfo(data.node_id, data.kind, data.staged_action)
+                Self::NodeInfo(data.node_id, data.kind, data.staged_action, data.address)
             }
             other => Self::Other(other.discriminant()),
         }
@@ -237,7 +237,7 @@ async fn settle(handle: LoreRevisionTree, node_ids: &[NodeID]) {
             .block(internal.repository_context.clone(), block_index)
             .await
             .expect("the block must be readable");
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         writer
             .node(lore_revision::node::Node::index(*node_id))
             .clear_all_change_flags();
@@ -352,8 +352,8 @@ async fn delete_discards_a_node_this_handle_added() {
     release(handle, store_handle_id);
 }
 
-/// A subtree of added nodes is discarded whole, deepest first, so unlinking a
-/// parent never strands the children still pointing at it.
+/// A subtree of added nodes leaves the tree whole: every node of it is counted,
+/// and its root stops being listed.
 #[tokio::test]
 async fn delete_discards_a_subtree_this_handle_added() {
     let partition = Partition::from([0x43u8; 16]);
@@ -911,6 +911,8 @@ async fn add_restores_a_node_staged_for_deletion_of_the_same_kind() {
         handle,
         vec![LoreRevisionTreeAddEntry {
             address: address(5, Context::default()),
+            mode: 0o755,
+            size: 77,
             ..add_entry(20, ROOT_NODE, "a.bin", LoreNodeType::File)
         }],
     )
@@ -931,6 +933,17 @@ async fn add_restores_a_node_staged_for_deletion_of_the_same_kind() {
         file_id_of(handle, node_id).await,
         seeded_file_id,
         "the restore must keep the node's identity; a generated one would record a move"
+    );
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let held = internal
+        .state_for_tests()
+        .node(internal.repository_context.clone(), node_id)
+        .await
+        .expect("the node must be readable");
+    assert_eq!(
+        (held.mode, held.size, held.address.hash),
+        (0o755, 77, address(5, Context::default()).hash),
+        "the restore must take the content the entry carries"
     );
     assert_eq!(
         marks_of(handle, node_id).await,
@@ -1241,7 +1254,7 @@ async fn a_target_discarded_after_validation_fails_only_its_own_entry() {
                 .await
                 .expect("the block must be readable");
             block
-                .write()
+                .write_for_tests()
                 .discard_node(block_index, lore_revision::node::Node::index(doomed));
 
             let result = apply_plan(
@@ -1274,10 +1287,9 @@ async fn a_target_discarded_after_validation_fails_only_its_own_entry() {
     release(handle, store_handle_id);
 }
 
-/// A settled directory holding a node this handle added is the one shape that
-/// drives both apply sub-phases inside a single entry — the settled nodes are
-/// tagged, the added one is discarded — and where the deepest-first ordering
-/// and the chain patch meet.
+/// A settled directory holding a node this handle added drives both phases of
+/// the apply inside a single entry: the settled nodes are staged for deletion
+/// and stay listed, the added one leaves the tree, and all three are counted.
 #[tokio::test]
 async fn delete_stages_the_settled_nodes_of_a_subtree_and_discards_the_added_one() {
     let partition = Partition::from([0x5eu8; 16]);
@@ -1362,7 +1374,7 @@ async fn fetch_node_info(handle: LoreRevisionTree, node_id: NodeID) -> (NodeID, 
     events
         .iter()
         .find_map(|event| match event {
-            CapturedEvent::NodeInfo(node_id, kind, staged_action) => {
+            CapturedEvent::NodeInfo(node_id, kind, staged_action, _) => {
                 Some((*node_id, *kind, *staged_action))
             }
             _ => None,
@@ -1398,6 +1410,594 @@ async fn add_rejects_a_name_a_live_child_holds_beside_a_deleted_one() {
     assert!(
         reason.contains("a child with this name already exists"),
         "the rejection must be the ordinary collision, got {reason:?}"
+    );
+    release(handle, store_handle_id);
+}
+
+/// The address `node_info` reports for `node_id`, whose context is the file id.
+async fn fetch_node_address(handle: LoreRevisionTree, node_id: NodeID) -> Address {
+    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let status = node_info(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeNodeInfoArgs {
+            id: 9,
+            handle,
+            node_id,
+        },
+        make_callback(sink.clone()),
+    )
+    .await;
+    assert_eq!(status, 0, "node_info must succeed");
+    let events = sink.lock().unwrap().clone();
+    events
+        .iter()
+        .find_map(|event| match event {
+            CapturedEvent::NodeInfo(_, _, _, address) => Some(*address),
+            _ => None,
+        })
+        .expect("node_info must emit a record")
+}
+
+/// A deleted added directory reads as a freed id does until the commit frees it: gone from its
+/// parent's listing, listed itself as empty, and reported a directory with no staged change and
+/// no address or file id; so does the file below it, whatever its kind was.
+#[tokio::test]
+async fn a_deleted_added_directory_reads_as_a_freed_id() {
+    let partition = Partition::from([0xd1u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-added-reads-freed", partition).await;
+
+    let kept = seed(handle, ROOT_NODE, "kept.bin", LoreNodeType::File).await;
+    settle(handle, &[kept]).await;
+    let directory = seed(handle, ROOT_NODE, "dir", LoreNodeType::Directory).await;
+    let child = seed(handle, directory, "a.bin", LoreNodeType::File).await;
+    let (status, events) = run_delete(handle, vec![entry(10, directory)]).await;
+    assert_eq!(status, 0, "deleting the added directory must succeed");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 2, LoreErrorCode::None)],
+        "the directory and its file must be counted"
+    );
+
+    assert_eq!(
+        children_of(handle, ROOT_NODE).await,
+        vec![(kept, LoreNodeStagedAction::None as u32)],
+        "the deleted directory leaves its parent's listing"
+    );
+    for node in [directory, child] {
+        assert!(
+            children_of(handle, node).await.is_empty(),
+            "a deleted node lists as empty"
+        );
+        assert_eq!(
+            fetch_node_info(handle, node).await,
+            (
+                node,
+                LoreNodeType::Directory as u32,
+                LoreNodeStagedAction::None as u32
+            ),
+            "a deleted node reports as a freed id does"
+        );
+        assert_eq!(
+            fetch_node_address(handle, node).await,
+            Address::default(),
+            "with no address and no file id"
+        );
+    }
+    release(handle, store_handle_id);
+}
+
+/// A deleted added link reads as a freed id does, as a deleted added directory does: gone from
+/// its parent's listing, listed as empty, and reported a directory with no staged change and
+/// no address, though its record keeps its kind for the commit's free.
+#[tokio::test]
+async fn a_deleted_added_link_reads_as_a_freed_id() {
+    let partition = Partition::from([0xd7u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-added-link-reads-freed", partition).await;
+
+    let link = seed(handle, ROOT_NODE, "lib", LoreNodeType::Link).await;
+    let (status, events) = run_delete(handle, vec![entry(10, link)]).await;
+    assert_eq!(status, 0, "deleting the added link must succeed");
+    assert_eq!(delete_outcomes(&events), vec![(10, 1, LoreErrorCode::None)]);
+
+    assert!(
+        children_of(handle, ROOT_NODE).await.is_empty(),
+        "the deleted link leaves its parent's listing"
+    );
+    assert!(
+        children_of(handle, link).await.is_empty(),
+        "and lists as empty"
+    );
+    assert_eq!(
+        fetch_node_info(handle, link).await,
+        (
+            link,
+            LoreNodeType::Directory as u32,
+            LoreNodeStagedAction::None as u32
+        ),
+        "a deleted link reports as a freed id does"
+    );
+    assert_eq!(fetch_node_address(handle, link).await, Address::default());
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let record = internal
+        .state_for_tests()
+        .node(internal.repository_context.clone(), link)
+        .await
+        .expect("the link's record reads");
+    assert!(
+        record.is_discarded() && record.is_link(),
+        "the record keeps its kind for the commit: {:x}",
+        record.flags
+    );
+    release(handle, store_handle_id);
+}
+
+/// What a dropped delete's task holds, for the tests of its claim: a tracked `t/a`, an added
+/// `n/c`, and the delete of both queued on the moves permit the test holds, its call dropped.
+struct DroppedDelete {
+    handle: LoreRevisionTree,
+    store_handle_id: u64,
+    internal: Arc<RevisionTreeInternal>,
+    t: NodeID,
+    a: NodeID,
+    n: NodeID,
+    c: NodeID,
+}
+
+impl DroppedDelete {
+    async fn start(label: &str, partition: Partition) -> (Self, impl Drop) {
+        let (handle, store_handle_id) = load_handle(label, partition).await;
+        let t = seed(handle, ROOT_NODE, "t", LoreNodeType::Directory).await;
+        let a = seed(handle, t, "a.bin", LoreNodeType::File).await;
+        settle(handle, &[t, a]).await;
+        let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+        let c = seed(handle, n, "c.bin", LoreNodeType::File).await;
+        let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+        let state = internal.state_for_tests();
+        let permit = OwnedPermit::take(state).await;
+
+        #[allow(clippy::disallowed_methods)]
+        let call = tokio::spawn(run_delete(handle, vec![entry(10, t), entry(11, n)]));
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !call.is_finished(),
+            "the delete must wait for the moves permit"
+        );
+        call.abort();
+        assert!(
+            call.await.expect_err("the call is dropped").is_cancelled(),
+            "the call must be dropped, not finished"
+        );
+        let dropped = Self {
+            handle,
+            store_handle_id,
+            internal,
+            t,
+            a,
+            n,
+            c,
+        };
+        (dropped, permit)
+    }
+
+    /// The delete went whole once its task ran: `t` staged for deletion with `t/a`, and `n`
+    /// pending with `n/c`.
+    async fn assert_deleted(&self) {
+        let state = self.internal.state_for_tests();
+        let context = self.internal.repository_context.clone();
+        for node in [self.t, self.a] {
+            let record = state.node(context.clone(), node).await.expect("reads");
+            assert!(record.is_staged_delete(), "{node} is staged for deletion");
+        }
+        for node in [self.n, self.c] {
+            let record = state.node(context.clone(), node).await.expect("reads");
+            assert!(record.is_discarded(), "{node} is pending");
+        }
+    }
+}
+
+/// The moves permit, held by a task of its own until dropped, so a test can hold it across
+/// awaits without borrowing the State.
+struct OwnedPermit {
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl OwnedPermit {
+    async fn take(state: Arc<lore_revision::state::State>) -> Self {
+        let (taken, is_taken) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            let permit = state.moves_permit().await.expect("the moves permit");
+            let _ = taken.send(());
+            let _ = released.await;
+            drop(permit);
+        });
+        is_taken.await.expect("the permit is taken");
+        Self {
+            release: Some(release),
+        }
+    }
+}
+
+impl Drop for OwnedPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+/// A delete whose call is dropped while its task waits for the moves permit still holds the
+/// handle's shared claim, so an exclusive claim, a commit's, waits for it; once the permit is
+/// free the task runs the whole delete and lets the claim go.
+#[tokio::test]
+async fn a_dropped_delete_holds_its_claim_until_its_task_ends() {
+    let (dropped, permit) =
+        DroppedDelete::start("delete-dropped-claim", Partition::from([0xd8u8; 16])).await;
+
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            dropped.internal.access_exclusive()
+        )
+        .await
+        .is_err(),
+        "an exclusive claim must wait for the delete's task"
+    );
+    drop(permit);
+    let exclusive = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        dropped.internal.access_exclusive(),
+    )
+    .await
+    .expect("the delete's task ends and lets its claim go");
+    drop(exclusive);
+    dropped.assert_deleted().await;
+    release(dropped.handle, dropped.store_handle_id);
+}
+
+/// A close of the handle waits for a dropped delete's task, which entered the handle on its own
+/// account, and the task runs the whole delete before the close completes.
+#[tokio::test]
+async fn a_close_waits_for_a_dropped_deletes_task() {
+    use lore::revision_tree::close::LoreRevisionTreeCloseArgs;
+    use lore::revision_tree::close::close;
+
+    let (dropped, permit) =
+        DroppedDelete::start("delete-dropped-close", Partition::from([0xd9u8; 16])).await;
+    let handle = dropped.handle;
+    #[allow(clippy::disallowed_methods)]
+    let closing = tokio::spawn(async move {
+        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        close(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCloseArgs { id: 1, handle },
+            make_callback(sink),
+        )
+        .await
+    });
+    let mut closing = closing;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut closing)
+            .await
+            .is_err(),
+        "the close must wait for the delete's task"
+    );
+    drop(permit);
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), closing)
+        .await
+        .expect("the close completes once the task ends")
+        .expect("the close's task");
+    assert_eq!(status, 0, "the close succeeds");
+    dropped.assert_deleted().await;
+    storage_handle::unregister(lore::storage::handle::LoreStore {
+        handle_id: dropped.store_handle_id,
+    });
+}
+
+/// Moves `node` under `destination` as `name` in a call of its own, which must succeed.
+async fn move_into(handle: LoreRevisionTree, node: NodeID, destination: NodeID, name: &str) {
+    use lore::revision_tree::move_node::LoreRevisionTreeMoveArgs;
+    use lore::revision_tree::move_node::LoreRevisionTreeMoveEntry;
+    use lore::revision_tree::move_node::move_node;
+
+    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let status = move_node(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeMoveArgs {
+            batch_id: 3,
+            handle,
+            entries: LoreArray::from_vec(vec![LoreRevisionTreeMoveEntry {
+                entry_id: 1,
+                node_id: node,
+                destination_parent_id: destination,
+                dst_name: LoreString::from_str(name),
+            }]),
+        },
+        make_callback(sink.clone()),
+    )
+    .await;
+    assert_eq!(status, 0, "the move into {destination} must succeed");
+}
+
+/// A tracked node moved into an added directory and deleted there does not make the directory's
+/// subtree mixed: the delete of the directory detaches it with the node, which the commit frees
+/// with the rest, and counts it no second time.
+#[tokio::test]
+async fn a_deleted_tracked_node_below_an_added_directory_goes_with_it() {
+    let partition = Partition::from([0xdau8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-added-over-deleted", partition).await;
+    let q = seed(handle, ROOT_NODE, "q", LoreNodeType::Directory).await;
+    let y = seed(handle, q, "y.bin", LoreNodeType::File).await;
+    settle(handle, &[q, y]).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+    let (status, _) = run_delete(handle, vec![entry(10, y)]).await;
+    assert_eq!(status, 0, "the delete of the moved node must succeed");
+
+    let (status, events) = run_delete(handle, vec![entry(11, n)]).await;
+    assert_eq!(status, 0, "the added directory is not mixed: {events:?}");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(11, 1, LoreErrorCode::None)],
+        "the directory goes with the deleted node below it, which its own delete counted"
+    );
+    for node in [n, y] {
+        assert_eq!(
+            fetch_node_info(handle, node).await,
+            (
+                node,
+                LoreNodeType::Directory as u32,
+                LoreNodeStagedAction::None as u32
+            ),
+            "{node} reads as a freed id does"
+        );
+    }
+    release(handle, store_handle_id);
+}
+
+/// A live tracked node moved into an added directory makes the directory's subtree mixed: its
+/// detach would take the node along, so the delete fails the entry with nothing detached, and
+/// the directory and the node stay listed.
+#[tokio::test]
+async fn an_added_directory_holding_a_moved_tracked_node_fails_its_entry() {
+    let partition = Partition::from([0xdfu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-mixed-added", partition).await;
+    let y = seed(handle, ROOT_NODE, "y.bin", LoreNodeType::File).await;
+    settle(handle, &[y]).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+
+    let (status, events) = run_delete(handle, vec![entry(10, n)]).await;
+    assert_ne!(status, 0, "the mixed subtree fails the call: {events:?}");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 0, LoreErrorCode::Internal)],
+        "the entry fails, reporting nothing removed"
+    );
+    assert_eq!(
+        batch_outcomes(&events),
+        vec![(CALL_ID, LoreErrorCode::Internal)],
+        "the call reports the failure for the batch"
+    );
+    assert_eq!(
+        children_of(handle, ROOT_NODE).await,
+        vec![(n, LoreNodeStagedAction::Add as u32)],
+        "the added directory is not detached"
+    );
+    assert_eq!(
+        children_of(handle, n).await,
+        vec![(y, LoreNodeStagedAction::Move as u32)],
+        "the moved node stays below it"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Plans `entries`, runs `between` on the tree, then applies the plan, all inside one call, as
+/// [`a_target_discarded_after_validation_fails_only_its_own_entry`] does; answers the call's
+/// status and events.
+async fn plan_change_apply(
+    handle: LoreRevisionTree,
+    entries: Vec<LoreRevisionTreeDeleteEntry>,
+    between: impl AsyncFnOnce(
+        Arc<lore_revision::state::State>,
+        Arc<lore_revision::repository::RepositoryContext>,
+    ) + Send
+    + 'static,
+) -> (i32, Vec<CapturedEvent>) {
+    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let status = revision_tree_call(
+        LoreGlobalArgs::default(),
+        make_callback(sink.clone()),
+        handle,
+        CALL_ID,
+        delete,
+        |_: &u64| {},
+        async move |internal: Arc<RevisionTreeInternal>, call_id: u64| {
+            let state = internal.state_for_tests();
+            let planned = plan_entries(&state, &internal.repository_context, &entries).await?;
+            between(state.clone(), internal.repository_context.clone()).await;
+            let result = apply_plan(state, internal.repository_context.clone(), planned).await;
+            emit_batch_complete(call_id, batch_error_code(&result));
+            result
+        },
+    )
+    .await;
+    let events = sink.lock().unwrap().clone();
+    (status, events)
+}
+
+/// An entry whose marks of the directories above it fail, here at an ancestor whose parent link
+/// names a block the tree does not have, fails alone, its node unmarked, as the climb comes first
+/// (H8), and an unfinished change noted for the directories the climb staged before it failed;
+/// the entry beside it reports what it removed.
+#[tokio::test]
+async fn an_entry_whose_ancestors_cannot_be_marked_fails_alone() {
+    let partition = Partition::from([0xdbu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-unclimbed", partition).await;
+    let t = seed(handle, ROOT_NODE, "t", LoreNodeType::Directory).await;
+    let sub = seed(handle, t, "sub", LoreNodeType::Directory).await;
+    let x = seed(handle, sub, "x.bin", LoreNodeType::File).await;
+    let intact = seed(handle, ROOT_NODE, "intact.bin", LoreNodeType::File).await;
+    settle(handle, &[t, sub, x, intact]).await;
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, x), entry(11, intact)],
+        async move |state, repository| {
+            let block = state
+                .block(repository, lore_revision::node::NodeBlock::index(t))
+                .await
+                .expect("t's block");
+            block
+                .write_for_tests()
+                .node(lore_revision::node::Node::index(t))
+                .parent = 0x00ff_ff00;
+        },
+    )
+    .await;
+
+    assert_ne!(status, 0, "the failed climb fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![
+            (10, 0, LoreErrorCode::Internal),
+            (11, 1, LoreErrorCode::None)
+        ],
+        "the entry whose climb failed fails alone"
+    );
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let record = internal
+        .state_for_tests()
+        .node(internal.repository_context.clone(), x)
+        .await
+        .expect("x reads");
+    assert!(
+        !record.is_staged_delete(),
+        "x is not marked after its climb failed"
+    );
+    assert!(
+        internal.state_for_tests().has_unfinished_change(),
+        "the climb that failed after marking sub is noted"
+    );
+    release(handle, store_handle_id);
+}
+
+/// An added root no longer where the plan found it when the delete reaches it, here detached
+/// meanwhile, fails its entry alone; the entry beside it reports what it removed.
+#[tokio::test]
+async fn an_added_root_gone_from_its_place_fails_its_entry_alone() {
+    let partition = Partition::from([0xdcu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-root-gone", partition).await;
+    let intact = seed(handle, ROOT_NODE, "intact.bin", LoreNodeType::File).await;
+    settle(handle, &[intact]).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+    seed(handle, n, "c.bin", LoreNodeType::File).await;
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, n), entry(11, intact)],
+        async move |state, repository| {
+            assert!(
+                state
+                    .node_detach(repository, n, lore_revision::state::Detach::Always)
+                    .await
+                    .expect("the detach"),
+                "n is detached"
+            );
+        },
+    )
+    .await;
+
+    assert_ne!(status, 0, "the root that left fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![
+            (10, 0, LoreErrorCode::Internal),
+            (11, 1, LoreErrorCode::None)
+        ],
+        "the entry whose root left fails alone"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Added roots below two directories are detached in groups, one per directory, which may run
+/// side by side, as the tracked children each level finds are gathered from groups that may too:
+/// each entry counts its own, and every added node reads as freed. The groups run as tasks only
+/// with two processors or more; on one, both run in place.
+#[tokio::test]
+async fn added_roots_below_two_directories_are_detached_per_entry() {
+    let partition = Partition::from([0xddu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-two-groups", partition).await;
+    let t = seed(handle, ROOT_NODE, "t", LoreNodeType::Directory).await;
+    let ts = seed(handle, t, "ts", LoreNodeType::Directory).await;
+    let tf = seed(handle, ts, "f.bin", LoreNodeType::File).await;
+    let q = seed(handle, ROOT_NODE, "q", LoreNodeType::Directory).await;
+    let qs = seed(handle, q, "qs", LoreNodeType::Directory).await;
+    let qg = seed(handle, qs, "g.bin", LoreNodeType::File).await;
+    settle(handle, &[t, ts, tf, q, qs, qg]).await;
+    let x = seed(handle, t, "x", LoreNodeType::Directory).await;
+    let xc = seed(handle, x, "c.bin", LoreNodeType::File).await;
+    let z = seed(handle, q, "z.bin", LoreNodeType::File).await;
+
+    let (status, events) = run_delete(handle, vec![entry(10, t), entry(11, q)]).await;
+
+    assert_eq!(status, 0, "both deletes succeed: {events:?}");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 5, LoreErrorCode::None), (11, 4, LoreErrorCode::None)],
+        "each entry counts its tracked nodes and the added subtree below it"
+    );
+    for node in [x, xc, z] {
+        assert_eq!(
+            fetch_node_info(handle, node).await,
+            (
+                node,
+                LoreNodeType::Directory as u32,
+                LoreNodeStagedAction::None as u32
+            ),
+            "{node} reads as a freed id does"
+        );
+    }
+    release(handle, store_handle_id);
+}
+
+/// An added root still live but no longer where the plan found it, here under another name,
+/// fails its entry alone: its detach finds no node at the place it names.
+#[tokio::test]
+async fn an_added_root_moved_from_its_place_fails_its_entry_alone() {
+    let partition = Partition::from([0xdeu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-root-moved", partition).await;
+    let intact = seed(handle, ROOT_NODE, "intact.bin", LoreNodeType::File).await;
+    settle(handle, &[intact]).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, n), entry(11, intact)],
+        async move |state, repository| {
+            let block = state
+                .block(repository, lore_revision::node::NodeBlock::index(n))
+                .await
+                .expect("n's block");
+            block
+                .write_for_tests()
+                .node(lore_revision::node::Node::index(n))
+                .name_hash ^= 1;
+        },
+    )
+    .await;
+
+    assert_ne!(status, 0, "the root that moved fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![
+            (10, 0, LoreErrorCode::Internal),
+            (11, 1, LoreErrorCode::None)
+        ],
+        "the entry whose root moved fails alone"
     );
     release(handle, store_handle_id);
 }

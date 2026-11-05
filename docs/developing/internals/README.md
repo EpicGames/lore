@@ -10,6 +10,7 @@ Precise technical descriptions of Lore's source: byte layouts, struct formats, s
 
 - [File I/O engine](file-io-engine.md) — the `lore-io` driver, buffer ownership, syscall pool, and the plan for replacing `std::fs` and `tokio::fs`.
 - [Parallel path staging](parallel-path-staging.md) — how `lore stage` normalizes a target set, pre-creates the directories targets share, and fans the walks out.
+- [State node architecture](state-node-architecture.md) — how a `State` holds its revision tree in node blocks, and how the node operations change it under concurrent writers: the tiers, the block locks, the checks under them, saving, and sweeping detached slots.
 
 ## Suggested starting points
 

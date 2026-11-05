@@ -83,7 +83,9 @@ use crate::repository::verify::verify_state_for_commit;
 use crate::revision::sync;
 use crate::state;
 use crate::state::LinkReference;
+use crate::state::Mark;
 use crate::state::NodeMapping;
+use crate::state::OwnFlags;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
@@ -1455,10 +1457,9 @@ async fn commit_link_only(
         level
             .state
             .node_mark(
-                level.repository.clone(),
+                &level.repository,
                 level.link_node_id,
-                NodeFlags::Staged,
-                true,
+                Mark::staged(NodeFlags::Staged, true),
             )
             .await
             .forward::<CommitError>("Failed to mark intermediate link node staged")?;
@@ -1774,6 +1775,13 @@ async fn commit_staged_revision(
         state_staged.reset_merge_conflict_flags();
         state_staged.clear_link_merge_state();
 
+        // Before the save, with the discards done, as nothing else frees a slot left detached or
+        // in flight (C15).
+        state_staged
+            .node_sweep_detached(&repository)
+            .await
+            .forward::<CommitError>("Failed to free the detached slots")?;
+
         // Serialize the new current state
         let signature = state_staged
             .serialize(repository.clone(), &token)
@@ -1899,7 +1907,7 @@ pub(crate) async fn commit_files_and_rehash(
             tracker: tracker.clone(),
             dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
         });
-        lore_spawn!(async move {
+        lore_spawn!(crate::subtask!(async move {
             let result = commit_directory(walk, relative_path, node_id, None).await;
             discover_stats
                 .discovery
@@ -1912,7 +1920,7 @@ pub(crate) async fn commit_files_and_rehash(
             })
             .send();
             result
-        })
+        }))
     };
 
     // Consumer: fragment files as they are discovered
@@ -1924,7 +1932,7 @@ pub(crate) async fn commit_files_and_rehash(
         let stats = stats.clone();
         let tracker = tracker.clone();
         let modified_times = modified_times.clone();
-        lore_spawn!(async move {
+        lore_spawn!(crate::subtask!(async move {
             commit_execute(
                 operation,
                 file_rx,
@@ -1936,24 +1944,17 @@ pub(crate) async fn commit_files_and_rehash(
                 modified_times,
             )
             .await
-        })
+        }))
     };
 
     join_commit_tasks(producer, consumer).await?;
-
-    commit_discard_subnodes(
-        repository.clone(),
-        state.clone(),
-        subnodes_to_discard.clone(),
-        stats.clone(),
-    )
-    .await?;
 
     commit_discard(
         repository.clone(),
         state.clone(),
         delta.clone(),
-        discard,
+        &discard,
+        &subnodes_to_discard,
         stats.clone(),
     )
     .await?;
@@ -2268,14 +2269,14 @@ fn commit_child(
         if child_node.is_directory() {
             lore_spawn!(
                 tasks,
-                collect_discard_subnodes(
+                crate::subtask!(collect_discard_subnodes(
                     walk.repository.clone(),
                     walk.state.clone(),
                     walk.delta.clone(),
                     child_node_id,
                     walk.subnodes_to_discard.clone(),
                     walk.stats.clone(),
-                )
+                ))
             );
             frame.updated = true;
         }
@@ -2297,13 +2298,18 @@ fn commit_child(
         };
         lore_spawn!(
             tasks,
-            commit_directory(walk.clone(), relative_path, child_node_id, Some(permit))
+            crate::subtask!(commit_directory(
+                walk.clone(),
+                relative_path,
+                child_node_id,
+                Some(permit)
+            ))
         );
     } else if child_node.is_link() {
         lore_debug!("Before committing link node, parent node {}", frame.node_id);
         lore_spawn!(
             tasks,
-            commit_link_node(
+            crate::subtask!(commit_link_node(
                 walk.operation.clone(),
                 walk.repository.clone(),
                 walk.token.share(),
@@ -2316,7 +2322,7 @@ fn commit_child(
                 walk.stats.clone(),
                 walk.parent_branch,
                 walk.tracker.clone(),
-            )
+            ))
         );
     } else if child_node.is_file() {
         return Ok(Some(ChildRest::File(
@@ -2337,169 +2343,70 @@ async fn collect_discard_subnodes(
     stats: Arc<CommitStats>,
 ) -> Result<(), CommitError> {
     lore_trace!("Committing raw deletion of node {node_id} children");
-
-    debug_assert!({
-        let node = state
-            .node(repository.clone(), node_id)
-            .await
-            .forward::<CommitError>("Failed deserializing state block")?;
-        node.is_directory()
-    });
-    let mut iter = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?;
-    while let Some((child_node_id, _child_node)) = iter
-        .next()
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?
-    {
-        lore_trace!("Committing raw deletion of node {child_node_id}");
-        let delta = delta.clone();
-        let subnodes_to_discard = subnodes_to_discard.clone();
-        let stats = stats.clone();
-        state::node_discard_nopatch(
-            state.clone(),
-            repository.clone(),
-            child_node_id,
-            true,
-            false,
-            move |discarded_node_id, flags| {
-                delta_add(delta.clone(), discarded_node_id, flags);
-                subnodes_to_discard.write().push(discarded_node_id);
-                if flags & NodeFlags::File != 0 {
-                    stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats
-                        .complete
-                        .directory_total
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            },
-        )
-        .await
-        .forward::<CommitError>("Failed discarding node staged for delete")?;
-    }
-
-    Ok(())
+    state::node_discard_walk(
+        state,
+        repository,
+        node_id,
+        move |discarded_node_id, flags| {
+            lore_trace!("Committing raw deletion of node {discarded_node_id}");
+            delta_add(delta.clone(), discarded_node_id, flags);
+            subnodes_to_discard.write().push(discarded_node_id);
+            if flags & NodeFlags::File != 0 {
+                stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats
+                    .complete
+                    .directory_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        },
+    )
+    .await
+    .forward::<CommitError>("Failed discarding node staged for delete")
 }
 
-async fn commit_discard_subnodes(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    subnodes_to_discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
-    stats: Arc<CommitStats>,
-) -> Result<(), CommitError> {
-    let subnodes_to_discard = {
-        let lock = subnodes_to_discard.read();
-        lock.clone()
-    };
-
-    let mut tasks = JoinSet::new();
-
-    for subnode_to_discard in subnodes_to_discard.iter() {
-        lore_spawn!(tasks, {
-            let state = state.clone();
-            let repository = repository.clone();
-            let node_to_discard = *subnode_to_discard;
-            let stats = stats.clone();
-            async move {
-                state::node_discard_nopatch(
-                    state,
-                    repository,
-                    node_to_discard,
-                    false,
-                    true,
-                    move |_discarded_node_id, flags| {
-                        if flags & NodeFlags::File != 0 {
-                            stats.complete.file_count.fetch_add(1, Ordering::Release);
-                            stats
-                                .complete
-                                .file_delete_count
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            stats
-                                .complete
-                                .directory_count
-                                .fetch_add(1, Ordering::Release);
-                            stats
-                                .complete
-                                .directory_delete_count
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    },
-                )
-                .await
-                .forward::<CommitError>("Failed discarding node staged for delete")
-            }
-        });
-    }
-
-    // Wait for all tasks to finish and gather any errors
-    let mut task_failure = Ok(());
-    let mut commit_failure = Ok(state::DiscardCounts::default());
-    while let Some(task) = tasks.join_next().await {
-        if let Ok(result) = task {
-            if result.is_err() {
-                commit_failure = result;
-            }
-        } else {
-            task_failure = Err(task.unwrap_err());
-        }
-    }
-    commit_failure?;
-    task_failure.internal("Recursion task failed")?;
-
-    Ok(())
-}
-
+/// Frees the nodes staged for deletion, `discard`, and the nodes below them a walk collected,
+/// `subnodes_to_discard`, recording each root in the delta: each root is detached before anything
+/// below it is freed (H6).
 async fn commit_discard(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
-    discard: Arc<parking_lot::RwLock<Vec<u32>>>,
+    discard: &parking_lot::RwLock<Vec<NodeID>>,
+    subnodes_to_discard: &parking_lot::RwLock<Vec<NodeID>>,
     stats: Arc<CommitStats>,
 ) -> Result<(), CommitError> {
-    let nodes = {
-        let lock = discard.read();
-        lock.clone()
-    };
-    if nodes.is_empty() {
+    let roots = std::mem::take(&mut *discard.write());
+    if roots.is_empty() {
         return Ok(());
     }
+    let collected = std::mem::take(&mut *subnodes_to_discard.write());
 
-    lore_debug!("Committing patched deletions of {} nodes", nodes.len());
+    lore_debug!(
+        "Committing deletions of {} nodes and {} below them",
+        roots.len(),
+        collected.len()
+    );
 
-    for node_id in nodes.iter() {
-        lore_trace!("Committing patched deletion of node {}", *node_id);
-        let delta = delta.clone();
-        let stats = stats.clone();
-        state::node_discard_patch(
-            state.clone(),
-            repository.clone(),
-            *node_id,
-            move |discarded_node_id, flags| {
-                delta_add(delta.clone(), discarded_node_id, flags);
-                if flags & NodeFlags::File != 0 {
-                    stats.complete.file_count.fetch_add(1, Ordering::Release);
-                    stats
-                        .complete
-                        .file_delete_count
-                        .fetch_add(1, Ordering::Relaxed);
-                } else {
-                    stats
-                        .complete
-                        .directory_count
-                        .fetch_add(1, Ordering::Release);
-                    stats
-                        .complete
-                        .directory_delete_count
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            },
-        )
-        .await
-        .forward::<CommitError>("Failed discarding node staged for delete")?;
-    }
+    let counts = state::node_discard_free(&state, &repository, &roots, collected, |root, flags| {
+        lore_trace!("Committing deletion of node {root}");
+        delta_add(delta.clone(), root, flags);
+    })
+    .await
+    .forward::<CommitError>("Failed discarding nodes staged for delete")?;
+    let complete = &stats.complete;
+    complete
+        .file_count
+        .fetch_add(counts.file_count, Ordering::Release);
+    complete
+        .file_delete_count
+        .fetch_add(counts.file_count, Ordering::Relaxed);
+    complete
+        .directory_count
+        .fetch_add(counts.directory_count, Ordering::Release);
+    complete
+        .directory_delete_count
+        .fetch_add(counts.directory_count, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2580,7 +2487,7 @@ async fn commit_execute(
     while let Some(file_to_commit) = file_rx.recv().await {
         lore_spawn!(
             tasks,
-            commit_file(
+            crate::subtask!(commit_file(
                 operation.clone(),
                 repository.clone(),
                 state.clone(),
@@ -2590,7 +2497,7 @@ async fn commit_execute(
                 stats.clone(),
                 tracker.clone(),
                 modified_times.clone(),
-            )
+            ))
         );
 
         while let Some(result) = tasks.try_join_next() {
@@ -2780,37 +2687,17 @@ fn commit_file(
             let flags = node.flags;
             delta_add(delta, node_id, flags);
 
-            let block_dirtied = {
-                let mut block_writer = block.write();
-                let node = block_writer.node(node_index);
-
-                node.address = address;
-                node.size = content_size;
-                node.mode = mode;
-                node.child = 0;
-
-                node.clear_all_change_flags();
-
-                block_writer.mark_dirty()
-            };
-            if block_dirtied {
-                state.block_modified(block.clone(), block_index);
-                state.mark_dirty();
-            }
+            state.node_change_owned(&block, node_id, |held| {
+                if !held.clear_change_flags() {
+                    return false;
+                }
+                held.overwrite_content(address, content_size, mode);
+                held.clear_legacy_mtime();
+                true
+            });
         } else if node.is_staged() {
             lore_trace!("Reset staged flag on node {} {}", node_id, relative_path);
-
-            let block_dirtied = {
-                let mut block_writer = block.write();
-                let node = block_writer.node(node_index);
-                node.clear_all_change_flags();
-
-                block_writer.mark_dirty()
-            };
-            if block_dirtied {
-                state.block_modified(block.clone(), block_index);
-                state.mark_dirty();
-            }
+            state.node_clear_own(&block, node_id, OwnFlags::Change);
         }
 
         if let Some(modified_time) = modified_time {
@@ -2860,18 +2747,7 @@ async fn commit_link_node(
         lore_trace!("Reset staged add flag on link node {relative_path}");
 
         delta_add(delta, node_id, node.flags);
-
-        let block_dirtied = {
-            let mut block_writer = block.write();
-            let node = block_writer.node(node_index);
-            node.clear_all_change_flags();
-
-            block_writer.mark_dirty()
-        };
-        if block_dirtied {
-            state.block_modified(block.clone(), block_index);
-            state.mark_dirty();
-        }
+        state.node_clear_own(&block, node_id, OwnFlags::Change);
         return Ok(());
     }
 
@@ -2938,17 +2814,10 @@ async fn commit_link_node(
     delta_add(delta, node_id, node.flags);
 
     // Clear staged bits before updating the link pin
-    let block_dirtied = {
-        let mut block_writer = block.write();
-        let node = block_writer.node(node_index);
-        node.flags &= !NodeFlags::StagedBits;
-        block_writer.mark_dirty()
-    };
-
-    if block_dirtied {
-        state.block_modified(block.clone(), block_index);
-        state.mark_dirty();
-    }
+    state.node_change_owned(&block, node_id, |held| {
+        held.clear_staged_and_action_bits();
+        true
+    });
 
     link::update_link_pin_by_node(
         &state,
@@ -3071,7 +2940,12 @@ async fn commit_link(
                     // Own budget per linked sub-repo, isolated from the parent's.
                     dir_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS)),
                 });
-                lore_spawn!(commit_directory(walk, relative_path, node_id, None))
+                lore_spawn!(crate::subtask!(commit_directory(
+                    walk,
+                    relative_path,
+                    node_id,
+                    None
+                )))
             };
 
             let consumer = {
@@ -3082,7 +2956,7 @@ async fn commit_link(
                 let stats = stats.clone();
                 let tracker = work_tracker.clone();
                 let modified_times = link_modified_times.clone();
-                lore_spawn!(async move {
+                lore_spawn!(crate::subtask!(async move {
                     commit_execute(
                         operation,
                         file_rx,
@@ -3094,24 +2968,17 @@ async fn commit_link(
                         modified_times,
                     )
                     .await
-                })
+                }))
             };
 
             join_commit_tasks(producer, consumer).await?;
-
-            commit_discard_subnodes(
-                repository.clone(),
-                state.clone(),
-                subnodes_to_discard.clone(),
-                stats.clone(),
-            )
-            .await?;
 
             commit_discard(
                 repository.clone(),
                 state.clone(),
                 delta.clone(),
-                discard.clone(),
+                &discard,
+                &subnodes_to_discard,
                 stats.clone(),
             )
             .await?;
@@ -3352,7 +3219,12 @@ pub async fn rehash_directory(
             child_data.push(child);
             lore_spawn!(
                 tasks,
-                rehash_directory_recurse(repository.clone(), state.clone(), child_node_id, index)
+                crate::subtask!(rehash_directory_recurse(
+                    repository.clone(),
+                    state.clone(),
+                    child_node_id,
+                    index
+                ))
             );
         } else {
             if child_node.is_staged() {
@@ -3429,30 +3301,22 @@ pub async fn rehash_directory(
     }
     let blake3_hash = hasher.finalize();
 
-    let block_dirtied = {
-        let mut block_writer = block.write();
-        let node = block_writer.node(node_index);
-        let prev_hash = node.address.hash;
-        node.address.hash = Hash::from(*blake3_hash.as_bytes());
-        node.size = total_size;
-        node.flags &= !NodeFlags::StagedBits;
+    state.node_change_owned(&block, node_id, |held| {
+        let prev_hash = held.address.hash;
+        held.set_hash_and_size(Hash::from(*blake3_hash.as_bytes()), total_size);
+        held.clear_staged_and_action_bits();
 
         lore_trace!(
             "Node {} rehashed, mode 0o{:o} size {} flags 0x{:x} hash {} (previous {})",
             node_id,
-            node.mode,
-            node.size,
-            node.flags,
-            node.address.hash,
+            held.mode,
+            held.size,
+            held.flags,
+            held.address.hash,
             prev_hash
         );
-
-        block_writer.mark_dirty()
-    };
-    if block_dirtied {
-        state.block_modified(block.clone(), block_index);
-        state.mark_dirty();
-    }
+        true
+    });
 
     Ok(())
 }
@@ -3712,7 +3576,6 @@ pub(crate) async fn weave_history(
 
                 if dirtied {
                     state.block_file_metadata_modified(file_metadata_block, block_index);
-                    state.mark_dirty();
                 }
             }
         }
@@ -3794,7 +3657,6 @@ pub(crate) async fn weave_history(
 
             if dirtied {
                 state.block_file_metadata_modified(file_metadata_block, block_index);
-                state.mark_dirty();
             }
 
             idelta += 1;
@@ -3928,7 +3790,6 @@ async fn copy_first_parent_history(
     };
     if dirtied {
         state.block_file_metadata_modified(block, block_index);
-        state.mark_dirty();
     }
     Ok(())
 }
@@ -3964,7 +3825,6 @@ fn record_first_parent_change(
 
     if dirtied {
         state.block_file_metadata_modified(block, block_index);
-        state.mark_dirty();
     }
 }
 
@@ -4157,7 +4017,7 @@ pub async fn prepare_commit_metadata(
 /// recursion, so no node is boxed and the thread's stack does not grow with the
 /// tree's depth.
 ///
-/// Only dirty children are descended into: `node_mark_dirty` propagates the
+/// Only dirty children are descended into: `node_mark` propagates the
 /// base Dirty bit up to the root, so a clean child cannot have dirty
 /// descendants (the same invariant `collect_dirty_paths` walks by). Clean
 /// subtrees are untouched — in particular a clean committed empty directory
@@ -4209,7 +4069,7 @@ struct PruneLevel {
     /// The next child to visit, invalid once every child has been, and from the start for a node
     /// that is not a directory.
     next_child: NodeID,
-    /// The children found to be patch-discarded, in the order visited.
+    /// The children found to be discarded, in the order visited.
     to_discard: Vec<NodeID>,
 }
 
@@ -4230,9 +4090,9 @@ impl PruneLevel {
     }
 }
 
-/// Leaves a node of [`prune_dirty_for_commit`] once its children have been: patch-discards the
-/// children found to be discarded, clears its dirty flags unless it is an unstaged dirty add to be
-/// discarded, and returns `true` when its parent should patch-discard it from its child chain.
+/// Leaves a node of [`prune_dirty_for_commit`] once its children have been: discards the
+/// children found to be discarded, each with its subtree, clears its dirty flags unless it is an
+/// unstaged dirty add to be discarded, and returns `true` when its parent should discard it.
 ///
 /// `clear_dirty_flags` preserves Staged and the action bits when Staged is set,
 /// so clearing both restores dirty-only nodes and strips a stale Dirty
@@ -4252,9 +4112,9 @@ async fn prune_dirty_leave(
         ..
     } = level;
     for discard_id in to_discard {
-        state::node_discard_patch(state.clone(), repository.clone(), discard_id, |_, _| {})
+        state::node_discard_fused(state.clone(), repository.clone(), discard_id)
             .await
-            .forward::<CommitError>("Failed patch-discarding dirty node")?;
+            .forward::<CommitError>("Failed discarding dirty node")?;
     }
 
     let node_index = Node::index(node_id);
@@ -4279,15 +4139,7 @@ async fn prune_dirty_leave(
         if let Some(link) = link.filter(|_| !is_staged) {
             restore_committed_link_pin(state, repository, node_id, link).await?;
         }
-        let dirtied = {
-            let mut block_writer = block.write();
-            let node = block_writer.node(node_index);
-            node.clear_dirty_flags();
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            state.block_modified(block.clone(), NodeBlock::index(node_id));
-        }
+        state.node_clear_own(&block, node_id, OwnFlags::Dirty);
     }
 
     if is_staged {
@@ -4533,6 +4385,18 @@ pub async fn commit_in_memory_revision(
         .await
         .map_err(InMemoryCommitFailure::rejected)?;
 
+    // The subtrees C API deletes detached, and every slot a dropped or failed call left detached
+    // or in flight, freed after the last refusal and before the snapshot (C15): a commit refused
+    // frees nothing, and the snapshot holds no slot left to free. A drain that fails before its
+    // frees frees nothing, and its frees find every block its walk held; a snapshot that fails
+    // after it refuses the commit with them freed, which takes nothing a caller reaches, as a
+    // pending node reads as a freed one already, and no caller holds a detached one.
+    state_staged
+        .node_sweep_detached(&repository)
+        .await
+        .forward::<CommitError>("Failed to free the deleted subtrees")
+        .map_err(InMemoryCommitFailure::rejected)?;
+
     state_staged.mark_dirty();
     let restore_from = state_staged
         .serialize(repository.clone(), token)
@@ -4663,23 +4527,46 @@ fn metadata_is_empty(metadata: &Metadata) -> bool {
 /// and link following is unbounded, so a cyclic link would hang here before the
 /// commit had looked at anything. The iterator neither allocates nor descends into
 /// a link, and carries the node so there is no second read per child.
+///
+/// Where a C API change failed or was dropped after its climb began
+/// ([`State::has_unfinished_change`]), a staged directory may hold no change, so only a node
+/// carrying an action or a merge's state counts: the walk descends staged directories until it
+/// meets one. Without an unfinished change, any staged child of the root answers, so an add then
+/// a delete below a tracked directory, which leaves the directory staged, still commits.
 async fn has_staged_children(
     repository: Arc<RepositoryContext>,
     state: &Arc<State>,
 ) -> Result<bool, CommitError> {
-    let mut children = StateNodeChildrenIterator::new(state.clone(), repository, ROOT_NODE)
-        .await
-        .forward::<CommitError>("Failed deserializing state node block")?;
-    while let Some((_child_node_id, child_node)) = children
-        .next()
-        .await
-        .forward::<CommitError>("Failed deserializing state node block")?
-    {
-        if child_node.is_staged() {
-            return Ok(true);
+    let actions_only = state.has_unfinished_change();
+    let mut pending = Vec::new();
+    let mut parent = ROOT_NODE;
+    loop {
+        let mut children =
+            StateNodeChildrenIterator::new(state.clone(), repository.clone(), parent)
+                .await
+                .forward::<CommitError>("Failed deserializing state node block")?;
+        while let Some((child_node_id, child_node)) = children
+            .next()
+            .await
+            .forward::<CommitError>("Failed deserializing state node block")?
+        {
+            if !child_node.is_staged() {
+                continue;
+            }
+            if !actions_only
+                || child_node.flags & (NodeFlags::ActionBits | NodeFlags::MergeBits).bits() != 0
+            {
+                return Ok(true);
+            }
+            if child_node.is_directory() {
+                pending.push(child_node_id);
+            }
+        }
+        match pending.pop() {
+            Some(next) => parent = next,
+            None => return Ok(false),
         }
     }
-    Ok(false)
 }
 
 /// Freeze the staged tree into the shape a revision records: dirty tracking
@@ -4716,19 +4603,12 @@ async fn freeze_in_memory_tree(
     })
     .send();
 
-    commit_discard_subnodes(
-        repository.clone(),
-        state.clone(),
-        subnodes_to_discard,
-        stats.clone(),
-    )
-    .await?;
-
     commit_discard(
         repository.clone(),
         state.clone(),
         delta.clone(),
-        discard,
+        &discard,
+        &subnodes_to_discard,
         stats.clone(),
     )
     .await?;
@@ -4771,24 +4651,16 @@ async fn freeze_directory(
 ) -> Result<(), CommitError> {
     let mut pending = vec![node_id];
     while let Some(node_id) = pending.pop() {
-        let parent = state
-            .node(repository.clone(), node_id)
-            .await
-            .forward::<CommitError>("Failed deserializing state block")?;
+        let (parent, mut children) =
+            StateNodeChildrenIterator::with_parent(state.clone(), repository.clone(), node_id)
+                .await
+                .forward::<CommitError>("Failed deserializing state block")?;
         if parent.is_staged() {
             delta_add(delta.clone(), node_id, parent.flags);
         }
 
         let first_subdirectory = pending.len();
         let mut updated = false;
-        let mut children = StateNodeChildrenIterator::from_parent(
-            state.clone(),
-            repository.clone(),
-            node_id,
-            &parent,
-        )
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?;
         while let Some((child_node_id, child_node)) = children
             .next()
             .await
@@ -4869,14 +4741,6 @@ async fn freeze_node(
         .block(repository, block_index)
         .await
         .forward::<CommitError>("Failed deserializing state block")?;
-    let dirtied = {
-        let mut writer = block.write();
-        writer.node(Node::index(node_id)).clear_all_change_flags();
-        writer.mark_dirty()
-    };
-    if dirtied {
-        state.block_modified(block, block_index);
-        state.mark_dirty();
-    }
+    state.node_clear_own(&block, node_id, OwnFlags::Change);
     Ok(())
 }

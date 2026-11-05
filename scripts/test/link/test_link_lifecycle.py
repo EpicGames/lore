@@ -16,7 +16,7 @@ from link_helpers import (
     make_repo_renumbering_folder,
 )
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import unstaged_entries
+from test_utils import has_staged_anchor, status_by_path, unstaged_entries
 
 from lore import Lore
 
@@ -1076,6 +1076,34 @@ def test_link_add_remove(new_lore_repo):
     )
     assert main_repo.compare_file(main_repo, expected_file2), (
         "Re-materialized file 2 content should match"
+    )
+    entries = status_by_path(main_repo)
+    assert entries == {}, (
+        f"Expected the unstaged removal to leave nothing staged or dirty, got: {entries}"
+    )
+    assert not has_staged_anchor(main_repo), (
+        "Expected the unstaged removal to leave no staged state"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.xfail(
+    strict=True,
+    reason="unstaging the removal of a link below a directory leaves the link staged as "
+    "deleted and dirty, where the same unstage of a top-level link restores it",
+)
+def test_link_unstage_of_a_nested_link_removal_leaves_nothing(new_lore_repo):
+    """Unstaging the removal of a committed link below a directory restores the link and leaves
+    no directory above it dirty, so no staged state is left."""
+    parent_repo, _ = make_parent_with_link(new_lore_repo)
+    parent_repo.link_remove(DEFAULT_LINK_MOUNT)
+
+    parent_repo.unstage(DEFAULT_LINK_MOUNT)
+
+    entries = status_by_path(parent_repo)
+    assert entries == {}, f"Expected nothing staged or dirty, got: {entries}"
+    assert not has_staged_anchor(parent_repo), (
+        "Expected the unstaged removal to leave no staged state"
     )
 
 

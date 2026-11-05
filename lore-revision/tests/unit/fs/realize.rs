@@ -14,9 +14,11 @@ use lore_revision::node::Node;
 use lore_revision::node::NodeFileMode;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::sync::SyncError;
 use lore_revision::state;
+use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
 use lore_revision::util;
@@ -25,6 +27,8 @@ use lore_revision::util::path::RelativePathBuf;
 use lore_storage::hash;
 use zerocopy::FromZeros;
 
+use crate::helper::in_memory::directory;
+use crate::helper::in_memory::file;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;
@@ -186,8 +190,87 @@ async fn record_time(repository: &Arc<RepositoryContext>, path: &RelativePath) {
     state::file_modified_time_store(repository.clone(), path, info.mtime()).await;
 }
 
-/// A file the branch never touched, holding what the current revision says it should.
-/// The merge has to be free to overwrite it.
+/// Adds what `make` makes of `name` below `parent`, clean.
+async fn add_clean(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    parent: NodeID,
+    (make, name): (fn(&str) -> Node, &str),
+) -> NodeID {
+    state
+        .node_add(repository.clone(), parent, make(name), name)
+        .await
+        .expect("the node adds")
+}
+
+/// A state holding `dir/keep.txt`, `dir/a.txt` and `other/`, clean, and `dir`'s id.
+async fn dir_and_other(repository: &Arc<RepositoryContext>) -> (Arc<State>, NodeID) {
+    let state = State::new();
+    let dir = add_clean(repository, &state, ROOT_NODE, (directory, "dir")).await;
+    add_clean(repository, &state, dir, (file, "keep.txt")).await;
+    add_clean(repository, &state, dir, (file, "a.txt")).await;
+    add_clean(repository, &state, ROOT_NODE, (directory, "other")).await;
+    (state, dir)
+}
+
+/// The realized move of `dir/a.txt` to `other/a.txt` in `state`.
+async fn realize_move_of_a(repository: &Arc<RepositoryContext>, state: &Arc<State>) {
+    let relative = |path: &str| RelativePath::new_from_initial_path(path).expect("the path");
+    let from = state
+        .find_node_link(repository.clone(), "dir/a.txt")
+        .await
+        .expect("dir/a.txt")
+        .node;
+    relink_moved_node(
+        state,
+        repository,
+        &relative("dir/a.txt"),
+        from,
+        &relative("other/a.txt"),
+        false,
+    )
+    .await
+    .expect("the realized move");
+}
+
+/// A realized move of a file out of a directory stages the directory it left: its children
+/// changed, so the commit rehashes it, which it skips for a directory not staged.
+#[tokio::test]
+async fn a_realized_move_out_of_a_directory_stages_the_one_it_left() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let (state, from) = dir_and_other(&repository).await;
+
+        realize_move_of_a(&repository, &state).await;
+
+        let left = state.node(repository.clone(), from).await.expect("dir");
+        assert!(left.is_staged(), "flags {:#x}", left.flags);
+    }))
+    .await;
+}
+
+/// A realized move of a file out of a directory staged as moved keeps that directory's move: the
+/// mark of the directory it left sets the base bit alone, where it is not set.
+#[tokio::test]
+async fn a_realized_move_out_of_a_moved_directory_keeps_its_move() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let (state, from) = dir_and_other(&repository).await;
+        state
+            .node_mark(&repository, from, Mark::staged(NodeFlags::StagedMove, true))
+            .await
+            .expect("dir staged as moved");
+
+        realize_move_of_a(&repository, &state).await;
+
+        let left = state.node(repository.clone(), from).await.expect("dir");
+        assert!(left.is_staged_move(), "flags {:#x}", left.flags);
+    }))
+    .await;
+}
+
 /// A scratch write reaches the filesystem directly, so a path in the tracked tree has to
 /// be refused: the provider may be virtualizing what is under the root, and a direct
 /// write would go behind it.
@@ -218,6 +301,8 @@ async fn a_scratch_path_inside_the_repository_is_refused() {
     .await;
 }
 
+/// A file the branch never touched, holding what the current revision says it should.
+/// The merge has to be free to overwrite it.
 #[tokio::test]
 async fn a_clean_file_is_overwritten() {
     Box::pin(with_execution(async {

@@ -52,6 +52,28 @@ cargo test --release
 uv run pytest scripts/test/ --lore-client-binary=release --lore-server-binary=release
 ```
 
+### The State node operations' scenarios
+
+When a change touches the State's implementation, `lore-revision/src/state.rs` and `lore-revision/src/state/` with the node module in `state/node/`, or the scenarios of its node operations and the stress harness they share, also run those scenarios and lint them. Other changes need neither. The scenarios live in `lore-revision/tests/state_scenarios/`, and those that run the C API's verbs in `lore/tests/state_scenarios/`. They drive the node operations through scheduling hooks built into `lore-revision`, so each builds only with its package's `state-stress` feature: neither a plain `cargo test` nor the pre-commit hook's clippy reaches them, and a plain run tests the build that ships.
+
+```bash
+# The State node operations' deterministic scenarios, and their lint
+cargo test --release -p lore-revision --features state-stress --test state_scenarios
+cargo test --release -p lore --features state-stress --test state_scenarios
+cargo clippy -p lore-revision --features state-stress --all-targets -- -D warnings --no-deps
+cargo clippy -p lore --features state-stress --all-targets -- -D warnings --no-deps
+```
+
+Their scenarios explore every interleaving they can, or every one within a preemption bound, so the run takes several minutes. An exploration stops at a wall budget only to guard against a hang: an hour by default, set in seconds by `LORE_STATE_TESTS_BUDGET_SECONDS`. One that stops there fails, since its coverage is incomplete.
+
+The scenarios cover the interleavings written for them. A change to the node operations, in `state/node/`, also runs a chaos campaign of the stress suite, which finds others: mixes of the operations run more at once than production runs them, on threads that yield at random scheduling points and on random settings, and every run is checked against the contract. `scripts/state-stress/README.md` covers its modes and options.
+
+```bash
+# A chaos campaign of the State node operations, after building the stress harness
+python3 scripts/state-stress/stress.py build
+python3 scripts/state-stress/stress.py chaos --minutes 30
+```
+
 ---
 
 ## 2. Rust unit tests
@@ -474,7 +496,13 @@ Lore has a load-testing suite that exercises concurrent clone, commit, sync, loc
 
 ---
 
-## 6. Best practices
+## 6. Instruction counts
+
+Wall-clock benchmarks on a shared machine vary by more than the regressions worth catching on a hot path, so gate a change to the State's node operations or the C API's revision-tree verbs on instruction counts instead. `scripts/instruction-gate/gate.py <base> <change>` builds every workload of `state_bench` and `revision_tree_bench` alone in each of two checkouts, counts the user-mode instructions it retires per operation on a hardware counter, and fails a workload that costs more than 0.5% over the base. It runs by hand on a physical Linux machine, since most virtual machines expose no counter. `scripts/instruction-gate/README.md` covers its requirements, options and output, and how to find what moved.
+
+---
+
+## 7. Best practices
 
 1. **Target risk, not line count** — spend test effort on business logic; leave plumbing and trivial code with few or no tests.
 2. **All Lore commands must have smoke tests** in `scripts/test/`.

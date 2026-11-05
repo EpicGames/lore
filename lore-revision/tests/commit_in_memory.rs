@@ -19,6 +19,7 @@ mod tests {
     use lore_revision::metadata::Metadata;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::state::Mark;
     use lore_revision::state::State;
     use lore_revision::state::StateNodeChildrenIterator;
     use lore_storage::hash::hash_string;
@@ -526,6 +527,83 @@ mod tests {
                     .find_node_link(repository, "keep.bin")
                     .await
                     .expect("its sibling must survive");
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// A deletion staged over a merge conflict resolved meanwhile keeps the resolution, so the
+    /// freeze, which refuses an unresolved conflict anywhere, drops the node and commits.
+    #[tokio::test]
+    async fn commit_in_memory_revision_drops_a_resolved_conflict_staged_for_deletion() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = State::new();
+                add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    file("go.bin"),
+                    "go.bin",
+                )
+                .await;
+                let first = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state.clone(),
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect("the first revision must commit");
+
+                let going = state
+                    .find_node_link(repository.clone(), "go.bin")
+                    .await
+                    .expect("the file must resolve")
+                    .node;
+                state
+                    .node_mark(
+                        &repository,
+                        going,
+                        Mark::staged(
+                            NodeFlags::StagedMergeResolved | NodeFlags::StagedMergeTheirs,
+                            true,
+                        ),
+                    )
+                    .await
+                    .expect("the resolution");
+                state
+                    .node_delete(repository.clone(), going)
+                    .await
+                    .expect("staging the deletion must succeed");
+
+                let second = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state,
+                    metadata_on(branch),
+                    first,
+                    branch,
+                )
+                .await
+                .expect("the deletion of a resolved conflict must commit");
+
+                let published = State::deserialize(repository.clone(), second)
+                    .await
+                    .expect("the committed revision must deserialize");
+                assert!(
+                    published
+                        .find_node_link(repository, "go.bin")
+                        .await
+                        .is_err(),
+                    "the deleted node must not survive the commit"
+                );
             }))
             .await
             .expect("Task failed");
@@ -1194,11 +1272,13 @@ mod tests {
                     let node_id =
                         add(&state, repository.clone(), ROOT_NODE, conflicted, "node").await;
                     state
-                        .node_mark_staged(
-                            repository.clone(),
+                        .node_mark(
+                            &repository,
                             node_id,
-                            NodeFlags::StagedMergeConflict,
-                            NodeFlags::NoFlags,
+                            Mark::staged_and_dirty(
+                                NodeFlags::StagedMergeConflict,
+                                NodeFlags::NoFlags,
+                            ),
                         )
                         .await
                         .expect("marking the conflict must succeed");

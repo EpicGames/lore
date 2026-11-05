@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 """Shared test utility functions."""
 
+import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -76,6 +77,20 @@ def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
     return {
         e.get("path"): e for e in parse_status_json(repo.status(json=True, **kwargs))
     }
+
+
+def has_staged_anchor(repo: "Lore") -> bool:
+    """Whether `status` reports a staged revision, the state every staged or dirty mark lives in."""
+    zero_hash = "0" * 64
+    for line in repo.status(json=True, offline=True).splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        revision_staged = event.get("data", {}).get("revisionStaged", "")
+        if revision_staged and revision_staged != zero_hash:
+            return True
+    return False
 
 
 def revision_metadata_keys(repo: "Lore") -> set[str]:

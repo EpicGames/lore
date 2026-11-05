@@ -718,7 +718,6 @@ pub async fn store_dependency_data(
 
         if dirtied {
             state.block_file_metadata_modified(metadata_block, metadata_block_index);
-            state.mark_dirty();
         }
 
         break;

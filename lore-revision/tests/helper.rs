@@ -130,7 +130,7 @@ pub struct TestRepository {
     pub repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
     pub write_token: lore_revision::repository::RepositoryWriteToken,
     pub path: std::path::PathBuf,
-    _tempdir: TempDir,
+    pub(crate) _tempdir: TempDir,
 }
 
 /// Creates a repository backed by `immutable_store` and `mutable_store` in a
@@ -915,6 +915,7 @@ pub mod in_memory {
     use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::Mark;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
 
@@ -992,7 +993,11 @@ pub mod in_memory {
             .await
             .expect("adding the node must succeed");
         state
-            .node_mark_staged(repository, node_id, staged, NodeFlags::DirtyAdd)
+            .node_mark(
+                &repository,
+                node_id,
+                Mark::staged_and_dirty(staged, NodeFlags::DirtyAdd),
+            )
             .await
             .expect("marking the addition must succeed");
         node_id
@@ -1030,4 +1035,57 @@ pub mod in_memory {
             .await
             .expect("deserializing the revision must succeed")
     }
+}
+
+/// Every slot of `state` that holds no node a chain from the root reaches and is not on its
+/// block's free list: what a discard leaked. A link's `child` names a node of the linked State,
+/// so a link is not descended. Loads every block.
+#[allow(dead_code)]
+pub async fn test_leaked_slots(
+    state: &std::sync::Arc<lore_revision::state::State>,
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+) -> Vec<lore_revision::node::NodeID> {
+    use lore_revision::node::BLOCK_NODE_COUNT;
+    use lore_revision::node::ROOT_NODE;
+    let mut reached = std::collections::BTreeSet::from([ROOT_NODE]);
+    let mut pending = vec![ROOT_NODE];
+    while let Some(directory) = pending.pop() {
+        let children = state
+            .node_children(repository.clone(), directory)
+            .await
+            .expect("a directory's children");
+        for child in children {
+            reached.insert(child);
+            let node = state
+                .node(repository.clone(), child)
+                .await
+                .expect("a child reads");
+            if node.is_directory() && !node.is_link() {
+                pending.push(child);
+            }
+        }
+    }
+    let mut leaked = Vec::new();
+    for block_index in 0..state.block_count() {
+        let block = state
+            .block(repository.clone(), block_index)
+            .await
+            .expect("a block loads");
+        let reader = block.read();
+        let data = reader.node_block();
+        let mut free = std::collections::BTreeSet::new();
+        let mut at = data.node_unused as usize;
+        for _ in 0..data.node_unused_count {
+            free.insert(at);
+            at = data.node[at].sibling as usize;
+        }
+        for index in (0..data.node_count as usize).filter(|index| !free.contains(index)) {
+            let id = lore_revision::node::NodeID::try_from(block_index * BLOCK_NODE_COUNT + index)
+                .expect("a node id");
+            if !reached.contains(&id) {
+                leaked.push(id);
+            }
+        }
+    }
+    leaked
 }

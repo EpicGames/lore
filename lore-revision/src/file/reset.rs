@@ -56,6 +56,7 @@ use crate::revision;
 use crate::revision::sync::SyncRealizeStats;
 use crate::runtime::execution_context;
 use crate::state;
+use crate::state::Clear;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -1406,24 +1407,33 @@ async fn reset_walk_named_path(
                 .find_node_link(repository.clone(), state_path.as_str())
                 .await
             {
-                let staged_node = state_staged
+                // The flags alone, so the record is not held across the awaits below.
+                let (staged, dirty_add, link, directory) = state_staged
                     .node(repository.clone(), staged_link.node)
                     .await
-                    .forward::<ResetError>("Failed to find staged node")?;
+                    .forward::<ResetError>("Failed to find staged node")
+                    .map(|node| {
+                        (
+                            node.is_staged(),
+                            node.is_dirty_add(),
+                            node.is_link(),
+                            node.is_directory(),
+                        )
+                    })?;
 
                 // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
                 // store, so the link is still staged here.
-                if staged_node.is_link() && execution_context().globals().dry_run() {
+                if link && execution_context().globals().dry_run() {
                     return Ok(());
                 }
-                if staged_node.is_staged() {
+                if staged {
                     return Err(InvalidArguments {
                         reason: "Failed to reset staged node".into(),
                     }
                     .into());
                 }
 
-                if staged_node.is_dirty_add() {
+                if dirty_add {
                     lore_trace!(
                         "Reset dirty add {}, discarding staged node and keeping the file",
                         relative_path.as_str()
@@ -1438,7 +1448,7 @@ async fn reset_walk_named_path(
                         execution_context().globals().force(),
                         parent_states,
                         &relative_path,
-                        staged_node.is_directory(),
+                        directory,
                         FilterMode::View,
                     );
                     delete_path = !excluded;
@@ -1471,12 +1481,7 @@ async fn replacing_dirty_add(
         return Ok(None);
     }
     let Some(sibling) = state_staged
-        .find_subnode_added_since(
-            repository.clone(),
-            staged_node.parent,
-            Some(node_id),
-            name_hash,
-        )
+        .find_subnode_ahead_of(repository.clone(), staged_node.parent, node_id, name_hash)
         .await
         .forward::<ResetError>("Failed to search the staged siblings")?
     else {
@@ -1631,19 +1636,28 @@ async fn reset_walk_node(
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
-    if let Ok(staged_block) = state_staged.block(repository.clone(), block_index).await {
-        let staged_node = staged_block.node(node_index);
-        if staged_node.is_staged() {
+    // The flags alone, so neither the block nor the record is held across the clear below.
+    let staged_flags = state_staged
+        .block(repository.clone(), block_index)
+        .await
+        .ok()
+        .map(|staged_block| {
+            let staged_node = staged_block.node(node_index);
+            (staged_node.is_staged(), staged_node.is_dirty())
+        });
+    if let Some((staged, dirty)) = staged_flags {
+        if staged {
             return Err(InvalidArguments {
                 reason: "Failed to reset staged node".into(),
             }
             .into());
         }
 
-        // Clear Dirty flag if set (reset restores file to current revision)
-        if staged_node.is_dirty() {
+        // Clear Dirty flag if set (reset restores file to current revision), then a dirty clear's
+        // climb clears each parent that nothing below keeps dirty, up to one already clean.
+        if dirty {
             state_staged
-                .node_clear_dirty(repository.clone(), node_id)
+                .node_clear(&repository, node_id, Clear::Dirty)
                 .await
                 .forward::<ResetError>("Failed to clear the dirty flags")?;
         }

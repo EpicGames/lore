@@ -874,6 +874,15 @@ impl RelativePath {
         covers_impl(self.as_lowercase_str(), child.as_lowercase_str())
     }
 
+    /// Returns `true` if `self` is strictly below `ancestor`, on the lowercased forms as
+    /// [`covers_ignore_case`](Self::covers_ignore_case) compares them. Unlike
+    /// [`below`](Self::below), `ancestor` itself is not below it, and an empty `ancestor` has
+    /// nothing below it.
+    pub fn is_below_ignore_case(&self, ancestor: &RelativePath) -> bool {
+        let (ancestor, path) = (ancestor.as_lowercase_str(), self.as_lowercase_str());
+        ancestor.len() < path.len() && covers_impl(ancestor, path)
+    }
+
     /// The names of this path below `ancestor`, or `None` where `ancestor` does not cover it.
     ///
     /// Both are spelled from the same root, so this is what a walk rooted at `ancestor` would have

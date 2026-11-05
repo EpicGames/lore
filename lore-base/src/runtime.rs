@@ -651,20 +651,28 @@ fn platform_processor_count() -> usize {
     unsafe { GetActiveProcessorCount(0xFFFF) as usize }
 }
 
-/// Returns the number of available processors.
+/// Returns the number of available processors, kept from the first read that succeeds; after a
+/// failed read the next call reads again. On Linux each read of
+/// `std::thread::available_parallelism` parses the cgroup files.
 ///
 /// On Windows, takes the maximum of `std::thread::available_parallelism` and the Win32
 /// `GetActiveProcessorCount` API, since the former underestimates on large machines.
 /// On other platforms, returns `std::thread::available_parallelism` (falling back to 1).
 pub fn processor_count() -> usize {
-    let std_count = std::thread::available_parallelism().map_or(1, |c| c.get());
-    #[cfg(target_os = "windows")]
-    {
-        std::cmp::max(std_count, platform_processor_count())
+    static COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    if let Some(&count) = COUNT.get() {
+        return count;
     }
+    let read = std::thread::available_parallelism();
+    let std_count = read.as_ref().map_or(1, |c| c.get());
+    #[cfg(target_os = "windows")]
+    let count = std::cmp::max(std_count, platform_processor_count());
     #[cfg(not(target_os = "windows"))]
-    {
-        std_count
+    let count = std_count;
+    if read.is_ok() {
+        *COUNT.get_or_init(|| count)
+    } else {
+        count
     }
 }
 

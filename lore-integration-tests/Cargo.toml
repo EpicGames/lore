@@ -55,7 +55,7 @@ lore = { workspace = true }
 lore-base = { workspace = true }
 lore-storage = { workspace = true }
 lore-aws = { workspace = true }
-lore-revision = { workspace = true, features = ["test-util"] }
+lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
 uuid = { workspace = true }
@@ -66,6 +66,10 @@ lore = { workspace = true, features = ["test-util"] }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true }
 lore-storage = { workspace = true, features = ["test-util"] }
+# Here rather than under [dependencies]: a normal dependency's features apply to every build that
+# includes this package, so a release build of the workspace would compile lore-revision's test
+# access into every binary.
+lore-revision = { workspace = true, features = ["test-util"] }
 lore-transport = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
 serde = { workspace = true }

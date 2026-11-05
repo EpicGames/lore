@@ -86,12 +86,12 @@ async fn write_node(
         .await
         .expect("Failed to read a block");
     let dirtied = {
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         *writer.node(Node::index(node_id)) = node;
         writer.mark_dirty()
     };
     if dirtied {
-        state.block_modified(block, block_index);
+        state.block_modified_for_tests(block, block_index);
     }
     state.mark_dirty();
 }

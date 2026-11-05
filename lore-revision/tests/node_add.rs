@@ -136,7 +136,7 @@ mod tests {
                     .block(repository.clone(), block_index)
                     .await
                     .expect("the parent block must be readable");
-                block.write().discard_node(block_index, Node::index(parent));
+                block.write_for_tests().discard_node(block_index, Node::index(parent));
 
                 let node = state
                     .node(repository.clone(), parent)

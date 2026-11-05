@@ -16,6 +16,7 @@ use lore_revision::metadata::Metadata;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::state::Mark;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_string;
@@ -95,11 +96,10 @@ async fn a_failure_past_the_budget_stops_the_walk() {
         let conflicted = fixture.add(a, directory("conflicted"), "conflicted").await;
         fixture
             .state
-            .node_mark_staged(
-                fixture.repository.clone(),
+            .node_mark(
+                &fixture.repository,
                 conflicted,
-                NodeFlags::StagedMergeConflict,
-                NodeFlags::NoFlags,
+                Mark::staged_and_dirty(NodeFlags::StagedMergeConflict, NodeFlags::NoFlags),
             )
             .await
             .expect("marking the conflict must succeed");
@@ -160,11 +160,10 @@ impl WalkFixture {
             .await
             .expect("adding the node must succeed");
         self.state
-            .node_mark_staged(
-                self.repository.clone(),
+            .node_mark(
+                &self.repository,
                 node_id,
-                NodeFlags::StagedAdd,
-                NodeFlags::DirtyAdd,
+                Mark::staged_and_dirty(NodeFlags::StagedAdd, NodeFlags::DirtyAdd),
             )
             .await
             .expect("marking the addition must succeed");

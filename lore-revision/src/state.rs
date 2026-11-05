@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub(crate) mod block;
 #[cfg(not(feature = "test-util"))]
 mod diff;
 #[cfg(feature = "test-util")]
 pub mod diff;
 pub mod dump;
+pub mod node;
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod os_diff;
+#[cfg(feature = "test-util")]
+pub mod os_diff;
 #[cfg(not(feature = "test-util"))]
 mod stream;
 #[cfg(feature = "test-util")]
@@ -22,6 +27,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
@@ -29,9 +36,57 @@ use bitflags::bitflags;
 use bytes::Bytes;
 pub use diff::DiffWalkStats;
 pub use diff::GraftOracle;
+use futures::future::Either;
 use lore_base::error::InvalidPath;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+pub use node::ServedNodes;
+pub use node::SwapNodes;
+pub use node::attach::Absent;
+pub use node::attach::AttachCheck;
+pub use node::attach::AttachOutcome;
+pub use node::attach::Built;
+pub use node::attach::TreeAttach;
+pub use node::attach::TreeBuild;
+pub use node::clear::Clear;
+pub use node::clear::ClearAgainst;
+pub use node::clear::ClearOutcome;
+pub use node::clear::ClearScratch;
+pub use node::clear::ServedClear;
+pub use node::detach::Detach;
+pub use node::detach::IfUnchanged;
+pub use node::discard::DiscardCounts;
+pub use node::discard::WalkDiscards;
+pub(crate) use node::discard::apply_pending_discards;
+pub use node::discard::node_discard_free;
+pub use node::discard::node_discard_fused;
+pub use node::discard::node_discard_walk;
+pub use node::in_place::LinkPin;
+pub use node::in_place::NodeContent;
+pub use node::in_place::OwnFlags;
+#[cfg(feature = "test-util")]
+pub use node::locks::BlockLocks;
+#[cfg(feature = "test-util")]
+pub use node::locks::ChainAttempts;
+#[cfg(feature = "test-util")]
+pub use node::locks::ChainPosition;
+#[cfg(feature = "test-util")]
+pub use node::locks::FoundPredecessor;
+#[cfg(feature = "test-util")]
+pub use node::locks::LockedBlock;
+#[cfg(feature = "test-util")]
+pub use node::locks::Predecessor;
+#[cfg(feature = "test-util")]
+pub use node::locks::chain_unchanged;
+pub use node::mark::Ext;
+pub use node::mark::Mark;
+pub use node::relocate::MovesPermit;
+pub use node::relocate::NameChange;
+pub use node::relocate::ReattachCheck;
+pub use node::relocate::Reattached;
+pub use node::rewrite::Content;
+pub use node::rewrite::LevelMark;
+pub use node::rewrite::Rewrite;
 use serde::Serialize;
 pub use stream::ChangeSender;
 pub use stream::ChangeStream;
@@ -48,11 +103,11 @@ use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
-use crate::errors::InvalidArguments;
 use crate::errors::LinkNotFound;
 use crate::errors::NodeNotFound;
 use crate::errors::NotFound;
 use crate::errors::Oversized;
+use crate::errors::SlowDown;
 use crate::errors::StateErrors;
 use crate::filter::FilterMode;
 use crate::filter::FilterPath;
@@ -76,7 +131,18 @@ use crate::instance::InstanceId;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
 use crate::link::LinkedState;
-use crate::lore::*;
+use crate::lore::Address;
+use crate::lore::BranchId;
+use crate::lore::Context;
+use crate::lore::FragmentReference;
+use crate::lore::FromBytes;
+use crate::lore::Hash;
+use crate::lore::IntoBytes;
+use crate::lore::RepositoryId;
+use crate::lore::TypedBytes;
+use crate::lore::TypedBytesMut;
+use crate::lore::ZeroHeapAlloc;
+use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_trace;
@@ -85,8 +151,23 @@ use crate::metadata;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
 use crate::nametable::NameTable;
-use crate::node;
-use crate::node::*;
+use crate::node::INVALID_BLOCK;
+use crate::node::INVALID_NODE;
+use crate::node::Node;
+use crate::node::NodeBlock;
+use crate::node::NodeBlockData;
+use crate::node::NodeBlockDataV0;
+use crate::node::NodeDelta;
+use crate::node::NodeExtFlags;
+use crate::node::NodeFileMetadataBlock;
+use crate::node::NodeFileMetadataBlockData;
+use crate::node::NodeFlags;
+use crate::node::NodeID;
+use crate::node::NodeIDExt;
+use crate::node::NodeLink;
+use crate::node::NodeNameLock;
+use crate::node::ROOT_NODE;
+use crate::node::SiblingCycleGuard;
 use crate::repository::DOT_LORE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -139,13 +220,48 @@ pub struct LoreRepositoryStateDumpNodeEventData {
 
 pub type StateError = StateErrors;
 
-#[derive(Debug)]
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy)]
 pub struct StateNamedNode {
     node: NodeID,
+    /// Position in the walk that collected it, above the node's flags [`Self::FLAGS`] keeps: one
+    /// word, so a listed child takes 16 bytes.
+    walk: u32,
     name: u64,
-    /// The node's flags, which say what is staged or marked at or below it and what kind it is,
-    /// for [`State::tracks`] and [`State::holds_tracked_change`].
-    flags: NodeFlags,
+}
+
+impl StateNamedNode {
+    /// The node's flags kept: what kind it is and what is staged or marked at or below it, all
+    /// [`State::tracks`] and [`State::holds_tracked_change`] read.
+    const FLAGS: u16 = NodeFlags::File.bits()
+        | NodeFlags::Link.bits()
+        | NodeFlags::Dirty.bits()
+        | NodeFlags::Staged.bits();
+    /// Where the walk index starts, past [`Self::FLAGS`].
+    const SHIFT: u32 = u16::BITS - Self::FLAGS.leading_zeros();
+
+    fn new(node: NodeID, walk_index: u32, name: u64, flags: NodeFlags) -> Self {
+        #[cfg(feature = "state-hooks")]
+        assert!(
+            walk_index < 1 << (u32::BITS - Self::SHIFT),
+            "a walk of 2^27 children"
+        );
+        Self {
+            node,
+            walk: walk_index << Self::SHIFT | u32::from(flags.bits() & Self::FLAGS),
+            name,
+        }
+    }
+
+    /// Position in the walk that collected it.
+    fn walk_index(&self) -> u32 {
+        self.walk >> Self::SHIFT
+    }
+
+    /// The node's flags [`Self::FLAGS`] keeps.
+    fn flags(&self) -> NodeFlags {
+        NodeFlags::from_bits_retain(self.walk as u16 & Self::FLAGS)
+    }
 }
 
 pub struct StateChildrenNodes {
@@ -157,6 +273,8 @@ pub struct StateChildrenNodes {
 #[derive(Debug)]
 pub struct StateNamedStringNode {
     pub node: NodeID,
+    /// Position in the walk that collected it
+    walk_index: u32,
     pub name: u64,
     pub name_string: String,
 }
@@ -187,8 +305,483 @@ bitflags! {
 }
 bitflagsops!(StateFlags, u32);
 
+/// Most times one walk of a directory's children starts over from the directory's head,
+/// after a node moved away or a revisit while the chain changes, before it reports
+/// [`SlowDown`].
+pub(crate) const CHAIN_WALK_RESTARTS: u32 = 64;
+
+/// Most attempts one change to a directory's child chain makes when the chain changes
+/// between loading its blocks and locking them.
+#[lore_macro::test_pub]
+pub(crate) const CHAIN_CHANGE_ATTEMPTS: u32 = 256;
+
+/// What a reattach adds to the chain change count of each directory it takes a node out of, as
+/// does a rename in place changing a name's hash, where an attach, a detach or a prepend adds 1.
+/// A reattach puts its node at a chain's head, behind a walk that has passed the head and ahead
+/// of a head a reader remembers, so a reader holding a count tells a reattach from other changes
+/// by how far the count moved: a find walks again, and a listing's mark reads stale
+/// ([`ChainMark::reattached`]). The count wraps at 2^32, so a reader misses a reattach only if
+/// 2^16 of them pass between its two reads.
+pub const REATTACH_CHANGES: u32 = 1 << 16;
+
+/// Counts of the chain nodes a find by name ([`State::find_subnode`],
+/// [`State::find_subnode_resident`]) steps through, while enabled, per thread and process-wide,
+/// so a test can show what a path's finds cost, and apart from them, per thread, those a children
+/// walk steps through (a listing, a search since a mark). A find or a walk counts its steps
+/// locally and adds them once as it ends, on the thread it ends on. Disabled, it costs one relaxed
+/// load of a flag nothing writes. Built with `test-util` only.
+#[cfg(feature = "test-util")]
+pub mod step_counting {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    static COUNTING: AtomicBool = AtomicBool::new(false);
+    static TOTAL: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        static THREAD: Cell<u64> = const { Cell::new(0) };
+        static WALK_THREAD: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Enables or disables counting process-wide. Disabled by default.
+    pub fn set_chain_step_counting(enabled: bool) {
+        COUNTING.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Chain steps counted on the calling thread.
+    pub fn thread_chain_steps() -> u64 {
+        THREAD.with(Cell::get)
+    }
+
+    /// Chain steps counted on every thread.
+    pub fn total_chain_steps() -> u64 {
+        TOTAL.load(Ordering::Relaxed)
+    }
+
+    /// Children walk steps counted on the calling thread.
+    pub fn thread_walk_steps() -> u64 {
+        WALK_THREAD.with(Cell::get)
+    }
+
+    /// One find's or walk's steps, added to its counts when it drops, however it ends.
+    pub(crate) struct Steps {
+        count: u64,
+        walk: bool,
+    }
+
+    impl Steps {
+        pub(crate) const fn new() -> Self {
+            Self {
+                count: 0,
+                walk: false,
+            }
+        }
+
+        /// A children walk's steps, counted apart from the finds'.
+        pub(crate) const fn walk() -> Self {
+            Self {
+                count: 0,
+                walk: true,
+            }
+        }
+
+        #[inline]
+        pub(crate) fn step(&mut self) {
+            self.count += 1;
+        }
+    }
+
+    impl Drop for Steps {
+        fn drop(&mut self) {
+            if self.count == 0 || !COUNTING.load(Ordering::Relaxed) {
+                return;
+            }
+            if self.walk {
+                WALK_THREAD.with(|count| count.set(count.get() + self.count));
+            } else {
+                THREAD.with(|count| count.set(count.get() + self.count));
+                TOTAL.fetch_add(self.count, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "test-util"))]
+pub(crate) mod step_counting {
+    /// One find's or walk's steps, which nothing counts.
+    pub(crate) struct Steps;
+
+    impl Steps {
+        pub(crate) const fn new() -> Self {
+            Self
+        }
+
+        pub(crate) const fn walk() -> Self {
+            Self
+        }
+
+        #[inline]
+        #[allow(clippy::unused_self)]
+        pub(crate) fn step(&mut self) {}
+    }
+}
+
+/// What [`State::walk_children`] found, whether it may have visited a child twice, and
+/// whether it ran to the chain's end rather than stopping where it was told to.
+#[lore_macro::test_pub]
+struct Walked<T> {
+    answer: Option<T>,
+    may_repeat: bool,
+    reached_end: bool,
+}
+
+/// What a walk of one directory's child chain does with the node it has just read.
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainStep {
+    /// A live child of the directory: visit it, then follow its `sibling`.
+    Visit,
+    /// A detached child, or one passed over on the way back to where a restarted walk
+    /// stood: follow its `sibling`.
+    Skip,
+    /// A node a reattach moved to another directory, or a cycle guard trip while the
+    /// directory's change count moves: start again from the head.
+    Restart,
+}
+
+/// The checks and position of one walk over a directory's child chain.
+///
+/// A reader copies one node at a time under its block's read lock while namespace
+/// changes rewrite the chain under write locks, so a walk meets what a static chain never
+/// shows. A detached node keeps its `sibling`, so the walk skips it and goes on. A node a
+/// reattach moved to another directory has a `sibling` in that directory's chain, and a
+/// node moved to the head of the walked directory leads the walk back over nodes it has
+/// visited, which can trip the sibling cycle guard. On either the walk starts again from
+/// the directory's current head, passing over the nodes up to the last one it visited, and
+/// reports that it may have visited a node twice ([`Self::may_repeat`]), as it does when
+/// the directory's chain change count, which prepends, removals and reattaches move, moves
+/// between the walk's start and its end. A find by name ([`Self::searching`]) passes over
+/// nothing on a restart, and walks again from the head when it misses its name after a
+/// reattach ([`Self::missed_a_reattach`]).
+///
+/// Revisiting a node needs a prepend to the directory, so a cycle guard trip while the
+/// count stands still since the walk's last start is a real cycle. A node that fails the
+/// parent check twice running, the count standing still in between, is a broken chain: a
+/// node moved out leaves the chain. Running out of restarts is churn, [`SlowDown`].
+#[lore_macro::test_pub]
+struct ChainWalk {
+    parent: NodeID,
+    cycle: SiblingCycleGuard,
+    restarts: u32,
+    /// The last node visited, [`INVALID_NODE`] before the first.
+    last_visited: NodeID,
+    /// The node a restarted walk resumes after, [`INVALID_NODE`] where it resumes at the head.
+    resume_after: NodeID,
+    /// The last node that failed the parent check and the count read then, [`INVALID_NODE`]
+    /// before the first.
+    last_misparented: (NodeID, u32),
+    may_repeat: bool,
+    /// A find by name, which walks the whole chain again on a restart rather than resuming
+    /// after the last node it visited.
+    searching: bool,
+    parent_block: Option<Arc<NodeBlock>>,
+    changes: u32,
+    /// The most restarts before [`SlowDown`]: [`CHAIN_WALK_RESTARTS`], or, under `state-hooks`,
+    /// the bound a test set on the walked State.
+    #[cfg(feature = "state-hooks")]
+    restart_bound: u32,
+}
+
+impl ChainWalk {
+    /// A walk of `parent`'s chain, whose change count in `parent_block` read `changes` with
+    /// the head.
+    #[lore_macro::test_pub]
+    fn new(parent: NodeID, parent_block: Arc<NodeBlock>, changes: u32) -> Self {
+        let mut walk = Self::empty(parent);
+        #[cfg(feature = "state-hooks")]
+        if let Some(bound) = parent_block.hook_retry_bound() {
+            walk.restart_bound = bound;
+        }
+        walk.parent_block = Some(parent_block);
+        walk.changes = changes;
+        walk
+    }
+
+    /// A walk of a chain with no nodes, under a parent id that names no node.
+    const fn empty(parent: NodeID) -> Self {
+        Self {
+            parent,
+            cycle: SiblingCycleGuard::new(parent),
+            restarts: 0,
+            last_visited: INVALID_NODE,
+            resume_after: INVALID_NODE,
+            last_misparented: (INVALID_NODE, 0),
+            may_repeat: false,
+            searching: false,
+            parent_block: None,
+            changes: 0,
+            #[cfg(feature = "state-hooks")]
+            restart_bound: CHAIN_WALK_RESTARTS,
+        }
+    }
+
+    /// A find by name over `parent`'s chain, whose change count in `parent_block` read `changes`
+    /// with the head: a restart walks the whole chain again, since a node a reattach put at the
+    /// head lies before the last one visited.
+    fn searching(parent: NodeID, parent_block: Arc<NodeBlock>, changes: u32) -> Self {
+        let mut walk = Self::new(parent, parent_block, changes);
+        walk.searching = true;
+        walk
+    }
+
+    /// A walk of `parent`'s children in `state`, watching its chain change count, and the first
+    /// child, read under one lock with the count.
+    async fn watched(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+    ) -> Result<(Self, Option<NodeID>), StateError> {
+        let parent_block = state.block(repository, NodeBlock::index(parent)).await?;
+        let (parent_node, changes) = parent_block.node_with_chain_head(parent);
+        Ok((
+            Self::new(parent, parent_block, changes),
+            parent_node.child(),
+        ))
+    }
+
+    fn chain_changed(&self) -> bool {
+        self.parent_block
+            .as_ref()
+            .is_some_and(|block| block.chain_changes(Node::index(self.parent)) != self.changes)
+    }
+
+    /// The directory's head as it is now, read with its change count, which later checks
+    /// compare against.
+    #[lore_macro::test_pub]
+    fn head_again(&mut self) -> Option<NodeID> {
+        let block = self.parent_block.as_ref()?;
+        let (parent, changes) = block.node_with_chain_changes(Node::index(self.parent));
+        self.changes = changes;
+        parent.child()
+    }
+
+    /// Classifies `node`, read for `node_id`.
+    #[lore_macro::test_pub]
+    fn step(&mut self, node_id: NodeID, node: &Node) -> Result<ChainStep, StateError> {
+        if node.parent != self.parent {
+            if self.last_misparented == (node_id, self.changes) && !self.chain_changed() {
+                node.check_parent_link(node_id, self.parent)?;
+            }
+            self.last_misparented = (node_id, self.changes);
+            return self.restart();
+        }
+        if let Err(trip) = self.cycle.observe(node_id) {
+            if !self.chain_changed() {
+                return Err(StateError::from(trip));
+            }
+            return self.restart();
+        }
+        if self.resume_after != INVALID_NODE {
+            if self.resume_after == node_id {
+                self.resume_after = INVALID_NODE;
+            }
+            return Ok(ChainStep::Skip);
+        }
+        if node.is_discarded() {
+            return Ok(ChainStep::Skip);
+        }
+        self.last_visited = node_id;
+        Ok(ChainStep::Visit)
+    }
+
+    /// Starts the walk again after the last node it visited, or for a find from the head.
+    fn restart(&mut self) -> Result<ChainStep, StateError> {
+        self.begin_again()?;
+        if !self.searching {
+            self.resume_after = self.last_visited;
+        }
+        Ok(ChainStep::Restart)
+    }
+
+    /// Whether a find that reached the end of the chain without its name walks again from the
+    /// head: it does when a reattach moved the directory's change count since the walk read the
+    /// head, since the node it put at the head lies behind the walk. A miss with only attaches
+    /// and detaches since stands, as it would had the find run before them.
+    fn missed_a_reattach(&mut self) -> Result<bool, StateError> {
+        let Some(block) = &self.parent_block else {
+            return Ok(false);
+        };
+        let changed = block
+            .chain_changes(Node::index(self.parent))
+            .wrapping_sub(self.changes);
+        if changed < REATTACH_CHANGES {
+            return Ok(false);
+        }
+        self.begin_again()?;
+        self.last_visited = INVALID_NODE;
+        Ok(true)
+    }
+
+    /// Whether the walk, having reached the end of the chain, starts again from the head:
+    /// it does when the node it was to resume after has left the chain, which only a
+    /// concurrent removal does. Otherwise the walk is over, and a chain change counted
+    /// since its start marks it as possibly repeating.
+    fn restart_at_end(&mut self) -> Result<bool, StateError> {
+        if std::mem::replace(&mut self.resume_after, INVALID_NODE) == INVALID_NODE {
+            if self.chain_changed() {
+                self.may_repeat = true;
+            }
+            return Ok(false);
+        }
+        self.begin_again()?;
+        self.last_visited = INVALID_NODE;
+        Ok(true)
+    }
+
+    /// Whether this walk may have visited a node more than once.
+    fn may_repeat(&self) -> bool {
+        self.may_repeat
+    }
+
+    fn begin_again(&mut self) -> Result<(), StateError> {
+        #[cfg(feature = "state-hooks")]
+        let bound = self.restart_bound;
+        #[cfg(not(feature = "state-hooks"))]
+        let bound = CHAIN_WALK_RESTARTS;
+        if self.restarts == bound {
+            #[cfg(feature = "state-hooks")]
+            if let Some(state) = self
+                .parent_block
+                .as_ref()
+                .and_then(|block| block.hook_state())
+            {
+                crate::state::node::hooks::log::arm(
+                    state,
+                    crate::state::node::hooks::log::Arm::SlowDown,
+                );
+            }
+            return Err(StateError::from(SlowDown));
+        }
+        self.restarts += 1;
+        self.may_repeat = true;
+        self.cycle = SiblingCycleGuard::new(self.parent);
+        Ok(())
+    }
+}
+
+/// A find by name over one directory's chain, stepped by its caller, which reads each node from
+/// a block it obtains its own way.
+struct NameSearch {
+    walk: ChainWalk,
+    /// The node to read next, `None` at the chain's end.
+    next: Option<NodeID>,
+    restart: bool,
+    name_hash: u64,
+    steps: step_counting::Steps,
+}
+
+impl NameSearch {
+    /// A search of `parent_node`'s chain for `name_hash`, from `parent`, read with `changes` from
+    /// `parent_block`.
+    fn new(
+        parent_node: NodeID,
+        parent: &Node,
+        parent_block: Arc<NodeBlock>,
+        changes: u32,
+        name_hash: u64,
+    ) -> Self {
+        Self {
+            walk: ChainWalk::searching(parent_node, parent_block, changes),
+            next: parent.child(),
+            restart: false,
+            name_hash,
+            steps: step_counting::Steps::new(),
+        }
+    }
+
+    /// The node to read next, after any restart the last step called for; `None` where the
+    /// chain holds no node of the name. Inlined for the step to the next sibling, which every
+    /// node of the walk takes; restarts and the chain's end take [`Self::next_after_end`].
+    #[inline]
+    fn next(&mut self, state: &State) -> Result<Option<NodeID>, StateError> {
+        if !self.restart
+            && let Some(node_id) = self.next
+        {
+            self.steps.step();
+            return Ok(Some(node_id));
+        }
+        self.next_after_end(state)
+    }
+
+    /// [`Self::next`] after a restart or at the chain's end.
+    #[cold]
+    #[inline(never)]
+    fn next_after_end(&mut self, state: &State) -> Result<Option<NodeID>, StateError> {
+        loop {
+            if std::mem::take(&mut self.restart) {
+                state.find_restarts.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "state-hooks")]
+                crate::state::node::hooks::log::arm(
+                    &state.hooks,
+                    crate::state::node::hooks::log::Arm::FindRestart,
+                );
+                self.next = self.walk.head_again();
+            }
+            if let Some(node_id) = self.next {
+                self.steps.step();
+                return Ok(Some(node_id));
+            }
+            if !(self.walk.restart_at_end()? || self.walk.missed_a_reattach()?) {
+                return Ok(None);
+            }
+            self.restart = true;
+        }
+    }
+
+    /// Steps over `node`, read for the node [`Self::next`] answered: whether it holds the name.
+    #[inline]
+    fn found(&mut self, node_id: NodeID, node: &Node) -> Result<bool, StateError> {
+        match self.walk.step(node_id, node)? {
+            ChainStep::Restart => self.restart = true,
+            ChainStep::Visit if node.name_hash == self.name_hash => return Ok(true),
+            ChainStep::Skip | ChainStep::Visit => self.next = node.sibling(),
+        }
+        Ok(false)
+    }
+}
+
+/// Keeps one copy of each node in `items`, the one with the highest walk index, for a
+/// consumer of a walk that reported it may repeat: a node renamed between two visits is
+/// current at its last. `key` gives each item's node id and walk index. Leaves `items` in
+/// node id order; `keep_last_in_walk_order` restores walk order for a consumer that needs
+/// it.
+pub fn drop_repeated_nodes<T>(items: &mut Vec<T>, key: impl Fn(&T) -> (NodeID, u32)) {
+    items.sort_unstable_by_key(|item| {
+        let (id, index) = key(item);
+        (id, std::cmp::Reverse(index))
+    });
+    items.dedup_by_key(|item| key(item).0);
+}
+
+/// Keeps, for a consumer that needs walk order, the copy of each node with the highest walk
+/// index, and puts the survivors back in walk order. `key` gives each item's node id and
+/// walk index. A caller filtering each visit as it comes keeps an earlier copy of a node its
+/// last visit filtered out, as a listing that read the node before a change beside it would.
+#[lore_macro::test_pub]
+fn keep_last_in_walk_order<T>(items: &mut Vec<T>, key: impl Fn(&T) -> (NodeID, u32)) {
+    drop_repeated_nodes(items, &key);
+    items.sort_unstable_by_key(|item| key(item).1);
+}
+
 /// Iterator over child nodes of a directory, loading blocks with nametable.
 /// Yields `(NodeID, Node, NodeNameLock)` — the child's ID, node data, and name.
+///
+/// The walk skips detached children and restarts past a child a reattach moved away
+/// (see `ChainWalk`). It yields each live child once unless [`Self::may_repeat`], when a
+/// consumer that must see a child once drops repeats with [`drop_repeated_nodes`]; a child moved
+/// during the walk may be passed over.
 ///
 /// The yielded [`NodeNameLock`] holds a read lock on the node block (zero-copy
 /// name access), not an owned string. Drop it before any call that may take
@@ -200,11 +793,13 @@ bitflagsops!(StateFlags, u32);
 pub struct StateNodeChildrenWithNameIterator {
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
-    parent_node_id: NodeID,
     current_node_id: Option<NodeID>,
     current_block: Option<Arc<NodeBlock>>,
     current_iblock: usize,
-    cycle: SiblingCycleGuard,
+    walk: ChainWalk,
+    /// Live children the walk passed over because their block could not give back their name.
+    #[cfg(feature = "test-util")]
+    skipped_invalid: u32,
 }
 
 impl StateNodeChildrenWithNameIterator {
@@ -219,15 +814,16 @@ impl StateNodeChildrenWithNameIterator {
             return Ok(Self {
                 state,
                 repository,
-                parent_node_id,
                 current_node_id: None,
                 current_block: None,
                 current_iblock: 0,
-                cycle: SiblingCycleGuard::new(parent_node_id),
+                walk: ChainWalk::empty(parent_node_id),
+                #[cfg(feature = "test-util")]
+                skipped_invalid: 0,
             });
         }
-        let parent = state.node(repository.clone(), parent_node_id).await?;
-        let first_child = parent.child();
+        let (walk, first_child) =
+            ChainWalk::watched(&state, repository.clone(), parent_node_id).await?;
 
         let (block, iblock) = if let Some(child_id) = first_child {
             let iblock = NodeBlock::index(child_id);
@@ -242,11 +838,12 @@ impl StateNodeChildrenWithNameIterator {
         Ok(Self {
             state,
             repository,
-            parent_node_id,
             current_node_id: first_child,
             current_block: block,
             current_iblock: iblock,
-            cycle: SiblingCycleGuard::new(parent_node_id),
+            walk,
+            #[cfg(feature = "test-util")]
+            skipped_invalid: 0,
         })
     }
 
@@ -256,8 +853,20 @@ impl StateNodeChildrenWithNameIterator {
     /// `Send`, but drop it before any call that may take another lock (see the
     /// type docs) — copy it out with [`NodeNameLock::freeze`] if needed.
     pub async fn next(&mut self) -> Result<Option<(NodeID, Node, NodeNameLock)>, StateError> {
+        let mut restart = false;
         loop {
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
+                .await;
+            if restart {
+                restart = false;
+                self.current_node_id = self.walk.head_again();
+            }
             let Some(node_id) = self.current_node_id else {
+                if self.walk.restart_at_end()? {
+                    restart = true;
+                    continue;
+                }
                 return Ok(None);
             };
 
@@ -273,58 +882,105 @@ impl StateNodeChildrenWithNameIterator {
 
             let block = self.current_block.as_ref().unwrap();
             let (node, name) = block.node_and_name_ref(Node::index(node_id));
-            node.walk_step(node_id, self.parent_node_id, &mut self.cycle)?;
-            self.current_node_id = node.sibling();
+            match self.walk.step(node_id, &node)? {
+                ChainStep::Restart => {
+                    restart = true;
+                    continue;
+                }
+                ChainStep::Skip => {
+                    self.current_node_id = node.sibling();
+                    continue;
+                }
+                ChainStep::Visit => self.current_node_id = node.sibling(),
+            }
             match name {
                 Ok(name) => return Ok(Some((node_id, node, name))),
                 Err(err) => {
+                    #[cfg(feature = "test-util")]
+                    {
+                        self.skipped_invalid += 1;
+                    }
                     lore_warn!("Skipping node {node_id} with invalid name: {err}");
                 }
             }
         }
     }
 
+    /// Whether a restart or a change to the chain since the walk began may have made it
+    /// yield a child twice.
+    pub fn may_repeat(&self) -> bool {
+        self.walk.may_repeat()
+    }
+
     /// Get the next child node, with the bytes of the name it stores appended to `name`,
     /// unchecked against the name rules, so a child [`Self::next`] skips for its name is yielded
-    /// too.
+    /// too. Walks as [`Self::next`] does; a child the walk passes over leaves `name` as it was.
     pub async fn next_with_name_bytes(
         &mut self,
         name: &mut Vec<u8>,
     ) -> Result<Option<(NodeID, Node)>, StateError> {
-        let Some(node_id) = self.current_node_id else {
-            return Ok(None);
-        };
-        let iblock = NodeBlock::index(node_id);
-        if iblock != self.current_iblock || self.current_block.is_none() {
-            self.current_iblock = iblock;
-            self.current_block = Some(
-                self.state
-                    .block_with_nametable(self.repository.clone(), iblock)
-                    .await?,
-            );
+        let mut restart = false;
+        loop {
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
+                .await;
+            if restart {
+                restart = false;
+                self.current_node_id = self.walk.head_again();
+            }
+            let Some(node_id) = self.current_node_id else {
+                if self.walk.restart_at_end()? {
+                    restart = true;
+                    continue;
+                }
+                return Ok(None);
+            };
+
+            let iblock = NodeBlock::index(node_id);
+            if iblock != self.current_iblock || self.current_block.is_none() {
+                self.current_iblock = iblock;
+                self.current_block = Some(
+                    self.state
+                        .block_with_nametable(self.repository.clone(), iblock)
+                        .await?,
+                );
+            }
+
+            let block = self.current_block.as_ref().unwrap();
+            let start = name.len();
+            let node = block
+                .node_and_name_bytes(Node::index(node_id), name)
+                .forward::<StateError>("Node name")?;
+            match self.walk.step(node_id, &node)? {
+                ChainStep::Restart => {
+                    name.truncate(start);
+                    restart = true;
+                }
+                ChainStep::Skip => {
+                    name.truncate(start);
+                    self.current_node_id = node.sibling();
+                }
+                ChainStep::Visit => {
+                    self.current_node_id = node.sibling();
+                    return Ok(Some((node_id, node)));
+                }
+            }
         }
-        let node = self
-            .current_block
-            .as_ref()
-            .unwrap()
-            .node_and_name_bytes(Node::index(node_id), name)
-            .forward::<StateError>("Node name")?;
-        node.walk_step(node_id, self.parent_node_id, &mut self.cycle)?;
-        self.current_node_id = node.sibling();
-        Ok(Some((node_id, node)))
     }
 }
 
 /// Iterator over child nodes of a directory, loading blocks without nametable.
 /// Yields `(NodeID, Node)` — the child's ID and node data, without the name string.
+///
+/// Walks as [`StateNodeChildrenWithNameIterator`] does, skipping detached children and
+/// restarting past a child a reattach moved away.
 pub struct StateNodeChildrenIterator {
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
-    parent_node_id: NodeID,
     current_node_id: Option<NodeID>,
     current_block: Option<Arc<NodeBlock>>,
     current_iblock: usize,
-    cycle: SiblingCycleGuard,
+    walk: ChainWalk,
 }
 
 impl StateNodeChildrenIterator {
@@ -339,30 +995,65 @@ impl StateNodeChildrenIterator {
             return Ok(Self {
                 state,
                 repository,
-                parent_node_id,
                 current_node_id: None,
                 current_block: None,
                 current_iblock: 0,
-                cycle: SiblingCycleGuard::new(parent_node_id),
+                walk: ChainWalk::empty(parent_node_id),
             });
         }
-        let parent = state.node(repository.clone(), parent_node_id).await?;
-        Self::from_parent(state, repository, parent_node_id, &parent).await
+        let (walk, first_child) =
+            ChainWalk::watched(&state, repository.clone(), parent_node_id).await?;
+        Self::starting_at(state, repository, first_child, walk).await
     }
 
-    /// Create an iterator from a parent node the caller has already read.
-    ///
-    /// Saves the parent lookup [`Self::new`] performs, for a caller that has just
-    /// inspected the parent — checking that it can take children, say — and is
-    /// about to walk what is under it.
-    pub async fn from_parent(
+    /// An iterator over `parent_node_id`'s children, with the parent's record, read with the
+    /// head the walk begins at and its change count (H10), for a caller that inspects the
+    /// parent too; [`Self::new`] reads them the same way, keeping only the walk. A walk begun
+    /// at the head of a record read earlier, its count read fresh, would miss what was prepended
+    /// between. `parent_node_id` names a directory: there is no empty walk for an invalid id, as
+    /// [`Self::new`] makes.
+    pub async fn with_parent(
         state: Arc<State>,
         repository: Arc<RepositoryContext>,
         parent_node_id: NodeID,
-        parent: &Node,
-    ) -> Result<Self, StateError> {
-        let first_child = parent.child();
+    ) -> Result<(Node, Self), StateError> {
+        let parent_block = state
+            .block(repository.clone(), NodeBlock::index(parent_node_id))
+            .await?;
+        Ok(Self::with_parent_in(
+            state,
+            repository,
+            parent_node_id,
+            parent_block,
+        ))
+    }
 
+    /// [`Self::with_parent`] in `parent_block`, the block holding the parent, which the caller
+    /// holds already. The first child's block loads at the first [`Self::next`].
+    pub fn with_parent_in(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        parent_node_id: NodeID,
+        parent_block: Arc<NodeBlock>,
+    ) -> (Node, Self) {
+        let (parent, changes) = parent_block.node_with_chain_head(parent_node_id);
+        let children = Self {
+            state,
+            repository,
+            current_node_id: parent.child(),
+            current_block: None,
+            current_iblock: 0,
+            walk: ChainWalk::new(parent_node_id, parent_block, changes),
+        };
+        (parent, children)
+    }
+
+    async fn starting_at(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        first_child: Option<NodeID>,
+        walk: ChainWalk,
+    ) -> Result<Self, StateError> {
         let (block, iblock) = if let Some(child_id) = first_child {
             let iblock = NodeBlock::index(child_id);
             let block = state.block(repository.clone(), iblock).await?;
@@ -374,34 +1065,55 @@ impl StateNodeChildrenIterator {
         Ok(Self {
             state,
             repository,
-            parent_node_id,
             current_node_id: first_child,
             current_block: block,
             current_iblock: iblock,
-            cycle: SiblingCycleGuard::new(parent_node_id),
+            walk,
         })
     }
 
     /// Get the next child node.
     pub async fn next(&mut self) -> Result<Option<(NodeID, Node)>, StateError> {
-        let Some(node_id) = self.current_node_id else {
-            return Ok(None);
-        };
+        let mut restart = false;
+        loop {
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
+                .await;
+            if restart {
+                restart = false;
+                self.current_node_id = self.walk.head_again();
+            }
+            let Some(node_id) = self.current_node_id else {
+                if self.walk.restart_at_end()? {
+                    restart = true;
+                    continue;
+                }
+                return Ok(None);
+            };
 
-        let iblock = NodeBlock::index(node_id);
-        if iblock != self.current_iblock || self.current_block.is_none() {
-            self.current_iblock = iblock;
-            self.current_block = Some(self.state.block(self.repository.clone(), iblock).await?);
+            let iblock = NodeBlock::index(node_id);
+            if iblock != self.current_iblock || self.current_block.is_none() {
+                self.current_iblock = iblock;
+                self.current_block = Some(self.state.block(self.repository.clone(), iblock).await?);
+            }
+
+            let block = self.current_block.as_ref().unwrap();
+            let node = block.node(Node::index(node_id));
+            match self.walk.step(node_id, &node)? {
+                ChainStep::Restart => restart = true,
+                ChainStep::Skip => self.current_node_id = node.sibling(),
+                ChainStep::Visit => {
+                    self.current_node_id = node.sibling();
+                    return Ok(Some((node_id, node)));
+                }
+            }
         }
+    }
 
-        let block = self.current_block.as_ref().unwrap();
-        let node_index = Node::index(node_id);
-        let node = block.node(node_index);
-        node.walk_step(node_id, self.parent_node_id, &mut self.cycle)?;
-
-        self.current_node_id = node.sibling();
-
-        Ok(Some((node_id, node)))
+    /// Whether a restart or a change to the chain since the walk began may have made it
+    /// yield a child twice.
+    pub fn may_repeat(&self) -> bool {
+        self.walk.may_repeat()
     }
 }
 
@@ -421,6 +1133,39 @@ impl StateNodeChildrenIterator {
 /// residency whatever they do.
 const BLOCK_LOADING_PERMITS: usize = 256;
 
+/// Marks a State dirty when dropped: a save clears the State's flag as it writes its data, and
+/// releases the blocks it wrote only after, so a save that fails or is dropped between leaves
+/// them registered, which the next save writes only with the State dirty. Disarmed once the
+/// blocks are released.
+struct Redirty<'a>(Option<&'a State>);
+
+impl Redirty<'_> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Redirty<'_> {
+    fn drop(&mut self) {
+        if let Some(state) = self.0 {
+            state.mark_dirty();
+        }
+    }
+}
+
+/// Under `state-hooks`: `block` is the State's block at `index`, which a registration takes, as a
+/// block's registered bit answers for the State holding it alone.
+#[cfg(feature = "state-hooks")]
+fn assert_resident<B>(resident: &[Weak<B>], block: &Arc<B>, index: usize) {
+    assert!(
+        resident
+            .get(index)
+            .and_then(Weak::upgrade)
+            .is_some_and(|held| Arc::ptr_eq(&held, block)),
+        "a registration of a block not resident at {index}"
+    );
+}
+
 /// Revision state control structure, internally mutable through r/w locks
 #[lore_macro::test_pub]
 pub struct State {
@@ -428,14 +1173,50 @@ pub struct State {
     data: parking_lot::RwLock<StateData>,
     /// Runtime in memory data
     runtime: parking_lot::RwLock<StateRuntime>,
+    /// A VFS provider serves this State, so its chains change only through the primitives
+    /// that count and log ([`Self::assert_unserved`]).
+    served: AtomicBool,
+    /// A C API change failed or was dropped after its climb of the directories above its node
+    /// began, so a directory may be staged with no change below it
+    /// ([`Self::has_unfinished_change`]).
+    unfinished_change: AtomicBool,
     /// Deserializing semaphore
     deserialize: tokio::sync::Semaphore,
     /// Unused node/block semaphore
     unused: tokio::sync::Semaphore,
+    /// Held by a reattach moving a directory to another parent, from its subtree check to
+    /// its move; by a C API move or delete for its whole batch; and by a C API restore of a node
+    /// below an added directory
+    moves: tokio::sync::Semaphore,
+    /// The roots of the subtrees C API deletes detached, kept until the C API commit frees
+    /// them ([`Self::node_free_pending`]); made by the first, as most States are never deleted
+    /// from through the C API and the queue is 256 bytes.
+    pending: std::sync::OnceLock<Box<crossbeam_queue::SegQueue<NodeID>>>,
+    /// How many times a find by name walked a chain again, read by tests.
+    find_restarts: AtomicU64,
+    /// How many times an attach looked its name up again, read by tests.
+    attach_retries: AtomicU64,
+    /// How many times the served chain rule refused a change under its locks, read by tests.
+    served_refusals: AtomicU64,
+    /// How many settles' clears a change overtook, read by tests.
+    clears_overtaken: AtomicU64,
+    /// How many unserved clears marked a directory again, read by tests.
+    clears_rechecked: AtomicU64,
+    /// How many of those found the directory detached, read by tests.
+    clears_found_gone: AtomicU64,
+    /// How many times a sweep's scan or a pending drain freed a slot
+    /// ([`Self::node_sweep_detached`], [`Self::node_free_pending`]): a chain mark or an absence
+    /// proof records it when taken, and answers stale once it moved, as a freed slot may have
+    /// been taken again since (C15).
+    reclaims: AtomicU32,
     /// Block deserialization semaphore
     block_deserialize: tokio::sync::Semaphore,
     /// File metadata block deserialization semaphore
     metadata_deserialize: tokio::sync::Semaphore,
+    /// Under `state-hooks`, what names this State to the scheduler, shared with the blocks it
+    /// installs.
+    #[cfg(feature = "state-hooks")]
+    hooks: Arc<crate::state::node::hooks::StateHooks>,
     /// Permits held while a block is deserialized, shared by a node block and
     /// its file metadata block. Allocated on the first block load: most states
     /// are read for their header alone and never load a block, and held inline
@@ -448,7 +1229,7 @@ pub struct State {
 
 impl std::fmt::Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "State({})", self.runtime.read().signature)
+        write!(f, "State({})", self.runtime_read().signature)
     }
 }
 
@@ -609,6 +1390,13 @@ struct StateRuntime {
     block_file_metadata: Vec<Weak<NodeFileMetadataBlock>>,
     /// Dirty blocks kept in memory
     block_file_metadata_dirty: Vec<(Arc<NodeFileMetadataBlock>, usize)>,
+    /// The file metadata block of the block attaches last took a slot from, held so the next
+    /// attach finds it resident
+    attach_file_metadata: Option<Arc<NodeFileMetadataBlock>>,
+    /// The tree's block count when new nodes began to come from fresh blocks only
+    /// ([`State::take_new_nodes_from_fresh_blocks`]): no block below it gives a slot, and no
+    /// block at or past it has stored file metadata
+    fresh_blocks_from: Option<usize>,
     /// Blocks read to check a recycled slot, kept in memory so the next check in the same block
     /// does not read it again
     block_file_metadata_checked: Vec<Arc<NodeFileMetadataBlock>>,
@@ -620,6 +1408,10 @@ struct StateRuntime {
     name_table_deprecated: Option<Arc<NameTable>>,
     /// Rehash node names
     rehash_node_names: bool,
+    /// The node blocks a sweep scans, a bit per block index: every block loaded or registered
+    /// since the last sweep, every block noted and not in memory then, and every block registered
+    /// then, which may flag itself again before a save releases it (C15).
+    unswept: Vec<u64>,
 }
 
 impl StateRuntime {
@@ -635,11 +1427,14 @@ impl StateRuntime {
             block_file_metadata_address: Bytes::default(),
             block_file_metadata: vec![],
             block_file_metadata_dirty: vec![],
+            attach_file_metadata: None,
+            fresh_blocks_from: None,
             block_file_metadata_checked: vec![],
             block_file_metadata_checked_next: 0,
             link_list: None,
             name_table_deprecated: None,
             rehash_node_names,
+            unswept: Vec::new(),
         }
     }
 
@@ -649,6 +1444,11 @@ impl StateRuntime {
             .as_ref()
             .map_or(0, |tree| tree.block_count as usize)
             .max(self.block.len())
+    }
+
+    /// Notes block `index` for the next sweep to look at.
+    fn note_unswept(&mut self, index: usize) {
+        set_block_bit(&mut self.unswept, index);
     }
 
     /// Keeps `block` in memory, in place of the oldest block kept once there are
@@ -668,6 +1468,15 @@ impl StateRuntime {
     }
 }
 
+/// Sets block `index`'s bit in `bits`, growing it to hold the bit.
+fn set_block_bit(bits: &mut Vec<u64>, index: usize) {
+    let word = index / 64;
+    if word >= bits.len() {
+        bits.resize(word + 1, 0);
+    }
+    bits[word] |= 1 << (index % 64);
+}
+
 /// How wide a directory the child collection sizes for once it knows there is a child.
 ///
 /// The nodes are a child-and-sibling list with no count to read, so the width is guessed. A
@@ -683,10 +1492,278 @@ fn push_named_child(children: &mut Vec<StateNamedNode>, child: StateNamedNode) {
     children.push(child);
 }
 
+/// Outcome of [`State::find_subnode_added_since`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddedSince {
+    /// A child carrying the name hash, met by the walk from the chain's head to the head the
+    /// mark saw: one prepended or reattached there since, or, where that head was detached, any
+    /// child of the chain.
+    Found(NodeID),
+    /// No child the walk met carries the name hash: none prepended or reattached ahead of the
+    /// head the mark saw, or, where that head was detached, none in the chain.
+    Absent,
+    /// What lies ahead of the head seen cannot be told: a reattach may have put a node in front
+    /// of children prepended since, a sweep freed a slot since the mark (C15), the marked node is
+    /// no longer a directory, or the mark is not of this State's directory.
+    Stale,
+}
+
+/// A directory's chain as a listing of it began: its head and its change count, read together
+/// ([`State::node_children_with_name_hash_marked`]), for [`State::find_subnode_added_since`]; or
+/// as a checked attach or reattach read it before its lookup that missed
+/// (`State::find_subnode_since`). The mark holds the directory's block, which keeps it in
+/// memory: a count restarts only where its block is loaded again (H9). Its head is compared by id,
+/// so no published slot may be freed while a mark lives, as C3 has it for a served State and
+/// under a shared claim, and as the stage holds by deferring its discards to its end; a sweep
+/// that frees one moves the State's reclaim count, which makes every older mark stale (C15).
+#[derive(Clone)]
+pub struct ChainMark {
+    parent: NodeID,
+    head: Option<NodeID>,
+    block: Arc<NodeBlock>,
+    changes: u32,
+    reclaims: u32,
+}
+
+impl ChainMark {
+    /// Counts a prepend to the directory the mark's holder made itself, which the walks since
+    /// the mark cover as they cover any other, so the holder's own adds never make a search
+    /// stale. A holder counting a prepend that did not land would hide a reattach.
+    pub fn count_own_prepend(&mut self) {
+        self.changes = self.changes.wrapping_add(1);
+    }
+
+    /// Whether the directory's count moved by [`REATTACH_CHANGES`] since the mark: a reattach
+    /// out of the directory or within it, or a rename in place changing a name's hash, may have
+    /// moved a child the listing holds, or renamed it. An Acquire load, no lock.
+    pub fn reattached(&self) -> bool {
+        self.block
+            .chain_changes(Node::index(self.parent))
+            .wrapping_sub(self.changes)
+            >= REATTACH_CHANGES
+    }
+}
+
+/// What a listing keeps of the chain its walk began from: nothing (`()`), so a listing that
+/// needs no mark costs nothing for one, or a [`ChainMark`].
+trait ListingMark {
+    /// The State's reclaim count, for a mark that records one, read before the head the mark
+    /// takes, so a sweep freeing that head between the two reads leaves the mark stale.
+    fn reclaims(state: &State) -> u32;
+    fn of(
+        reclaims: u32,
+        parent: NodeID,
+        head: Option<NodeID>,
+        block: &Arc<NodeBlock>,
+        changes: u32,
+    ) -> Self;
+    fn none() -> Self;
+}
+
+impl ListingMark for () {
+    fn reclaims(_: &State) -> u32 {
+        0
+    }
+    fn of(_: u32, _: NodeID, _: Option<NodeID>, _: &Arc<NodeBlock>, _: u32) -> Self {}
+    fn none() -> Self {}
+}
+
+impl ListingMark for Option<ChainMark> {
+    fn reclaims(state: &State) -> u32 {
+        state.reclaims()
+    }
+
+    fn of(
+        reclaims: u32,
+        parent: NodeID,
+        head: Option<NodeID>,
+        block: &Arc<NodeBlock>,
+        changes: u32,
+    ) -> Self {
+        Some(ChainMark {
+            parent,
+            head,
+            block: block.clone(),
+            changes,
+            reclaims,
+        })
+    }
+
+    fn none() -> Self {
+        None
+    }
+}
+
+/// A listed child with its walk index and name hash.
+fn with_name_hash(child_id: NodeID, child: &Node, index: u32) -> (NodeID, u32, u64) {
+    (child_id, index, child.name_hash)
+}
+
+/// Keeps each listed child once, at its last place in the walk.
+fn keep_last_with_name_hash(children: &mut Vec<(NodeID, u32, u64)>) {
+    keep_last_in_walk_order(children, |&(id, index, _)| (id, index));
+}
+
+/// A listing's children with their name hashes, the walk index each was kept at dropped.
+fn without_walk_index(children: Vec<(NodeID, u32, u64)>) -> Vec<(NodeID, u64)> {
+    // Collected in place: the element sizes match, so this reuses the vector.
+    children
+        .into_iter()
+        .map(|(id, _, name_hash)| (id, name_hash))
+        .collect()
+}
+
 impl State {
     /// An empty state, in the `Arc` every state is shared through.
     pub fn new() -> Arc<Self> {
-        Self::new_shared(&StateData::new_zeroed(), Hash::default(), false)
+        let state = Self::new_shared(&StateData::new_zeroed(), Hash::default(), false);
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::log::record(
+            &state.hooks,
+            crate::state::node::hooks::log::Effect::Created { from: None },
+        );
+        state
+    }
+
+    /// The runtime lock's write guard.
+    #[inline]
+    pub(in crate::state) fn runtime_write(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, StateRuntime> {
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::touched(
+            crate::state::node::hooks::Resource::Runtime(self.hooks.ordinal()),
+            true,
+        );
+        self.runtime.write()
+    }
+
+    /// The data lock's write guard; under `state-hooks`, touched once taken.
+    #[inline]
+    pub(in crate::state) fn data_write(&self) -> parking_lot::RwLockWriteGuard<'_, StateData> {
+        let guard = self.data.write();
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::touched(
+            crate::state::node::hooks::Resource::Data(self.hooks.ordinal()),
+            true,
+        );
+        guard
+    }
+
+    /// The data lock's read guard; under `state-hooks`, touched once taken.
+    #[inline]
+    pub(in crate::state) fn data_read(&self) -> parking_lot::RwLockReadGuard<'_, StateData> {
+        let guard = self.data.read();
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::touched(
+            crate::state::node::hooks::Resource::Data(self.hooks.ordinal()),
+            false,
+        );
+        guard
+    }
+
+    /// The runtime lock's read guard.
+    #[inline]
+    fn runtime_read(&self) -> parking_lot::RwLockReadGuard<'_, StateRuntime> {
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::touched(
+            crate::state::node::hooks::Resource::Runtime(self.hooks.ordinal()),
+            false,
+        );
+        self.runtime.read()
+    }
+
+    /// Marks this State as served by a VFS provider, for good.
+    pub fn mark_served(&self) {
+        self.served.store(true, Ordering::Relaxed);
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::log::record(
+            &self.hooks,
+            crate::state::node::hooks::log::Effect::Served,
+        );
+    }
+
+    /// Whether a VFS provider serves this State ([`Self::mark_served`]).
+    pub fn is_served(&self) -> bool {
+        self.served.load(Ordering::Relaxed)
+    }
+
+    /// Notes that a C API change failed or was dropped after its climb of the directories above
+    /// its node began and before the node changed ([`Self::node_move_staged`],
+    /// [`Self::node_add_staged`], [`Self::node_modify_staged`], [`Self::node_delete_level`]),
+    /// which may leave the directories it marked staged with no change of its own below them.
+    ///
+    /// Relaxed, as the flag's readers are ordered after its writers by the handle's claims: a C
+    /// API change notes it under its shared claim, which the tasks a call spawns hold shares of
+    /// until each is dropped, and the commit reads it under its exclusive one.
+    pub fn note_unfinished_change(&self) {
+        self.unfinished_change.store(true, Ordering::Relaxed);
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::log::record(
+            &self.hooks,
+            crate::state::node::hooks::log::Effect::Unfinished { set: true },
+        );
+    }
+
+    /// Whether a C API change failed or was dropped after its climb began since this State was
+    /// built or last committed through the C API, so a staged directory may hold no change: the
+    /// in-memory commit then counts only nodes carrying an action as staged.
+    pub fn has_unfinished_change(&self) -> bool {
+        self.unfinished_change.load(Ordering::Relaxed)
+    }
+
+    /// Forgets the unfinished changes noted, for the C API commit once its in-memory commit
+    /// published the tree it froze, clearing the staged marks it reached.
+    pub fn clear_unfinished_change(&self) {
+        self.unfinished_change.store(false, Ordering::Relaxed);
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::log::record(
+            &self.hooks,
+            crate::state::node::hooks::log::Effect::Unfinished { set: false },
+        );
+    }
+
+    /// For a `writer` changing chains or names past the primitives, which neither count nor log,
+    /// so a served State's listings would never see the change.
+    #[track_caller]
+    pub(in crate::state) fn assert_unserved(&self, writer: &str) {
+        debug_assert!(
+            !self.is_served(),
+            "{writer} changed a chain past the primitives of a served State, whose listings \
+             never see it"
+        );
+    }
+
+    /// The most attempts one change to a directory's chain makes before [`SlowDown`]:
+    /// [`CHAIN_CHANGE_ATTEMPTS`], or, under `state-hooks`, the bound a test set
+    /// ([`Self::set_retry_bound_for_tests`]).
+    #[inline]
+    #[cfg_attr(not(feature = "state-hooks"), allow(clippy::unused_self))]
+    pub(crate) fn chain_change_attempts(&self) -> u32 {
+        #[cfg(feature = "state-hooks")]
+        if let Some(bound) = self.hooks.retry_bound() {
+            return bound;
+        }
+        CHAIN_CHANGE_ATTEMPTS
+    }
+
+    /// Under `state-hooks`, what names this State to the scheduler, and what a test reads of it;
+    /// shared with the State's blocks, so a count read after the State drops shows the blocks that
+    /// outlived it.
+    #[cfg(feature = "state-hooks")]
+    pub fn hooks(&self) -> &Arc<crate::state::node::hooks::StateHooks> {
+        &self.hooks
+    }
+
+    /// Under `state-hooks`, lowers the most attempts a change to a chain makes, and the most
+    /// restarts a walk of one makes, before [`SlowDown`], to `bound`; `None` restores the
+    /// product's. For tests, before any operation runs on the State: the attach's loops compare
+    /// their counts with the bound at each check, so one lowered below a count already reached
+    /// would never stop them, and `ChainAttempts::exhausted` would answer `SlowDown` where its
+    /// misses show a broken hierarchy.
+    #[cfg(feature = "state-hooks")]
+    pub fn set_retry_bound_for_tests(&self, bound: Option<u32>) {
+        self.hooks.set_retry_bound(bound);
     }
 
     /// Builds the state in its `Arc` allocation, one field at a time. Built as a
@@ -698,11 +1775,24 @@ impl State {
             let Self {
                 data: _,
                 runtime: _,
+                served: _,
+                unfinished_change: _,
                 unused: _,
+                moves: _,
+                pending: _,
+                find_restarts: _,
+                attach_retries: _,
+                served_refusals: _,
+                clears_overtaken: _,
+                clears_rechecked: _,
+                clears_found_gone: _,
+                reclaims: _,
                 deserialize: _,
                 block_deserialize: _,
                 metadata_deserialize: _,
                 block_loading: _,
+                #[cfg(feature = "state-hooks")]
+                    hooks: _,
                 base: _,
             } = state;
         };
@@ -717,11 +1807,24 @@ impl State {
                 signature,
                 rehash_node_names,
             )));
+            (&raw mut (*fields).served).write(AtomicBool::new(false));
+            (&raw mut (*fields).unfinished_change).write(AtomicBool::new(false));
             (&raw mut (*fields).unused).write(tokio::sync::Semaphore::new(1));
+            (&raw mut (*fields).moves).write(tokio::sync::Semaphore::new(1));
+            (&raw mut (*fields).pending).write(std::sync::OnceLock::new());
+            (&raw mut (*fields).find_restarts).write(AtomicU64::new(0));
+            (&raw mut (*fields).attach_retries).write(AtomicU64::new(0));
+            (&raw mut (*fields).served_refusals).write(AtomicU64::new(0));
+            (&raw mut (*fields).clears_overtaken).write(AtomicU64::new(0));
+            (&raw mut (*fields).clears_rechecked).write(AtomicU64::new(0));
+            (&raw mut (*fields).clears_found_gone).write(AtomicU64::new(0));
+            (&raw mut (*fields).reclaims).write(AtomicU32::new(0));
             (&raw mut (*fields).deserialize).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).block_deserialize).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).metadata_deserialize).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).block_loading).write(std::sync::OnceLock::new());
+            #[cfg(feature = "state-hooks")]
+            (&raw mut (*fields).hooks).write(crate::state::node::hooks::StateHooks::new());
             (&raw mut (*fields).base).write(parking_lot::Mutex::new(None));
             state.assume_init()
         }
@@ -779,6 +1882,9 @@ impl State {
         }
         let address = Address::zero_context_hash(signature);
         let options = read_options_from_repository(&repository);
+        // Under `state-hooks`, the repository the State is read from, as the log names it.
+        #[cfg(feature = "state-hooks")]
+        let from = Arc::as_ptr(&repository) as usize;
         let mut data =
             match Box::pin(StateData::read_from_immutable(repository, address, options)).await {
                 Ok(data) => data,
@@ -820,7 +1926,15 @@ impl State {
             let rehash_node_names = data.format < StateFormat::LowerCaseHash as u32;
             // Clean flags
             data.flags &= !StateFlags::Dirty;
-            Ok(State::new_shared(&data, signature, rehash_node_names))
+            let state = State::new_shared(&data, signature, rehash_node_names);
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::log::record(
+                &state.hooks,
+                crate::state::node::hooks::log::Effect::Created {
+                    from: Some((from, signature)),
+                },
+            );
+            Ok(state)
         }
     }
 
@@ -830,11 +1944,24 @@ impl State {
     /// Takes the state's `Arc`: a state that rehashes its node names, as one read in a format
     /// before [`StateFormat::LowerCaseHash`] does, loads every block in a task of its own, and
     /// each task holds the state.
+    ///
+    /// No writer runs beside a save, nor another save of this State (the Serialize tier is
+    /// exclusive): each block records one save's edit sequence. A writer that does run beside one
+    /// is not lost: what it changed goes into the next save, which then holds everything the
+    /// State does. The signature this save answers is not a snapshot of any one moment then: a
+    /// parent block imaged after a publish can name a child whose block was imaged before it, and
+    /// a block threaded onto the unused chain behind a fresh head this save does not write is
+    /// reached in the next save alone.
     pub async fn serialize(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
         _token: &RepositoryWriteToken,
     ) -> Result<Hash, StateError> {
+        debug_assert!(
+            self.runtime_read().fresh_blocks_from.is_none(),
+            "a State taking new nodes from fresh blocks is never serialized: its stored unused \
+             chain would leave out the tree's free slots"
+        );
         let is_dirty = self.is_dirty();
         if !is_dirty {
             lore_trace!(
@@ -844,7 +1971,7 @@ impl State {
             return Ok(self.revision());
         }
 
-        if self.runtime.read().rehash_node_names {
+        if self.runtime_read().rehash_node_names {
             // Deserialize all blocks to force update the node name hashes, as state format
             // requires all blocks to have same format
             lore_info!("Updating all state block name hashes");
@@ -854,15 +1981,18 @@ impl State {
             for block_index in 0..block_count {
                 let state = self.clone();
                 let repository = repository.clone();
-                lore_spawn!(tasks, async move {
-                    lore_trace!("  block {}/{}", block_index + 1, block_count);
-                    let block = state.block(repository, block_index).await?;
-                    {
-                        block.write().mark_dirty();
-                    }
-                    state.block_modified(block, block_index);
-                    Ok(())
-                });
+                lore_spawn!(
+                    tasks,
+                    crate::subtask!(async move {
+                        lore_trace!("  block {}/{}", block_index + 1, block_count);
+                        let block = state.block(repository, block_index).await?;
+                        {
+                            block.write().mark_dirty();
+                        }
+                        state.block_modified(block, block_index);
+                        Ok(())
+                    })
+                );
                 if let Some(task_result) = tasks.try_join_next() {
                     match task_result {
                         Ok(inner_result) => {
@@ -891,12 +2021,17 @@ impl State {
             result?;
         }
 
-        let (block_dirty, block_file_metadata_dirty) = {
-            let lock = self.runtime.read();
-            (
-                lock.block_dirty.clone(),
-                lock.block_file_metadata_dirty.clone(),
-            )
+        let (mut block_dirty, block_file_metadata_dirty) = {
+            let lock = self.runtime_read();
+            // Room for the unused chain's head, which a threading may add.
+            let block_dirty = if lock.block_dirty.is_empty() {
+                Vec::new()
+            } else {
+                let mut block_dirty = Vec::with_capacity(lock.block_dirty.len() + 1);
+                block_dirty.extend(lock.block_dirty.iter().cloned());
+                block_dirty
+            };
+            (block_dirty, lock.block_file_metadata_dirty.clone())
         };
 
         // Each phase reads the tree again where it updates it, rather than sharing a copy: a copy
@@ -904,7 +2039,7 @@ impl State {
         let block_count = self.tree(repository.clone()).await?.block_count as usize;
 
         if !block_dirty.is_empty() {
-            self.serialize_node_blocks(&repository, &block_dirty, block_count)
+            self.serialize_node_blocks(&repository, &mut block_dirty, block_count)
                 .await?;
         }
         if !block_file_metadata_dirty.is_empty() {
@@ -916,10 +2051,10 @@ impl State {
             .await?;
         }
 
-        let link_list = { self.runtime.read().link_list.clone() };
+        let link_list = { self.runtime_read().link_list.clone() };
         if let Some(link_list) = link_list {
             let list_hash = hash::hash_slice(link_list.as_bytes());
-            if list_hash != self.data.read().hash_link {
+            if list_hash != self.data_read().hash_link {
                 let rehashed_list = if link_list.is_empty() {
                     lore_debug!("Link list empty, write default hash");
                     Hash::default()
@@ -940,7 +2075,7 @@ impl State {
                 };
 
                 lore_debug!("Serialized link list to {rehashed_list}");
-                let mut data = self.data.write();
+                let mut data = self.data_write();
                 data.hash_link = rehashed_list;
                 data.flags |= StateFlags::Dirty;
             }
@@ -949,15 +2084,18 @@ impl State {
         self.serialize_tree(&repository).await?;
 
         // Serialize the state
+        let redirty = Redirty(Some(self));
         let address = {
             let buffer = {
-                let mut data = self.data.write();
+                let mut data = self.data_write();
                 data.flags &= !StateFlags::Dirty;
                 data.format = StateFormat::LowerCaseHash as u32;
                 data.magic = STATE_MAGIC;
 
                 Bytes::copy_from_slice(data.as_bytes())
             };
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::reached(crate::state::node::hooks::Point::Serialize).await;
 
             immutable::write(
                 repository.clone(),
@@ -973,11 +2111,12 @@ impl State {
         };
 
         {
-            let mut runtime = self.runtime.write();
+            let mut runtime = self.runtime_write();
             runtime.signature = address.hash;
         }
 
         self.release_serialized_blocks(&block_dirty, &block_file_metadata_dirty);
+        redirty.disarm();
 
         lore_trace!(
             "Serialized state to {} in repository {}",
@@ -996,65 +2135,61 @@ impl State {
     async fn serialize_node_blocks(
         &self,
         repository: &Arc<RepositoryContext>,
-        block_dirty: &[(Arc<NodeBlock>, usize)],
+        block_dirty: &mut Vec<(Arc<NodeBlock>, usize)>,
         block_count: usize,
     ) -> Result<(), StateError> {
         lore_debug!("Serializing {} dirty blocks", block_dirty.len());
-        let mut block_unused_first = self.tree_readonly()?.block_unused_first;
+        self.thread_unused_blocks(repository, block_dirty, block_count)
+            .await?;
         let mut tasks: JoinSet<Result<(Address, usize), StateError>> = JoinSet::new();
         for (block, block_index) in block_dirty.iter() {
             let block = block.clone();
             let block_index = *block_index;
-            if block.read().has_first_unused_node() {
-                block.write().node_block().block_unused_next = block_unused_first;
-                block_unused_first = block_index as u32;
-            }
             lore_trace!("Queue serialization of dirty node block {}", block_index);
             let repository = repository.clone();
-            lore_spawn!(tasks, async move {
-                lore_trace!("Serializing dirty node block {}", block_index);
-                let node_block = {
-                    block.deserialize_nametable(repository.clone()).await?;
-                    block.node_name_repack();
-                    if block.is_nametable_deserialized() {
+            lore_spawn!(
+                tasks,
+                crate::subtask!(async move {
+                    lore_trace!("Serializing dirty node block {}", block_index);
+                    #[cfg(feature = "state-hooks")]
+                    crate::state::node::hooks::reached(crate::state::node::hooks::Point::BlockSave)
+                        .await;
+                    let node_block = {
+                        block.deserialize_nametable(repository.clone()).await?;
                         lore_trace!("Serializing dirty node block {} name table", block_index);
-                        let name_table = {
-                            let reader = block.read_owned();
-                            if reader.name_table().is_empty() {
-                                Address::default()
-                            } else {
-                                immutable::write_borrowed(
-                                    repository.clone(),
-                                    Context::default(),
-                                    reader.name_table(),
-                                    immutable::write_options_from_repository(repository.clone())
-                                        .with_local_cache_priority()
-                                        .with_max_size_chunk(),
-                                )
-                                .await
-                                .forward::<StateError>("Failed to serialize node block")?
-                            }
+                        // The table and the image under one hold: an edit between them would store
+                        // a name the table written lacks.
+                        let saving = block.saving();
+                        let name_table = if saving.name_table().is_empty() {
+                            Address::default()
+                        } else {
+                            immutable::write_borrowed(
+                                repository.clone(),
+                                Context::default(),
+                                saving.name_table(),
+                                immutable::write_options_from_repository(repository.clone())
+                                    .with_local_cache_priority()
+                                    .with_max_size_chunk(),
+                            )
+                            .await
+                            .forward::<StateError>("Failed to serialize node block")?
                         };
-                        {
-                            let mut writer = block.write();
-                            writer.node_block().name_table = name_table.hash;
-                        }
-                    }
-                    block.read_owned()
-                };
-                let address = node_block
-                    .node_block()
-                    .write_to_immutable(
-                        repository.clone(),
-                        Context::default(),
-                        immutable::write_options_from_repository(repository.clone())
-                            .with_local_cache_priority()
-                            .with_max_size_chunk(),
-                    )
-                    .await
-                    .forward::<StateError>("Failed to serialize node block")?;
-                Ok((address, block_index))
-            });
+                        saving.image(name_table.hash)
+                    };
+                    let address = node_block
+                        .node_block()
+                        .write_to_immutable(
+                            repository.clone(),
+                            Context::default(),
+                            immutable::write_options_from_repository(repository.clone())
+                                .with_local_cache_priority()
+                                .with_max_size_chunk(),
+                        )
+                        .await
+                        .forward::<StateError>("Failed to serialize node block")?;
+                    Ok((address, block_index))
+                })
+            );
         }
 
         let hash_node = self.tree_readonly()?.hash_node;
@@ -1098,24 +2233,158 @@ impl State {
         .await
         .forward::<StateError>("Failed to serialize node block list")?;
 
-        // Update the tree node block list address
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::reached(crate::state::node::hooks::Point::Serialize).await;
+        // Update the tree node block list address, in place: a copy written back would undo a
+        // grab's change to the tree since it was read.
         {
-            let mut tree = self.tree_readonly()?;
+            let mut lock = self.runtime_write();
+            let tree = lock
+                .tree
+                .as_mut()
+                .ok_or_else(|| StateError::internal("Tree is None"))?;
             lore_trace!(
                 "Update tree node block list from {} to {}",
                 tree.hash_node,
                 list_address.hash
             );
-            tree.block_unused_first = block_unused_first;
             tree.hash_node = list_address.hash;
             tree.flags |= TreeFlags::Dirty;
-            {
-                let mut lock = self.runtime.write();
-                lock.tree = Some(tree);
-                lock.block_address = block_hash_bytes;
-            }
+            lock.block_address = block_hash_bytes;
         }
         Ok(())
+    }
+
+    /// Threads each block of `block_dirty` that freed a slot while full, which no grab reaches
+    /// until then, onto the tree's unused chain right behind its head, under the unused permit,
+    /// so no retire or push moves the head meanwhile, and none is written over (H4).
+    ///
+    /// The head never moves for it: grabs take only the head's slots, so a block behind the head
+    /// never fills, and a full head never ends up behind another block, where no grab retires it
+    /// and the slot it later frees would thread it a second time, a cycle. A grab filling the
+    /// head meanwhile is the usual case: the next grab retires it onto the blocks threaded
+    /// behind it. Where the chain is empty the blocks threaded make it, its head set under the
+    /// permit, which a grab finding no head waits for.
+    ///
+    /// Not threaded: the head, full when it freed its slot (it would follow itself), and a marked
+    /// block full again, its slot taken back while it was the head before a grab retired it. A
+    /// block threaded is marked dirty before its image, and so is the head linked to them, which
+    /// this save writes though it was clean: left to the next save, its link would be in memory
+    /// alone and keep the State dirty. A fresh head past the save's address list, dirty from its
+    /// allocation, goes into the next save.
+    ///
+    /// A grab that read the head before a retire moved it can still take the last free slot of
+    /// that block, once a discard or a slot's release freed one and a save threaded it behind the
+    /// new head: the block, full on the chain, frees a slot later and is threaded again. The
+    /// grab's head read has to span a retire, a free and a save; no save runs beside writers
+    /// (the Serialize tier is exclusive), so it is latent, as H4 is. Closing it would take every
+    /// grab re-checking, under its block's lock, that the block is still the head, a cost on the
+    /// grab's fast path a latent race does not justify.
+    ///
+    /// A block marked after the scan, or after its pass, stays registered for the next save
+    /// ([`NodeBlock::release_saved`]).
+    async fn thread_unused_blocks(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        block_dirty: &mut Vec<(Arc<NodeBlock>, usize)>,
+        block_count: usize,
+    ) -> Result<(), StateError> {
+        // Few saves have a block to thread: the permit is for those.
+        let Some(from) = block_dirty
+            .iter()
+            .position(|(block, _)| block.read().has_first_unused_node())
+        else {
+            return Ok(());
+        };
+        // The head loaded before the permit, as a grab loads it: only a head a retire moved to
+        // meanwhile loads under it.
+        let mut held = self.head_block(repository, None).await?;
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::reached(crate::state::node::hooks::Point::Serialize).await;
+        let _permit = self.acquire_unused().await?;
+        let first = self
+            .runtime_read()
+            .tree
+            .as_ref()
+            .ok_or_else(|| StateError::internal("Tree is None"))?
+            .block_unused_first;
+        if held.as_ref().is_none_or(|(at, _)| *at != first) {
+            held = self.head_block(repository, Some(first)).await?;
+        }
+        let behind = held.as_ref().map_or(INVALID_BLOCK, |(_, block)| {
+            block.read().node_block().block_unused_next
+        });
+        let mut next = behind;
+        for (block, block_index) in &block_dirty[from..] {
+            // Read first: few blocks carry the mark, and the write lock is for those.
+            if !block.read().has_first_unused_node() {
+                continue;
+            }
+            #[cfg(feature = "state-hooks")]
+            let _label = crate::state::node::hooks::log::label(
+                crate::state::node::hooks::log::Section::Save,
+            );
+            let mut writer = block.write();
+            if writer.take_first_unused_node() && !writer.is_full() && *block_index as u32 != first
+            {
+                writer.node_block().block_unused_next = next;
+                writer.mark_dirty();
+                next = *block_index as u32;
+            }
+        }
+        if next == behind {
+            return Ok(());
+        }
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::reached(crate::state::node::hooks::Point::Threading).await;
+        if let Some((_, block)) = held {
+            let dirtied = {
+                #[cfg(feature = "state-hooks")]
+                let _label = crate::state::node::hooks::log::label(
+                    crate::state::node::hooks::log::Section::Save,
+                );
+                let mut writer = block.write();
+                writer.node_block().block_unused_next = next;
+                writer.mark_dirty()
+            };
+            if dirtied {
+                self.block_modified(block.clone(), first as usize);
+            }
+            // Written by this save wherever its list lacks it, turned dirty by the link or by a
+            // writer after the list was taken, and once: but for a fresh block past the save's
+            // address list, dirty from its allocation, which the next save writes.
+            if (first as usize) < block_count
+                && !block_dirty.iter().any(|(_, at)| *at == first as usize)
+            {
+                block_dirty.push((block, first as usize));
+            }
+        } else {
+            let mut runtime = self.runtime_write();
+            let tree = runtime
+                .tree
+                .as_mut()
+                .ok_or_else(|| StateError::internal("Tree is None"))?;
+            tree.block_unused_first = next;
+            tree.flags |= TreeFlags::Dirty;
+        }
+        Ok(())
+    }
+
+    /// The unused chain's head, `at` or else the one the tree names now, with its block; `None`
+    /// where the chain is empty.
+    async fn head_block(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        at: Option<u32>,
+    ) -> Result<Option<(u32, Arc<NodeBlock>)>, StateError> {
+        let head = at.unwrap_or_else(|| self.unused_head());
+        if head as usize >= self.block_count() {
+            return Ok(None);
+        }
+        Ok(Some((
+            head,
+            self.block(repository.clone(), head as usize).await?,
+        )))
     }
 
     /// Writes the dirty file metadata blocks and the list of their addresses, and points the tree
@@ -1140,26 +2409,32 @@ impl State {
                 block_index
             );
 
-            lore_spawn!(tasks, async move {
-                lore_trace!("Serializing dirty file metadata node block {}", block_index);
-                let node_block = block.read_owned();
-                let address = node_block
-                    .node_block()
-                    .write_to_immutable(
-                        repository.clone(),
-                        Context::default(),
-                        immutable::write_options_from_repository(repository.clone())
-                            .with_local_cache_priority()
-                            .with_max_size_chunk(),
-                    )
-                    .await
-                    .forward::<StateError>("Failed to serialize file metadata block")?;
-                Ok((address, block_index))
-            });
+            lore_spawn!(
+                tasks,
+                crate::subtask!(async move {
+                    lore_trace!("Serializing dirty file metadata node block {}", block_index);
+                    #[cfg(feature = "state-hooks")]
+                    crate::state::node::hooks::reached(crate::state::node::hooks::Point::BlockSave)
+                        .await;
+                    let node_block = block.read_saving();
+                    let address = node_block
+                        .node_block()
+                        .write_to_immutable(
+                            repository.clone(),
+                            Context::default(),
+                            immutable::write_options_from_repository(repository.clone())
+                                .with_local_cache_priority()
+                                .with_max_size_chunk(),
+                        )
+                        .await
+                        .forward::<StateError>("Failed to serialize file metadata block")?;
+                    Ok((address, block_index))
+                })
+            );
         }
 
         let mut block_hash_bytes = {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             // Resize buffer with empty hashes if needed
             lock.block_file_metadata_address
                 .clone_and_resize_zeroed::<Hash>(block_count)
@@ -1200,9 +2475,15 @@ impl State {
         .await
         .forward::<StateError>("Failed to serialize file metadata block list")?;
 
-        // Update the tree file metadata node block list address
+        #[cfg(feature = "state-hooks")]
+        crate::state::node::hooks::reached(crate::state::node::hooks::Point::Serialize).await;
+        // Update the tree file metadata node block list address, in place, as the node blocks'.
         {
-            let mut tree = self.tree_readonly()?;
+            let mut lock = self.runtime_write();
+            let tree = lock
+                .tree
+                .as_mut()
+                .ok_or_else(|| StateError::internal("Tree is None"))?;
             lore_trace!(
                 "Update tree file metadata node block list from {} to {}",
                 tree.hash_file_metadata,
@@ -1210,11 +2491,7 @@ impl State {
             );
             tree.hash_file_metadata = list_address.hash;
             tree.flags |= TreeFlags::Dirty;
-            {
-                let mut lock = self.runtime.write();
-                lock.tree = Some(tree);
-                lock.block_file_metadata_address = block_hash_bytes;
-            }
+            lock.block_file_metadata_address = block_hash_bytes;
         }
         Ok(())
     }
@@ -1224,7 +2501,7 @@ impl State {
     /// Its own future, so that the copy of the tree it writes from is not held in every state
     /// of [`Self::serialize`].
     async fn serialize_tree(&self, repository: &Arc<RepositoryContext>) -> Result<(), StateError> {
-        let tree = { self.runtime.read().tree.unwrap_or_default() };
+        let tree = { self.runtime_read().tree.unwrap_or_default() };
         if tree.flags & TreeFlags::Dirty == 0 {
             return Ok(());
         }
@@ -1242,7 +2519,7 @@ impl State {
         lore_trace!("Serialized tree to {}", address.hash);
         lore_trace!("  node block {}", tree.hash_node);
         lore_trace!("  file metadata block {}", tree.hash_file_metadata);
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.hash_tree = address.hash;
         data.flags |= StateFlags::Dirty;
         Ok(())
@@ -1255,40 +2532,48 @@ impl State {
     /// flagged dirty, so the next edit's `mark_dirty` reports "already dirty", its
     /// caller registers nothing and does not mark the state dirty, and the next
     /// `serialize` returns the previous signature having written none of the edits.
-    /// Only the blocks this call wrote are released — anything registered while it ran
-    /// still needs writing.
     ///
-    /// The dirty flag cleared here is itself the membership test, so the registrations
-    /// are filtered on it rather than against a set of what was written: a block still
-    /// dirty was either registered while this call ran or re-edited since it was
-    /// written, and either way it still needs writing.
+    /// A block an edit marked since the save took its image stays dirty: that edit found it
+    /// dirty already and registered nothing, so only this keeps it in a save (H4). The dirty
+    /// flag is then the membership test, so the registrations are filtered on it: a block
+    /// still dirty was either registered while this call ran or edited since its image, and
+    /// either way it still needs writing. The State, its flag cleared when its data was
+    /// written, is marked dirty again while any block stays registered.
     fn release_serialized_blocks(
         &self,
         block_dirty: &[(Arc<NodeBlock>, usize)],
         block_file_metadata_dirty: &[(Arc<NodeFileMetadataBlock>, usize)],
     ) {
         for (block, _) in block_dirty.iter() {
-            block.write().clear_dirty();
+            block.release_saved();
         }
         for (block, _) in block_file_metadata_dirty.iter() {
-            block.write().clear_dirty();
+            block.release_saved();
         }
 
-        let mut runtime = self.runtime.write();
-        runtime
-            .block_dirty
-            .retain(|(block, _)| block.read().is_dirty());
-        runtime
-            .block_file_metadata_dirty
-            .retain(|(block, _)| block.read().is_dirty());
+        let registered = {
+            let mut runtime = self.runtime_write();
+            // A block read clean drops its registration under the same read lock, so a write
+            // turning it dirty after registers it again, behind this runtime lock.
+            runtime
+                .block_dirty
+                .retain(|(block, _)| block.keep_registration());
+            runtime
+                .block_file_metadata_dirty
+                .retain(|(block, _)| block.keep_registration());
+            !runtime.block_dirty.is_empty() || !runtime.block_file_metadata_dirty.is_empty()
+        };
+        if registered {
+            self.mark_dirty();
+        }
     }
 
     pub fn format(&self) -> u32 {
-        self.data.read().format
+        self.data_read().format
     }
 
     pub fn flags(&self) -> u32 {
-        self.data.read().flags
+        self.data_read().flags
     }
 
     pub async fn update_tree_root_hash(
@@ -1296,7 +2581,7 @@ impl State {
         repository: Arc<RepositoryContext>,
     ) -> Result<(), StateError> {
         let root_block = {
-            let runtime = self.runtime.read();
+            let runtime = self.runtime_read();
             if !runtime.block.is_empty() {
                 runtime.block[0].upgrade()
             } else {
@@ -1306,6 +2591,10 @@ impl State {
 
         let root_data = {
             if let Some(root_block) = root_block {
+                #[cfg(feature = "state-hooks")]
+                let _label = crate::state::node::hooks::log::label(
+                    crate::state::node::hooks::log::Section::Save,
+                );
                 let mut block = root_block.write();
                 let root_node = block.node(0);
                 let root_hash = root_node.address.hash;
@@ -1342,7 +2631,7 @@ impl State {
 
         let dirty = {
             if let Some(tree) = tree {
-                let mut runtime = self.runtime.write();
+                let mut runtime = self.runtime_write();
                 runtime.tree = Some(tree);
                 true
             } else {
@@ -1351,7 +2640,7 @@ impl State {
         };
 
         if dirty {
-            let mut data = self.data.write();
+            let mut data = self.data_write();
             data.flags |= StateFlags::Dirty;
         }
 
@@ -1367,16 +2656,16 @@ impl State {
     }
 
     pub fn metadata_hash(&self) -> Hash {
-        self.data.read().hash_metadata
+        self.data_read().hash_metadata
     }
 
     /// The hash of the tree record, or zero when the state has no stored tree.
     pub fn tree_hash(&self) -> Hash {
-        self.data.read().hash_tree
+        self.data_read().hash_tree
     }
 
     pub fn set_metadata_hash(&self, metadata: Hash) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.hash_metadata = metadata;
         data.flags |= StateFlags::Dirty;
     }
@@ -1387,7 +2676,7 @@ impl State {
             tree.hash_delta = delta_block;
             tree.delta_count = delta_count as u32;
             tree.flags |= TreeFlags::Dirty;
-            self.runtime.write().tree = Some(tree);
+            self.runtime_write().tree = Some(tree);
         }
         Ok(())
     }
@@ -1431,7 +2720,7 @@ impl State {
 
     /// Node blocks the tree has, whether or not any of them is in memory.
     pub fn block_count(&self) -> usize {
-        self.runtime.read().block_count()
+        self.runtime_read().block_count()
     }
 
     pub async fn block(
@@ -1440,7 +2729,7 @@ impl State {
         block_index: usize,
     ) -> Result<Arc<NodeBlock>, StateError> {
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if lock.block.len() > block_index
                 && let Some(block) = lock.block[block_index].upgrade()
             {
@@ -1451,13 +2740,19 @@ impl State {
         Box::pin(self.block_deserialize(repository, block_index)).await
     }
 
+    /// Node block `block_index` where it is in memory, reading nothing.
+    pub fn resident_block(&self, block_index: usize) -> Option<Arc<NodeBlock>> {
+        let lock = self.runtime_read();
+        lock.block.get(block_index).and_then(Weak::upgrade)
+    }
+
     pub async fn try_block(
         &self,
         repository: Arc<RepositoryContext>,
         block_index: usize,
     ) -> Option<Arc<NodeBlock>> {
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if lock.block.len() > block_index
                 && let Some(block) = lock.block[block_index].upgrade()
             {
@@ -1511,15 +2806,20 @@ impl State {
             )));
         }
 
+        #[cfg(feature = "state-hooks")]
+        let waiting =
+            crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::BlockLoad);
         let _loading_permit = self
             .block_loading_permit(block_index)
             .acquire()
             .await
             .internal("Failed to deserialize node block")?;
+        #[cfg(feature = "state-hooks")]
+        drop(waiting);
         // One permit covers many blocks, so the task that held it before this
         // one may have published this block, or a different one.
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if lock.block.len() > block_index
                 && let Some(block) = lock.block[block_index].upgrade()
             {
@@ -1528,27 +2828,32 @@ impl State {
         }
 
         let (mut block_hash_bytes, rehash_node_names) = {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             (lock.block_address.clone(), lock.rehash_node_names)
         };
 
         if block_index >= block_hash_bytes.count::<Hash>() {
             // Avoid multiple tasks deserializing block list and block at the same time
+            #[cfg(feature = "state-hooks")]
+            let waiting =
+                crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::BlockLoad);
             let _guard = self
                 .block_deserialize
                 .acquire()
                 .await
                 .internal("Failed to deserialize node block")?;
+            #[cfg(feature = "state-hooks")]
+            drop(waiting);
 
             block_hash_bytes = {
-                let lock = self.runtime.read();
+                let lock = self.runtime_read();
                 lock.block_address.clone()
             };
 
             // Check if deserialize still needed after getting lock
             if block_index >= block_hash_bytes.count::<Hash>() {
                 if hash_node.is_zero() {
-                    let block = Arc::new(NodeBlock::new_zeroed());
+                    let block = NodeBlock::new_zeroed();
                     if block_index == 0 {
                         // Reserve root node
                         let block = block.clone();
@@ -1557,7 +2862,7 @@ impl State {
                         node_block.node_count = 1;
                     }
                     {
-                        let mut lock = self.runtime.write();
+                        let mut lock = self.runtime_write();
                         if block_index >= lock.block.len() {
                             lock.block.resize(block_count, Weak::default());
                         }
@@ -1565,6 +2870,12 @@ impl State {
                             return Ok(prev_block);
                         }
                         lock.block[block_index] = Arc::downgrade(&block);
+                        #[cfg(feature = "state-hooks")]
+                        block.set_hook_index(
+                            &self.hooks,
+                            block_index,
+                            crate::state::node::hooks::log::Install::Loaded { zeroed: true },
+                        );
                     }
                     return Ok(block);
                 }
@@ -1583,8 +2894,8 @@ impl State {
         }
 
         if block_hash[block_index].is_zero() {
-            let block = Arc::new(NodeBlock::new_zeroed());
-            let mut lock = self.runtime.write();
+            let block = NodeBlock::new_zeroed();
+            let mut lock = self.runtime_write();
             if block_index >= lock.block.len() {
                 lock.block.resize(block_count, Weak::default());
             }
@@ -1599,6 +2910,12 @@ impl State {
                 node_block.node_count = 1;
             }
             lock.block[block_index] = Arc::downgrade(&block);
+            #[cfg(feature = "state-hooks")]
+            block.set_hook_index(
+                &self.hooks,
+                block_index,
+                crate::state::node::hooks::log::Install::Loaded { zeroed: true },
+            );
             if lock.block_cache.len() < MAX_BLOCK_CACHE {
                 lock.block_cache.push(block.clone());
             } else {
@@ -1614,9 +2931,15 @@ impl State {
         lore_trace!("Deserialize state node block {block_index}");
 
         let address = Address::zero_context_hash(block_hash[block_index]);
-        let block = Arc::new(NodeBlock::deserialize(repository, self, address).await?);
+        #[cfg(feature = "state-hooks")]
+        let waiting =
+            crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::BlockLoad);
+        let deserialized = NodeBlock::deserialize(repository, self, address).await;
+        #[cfg(feature = "state-hooks")]
+        drop(waiting);
+        let block = deserialized?;
         {
-            let mut lock = self.runtime.write();
+            let mut lock = self.runtime_write();
             if block_index >= lock.block.len() {
                 lock.block.resize(block_count, Weak::default());
             }
@@ -1624,11 +2947,19 @@ impl State {
                 return Ok(prev_block);
             }
 
-            if rehash_node_names {
+            if rehash_node_names && block.claim_registration() {
                 lock.block_dirty.push((block.clone(), block_index));
             }
+            // Loaded flagged, as its records may hold slots an earlier session left detached.
+            lock.note_unswept(block_index);
 
             lock.block[block_index] = Arc::downgrade(&block);
+            #[cfg(feature = "state-hooks")]
+            block.set_hook_index(
+                &self.hooks,
+                block_index,
+                crate::state::node::hooks::log::Install::Loaded { zeroed: false },
+            );
             if lock.block_cache.len() < MAX_BLOCK_CACHE {
                 lock.block_cache.push(block.clone());
             } else {
@@ -1685,7 +3016,7 @@ impl State {
         block_index: usize,
     ) -> Result<Option<Arc<NodeFileMetadataBlock>>, StateError> {
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if lock.block_file_metadata.len() > block_index
                 && let Some(block) = lock.block_file_metadata[block_index].upgrade()
             {
@@ -1693,30 +3024,22 @@ impl State {
             }
         }
 
-        let Tree {
-            block_count,
-            hash_file_metadata,
-            ..
-        } = self.tree(repository.clone()).await?;
+        let Tree { block_count, .. } = self.tree(repository.clone()).await?;
         if block_index >= block_count as usize {
             return Err(StateError::internal(format!(
                 "Invalid block index: {block_index}"
             )));
         }
 
-        if hash_file_metadata.is_zero() {
-            return Ok(None);
-        }
-        {
-            let runtime = self.runtime.read();
-            let addresses = runtime.block_file_metadata_address.as_type_slice::<Hash>();
-            if !addresses.is_empty() && addresses.get(block_index).is_none_or(Hash::is_zero) {
-                return Ok(None);
-            }
+        // A tree that records no file metadata, or an address list in memory with no entry or a
+        // zero hash at this index, answers without a read. Otherwise `block_file_metadata` reads
+        // the list, and repeats the same test against it before deserializing.
+        if let Ok(answer) = self.resident_file_metadata(block_index) {
+            return Ok(answer);
         }
 
         let block = self.block_file_metadata(repository, block_index).await?;
-        let mut runtime = self.runtime.write();
+        let mut runtime = self.runtime_write();
         let stored = runtime
             .block_file_metadata_address
             .as_type_slice::<Hash>()
@@ -1738,7 +3061,7 @@ impl State {
         block_index: usize,
     ) -> Result<Arc<NodeFileMetadataBlock>, StateError> {
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if lock.block_file_metadata.len() > block_index
                 && let Some(block) = lock.block_file_metadata[block_index].upgrade()
             {
@@ -1767,15 +3090,20 @@ impl State {
             )));
         }
 
+        #[cfg(feature = "state-hooks")]
+        let waiting =
+            crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::FileMetadata);
         let _loading_permit = self
             .block_loading_permit(block_index)
             .acquire()
             .await
             .internal("Failed to deserialize metadata")?;
+        #[cfg(feature = "state-hooks")]
+        drop(waiting);
         // One permit covers many blocks, so the task that held it before this
         // one may have published this block, or a different one.
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if lock.block_file_metadata.len() > block_index
                 && let Some(block) = lock.block_file_metadata[block_index].upgrade()
             {
@@ -1784,7 +3112,7 @@ impl State {
         }
 
         {
-            let mut lock = self.runtime.write();
+            let mut lock = self.runtime_write();
             if block_index >= lock.block_file_metadata.len() {
                 lock.block_file_metadata
                     .resize(block_count as usize, Weak::default());
@@ -1799,19 +3127,28 @@ impl State {
             .copied()
             .filter(|hash| !hash.is_zero());
         let block = Arc::new(match stored {
-            Some(hash) => NodeFileMetadataBlock::new(
-                NodeFileMetadataBlockData::read_box_from_immutable_compat(
+            Some(hash) => NodeFileMetadataBlock::new({
+                #[cfg(feature = "state-hooks")]
+                let waiting = crate::state::node::hooks::waiting(
+                    crate::state::node::hooks::Wait::FileMetadata,
+                );
+                let data = NodeFileMetadataBlockData::read_box_from_immutable_compat(
                     repository.clone(),
                     Address::zero_context_hash(hash),
                     true,
                 )
                 .await
-                .forward::<StateError>("Failed to deserialize file metadata block")?,
-            ),
+                .forward::<StateError>("Failed to deserialize file metadata block")?;
+                #[cfg(feature = "state-hooks")]
+                drop(waiting);
+                data
+            }),
             None => NodeFileMetadataBlock::default(),
         });
+        #[cfg(feature = "state-hooks")]
+        block.set_hook_name(self.hooks.ordinal(), block_index);
 
-        let mut lock = self.runtime.write();
+        let mut lock = self.runtime_write();
         if let Some(prev_block) = lock.block_file_metadata[block_index].upgrade() {
             return Ok(prev_block);
         }
@@ -1833,19 +3170,24 @@ impl State {
         block_count: usize,
     ) -> Result<Bytes, StateError> {
         {
-            let held = self.runtime.read().block_file_metadata_address.clone();
+            let held = self.runtime_read().block_file_metadata_address.clone();
             if !held.is_empty() || hash_file_metadata.is_zero() {
                 return Ok(held);
             }
         }
 
+        #[cfg(feature = "state-hooks")]
+        let waiting =
+            crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::FileMetadata);
         let _guard = self
             .metadata_deserialize
             .acquire()
             .await
             .internal("Failed to deserialize metadata")?;
+        #[cfg(feature = "state-hooks")]
+        drop(waiting);
         {
-            let held = self.runtime.read().block_file_metadata_address.clone();
+            let held = self.runtime_read().block_file_metadata_address.clone();
             if !held.is_empty() {
                 return Ok(held);
             }
@@ -1853,6 +3195,9 @@ impl State {
 
         // TODO(mjansson): To support huge trees we might want to selectively
         // read the block addresses instead of all in one big buffer
+        #[cfg(feature = "state-hooks")]
+        let waiting =
+            crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::FileMetadata);
         let mut addresses = Box::pin(immutable::read(
             repository.clone(),
             Address::zero_context_hash(hash_file_metadata),
@@ -1863,12 +3208,14 @@ impl State {
         ))
         .await
         .forward::<StateError>("Failed to deserialize file metadata block list")?;
+        #[cfg(feature = "state-hooks")]
+        drop(waiting);
         if addresses.count::<Hash>() < block_count {
             addresses = addresses
                 .clone_and_resize_zeroed::<Hash>(block_count)
                 .freeze();
         }
-        self.runtime.write().block_file_metadata_address = addresses.clone();
+        self.runtime_write().block_file_metadata_address = addresses.clone();
         Ok(addresses)
     }
 
@@ -1884,19 +3231,24 @@ impl State {
         block_count: usize,
     ) -> Result<Bytes, StateError> {
         {
-            let held = self.runtime.read().block_address.clone();
+            let held = self.runtime_read().block_address.clone();
             if !held.is_empty() || hash_node.is_zero() {
                 return Ok(held);
             }
         }
 
+        #[cfg(feature = "state-hooks")]
+        let waiting =
+            crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::BlockLoad);
         let _guard = self
             .block_deserialize
             .acquire()
             .await
             .internal("Failed to deserialize node block")?;
+        #[cfg(feature = "state-hooks")]
+        drop(waiting);
         {
-            let held = self.runtime.read().block_address.clone();
+            let held = self.runtime_read().block_address.clone();
             if !held.is_empty() {
                 return Ok(held);
             }
@@ -1935,6 +3287,9 @@ impl State {
         // TODO(mjansson): To support huge trees we might want to selectively
         // read the block addresses instead of all in one big buffer
         lore_trace!("Deserialize block address list");
+        #[cfg(feature = "state-hooks")]
+        let waiting =
+            crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::BlockLoad);
         let mut addresses = immutable::read(
             repository.clone(),
             Address::zero_context_hash(hash_node),
@@ -1945,36 +3300,38 @@ impl State {
         )
         .await
         .forward::<StateError>("Failed to deserialize node block list")?;
+        #[cfg(feature = "state-hooks")]
+        drop(waiting);
         if addresses.count::<Hash>() < block_count {
             addresses = addresses
                 .clone_and_resize_zeroed::<Hash>(block_count)
                 .freeze();
         }
-        self.runtime.write().block_address = addresses.clone();
+        self.runtime_write().block_address = addresses.clone();
         lore_trace!("Deserialized block address list");
         Ok(addresses)
     }
 
     pub fn parents(&self) -> [Hash; 2] {
-        self.data.read().parent
+        self.data_read().parent
     }
 
     pub fn parent_self(&self) -> Hash {
-        self.data.read().parent[0]
+        self.data_read().parent[0]
     }
 
     pub fn parent_other(&self) -> Hash {
-        self.data.read().parent[1]
+        self.data_read().parent[1]
     }
 
     pub fn set_parent_self(&self, signature: Hash) {
-        let mut lock = self.data.write();
+        let mut lock = self.data_write();
         lock.parent[0] = signature;
         lock.flags |= StateFlags::Dirty;
     }
 
     pub fn set_parent_other(&self, signature: Hash) {
-        let mut lock = self.data.write();
+        let mut lock = self.data_write();
         lock.parent[1] = signature;
         if !signature.is_zero() {
             lock.flags |= StateFlags::Merge;
@@ -1985,7 +3342,7 @@ impl State {
     }
 
     pub fn revision(&self) -> Hash {
-        self.runtime.read().signature
+        self.runtime_read().signature
     }
 
     /// Point the state at the revision it is based on.
@@ -1996,15 +3353,15 @@ impl State {
     /// from. Pair it with [`Self::mark_dirty`] — a state with unserialized edits and
     /// a signature is exactly what an edited handle looks like.
     pub fn set_revision(&self, signature: Hash) {
-        self.runtime.write().signature = signature;
+        self.runtime_write().signature = signature;
     }
 
     pub fn state_data(&self) -> StateData {
-        *self.data.read()
+        *self.data_read()
     }
 
     pub fn revision_number(&self) -> u64 {
-        self.data.read().revision_number
+        self.data_read().revision_number
     }
 
     pub fn committed_revision(&self) -> Hash {
@@ -2117,7 +3474,7 @@ impl State {
     }
 
     pub fn set_revision_number(&self, revision_number: u64) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         if data.revision_number != revision_number {
             data.revision_number = revision_number;
             data.flags |= StateFlags::Dirty;
@@ -2150,7 +3507,7 @@ impl State {
     }
 
     pub fn is_merge(&self) -> bool {
-        self.data.read().flags & StateFlags::Merge != 0
+        self.data_read().flags & StateFlags::Merge != 0
     }
 
     /// Whether the state is a merge whose second parent is `current_revision`, which is how a
@@ -2161,1166 +3518,338 @@ impl State {
     }
 
     pub fn is_cherry_pick(&self) -> bool {
-        self.data.read().flags & StateFlags::CherryPick != 0
+        self.data_read().flags & StateFlags::CherryPick != 0
     }
 
     pub fn is_revert(&self) -> bool {
-        self.data.read().flags & StateFlags::Revert != 0
+        self.data_read().flags & StateFlags::Revert != 0
     }
 
     pub fn is_merge_or_cherry_pick_or_revert(&self) -> bool {
-        self.data.read().flags & (StateFlags::Merge | StateFlags::CherryPick | StateFlags::Revert)
+        self.data_read().flags & (StateFlags::Merge | StateFlags::CherryPick | StateFlags::Revert)
             != 0
     }
 
     pub fn is_conflict(&self) -> bool {
-        self.data.read().flags & StateFlags::Conflict != 0
+        self.data_read().flags & StateFlags::Conflict != 0
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.data.read().flags & StateFlags::Dirty != 0
+        self.data_read().flags & StateFlags::Dirty != 0
     }
 
     pub fn set_merge(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::Merge;
     }
 
     pub fn set_cherry_pick(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::CherryPick;
     }
 
     pub fn set_revert(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::Revert;
     }
 
     pub fn set_conflict(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::Conflict;
         data.flags |= StateFlags::Dirty;
     }
 
     pub fn set_merge_conflict(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::Conflict | StateFlags::Merge | StateFlags::Dirty;
     }
 
     pub fn set_cherry_pick_conflict(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::Conflict | StateFlags::CherryPick | StateFlags::Dirty;
     }
 
     pub fn set_revert_conflict(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::Conflict | StateFlags::Revert | StateFlags::Dirty;
     }
 
     pub fn reset_merge_conflict_flags(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags &= !(StateFlags::Conflict
             | StateFlags::Merge
             | StateFlags::CherryPick
             | StateFlags::Revert);
     }
 
-    pub fn block_modified(&self, block: Arc<NodeBlock>, index: usize) {
-        let mut lock = self.runtime.write();
-        for tuple in lock.block_dirty.iter() {
-            if tuple.1 == index {
-                return;
-            }
+    /// Registers `block`, which turned dirty, for the next save, and marks the State dirty with
+    /// it: a save of a State not dirty writes nothing, so a block registered under a clean State
+    /// would go into no save (C14). A block registered already, as its registered bit says, is
+    /// not registered twice, and takes no runtime lock. Only the State's own code registers a node
+    /// block: every writer outside it goes through the node operations, which do.
+    pub(in crate::state) fn block_modified(&self, block: Arc<NodeBlock>, index: usize) {
+        if block.claim_registration() {
+            lore_trace!("Node block {index} marked dirty");
+            let mut runtime = self.runtime_write();
+            #[cfg(feature = "state-hooks")]
+            assert_resident(&runtime.block, &block, index);
+            runtime.block_dirty.push((block, index));
+            runtime.note_unswept(index);
         }
-        lore_trace!("Node block {index} marked dirty");
-        lock.block_dirty.push((block.clone(), index));
+        self.mark_dirty();
     }
 
-    pub fn block_file_metadata_modified(&self, block: Arc<NodeFileMetadataBlock>, index: usize) {
-        let mut lock = self.runtime.write();
-        for tuple in lock.block_file_metadata_dirty.iter() {
-            if tuple.1 == index {
-                //panic!("File metadata block marked as modified twice");
-                return;
+    /// The node blocks in memory a sweep scans ([`StateRuntime::unswept`]), with the notes they
+    /// were found by, which stay as they are until [`Self::settle_unswept`] takes them, so a sweep
+    /// dropped before takes nothing. The note of a block not in memory is not among them: it
+    /// stays for the sweep after the block loads, as a walk may load it flagged meanwhile.
+    pub(in crate::state) fn unswept_blocks(&self) -> (Vec<(usize, Arc<NodeBlock>)>, Vec<u64>) {
+        let runtime = self.runtime_read();
+        let mut noted = runtime.unswept.clone();
+        let mut found =
+            Vec::with_capacity(noted.iter().map(|word| word.count_ones() as usize).sum());
+        for (word_index, word) in noted.iter_mut().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                let index = word_index * 64 + bit as usize;
+                bits &= bits - 1;
+                match runtime.block.get(index).and_then(Weak::upgrade) {
+                    Some(resident) => found.push((index, resident)),
+                    None => *word &= !(1 << bit),
+                }
             }
         }
-        lore_trace!("File metadata block {index} marked dirty");
-        lock.block_file_metadata_dirty.push((block.clone(), index));
+        drop(runtime);
+        (found, noted)
+    }
+
+    /// Takes `noted`, the notes a sweep found its blocks by, and notes again every block
+    /// registered now, which may flag itself again before a save releases it, and `kept`, the
+    /// blocks of the roots the sweep kept.
+    pub(in crate::state) fn settle_unswept(
+        &self,
+        noted: &[u64],
+        kept: impl Iterator<Item = usize>,
+    ) {
+        let mut runtime = self.runtime_write();
+        let StateRuntime {
+            unswept,
+            block_dirty,
+            ..
+        } = &mut *runtime;
+        for (word, taken) in unswept.iter_mut().zip(noted) {
+            *word &= !taken;
+        }
+        for &(_, index) in block_dirty.iter() {
+            set_block_bit(unswept, index);
+        }
+        for index in kept {
+            set_block_bit(unswept, index);
+        }
+    }
+
+    /// Counts a sweep's scan or a pending drain that freed a slot, which every chain mark and
+    /// absence proof taken before answers stale after ([`Self::reclaims`]).
+    pub(in crate::state) fn note_reclaim(&self) {
+        self.reclaims.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many times a sweep's scan or a pending drain freed a slot over this State's life,
+    /// which a chain mark or an absence proof records when taken.
+    #[lore_macro::test_pub]
+    pub(in crate::state) fn reclaims(&self) -> u32 {
+        self.reclaims.load(Ordering::Acquire)
+    }
+
+    /// `block_modified` for a file metadata block, which must be this State's block at
+    /// `index`: its registered bit answers for this State alone.
+    pub fn block_file_metadata_modified(&self, block: Arc<NodeFileMetadataBlock>, index: usize) {
+        if block.claim_registration() {
+            lore_trace!("File metadata block {index} marked dirty");
+            let mut runtime = self.runtime_write();
+            #[cfg(feature = "state-hooks")]
+            assert_resident(&runtime.block_file_metadata, &block, index);
+            runtime.block_file_metadata_dirty.push((block, index));
+        }
+        self.mark_dirty();
     }
 
     pub fn mark_dirty(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.flags |= StateFlags::Dirty;
     }
 
-    /// Allocate a fresh node, initialize it, and prepend it to `parent`'s child
-    /// chain, returning the new node's ID.
+    /// The live children of the directory `walk` walks, in sibling order, from `child_node`, until
+    /// `step` answers for one of them or `stop_at` heads what is left of the chain.
     ///
-    /// # Concurrency
+    /// `child_node` is the directory's head, read together with the chain change count `walk`
+    /// began from. Detached children are skipped and a child a reattach
+    /// moved away restarts the walk (see `ChainWalk`), which may then visit a
+    /// child twice, as [`Walked::may_repeat`] says. A run of siblings sharing a
+    /// block is walked under one lock on it, so `step` must not read that block
+    /// again: a second shared lock behind a queued writer deadlocks. The answer is
+    /// `None` where `step` answered for none of them.
     ///
-    /// Safe to call concurrently to add **distinct siblings** under a parent: the
-    /// node is fully initialized before it is published and the publish is an
-    /// atomic CAS prepend, so concurrent sibling adds neither lose an update nor
-    /// expose a half-initialized node to a chain walk.
-    ///
-    /// **Not** safe for two tasks to add the **same** `(parent, name)`: this is
-    /// always-create, not get-or-add, so they produce duplicate siblings. The
-    /// find-then-add is a check-then-act at the call site that this cannot close;
-    /// callers fanning out across paths must ensure at most one add per
-    /// `(parent, name)` (e.g. pre-create the ancestors two paths share, from a
-    /// path set holding one case variation of each entry).
-    ///
-    /// Slot allocation is serialized per tree by a single permit, so concurrent
-    /// adds overlap only in the initialize and publish that follow it.
-    ///
-    /// The publish **prepends**, and that is relied on rather than incidental: a
-    /// caller holding a chain it walked earlier knows everything linked since
-    /// lies ahead of the head it saw, which is what
-    /// [`Self::find_subnode_added_since`] walks to. Appending instead would put
-    /// a new child past the end of what such a caller holds, and it would stop
-    /// finding them.
-    pub async fn node_add(
-        &self,
-        repository: Arc<RepositoryContext>,
-        parent: NodeID,
-        node: Node,
-        name: &str,
-    ) -> Result<NodeID, StateError> {
-        // The parent is checked before a slot is allocated: a discarded parent is
-        // itself on the free list, so the allocator would hand its slot straight
-        // back out as the new node's, zeroing the flag that identifies it.
-        self.tree(repository.clone()).await?;
-        let parent_block_index = NodeBlock::index(parent);
-        let parent_block = self.block(repository.clone(), parent_block_index).await?;
-        if parent_block.read().node(Node::index(parent)).is_discarded() {
-            return Err(StateError::internal(
-                "cannot add a child to a discarded node",
-            ));
-        }
-
-        let node_id = self.grab_node_slot(repository.clone()).await?;
-
-        let block_index = NodeBlock::index(node_id);
-        lore_trace!("Block {} node {} added", block_index, Node::index(node_id));
-
-        let block = match self
-            .initialize_node(repository.clone(), node_id, parent, node, name)
-            .await
-        {
-            Ok(block) => block,
-            Err(error) => {
-                self.release_node(repository.clone(), node_id).await;
-                return Err(error);
-            }
-        };
-
-        // Prepend into the child chain via CAS: stash the current head as our
-        // `sibling`, then swap ourselves in as the head. Keeps capture+publish
-        // atomic (no lost updates) without nesting the parent/child block locks,
-        // which may be the same block or invert order across concurrent adds.
-        // ABA-free: prepends only ever use freshly grabbed IDs.
-        let sibling = loop {
-            let old_head = parent_block.node(Node::index(parent)).child;
-            {
-                let mut block_lock = block.write();
-                block_lock.node(Node::index(node_id)).sibling = old_head;
-                block_lock.mark_dirty();
-            }
-            let publish_result = {
-                let mut parent_lock = parent_block.write();
-                let parent_node = parent_lock.node(Node::index(parent));
-                if parent_node.child == old_head {
-                    parent_node.child = node_id;
-                    Some(parent_lock.mark_dirty())
-                } else {
-                    None
-                }
-            };
-            if let Some(parent_dirtied) = publish_result {
-                if parent_dirtied {
-                    self.block_modified(parent_block.clone(), parent_block_index);
-                }
-                break old_head;
-            }
-        };
-
-        lore_trace!(
-            "Block {} node {} parent {} sibling {}",
-            block_index,
-            Node::index(node_id),
-            parent,
-            sibling
-        );
-
-        Ok(node_id)
-    }
-
-    /// Fill in every field of a freshly grabbed slot except `sibling`, and clear the file
-    /// metadata a recycled slot still carries from whatever used to live there, returning the
-    /// block that holds it. Where no file metadata block exists there is nothing to carry.
-    ///
-    /// The slot is initialized fully before it is reachable: `grab_node_unused`
-    /// left it zeroed, so a concurrent chain walk that observed it
-    /// published-but-uninitialized would read `parent`/`sibling` as 0 and error
-    /// or truncate, and a reader of the published node would read its predecessor's
-    /// metadata. `sibling` is set atomically at publish. The metadata is cleared after every
-    /// step that can fail, so a failed initialization leaves it untouched.
-    async fn initialize_node(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-        parent: NodeID,
-        node: Node,
-        name: &str,
-    ) -> Result<Arc<NodeBlock>, StateError> {
-        let block_index = NodeBlock::index(node_id);
-        let block = self
-            .block_with_nametable(repository.clone(), block_index)
-            .await?;
-        let metadata_node_id = node::node_to_file_metadata(node_id);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
-        let metadata_block = self
-            .try_block_file_metadata_existing(repository, metadata_block_index)
-            .await?;
-
-        let dirtied = {
-            let mut block_lock = block.write();
-            let (name_offset, name_length) = block_lock
-                .node_name_store(name, 0, 0)
-                .forward::<StateError>("Storing new node name")?;
-            let target_node = block_lock.node(Node::index(node_id));
-            *target_node = node;
-            target_node.parent = parent;
-            target_node.name_offset = name_offset;
-            target_node.name_length = name_length;
-            block_lock.mark_dirty()
-        };
-        if dirtied {
-            self.block_modified(block.clone(), block_index);
-        }
-
-        if let Some(metadata_block) = metadata_block {
-            let dirtied = {
-                let mut block_lock = metadata_block.write();
-                let node_metadata = block_lock.node(NodeFileMetadata::index(metadata_node_id));
-                if node_metadata.metadata.is_zero() {
-                    false
-                } else {
-                    node_metadata.metadata.zero();
-                    block_lock.mark_dirty()
-                }
-            };
-            if dirtied {
-                self.block_file_metadata_modified(metadata_block, metadata_block_index);
-            }
-        }
-
-        Ok(block)
-    }
-
-    /// Grab a free node slot, extending the tree when nothing is available.
-    ///
-    /// The common path takes no allocator permit. `grab_node_unused` mutates
-    /// only the block it is called on and only under that block's write lock,
-    /// so concurrent grabbers on the same block are already handed distinct
-    /// slots. A block holds [`BLOCK_NODE_COUNT`] of them, so all but one add per
-    /// block full is pure per-block work; the permit is needed only for the
-    /// transitions that mutate the unused chain or the block vector.
-    async fn grab_node_slot(
-        &self,
-        repository: Arc<RepositoryContext>,
-    ) -> Result<NodeID, StateError> {
-        loop {
-            let head = self.unused_head();
-            if (head as usize) < self.block_count() {
-                let block = self.block(repository.clone(), head as usize).await?;
-                if let Some(node_id) = self.try_grab_in(&block, head as usize) {
-                    return Ok(node_id);
-                }
-
-                let _permit = self.acquire_unused().await?;
-                self.retire_full_block(head, &block);
-                continue;
-            }
-
-            let _permit = self.acquire_unused().await?;
-            // Whoever held the permit before may have already published a block
-            // with room, in which case the retry finds it on the fast path.
-            if self.unused_head() != head {
-                continue;
-            }
-
-            if let Some((idx, block)) = self.try_recycle_last_block()
-                && let Some(node_id) = self.try_grab_in(&block, idx)
-            {
-                self.push_unused_block_list(idx, &block);
-                return Ok(node_id);
-            }
-
-            let (idx, block) = self.allocate_fresh_block()?;
-            let node_id = self.try_grab_in(&block, idx).ok_or_else(|| {
-                StateError::internal(
-                    "grab_node_unused returned INVALID on a freshly-allocated block",
-                )
-            })?;
-            self.push_unused_block_list(idx, &block);
-            return Ok(node_id);
-        }
-    }
-
-    async fn acquire_unused(&self) -> Result<tokio::sync::SemaphorePermit<'_>, StateError> {
-        self.unused.acquire().await.map_err(|error| {
-            StateError::internal(format!("node allocation semaphore is closed: {error}"))
-        })
-    }
-
-    fn unused_head(&self) -> u32 {
-        self.runtime
-            .read()
-            .tree
-            .as_ref()
-            .map_or(INVALID_BLOCK, |tree| tree.block_unused_first)
-    }
-
-    /// Take one slot out of `block`, recording the dirty state a successful grab
-    /// produces. `None` means the block had nothing left.
-    fn try_grab_in(&self, block: &Arc<NodeBlock>, block_index: usize) -> Option<NodeID> {
-        let (node_id, dirtied) = {
-            let mut block_writer = block.write();
-            let node_id = block_writer.grab_node_unused(block_index as u32);
-            if node_id.is_valid_node_id() {
-                (node_id, block_writer.mark_dirty())
-            } else {
-                (node_id, false)
-            }
-        };
-        if !node_id.is_valid_node_id() {
-            return None;
-        }
-        if dirtied {
-            self.block_modified(block.clone(), block_index);
-            self.mark_dirty();
-        }
-        Some(node_id)
-    }
-
-    /// Unlink an exhausted block from the head of the unused chain.
-    ///
-    /// Fullness is re-tested here rather than trusted from the caller's failed
-    /// grab: [`Self::release_node`] can return a slot to this block in between,
-    /// and retiring it then would strand a block that has room. Holding the
-    /// permit keeps that release from landing inside this check.
-    fn retire_full_block(&self, head: u32, block: &Arc<NodeBlock>) {
-        let popped_dirty = {
-            let mut runtime = self.runtime.write();
-            let Some(tree) = runtime.tree.as_mut() else {
-                return;
-            };
-            if tree.block_unused_first != head {
-                return;
-            }
-            let mut block_writer = block.write();
-            if !block_writer.is_full() {
-                return;
-            }
-            tree.block_unused_first = block_writer.block_unused_next();
-            tree.flags |= TreeFlags::Dirty;
-            block_writer.node_block().block_unused_next = INVALID_BLOCK;
-            block_writer.mark_dirty()
-        };
-        if popped_dirty {
-            self.block_modified(block.clone(), head as usize);
-            self.mark_dirty();
-        }
-    }
-
-    /// Return a grabbed but unpublished node slot to its block's free list.
-    ///
-    /// Initialization runs after the allocator hands the slot out, so a failure
-    /// there would otherwise consume it for the lifetime of the tree: it is
-    /// reachable from no chain, and nothing hands it out a second time. The
-    /// allocation permit is held for the push so it cannot interleave with a
-    /// grab walking the same block.
-    async fn release_node(&self, repository: Arc<RepositoryContext>, node_id: NodeID) {
-        let block_index = NodeBlock::index(node_id);
-        let Ok(block) = self.block(repository, block_index).await else {
-            lore_warn!("Node {node_id} slot lost: its block could not be read back");
-            return;
-        };
-        let _permit = self.unused.acquire().await;
-        let dirtied = {
-            let mut block_writer = block.write();
-            block_writer.discard_node(block_index, Node::index(node_id));
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            self.block_modified(block, block_index);
-        }
-    }
-
-    /// Return the most recently allocated block when it still has at least one
-    /// free slot, without touching the unused chain. The caller is expected to
-    /// attempt a grab before deciding whether to splice the block into the
-    /// chain — so a block whose internal bookkeeping diverges from `is_full()`
-    /// is not introduced into the chain where it could mislead future scans.
-    fn try_recycle_last_block(&self) -> Option<(usize, Arc<NodeBlock>)> {
-        let runtime = self.runtime.read();
-        let block_index = runtime.block.len().checked_sub(1)?;
-        let block = runtime.block[block_index].upgrade()?;
-        if block.read().is_full() {
-            return None;
-        }
-        Some((block_index, block))
-    }
-
-    /// Allocate a fresh `NodeBlock` and push it onto the runtime's block vector, leaving it
-    /// out of the unused chain. Errors only when the per-tree block limit is reached.
-    ///
-    /// Staying out of the chain is what makes the caller's grab certain to succeed: a
-    /// newly-zeroed block has `node_count == 0`, well below `BLOCK_NODE_COUNT`, and the chain
-    /// is the only way another grabber reaches a block, so while the caller holds the
-    /// allocation permit nothing else can take a slot from this one. The caller splices it in
-    /// with [`Self::push_unused_block_list`] once it has taken its own, as the recycling path
-    /// does.
-    ///
-    /// The block goes at [`Self::block_count`], past every block the tree has, whether or not
-    /// any of them is in memory. It is zeroed before the runtime write lock is taken, since every
-    /// reader of the State waits on that lock.
+    /// Not an `async fn`, which would hold a second copy of its arguments.
     #[lore_macro::test_pub]
-    fn allocate_fresh_block(&self) -> Result<(usize, Arc<NodeBlock>), StateError> {
-        let block = Arc::new(NodeBlock::new_zeroed());
-        block.write().mark_dirty();
-        let mut runtime = self.runtime.write();
-        let block_index = runtime.block_count();
-        if block_index >= MAX_TREE_BLOCK_COUNT as usize {
-            return Err(StateError::from(Oversized {
-                context: format!("tree block count limit reached: {MAX_TREE_BLOCK_COUNT}"),
-            }));
-        }
-        if block_index == 0 {
-            block.write().node_block().node_count = 1;
-        }
-        runtime.block.resize(block_index, Weak::default());
-        runtime.block.push(Arc::downgrade(&block));
-
-        if let Some(tree) = runtime.tree.as_mut() {
-            tree.block_count = 1 + block_index as u32;
-            tree.flags |= TreeFlags::Dirty;
-        }
-        drop(runtime);
-        self.block_modified(block.clone(), block_index);
-        Ok((block_index, block))
-    }
-
-    /// Insert `block` at the head of the unused chain when it isn't already
-    /// there. The chain is a prepend-only singly-linked list whose head
-    /// `tree.block_unused_first` advances only as exhausted blocks are popped;
-    /// the most recently allocated block is therefore either at the head or
-    /// not in the chain at all, so a non-head index here means the block can
-    /// be safely linked at the front without traversing to deduplicate.
-    fn push_unused_block_list(&self, block_index: usize, block: &Arc<NodeBlock>) {
-        let block_idx_u32 = block_index as u32;
-        let mut runtime = self.runtime.write();
-        let Some(tree) = runtime.tree.as_mut() else {
-            return;
-        };
-        if tree.block_unused_first == block_idx_u32 {
-            return;
-        }
-        let prior_head = tree.block_unused_first;
-        tree.block_unused_first = block_idx_u32;
-        tree.flags |= TreeFlags::Dirty;
-        let newly_dirty = {
-            let mut block_writer = block.write();
-            block_writer.node_block().block_unused_next = prior_head;
-            block_writer.mark_dirty()
-        };
-        drop(runtime);
-        if newly_dirty {
-            self.block_modified(block.clone(), block_index);
-        }
-    }
-
-    /// Rewrite a file node's `mode`, `size` and `address` in place.
-    ///
-    /// A zero `address.context` preserves the node's existing file id. The node
-    /// already carries an identity, and replacing it would record the edit as a
-    /// move.
-    ///
-    /// Only a file is modifiable: a directory's size and address are derived
-    /// when the revision is committed, and a link's address is its target, so
-    /// neither holds content this can rewrite. A discarded slot is refused
-    /// under its own reason — it carries neither the file nor the link flag, so
-    /// it would otherwise read back as an ordinary directory.
-    ///
-    /// # Concurrency
-    ///
-    /// The kind check and the rewrite share one block write lock, so a node
-    /// discarded concurrently is never rewritten after the fact. Nothing here
-    /// touches a parent or sibling chain, so modifications of distinct nodes are
-    /// independent even within one block.
-    pub async fn node_modify(
+    #[allow(clippy::manual_async_fn)]
+    fn walk_children<T, F>(
         &self,
         repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-        mode: u16,
-        size: u64,
-        address: Address,
-    ) -> Result<(), StateError> {
-        if !node_id.is_valid_node_id() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "node id does not name a modifiable node".into(),
-            }));
-        }
-        let block_index = NodeBlock::index(node_id);
-        let block = self.block(repository, block_index).await?;
-        let dirtied = {
-            let mut block_writer = block.write();
-            let node = block_writer.node(Node::index(node_id));
-            if node.is_discarded() {
-                return Err(StateError::from(InvalidArguments {
-                    reason: "cannot modify a deleted node".into(),
-                }));
-            }
-            if !node.is_file() {
-                return Err(StateError::from(InvalidArguments {
-                    reason: "only a file node carries content to modify".into(),
-                }));
-            }
-            let file_id = node.address.context;
-            node.mode = mode;
-            node.size = size;
-            node.address = address;
-            if node.address.context.is_zero() {
-                node.address.context = file_id;
-            }
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            self.block_modified(block, block_index);
-            self.mark_dirty();
-        }
-        Ok(())
-    }
-
-    /// Record a staged change on a node and the matching dirty change, marking
-    /// its ancestors on the way to the root.
-    ///
-    /// The pairing is the one the working-tree staging path applies: the staged
-    /// action on the node, `Staged` on every ancestor, then the dirty action on
-    /// the node and `Dirty` on every ancestor. A staged change recorded without
-    /// its dirty counterpart leaves the two views of the tree disagreeing, so
-    /// they are set together here rather than at each call site.
-    pub async fn node_mark_staged(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-        staged: NodeFlags,
-        dirty: NodeFlags,
-    ) -> Result<(), StateError> {
-        self.node_mark(repository.clone(), node_id, staged, true)
-            .await?;
-        self.node_mark_dirty(repository, node_id, dirty, true).await
-    }
-
-    /// The staged and dirty flags an edit to `node` should record.
-    ///
-    /// A node staged for addition stays staged for addition however it is edited
-    /// afterwards: it is in no revision yet, so there is nothing for a commit to
-    /// record a modification against.
-    pub fn staged_edit_flags(node: &Node) -> (NodeFlags, NodeFlags) {
-        if node.is_staged_add() {
-            (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
-        } else {
-            (NodeFlags::StagedModify, NodeFlags::DirtyModify)
-        }
-    }
-
-    /// Stage a single node for deletion, leaving it in the tree.
-    ///
-    /// Returns whether the node took the tag; `false` means it already carried
-    /// it and nothing was written. The node keeps its name, its parent and its
-    /// place in the sibling chain — only flags change — so the revision still
-    /// reads it and the commit that freezes the tree is what discards it. This
-    /// is the tagging half of a deletion; a node staged for addition has nothing
-    /// to delete in the revision it was loaded from and is discarded outright
-    /// through [`node_discard_patch`] instead.
-    ///
-    /// Recursion is the caller's: this stages the one node it is given, not the
-    /// subtree under it.
-    ///
-    /// # Concurrency
-    ///
-    /// Safe for distinct nodes to run concurrently. Each tag takes the target's
-    /// block write lock, and no parent or sibling pointer is written, so the
-    /// chain the CAS-prepend in [`Self::node_add`] does not protect is never
-    /// touched. The walk to the root that marks ancestors staged takes one block
-    /// write lock at a time and stops at the first ancestor already marked.
-    pub async fn node_delete(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-    ) -> Result<bool, StateError> {
-        if !node_id.is_valid_or_root_node_id() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "node id does not name a deletable node".into(),
-            }));
-        }
-        let block_index = NodeBlock::index(node_id);
-        let block = self.block(repository.clone(), block_index).await?;
-        {
-            let node = block.node(Node::index(node_id));
-            if node.is_discarded() {
-                return Err(StateError::from(InvalidArguments {
-                    reason: "cannot delete a discarded node".into(),
-                }));
-            }
-            if node.is_staged_delete() {
-                return Ok(false);
-            }
-        }
-
-        self.node_mark_staged(
-            repository,
-            node_id,
-            NodeFlags::StagedDelete,
-            NodeFlags::DirtyDelete,
-        )
-        .await?;
-        Ok(true)
-    }
-
-    /// Take a node staged for deletion back into the revision, rewriting the
-    /// content fields its kind carries.
-    ///
-    /// The node returns as a **modification**, not an addition: it exists in the
-    /// revision the handle was loaded from, so what is staged is a change to it.
-    /// A zero `address.context` preserves the existing file id, as
-    /// [`Self::node_modify`] does, since the node keeps the identity it already
-    /// had. Fields a kind does not carry are dropped rather than refused — a
-    /// directory stores no size and no address, a link no size.
-    ///
-    /// Only the node named is restored. Its children stay staged for deletion
-    /// until each is restored in turn.
-    pub async fn node_undelete(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-        mode: u16,
-        size: u64,
-        address: Address,
-    ) -> Result<(), StateError> {
-        if !node_id.is_valid_node_id() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "node id does not name a restorable node".into(),
-            }));
-        }
-        let block_index = NodeBlock::index(node_id);
-        let block = self.block(repository.clone(), block_index).await?;
-        let dirtied = {
-            let mut block_writer = block.write();
-            let node = block_writer.node(Node::index(node_id));
-            if node.is_discarded() {
-                return Err(StateError::from(InvalidArguments {
-                    reason: "cannot restore a discarded node".into(),
-                }));
-            }
-            if !node.is_staged_delete() {
-                return Err(StateError::from(InvalidArguments {
-                    reason: "node is not staged for deletion".into(),
-                }));
-            }
-            let file_id = node.address.context;
-            let is_file = node.is_file();
-            let is_link = node.is_link();
-            node.clear_staged_flags();
-            node.mode = mode;
-            if is_file {
-                node.size = size;
-                node.address = address;
-                if node.address.context.is_zero() {
-                    node.address.context = file_id;
-                }
-            } else if is_link {
-                node.size = 0;
-                node.address = address;
-            } else {
-                node.size = 0;
-                node.address = Address::default();
-            }
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            self.block_modified(block, block_index);
-            self.mark_dirty();
-        }
-
-        self.node_mark_staged(
-            repository,
-            node_id,
-            NodeFlags::StagedModify,
-            NodeFlags::DirtyModify,
-        )
-        .await
-    }
-
-    /// The staged and dirty change a move records on `node`.
-    ///
-    /// A node staged for addition stays staged for addition: it is in no revision a move
-    /// could be recorded against, and its addition already carries whatever parent and
-    /// name it ends up under.
-    pub fn staged_move_flags(node: &Node) -> (NodeFlags, NodeFlags) {
-        if node.is_staged_add() {
-            (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
-        } else {
-            (NodeFlags::StagedMove, NodeFlags::DirtyMove)
-        }
-    }
-
-    /// Reparent and/or rename a node, keeping the identity it already has.
-    ///
-    /// The node keeps its node id, its `file_id` and its children, and the change is
-    /// recorded as a **move**: the delta a commit writes names the same node, so a
-    /// consumer reads one move rather than a delete of one node and an add of another.
-    /// Naming the node's current parent renames it where it is.
-    ///
-    /// Every node under a moved directory is recorded as moved as well, as the
-    /// working-tree staging path records them. Their own records do not change — the
-    /// subtree travels by its parent pointers — but their paths do, and the per-node delta
-    /// is what `file history` reads to report the move against each of them. The work is
-    /// therefore proportional to the subtree rather than to the one node named.
-    ///
-    /// A node under the moved directory that is staged for deletion keeps its deletion and
-    /// is not descended into: it leaves the revision at the commit that freezes the tree,
-    /// and recording a move over it would take the deletion off it.
-    ///
-    /// Rejected are the root, an unknown or discarded node, a node staged for deletion, a
-    /// destination that is not a directory or is itself staged for deletion, a destination
-    /// inside the node's own subtree, a destination the node already sits under by the
-    /// name it already has, and a name the node name table would refuse.
-    ///
-    /// **Everything that can fail runs before anything is rewritten**, in the order the
-    /// tree can absorb: the destination's block is read, then the rename is stored, then
-    /// the node is unlinked, and only then is it linked in and its record pointed at its
-    /// new parent. The rename is what forces the order — the name table can refuse a name
-    /// on capacity alone, which validating the name cannot rule out — and a failure at the
-    /// unlink therefore leaves a renamed node where it was rather than one linked into two
-    /// chains at once.
-    ///
-    /// **A name a child of the destination already holds is not rejected here.** Like
-    /// [`Self::node_add`], this is always-move rather than move-if-vacant, and the check
-    /// belongs to the caller: a batch caller has to hold the name against the tree its
-    /// whole batch produces rather than the one in front of it, since moving `x` out of a
-    /// directory while moving another `x` into it is legal as a batch and would fail under
-    /// every ordering if each step checked the name against the intermediate tree.
-    ///
-    /// # Concurrency
-    ///
-    /// **Not** safe to run concurrently with another move, an add or a discard touching
-    /// either parent. Reparenting rewrites the parent and sibling pointers around the
-    /// node, which the CAS prepend in [`Self::node_add`] protects only against other
-    /// prepends, and the checks and the rewrite do not share a lock. Callers serialize
-    /// moves, as they serialize [`node_discard_patch`].
-    pub async fn move_node(
-        self: &Arc<Self>,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-        destination_parent_id: NodeID,
-        dst_name: &str,
-    ) -> Result<(), StateError> {
-        if !node_id.is_valid_node_id() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "node id does not name a movable node".into(),
-            }));
-        }
-        if !destination_parent_id.is_valid_or_root_node_id() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "destination parent id does not name a node".into(),
-            }));
-        }
-        if let Err(error) = validate_node_name_for_store(dst_name) {
-            return Err(StateError::from(InvalidArguments {
-                reason: format!("destination name is not storable: {error}"),
-            }));
-        }
-
-        let block_index = NodeBlock::index(node_id);
-        let node_index = Node::index(node_id);
-        let block = self
-            .block_with_nametable(repository.clone(), block_index)
-            .await?;
-        let node = block.node(node_index);
-        if node.is_discarded() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "cannot move a discarded node".into(),
-            }));
-        }
-        if node.is_staged_delete() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "cannot move a node staged for deletion".into(),
-            }));
-        }
-        if node.name_length == 0 {
-            return Err(StateError::from(InvalidArguments {
-                reason: "node id does not resolve to a named node".into(),
-            }));
-        }
-
-        let destination = self.node(repository.clone(), destination_parent_id).await?;
-        if destination.is_discarded() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "destination parent has been deleted".into(),
-            }));
-        }
-        if destination.is_staged_delete() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "destination parent is staged for deletion, so the moved node \
-                         would go with it"
-                    .into(),
-            }));
-        }
-        if destination.is_link() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "destination parent is a link, which addresses a revision this \
-                         state does not hold"
-                    .into(),
-            }));
-        }
-        if !destination.is_directory() {
-            return Err(StateError::from(InvalidArguments {
-                reason: "destination parent is not a directory".into(),
-            }));
-        }
-        if destination_parent_id != ROOT_NODE && destination.name_length == 0 {
-            return Err(StateError::from(InvalidArguments {
-                reason: "destination parent id does not resolve to a named node".into(),
-            }));
-        }
-        if self
-            .is_inside_subtree(repository.clone(), destination_parent_id, node_id)
-            .await?
-        {
-            return Err(StateError::from(InvalidArguments {
-                reason: "destination parent is the node itself or one of its descendants".into(),
-            }));
-        }
-
-        let source_parent_id = node.parent;
-        let reparented = source_parent_id != destination_parent_id;
-        let parent_block_index = NodeBlock::index(destination_parent_id);
-        let parent_node_index = Node::index(destination_parent_id);
-        let parent_block = if reparented {
-            Some(self.block(repository.clone(), parent_block_index).await?)
-        } else {
-            None
-        };
-
-        if !self.node_rename(&block, block_index, node_index, &node, dst_name)? && !reparented {
-            return Err(StateError::from(InvalidArguments {
-                reason: "the node is already under that parent by that name".into(),
-            }));
-        }
-
-        if let Some(parent_block) = parent_block {
-            self.unlink_child(repository.clone(), node_id, source_parent_id, node.sibling)
-                .await?;
-
-            let (sibling, parent_dirtied) = {
-                let mut writer = parent_block.write();
-                let parent = writer.node(parent_node_index);
-                let head = parent.child;
-                parent.child = node_id;
-                (head, writer.mark_dirty())
-            };
-            if parent_dirtied {
-                self.block_modified(parent_block, parent_block_index);
-            }
-
-            let dirtied = {
-                let mut writer = block.write();
-                let record = writer.node(node_index);
-                record.parent = destination_parent_id;
-                record.sibling = sibling;
-                writer.mark_dirty()
-            };
-            if dirtied {
-                self.block_modified(block, block_index);
-            }
-            self.mark_dirty();
-        }
-
-        let (staged, dirty) = Self::staged_move_flags(&node);
-        self.node_mark_staged(repository.clone(), node_id, staged, dirty)
-            .await?;
-        if node.is_directory() {
-            self.mark_subtree_moved(repository.clone(), node_id).await?;
-        }
-
-        // The source parent lost a child, so the hash a commit derives for it changes —
-        // and `rehash_directory` skips a directory that is not staged.
-        if reparented {
-            self.node_mark(
-                repository.clone(),
-                source_parent_id,
-                NodeFlags::Staged,
-                false,
-            )
-            .await?;
-            self.node_mark_dirty(repository, source_parent_id, NodeFlags::Dirty, false)
-                .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Stores `name` as the name of `node`, the node at `node_index` in `block`, where it differs
-    /// from the stored name, and answers whether it did. `block` holds its name table, as
-    /// [`Self::block_with_nametable`] returns it. The name hash folds case, so a name that hashes
-    /// alike is compared with the stored one to tell a change of case from no change.
-    ///
-    /// Only the name changes: the node keeps its place, its children and its flags.
-    fn node_rename(
-        &self,
-        block: &Arc<NodeBlock>,
-        block_index: usize,
-        node_index: usize,
-        node: &Node,
-        name: &str,
-    ) -> Result<bool, StateError> {
-        let name_hash = hash::hash_string(name);
-        if node.name_hash == name_hash
-            && *block
-                .node_name_ref(node_index)
-                .forward::<StateError>("Node name")?
-                == *name
-        {
-            return Ok(false);
-        }
-
-        let dirtied = {
-            let mut writer = block.write();
-            let (name_offset, name_length) = writer
-                .node_name_store(name, node.name_offset, node.name_length)
-                .forward::<StateError>("Storing the node's name")?;
-            let record = writer.node(node_index);
-            record.name_offset = name_offset;
-            record.name_length = name_length;
-            record.name_hash = name_hash;
-            writer.mark_dirty()
-        };
-        if dirtied {
-            self.block_modified(block.clone(), block_index);
-        }
-        self.mark_dirty();
-        Ok(true)
-    }
-
-    /// Whether `candidate` is `node_id` itself or one of its descendants, so moving
-    /// `node_id` onto it would detach the subtree from the tree.
-    ///
-    /// Walks `candidate`'s ancestors rather than `node_id`'s subtree: an ancestor chain is
-    /// one node per level, where the subtree can be the whole tree. The walk is guarded
-    /// against a cycle the chain should not contain, so a corrupt state fails here rather
-    /// than hangs.
-    async fn is_inside_subtree(
-        &self,
-        repository: Arc<RepositoryContext>,
-        candidate: NodeID,
-        node_id: NodeID,
-    ) -> Result<bool, StateError> {
-        let mut ancestor = candidate;
-        let mut cycle = SiblingCycleGuard::new(node_id);
-        while ancestor.is_valid_node_id() {
-            if ancestor == node_id {
-                return Ok(true);
-            }
-            cycle.observe(ancestor).map_err(StateError::from)?;
-            ancestor = self.node(repository.clone(), ancestor).await?.parent;
-        }
-        Ok(false)
-    }
-
-    /// Remove `node_id` from `parent_id`'s child chain, splicing `sibling` — the node's
-    /// own next — in over it.
-    ///
-    /// Serial by contract, as [`node_discard_patch`] is: each link is read and then
-    /// rewritten without holding the read across the write, so a concurrent walk of the
-    /// same chain can see the node in neither position.
-    async fn unlink_child(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-        parent_id: NodeID,
-        sibling: NodeID,
-    ) -> Result<(), StateError> {
-        let parent_block_index = NodeBlock::index(parent_id);
-        let parent_node_index = Node::index(parent_id);
-        let parent_block = self.block(repository.clone(), parent_block_index).await?;
-        let head = parent_block.node(parent_node_index).child;
-        if head == node_id {
-            let dirtied = {
-                let mut writer = parent_block.write();
-                writer.node(parent_node_index).child = sibling;
-                writer.mark_dirty()
-            };
-            if dirtied {
-                self.block_modified(parent_block, parent_block_index);
-            }
-            self.mark_dirty();
-            return Ok(());
-        }
-
-        let mut previous_id = head;
-        let mut cycle = SiblingCycleGuard::new(parent_id);
-        while previous_id.is_valid_node_id() {
-            cycle.observe(previous_id).map_err(StateError::from)?;
-            let previous_block_index = NodeBlock::index(previous_id);
-            let previous_node_index = Node::index(previous_id);
-            let previous_block = self.block(repository.clone(), previous_block_index).await?;
-            let next = previous_block.node(previous_node_index).sibling;
-            if next == node_id {
-                let dirtied = {
-                    let mut writer = previous_block.write();
-                    writer.node(previous_node_index).sibling = sibling;
-                    writer.mark_dirty()
-                };
-                if dirtied {
-                    self.block_modified(previous_block, previous_block_index);
-                }
-                self.mark_dirty();
-                return Ok(());
-            }
-            previous_id = next;
-        }
-
-        let chain = format_parent_child_chain(self, &repository, parent_id).await;
-        Err(StateError::internal(format!(
-            "Move hierarchy broken: node {node_id} not in the child chain of its parent \
-             {parent_id} (observed: {chain})"
-        )))
-    }
-
-    /// Record a move on every node under `node_id`.
-    ///
-    /// Each node's flag pair is decided from its own staging state rather than inherited,
-    /// so a node this handle added stays an addition while a node the revision holds
-    /// becomes a move. A node staged for deletion is left as it is and not descended
-    /// into: the action bits hold one change at a time, so recording a move over it would
-    /// take the deletion off it, and its whole subtree is staged for deletion with it.
-    ///
-    /// Descent stops at a link too, whose children belong to the linked repository's tree
-    /// and not to this one.
-    ///
-    /// Walks with [`StateNodeChildrenIterator`], which carries each child's record with
-    /// its id and holds one block across the siblings that share it — so the walk costs
-    /// one read per node and allocates nothing per directory. The pending list holds ids
-    /// rather than records, since it can grow to the directory count of the subtree.
-    async fn mark_subtree_moved(
-        self: &Arc<Self>,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-    ) -> Result<(), StateError> {
-        let mut pending = vec![node_id];
-        while let Some(parent_id) = pending.pop() {
-            let mut children =
-                StateNodeChildrenIterator::new(self.clone(), repository.clone(), parent_id).await?;
-            while let Some((child_id, child)) = children.next().await? {
-                if child.is_staged_delete() || child.is_discarded() {
-                    continue;
-                }
-                let (staged, dirty) = Self::staged_move_flags(&child);
-                self.node_mark(repository.clone(), child_id, staged, false)
-                    .await?;
-                self.node_mark_dirty(repository.clone(), child_id, dirty, false)
-                    .await?;
-                if child.is_directory() {
-                    pending.push(child_id);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// The children of `parent`, in sibling order, until `step` answers for one
-    /// of them or `stop_at` heads what is left of the chain.
-    ///
-    /// A run of siblings sharing a block is walked under one lock on it, so
-    /// `step` must not read that block again: a second shared lock behind a
-    /// queued writer deadlocks. `None` where `step` answered for none of them.
-    async fn walk_children<T, F>(
-        &self,
-        repository: Arc<RepositoryContext>,
-        parent_node: NodeID,
-        parent: &Node,
+        mut child_node: Option<NodeID>,
+        mut walk: ChainWalk,
         stop_at: Option<NodeID>,
         mut step: F,
-    ) -> Result<Option<T>, StateError>
+    ) -> impl Future<Output = Result<Walked<T>, StateError>>
     where
         F: FnMut(NodeID, &Node) -> Option<T>,
     {
-        let mut cycle = SiblingCycleGuard::new(parent_node);
-        let mut child_node = parent.child();
-        while let Some(first_in_block) = child_node {
-            if Some(first_in_block) == stop_at {
-                return Ok(None);
-            }
-            let iblock = NodeBlock::index(first_in_block);
-            let block = self.block(repository.clone(), iblock).await?;
-            let reader = block.read();
-            let mut next = Some(first_in_block);
-            while let Some(child_id) = next {
-                if Some(child_id) == stop_at || NodeBlock::index(child_id) != iblock {
-                    break;
+        async move {
+            let mut restart = false;
+            let mut steps = step_counting::Steps::walk();
+            // A scheduling point where the walk goes on to another block, or starts again, so a
+            // walk within one block that never restarts, as most are, adds none.
+            #[cfg(feature = "state-hooks")]
+            let mut onward = false;
+            loop {
+                if restart {
+                    restart = false;
+                    #[cfg(feature = "state-hooks")]
+                    crate::state::node::hooks::log::arm(
+                        &self.hooks,
+                        crate::state::node::hooks::log::Arm::SearchRestart,
+                    );
+                    child_node = walk.head_again();
                 }
-                let child = reader.node(Node::index(child_id));
-                child.walk_step(child_id, parent_node, &mut cycle)?;
-                if let Some(answer) = step(child_id, child) {
-                    return Ok(Some(answer));
+                let Some(first_in_block) = child_node else {
+                    if walk.restart_at_end()? {
+                        restart = true;
+                        continue;
+                    }
+                    return Ok(Walked {
+                        answer: None,
+                        may_repeat: walk.may_repeat(),
+                        reached_end: true,
+                    });
+                };
+                if Some(first_in_block) == stop_at {
+                    return Ok(Walked {
+                        answer: None,
+                        may_repeat: walk.may_repeat(),
+                        reached_end: false,
+                    });
                 }
-                next = child.sibling();
+                #[cfg(feature = "state-hooks")]
+                {
+                    if onward {
+                        crate::state::node::hooks::reached(
+                            crate::state::node::hooks::Point::IterStep,
+                        )
+                        .await;
+                    }
+                    onward = true;
+                }
+                let iblock = NodeBlock::index(first_in_block);
+                let block = self.block(repository.clone(), iblock).await?;
+                let mut next = Some(first_in_block);
+                {
+                    let reader = block.read();
+                    while let Some(child_id) = next {
+                        if Some(child_id) == stop_at || NodeBlock::index(child_id) != iblock {
+                            break;
+                        }
+                        let child = reader.node(Node::index(child_id));
+                        steps.step();
+                        match walk.step(child_id, child)? {
+                            ChainStep::Restart => {
+                                restart = true;
+                                break;
+                            }
+                            ChainStep::Skip => {}
+                            ChainStep::Visit => {
+                                if let Some(answer) = step(child_id, child) {
+                                    return Ok(Walked {
+                                        answer: Some(answer),
+                                        may_repeat: walk.may_repeat(),
+                                        reached_end: false,
+                                    });
+                                }
+                            }
+                        }
+                        next = child.sibling();
+                    }
+                }
+                child_node = next;
             }
-            child_node = next;
         }
-        Ok(None)
     }
 
     /// The children of a directory node in sibling order, each taken from the
     /// record the walk read for it by `extract`.
     ///
-    /// `extract` runs under the lock [`Self::walk_children`] holds, so the
-    /// constraint that carries is that it must not read the block again. A link
-    /// resolves to the children of the node it points at.
-    async fn node_children_map<T, F>(
+    /// `extract` gets each child's position in the walk too, and runs under the
+    /// lock [`Self::walk_children`] holds, so the constraint that carries is that
+    /// it must not read the block again. After a walk that may have repeated,
+    /// `drop_repeats` makes each child come once. A link resolves to the children
+    /// of the node it points at. A directory's listing comes with what `M` keeps of the head
+    /// and count its walk began from: nothing, or a [`ChainMark`]; a link's and a file's with
+    /// none.
+    async fn node_children_map<T, F, M: ListingMark>(
         &self,
         repository: Arc<RepositoryContext>,
         node: NodeID,
         extract: F,
-    ) -> Result<Vec<T>, StateError>
+        drop_repeats: fn(&mut Vec<T>),
+    ) -> Result<(Vec<T>, M), StateError>
     where
-        F: Fn(NodeID, &Node) -> T + Copy,
+        F: Fn(NodeID, &Node, u32) -> T + Copy,
     {
         let parent_id = node;
-        let node = self.node(repository.clone(), node).await?;
-        if node.is_directory() {
-            let mut children = vec![];
-            self.walk_children(repository, parent_id, &node, None, |child_id, child| {
-                children.push(extract(child_id, child));
-                None::<()>
-            })
+        let block = self
+            .block(repository.clone(), NodeBlock::index(parent_id))
             .await?;
-            Ok(children)
+        let reclaims = M::reclaims(self);
+        let (node, changes) = block.node_with_chain_head(parent_id);
+        if node.is_directory() {
+            let head = node.child();
+            let mark = M::of(reclaims, parent_id, head, &block, changes);
+            let mut children = vec![];
+            let walked = self
+                .walk_children(
+                    repository.clone(),
+                    head,
+                    ChainWalk::new(parent_id, block, changes),
+                    None,
+                    |child_id, child| {
+                        children.push(extract(child_id, child, children.len() as u32));
+                        None::<()>
+                    },
+                )
+                .await?;
+            if walked.may_repeat {
+                drop_repeats(&mut children);
+            }
+            Ok((children, mark))
         } else if node.is_link() {
             let link = node.linked_node();
             let linked_repository = repository.to_link_context(link.repository).await;
             let link_state = State::deserialize(linked_repository.clone(), link.revision).await?;
-            Box::pin(link_state.node_children_map(linked_repository.clone(), link.node, extract))
-                .await
+            Box::pin(link_state.node_children_map::<T, F, ()>(
+                linked_repository.clone(),
+                link.node,
+                extract,
+                drop_repeats,
+            ))
+            .await
+            .map(|(children, ())| (children, M::none()))
         } else {
-            Ok(vec![])
+            Ok((vec![], M::none()))
         }
     }
 
-    /// The children of a directory node in sibling order.
+    /// The children of a directory node in sibling order, or in node id order
+    /// after a walk that a concurrent change may have made repeat.
     ///
     /// A link resolves to the children of the node it points at; a node that
     /// takes no children, such as a file, reports none.
@@ -3329,41 +3858,123 @@ impl State {
         repository: Arc<RepositoryContext>,
         node: NodeID,
     ) -> Result<Vec<NodeID>, StateError> {
-        self.node_children_map(repository, node, |child_id, _| child_id)
-            .await
+        self.node_children_map(
+            repository,
+            node,
+            |child_id, _, _| child_id,
+            |children| {
+                children.sort_unstable();
+                children.dedup();
+            },
+        )
+        .await
+        .map(|(children, ())| children)
     }
 
-    /// The first child of `parent_node` carrying `name_hash` among those linked
-    /// into its chain since `known_head` headed it.
+    /// The first child of the marked directory carrying `name_hash` that its walk from the
+    /// chain's head to the head `since` saw meets: what was prepended or reattached there
+    /// since.
     ///
-    /// A child is prepended, so everything linked since lies ahead of
-    /// `known_head` and the walk stops there rather than covering children the
-    /// caller already holds. `known_head` of `None` walks the whole chain, which
-    /// is what a caller holding no children has to do.
+    /// A child is prepended, so everything prepended since lies ahead of the head
+    /// the mark saw, and the walk stops there rather than covering children the
+    /// caller already holds; a walk not meeting that head, which its detach causes,
+    /// covers the whole chain. A miss answers [`AddedSince::Stale`] where the
+    /// directory's count moved by [`REATTACH_CHANGES`], read at the walk's end, so a
+    /// reattach during the walk counts: since the mark, for a walk stopping at the
+    /// mark's head, as a reattach puts a node at the head, the mark's head among
+    /// them, in front of children prepended since (H9); since the walk's start, for
+    /// a walk covering the whole chain, where only a restart can pass over a node. A
+    /// mark of another State's directory is stale, as is one of a node no longer a
+    /// directory, and one taken before a sweep freed a slot (C15).
     pub async fn find_subnode_added_since(
         &self,
         repository: Arc<RepositoryContext>,
-        parent_node: NodeID,
-        known_head: Option<NodeID>,
+        since: &ChainMark,
         name_hash: u64,
-    ) -> Result<Option<NodeID>, StateError> {
-        let parent = self.node(repository.clone(), parent_node).await?;
-        if !parent.is_directory() {
-            return Ok(None);
+    ) -> Result<AddedSince, StateError> {
+        if since.reclaims != self.reclaims() {
+            return Ok(AddedSince::Stale);
         }
-        self.walk_children(
-            repository,
-            parent_node,
-            &parent,
-            known_head,
-            |child_id, child| (child.name_hash == name_hash).then_some(child_id),
-        )
-        .await
+        let parent_node = since.parent;
+        let Some(block) = self
+            .resident_block(NodeBlock::index(parent_node))
+            .filter(|block| Arc::ptr_eq(block, &since.block))
+        else {
+            return Ok(AddedSince::Stale);
+        };
+        let (head, changes) = {
+            let (parent, changes) = block.node_with_chain_changes(Node::index(parent_node));
+            if !parent.is_directory() {
+                return Ok(AddedSince::Stale);
+            }
+            (parent.child(), changes)
+        };
+        let walked = self
+            .walk_children(
+                repository,
+                head,
+                ChainWalk::new(parent_node, block, changes),
+                since.head,
+                |child_id, child| (child.name_hash == name_hash).then_some(child_id),
+            )
+            .await?;
+        if let Some(found) = walked.answer {
+            return Ok(AddedSince::Found(found));
+        }
+        // A walk that ran to the chain's end covered what the chain held at its start, read
+        // with `changes`.
+        let base = if walked.reached_end {
+            changes
+        } else {
+            since.changes
+        };
+        let moved = since
+            .block
+            .chain_changes(Node::index(parent_node))
+            .wrapping_sub(base);
+        Ok(if moved >= REATTACH_CHANGES {
+            AddedSince::Stale
+        } else {
+            AddedSince::Absent
+        })
+    }
+
+    /// A find of `name_hash` below `parent`, for a retry whose earlier attempt found no other
+    /// node of the name, with `since`, the head and count read from `parent_block` before that
+    /// attempt's lookup: only what was prepended since is walked
+    /// ([`Self::find_subnode_added_since`]), the whole chain where a move's weight landed
+    /// meanwhile. Its callers box it, as only a retry takes it.
+    #[lore_macro::test_pub]
+    pub(in crate::state) async fn find_subnode_since(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        parent_block: &Arc<NodeBlock>,
+        (head, changes): (Option<NodeID>, u32),
+        name_hash: u64,
+    ) -> Result<NodeID, StateError> {
+        let added = {
+            // No sweep runs beside the retry, so the count it reads is the lookup's.
+            let since = ChainMark {
+                parent,
+                head,
+                block: parent_block.clone(),
+                changes,
+                reclaims: self.reclaims(),
+            };
+            self.find_subnode_added_since(repository.clone(), &since, name_hash)
+                .await?
+        };
+        match added {
+            AddedSince::Found(found) => Ok(found),
+            AddedSince::Absent => Err(NodeNotFound.into()),
+            AddedSince::Stale => self.find_subnode(repository, parent, name_hash).await,
+        }
     }
 
     /// The dirty adds among the children of `parent_node`, each with its name hash. Empty where
     /// the state holds no `parent_node`, or it is not dirty, as a dirty child marks every
-    /// ancestor but the root.
+    /// ancestor but the root. After a walk that may have repeated, each comes once.
     pub(crate) async fn node_dirty_add_children(
         &self,
         repository: Arc<RepositoryContext>,
@@ -3373,33 +3984,92 @@ impl State {
         if !parent_node.is_valid_or_root_node_id() {
             return Ok(dirty_adds);
         }
-        let Ok(parent) = self.node(repository.clone(), parent_node).await else {
+        let Ok(block) = self
+            .block(repository.clone(), NodeBlock::index(parent_node))
+            .await
+        else {
             return Ok(dirty_adds);
         };
+        let (parent, changes) = block.node_with_chain_head(parent_node);
         if !parent.is_directory() || (parent_node != ROOT_NODE && !parent.is_dirty()) {
             return Ok(dirty_adds);
         }
-        self.walk_children(repository, parent_node, &parent, None, |child_id, child| {
-            if child.is_dirty_add() {
-                dirty_adds.push((child_id, child.name_hash));
-            }
-            None::<()>
-        })
-        .await?;
+        let walked = self
+            .walk_children(
+                repository,
+                parent.child(),
+                ChainWalk::new(parent_node, block, changes),
+                None,
+                |child_id, child| {
+                    if child.is_dirty_add() {
+                        dirty_adds.push((child_id, child.name_hash));
+                    }
+                    None::<()>
+                },
+            )
+            .await?;
+        if walked.may_repeat {
+            dirty_adds.sort_unstable();
+            dirty_adds.dedup();
+        }
         Ok(dirty_adds)
     }
 
-    /// [`Self::node_children`], and the name hash each of them carries, which
-    /// the walk has already read.
+    /// The first child of `parent_node` carrying `name_hash` ahead of `stop_at` in its chain. A
+    /// child is prepended, so one linked after `stop_at` lies ahead of it. `None` where
+    /// `parent_node` is no directory.
+    pub(crate) async fn find_subnode_ahead_of(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        stop_at: NodeID,
+        name_hash: u64,
+    ) -> Result<Option<NodeID>, StateError> {
+        let block = self
+            .block(repository.clone(), NodeBlock::index(parent_node))
+            .await?;
+        let (parent, changes) = block.node_with_chain_head(parent_node);
+        if !parent.is_directory() {
+            return Ok(None);
+        }
+        let walked = self
+            .walk_children(
+                repository,
+                parent.child(),
+                ChainWalk::new(parent_node, block, changes),
+                Some(stop_at),
+                |child_id, child| (child.name_hash == name_hash).then_some(child_id),
+            )
+            .await?;
+        Ok(walked.answer)
+    }
+
+    /// The children of a directory node in sibling order, each with the name
+    /// hash the walk read for it. After a walk that may have repeated, each child
+    /// comes once, at its last position in the walk and with the hash it carried
+    /// there.
     pub async fn node_children_with_name_hash(
         &self,
         repository: Arc<RepositoryContext>,
         node: NodeID,
     ) -> Result<Vec<(NodeID, u64)>, StateError> {
-        self.node_children_map(repository, node, |child_id, child| {
-            (child_id, child.name_hash)
-        })
-        .await
+        let (children, ()) = self
+            .node_children_map(repository, node, with_name_hash, keep_last_with_name_hash)
+            .await?;
+        Ok(without_walk_index(children))
+    }
+
+    /// [`Self::node_children_with_name_hash`], with the mark of the chain the listing began
+    /// from, for [`Self::find_subnode_added_since`]; `None` for a link or a file.
+    pub async fn node_children_with_name_hash_marked(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<(Vec<(NodeID, u64)>, Option<ChainMark>), StateError> {
+        let (children, mark) = self
+            .node_children_map(repository, node, with_name_hash, keep_last_with_name_hash)
+            .await?;
+        Ok((without_walk_index(children), mark))
     }
 
     pub async fn node_name_clone(
@@ -3411,7 +4081,35 @@ impl State {
             .block_with_nametable(repository.clone(), NodeBlock::index(node))
             .await?;
         block
-            .node_name_clone(Node::index(node))
+            .read_node_and_name(Node::index(node), |_, stored| {
+                #[cfg(feature = "state-hooks")]
+                if let Ok(stored) = stored {
+                    block.hook_named(node, stored);
+                }
+                stored.map(str::to_owned)
+            })
+            .forward::<StateError>("Node name")
+    }
+
+    /// Whether `node`'s stored name is `name`, compared where it is stored, under its block's
+    /// read lock, and copied nowhere.
+    pub async fn node_name_is(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+        name: &str,
+    ) -> Result<bool, StateError> {
+        let block = self
+            .block_with_nametable(repository, NodeBlock::index(node))
+            .await?;
+        block
+            .read_node_and_name(Node::index(node), |_, stored| {
+                #[cfg(feature = "state-hooks")]
+                if let Ok(stored) = stored {
+                    block.hook_named(node, stored);
+                }
+                stored.map(|stored| stored == name)
+            })
             .forward::<StateError>("Node name")
     }
 
@@ -3423,9 +4121,12 @@ impl State {
         let block = self
             .block_with_nametable(repository.clone(), NodeBlock::index(node))
             .await?;
-        block
+        let name = block
             .node_name_ref(Node::index(node))
-            .forward::<StateError>("Node name")
+            .forward::<StateError>("Node name")?;
+        #[cfg(feature = "state-hooks")]
+        block.hook_named(node, &name);
+        Ok(name)
     }
 
     /// [`Self::node_name_ref`], answering `None` for a node whose name the read path refuses,
@@ -3442,9 +4143,14 @@ impl State {
         let block = self
             .block_with_nametable(repository, NodeBlock::index(node))
             .await?;
-        block
+        let name = block
             .node_name_ref_or_skip(Node::index(node), node)
-            .forward::<StateError>("Node name")
+            .forward::<StateError>("Node name")?;
+        #[cfg(feature = "state-hooks")]
+        if let Some(name) = &name {
+            block.hook_named(node, name);
+        }
+        Ok(name)
     }
 
     /// The node `node` names and its name, read from one block, or `None` for a node whose name
@@ -3485,71 +4191,6 @@ impl State {
             .map(|name| name.to_string()))
     }
 
-    pub async fn node_mark(
-        &self,
-        repository: Arc<RepositoryContext>,
-        mut node_id: NodeID,
-        mut flags: NodeFlags,
-        mut mark_dirty: bool,
-    ) -> Result<(), StateError> {
-        while node_id.is_valid_node_id() {
-            let block_index = NodeBlock::index(node_id);
-            let node_index = Node::index(node_id);
-            let block = self.block(repository.clone(), block_index).await?;
-            let (parent_id, dirtied) = {
-                let mut locked_block = block.write();
-                let node_block = locked_block.node_block();
-                let node = &mut node_block.node[node_index];
-                if !mark_dirty && (node.flags & flags) == flags {
-                    lore_trace!("Node {} already marked with flags {:x}", node_id, flags);
-                    return Ok(());
-                }
-                // The merge flag must always be maintained (unless explicitly dropped through unstaging)
-                if node.is_staged_merge() {
-                    flags |= NodeFlags::StagedMerge;
-                }
-                // The conflict flag must always be maintained (unless explicitly dropped through unstaging)
-                if node.is_staged_merge_conflict() {
-                    flags |= NodeFlags::StagedMergeConflict;
-                }
-                node.flags &= !NodeFlags::StagedBits;
-                node.flags |= (NodeFlags::Staged | flags) & NodeFlags::StagedBits;
-                lore_trace!(
-                    "Node {} with parent {} now marked with flags {:x}",
-                    node_id,
-                    node.parent,
-                    node.flags
-                );
-                (node.parent, locked_block.mark_dirty())
-            };
-            if dirtied {
-                lore_trace!("Block {block_index} and state marked dirty");
-                self.block_modified(block, block_index);
-                self.mark_dirty();
-            }
-
-            mark_dirty = false;
-            flags = NodeFlags::Staged;
-
-            node_id = parent_id;
-        }
-
-        // If we get here the root block should be marked as dirty as this was the fist traversal
-        // up to the root for the given subtree being walked
-        let block = self.block(repository, 0).await?;
-        let dirtied = {
-            let mut locked_block = block.write();
-            locked_block.mark_dirty()
-        };
-        if dirtied {
-            lore_trace!("Block 0 and state marked dirty");
-            self.block_modified(block, 0);
-            self.mark_dirty();
-        }
-
-        Ok(())
-    }
-
     pub async fn node_has_staged_children(
         &self,
         repository: Arc<RepositoryContext>,
@@ -3577,73 +4218,6 @@ impl State {
         }
 
         Ok(has_staged)
-    }
-
-    /// Mark a node as dirty and propagate the Dirty flag up to parent directories.
-    /// The target node is marked with the given dirty flags (including action bits).
-    /// Parent directories get only the base Dirty flag (bit 3, no action bits).
-    /// Early-out if a parent already has Dirty set (when `mark_dirty` is false).
-    pub async fn node_mark_dirty(
-        &self,
-        repository: Arc<RepositoryContext>,
-        mut node_id: NodeID,
-        mut flags: NodeFlags,
-        mut mark_dirty: bool,
-    ) -> Result<(), StateError> {
-        while node_id.is_valid_node_id() {
-            let block_index = NodeBlock::index(node_id);
-            let node_index = Node::index(node_id);
-            let block = self.block(repository.clone(), block_index).await?;
-            let (parent_id, dirtied) = {
-                let mut locked_block = block.write();
-                let node_block = locked_block.node_block();
-                let node = &mut node_block.node[node_index];
-                if !mark_dirty && (node.flags & flags) == flags {
-                    lore_trace!(
-                        "Node {} already marked with dirty flags {:x}",
-                        node_id,
-                        flags
-                    );
-                    return Ok(());
-                }
-                // Clear existing dirty+action bits, then set new ones.
-                // This replaces the previous action (latest wins). Staged and merge bits are preserved.
-                node.flags &= !NodeFlags::DirtyBits;
-                node.flags |= flags & NodeFlags::DirtyBits;
-                lore_trace!(
-                    "Node {} with parent {} now marked with dirty flags {:x}",
-                    node_id,
-                    node.parent,
-                    node.flags
-                );
-                (node.parent, locked_block.mark_dirty())
-            };
-            if dirtied {
-                lore_trace!("Block {block_index} and state marked dirty");
-                self.block_modified(block, block_index);
-                self.mark_dirty();
-            }
-
-            // For parent nodes, only set the base Dirty flag (no action bits)
-            mark_dirty = false;
-            flags = NodeFlags::Dirty;
-
-            node_id = parent_id;
-        }
-
-        // Mark root block as dirty on first traversal up to root
-        let block = self.block(repository, 0).await?;
-        let dirtied = {
-            let mut locked_block = block.write();
-            locked_block.mark_dirty()
-        };
-        if dirtied {
-            lore_trace!("Block 0 and state marked dirty");
-            self.block_modified(block, 0);
-            self.mark_dirty();
-        }
-
-        Ok(())
     }
 
     /// Check if a parent node has any children with the Dirty flag set.
@@ -3688,91 +4262,6 @@ impl State {
             }
         }
         Ok(false)
-    }
-
-    /// Clear `node_id`'s staged flags, leaving the dirty ones as they are.
-    ///
-    /// The node alone: an ancestor's staged bits stand for a sibling's action as much as for
-    /// this one's, so clearing them is not this node's to do.
-    pub async fn node_clear_staged(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-    ) -> Result<(), StateError> {
-        if !node_id.is_valid_node_id() {
-            return Ok(());
-        }
-
-        let block_index = NodeBlock::index(node_id);
-        let node_index = Node::index(node_id);
-        let block = self.block(repository, block_index).await?;
-        let block_dirtied = {
-            let mut locked_block = block.write();
-            locked_block.node(node_index).clear_staged_flags();
-            locked_block.mark_dirty()
-        };
-        if block_dirtied {
-            self.block_modified(block, block_index);
-            self.mark_dirty();
-        }
-        Ok(())
-    }
-
-    /// Clear the dirty flags on `node_id` and propagate the clear up the parent
-    /// chain: each ancestor with no remaining dirty children also has its dirty
-    /// flags cleared. Staged flags are preserved (see [`Node::clear_dirty_flags`]).
-    ///
-    /// This is the inverse of [`node_mark_dirty`](Self::node_mark_dirty).
-    pub async fn node_clear_dirty(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_id: NodeID,
-    ) -> Result<(), StateError> {
-        if !node_id.is_valid_node_id() {
-            return Ok(());
-        }
-
-        let block_index = NodeBlock::index(node_id);
-        let node_index = Node::index(node_id);
-        let block = self.block(repository.clone(), block_index).await?;
-        let mut parent_id = block.node(node_index).parent;
-        let block_dirtied = {
-            let mut locked_block = block.write();
-            locked_block.node(node_index).clear_dirty_flags();
-            locked_block.mark_dirty()
-        };
-        if block_dirtied {
-            self.block_modified(block, block_index);
-            self.mark_dirty();
-        }
-
-        while parent_id.is_valid_node_id() {
-            if self
-                .node_has_dirty_children(repository.clone(), parent_id)
-                .await?
-            {
-                break;
-            }
-            let parent_block_index = NodeBlock::index(parent_id);
-            let parent_node_index = Node::index(parent_id);
-            let parent_block = self.block(repository.clone(), parent_block_index).await?;
-            let next_parent_id = parent_block.node(parent_node_index).parent;
-            let parent_block_dirtied = {
-                let mut locked_block = parent_block.write();
-                locked_block.node(parent_node_index).clear_dirty_flags();
-                locked_block.mark_dirty()
-            };
-            if parent_block_dirtied {
-                self.block_modified(parent_block, parent_block_index);
-                self.mark_dirty();
-            }
-            if parent_id == ROOT_NODE {
-                break;
-            }
-            parent_id = next_parent_id;
-        }
-
-        Ok(())
     }
 
     /// Collect the repository-relative paths of all dirty nodes at or under
@@ -3930,64 +4419,130 @@ impl State {
         Ok(result)
     }
 
-    pub async fn find_subnode(
+    /// Find a child of `parent_node` by name hash; a parent that cannot take children is
+    /// [`NodeNotFound`].
+    ///
+    /// The head is read with the directory's chain change count, so a name held throughout the
+    /// find is found however the chain changes meanwhile: a walk a node moved under starts
+    /// again from the head, and one that reaches the end without the name after a reattach
+    /// moved the count ([`REATTACH_CHANGES`]) walks the chain again, since the reattach may have
+    /// put the name's node at the head behind it. Walks again at most `CHAIN_WALK_RESTARTS`
+    /// times, then reports [`SlowDown`].
+    pub fn find_subnode(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
         name_hash: u64,
-    ) -> Result<NodeID, StateError> {
-        let iblock = NodeBlock::index(parent_node);
-        let inode = Node::index(parent_node);
-        let block = self.block(repository.clone(), iblock).await?;
-
-        // TODO(mjansson): This does not actually need to grab the whole node
-        let node = { *block.read().node(inode) };
-        self.find_subnode_of(repository, parent_node, &node, name_hash)
-            .await
+    ) -> impl Future<Output = Result<NodeID, StateError>> + Send + '_ {
+        self.find_subnode_in(repository, parent_node, name_hash)
     }
 
-    /// Find a child of `parent_node` by name hash, starting from a parent node
-    /// the caller has already read.
-    ///
-    /// Saves the lookup [`Self::find_subnode`] performs, for a caller that has
-    /// just inspected the parent and is about to search under it.
-    pub async fn find_subnode_of(
+    /// The find of [`Self::find_subnode`]: the parent's block loaded, its head read with its
+    /// chain change count, and its chain walked.
+    async fn find_subnode_in(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
-        parent: &Node,
         name_hash: u64,
     ) -> Result<NodeID, StateError> {
-        if !parent.is_directory() {
-            return Err(NodeNotFound.into());
-        }
-
+        let mut block = self
+            .block(repository.clone(), NodeBlock::index(parent_node))
+            .await?;
+        let mut search = {
+            let (parent, changes) = block.node_with_chain_changes(Node::index(parent_node));
+            if !parent.is_directory() {
+                return Err(NodeNotFound.into());
+            }
+            NameSearch::new(parent_node, &parent, block.clone(), changes, name_hash)
+        };
         let mut iblock = NodeBlock::index(parent_node);
-        let mut block = self.block(repository.clone(), iblock).await?;
-
-        let mut child_node_ref = parent.child();
-        let mut cycle = SiblingCycleGuard::new(parent_node);
-        while let Some(node_id) = child_node_ref {
-            let inextblock = NodeBlock::index(node_id);
-            let inode = Node::index(node_id);
-            let node = {
-                if iblock != inextblock {
-                    iblock = inextblock;
-                    block = self.block(repository.clone(), iblock).await?;
-                }
-                *block.read().node(inode)
+        loop {
+            let Some(node_id) = search.next(self)? else {
+                return Err(NodeNotFound.into());
             };
-
-            node.walk_step(node_id, parent_node, &mut cycle)?;
-
-            if node.name_hash == name_hash {
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::reached(crate::state::node::hooks::Point::FindStep).await;
+            if iblock != NodeBlock::index(node_id) {
+                iblock = NodeBlock::index(node_id);
+                block = self.block(repository.clone(), iblock).await?;
+            }
+            let node = *block.read().node(Node::index(node_id));
+            if search.found(node_id, &node)? {
                 return Ok(node_id);
             }
-
-            child_node_ref = node.sibling();
         }
+    }
 
-        Err(NodeNotFound.into())
+    /// [`Self::find_subnode`] through blocks in memory only, for a request that reads nothing
+    /// from the store: `None` on the first block it needs that is not in memory.
+    pub fn find_subnode_resident(
+        &self,
+        parent_node: NodeID,
+        name_hash: u64,
+    ) -> Result<Option<NodeID>, StateError> {
+        let mut iblock = NodeBlock::index(parent_node);
+        let Some(mut block) = self.resident_block(iblock) else {
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::log::arm(
+                &self.hooks,
+                crate::state::node::hooks::log::Arm::NeedLoad,
+            );
+            return Ok(None);
+        };
+        let mut search = {
+            let (parent, changes) = block.node_with_chain_changes(Node::index(parent_node));
+            if !parent.is_directory() {
+                return Err(NodeNotFound.into());
+            }
+            NameSearch::new(parent_node, &parent, block.clone(), changes, name_hash)
+        };
+        loop {
+            let Some(node_id) = search.next(self)? else {
+                return Err(NodeNotFound.into());
+            };
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::window(crate::state::node::hooks::Window::ResidentFind);
+            if iblock != NodeBlock::index(node_id) {
+                iblock = NodeBlock::index(node_id);
+                let Some(next) = self.resident_block(iblock) else {
+                    #[cfg(feature = "state-hooks")]
+                    crate::state::node::hooks::log::arm(
+                        &self.hooks,
+                        crate::state::node::hooks::log::Arm::NeedLoad,
+                    );
+                    return Ok(None);
+                };
+                block = next;
+            }
+            let node = *block.read().node(Node::index(node_id));
+            if search.found(node_id, &node)? {
+                return Ok(Some(node_id));
+            }
+        }
+    }
+
+    /// Counts a refusal of the served chain rule under its locks.
+    #[cold]
+    pub(in crate::state) fn served_refused(&self) {
+        self.served_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a settle's clear a change overtook.
+    #[cold]
+    pub(in crate::state) fn clear_overtaken(&self) {
+        self.clears_overtaken.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts an unserved clear marking its directory again.
+    #[cold]
+    pub(in crate::state) fn clear_rechecked(&self) {
+        self.clears_rechecked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts an unserved clear's mark finding its directory detached.
+    #[cold]
+    pub(in crate::state) fn clear_found_gone(&self) {
+        self.clears_found_gone.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Resolves `path` below `root`, entering links on the way.
@@ -4028,9 +4583,16 @@ impl State {
             }
             let name_hash = hash::hash_string(current_name);
 
-            current_node = self
-                .find_subnode(repository.clone(), current_node, name_hash)
-                .await?;
+            // Under `state-hooks` the log borrows the find's answer; the block ends that borrow
+            // before the awaits after it.
+            current_node = {
+                let found = self
+                    .find_subnode(repository.clone(), current_node, name_hash)
+                    .await;
+                #[cfg(feature = "state-hooks")]
+                crate::state::node::hooks::log::hop(&self.hooks, (current_node, name_hash), &found);
+                found
+            }?;
 
             // If the node is a link, resolve and enter that link
             if !path.is_empty() {
@@ -4184,19 +4746,25 @@ impl State {
     ) -> Result<Option<RelativePathBuf>, StateError> {
         let mut nodes = vec![];
         while node != ancestor {
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::NodePath)
+                .await;
             if !node.is_valid_node_id() {
                 return Ok(None);
             }
             nodes.push(node);
 
-            let block_index = NodeBlock::index(node);
-            let node_index = Node::index(node);
-            let block = self.block(repository.clone(), block_index).await?;
-            node = block.node(node_index).parent;
+            let block = self
+                .block(repository.clone(), NodeBlock::index(node))
+                .await?;
+            node = block.node_parent(node);
         }
 
         let mut path = RelativePathBuf::new();
         for node in nodes.iter().rev() {
+            #[cfg(feature = "state-hooks")]
+            crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::NodePath)
+                .await;
             let name = self
                 .node_name_ref(repository.clone(), *node)
                 .await
@@ -4240,12 +4808,37 @@ impl State {
             .map(RelativePathBuf::freeze))
     }
 
-    pub async fn collect_children_unsorted(
+    /// The children of `parent` in walk order, those staged for deletion where `include_deleted`;
+    /// for a link, where `include_links`, the children of the node it mounts in its linked State.
+    /// A child the walk visits twice is kept once, at its last place, and one it filters at its
+    /// last visit, as a delete beside it stages it, as the earlier visit read it
+    /// (`keep_last_in_walk_order`). Not an `async fn`, which would hold its arguments twice.
+    pub fn collect_children_unsorted(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
         parent: NodeID,
         include_deleted: bool,
         include_links: bool,
+    ) -> impl Future<Output = Result<StateChildrenNodes, StateError>> + Send + '_ {
+        self.collect_children_unsorted_where(
+            repository,
+            parent,
+            include_deleted,
+            include_links,
+            |_| true,
+        )
+    }
+
+    /// [`Self::collect_children_unsorted`] of the children whose record `keep` keeps, read as the
+    /// walk passes them, so the filter costs no read.
+    #[lore_macro::test_pub]
+    async fn collect_children_unsorted_where(
+        self: &Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        include_deleted: bool,
+        include_links: bool,
+        keep: impl Fn(&Node) -> bool + Copy + Send + Sync,
     ) -> Result<StateChildrenNodes, StateError> {
         let mut children = vec![];
         if !parent.is_valid_or_root_node_id() {
@@ -4283,11 +4876,12 @@ impl State {
                 .await
                 .forward::<StateError>("Link error")?;
 
-            let result = Box::pin(link_state.collect_children_unsorted(
+            let result = Box::pin(link_state.collect_children_unsorted_where(
                 linked_repository.clone(),
                 link_node,
                 include_deleted,
                 include_links,
+                keep,
             ))
             .await?;
 
@@ -4297,16 +4891,21 @@ impl State {
         let mut iter =
             StateNodeChildrenIterator::new(self.clone(), repository.clone(), parent).await?;
         while let Some((child_id, child_node)) = iter.next().await? {
-            if include_deleted || !child_node.is_staged_delete() {
+            if (include_deleted || !child_node.is_staged_delete()) && keep(&child_node) {
+                let walk_index = children.len() as u32;
                 push_named_child(
                     &mut children,
-                    StateNamedNode {
-                        node: child_id,
-                        name: child_node.name_hash,
-                        flags: NodeFlags::from_bits_retain(child_node.flags),
-                    },
+                    StateNamedNode::new(
+                        child_id,
+                        walk_index,
+                        child_node.name_hash,
+                        NodeFlags::from_bits_retain(child_node.flags),
+                    ),
                 );
             }
+        }
+        if iter.may_repeat() {
+            keep_last_in_walk_order(&mut children, |child| (child.node, child.walk_index()));
         }
 
         Ok(StateChildrenNodes {
@@ -4377,10 +4976,14 @@ impl State {
             if include_deleted || !child_node.is_staged_delete() {
                 children.push(StateNamedStringNode {
                     node: child_id,
+                    walk_index: children.len() as u32,
                     name: child_node.name_hash,
                     name_string: name_lock.freeze(),
                 });
             }
+        }
+        if iter.may_repeat() {
+            keep_last_in_walk_order(&mut children, |child| (child.node, child.walk_index));
         }
 
         Ok(StateNamedChildrenNodes {
@@ -4392,7 +4995,7 @@ impl State {
 
     pub fn tree_readonly(&self) -> Result<Tree, StateError> {
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if let Some(tree) = lock.tree.as_ref() {
                 return Ok(*tree);
             }
@@ -4412,13 +5015,13 @@ impl State {
     /// the read, whether or not the tree is loaded.
     pub async fn tree(&self, repository: Arc<RepositoryContext>) -> Result<Tree, StateError> {
         {
-            let lock = self.runtime.read();
+            let lock = self.runtime_read();
             if let Some(tree) = lock.tree.as_ref() {
                 return Ok(*tree);
             }
         }
 
-        let hash_tree = { self.data.read().hash_tree };
+        let hash_tree = { self.data_read().hash_tree };
 
         let tree = {
             if hash_tree.is_zero() {
@@ -4427,7 +5030,7 @@ impl State {
                 tree.format = TreeFormat::Initial as u32;
                 tree.block_count = 1;
                 {
-                    let mut lock = self.runtime.write();
+                    let mut lock = self.runtime_write();
                     if let Some(current_tree) = &lock.tree {
                         tree = *current_tree;
                     } else {
@@ -4439,10 +5042,15 @@ impl State {
             } else {
                 let tree_address = Address::zero_context_hash(hash_tree);
                 let options = read_options_from_repository(&repository);
+                #[cfg(feature = "state-hooks")]
+                let waiting =
+                    crate::state::node::hooks::waiting(crate::state::node::hooks::Wait::BlockLoad);
                 let mut tree =
                     Box::pin(Tree::read_from_immutable(repository, tree_address, options))
                         .await
                         .forward::<StateError>("Failed to deserialize tree")?;
+                #[cfg(feature = "state-hooks")]
+                drop(waiting);
                 if tree.magic != TREE_MAGIC {
                     return Err(StateError::internal("Tree corrupt header"));
                 } else if tree.format == 0 || tree.format > TreeFormat::Initial as u32 {
@@ -4459,7 +5067,7 @@ impl State {
                     }));
                 }
                 {
-                    let mut lock = self.runtime.write();
+                    let mut lock = self.runtime_write();
                     if let Some(current_tree) = &lock.tree {
                         tree = *current_tree;
                     } else {
@@ -4571,7 +5179,7 @@ impl State {
         address.push(Address::zero_context_hash(tree.hash_node));
 
         {
-            let data = self.data.read();
+            let data = self.data_read();
             address.push(Address::zero_context_hash(data.hash_tree));
             address.push(Address::zero_context_hash(data.hash_metadata));
             address.push(Address::zero_context_hash(data.hash_link));
@@ -4632,17 +5240,17 @@ impl State {
     }
 
     pub fn link_merge_hash(&self) -> Hash {
-        self.data.read().hash_link_merge
+        self.data_read().hash_link_merge
     }
 
     pub fn set_link_merge_hash(&self, hash: Hash) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         data.hash_link_merge = hash;
         data.flags |= StateFlags::Dirty;
     }
 
     pub fn clear_link_merge_state(&self) {
-        let mut data = self.data.write();
+        let mut data = self.data_write();
         if !data.hash_link_merge.is_zero() {
             data.hash_link_merge = Hash::default();
             data.flags |= StateFlags::Dirty;
@@ -4732,7 +5340,7 @@ impl State {
         &self,
         repository: Arc<RepositoryContext>,
     ) -> Result<Vec<LinkReference>, StateError> {
-        let list_hash = { self.data.read().hash_link };
+        let list_hash = { self.data_read().hash_link };
         if list_hash.is_zero() {
             return Ok(vec![]);
         }
@@ -4763,7 +5371,7 @@ impl State {
         repository: Arc<RepositoryContext>,
     ) -> Result<Vec<LinkReference>, StateError> {
         {
-            let runtime = self.runtime.read();
+            let runtime = self.runtime_read();
             if let Some(link_list) = runtime.link_list.as_ref() {
                 return Ok(link_list.clone());
             }
@@ -4785,14 +5393,14 @@ impl State {
         repository: Arc<RepositoryContext>,
         edit: impl FnOnce(&mut Vec<LinkReference>) -> Result<(), StateError>,
     ) -> Result<(), StateError> {
-        let populated = self.runtime.read().link_list.is_some();
+        let populated = self.runtime_read().link_list.is_some();
         let loaded = if populated {
             vec![]
         } else {
             self.serialized_link_list(repository).await?
         };
 
-        let mut runtime = self.runtime.write();
+        let mut runtime = self.runtime_write();
         edit(runtime.link_list.get_or_insert(loaded))
     }
 
@@ -4803,14 +5411,14 @@ impl State {
         local_node: NodeID,
     ) -> Result<LinkReference, StateError> {
         let link_list = {
-            let runtime = self.runtime.read();
+            let runtime = self.runtime_read();
             runtime.link_list.clone()
         };
 
         let link_list = if let Some(link_list) = link_list {
             link_list
         } else {
-            let list_hash = { self.data.read().hash_link };
+            let list_hash = { self.data_read().hash_link };
             if !list_hash.is_zero() {
                 let data = immutable::read(
                     repository.clone(),
@@ -4937,7 +5545,7 @@ impl State {
     }
 
     pub fn force_rehash_names(&self) {
-        self.runtime.write().rehash_node_names = true;
+        self.runtime_write().rehash_node_names = true;
     }
 
     /// The deprecated name table, loaded unless it is resident.
@@ -4949,7 +5557,7 @@ impl State {
         repository: Arc<RepositoryContext>,
     ) -> Result<Arc<NameTable>, StateError> {
         {
-            let runtime = self.runtime.read();
+            let runtime = self.runtime_read();
             if let Some(name_table) = runtime.name_table_deprecated.as_ref() {
                 return Ok(name_table.clone());
             }
@@ -4986,7 +5594,7 @@ impl State {
         };
 
         {
-            let mut runtime = self.runtime.write();
+            let mut runtime = self.runtime_write();
             if let Some(prev_name_table) = runtime.name_table_deprecated.as_ref() {
                 return Ok(prev_name_table.clone());
             }
@@ -5118,8 +5726,8 @@ pub async fn rebase_staged_state(
 /// Propagated-only `Dirty` parents are walked but not recorded — only the
 /// leaves with concrete actions need re-application. A dirty link is followed
 /// into the linked state it pins, recording its paths below the mount. Descent
-/// stops at `DirtyDelete`/`DirtyMove` subtrees (the parent action carries the
-/// whole subtree when re-applied).
+/// stops at `DirtyDelete`/`DirtyMove` subtrees the walk records (the parent
+/// action carries the whole subtree when re-applied).
 pub(crate) async fn collect_dirty_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -5144,7 +5752,9 @@ pub(crate) async fn collect_dirty_paths(
 /// re-applied as a new staged anchor on top of the freshly committed
 /// revision — staged paths are already part of the new commit and would be
 /// incorrectly re-marked as `DirtyModify` by `file::dirty::dirty()` if
-/// included.
+/// included. A staged `DirtyDelete`/`DirtyMove` directory records no path, so
+/// the walk descends it, a staged subtree whole, for the unstaged nodes below.
+#[lore_macro::test_pub]
 pub(crate) async fn collect_dirty_only_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -5212,14 +5822,15 @@ fn marked_directory_carried_by_children(node: &Node) -> bool {
     node.is_dirty_add() && !node.is_staged() && node.is_directory() && node.child().is_some()
 }
 
-/// Whether a dirty node's children must be walked.
+/// Whether a dirty node's children must be walked, given whether it records a path of its own
+/// (`contributes`).
 ///
-/// A `DirtyDelete` or `DirtyMove` directory carries its whole subtree when it is
-/// re-applied, so its descendants are covered by its own path. A directory that
-/// records no path of its own is still walked: staging a file stages the
+/// A `DirtyDelete` or `DirtyMove` directory recording its path carries its whole subtree when
+/// it is re-applied, so its descendants are covered by its own path. A directory that records
+/// no path of its own is still walked, a moved or deleted one too: staging a file stages the
 /// directories above it, so a staged directory is where a dirty-only file lives.
-fn dirty_path_descends(child: &Node) -> bool {
-    child.is_directory() && !child.is_dirty_delete() && !child.is_dirty_move()
+fn dirty_path_descends(child: &Node, contributes: bool) -> bool {
+    child.is_directory() && (!contributes || !child.is_dirty_delete() && !child.is_dirty_move())
 }
 
 /// The node block a sibling chain is being read from.
@@ -5436,7 +6047,7 @@ async fn collect_dirty_paths_linked(
         }
 
         let contributes = dirty_path_contributes(&child, options.skip_staged);
-        let descends = dirty_path_descends(&child);
+        let descends = dirty_path_descends(&child, contributes);
         let crosses = child.is_link() && link_depth < MAX_LINK_DEPTH;
         if !contributes && !descends && !crosses {
             continue;
@@ -5813,254 +6424,7 @@ fn gather_tree_paths_node_recurse<'a>(
     })
 }
 
-/// Discard a single node and patch the parent/sibling hierarchy links
-/// to remove the node from the linked list. This has to be done in serial
-/// as a post-processing step of the commit operation to avoid different
-/// tasks modifying the parent/sibling pointers of related nodes during
-/// the hierarchy walk to find related nodes.
-pub async fn node_discard_patch<F>(
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-    node_id: NodeID,
-    handler: F,
-) -> Result<usize, StateError>
-where
-    F: Fn(NodeID, u16) + Clone + Send + 'static,
-{
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-    let block = state.block(repository.clone(), block_index).await?;
-    let node = block.node(node_index);
-
-    // Remap any previous child/sibling node to point to the new "next" node
-    lore_trace!("Remapping child/sibling links for node {node_id}",);
-
-    let mut found_node = false;
-    let parent_block_index = NodeBlock::index(node.parent);
-    let parent_node_index = Node::index(node.parent);
-    let mut prev_sibling_id = {
-        let parent_block = state.block(repository.clone(), parent_block_index).await?;
-        let parent_node = parent_block.node(parent_node_index);
-        if parent_node.child == node_id {
-            lore_trace!(
-                "Child link on parent node {} matching node {}",
-                node.parent,
-                node_id
-            );
-            // Since patched deletion of nodes is done in a serial fashion we
-            // don't need a read lock on current block to ensure sibling is
-            // still accurate - we can use the previously fetched node info
-            {
-                let mut parent_block_writer = parent_block.write();
-                parent_block_writer.node(parent_node_index).child = node.sibling;
-                if parent_block_writer.mark_dirty() {
-                    state.block_modified(parent_block.clone(), parent_block_index);
-                }
-            }
-            lore_trace!(
-                "Child link on parent node {} remapped from node {} -> node {} (expected {})",
-                node.parent,
-                node_id,
-                parent_block.node(parent_node_index).child,
-                node.sibling
-            );
-            found_node = true;
-            INVALID_NODE
-        } else {
-            lore_trace!(
-                "Child link on parent node {} is node {}, not node {} - walk list",
-                node.parent,
-                parent_node.child,
-                node_id
-            );
-            parent_node.child
-        }
-    };
-    while prev_sibling_id.is_valid_node_id() {
-        let sibling_block_index = NodeBlock::index(prev_sibling_id);
-        let sibling_node_index = Node::index(prev_sibling_id);
-        let sibling_block = state.block(repository.clone(), sibling_block_index).await?;
-        let sibling_node = sibling_block.node(sibling_node_index);
-        if sibling_node.sibling == node_id {
-            lore_trace!(
-                "Sibling link on node {} matching node {}",
-                prev_sibling_id,
-                node_id
-            );
-            // Since patched deletion of nodes is done in a serial fashion we
-            // don't need a read lock on current block to ensure sibling is
-            // still accurate - we can use the previously fetched node info
-            {
-                let mut sibling_block_writer = sibling_block.write();
-                sibling_block_writer.node(sibling_node_index).sibling = node.sibling;
-                if sibling_block_writer.mark_dirty() {
-                    state.block_modified(sibling_block.clone(), sibling_block_index);
-                }
-            }
-            lore_trace!(
-                "Sibling link on node {} remapped from node {} -> node {} (expected {})",
-                prev_sibling_id,
-                node_id,
-                sibling_block.node(sibling_node_index).sibling,
-                node.sibling
-            );
-            found_node = true;
-            break;
-        } else {
-            lore_trace!(
-                "Sibling link on node {} is node {}, not node {} - continue walk list",
-                prev_sibling_id,
-                sibling_node.sibling,
-                node_id
-            );
-            prev_sibling_id = sibling_node.sibling;
-        }
-    }
-
-    if !found_node {
-        let chain = format_parent_child_chain(&state, &repository, node.parent).await;
-        return Err(StateError::internal(format!(
-            "Discard hierarchy broken: node {node_id} (parent={parent_node_id}, \
-             sibling_in_node={node_sibling}, flags={node_flags:#x}) not in \
-             parent.child chain (observed: {chain})",
-            parent_node_id = node.parent,
-            node_sibling = node.sibling,
-            node_flags = node.flags,
-        )));
-    }
-
-    handler(node_id, node.flags);
-
-    let dirtied = {
-        lore_trace!("Updating block to discard node {}", node_id);
-        let mut lock = block.write();
-        lock.discard_node(block_index, node_index);
-        lock.mark_dirty()
-    };
-    if dirtied {
-        state.block_modified(block.clone(), block_index);
-        state.mark_dirty();
-    }
-
-    Ok(1)
-}
-
-/// Read-only walk of `parent_node_id`'s `child → sibling → …` chain
-/// formatted for diagnostic error messages. Called only from the error
-/// paths of [`node_discard_patch`] and [`State::move_node`], so it never
-/// costs on the hot path.
-async fn format_parent_child_chain(
-    state: &State,
-    repository: &Arc<RepositoryContext>,
-    parent_node_id: NodeID,
-) -> String {
-    const MAX_CHAIN: usize = 64;
-
-    let Ok(parent_block) = state
-        .block(repository.clone(), NodeBlock::index(parent_node_id))
-        .await
-    else {
-        return "<parent block unreadable>".to_string();
-    };
-    let initial_child = parent_block.node(Node::index(parent_node_id)).child;
-
-    let mut buffer = String::new();
-    if !initial_child.is_valid_node_id() {
-        buffer.push_str("<empty>");
-        return buffer;
-    }
-
-    let mut current_node_id = initial_child;
-    let mut steps = 0;
-    while current_node_id.is_valid_node_id() {
-        if steps == MAX_CHAIN {
-            buffer.push_str(" -> …(truncated)");
-            return buffer;
-        }
-        if steps > 0 {
-            buffer.push_str(" -> ");
-        }
-        buffer.push_str(&current_node_id.to_string());
-        steps += 1;
-
-        let Ok(sibling_block) = state
-            .block(repository.clone(), NodeBlock::index(current_node_id))
-            .await
-        else {
-            buffer.push_str(" -> <unreadable>");
-            return buffer;
-        };
-        current_node_id = sibling_block.node(Node::index(current_node_id)).sibling;
-    }
-    buffer
-}
-
-/// Counts of files and directories discarded during a node discard operation.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct DiscardCounts {
-    pub file_count: u64,
-    pub directory_count: u64,
-}
-
-/// Discard a node and all child nodes in the subhierarchy in case this is a directory node.
-/// Will not patch any parent/sibling pointers and should only be called on the child nodes
-/// of the initial node being discarded in a commit operation. This allows the subhierarchy
-/// node discard to happen in parallel as is does not modify hierarchy parent/sibling linked
-/// lists, while deferring the discard on the initial node which needs hierarchy patching to
-/// a serial post-process step.
-pub async fn node_discard_nopatch<F>(
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-    node_id: NodeID,
-    recurse: bool,
-    discard: bool,
-    handler: F,
-) -> Result<DiscardCounts, StateError>
-where
-    F: Fn(NodeID, u16) + Clone + Send + 'static,
-{
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-    let block = state.block(repository.clone(), block_index).await?;
-    let node = block.node(node_index);
-
-    let mut counts = if recurse && node.is_directory() {
-        node_discard_children(
-            state.clone(),
-            repository.clone(),
-            node_id,
-            node.child(),
-            discard,
-            handler.clone(),
-        )
-        .await?
-    } else {
-        DiscardCounts::default()
-    };
-
-    handler(node_id, node.flags);
-
-    if discard {
-        let dirtied = {
-            lore_trace!("Updating block to discard node {}", node_id);
-            let mut lock = block.write();
-            lock.discard_node(block_index, node_index);
-            lock.mark_dirty()
-        };
-        if dirtied {
-            state.block_modified(block.clone(), block_index);
-            state.mark_dirty();
-        }
-    }
-
-    if node.is_directory() {
-        counts.directory_count += 1;
-    } else {
-        counts.file_count += 1;
-    }
-    Ok(counts)
-}
-
+#[lore_macro::test_pub]
 #[repr(C)]
 #[derive(Copy, Clone, IntoBytes, FromBytes, Immutable)]
 pub struct Tree {
@@ -6206,7 +6570,7 @@ fn add_change(
     changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
-) -> impl Future<Output = Result<(), StateError>> {
+) -> impl Future<Output = Result<(), StateError>> + Send + '_ {
     async move {
         // Avoid adding repository root node in case it was to/from an empty repository
         if from.mapping.node != ROOT_NODE || to.mapping.node != ROOT_NODE {
@@ -7001,110 +7365,6 @@ pub(crate) async fn diff_filesystem_queuing(
     ))
 }
 
-/// Patch-discard the nodes a parallel filesystem walk collected — a reverted `DirtyAdd`, an
-/// entry behind a nested-repository boundary, or an entry neither the file system nor any commit
-/// holds — and [clear the propagation](clear_propagation) each leaves stale on its ancestor
-/// chain. A directory node goes with the whole subtree below it, so no slot is left holding an
-/// entry unreachable from the root. Must only be called after every walk over the tree has
-/// drained — discarding mid-walk mutates `parent.child` / sibling chains under walks that are
-/// still reading them and races into `node_discard_patch`'s `"Discard hierarchy broken"`, and
-/// clears marks other walks are still carrying up.
-pub(crate) async fn apply_pending_discards(
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-    mut pending_discards: Vec<NodeID>,
-) -> Result<(), StateError> {
-    if pending_discards.is_empty() {
-        return Ok(());
-    }
-    pending_discards.sort_unstable();
-    pending_discards.dedup();
-
-    for discard_node_id in pending_discards {
-        let Ok(discard_node) = state.node(repository.clone(), discard_node_id).await else {
-            continue;
-        };
-        if discard_node.is_discarded() {
-            continue;
-        }
-
-        let initial_ancestor = discard_node.parent;
-
-        if discard_node.is_directory() {
-            node_discard_children(
-                state.clone(),
-                repository.clone(),
-                discard_node_id,
-                discard_node.child(),
-                true,
-                |_, _| {},
-            )
-            .await?;
-        }
-
-        node_discard_patch(
-            state.clone(),
-            repository.clone(),
-            discard_node_id,
-            |_, _| {},
-        )
-        .await?;
-        state.mark_dirty();
-
-        clear_propagation(&state, &repository, initial_ancestor).await?;
-    }
-    Ok(())
-}
-
-/// Nodes walks over a tree found stale, each with the tree it belongs to, held for
-/// `apply_pending_discards` until every walk that marks the tree has drained.
-///
-/// A walk crosses into linked and layer trees, so what it holds can belong to several.
-#[derive(Default)]
-pub struct WalkDiscards {
-    batches: parking_lot::Mutex<Vec<DiscardBatch>>,
-}
-
-/// Children of one directory of `state` a walk found stale.
-struct DiscardBatch {
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-    nodes: Vec<NodeID>,
-}
-
-impl WalkDiscards {
-    /// Hold `nodes`, children of one directory of `state`, for discarding.
-    pub(crate) fn queue(
-        &self,
-        state: Arc<State>,
-        repository: Arc<RepositoryContext>,
-        nodes: Vec<NodeID>,
-    ) {
-        if !nodes.is_empty() {
-            self.batches.lock().push(DiscardBatch {
-                state,
-                repository,
-                nodes,
-            });
-        }
-    }
-
-    /// Whether no node is held, which leaves nothing to [apply](Self::apply).
-    pub(crate) fn is_empty(&self) -> bool {
-        self.batches.lock().is_empty()
-    }
-
-    /// Discard every node held. Call only once every walk holding nodes here has drained.
-    #[lore_macro::test_pub]
-    pub(crate) async fn apply(&self) -> Result<(), StateError> {
-        let batches = std::mem::take(&mut *self.batches.lock());
-        for batch in batches {
-            apply_pending_discards(batch.state, batch.repository, batch.nodes).await?;
-        }
-        Ok(())
-    }
-}
-
 /// Whether `node` is staged only because something below it is: the bare `Staged` bit
 /// [`State::node_mark`] carries up to the ancestors of the node it marks. An action bit can be the
 /// node's own staged action or its dirty one, so a node carrying one, a merge flag, or a link is
@@ -7133,15 +7393,16 @@ pub(crate) async fn clear_propagation(
         let block_index = NodeBlock::index(ancestor);
         let node_index = Node::index(ancestor);
         let block = state.block(repository.clone(), block_index).await?;
-        let node = block.node(node_index);
-        staged &= is_staged_for_descendants_only(&node);
-        let mut children = StateNodeChildrenIterator::from_parent(
-            state.clone(),
-            repository.clone(),
-            ancestor,
-            &node,
-        )
-        .await?;
+        let (parent, mut children) = {
+            let (node, children) = StateNodeChildrenIterator::with_parent_in(
+                state.clone(),
+                repository.clone(),
+                ancestor,
+                block.clone(),
+            );
+            staged &= is_staged_for_descendants_only(&node);
+            (node.parent, children)
+        };
         while (dirty || staged)
             && let Some((_, child)) = children.next().await?
         {
@@ -7152,6 +7413,10 @@ pub(crate) async fn clear_propagation(
             break;
         }
         let dirtied = {
+            #[cfg(feature = "state-hooks")]
+            let _label = crate::state::node::hooks::log::label(
+                crate::state::node::hooks::log::Section::ClearPropagation,
+            );
             let mut block_writer = block.write();
             let writer_node = block_writer.node(node_index);
             if dirty {
@@ -7164,12 +7429,11 @@ pub(crate) async fn clear_propagation(
         };
         if dirtied {
             state.block_modified(block, block_index);
-            state.mark_dirty();
         }
         if ancestor == ROOT_NODE {
             break;
         }
-        ancestor = node.parent;
+        ancestor = parent;
     }
     Ok(())
 }
@@ -7428,11 +7692,10 @@ impl FileDiffContext {
 
         let _ = self
             .state_from
-            .node_mark_dirty(
-                self.repository_from.clone(),
+            .node_mark(
+                &self.repository_from,
                 parent_node_id,
-                NodeFlags::Dirty,
-                false,
+                Mark::dirty(NodeFlags::Dirty, Ext::Keep, false),
             )
             .await;
         Ok(node_id)
@@ -7480,36 +7743,25 @@ impl SettledAction {
 /// exception for a staging intent, which records the staged action the node does not yet
 /// carry.
 ///
-/// A staging intent records the staged action through [`State::node_mark`], which keeps it
-/// in the staged bits; [`State::node_mark_dirty`] masks to the dirty bits and would drop
-/// it. A merge carries its own staged flags and takes no dirty action beside them, which
-/// is what staging a node does today.
-async fn mark_settled(
-    state: &Arc<State>,
-    repository: &Arc<RepositoryContext>,
+/// A staging intent records the staged action in the mark's staged half, which keeps it in
+/// the staged bits; the dirty half masks to the dirty bits and would drop it. The mark is the
+/// one a stage records ([`crate::stage::staged_change`]).
+///
+/// Not an `async fn`, which would hold its arguments beside the mark's future.
+fn mark_settled<'a>(
+    state: &'a Arc<State>,
+    repository: &'a Arc<RepositoryContext>,
     node_id: NodeID,
     action: SettledAction,
     intent: FilesystemDiffIntent,
-) -> Result<(), StateError> {
-    let Some(stage) = intent.stage() else {
-        return state
-            .node_mark_dirty(repository.clone(), node_id, action.dirty(), true)
-            .await;
+) -> impl Future<Output = Result<(), StateError>> + Send + 'a {
+    let mark = match intent.stage() {
+        None => Mark::dirty(action.dirty(), Ext::Set(NodeExtFlags::NoFlags), true),
+        Some(stage) => {
+            crate::stage::staged_change(action.staged(), action.dirty(), stage.node_flags)
+        }
     };
-    state
-        .node_mark(
-            repository.clone(),
-            node_id,
-            action.staged() | stage.node_flags,
-            true,
-        )
-        .await?;
-    if stage.node_flags.contains(NodeFlags::StagedMerge) {
-        return Ok(());
-    }
-    state
-        .node_mark_dirty(repository.clone(), node_id, action.dirty(), true)
-        .await
+    state.node_mark(repository, node_id, mark)
 }
 
 /// Returns whether the child `name` of the directory `parent` addresses holds
@@ -8352,7 +8604,7 @@ async fn collect_state_fragments(
     let mut addresses = Vec::with_capacity(32);
 
     {
-        let data = state.data.read();
+        let data = state.data_read();
         addresses.push(Address::zero_context_hash(data.hash_link));
         addresses.push(Address::zero_context_hash(data.hash_metadata));
         addresses.push(Address::zero_context_hash(data.hash_tree));
@@ -9435,25 +9687,24 @@ pub async fn apply_tree_changes(
 
             if node_link.is_valid() {
                 if change.is_case_only_move() {
-                    let block_index = NodeBlock::index(node_link.node);
-                    let node_index = Node::index(node_link.node);
-                    let block = target_state
-                        .block_with_nametable(repository.clone(), block_index)
+                    let renamed_directory = target_state
+                        .node(repository.clone(), node_link.node)
+                        .await?
+                        .is_directory();
+                    target_state
+                        .node_rename(
+                            repository.clone(),
+                            node_link.node,
+                            NameChange::Rename(change.path().name()),
+                        )
                         .await?;
-                    let renamed_directory = {
-                        let node = block.node(node_index);
-                        target_state.node_rename(
-                            &block,
-                            block_index,
-                            node_index,
-                            &node,
-                            change.path().name(),
-                        )?;
-                        node.is_directory()
-                    };
                     if renamed_directory || !change.flags.contains(change::Flags::Modify) {
                         target_state
-                            .node_mark(repository.clone(), node_link.node, NodeFlags::Staged, true)
+                            .node_mark(
+                                &repository,
+                                node_link.node,
+                                Mark::staged(NodeFlags::Staged, true),
+                            )
                             .await?;
                         continue;
                     }
@@ -9501,66 +9752,6 @@ pub async fn apply_tree_changes(
     Ok(())
 }
 
-/// Discards every node below `parent_node_id`, whose child chain starts at
-/// `first_child`, leaving that node and its hierarchy links untouched. Children
-/// are discarded concurrently: nothing in the subtree patches a parent, child
-/// or sibling pointer, so no walk observes a partially relinked chain. Each
-/// child's sibling is read before that child is discarded, since discarding
-/// repurposes the pointer for the block's free list.
-///
-/// With `discard` false the subtree is walked and reported through `handler`
-/// without being discarded. The returned counts cover the subtree, excluding
-/// `parent_node_id` itself.
-async fn node_discard_children<F>(
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-    parent_node_id: NodeID,
-    first_child: Option<NodeID>,
-    discard: bool,
-    handler: F,
-) -> Result<DiscardCounts, StateError>
-where
-    F: Fn(NodeID, u16) + Clone + Send + 'static,
-{
-    lore_trace!("Recursively discarding children of directory node {parent_node_id}");
-    let mut counts = DiscardCounts::default();
-    let mut tasks = JoinSet::new();
-    let mut child_node_ref = first_child;
-    let mut cycle = SiblingCycleGuard::new(parent_node_id);
-    while let Some(child_node_id) = child_node_ref {
-        let child_block = state
-            .block(repository.clone(), NodeBlock::index(child_node_id))
-            .await?;
-        let child_node = child_block.node(Node::index(child_node_id));
-
-        child_node.walk_step(child_node_id, parent_node_id, &mut cycle)?;
-
-        lore_spawn!(tasks, {
-            let state = state.clone();
-            let repository = repository.clone();
-            let handler = handler.clone();
-            async move {
-                node_discard_recurse(state, repository, child_node_id, true, discard, handler).await
-            }
-        });
-
-        child_node_ref = child_node.sibling();
-    }
-
-    let mut task_failure = Ok(());
-    while let Some(task) = tasks.join_next().await {
-        if let Ok(result) = task {
-            let child_counts = result?;
-            counts.file_count += child_counts.file_count;
-            counts.directory_count += child_counts.directory_count;
-        } else {
-            task_failure = Err(task.unwrap_err());
-        }
-    }
-    task_failure.internal("Discard node task")?;
-    Ok(counts)
-}
-
 /// Load a node based on the determined source.
 async fn load_node_for_change(
     source: NodeSource,
@@ -9592,16 +9783,35 @@ async fn load_node_for_change(
     }
 }
 
-/// A directory the hierarchy walk has entered: the children it has yet to emit, whether its name is
-/// on the walk's path buffer, and the filter's verdict for the directory, which each child steps
-/// from.
+/// A directory the hierarchy walk has entered: the children it has yet to emit, whether its name
+/// is on the walk's path buffer, and the filter's verdict for the directory, which each child
+/// steps from.
 ///
 /// `appended` is false for the walk's top directory, whose path the buffer starts as, and for a
 /// directory with an empty name, which appends nothing and so must take nothing off.
 struct HierarchyLevel {
-    children: StateNodeChildrenWithNameIterator,
+    children: LevelChildren,
     appended: bool,
     states: FilterStates,
+}
+
+/// The children a [`HierarchyLevel`] has yet to emit.
+enum LevelChildren {
+    /// On a State no VFS provider serves: the directory's chain, walked as the level goes.
+    Streamed(StateNodeChildrenWithNameIterator),
+    /// On a served State, which may change under the walk: the children collected when the level
+    /// opened.
+    Collected(CollectedChildren),
+}
+
+/// A served directory's children in walk order, each once however often a chain walk that may
+/// repeat met it.
+struct CollectedChildren {
+    /// The directory the children were collected from.
+    node: NodeID,
+    children: std::vec::IntoIter<StateNamedNode>,
+    /// The block the last child was read from, which consecutive children mostly share.
+    block: Option<(usize, Arc<NodeBlock>)>,
 }
 
 impl HierarchyLevel {
@@ -9612,17 +9822,87 @@ impl HierarchyLevel {
         appended: bool,
         states: FilterStates,
     ) -> Result<Self, StateError> {
-        let children = StateNodeChildrenWithNameIterator::new(
-            side.mapping.state.clone(),
-            side.mapping.repository.clone(),
-            node,
-        )
-        .await?;
+        let NodeMapping {
+            repository, state, ..
+        } = &side.mapping;
+        let children = if state.is_served() {
+            // Boxed: only a served State collects, and the collection would otherwise set the
+            // size of every walk's future.
+            let collected =
+                Box::pin(state.collect_children_unsorted(repository.clone(), node, true, false))
+                    .await?;
+            LevelChildren::Collected(CollectedChildren {
+                node,
+                children: collected.children.into_iter(),
+                block: None,
+            })
+        } else {
+            LevelChildren::Streamed(
+                StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node)
+                    .await?,
+            )
+        };
         Ok(Self {
             children,
             appended,
             states,
         })
+    }
+
+    /// The next child to emit, with its record and name, or `None` once the level is done.
+    fn next_child<'a>(
+        &'a mut self,
+        side: &'a NodeChangeState,
+    ) -> impl Future<Output = Result<Option<(NodeID, Node, NodeNameLock)>, StateError>> + Send + 'a
+    {
+        match &mut self.children {
+            LevelChildren::Streamed(children) => Either::Left(children.next()),
+            LevelChildren::Collected(children) => Either::Right(children.next(side)),
+        }
+    }
+}
+
+impl CollectedChildren {
+    /// The next child, read again from its block, that is still at its place under the name it
+    /// was collected with: one discarded, moved to another directory or renamed to another name
+    /// hash since is left out, as a children walk may omit a node moved during it. A child whose
+    /// name the read path refuses is skipped with a warning, as a listing skips it.
+    async fn next(
+        &mut self,
+        side: &NodeChangeState,
+    ) -> Result<Option<(NodeID, Node, NodeNameLock)>, StateError> {
+        loop {
+            let Some(StateNamedNode {
+                node: child,
+                name: name_hash,
+                ..
+            }) = self.children.next()
+            else {
+                return Ok(None);
+            };
+            let index = NodeBlock::index(child);
+            let block = match self.block.take() {
+                Some((held, block)) if held == index => block,
+                _ => {
+                    side.mapping
+                        .state
+                        .block_with_nametable(side.mapping.repository.clone(), index)
+                        .await?
+                }
+            };
+            let (node, name) = self
+                .block
+                .insert((index, block))
+                .1
+                .node_and_name_ref(Node::index(child));
+            if node.is_discarded() || node.parent != self.node || node.name_hash != name_hash {
+                continue;
+            }
+            match name {
+                Ok(name) => return Ok(Some((child, node, name))),
+                Err(err) => lore_warn!("Skipping node {child} with invalid name: {err}"),
+            }
+        }
     }
 }
 
@@ -9637,15 +9917,22 @@ impl HierarchyLevel {
 /// Descent is an explicit stack of [`HierarchyLevel`] rather than a box per node, so the walk runs
 /// at a fixed call depth. A child directory is handed to a task of its own while
 /// [`hierarchy_task_semaphore`] allows, so a hierarchy of millions of nodes is walked on every core
-/// rather than one; once the budget is spent, the levels stack here as before. A directory's change
-/// precedes everything below it, but siblings walked by different tasks interleave.
+/// rather than one; once the budget is spent, the levels stack in this task. A directory's change
+/// precedes everything below it, but siblings walked by different tasks interleave. On a State no
+/// VFS provider serves, no child of a directory moves while the walk lists it, so each level walks
+/// its directory's chain as the walk goes, reading each child once, as a listing does: a child
+/// renamed in place is emitted at the name it holds when the walk reaches it, and one detached
+/// before then is left out. A served State may change under the walk, so there each level collects
+/// its children first and reads each again as it emits it ([`CollectedChildren`]): no path is
+/// emitted twice and none at a name its node has left. A child whose name the read path refuses is
+/// skipped with a warning, as a listing skips it.
 ///
 /// Children are named on one path buffer, which holds the path of the directory being walked and
 /// keeps [`RelativePath::COMPONENT_ROOM`] free beyond it. A child's name is a read lock on its node
-/// block, released as the name is pushed, so the lock covers copying the name into that room; only
-/// a longer name grows the buffer under it. The child's own path is allocated from the buffer after
-/// that, and only for a child the filter keeps. A name is taken off as soon as its child is done
-/// with, or for a directory once its level is done.
+/// block, released once the name is pushed, so the lock covers copying the name into that room;
+/// only a longer name grows the buffer under it. The child's own path is allocated from the buffer
+/// after that, and only for a child the filter keeps. A name is taken off as soon as its child is
+/// done with, or for a directory once its level is done.
 ///
 /// Not an `async fn`, which would hold `from` and `to` beside the sides taken from them.
 fn add_change_hierarchy(
@@ -9753,7 +10040,7 @@ async fn walk_hierarchy(
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
     let mut levels = vec![HierarchyLevel::open(side, side.mapping.node, false, states).await?];
     while let Some(level) = levels.last_mut() {
-        let Some((child_id, child_node, child_name)) = level.children.next().await? else {
+        let Some((child_id, child_node, child_name)) = level.next_child(side).await? else {
             if levels.pop().is_some_and(|done| done.appended) {
                 path.pop();
             }
@@ -9816,7 +10103,15 @@ async fn walk_hierarchy(
                 let changes = changes.clone();
                 lore_spawn!(
                     tasks,
-                    spawned_hierarchy(from, to, action, changes, filter_mode, child_states, permit)
+                    crate::subtask!(spawned_hierarchy(
+                        from,
+                        to,
+                        action,
+                        changes,
+                        filter_mode,
+                        child_states,
+                        permit
+                    ))
                 );
                 if appended {
                     path.pop();
@@ -9836,22 +10131,6 @@ async fn walk_hierarchy(
         }
     }
     Ok(())
-}
-
-fn node_discard_recurse<F>(
-    state: Arc<State>,
-    repository: Arc<RepositoryContext>,
-    node_id: NodeID,
-    recurse: bool,
-    discard: bool,
-    handler: F,
-) -> Pin<Box<dyn Future<Output = Result<DiscardCounts, StateError>> + Send>>
-where
-    F: Fn(NodeID, u16) + Clone + Send + 'static,
-{
-    Box::pin(node_discard_nopatch(
-        state, repository, node_id, recurse, discard, handler,
-    ))
 }
 
 bitflags! {
@@ -9877,5 +10156,229 @@ fn delete_hierarchy_side(from: NodeChangeState, to: &NodeChangeState) -> Option<
         Some(to.clone())
     } else {
         None
+    }
+}
+
+/// The accessors, wrappers and constructors a `test-util` build adds to this module's types, for
+/// tests.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use lore_base::lore_drain_tasks;
+
+    use super::*;
+
+    /// Pushes `block` onto `blocks` unless it holds it already; answers whether it pushed. A
+    /// sibling chain may leave a block and come back to it, and the one just seen is the likeliest
+    /// match.
+    pub fn push_distinct(blocks: &mut Vec<Arc<NodeBlock>>, block: &Arc<NodeBlock>) -> bool {
+        if blocks.iter().rev().any(|seen| Arc::ptr_eq(seen, block)) {
+            return false;
+        }
+        blocks.push(block.clone());
+        true
+    }
+
+    impl StateNodeChildrenIterator {
+        /// The node block holding the child [`Self::next`] returned last.
+        pub fn block(&self) -> Option<&Arc<NodeBlock>> {
+            self.current_block.as_ref()
+        }
+    }
+
+    impl StateNodeChildrenWithNameIterator {
+        /// Live children the walk passed over because their block could not give back their name.
+        pub fn skipped_invalid(&self) -> u32 {
+            self.skipped_invalid
+        }
+    }
+
+    impl State {
+        /// Loads every node block holding a child of `parent`, with its name table, and returns the
+        /// blocks so they stay resident while the caller walks the children.
+        ///
+        /// The children form a sibling chain across blocks, so a block is known only once the block
+        /// before it is loaded: the blocks load in turn, and each name table loads while the walk
+        /// goes on.
+        pub async fn load_children_with_nametables(
+            self: &Arc<Self>,
+            repository: Arc<RepositoryContext>,
+            parent: NodeID,
+        ) -> Result<Vec<Arc<NodeBlock>>, StateError> {
+            let mut children =
+                StateNodeChildrenIterator::new(self.clone(), repository.clone(), parent).await?;
+            let mut blocks: Vec<Arc<NodeBlock>> = Vec::new();
+            let mut nametables: JoinSet<Result<(), StateError>> = JoinSet::new();
+            while children.next().await?.is_some() {
+                let Some(block) = children.block() else {
+                    continue;
+                };
+                if !push_distinct(&mut blocks, block) {
+                    continue;
+                }
+                if !block.is_nametable_deserialized() {
+                    let block = block.clone();
+                    let repository = repository.clone();
+                    lore_spawn!(
+                        nametables,
+                        crate::subtask!(
+                            async move { block.deserialize_nametable(repository).await }
+                        )
+                    );
+                }
+            }
+            lore_drain_tasks!(
+                nametables,
+                StateError::internal("Failed to load a node name table")
+            )?;
+            Ok(blocks)
+        }
+
+        /// Drops the State's own hold on the blocks it keeps in memory for reuse: its block cache
+        /// and the file metadata blocks kept for checks and attaches. A block nothing else holds
+        /// leaves memory, to be loaded again when next asked for. Dirty blocks stay registered for
+        /// the next save, and a holder of a block's `Arc` keeps it. Takes the runtime write lock
+        /// and no block lock; the blocks drop after it is released. For tests and the stress
+        /// suite's evictor.
+        pub fn evict_blocks_for_tests(&self) {
+            let held = {
+                let mut runtime = self.runtime_write();
+                (
+                    std::mem::take(&mut runtime.block_cache),
+                    std::mem::take(&mut runtime.block_file_metadata_checked),
+                    runtime.attach_file_metadata.take(),
+                )
+            };
+            drop(held);
+        }
+
+        /// [`Self::block_modified`], for tests that write a block's records or names directly, or
+        /// register a block no write changed.
+        pub fn block_modified_for_tests(&self, block: Arc<NodeBlock>, index: usize) {
+            self.block_modified(block, index);
+        }
+
+        /// How many times a find by name ([`Self::find_subnode`], [`Self::find_subnode_resident`])
+        /// walked its directory's chain again after a reattach, over this state's life.
+        pub fn find_restarts(&self) -> u64 {
+            self.find_restarts.load(Ordering::Relaxed)
+        }
+
+        /// How many times an attach ([`Self::node_attach`]) found its publish refused and looked
+        /// its name up again, over this state's life. For tests.
+        pub fn attach_retries(&self) -> u64 {
+            self.attach_retries.load(Ordering::Relaxed)
+        }
+
+        /// How many times the served chain rule refused a change under its locks, after the
+        /// change's pre-test passed: an attach's publish, a detach's or a reattach's section, or a
+        /// level of a served mark's descent, over this state's life. For tests.
+        pub fn served_refusals(&self) -> u64 {
+            self.served_refusals.load(Ordering::Relaxed)
+        }
+
+        /// How many settles' clears found their directory's children equal to the committed ones,
+        /// then a change below, or a served move of the directory itself, landed before the clear
+        /// (the pending clear dropped, or the chain count moved), over this state's life. For
+        /// tests.
+        pub fn clears_overtaken(&self) -> u64 {
+            self.clears_overtaken.load(Ordering::Relaxed)
+        }
+
+        /// How many unserved clears found a directory's child dirty, or its chain changed, after
+        /// clearing it, and marked it again, over this state's life. For tests.
+        pub fn clears_rechecked(&self) -> u64 {
+            self.clears_rechecked.load(Ordering::Relaxed)
+        }
+
+        /// How many unserved clears marking a directory again found it, or a directory above it,
+        /// detached, which they answer as success, over this state's life. For tests.
+        pub fn clears_found_gone(&self) -> u64 {
+            self.clears_found_gone.load(Ordering::Relaxed)
+        }
+
+        /// Whether node block `index` is recorded changed ([`Self::block_modified`]), so the next
+        /// save writes it.
+        pub fn block_recorded_changed(&self, index: usize) -> bool {
+            self.runtime_read()
+                .block_dirty
+                .iter()
+                .any(|(_, at)| *at == index)
+        }
+
+        /// Whether node block `index` is noted for the next sweep ([`StateRuntime::unswept`]),
+        /// which scans a noted block in memory whose flag is set (C15). For tests.
+        pub fn block_noted_unswept(&self, index: usize) -> bool {
+            self.runtime_read()
+                .unswept
+                .get(index / 64)
+                .is_some_and(|word| word & (1 << (index % 64)) != 0)
+        }
+
+        /// How many times node block `index` is registered for the next save, at most once.
+        pub fn block_registrations(&self, index: usize) -> usize {
+            self.runtime_read()
+                .block_dirty
+                .iter()
+                .filter(|(_, at)| *at == index)
+                .count()
+        }
+
+        /// How many times file metadata block `index` is registered for the next save, at most
+        /// once.
+        pub fn block_file_metadata_registrations(&self, index: usize) -> usize {
+            self.runtime_read()
+                .block_file_metadata_dirty
+                .iter()
+                .filter(|(_, at)| *at == index)
+                .count()
+        }
+
+        /// Where the registered bits disagree with the registrations, at rest: a block registered
+        /// twice, a registered block whose bit is clear, a resident block whose bit is set that no
+        /// registration holds, node and file metadata blocks alike. For tests.
+        pub fn registration_faults(&self) -> Vec<String> {
+            fn faults<B>(
+                kind: &str,
+                registered: &[(Arc<B>, usize)],
+                resident: &[Weak<B>],
+                is_registered: impl Fn(&B) -> bool,
+            ) -> Vec<String> {
+                let mut found = Vec::new();
+                let mut listed = std::collections::BTreeSet::new();
+                for (block, index) in registered {
+                    if !listed.insert(*index) {
+                        found.push(format!("{kind} block {index} is registered twice"));
+                    }
+                    if !is_registered(block) {
+                        found.push(format!(
+                            "{kind} block {index} is registered with its bit clear"
+                        ));
+                    }
+                }
+                for (index, block) in resident.iter().enumerate() {
+                    if let Some(block) = block.upgrade()
+                        && is_registered(&block)
+                        && !listed.contains(&index)
+                    {
+                        found.push(format!("{kind} block {index} has its bit set unregistered"));
+                    }
+                }
+                found
+            }
+            let runtime = self.runtime_read();
+            let mut found = faults(
+                "node",
+                &runtime.block_dirty,
+                &runtime.block,
+                NodeBlock::is_registered,
+            );
+            found.append(&mut faults(
+                "file metadata",
+                &runtime.block_file_metadata_dirty,
+                &runtime.block_file_metadata,
+                NodeFileMetadataBlock::is_registered,
+            ));
+            found
+        }
     }
 }

@@ -15,13 +15,12 @@ Assertions encode the intended behavior and validate the full reported
 file/directory state after each operation.
 """
 
-import json
 import logging
 import os
 
 import pytest
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import to_posix
+from test_utils import has_staged_anchor, to_posix
 
 from lore import Lore
 
@@ -65,20 +64,6 @@ def find_status_entry(entries: list[dict], path: str) -> dict | None:
         if to_posix(entry.get("path", "")) == target:
             return entry
     return None
-
-
-def has_staged_anchor(repo: Lore) -> bool:
-    """True iff the repo currently has a non-zero staged revision anchor."""
-    zero = "0" * 64
-    for line in repo.status(json=True, offline=True).splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        staged = event.get("data", {}).get("revisionStaged", "")
-        if staged and staged != zero:
-            return True
-    return False
 
 
 def summarize(entries: list[dict]) -> list[tuple]:

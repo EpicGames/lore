@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
 use lore_base::runtime::processor_count;
 use lore_error_set::prelude::*;
@@ -21,20 +22,27 @@ use lore_revision::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeDeleteCompleteEventData;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
+use lore_revision::node::Node;
+use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
 use lore_revision::node::NodeIDExt;
 use lore_revision::node::ROOT_NODE;
+use lore_revision::node::SiblingCycleGuard;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::state;
+use lore_revision::state::LevelMark;
 use lore_revision::state::State;
+use lore_revision::state::StateError;
 use lore_revision::state::StateNodeChildrenIterator;
+use lore_revision::subtask;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::revision_tree::call::EntryFailure;
 use crate::revision_tree::call::revision_tree_call;
 use crate::revision_tree::handle::LoreRevisionTree;
+use crate::revision_tree::handle::RevisionTreeGuard;
 use crate::revision_tree::handle::RevisionTreeInternal;
 
 /// One subtree to remove. The node must already exist and must not be the root.
@@ -66,6 +74,7 @@ pub struct LoreRevisionTreeDeleteArgs {
 #[error_set]
 enum DeleteError {
     InvalidArguments,
+    SlowDown,
 }
 
 impl DeleteError {
@@ -82,6 +91,7 @@ impl EventError for DeleteError {
     fn translated(&self) -> LoreError {
         match self {
             DeleteError::InvalidArguments(_) => LoreError::InvalidArguments,
+            DeleteError::SlowDown(_) => LoreError::SlowDown,
             DeleteError::Internal(_) => LoreError::Internal,
         }
     }
@@ -100,8 +110,8 @@ fn emit_delete_complete(entry_id: u64, node_count: u64, error_code: LoreErrorCod
     .send();
 }
 
-/// Emit the `entry_id`-carrying terminal for a failed entry. Nothing was
-/// removed, so the count is zero.
+/// Emit the `entry_id`-carrying terminal for a failed entry, its count zero
+/// whatever part of its subtree was removed.
 fn emit_delete_error(entry_id: u64, error_code: LoreErrorCode) {
     emit_delete_complete(entry_id, 0, error_code);
 }
@@ -122,18 +132,37 @@ fn batch_error_code(result: &Result<(), DeleteError>) -> LoreErrorCode {
     match result {
         Ok(()) => LoreErrorCode::None,
         Err(DeleteError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
+        Err(DeleteError::SlowDown(_)) => LoreErrorCode::SlowDown,
         Err(DeleteError::Internal(_)) => LoreErrorCode::Internal,
     }
 }
 
-/// Reject the whole batch as a bad argument, attributing it to `entry_id`.
+/// An entry the planning refused: the whole batch is rejected as a bad argument, attributed to
+/// `entry_id`.
 ///
 /// The batch index goes into the reason as well, because a caller may leave
 /// `entry_id` at zero — which any number of entries may share — so the id on its
 /// own need not say which entry was at fault.
-fn reject(entry_id: u64, entry_index: usize, reason: &str) -> DeleteError {
-    emit_delete_error(entry_id, LoreErrorCode::InvalidArguments);
-    DeleteError::invalid(format!("entry {entry_index}: {reason}"))
+struct Rejection {
+    entry_id: u64,
+    entry_index: usize,
+    reason: &'static str,
+}
+
+impl Rejection {
+    /// Reports the rejection on its entry and makes the call's error.
+    fn emit(self) -> DeleteError {
+        emit_delete_error(self.entry_id, LoreErrorCode::InvalidArguments);
+        DeleteError::invalid(format!("entry {}: {}", self.entry_index, self.reason))
+    }
+}
+
+fn reject(entry_id: u64, entry_index: usize, reason: &'static str) -> Rejection {
+    Rejection {
+        entry_id,
+        entry_index,
+        reason,
+    }
 }
 
 /// A validated entry, ready to apply without further checks. The kind and
@@ -144,27 +173,27 @@ fn reject(entry_id: u64, entry_index: usize, reason: &str) -> DeleteError {
 struct Planned {
     entry_id: u64,
     node_id: NodeID,
+    /// The directory the node stood in, and its name's hash, as the plan read them: where an
+    /// added root is detached from.
+    parent: NodeID,
+    name_hash: u64,
     staged_add: bool,
-    descend: bool,
+    directory: bool,
 }
 
-/// One node of a subtree, carrying the index of the entry that reached it so a
-/// per-entry count survives a wavefront shared by the whole batch.
-#[derive(Clone, Copy)]
-struct Reached {
-    node_id: NodeID,
-    entry_index: usize,
-    /// The node was added through this handle, so it is discarded rather than
-    /// staged for deletion.
-    staged_add: bool,
-    /// Children may hang below, so the walk descends. False for a file and for
-    /// a link, whose subtree lives in the linked repository's tree.
-    descend: bool,
+/// Checks `entries` as a call does, reporting a rejection on its entry.
+#[cfg(feature = "test-util")]
+pub async fn plan_entries(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    entries: &[LoreRevisionTreeDeleteEntry],
+) -> Result<Vec<Planned>, DeleteError> {
+    plan(state, context, entries).await.map_err(Rejection::emit)
 }
 
-/// Check every entry against the tree and against the rest of the batch,
-/// producing the apply plan. Mutates nothing; the first invalid entry rejects
-/// the batch.
+/// Checks every entry against the tree and against the rest of the batch, producing the apply
+/// plan. Mutates nothing and reports nothing: the first invalid entry rejects the batch, handed
+/// back for the call to report once its task has ended.
 ///
 /// A discarded slot and a slot the allocator never handed out both read back as
 /// ordinary empty directories, so each is refused on its own terms; a zero name
@@ -173,12 +202,11 @@ struct Reached {
 /// would cost the batch squared — with `cleared` holding the nodes already proven
 /// to have no targeted ancestor so entries sharing a chain walk it once between
 /// them.
-#[lore_macro::test_pub]
-async fn plan_entries(
+async fn plan(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     entries: &[LoreRevisionTreeDeleteEntry],
-) -> Result<Vec<Planned>, DeleteError> {
+) -> Result<Vec<Planned>, Rejection> {
     let mut planned: Vec<Planned> = Vec::with_capacity(entries.len());
     let mut targets: HashSet<NodeID> = HashSet::with_capacity(entries.len());
     let mut ids: HashSet<u64> = HashSet::with_capacity(entries.len());
@@ -227,8 +255,10 @@ async fn plan_entries(
         planned.push(Planned {
             entry_id,
             node_id: entry.node_id,
+            parent: node.parent,
+            name_hash: node.name_hash,
             staged_add: node.is_staged_add(),
-            descend: node.is_directory(),
+            directory: node.is_directory(),
         });
     }
 
@@ -263,227 +293,535 @@ async fn plan_entries(
     Ok(planned)
 }
 
-/// Read the children of every node in `level` that can have them, tagging each
-/// with the entry that reached it.
-///
-/// A node already staged for deletion ends the descent: staging a deletion
-/// stages the whole subtree, so everything below it is staged too and revisiting
-/// it would re-walk a tree that is already accounted for.
-///
-/// An entry whose subtree mixes added and pre-existing children fails instead:
-/// discarding a parent whose children are only staged would unlink a chain those
-/// children still point into, and `discard_added` skips a failed entry, so the
-/// parent stays put.
-async fn next_level(
-    state: &Arc<State>,
-    context: &Arc<RepositoryContext>,
-    level: &[Reached],
-    failed: &mut [bool],
-) -> Vec<Reached> {
-    let mut children = Vec::new();
-    for item in level.iter().filter(|item| item.descend) {
-        let Ok(mut iterator) =
-            StateNodeChildrenIterator::new(state.clone(), context.clone(), item.node_id).await
-        else {
-            failed[item.entry_index] = true;
-            continue;
-        };
-        loop {
-            match iterator.next().await {
-                Ok(None) => break,
-                Err(_) => {
-                    failed[item.entry_index] = true;
-                    break;
-                }
-                Ok(Some((child_id, child))) => {
-                    if child.is_discarded() || child.is_staged_delete() {
-                        continue;
-                    }
-                    if item.staged_add && !child.is_staged_add() {
-                        failed[item.entry_index] = true;
-                        break;
-                    }
-                    children.push(Reached {
-                        node_id: child_id,
-                        entry_index: item.entry_index,
-                        staged_add: child.is_staged_add(),
-                        descend: child.is_directory(),
-                    });
-                }
-            }
-        }
-    }
-    children
+/// A tracked node of a level, below `parent`, reached by entry `entry_index`.
+#[derive(Clone, Copy)]
+struct Tracked {
+    node_id: NodeID,
+    parent: NodeID,
+    entry_index: usize,
 }
 
-/// Stage every node of `level` for deletion, over at most one task per
-/// processor.
-///
-/// Tagging is a flag write under the node's own block lock and touches no
-/// parent or sibling pointer, so the nodes of one level are independent of each
-/// other and of the levels around them.
-///
-/// A node that cannot be staged fails its own entry and no other: the level runs
-/// to completion so every entry's outcome is its own, rather than the first
-/// failure standing in for the batch. A group that dies without reporting fails
-/// every entry it held.
-async fn stage_level(
+/// An added node standing in a tracked one, or an added entry root: the root of a subtree the
+/// delete detaches whole.
+#[derive(Clone, Copy)]
+struct AddedRoot {
+    node_id: NodeID,
+    parent: NodeID,
+    name_hash: u64,
+    entry_index: usize,
+    /// Whether it is a directory, as the delete read it: a file or a link holds nothing below.
+    directory: bool,
+}
+
+/// What a group of a level found: its nodes staged and its failures per entry, in `T`, the
+/// tracked children making the next level, and the added children.
+#[derive(Default)]
+struct LevelFound<T> {
+    tally: T,
+    next: Vec<Tracked>,
+    added: Vec<AddedRoot>,
+}
+
+/// Per entry of the batch, how many nodes the delete removed, and how it failed.
+struct Applied {
+    counts: Vec<u64>,
+    failed: Vec<EntryFailure>,
+}
+
+/// Per entry a fan-out task's items reached, a count and how it failed, consecutive items of one
+/// entry folded into one run, so a task's memory and its merge follow its items, not the batch's
+/// entries.
+#[derive(Default)]
+struct Runs(Vec<Run>);
+
+/// What consecutive items of one entry counted, and how they failed.
+#[derive(Clone, Copy)]
+struct Run {
+    entry: usize,
+    count: u64,
+    failure: EntryFailure,
+}
+
+/// Where a group counts its entries' nodes and failures: the call's [`Applied`], or a fan-out
+/// task's [`Runs`].
+trait Tally: Send {
+    /// Counts `by` more nodes removed for `entry`.
+    fn count(&mut self, entry: usize, by: u64);
+
+    /// Fails `entry` as `failure` says, keeping the stronger failure.
+    fn fail(&mut self, entry: usize, failure: EntryFailure);
+}
+
+impl Tally for Applied {
+    fn count(&mut self, entry: usize, by: u64) {
+        self.counts[entry] += by;
+    }
+
+    fn fail(&mut self, entry: usize, failure: EntryFailure) {
+        self.failed[entry].merge(failure);
+    }
+}
+
+impl Tally for Runs {
+    fn count(&mut self, entry: usize, by: u64) {
+        match self.0.last_mut() {
+            Some(run) if run.entry == entry => run.count += by,
+            _ => self.0.push(Run {
+                entry,
+                count: by,
+                failure: EntryFailure::None,
+            }),
+        }
+    }
+
+    fn fail(&mut self, entry: usize, failure: EntryFailure) {
+        match self.0.last_mut() {
+            Some(run) if run.entry == entry => run.failure.merge(failure),
+            _ => self.0.push(Run {
+                entry,
+                count: 0,
+                failure,
+            }),
+        }
+    }
+}
+
+impl Applied {
+    /// Nothing removed and nothing failed, for `entry_count` entries.
+    fn new(entry_count: usize) -> Self {
+        Self {
+            counts: vec![0u64; entry_count],
+            failed: vec![EntryFailure::None; entry_count],
+        }
+    }
+
+    /// Takes in what a fan-out task counted.
+    fn take_runs(&mut self, runs: Runs) {
+        for run in runs.0 {
+            self.count(run.entry, run.count);
+            self.fail(run.entry, run.failure);
+        }
+    }
+
+    /// Reports each entry's outcome, an entry that failed with a count of zero, whatever part
+    /// of its subtree it removed, and makes the call's result: `SLOW_DOWN` where every entry
+    /// that failed slowed, `INTERNAL` otherwise.
+    fn emit(self, planned: &[Planned]) -> Result<(), DeleteError> {
+        let mut failures = 0usize;
+        let mut strongest = EntryFailure::None;
+        for (index, item) in planned.iter().enumerate() {
+            let failure = self.failed[index];
+            if failure.failed() {
+                failures += 1;
+                strongest.merge(failure);
+                emit_delete_error(item.entry_id, failure.code());
+            } else {
+                emit_delete_complete(item.entry_id, self.counts[index], LoreErrorCode::None);
+            }
+        }
+        if failures > 0 {
+            return Err(strongest.call_error(&format!(
+                "{failures}/{} subtree deletions failed",
+                planned.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Stages every tracked node of `level` for deletion, over at most one task per processor,
+/// each reading the node's chain head under the lock its mark takes
+/// ([`State::node_delete_level`]) and sorting the children it reaches: tracked ones make the
+/// next level, added ones are the roots of subtrees to detach, and nodes staged for deletion or
+/// discarded already are passed over. A node that cannot be marked fails its own entry and no
+/// other, and a group that dies without reporting fails every entry it held. A level one task
+/// takes is marked in place, with no task, where a panic fails the whole batch rather than the
+/// group's entries.
+async fn mark_level(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
-    level: Arc<Vec<Reached>>,
-    counts: &mut [u64],
-    failed: &mut [bool],
+    level: Vec<Tracked>,
+    found: &mut LevelFound<Applied>,
 ) {
     let total = level.len();
-    if total == 0 {
+    let task_count = processor_count().min(total).max(1);
+    if task_count == 1 {
+        mark_group(state, context, &level, found).await;
         return;
     }
-    let task_count = processor_count().min(total).max(1);
     let chunk = total.div_ceil(task_count);
     let ranges: Vec<(usize, usize)> = (0..total)
         .step_by(chunk)
         .map(|start| (start, (start + chunk).min(total)))
         .collect();
-    let entry_count = counts.len();
+    fan_out(state, context, level, ranges, found).await;
+}
 
-    let mut tasks: JoinSet<(usize, Vec<u64>, Vec<bool>)> = JoinSet::new();
+/// What the groups of a fan-out find ([`fan_out`]): each task finds into a [`Self::Own`] of its
+/// own, holding its items' entries alone, merged into the call's once the task ends.
+trait Found {
+    /// The items a group is made of.
+    type Item: Send + Sync + 'static;
+
+    /// What a group's task finds into.
+    type Own: Default + Send + 'static;
+
+    /// Works `items`, one after another, into `own`.
+    fn work<'a>(
+        own: &'a mut Self::Own,
+        state: &'a Arc<State>,
+        context: &'a Arc<RepositoryContext>,
+        items: &'a [Self::Item],
+    ) -> impl Future<Output = ()> + Send + 'a;
+
+    /// Takes in what a group's task found.
+    fn merge(&mut self, own: Self::Own);
+
+    /// Fails the entry that reached `item`.
+    fn fail_item(&mut self, item: &Self::Item);
+}
+
+/// Works `items` into `found`, each of `ranges` of them in a task of its own, as [`Found`] says.
+/// A task that dies without reporting fails every entry its range held.
+async fn fan_out<F: Found>(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    items: Vec<F::Item>,
+    ranges: Vec<(usize, usize)>,
+    found: &mut F,
+) {
+    let items = Arc::new(items);
+    let mut tasks: JoinSet<(usize, F::Own)> = JoinSet::new();
     for (group, (start, end)) in ranges.iter().copied().enumerate() {
-        let level = level.clone();
+        let items = items.clone();
         let state = state.clone();
         let context = context.clone();
-        lore_spawn!(tasks, async move {
-            let mut staged = vec![0u64; entry_count];
-            let mut broke = vec![false; entry_count];
-            for item in &level[start..end] {
-                if item.staged_add {
-                    continue;
-                }
-                match state.node_delete(context.clone(), item.node_id).await {
-                    Ok(true) => staged[item.entry_index] += 1,
-                    Ok(false) => {}
-                    Err(_) => broke[item.entry_index] = true,
-                }
-            }
-            (group, staged, broke)
-        });
+        lore_spawn!(
+            tasks,
+            subtask!(async move {
+                let mut own = F::Own::default();
+                F::work(&mut own, &state, &context, &items[start..end]).await;
+                (group, own)
+            })
+        );
     }
 
     let mut reported = vec![false; ranges.len()];
     while let Some(result) = tasks.join_next().await {
-        if let Ok((group, staged, broke)) = result {
+        if let Ok((group, own)) = result {
             reported[group] = true;
-            for index in 0..entry_count {
-                counts[index] += staged[index];
-                failed[index] |= broke[index];
-            }
+            found.merge(own);
         }
     }
     for (group, (start, end)) in ranges.iter().copied().enumerate() {
         if !reported[group] {
-            for item in &level[start..end] {
-                failed[item.entry_index] = true;
+            for item in &items[start..end] {
+                found.fail_item(item);
             }
         }
     }
 }
 
-/// Discard every node this handle added, deepest first.
-///
-/// A node staged for addition is not in the revision the handle was loaded
-/// from, so there is nothing for a commit to delete: it is removed from the
-/// tree outright, exactly as removing a freshly added link does. Unlike
-/// tagging, this rewrites the parent and sibling pointers around the node, and
-/// [`state::node_discard_patch`] documents that as work which has to run in
-/// serial — so this phase does, and deepest first, so a parent is never
-/// unlinked before the children still pointing at it.
-///
-/// An entry that has already failed is skipped, which is what keeps a parent
-/// linked when a discard below it did not happen.
-async fn discard_added(
+impl Found for LevelFound<Applied> {
+    type Item = Tracked;
+    type Own = LevelFound<Runs>;
+
+    fn work<'a>(
+        own: &'a mut LevelFound<Runs>,
+        state: &'a Arc<State>,
+        context: &'a Arc<RepositoryContext>,
+        items: &'a [Tracked],
+    ) -> impl Future<Output = ()> + Send + 'a {
+        mark_group(state, context, items, own)
+    }
+
+    fn merge(&mut self, mut own: LevelFound<Runs>) {
+        self.tally.take_runs(own.tally);
+        take_all(&mut self.next, &mut own.next);
+        take_all(&mut self.added, &mut own.added);
+    }
+
+    fn fail_item(&mut self, item: &Tracked) {
+        self.tally.fail(item.entry_index, EntryFailure::Internal);
+    }
+}
+
+impl Found for Applied {
+    type Item = AddedRoot;
+    type Own = Runs;
+
+    fn work<'a>(
+        own: &'a mut Runs,
+        state: &'a Arc<State>,
+        context: &'a Arc<RepositoryContext>,
+        items: &'a [AddedRoot],
+    ) -> impl Future<Output = ()> + Send + 'a {
+        detach_group(state, context, items, own)
+    }
+
+    fn merge(&mut self, own: Runs) {
+        self.take_runs(own);
+    }
+
+    fn fail_item(&mut self, root: &AddedRoot) {
+        self.fail(root.entry_index, EntryFailure::Internal);
+    }
+}
+
+/// Marks `items`, one after another, into `found`, as [`mark_level`] says.
+async fn mark_group<T: Tally>(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
-    added: &[(Reached, usize)],
-    counts: &mut [u64],
-    failed: &mut [bool],
+    items: &[Tracked],
+    found: &mut LevelFound<T>,
 ) {
-    let mut ordered: Vec<&(Reached, usize)> = added.iter().collect();
-    ordered.sort_by_key(|(_, depth)| std::cmp::Reverse(*depth));
-
-    for (item, _) in ordered {
-        if failed[item.entry_index] {
-            continue;
-        }
-        match state::node_discard_patch(
-            state.clone(),
-            context.clone(),
-            item.node_id,
-            |_discarded_node_id, _flags| {},
-        )
-        .await
+    for item in items {
+        match state
+            .node_delete_level(context, item.node_id, item.parent)
+            .await
         {
-            Ok(_) => counts[item.entry_index] += 1,
-            Err(_) => failed[item.entry_index] = true,
+            Ok(LevelMark::Marked(head)) => {
+                found.tally.count(item.entry_index, 1);
+                if let Err(error) = sort_children(state, context, item, head, found).await {
+                    found.tally.fail(item.entry_index, EntryFailure::of(&error));
+                }
+            }
+            Ok(LevelMark::Staged) => {}
+            Ok(LevelMark::Other) => found.tally.fail(item.entry_index, EntryFailure::Internal),
+            Err(error) => found.tally.fail(item.entry_index, EntryFailure::of(&error)),
         }
     }
 }
 
-/// Walk every planned subtree and remove it, reporting per entry how many nodes
-/// went.
-///
-/// The walk runs to completion whatever fails: an entry reports its own outcome,
-/// and the call reports how many entries did not finish. An entry that failed
-/// reports nothing removed, since part of its subtree is in whichever state the
-/// failure left it.
-#[lore_macro::test_pub]
-async fn apply_plan(
+/// Moves everything `from` holds onto the end of `into`, taking its buffer where `into` holds
+/// nothing, so the first group's findings are not copied.
+fn take_all<T>(into: &mut Vec<T>, from: &mut Vec<T>) {
+    if into.is_empty() {
+        std::mem::swap(into, from);
+    } else {
+        into.append(from);
+    }
+}
+
+/// Sorts the children of `item`, its chain starting at `head`, into `found`: tracked ones for
+/// the next level, added ones as roots to detach.
+async fn sort_children<T>(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    item: &Tracked,
+    head: Option<NodeID>,
+    found: &mut LevelFound<T>,
+) -> Result<(), StateError> {
+    let mut cycle = SiblingCycleGuard::new(item.node_id);
+    let mut next = head;
+    // The block of the last child read, as siblings mostly share one.
+    let mut held: Option<(usize, Arc<NodeBlock>)> = None;
+    while let Some(child_id) = next {
+        let block_index = NodeBlock::index(child_id);
+        let block = match &held {
+            Some((index, block)) if *index == block_index => block,
+            _ => {
+                let block = match state.resident_block(block_index) {
+                    Some(block) => block,
+                    None => state.block(context.clone(), block_index).await?,
+                };
+                &held.insert((block_index, block)).1
+            }
+        };
+        let child = block.node(Node::index(child_id));
+        child.walk_step(child_id, item.node_id, &mut cycle)?;
+        next = child.sibling();
+        if child.is_discarded() || child.is_staged_delete() {
+            continue;
+        }
+        if child.is_staged_add() {
+            found.added.push(AddedRoot {
+                node_id: child_id,
+                parent: item.node_id,
+                name_hash: child.name_hash,
+                entry_index: item.entry_index,
+                directory: child.is_directory(),
+            });
+        } else {
+            found.next.push(Tracked {
+                node_id: child_id,
+                parent: item.node_id,
+                entry_index: item.entry_index,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether the subtree below added node `root` holds a node that is not added: a tracked node moved
+/// into it, which a detach of the subtree would take along. A node staged for deletion is passed
+/// over with all below it: the commit frees it with the subtree. Links are leaves. `pending` is the
+/// caller's buffer for the directories still to walk, cleared on entry.
+async fn mixed(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    root: &AddedRoot,
+    pending: &mut Vec<NodeID>,
+) -> Result<bool, StateError> {
+    if !root.directory {
+        return Ok(false);
+    }
+    pending.clear();
+    pending.push(root.node_id);
+    while let Some(directory) = pending.pop() {
+        let mut children =
+            StateNodeChildrenIterator::new(state.clone(), context.clone(), directory).await?;
+        while let Some((child_id, child)) = children.next().await? {
+            if child.is_staged_delete() {
+                continue;
+            }
+            if !child.is_staged_add() {
+                return Ok(true);
+            }
+            if child.is_directory() {
+                pending.push(child_id);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Detaches every added root of an entry that has not failed, grouped by parent, the groups over
+/// at most one task per processor: detaches from one directory's chain run one after another, so
+/// siblings do not fail each other's chain checks. Each root goes with its whole subtree onto the
+/// State's pending queue ([`State::node_discard_pending`]), counted for its entry; one no longer
+/// where the delete found it fails its entry. Where one task would take every group, they are
+/// detached in place, with no task, where a panic fails the whole batch rather than the groups'
+/// entries.
+async fn detach_added(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    mut added: Vec<AddedRoot>,
+    applied: &mut Applied,
+) {
+    added.retain(|root| !applied.failed[root.entry_index].failed());
+    if added.is_empty() {
+        return;
+    }
+    // Stable, so each parent's roots keep the order the delete read them in.
+    added.sort_by_key(|root| root.parent);
+    let group_count = 1 + added
+        .windows(2)
+        .filter(|pair| pair[0].parent != pair[1].parent)
+        .count();
+    let task_count = processor_count().min(group_count).max(1);
+    if task_count == 1 {
+        detach_group(state, context, &added, applied).await;
+        return;
+    }
+    let mut groups: Vec<(usize, usize)> = Vec::with_capacity(group_count);
+    let mut start = 0;
+    for index in 1..=added.len() {
+        if index == added.len() || added[index].parent != added[start].parent {
+            groups.push((start, index));
+            start = index;
+        }
+    }
+    let per_task = groups.len().div_ceil(task_count);
+    let batches: Vec<(usize, usize)> = groups
+        .chunks(per_task)
+        .map(|batch| (batch[0].0, batch[batch.len() - 1].1))
+        .collect();
+    fan_out(state, context, added, batches, applied).await;
+}
+
+/// Detaches `roots` one after another onto the State's pending queue, counting each root's
+/// subtree for its entry; a root no longer where the delete found it fails its entry.
+async fn detach_group<T: Tally>(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    roots: &[AddedRoot],
+    tally: &mut T,
+) {
+    for root in roots {
+        match state
+            .node_discard_pending(context.clone(), root.node_id, root.parent, root.name_hash)
+            .await
+        {
+            Ok(Some(count)) => tally.count(root.entry_index, count),
+            Ok(None) => tally.fail(root.entry_index, EntryFailure::Internal),
+            Err(error) => tally.fail(root.entry_index, EntryFailure::of(&error)),
+        }
+    }
+}
+
+/// Applies `planned` as a call does, reporting each entry's outcome.
+#[cfg(feature = "test-util")]
+pub async fn apply_plan(
     state: Arc<State>,
     context: Arc<RepositoryContext>,
     planned: Vec<Planned>,
 ) -> Result<(), DeleteError> {
-    let mut counts = vec![0u64; planned.len()];
-    let mut failed = vec![false; planned.len()];
-    let mut added: Vec<(Reached, usize)> = Vec::new();
+    apply(&state, &context, &planned).await.emit(&planned)
+}
 
-    let mut level: Vec<Reached> = planned
-        .iter()
-        .enumerate()
-        .map(|(entry_index, item)| Reached {
-            node_id: item.node_id,
-            entry_index,
-            staged_add: item.staged_add,
-            descend: item.descend,
-        })
-        .collect();
-
-    let mut depth = 0usize;
-    while !level.is_empty() {
-        for item in level.iter().filter(|item| item.staged_add) {
-            added.push((*item, depth));
-        }
-        let next = next_level(&state, &context, &level, &mut failed).await;
-        stage_level(&state, &context, Arc::new(level), &mut counts, &mut failed).await;
-        level = next;
-        depth += 1;
-    }
-
-    discard_added(&state, &context, &added, &mut counts, &mut failed).await;
-
-    let mut failures = 0usize;
-    for (index, item) in planned.iter().enumerate() {
-        if failed[index] {
-            failures += 1;
-            emit_delete_error(item.entry_id, LoreErrorCode::Internal);
+/// Walks every planned subtree and removes it, counting per entry how many nodes went, and hands
+/// the outcome back for the call to report once its task has ended. The walk runs to completion
+/// whatever fails: an entry reports its own outcome, and the call reports how many entries did not
+/// finish. An entry that failed reports nothing removed, since part of its subtree is in whichever
+/// state the failure left it.
+///
+/// Tracked nodes are staged for deletion a level at a time, top-down, each level read from the
+/// chain heads the level above read under its marks' locks, so a child added or restored meanwhile
+/// is reached, staged and counted, or refused under the lock. Then every added subtree an entry
+/// reached is checked whole, one holding a tracked node failing its entry with nothing detached,
+/// and the subtrees of the entries left are detached onto the pending queue.
+async fn apply(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    planned: &[Planned],
+) -> Applied {
+    let mut found = LevelFound {
+        tally: Applied::new(planned.len()),
+        next: Vec::new(),
+        added: Vec::new(),
+    };
+    let mut level: Vec<Tracked> = Vec::new();
+    for (entry_index, item) in planned.iter().enumerate() {
+        if item.staged_add {
+            found.added.push(AddedRoot {
+                node_id: item.node_id,
+                parent: item.parent,
+                name_hash: item.name_hash,
+                entry_index,
+                directory: item.directory,
+            });
         } else {
-            emit_delete_complete(item.entry_id, counts[index], LoreErrorCode::None);
+            level.push(Tracked {
+                node_id: item.node_id,
+                parent: item.parent,
+                entry_index,
+            });
         }
     }
-    if failures > 0 {
-        return Err(DeleteError::internal(format!(
-            "{failures}/{} subtree deletions failed",
-            planned.len()
-        )));
+    while !level.is_empty() {
+        mark_level(state, context, level, &mut found).await;
+        level = std::mem::take(&mut found.next);
     }
-    Ok(())
+
+    let LevelFound {
+        tally: mut applied,
+        added,
+        ..
+    } = found;
+    let mut pending = Vec::new();
+    for root in &added {
+        if applied.failed[root.entry_index].failed() {
+            continue;
+        }
+        match mixed(state, context, root, &mut pending).await {
+            Ok(false) => {}
+            Ok(true) => applied.fail(root.entry_index, EntryFailure::Internal),
+            Err(error) => applied.fail(root.entry_index, EntryFailure::of(&error)),
+        }
+    }
+    detach_added(state, context, added, &mut applied).await;
+    applied
 }
 
 /// Remove a batch of subtrees from the revision being built.
@@ -499,10 +837,11 @@ async fn apply_plan(
 /// reports through `node_info`, carrying `LORE_NODE_STAGED_ACTION_DELETE` — that
 /// is how a caller sees what a commit would remove. A node **this handle
 /// added** is a different case: it is in no revision yet, so there is nothing
-/// for a commit to delete and it is discarded from the tree outright, freeing
-/// its name and its node id. A link is staged or discarded as one node; its
-/// subtree lives in the linked repository's tree, which this verb does not
-/// touch.
+/// for a commit to delete and it leaves the tree outright: it stops being listed,
+/// `node_info` reads it as a freed id does, and the next commit that goes ahead frees
+/// its node id.
+/// A link is staged or discarded as one node; its subtree lives in the linked
+/// repository's tree, which this verb does not touch.
 ///
 /// A staged deletion is reversible through `add`: adding the same name under the
 /// same parent with the same kind restores the node, staged as a modification.
@@ -516,8 +855,9 @@ async fn apply_plan(
 /// The call as a whole reports on `RevisionTreeBatchComplete`, carrying the
 /// call's own `batch_id` and firing exactly once — after any per-entry
 /// terminals and before `Complete`. A failure that belongs to the call rather
-/// than to one entry is reported only there: an unknown or closed handle, and a
-/// walk that could not read the tree.
+/// than to one entry is reported only there: an unknown or closed handle, a
+/// moves permit that cannot be taken, and the batch's own task ending without a
+/// result, as a panic in it does.
 ///
 /// Every entry is checked before any node is touched, and a single bad entry
 /// rejects the whole call with `INVALID_ARGUMENTS` on that entry's `entry_id`,
@@ -535,27 +875,42 @@ async fn apply_plan(
 /// cannot be read, or a tree changing under the walk — belongs to the entry
 /// whose subtree hit it: that entry reports `INTERNAL` with nothing removed,
 /// every other entry reports its own outcome, and the call reports `INTERNAL`
-/// for the batch. A failed entry may leave part of its subtree removed; nothing
-/// is rolled back, the handle stays usable, and no revision is published until
-/// `commit`.
+/// for the batch. An entry the tree gave up on under load, heavy concurrent
+/// change or a store asking it to slow down, reports `SLOW_DOWN` instead, which a
+/// caller can retry, and so does the batch where nothing failed otherwise. A
+/// failed entry may leave part of its subtree removed; nothing is rolled back,
+/// the handle stays usable, and no revision is published until `commit`.
 ///
-/// Memory while a batch runs is proportional to the widest level of the subtrees
-/// being removed rather than to the number of entries: a level is collected
-/// before it is staged, at a few dozen bytes per node. A batch of many small
-/// subtrees costs less than one entry naming a directory of a million children.
+/// Memory while a batch runs is proportional to its entry count, for the plan and
+/// each entry's count and failure; a task a level or the detaches spread over keeps
+/// a count and a failure only for the entries its own items reach. Added to
+/// that are two adjacent levels of the tracked subtrees being removed, the one
+/// being staged and the next, collected from the chain heads its marks read, at a
+/// few dozen bytes per node; one record per added subtree root found, held to the
+/// end of the batch; and, while an added subtree is checked, its directories still
+/// to walk.
 ///
-/// Staging fans out. Nodes are removed one depth level at a time and a level's
+/// Staging fans out. Nodes are staged one depth level at a time and a level's
 /// nodes spread over at most one task per processor, since a tag is a flag write
-/// under the node's own block lock and touches no parent or sibling pointer.
-/// Discarding an added node does rewrite those pointers, so that phase runs
-/// serially and deepest first. Per-entry events fire after the whole batch has
-/// been walked, so they are not ordered by entry index and carry a count only on
-/// success.
+/// under the node's own block lock, beside a read lock of its parent's, and
+/// touches no parent or sibling pointer. Each added subtree is checked whole,
+/// then detached from its directory in one step, its nodes kept for the commit to
+/// free; detaches from one directory run one after another. Per-entry events fire
+/// in entry order after the whole batch has been walked, and carry a count only
+/// on success. A node staged for deletion inside an added subtree, by a move
+/// there then a delete, is not counted again.
 ///
-/// Concurrent calls are not serialized against each other. Two calls deleting
-/// nodes in one subtree both validate before either applies, so the second stages
-/// nothing where the first already did and reports a smaller count; batch
-/// deletions that may overlap into one call, which rejects the overlap.
+/// A call holds the tree's moves permit from before its checks to after its last
+/// change, so deletes and moves apply one after another, each checking its
+/// entries against the tree the one before left: a second delete of a subtree
+/// the first removed is rejected. Adds, modifications and restores run
+/// alongside: one that lands before the delete reaches its directory is removed
+/// with it, and one after is refused. A restore of a node below an added
+/// directory, which stands there only once a move put it there, waits for the
+/// permit instead: landing first, it makes the added subtree mixed, so the
+/// delete's entry fails with `INTERNAL` and nothing is detached. The batch runs
+/// in a task the call waits for, so a call dropped part way still finishes its
+/// batch, and reports nothing.
 pub async fn delete(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeDeleteArgs,
@@ -564,8 +919,16 @@ pub async fn delete(
     dispatch_call(globals, args, callback, delete_impl).await
 }
 
-/// Plan and apply one batch. Split out of the dispatcher closure so the batch
-/// terminal fires on every path the batch can take, including an early return.
+/// Plan and apply one batch in a task of its own, then report what it found. Split out of the
+/// dispatcher closure so the batch terminal fires on every path the batch can take, including an
+/// early return.
+///
+/// The task holds a guard of its own, so a close waits for it, and takes the shared claim and
+/// then the moves permit itself, as a move batch does: a delete and a move never interleave, and
+/// a call dropped while its task runs leaves no subtree half deleted. Every event the batch
+/// reports, its rejection included, is emitted here after the task ends, so a dropped call
+/// reports nothing. A dropped call drops the task's `JoinHandle`, which detaches the task, as a
+/// `DetachingJoinSet` would without its several hundred instructions per call.
 async fn delete_batch(
     internal: Arc<RevisionTreeInternal>,
     args: LoreRevisionTreeDeleteArgs,
@@ -573,11 +936,34 @@ async fn delete_batch(
     if args.entries.is_empty() {
         return Ok(());
     }
-    let context = internal.repository_context.clone();
-    let access = internal.access_shared().await;
-    let state = access.state();
-    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
-    apply_plan(state, context, planned).await
+    let Some(guard) = RevisionTreeGuard::join(internal.clone()) else {
+        return Err(DeleteError::invalid(
+            "revision tree handle is unknown or has been closed",
+        ));
+    };
+    let task = lore_spawn!(subtask!(async move {
+        let context = internal.repository_context.clone();
+        let access = internal.access_shared().await;
+        let state = access.state();
+        let permit = state
+            .moves_permit()
+            .await
+            .map_err(|error| DeleteError::internal_with_context(error, "take the moves permit"))?;
+        let planned = match plan(&state, &context, args.entries.as_slice()).await {
+            Ok(planned) => planned,
+            Err(rejection) => return Ok(Err(rejection)),
+        };
+        let applied = apply(&state, &context, &planned).await;
+        drop(permit);
+        drop(access);
+        drop(guard);
+        Ok::<_, DeleteError>(Ok((planned, applied)))
+    }));
+    let found = task.await.internal("run the delete's task")??;
+    match found {
+        Ok((planned, applied)) => applied.emit(&planned),
+        Err(rejection) => Err(rejection.emit()),
+    }
 }
 
 async fn delete_impl(

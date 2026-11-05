@@ -19,7 +19,6 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Hash;
-use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::state::State;
 
@@ -81,24 +80,17 @@ async fn commit_rehashing_a_wide_directory() {
                     .node;
                 let version = u64::from(round) + 1;
                 state
-                    .node_modify(
-                        repository.clone(),
+                    .node_modify_staged(
+                        &repository,
                         node,
-                        0o644,
-                        version,
-                        Address::zero_context_hash(Hash::from_u64(version)),
+                        &lore_revision::state::Content {
+                            mode: 0o644,
+                            size: version,
+                            address: Address::zero_context_hash(Hash::from_u64(version)),
+                        },
                     )
                     .await
-                    .expect("Failed to modify the file");
-                state
-                    .node_mark_staged(
-                        repository.clone(),
-                        node,
-                        NodeFlags::StagedModify,
-                        NodeFlags::DirtyModify,
-                    )
-                    .await
-                    .expect("Failed to stage the modification");
+                    .expect("Failed to modify and stage the file");
                 let start = Instant::now();
                 revision = commit(&repository, &state, revision, branch).await;
                 if round > 0 {

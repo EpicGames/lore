@@ -98,7 +98,7 @@ impl<Summary: Default + Send + 'static> ChangeStream<Summary> {
         let (sender, changes) = mpsc::channel(lookahead.get());
         ChangeStream {
             changes,
-            walk: Some(lore_spawn!(walk(sender))),
+            walk: Some(lore_spawn!(crate::subtask!(walk(sender)))),
         }
     }
 

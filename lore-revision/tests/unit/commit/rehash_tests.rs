@@ -9,7 +9,6 @@ use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_revision::node::Node;
 use lore_revision::node::NodeBlock;
-use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
@@ -61,7 +60,7 @@ async fn commit_with_refused_name(
         .await
         .expect("Failed to read the block");
     {
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         let node = writer.node(Node::index(legacy));
         let (offset, length) = (node.name_offset, node.name_length);
         node.name_hash = hash_string(".URC");
@@ -74,7 +73,7 @@ async fn commit_with_refused_name(
         node.name_length = length;
         writer.mark_dirty();
     }
-    state.block_modified(block, block_index);
+    state.block_modified_for_tests(block, block_index);
 
     let edited = state
         .find_subnode(repository.clone(), directory, hash_string("a.txt"))
@@ -87,27 +86,20 @@ async fn commit_with_refused_name(
         .address
         .context;
     state
-        .node_modify(
-            repository.clone(),
+        .node_modify_staged(
+            repository,
             edited,
-            0o644,
-            20,
-            Address {
-                hash: Hash::from_u64(content + 100),
-                context,
+            &lore_revision::state::Content {
+                mode: 0o644,
+                size: 20,
+                address: Address {
+                    hash: Hash::from_u64(content + 100),
+                    context,
+                },
             },
         )
         .await
-        .expect("Failed to edit the file");
-    state
-        .node_mark_staged(
-            repository.clone(),
-            edited,
-            NodeFlags::StagedModify,
-            NodeFlags::DirtyModify,
-        )
-        .await
-        .expect("Failed to stage the edit");
+        .expect("Failed to edit and stage the file");
     commit(repository, &state, base, branch_id()).await
 }
 

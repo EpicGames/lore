@@ -14,6 +14,7 @@ mod tests {
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::verify::verify_state_for_commit;
+    use lore_revision::state::Mark;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
@@ -76,11 +77,10 @@ mod tests {
             .await
             .expect("adding the node must succeed");
         state
-            .node_mark_staged(
-                repository,
+            .node_mark(
+                &repository,
                 node_id,
-                NodeFlags::StagedAdd,
-                NodeFlags::DirtyAdd,
+                Mark::staged_and_dirty(NodeFlags::StagedAdd, NodeFlags::DirtyAdd),
             )
             .await
             .expect("marking the addition must succeed");
@@ -96,11 +96,11 @@ mod tests {
             .await
             .expect("the block must read back");
         {
-            let mut writer = block.write();
+            let mut writer = block.write_for_tests();
             writer.node(Node::index(node_id)).clear_all_change_flags();
             writer.mark_dirty();
         }
-        state.block_modified(block, block_index);
+        state.block_modified_for_tests(block, block_index);
     }
 
     /// The walk has to accept the ordinary case, or nothing commits.
@@ -295,11 +295,11 @@ mod tests {
                     .await
                     .expect("the block must read back");
                 {
-                    let mut writer = block.write();
+                    let mut writer = block.write_for_tests();
                     writer.node(Node::index(node_id)).name_hash = hash_string("b.bin");
                     writer.mark_dirty();
                 }
-                state.block_modified(block, block_index);
+                state.block_modified_for_tests(block, block_index);
 
                 let error = verify_state_for_commit(repository, state)
                     .await
@@ -340,7 +340,7 @@ mod tests {
                     .await
                     .expect("the block must read back");
                 {
-                    let mut writer = block.write();
+                    let mut writer = block.write_for_tests();
                     let node = writer.node(Node::index(node_id));
                     let (offset, length) = (node.name_offset, node.name_length);
                     node.name_hash = hash_string(".urc");
@@ -352,7 +352,7 @@ mod tests {
                     node.name_length = length;
                     writer.mark_dirty();
                 }
-                state.block_modified(block, block_index);
+                state.block_modified_for_tests(block, block_index);
 
                 let error = verify_state_for_commit(repository, state)
                     .await

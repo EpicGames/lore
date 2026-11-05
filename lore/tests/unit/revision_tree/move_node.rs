@@ -247,7 +247,7 @@ async fn settle(handle: LoreRevisionTree, node_ids: &[NodeID]) {
             .block(internal.repository_context.clone(), block_index)
             .await
             .expect("the block must be readable");
-        let mut writer = block.write();
+        let mut writer = block.write_for_tests();
         writer
             .node(lore_revision::node::Node::index(*node_id))
             .clear_all_change_flags();
@@ -679,14 +679,17 @@ async fn an_entry_that_vanishes_after_validation_fails_the_batch_as_internal() {
                 .await
                 .expect("the block must be readable");
             block
-                .write()
+                .write_for_tests()
                 .discard_node(block_index, lore_revision::node::Node::index(node_id));
 
+            let state = internal.state_for_tests();
+            let permit = state.moves_permit().await.expect("the moves permit");
             let result = apply_plan(
                 &args,
-                internal.state_for_tests(),
+                &state,
                 internal.repository_context.clone(),
                 planned,
+                &permit,
             )
             .await;
             emit_batch_complete(args.batch_id, batch_error_code(&result));
@@ -709,6 +712,103 @@ async fn an_entry_that_vanishes_after_validation_fails_the_batch_as_internal() {
         batch_outcomes(&events),
         vec![(CALL_ID, LoreErrorCode::Internal)],
         "the batch terminal must carry the failure, not report success"
+    );
+    release(handle, store_handle_id);
+}
+
+/// The plan settles each entry against the tree the entries before it produce, and the apply
+/// phase takes its walk of a directory's destination as done only while every entry before it
+/// applied. Here the first entry, moving `b` out of `a`, fails after validation, its name table
+/// filled meanwhile, so the second, moving `a` under `b`, which the plan passed with `b` moved
+/// out, would close a loop: it walks again and is refused, and `a` stays under the root.
+#[tokio::test]
+async fn a_move_after_a_failed_entry_walks_its_destination_again() {
+    let partition = Partition::from([0xe4u8; 16]);
+    let (handle, store_handle_id) = load_handle("move-walks-after-failure", partition).await;
+
+    let a = seed(handle, ROOT_NODE, "a", LoreNodeType::Directory).await;
+    let b = seed(handle, a, "b", LoreNodeType::Directory).await;
+    settle(handle, &[a, b]).await;
+    let long_name = "n".repeat(1000);
+
+    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let args = LoreRevisionTreeMoveArgs {
+        batch_id: CALL_ID,
+        handle,
+        entries: LoreArray::from_vec(vec![
+            entry(10, b, ROOT_NODE, &long_name),
+            entry(11, a, b, "a"),
+        ]),
+    };
+    let status = revision_tree_call(
+        LoreGlobalArgs::default(),
+        make_callback(sink.clone()),
+        handle,
+        args,
+        move_node,
+        |_: &LoreRevisionTreeMoveArgs| {},
+        async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeMoveArgs| {
+            let state = internal.state_for_tests();
+            let permit = state.moves_permit().await.expect("the moves permit");
+            let planned = plan_entries(
+                &state,
+                &internal.repository_context,
+                args.entries.as_slice(),
+            )
+            .await?;
+
+            // Fill the name table `b`'s rename would grow, so the rename fails before it marks.
+            let block = state
+                .block_with_nametable(internal.repository_context.clone(), NodeBlock::index(b))
+                .await
+                .expect("the block must be readable");
+            {
+                let mut writer = block.write_for_tests();
+                let filler = "f".repeat(1000);
+                while writer.node_name_store(&filler, 0, 0).is_ok() {}
+            }
+
+            let result = apply_plan(
+                &args,
+                &state,
+                internal.repository_context.clone(),
+                planned,
+                &permit,
+            )
+            .await;
+            emit_batch_complete(args.batch_id, batch_error_code(&result));
+            result
+        },
+    )
+    .await;
+
+    assert_ne!(status, 0, "both entries fail");
+    let events = sink.lock().unwrap().clone();
+    assert_eq!(
+        move_outcomes(&events),
+        vec![
+            (10, INVALID_NODE, LoreErrorCode::Internal),
+            (11, INVALID_NODE, LoreErrorCode::Internal),
+        ],
+        "the rename finds no room, and the move under `b` is refused"
+    );
+    assert_eq!(
+        children_of(handle, ROOT_NODE)
+            .await
+            .iter()
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>(),
+        vec![a],
+        "`a` stays under the root"
+    );
+    assert_eq!(
+        children_of(handle, a)
+            .await
+            .iter()
+            .map(|(node, _)| *node)
+            .collect::<Vec<_>>(),
+        vec![b],
+        "and `b` under `a`"
     );
     release(handle, store_handle_id);
 }
@@ -1678,6 +1778,7 @@ async fn the_parent_a_node_left_is_rehashed_by_the_commit() {
         !before.hash.is_zero(),
         "the fixture must start from a directory the commit has hashed"
     );
+    let destination_before = fetch_node_info(handle, destination).await.address;
 
     let (status, _events) =
         run_move(handle, vec![entry(10, node_id, destination, "data.bin")]).await;
@@ -1690,13 +1791,10 @@ async fn the_parent_a_node_left_is_rehashed_by_the_commit() {
         "the parent that lost the child must be rehashed, or the revision carries a \
              directory hash that no longer describes its children"
     );
-    assert!(
-        !fetch_node_info(handle, destination)
-            .await
-            .address
-            .hash
-            .is_zero(),
-        "and the parent that gained it must be hashed too"
+    assert_ne!(
+        fetch_node_info(handle, destination).await.address.hash,
+        destination_before.hash,
+        "and the parent that gained it must be rehashed too"
     );
     release(handle, store_handle_id);
 }
@@ -1789,5 +1887,60 @@ async fn move_takes_a_directory_and_one_of_its_children_in_one_batch() {
         vec![(leaving, LoreNodeStagedAction::Move as u32)],
         "while the child with an entry went where its entry said"
     );
+    release(handle, store_handle_id);
+}
+
+/// A batch takes the moves permit before it checks its entries, so it checks them against
+/// the tree as the permit's previous holder, and any call running meanwhile, left it: here a
+/// delete, which takes the permit too and waits for it first, lands while the batch waits, and
+/// the batch refuses the deleted node as a bad argument. Checked before the permit, the entry
+/// would pass and its move then fail as internal.
+#[tokio::test]
+async fn a_batch_checks_its_entries_after_it_takes_the_moves_permit() {
+    use futures::FutureExt as _;
+
+    let partition = Partition::from([0x87u8; 16]);
+    let (handle, store_handle_id) = load_handle("move-permit-placement", partition).await;
+
+    let destination = seed(handle, ROOT_NODE, "dst", LoreNodeType::Directory).await;
+    let node_id = seed(handle, ROOT_NODE, "data.bin", LoreNodeType::File).await;
+    settle(handle, &[destination, node_id]).await;
+
+    let state = rt_handle::lookup(handle)
+        .expect("the handle must resolve")
+        .state_for_tests();
+    let permit = state.moves_permit().await.expect("the moves permit");
+    // The delete in a task of its own, queued on the permit before the batch.
+    #[allow(clippy::disallowed_methods)]
+    let delete = tokio::spawn(run_delete(handle, node_id));
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !delete.is_finished(),
+        "the delete must wait for the moves permit"
+    );
+    let mut batch = std::pin::pin!(run_move(
+        handle,
+        vec![entry(10, node_id, destination, "data.bin")]
+    ));
+    for _ in 0..64 {
+        assert!(
+            batch.as_mut().now_or_never().is_none(),
+            "the batch must wait for the moves permit"
+        );
+        tokio::task::yield_now().await;
+    }
+    drop(permit);
+    delete.await.expect("the delete's task");
+
+    let (status, events) = batch.await;
+    assert_ne!(status, 0, "the deleted node must not move");
+    assert_eq!(
+        move_outcomes(&events),
+        vec![(10, INVALID_NODE, LoreErrorCode::InvalidArguments)],
+        "the entry must be refused as checked, not fail as applied"
+    );
+    assert_eq!(fetch_node_info(handle, node_id).await.parent_id, ROOT_NODE);
     release(handle, store_handle_id);
 }

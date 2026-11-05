@@ -287,6 +287,9 @@ async fn commit_revision(
     .await
     {
         Ok(revision) => {
+            // The freeze cleared the staged marks its rehash reached, those an unfinished change
+            // left among them.
+            state.clear_unfinished_change();
             *internal.pending_metadata.write() = Metadata::default();
             emit_commit_complete(id, revision, Hash::default(), LoreErrorCode::None);
             emit_commit_telemetry(
@@ -334,7 +337,8 @@ async fn commit_revision(
 /// deserialized into a new `State` and takes its place. `serialize` left the snapshot's
 /// signature on itself and cleared its dirty flag, so both are restored — a handle with
 /// unserialized edits sitting on the revision it was loaded at is exactly the state the
-/// caller had.
+/// caller had — and so is an unfinished change the replaced State noted, which no serialization
+/// carries.
 ///
 /// A failure here is the one case that still poisons: the handle is holding a tree
 /// neither committed nor restored, and no further call can be trusted against it. It
@@ -363,6 +367,9 @@ async fn restore_tree(
     };
     restored.set_revision(current_revision);
     restored.mark_dirty();
+    if access.state().has_unfinished_change() {
+        restored.note_unfinished_change();
+    }
     access.replace(restored);
     Ok(())
 }

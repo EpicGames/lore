@@ -48,6 +48,7 @@ use crate::lore_trace;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeExtFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
@@ -64,7 +65,14 @@ use crate::repository::is_reserved_node_name;
 use crate::revision::sync;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
+use crate::state::AddedSince;
+use crate::state::ChainMark;
+use crate::state::Ext;
+use crate::state::LinkPin;
+use crate::state::Mark;
+use crate::state::NameChange;
 use crate::state::NodeMapping;
+use crate::state::OwnFlags;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
@@ -417,16 +425,12 @@ pub(crate) async fn drops_cleanly(
         return Ok(true);
     }
 
-    let mut directories = vec![(id, *node)];
-    while let Some((directory, directory_node)) = directories.pop() {
-        let mut children = StateNodeChildrenIterator::from_parent(
-            state.clone(),
-            repository.clone(),
-            directory,
-            &directory_node,
-        )
-        .await
-        .forward::<StageError>("Failed to list the staged directory")?;
+    let mut directories = vec![id];
+    while let Some(directory) = directories.pop() {
+        let mut children =
+            StateNodeChildrenIterator::new(state.clone(), repository.clone(), directory)
+                .await
+                .forward::<StageError>("Failed to list the staged directory")?;
         while let Some((child, child_node)) = children
             .next()
             .await
@@ -436,7 +440,7 @@ pub(crate) async fn drops_cleanly(
                 return Ok(false);
             }
             if child_node.is_directory() {
-                directories.push((child, child_node));
+                directories.push(child);
             }
         }
     }
@@ -1021,6 +1025,7 @@ impl StageDescent {
                 link: node_link,
                 states,
                 added,
+                prepended: _,
             } = stage_node_from_metadata(
                 operation,
                 NodeMapping {
@@ -1191,35 +1196,55 @@ pub(crate) async fn stage_single_node(
                 .await
                 .forward::<StageError>("Failed deserializing state node block")?;
 
-            let existing_node = block.node(node_index);
+            // What the update needs of the existing node, read where no await holds it.
+            let (same_type, place, resized, link) = {
+                let existing_node = block.node(node_index);
+                lore_debug!(
+                    "Found previous node {} flags 0x{:x}",
+                    found_node,
+                    existing_node.flags
+                );
+                (
+                    node_flags.node_type() == existing_node.node_type(),
+                    (base_node.node, existing_node.name_hash),
+                    (existing_node.size, existing_node.mode) != (node.size, node.mode),
+                    existing_node.is_link(),
+                )
+            };
 
-            lore_debug!(
-                "Found previous node {} flags 0x{:x}",
-                found_node,
-                existing_node.flags
-            );
-
-            if node_flags.node_type() == existing_node.node_type() {
-                let block_dirtied = {
-                    let mut block_writer = block.write();
-                    let existing_node = block_writer.node(node_index);
-                    existing_node.address = node.address;
-                    existing_node.mode = node.mode;
-                    existing_node.size = node.size;
-                    existing_node.take_mount_source(&node);
-                    block_writer.mark_dirty()
-                };
-                if block_dirtied {
-                    state.block_modified(block.clone(), block_index);
-                    state.mark_dirty();
+            if same_type {
+                // Update the existing node: a link takes the whole pin, its node in the linked
+                // State included (H17); any other node its content.
+                if link {
+                    state
+                        .node_set_link_target_in(
+                            &block,
+                            found_node,
+                            LinkPin::Whole {
+                                address: node.address,
+                                child: node.child,
+                            },
+                        )
+                        .forward::<StageError>("Failed to repin the link")?;
+                    if resized {
+                        state.node_change_in_place(&block, found_node, place, |held| {
+                            held.set_size(node.size);
+                            held.set_mode(node.mode);
+                            true
+                        });
+                    }
+                } else {
+                    state.node_change_in_place(&block, found_node, place, |held| {
+                        held.overwrite_content(node.address, node.size, node.mode);
+                        true
+                    });
                 }
 
                 state
                     .node_mark(
-                        repository.clone(),
+                        &repository,
                         found_node,
-                        node_flags.bitand(NodeFlags::StagedBits),
-                        true,
+                        Mark::staged(node_flags.bitand(NodeFlags::StagedBits), true),
                     )
                     .await
                     .forward::<StageError>("Failed to mark node as staged")?;
@@ -1283,12 +1308,7 @@ pub(crate) async fn stage_single_node(
         node_flags | NodeFlags::StagedAdd
     };
     state
-        .node_mark(
-            repository.clone(),
-            node_id,
-            mark_flags,
-            true, /* mark dirty */
-        )
+        .node_mark(&repository, node_id, Mark::staged(mark_flags, true))
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
 
@@ -1379,10 +1399,9 @@ pub(crate) async fn stage_merge_path(
 
         state_stage
             .node_mark(
-                repository.clone(),
+                &repository,
                 change.to.mapping.node,
-                merge_flags,
-                true,
+                Mark::staged(merge_flags, true),
             )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
@@ -1405,10 +1424,9 @@ pub(crate) async fn stage_merge_path(
 
         state_stage
             .node_mark(
-                repository.clone(),
+                &repository,
                 change.to.mapping.node,
-                merge_flags,
-                true,
+                Mark::staged(merge_flags, true),
             )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
@@ -1422,28 +1440,23 @@ pub(crate) async fn stage_merge_path(
     Ok(())
 }
 
-/// After staging a filesystem-detected change, also mark the node dirty so that
-/// `flagDirty` reflects the working-tree difference: any uncommitted change is
-/// dirty, whether it was recorded by `dirty`, `status --scan` or `stage`/
-/// `stage --scan`. `node_mark` only sets staged bits (it preserves an existing
-/// Dirty but never sets one), so the dirty bit must be applied here.
+/// The mark a stage records on a node it found changed: the staged action `staged` with the
+/// stage's own `node_flags`, and the dirty action `dirty` beside it, so that `flagDirty`
+/// reflects the working-tree difference: any uncommitted change is dirty, whether it was
+/// recorded by `dirty`, `status --scan` or `stage`/`stage --scan`.
 ///
-/// Skipped for merge staging — a merge resolution is not a fresh filesystem
-/// detection and keeps its own staged/merge flags.
-async fn mark_staged_node_dirty(
-    repository: Arc<RepositoryContext>,
-    state: &Arc<State>,
-    node_id: NodeID,
-    dirty_flags: NodeFlags,
-    node_flags: NodeFlags,
-) -> Result<(), StageError> {
-    if node_flags.contains(NodeFlags::StagedMerge) {
-        return Ok(());
+/// No dirty action for merge staging: a merge resolution is not a fresh filesystem detection
+/// and keeps its own staged and merge flags.
+#[lore_macro::test_pub]
+pub(crate) fn staged_change(staged: NodeFlags, dirty: NodeFlags, node_flags: NodeFlags) -> Mark {
+    Mark {
+        staged: Some((staged | node_flags, true)),
+        dirty: (!node_flags.contains(NodeFlags::StagedMerge)).then_some((
+            dirty,
+            Ext::Set(NodeExtFlags::NoFlags),
+            true,
+        )),
     }
-    state
-        .node_mark_dirty(repository, node_id, dirty_flags, true)
-        .await
-        .forward::<StageError>("Failed to mark staged node as dirty")
 }
 
 /// Mark `node_id` staged for deletion, reporting the node when this call is the one that
@@ -1491,26 +1504,11 @@ async fn stage_delete_node(
         stats.file_checked_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    let flags = NodeFlags::StagedDelete | node_flags;
-
+    let mark = staged_change(NodeFlags::StagedDelete, NodeFlags::DirtyDelete, node_flags);
     state
-        .node_mark(
-            repository.clone(),
-            node_id,
-            flags,
-            true, /* Mark dirty */
-        )
+        .node_mark(repository, node_id, mark)
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
-
-    mark_staged_node_dirty(
-        repository.clone(),
-        state,
-        node_id,
-        NodeFlags::DirtyDelete,
-        node_flags,
-    )
-    .await?;
 
     if let Some(tracker) = link_tracker {
         tracker.on_node_changed(repository);
@@ -2010,17 +2008,16 @@ struct DirectoryChildren {
     /// by the first two, so a tie on the hash is claimed in sibling order. The
     /// id is held here as well, where a claim has taken it out of `node`.
     by_name_hash: Vec<(u64, u32, NodeID)>,
-    /// The child the chain was headed by when the listing was taken, which
-    /// everything linked into it since sits ahead of.
-    listing_head: Option<NodeID>,
+    /// The chain as the listing began it, which everything linked into it since
+    /// sits ahead of while no reattach moves it; `None` for a link's or a file's.
+    since: Option<ChainMark>,
 }
 
 impl DirectoryChildren {
     /// The children of a directory node in sibling order, with the name hash
-    /// each of them carries.
+    /// each of them carries, and the mark of the chain the listing began from.
     #[lore_macro::test_pub]
-    fn new(child: Vec<(NodeID, u64)>) -> Self {
-        let listing_head = child.first().map(|&(node, _)| node);
+    fn new(child: Vec<(NodeID, u64)>, since: Option<ChainMark>) -> Self {
         let mut by_name_hash: Vec<(u64, u32, NodeID)> = child
             .iter()
             .enumerate()
@@ -2031,7 +2028,7 @@ impl DirectoryChildren {
         Self {
             node,
             by_name_hash,
-            listing_head,
+            since,
         }
     }
 
@@ -2058,6 +2055,25 @@ impl DirectoryChildren {
         Some(node)
     }
 
+    /// Marks `node` claimed where the listing holds it: a child a search of the chain
+    /// answered, which the listing may hold under the name it had before a rename,
+    /// so the pass over what nothing claimed leaves it.
+    #[lore_macro::test_pub]
+    fn claim_node(&mut self, node: NodeID) {
+        if let Some(slot) = self.node.iter_mut().find(|slot| **slot == node) {
+            *slot = INVALID_NODE;
+        }
+    }
+
+    /// Counts a node the stage itself added to the directory, prepending it, in the mark, so
+    /// the stage's own adds never make its searches stale nor show as a reattach. Only an add
+    /// that landed counts: counting one that did not could hide a reattach.
+    fn count_own_add(&mut self) {
+        if let Some(since) = self.since.as_mut() {
+            since.count_own_prepend();
+        }
+    }
+
     /// The first child the listing holds carrying `name_hash`, claimed or not,
     /// which is the one a search of the chain reaches once past what was linked
     /// into it since.
@@ -2079,6 +2095,7 @@ impl DirectoryChildren {
 
 /// Whether the caller has established which child of a directory a name belongs
 /// to.
+#[lore_macro::test_pub]
 #[derive(Clone, Copy)]
 pub(crate) enum KnownChild {
     /// The child, or that the directory holds none. Taken as given.
@@ -2092,8 +2109,17 @@ pub(crate) enum KnownChild {
 ///
 /// A child is prepended, so whatever was linked into the chain since the listing
 /// was taken lies ahead of it. Only that much is walked; the listing answers from
-/// the index behind it, claimed children included. The answer is the one a search
-/// of the whole chain reaches.
+/// the index behind it, claimed children included. Where a reattach may have put a
+/// node in front of what was linked in since, the whole chain is searched. The
+/// answer is the one a search of the whole chain reaches; a child a search answered
+/// after a reattach is claimed in the listing too, which may hold it under the name
+/// it had. A link's or a file's listing, which carries no mark, answers from the
+/// listing alone.
+///
+/// The listing's own answers are taken as given: no writer but the stage's own tasks, each in its
+/// own directory, runs beside a stage (the node module's Limitations, "The stage's listing"), so no
+/// child the listing holds is renamed, moved or removed meanwhile.
+#[lore_macro::test_pub]
 async fn claim_child(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -2104,19 +2130,33 @@ async fn claim_child(
     if let Some(node) = children.claim(name_hash) {
         return Ok(Some(node));
     }
-    if let Some(node) = state
-        .find_subnode_added_since(
-            repository.clone(),
-            directory_node,
-            children.listing_head,
-            name_hash,
-        )
+    let Some(since) = children.since.as_ref() else {
+        return Ok(children.holds(name_hash));
+    };
+    let searched = match state
+        .find_subnode_added_since(repository.clone(), since, name_hash)
         .await
         .forward::<StageError>("Failed to search the directory node children")?
     {
-        return Ok(Some(node));
+        AddedSince::Found(node) => node,
+        AddedSince::Absent => return Ok(children.holds(name_hash)),
+        AddedSince::Stale => match state
+            .find_subnode(repository.clone(), directory_node, name_hash)
+            .await
+        {
+            Ok(node) => node,
+            Err(error) if error.is_node_not_found() => return Ok(children.holds(name_hash)),
+            Err(error) => {
+                return Err(error)
+                    .forward::<StageError>("Failed to search the directory node children");
+            }
+        },
+    };
+    // A listed child stands ahead of the mark's head only where a reattach moved it.
+    if since.reattached() {
+        children.claim_node(searched);
     }
-    Ok(children.holds(name_hash))
+    Ok(Some(searched))
 }
 
 static DIRECTORY_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -2213,12 +2253,11 @@ pub(crate) async fn stage_directory(
     discards: PendingDiscards,
     states: FilterStates,
 ) -> Result<bool, StageError> {
-    let mut children = DirectoryChildren::new(
-        state
-            .node_children_with_name_hash(repository.clone(), directory_node)
-            .await
-            .forward::<StageError>("Failed to list directory node children")?,
-    );
+    let (listing, since) = state
+        .node_children_with_name_hash_marked(repository.clone(), directory_node)
+        .await
+        .forward::<StageError>("Failed to list directory node children")?;
+    let mut children = DirectoryChildren::new(listing, since);
 
     let directory_path = relative_path.clone().freeze();
     let mut file_list = operation
@@ -2368,6 +2407,9 @@ pub(crate) async fn stage_directory(
                     break;
                 }
             };
+            if staged.prepended {
+                children.count_own_add();
+            }
             let node_link = staged.link;
             let child_states = staged.states;
             let added = staged.added;
@@ -2479,7 +2521,15 @@ pub(crate) async fn stage_directory(
                 states,
             )
             .await;
-            fold_child(result.map(|staged| staged.link.is_valid()), &mut outcome);
+            match result {
+                Ok(staged) => {
+                    if staged.prepended {
+                        children.count_own_add();
+                    }
+                    fold_child(Ok(staged.link.is_valid()), &mut outcome);
+                }
+                Err(error) => fold_child(Err(error), &mut outcome),
+            }
         }
 
         while let Some(result) = directory_tasks.try_join_next() {
@@ -2536,6 +2586,9 @@ pub(crate) async fn stage_directory(
         .await;
         fold_child(result.map(|_| true), &mut outcome);
     }
+    // Nothing reads the listing past here: its vectors and the mark's block go before the
+    // subtree's tasks are awaited.
+    drop(children);
 
     while let Some(result) = directory_tasks.join_next().await {
         fold_child(
@@ -2760,9 +2813,12 @@ fn stage_directory_recurse(
 ///
 /// The verdict is handed back rather than recomputed below, because staging the
 /// child had to reach it to decide whether the child was excluded at all.
+#[lore_macro::test_pub]
 pub(crate) struct StagedChild {
     pub link: NodeLink,
     pub states: FilterStates,
+    /// Whether the stage added the child's node to the directory, prepending it there.
+    pub prepended: bool,
     /// A directory no commit holds whose add this call staged, which the caller records once it
     /// keeps it.
     pub added: bool,
@@ -2774,21 +2830,10 @@ impl StagedChild {
         Self {
             link: NodeLink::invalid(),
             states: FilterStates::ROOT,
+            prepended: false,
             added: false,
         }
     }
-}
-
-/// Record on `node` what a staged file carries: it is a file, it holds no children, and it is
-/// the size the walk measured.
-///
-/// The mode is not recorded. A commit reads the file's mode and compares it with the node's to
-/// see whether the revision has to carry a change to it, so a mode recorded here would be
-/// compared against itself and a change to the executable bit alone would be lost.
-fn record_staged_file(node: &mut Node, info: &FileInfo) {
-    node.flags |= NodeFlags::File;
-    node.child = 0;
-    node.size = info.size();
 }
 
 /// Whether `directory` holds both the spelling the tree carries and the one the file system
@@ -2817,6 +2862,7 @@ async fn holds_both_spellings(
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
 /// rather than folding its whole path.
 #[allow(clippy::too_many_arguments, unused_assignments)]
+#[lore_macro::test_pub]
 pub(crate) async fn stage_node_from_metadata(
     operation: &Arc<InstanceOperationImpl>,
     base: NodeMapping,
@@ -2842,6 +2888,7 @@ pub(crate) async fn stage_node_from_metadata(
                 revision: state.revision(),
             },
             states: parent_states,
+            prepended: false,
             added: false,
         });
     }
@@ -3050,24 +3097,15 @@ pub(crate) async fn stage_node_from_metadata(
             .await
             .forward::<StageError>("Failed to add a node to revision tree")?;
 
-        state
-            .node_mark(
-                repository.clone(),
-                node_id,
-                NodeFlags::StagedAdd | options.node_flags,
-                true, /* mark dirty */
-            )
-            .await
-            .forward::<StageError>("Failed to mark node as staged")?;
-
-        mark_staged_node_dirty(
-            repository.clone(),
-            &state,
-            node_id,
+        let mark = staged_change(
+            NodeFlags::StagedAdd,
             NodeFlags::DirtyAdd,
             options.node_flags,
-        )
-        .await?;
+        );
+        state
+            .node_mark(&repository, node_id, mark)
+            .await
+            .forward::<StageError>("Failed to mark node as staged")?;
 
         if let Some(ref tracker) = link_tracker {
             tracker.on_node_changed(&repository);
@@ -3097,6 +3135,7 @@ pub(crate) async fn stage_node_from_metadata(
                 revision: state.revision(),
             },
             states,
+            prepended: true,
             added: info.is_dir(),
         });
     }
@@ -3110,41 +3149,28 @@ pub(crate) async fn stage_node_from_metadata(
         .await
         .forward::<StageError>("Failed deserializing state node block")?;
 
-    let mut node = block.node(node_index);
+    let node = block.node(node_index);
     let mut event_action = None;
     let mut from_path = None;
+    #[cfg(feature = "state-hooks")]
+    crate::state::node::hooks::reached(crate::state::node::hooks::Point::StageWindow).await;
 
-    // Undelete if deleted
+    // Undelete if deleted: the forced mark replaces the staged deletion. The merge flags stand
+    // until an unstage drops them, as the mark keeps them; under merge options it sets the
+    // options' merge state instead, as the stage's own mark below does again. The decisions
+    // below read the node as found.
     if node.is_staged_delete() {
         lore_trace!("Undelete node {} before staging", node_link.node);
 
-        let dirtied = {
-            let mut block_writer = block.write();
-            block_writer.node(node_index).clear_staged_flags();
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            state.block_modified(block.clone(), block_index);
-            state.mark_dirty();
-        }
-        state
-            .node_mark(
-                repository.clone(),
-                node_link.node,
-                NodeFlags::StagedModify | options.node_flags,
-                true, /* Mark dirty */
-            )
-            .await
-            .forward::<StageError>("Failed to mark node as staged")?;
-
-        mark_staged_node_dirty(
-            repository.clone(),
-            &state,
-            node_link.node,
+        let mark = staged_change(
+            NodeFlags::StagedModify,
             NodeFlags::DirtyModify,
             options.node_flags,
-        )
-        .await?;
+        );
+        state
+            .node_mark(&repository, node_link.node, mark)
+            .await
+            .forward::<StageError>("Failed to mark node as staged")?;
 
         if let Some(ref tracker) = link_tracker {
             tracker.on_node_changed(&repository);
@@ -3209,30 +3235,23 @@ pub(crate) async fn stage_node_from_metadata(
                     })?;
                 }
 
-                // Set updated node name
-                node.name_hash = name_hash;
-
                 from_path = Some(relative_path.join(&node_name).to_string());
                 event_action = Some(LoreFileAction::Move);
 
-                let dirtied = {
-                    let mut block_writer = block.write();
-                    (node.name_offset, node.name_length) = block_writer
-                        .node_name_store(name.as_str(), node.name_offset, node.name_length)
-                        .forward::<StageError>("storing node name on stage move")?;
-                    *block_writer.node(node_index) = node;
-                    block_writer.mark_dirty()
-                };
-                if dirtied {
-                    state.block_modified(block.clone(), block_index);
-                    state.mark_dirty();
-                }
+                // The case alone changes, so the node keeps its name hash and its place.
                 state
-                    .node_mark(
+                    .node_rename(
                         repository.clone(),
                         node_link.node,
-                        NodeFlags::StagedMove | options.node_flags,
-                        true, /* Mark dirty */
+                        NameChange::Rename(name.as_str()),
+                    )
+                    .await
+                    .forward::<StageError>("storing node name on stage move")?;
+                state
+                    .node_mark(
+                        &repository,
+                        node_link.node,
+                        Mark::staged(NodeFlags::StagedMove | options.node_flags, true),
                     )
                     .await
                     .forward::<StageError>("Failed to mark node as staged")?;
@@ -3261,39 +3280,41 @@ pub(crate) async fn stage_node_from_metadata(
         // unstaged; re-staging must promote it back to a staged add even when
         // the filesystem content compares equal to the node's stored hash.
         let was_dirty_add = node.is_dirty_add();
+        // Whether the node's own fields are written in place: a node of another kind than the
+        // filesystem entry was staged for deletion above, and a new one added.
+        let mut write_content = false;
 
         if !info.is_dir() {
-            let stage_file_node = if !node.is_file() {
-                lore_debug!("Stage node type change to file for node {}", node_link.node);
-                true
-            } else {
-                let node_path = relative_path.join(name.as_str());
-
-                info.mode_differs_from(node.mode)
-                    || file_modified_against_node(
-                        repository.clone(),
-                        &node,
-                        info.mtime(),
-                        info.size(),
-                        &node_path,
-                        !node.is_staged(),
-                        operation,
-                        &lore_storage::ContentHashes::default(),
-                    )
-                    .await
-                    .forward::<StageError>("Failed to determine if file is modified")?
-                    .is_modified()
-            };
+            debug_assert!(node.is_file(), "a file entry over a node of another kind");
+            let node_path = relative_path.join(name.as_str());
+            let stage_file_node = info.mode_differs_from(node.mode)
+                || file_modified_against_node(
+                    repository.clone(),
+                    &node,
+                    info.mtime(),
+                    info.size(),
+                    &node_path,
+                    !node.is_staged(),
+                    operation,
+                    &lore_storage::ContentHashes::default(),
+                )
+                .await
+                .forward::<StageError>("Failed to determine if file is modified")?
+                .is_modified();
 
             if stage_file_node {
-                record_staged_file(&mut node, &info);
+                // The size the walk measured. Not the mode: a commit compares the file's mode with
+                // the node's to see whether the revision carries a change to it, so a mode
+                // recorded here would be compared with itself and a change to the executable bit
+                // alone would be lost.
+                write_content = true;
                 maybe_content_modified = true;
             } else if was_dirty_add {
                 maybe_content_modified = true;
             }
-        } else if node.is_file() || node.mode != 0 {
-            node.flags &= !NodeFlags::File;
-            node.mode = 0;
+        } else if node.mode != 0 {
+            debug_assert!(!node.is_file(), "a directory entry over a file node");
+            write_content = true;
             maybe_content_modified = true;
         } else if node.is_dirty_add() {
             // A new directory has no content change to detect but must still be
@@ -3306,16 +3327,21 @@ pub(crate) async fn stage_node_from_metadata(
             || options.node_flags.contains(NodeFlags::StagedMerge)
             || node.is_staged_merge_unresolved()
         {
-            let dirtied = {
-                let mut block_writer = block.write();
-                let write_node = block_writer.node(node_index);
-                *write_node = node;
-                block_writer.mark_dirty()
-            };
-
-            if dirtied {
-                state.block_modified(block, block_index);
-                state.mark_dirty();
+            if write_content {
+                let changed = state.node_change_in_place(
+                    &block,
+                    node_link.node,
+                    (node.parent, node.name_hash),
+                    |held| {
+                        if info.is_dir() {
+                            held.set_mode(0);
+                        } else {
+                            held.set_size(info.size());
+                        }
+                        true
+                    },
+                );
+                debug_assert!(changed, "the staged node left its place");
             }
 
             let (staged_flag, dirty_flag) = if was_dirty_add {
@@ -3324,24 +3350,11 @@ pub(crate) async fn stage_node_from_metadata(
                 (NodeFlags::StagedModify, NodeFlags::DirtyModify)
             };
 
+            let mark = staged_change(staged_flag, dirty_flag, options.node_flags);
             state
-                .node_mark(
-                    repository.clone(),
-                    node_link.node,
-                    staged_flag | options.node_flags,
-                    true, /* Mark dirty */
-                )
+                .node_mark(&repository, node_link.node, mark)
                 .await
                 .forward::<StageError>("Failed to mark node as staged")?;
-
-            mark_staged_node_dirty(
-                repository.clone(),
-                &state,
-                node_link.node,
-                dirty_flag,
-                options.node_flags,
-            )
-            .await?;
 
             lore_trace!(
                 "Staged existing node {} as modified for {}",
@@ -3388,6 +3401,7 @@ pub(crate) async fn stage_node_from_metadata(
     Ok(StagedChild {
         link: node_link,
         states,
+        prepended: false,
         added,
     })
 }
@@ -4537,21 +4551,14 @@ pub(crate) async fn stage_from_parent_state(
             continue;
         }
 
-        let block_index = NodeBlock::index(change.to.mapping.node);
-        let node_index = Node::index(change.to.mapping.node);
         let block = state_current
-            .block(change.to.mapping.repository.clone(), block_index)
+            .block(
+                change.to.mapping.repository.clone(),
+                NodeBlock::index(change.to.mapping.node),
+            )
             .await
             .forward::<StageError>("Failed deserializing state node block")?;
-        let dirtied = {
-            let mut block_writer = block.write();
-            block_writer.node(node_index).clear_staged_flags();
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            state_current.block_modified(block, block_index);
-            state_current.mark_dirty();
-        }
+        state_current.node_clear_own(&block, change.to.mapping.node, OwnFlags::Staged);
     }
 
     // Perform the changes

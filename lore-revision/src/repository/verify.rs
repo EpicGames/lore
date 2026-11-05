@@ -181,17 +181,12 @@ async fn verify_staged_directory(
     state: Arc<State>,
     node_id: NodeID,
 ) -> Result<(), RepositoryError> {
-    let parent = state
-        .node(repository.clone(), node_id)
+    let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
         .await
         .forward::<RepositoryError>("Failed to deserialize repository state")?;
 
     let mut names: Vec<ChildName> = Vec::new();
     let mut any_staged = false;
-    let mut children =
-        StateNodeChildrenIterator::from_parent(state.clone(), repository.clone(), node_id, &parent)
-            .await
-            .forward::<RepositoryError>("Invalid node hierarchy in revision state")?;
 
     while let Some((child_node_id, child_node)) = children
         .next()

@@ -37,7 +37,6 @@ use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
-use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
@@ -45,7 +44,10 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::is_reserved_node_name;
 use crate::state;
+use crate::state::Clear;
+use crate::state::LinkPin;
 use crate::state::NodeMapping;
+use crate::state::OwnFlags;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util;
@@ -907,38 +909,42 @@ async fn unstage_parent_chain(
             .block(repository.clone(), parent_block_index)
             .await
             .forward::<UnstageError>("Failed deserializing state node block")?;
-        let parent = parent_block.node(parent_node_index);
+        // Read in a scope, so the record is not held across the listing below.
+        let (staged_add, dirty, grandparent) = {
+            let parent = parent_block.node(parent_node_index);
+            (parent.is_staged_add(), parent.is_dirty(), parent.parent)
+        };
 
         // A parent that is itself a staged ADD is a legitimate independent
         // staged node (not merely staged to carry a descendant), so leave
         // it staged — unstaging a child must not unstage the parent.
-        if stop_at_staged_add && parent.is_staged_add() {
+        if stop_at_staged_add && staged_add {
             break;
         }
 
-        let dirtied = {
-            let mut block_writer = parent_block.write();
-            let parent_node = block_writer.node(parent_node_index);
-            if stop_at_staged_add {
-                parent_node.clear_staged_flags();
-            } else {
-                parent_node.clear_all_change_flags();
-            }
-            block_writer.mark_dirty()
+        // An added link's unstage takes the directory's dirty flags too, but where a dirty child
+        // keeps them (C9): a file dirtied beside the link stays dirty, and so does every
+        // directory above it. A directory not dirty holds no dirty child, so it is not listed.
+        let flags = if stop_at_staged_add
+            || (dirty
+                && state_staged
+                    .node_has_dirty_children(repository.clone(), parent_node_id)
+                    .await
+                    .forward::<UnstageError>("Failed to check node children")?)
+        {
+            OwnFlags::Staged
+        } else {
+            OwnFlags::Change
         };
+        state_staged.node_clear_own(&parent_block, parent_node_id, flags);
 
         link_tracker.on_node_changed(&repository);
-
-        if dirtied {
-            state_staged.block_modified(parent_block.clone(), parent_block_index);
-            state_staged.mark_dirty();
-        }
 
         if parent_node_id == ROOT_NODE {
             break;
         }
 
-        parent_node_id = parent.parent;
+        parent_node_id = grandparent;
     }
 
     Ok(())
@@ -1068,13 +1074,9 @@ async fn unstage_node(
             })
             .send();
 
-            {
-                let mut block_writer = block.write();
-                block_writer.node(node_index).clear_staged_flags();
-                if block_writer.mark_dirty() {
-                    state_staged.block_modified(block.clone(), block_index);
-                }
-            }
+            // Every change flag: the link, discarded once the unstage ends, keeps no directory
+            // above it staged or dirty.
+            state_staged.node_clear_own(&block, node_id, OwnFlags::Change);
 
             queue_discard(&discard, repository.id, node_id);
 
@@ -1094,14 +1096,7 @@ async fn unstage_node(
 
         // Clearing the staged flags on a dirty node preserves Dirty +
         // action bits, leaving a plain dirty add.
-        {
-            let mut block_writer = block.write();
-            block_writer.node(node_index).clear_staged_flags();
-            if block_writer.mark_dirty() {
-                state_staged.block_modified(block.clone(), block_index);
-                state_staged.mark_dirty();
-            }
-        }
+        state_staged.node_clear_own(&block, node_id, OwnFlags::Staged);
         node.clear_staged_flags();
         link_tracker.on_node_changed(&repository);
 
@@ -1149,12 +1144,12 @@ async fn unstage_node(
                 .await
                 .forward::<UnstageError>("Failed to check link staged pin change")?;
 
-        let was_modified = if node.is_staged_modify() && node.is_file() {
-            node.flags |= NodeFlags::File;
-            node.child = current_node.child;
+        // A staged modification of a file takes the current revision's mode and size back,
+        // and a staged repin of a link the current revision's pin, the node it exposes
+        // included; the rest of the node stays as it is.
+        if node.is_staged_modify() && node.is_file() {
             node.mode = current_node.mode;
             node.size = current_node.size;
-            true
         } else if is_staged_update_link {
             link::reset::reset_staged_update_link(
                 &operation,
@@ -1172,37 +1167,39 @@ async fn unstage_node(
             .await
             .forward::<UnstageError>("Failed to reset staged-update link")?;
 
-            node.flags |= NodeFlags::Link;
             node.address.hash = current_node.address.hash;
             node.child = current_node.child;
+            state_staged
+                .node_set_link_target_in(
+                    &block,
+                    node_id,
+                    LinkPin::Whole {
+                        address: node.address,
+                        child: node.child,
+                    },
+                )
+                .forward::<UnstageError>("Failed to restore the link's pin")?;
             stats
                 .directory_unstaged_count
                 .fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        };
+        }
 
-        node.clear_staged_flags();
+        {
+            // Read here, in a scope no await crosses; nothing above changes the flags.
+            let restore_file = node.is_staged_modify() && node.is_file();
+            node.clear_staged_flags();
 
-        link_tracker.on_node_changed(&repository);
+            link_tracker.on_node_changed(&repository);
 
-        let dirtied = {
-            let mut block_writer = block.write();
-            {
-                let write_node = block_writer.node(node_index);
-                if was_modified {
-                    *write_node = node;
-                } else {
-                    write_node.flags = node.flags;
+            let place = (node.parent, node.name_hash);
+            state_staged.node_change_in_place(&block, node_id, place, |held| {
+                if restore_file {
+                    held.set_mode(current_node.mode);
+                    held.set_size(current_node.size);
                 }
-            }
-            block_writer.mark_dirty()
-        };
-
-        if dirtied {
-            state_staged.block_modified(block.clone(), block_index);
-            state_staged.mark_dirty();
+                held.clear_staged_flags();
+                true
+            });
         }
 
         // After clearing Staged, re-check filesystem: clear Dirty if file matches current
@@ -1229,15 +1226,10 @@ async fn unstage_node(
             if !file_modified {
                 // File matches current revision — clear Dirty
                 node.clear_dirty_flags();
-                let dirtied = {
-                    let mut block_writer = block.write();
-                    block_writer.node(node_index).flags = node.flags;
-                    block_writer.mark_dirty()
-                };
-                if dirtied {
-                    state_staged.block_modified(block.clone(), block_index);
-                    state_staged.mark_dirty();
-                }
+                // The place read again from the node, so no await above holds it.
+                let place = (node.parent, node.name_hash);
+                state_staged
+                    .node_change_in_place(&block, node_id, place, |held| held.clear_dirty_flags());
             }
         }
         // If file doesn't exist on disk — could be a delete, preserve Dirty
@@ -1252,44 +1244,11 @@ async fn unstage_node(
     )
     .await?;
 
-    // Dirty parent cleanup: if the node is no longer dirty, walk up and clear
-    // Dirty on parents that have no remaining dirty children
     if !node.is_dirty() {
-        let mut dirty_parent_id = node.parent;
-        while dirty_parent_id.is_valid_node_id() {
-            if state_staged
-                .node_has_dirty_children(repository.clone(), dirty_parent_id)
-                .await
-                .forward::<UnstageError>("Failed to check node children")?
-            {
-                break;
-            }
-
-            let dp_block_index = NodeBlock::index(dirty_parent_id);
-            let dp_node_index = Node::index(dirty_parent_id);
-            let dp_block = state_staged
-                .block(repository.clone(), dp_block_index)
-                .await
-                .forward::<UnstageError>("Failed deserializing state node block")?;
-            let dp_node = dp_block.node(dp_node_index);
-
-            let dirtied = {
-                let mut block_writer = dp_block.write();
-                block_writer.node(dp_node_index).clear_dirty_flags();
-                block_writer.mark_dirty()
-            };
-
-            if dirtied {
-                state_staged.block_modified(dp_block.clone(), dp_block_index);
-                state_staged.mark_dirty();
-            }
-
-            if dirty_parent_id == ROOT_NODE {
-                break;
-            }
-
-            dirty_parent_id = dp_node.parent;
-        }
+        state_staged
+            .node_clear(&repository, node.parent, Clear::Vacated)
+            .await
+            .forward::<UnstageError>("Failed to clear the dirty parents")?;
     }
 
     if node.is_link() {
@@ -1349,15 +1308,7 @@ async fn unstage_node(
             }
 
             node.clear_dirty_flags();
-            let dirtied = {
-                let mut block_writer = block.write();
-                block_writer.node(node_index).clear_dirty_flags();
-                block_writer.mark_dirty()
-            };
-            if dirtied {
-                state_staged.block_modified(block.clone(), block_index);
-                state_staged.mark_dirty();
-            }
+            state_staged.node_clear_own(&block, node_id, OwnFlags::Dirty);
         }
 
         if options.single_node {
@@ -1518,15 +1469,7 @@ fn demote_subnodes_to_dirty<'a>(
             let child_path = relative_path.push_into_buf(child_name).freeze();
 
             // Clear staged flags (preserves Dirty + action bits when Dirty is set).
-            let dirtied = {
-                let mut block_writer = child_block.write();
-                block_writer.node(child_node_index).clear_staged_flags();
-                block_writer.mark_dirty()
-            };
-            if dirtied {
-                state.block_modified(child_block.clone(), child_block_index);
-                state.mark_dirty();
-            }
+            state.node_clear_own(&child_block, child_node_id, OwnFlags::Staged);
 
             if child_node.is_directory() {
                 stats
@@ -1622,15 +1565,11 @@ async fn discard_nodes_for_repository(
     );
 
     for node_id in node_ids.iter() {
-        lore_debug!("Discarding node {} patch", *node_id);
+        lore_debug!("Discarding node {}", *node_id);
 
-        state::node_discard_patch(state.clone(), repository.clone(), *node_id, {
-            move |discarded_node_id, _flags| {
-                lore_debug!("Discarded node {discarded_node_id} with patching");
-            }
-        })
-        .await
-        .forward::<UnstageError>("Failed to discard node")?;
+        state::node_discard_fused(state.clone(), repository.clone(), *node_id)
+            .await
+            .forward::<UnstageError>("Failed to discard node")?;
     }
 
     Ok(())

@@ -109,13 +109,10 @@ pub(crate) async fn remove(
     if is_staged_add {
         // Link was added but never committed — discard the node from the staged tree
         lore_debug!("Link node was staged for add, discarding instead of staging delete");
-        state::node_discard_patch(
+        state::node_discard_fused(
             inner_state.clone(),
             inner_repository.clone(),
             node_link.node,
-            |discarded_node_id, _flags| {
-                lore_debug!("Discarded link node {discarded_node_id}");
-            },
         )
         .await
         .forward::<LinkError>("Failed to discard link node")?;

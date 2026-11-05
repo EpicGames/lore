@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
 use lore_base::runtime::processor_count;
 use lore_base::types::Address;
@@ -31,18 +32,23 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::node::validate_node_name_for_store;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::Content;
 use lore_revision::state::State;
 use lore_revision::state::StateError;
 use lore_revision::state::StateNodeChildrenIterator;
+use lore_revision::subtask;
 use lore_storage::hash::hash_string;
 use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::revision_tree::call::EntryFailure;
 use crate::revision_tree::call::revision_tree_call;
+use crate::revision_tree::call::state_failure;
 use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
+use crate::revision_tree::handle::SharedClaim;
 
 /// One node to add. The parent is `parent_node_id`, or the node created by an
 /// earlier entry when `parent_node_id` is the invalid-node sentinel.
@@ -84,6 +90,7 @@ pub struct LoreRevisionTreeAddArgs {
 #[error_set]
 enum AddError {
     InvalidArguments,
+    SlowDown,
 }
 
 impl AddError {
@@ -100,6 +107,7 @@ impl EventError for AddError {
     fn translated(&self) -> LoreError {
         match self {
             AddError::InvalidArguments(_) => LoreError::InvalidArguments,
+            AddError::SlowDown(_) => LoreError::SlowDown,
             AddError::Internal(_) => LoreError::Internal,
         }
     }
@@ -137,6 +145,7 @@ fn batch_error_code(result: &Result<(), AddError>) -> LoreErrorCode {
     match result {
         Ok(()) => LoreErrorCode::None,
         Err(AddError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
+        Err(AddError::SlowDown(_)) => LoreErrorCode::SlowDown,
         Err(AddError::Internal(_)) => LoreErrorCode::Internal,
     }
 }
@@ -161,7 +170,7 @@ fn fields_for_kind(flags: NodeFlags, size: u64, address: Address) -> (u64, Addre
 ///
 /// Only for a node being created. A node being restored already has an identity,
 /// and generating one here would leave the restore unable to keep it — the zero
-/// context that means "preserve" would never reach [`State::node_undelete`].
+/// context that means "preserve" would never reach [`State::node_restore`].
 fn with_generated_file_id(flags: NodeFlags, address: Address) -> Address {
     if flags.is_directory() || flags.contains(NodeFlags::Link) || !address.context.is_zero() {
         return address;
@@ -231,15 +240,16 @@ fn reject(entry_id: u64, entry_index: usize, reason: &str) -> AddError {
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the
-/// underlying failure as context.
+/// underlying failure as context: `SLOW_DOWN` for a `SlowDown` of the State,
+/// `INTERNAL` otherwise.
 fn reject_internal(
     entry_id: u64,
     entry_index: usize,
     error: StateError,
     context: &str,
 ) -> AddError {
-    emit_add_error(entry_id, LoreErrorCode::Internal);
-    AddError::internal_with_context(error, &format!("entry {entry_index}: {context}"))
+    emit_add_error(entry_id, EntryFailure::of(&error).code());
+    state_failure(error, &format!("entry {entry_index}: {context}"))
 }
 
 /// A child staged for deletion, which a matching name may restore rather than
@@ -306,11 +316,9 @@ async fn child_names(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     parent: NodeID,
-    parent_node: &Node,
 ) -> Result<ChildNames, StateError> {
     let mut children =
-        StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
-            .await?;
+        StateNodeChildrenIterator::new(state.clone(), context.clone(), parent).await?;
     let mut live = Vec::new();
     let mut deleted = Vec::new();
     while let Some((node_id, node)) = children.next().await? {
@@ -347,13 +355,11 @@ async fn find_name_in_parent(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     parent: NodeID,
-    parent_node: &Node,
     name_hash: u64,
     kind: NodeFlags,
 ) -> Result<NameLookup, StateError> {
     let mut children =
-        StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
-            .await?;
+        StateNodeChildrenIterator::new(state.clone(), context.clone(), parent).await?;
     let mut restorable = None;
     while let Some((node_id, node)) = children.next().await? {
         if node.name_hash != name_hash {
@@ -387,21 +393,10 @@ enum ParentProgress {
     Snapshotted,
 }
 
-/// What a batch has learned about an existing parent, so the work it drives runs
-/// once for the parent rather than once per entry landing under it.
-struct ParentState {
-    /// The parent as it read when it was checked, so neither a name lookup nor
-    /// the snapshot walk has to fetch it again.
-    node: Node,
-    /// Its children, collected once a second entry named it.
-    names: Option<ChildNames>,
-}
-
 /// Check that an existing node can take children, attributing any failure to
 /// `entry_id`. Runs once per parent per batch, for the first entry that names it.
-///
-/// Returns the parent it read, which the caller keeps: every later lookup under
-/// this parent starts from the child chain it holds.
+/// Every later lookup under the parent reads it again, with the head of its child
+/// chain and the chain's change count (H10).
 ///
 /// A discarded slot and a slot the allocator never handed out both read back as
 /// ordinary directories, so each is refused on its own terms: a child hung off a
@@ -414,7 +409,7 @@ async fn check_existing_parent(
     parent: NodeID,
     entry_id: u64,
     entry_index: usize,
-) -> Result<Node, AddError> {
+) -> Result<(), AddError> {
     let Ok(parent_node) = state.node(context.clone(), parent).await else {
         return Err(reject(entry_id, entry_index, "parent node id is unknown"));
     };
@@ -453,7 +448,7 @@ async fn check_existing_parent(
             "parent node id does not resolve to a named node",
         ));
     }
-    Ok(parent_node)
+    Ok(())
 }
 
 /// Check every entry against the tree and against the rest of the batch,
@@ -472,7 +467,7 @@ async fn plan_entries(
     context: &Arc<RepositoryContext>,
     entries: &[LoreRevisionTreeAddEntry],
 ) -> Result<Vec<Planned>, AddError> {
-    let mut existing: HashMap<NodeID, ParentState> = HashMap::new();
+    let mut existing: HashMap<NodeID, Option<ChildNames>> = HashMap::new();
     let mut planned: Vec<Planned> = Vec::with_capacity(entries.len());
     let mut taken: HashSet<(ParentRef, u64)> = HashSet::with_capacity(entries.len());
     let mut ids: HashSet<u64> = HashSet::with_capacity(entries.len());
@@ -512,27 +507,18 @@ async fn plan_entries(
             let parent_node_id = entry.parent_node_id;
             let progress = match existing.get(&parent_node_id) {
                 None => ParentProgress::Unchecked,
-                Some(ParentState { names: None, .. }) => ParentProgress::Checked,
-                Some(ParentState { names: Some(_), .. }) => ParentProgress::Snapshotted,
+                Some(None) => ParentProgress::Checked,
+                Some(Some(_)) => ParentProgress::Snapshotted,
             };
             match progress {
                 ParentProgress::Unchecked => {
-                    let node =
-                        check_existing_parent(state, context, parent_node_id, entry_id, index)
-                            .await?;
-                    existing.insert(parent_node_id, ParentState { node, names: None });
+                    check_existing_parent(state, context, parent_node_id, entry_id, index).await?;
+                    existing.insert(parent_node_id, None);
                 }
                 ParentProgress::Checked => {
-                    let node = existing[&parent_node_id].node;
-                    match child_names(state, context, parent_node_id, &node).await {
+                    match child_names(state, context, parent_node_id).await {
                         Ok(names) => {
-                            existing.insert(
-                                parent_node_id,
-                                ParentState {
-                                    node,
-                                    names: Some(names),
-                                },
-                            );
+                            existing.insert(parent_node_id, Some(names));
                         }
                         Err(error) => {
                             return Err(reject_internal(
@@ -561,22 +547,12 @@ async fn plan_entries(
         if let ParentRef::Existing(parent_node_id) = parent {
             let snapshot_hit = existing
                 .get(&parent_node_id)
-                .and_then(|parent| parent.names.as_ref())
+                .and_then(Option::as_ref)
                 .map(|names| names.lookup(name_hash, flags));
             let held = if let Some(held) = snapshot_hit {
                 held
             } else {
-                let parent_node = existing[&parent_node_id].node;
-                match find_name_in_parent(
-                    state,
-                    context,
-                    parent_node_id,
-                    &parent_node,
-                    name_hash,
-                    flags,
-                )
-                .await
-                {
+                match find_name_in_parent(state, context, parent_node_id, name_hash, flags).await {
                     Ok(held) => held,
                     Err(error) => {
                         return Err(reject_internal(
@@ -650,17 +626,74 @@ fn entry_levels(planned: &[Planned]) -> Vec<Vec<usize>> {
     levels
 }
 
+/// How the entries of a batch failed, kept per entry only once one has, so a
+/// batch that fails nothing allocates nothing for it, and the strongest failure
+/// among them, which the call reports.
+#[lore_macro::test_pub]
+struct Failures {
+    total: usize,
+    entries: Vec<EntryFailure>,
+    strongest: EntryFailure,
+}
+
+impl Failures {
+    #[lore_macro::test_pub]
+    fn new(total: usize) -> Self {
+        Self {
+            total,
+            entries: Vec::new(),
+            strongest: EntryFailure::None,
+        }
+    }
+
+    /// Notes that entry `index` failed as `failure`.
+    #[lore_macro::test_pub]
+    fn note(&mut self, index: usize, failure: EntryFailure) {
+        if self.entries.is_empty() {
+            self.entries.resize(self.total, EntryFailure::None);
+        }
+        self.entries[index] = failure;
+        self.strongest.merge(failure);
+    }
+
+    /// Notes that an apply task died without reporting the entries it held.
+    #[lore_macro::test_pub]
+    fn lost(&mut self) {
+        self.strongest.merge(EntryFailure::Internal);
+    }
+
+    /// How entry `index`, which created no node, failed: `Internal` where it
+    /// reported nothing, as the entries of a task that died.
+    #[lore_macro::test_pub]
+    fn of(&self, index: usize) -> EntryFailure {
+        match self.entries.get(index) {
+            Some(&failure) if failure.failed() => failure,
+            _ => EntryFailure::Internal,
+        }
+    }
+}
+
 /// Pair each entry in `level` with its resolved parent.
 ///
 /// An entry whose parent entry failed resolves to the invalid node; it is
-/// reported here and left out of the wave rather than attempted against a parent
-/// that does not exist.
-fn take_wave(planned: &[Planned], created: &[NodeID], level: &[usize]) -> Vec<(usize, NodeID)> {
+/// reported here, failing as its parent did, and left out of the wave rather
+/// than attempted against a parent that does not exist.
+fn take_wave(
+    planned: &[Planned],
+    created: &[NodeID],
+    failures: &mut Failures,
+    level: &[usize],
+) -> Vec<(usize, NodeID)> {
     let mut wave = Vec::with_capacity(level.len());
     for &index in level {
         let parent = resolve_parent(planned[index].parent, created);
         if parent == INVALID_NODE {
-            emit_add_error(planned[index].entry_id, LoreErrorCode::Internal);
+            let failure = match planned[index].parent {
+                ParentRef::Entry(parent_index) => failures.of(parent_index),
+                ParentRef::Existing(_) => EntryFailure::Internal,
+            };
+            emit_add_error(planned[index].entry_id, failure.code());
+            failures.note(index, failure);
             continue;
         }
         wave.push((index, parent));
@@ -678,15 +711,16 @@ fn take_wave(planned: &[Planned], created: &[NodeID], level: &[usize]) -> Vec<(u
 /// spawning one for each, which would buy nothing — slot allocation is serialized
 /// per tree, so the concurrency a wave can use is bounded regardless.
 ///
-/// Records each new node in `created` and returns how many landed; every entry
-/// reports its own outcome either way.
+/// Records each new node in `created` and each failure in `failures`, and returns
+/// how many landed; every entry reports its own outcome either way. Each task holds
+/// a share of the call's claim ([`SharedClaim`]), so none outlives it.
 async fn apply_wave(
     args: &Arc<LoreRevisionTreeAddArgs>,
     planned: &Arc<Vec<Planned>>,
-    state: &Arc<State>,
+    claim: &SharedClaim,
     context: &Arc<RepositoryContext>,
     wave: Vec<(usize, NodeID)>,
-    created: &mut [NodeID],
+    (created, failures): (&mut [NodeID], &mut Failures),
 ) -> usize {
     let mut groups: HashMap<NodeID, Vec<usize>> = HashMap::new();
     for (index, parent) in wave {
@@ -699,7 +733,7 @@ async fn apply_wave(
         buckets[slot % task_count].push(group);
     }
 
-    let mut tasks: JoinSet<Vec<(usize, NodeID)>> = JoinSet::new();
+    let mut tasks: JoinSet<Vec<(usize, Result<NodeID, EntryFailure>)>> = JoinSet::new();
     for bucket in buckets {
         if bucket.is_empty() {
             continue;
@@ -707,60 +741,70 @@ async fn apply_wave(
         let capacity = bucket.iter().map(|(_, group)| group.len()).sum();
         let args = args.clone();
         let planned = planned.clone();
-        let state = state.clone();
+        let claim = claim.clone();
         let context = context.clone();
-        lore_spawn!(tasks, async move {
-            let mut landed = Vec::with_capacity(capacity);
-            for (parent, group) in bucket {
-                for index in group {
-                    let item = planned[index];
-                    let name = entry_name(&args, item.entry_index);
-                    let outcome = match item.restore {
-                        Some(node_id) => state
-                            .node_undelete(
-                                context.clone(),
-                                node_id,
-                                item.node.mode,
-                                item.node.size,
-                                item.node.address,
-                            )
-                            .await
-                            .map(|()| node_id),
-                        None => match state
-                            .node_add(context.clone(), parent, item.node, name)
-                            .await
-                        {
-                            Ok(node_id) => state
-                                .node_mark_staged(
-                                    context.clone(),
-                                    node_id,
-                                    NodeFlags::StagedAdd,
-                                    NodeFlags::DirtyAdd,
-                                )
-                                .await
-                                .map(|()| node_id),
-                            Err(error) => Err(error),
-                        },
-                    };
-                    match outcome {
-                        Ok(node_id) => {
-                            emit_add_complete(item.entry_id, node_id, LoreErrorCode::None);
-                            landed.push((index, node_id));
+        lore_spawn!(
+            tasks,
+            subtask!(async move {
+                // Bound first, so a task dropped where it parked drops its change, and the
+                // guard noting an unfinished one, before its share of the claim.
+                let claim = claim;
+                // Read from the claim's cell once, not at each entry.
+                let state: &State = claim.state();
+                let mut outcomes = Vec::with_capacity(capacity);
+                for (parent, group) in bucket {
+                    for index in group {
+                        let item = planned[index];
+                        let name = entry_name(&args, item.entry_index);
+                        let outcome = match item.restore {
+                            Some(node_id) => {
+                                let content = Content {
+                                    mode: item.node.mode,
+                                    size: item.node.size,
+                                    address: item.node.address,
+                                };
+                                state
+                                    .node_restore(&context, node_id, &content)
+                                    .await
+                                    .map(|()| node_id)
+                            }
+                            None => {
+                                state
+                                    .node_add_staged(context.clone(), parent, item.node, name)
+                                    .await
+                            }
+                        };
+                        match outcome {
+                            Ok(node_id) => {
+                                emit_add_complete(item.entry_id, node_id, LoreErrorCode::None);
+                                outcomes.push((index, Ok(node_id)));
+                            }
+                            Err(error) => {
+                                let failure = EntryFailure::of(&error);
+                                emit_add_error(item.entry_id, failure.code());
+                                outcomes.push((index, Err(failure)));
+                            }
                         }
-                        Err(_) => emit_add_error(item.entry_id, LoreErrorCode::Internal),
                     }
                 }
-            }
-            landed
-        });
+                outcomes
+            })
+        );
     }
 
     let mut applied = 0;
     while let Some(result) = tasks.join_next().await {
-        if let Ok(landed) = result {
-            applied += landed.len();
-            for (index, node_id) in landed {
-                created[index] = node_id;
+        let Ok(outcomes) = result else {
+            failures.lost();
+            continue;
+        };
+        for (index, outcome) in outcomes {
+            match outcome {
+                Ok(node_id) => {
+                    created[index] = node_id;
+                    applied += 1;
+                }
+                Err(failure) => failures.note(index, failure),
             }
         }
     }
@@ -774,15 +818,17 @@ async fn apply_wave(
 /// up — so a level runs as a single wave, and the barrier between levels keeps a
 /// child from running before the parent it names exists. A batch that parents
 /// entirely onto existing nodes is one wave. An entry whose parent failed is
-/// reported and skipped rather than attempted against a parent that was never
-/// created.
+/// reported with its parent's code and skipped rather than attempted against a
+/// parent that was never created. A call with an entry that failed reports
+/// `SLOW_DOWN` where every failure was a `SlowDown` of the State, `INTERNAL`
+/// otherwise.
 ///
 /// The plan is shared with the wave tasks rather than handed out piecewise, so
 /// nothing an entry carries is moved or copied per wave: a wave is a list of
 /// indices.
 async fn apply_plan(
     args: Arc<LoreRevisionTreeAddArgs>,
-    state: Arc<State>,
+    claim: SharedClaim,
     context: Arc<RepositoryContext>,
     planned: Vec<Planned>,
 ) -> Result<(), AddError> {
@@ -790,20 +836,29 @@ async fn apply_plan(
     let levels = entry_levels(&planned);
     let planned = Arc::new(planned);
     let mut created = vec![INVALID_NODE; total];
+    let mut failures = Failures::new(total);
     let mut applied = 0usize;
 
     for level in &levels {
-        let wave = take_wave(&planned, &created, level);
+        let wave = take_wave(&planned, &created, &mut failures, level);
         if !wave.is_empty() {
-            applied += apply_wave(&args, &planned, &state, &context, wave, &mut created).await;
+            applied += apply_wave(
+                &args,
+                &planned,
+                &claim,
+                &context,
+                wave,
+                (&mut created, &mut failures),
+            )
+            .await;
         }
     }
 
     if applied < total {
         let failed = total - applied;
-        return Err(AddError::internal(format!(
-            "{failed}/{total} node adds failed"
-        )));
+        return Err(failures
+            .strongest
+            .call_error(&format!("{failed}/{total} node adds failed")));
     }
     Ok(())
 }
@@ -848,9 +903,14 @@ async fn apply_plan(
 ///
 /// Atomicity covers the rules checked here, which is every rule a caller can
 /// break through the arguments. A failure after the checks pass — a block that
-/// cannot be read, a tree at its block limit — reports `INTERNAL` and may leave
-/// part of the batch created: nothing is rolled back, the handle stays usable,
-/// and no revision is published until `commit`.
+/// cannot be read, a tree at its block limit, or a parent, or a node to restore,
+/// that a concurrent `delete` took between its check and its write — reports
+/// `INTERNAL`. An entry the tree gave up on under load, heavy concurrent change or
+/// a store asking it to slow down, reports `SLOW_DOWN`, in its checks or after,
+/// which a caller can retry, and so do the entries parented onto it and the batch
+/// where nothing failed otherwise. Either may leave part of the batch created:
+/// nothing is rolled back, the handle stays usable, and no revision is published
+/// until `commit`.
 ///
 /// Entries are created a depth level at a time — everything parented onto a node
 /// that already exists, then everything parented onto those, and so on — and
@@ -884,10 +944,9 @@ async fn add_batch(
         return Ok(());
     }
     let context = internal.repository_context.clone();
-    let access = internal.access_shared().await;
-    let state = access.state();
-    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
-    apply_plan(args.clone(), state, context, planned).await
+    let claim = internal.claim_shared().await;
+    let planned = plan_entries(claim.state(), &context, args.entries.as_slice()).await?;
+    apply_plan(args.clone(), claim, context, planned).await
 }
 
 async fn add_impl(

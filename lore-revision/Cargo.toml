@@ -68,6 +68,19 @@ zerocopy = { workspace = true }
 # staleness reads its error constants from the latter, so both are named here.
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
+[[example]]
+name = "state_bench"
+path = "examples/state_bench/main.rs"
+required-features = ["state-bench"]
+
+# The node operations' stress harness, run by hand through `scripts/state-stress/stress.py`, which
+# enables `state-stress`. Naming the feature keeps `cargo test` and builds of all targets from
+# building it.
+[[example]]
+name = "state_stress"
+path = "examples/state_stress/main.rs"
+required-features = ["state-stress"]
+
 [dev-dependencies]
 ctor = { workspace = true }
 keyring-core = { workspace = true }
@@ -92,10 +105,29 @@ trace_log = ["lore-base/trace_log"]
 vfs = []
 swfs = []
 test-util = []
+# The node operation bench, run by hand: `cargo run --release -p lore-revision --example
+# state_bench --features state-bench`. Naming the feature keeps `cargo test` and builds of all
+# targets from building it.
+state-bench = []
+# The node operations' scheduling points (`state::node::hooks`), which the stress harness drives:
+# enabled by `state-stress` alone, so no other build or test run carries them. Benchmarks never
+# build with it.
+state-hooks = []
+# The builds of the stress harness, with the scheduling points and the test utilities it drives:
+# the stress example (`examples/state_stress`) and the deterministic scenarios
+# (`tests/state_scenarios`), both run by hand.
+state-stress = ["state-hooks", "test-util"]
 
 [[test]]
 name = "compile_fail"
 required-features = ["compile_fail_tests"]
+
+# The node operations' deterministic scenarios, run by hand: naming the feature keeps a plain
+# `cargo test` testing the build that ships, without the scheduling points.
+[[test]]
+name = "state_scenarios"
+path = "tests/state_scenarios/main.rs"
+required-features = ["state-stress"]
 
 [lints]
 workspace = true

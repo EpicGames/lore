@@ -2415,6 +2415,7 @@ dependencies = [
  "lore-storage",
  "lore-transport",
  "parking_lot",
+ "pin-project",
  "rand 0.9.5",
  "serde",
  "serde_json",

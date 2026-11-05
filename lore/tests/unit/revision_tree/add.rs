@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::add::*;
+use lore::revision_tree::call::EntryFailure;
 use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::list_children::LoreRevisionTreeListChildrenArgs;
@@ -680,7 +681,9 @@ async fn add_rejects_a_parent_that_has_been_deleted() {
             .block(internal.repository_context.clone(), block_index)
             .await
             .expect("the parent block must be readable");
-        block.write().discard_node(block_index, Node::index(doomed));
+        block
+            .write_for_tests()
+            .discard_node(block_index, Node::index(doomed));
     }
 
     let (status, events) =
@@ -832,4 +835,44 @@ async fn add_reports_the_batch_terminal_on_success_and_rejection() {
     );
 
     release(handle, store_handle_id);
+}
+
+/// A batch's failures hold nothing per entry until one fails, so a batch that fails nothing
+/// allocates nothing for them. An entry whose parent entry created no node fails as the parent
+/// did: as noted, or `Internal` where the parent reported nothing, as the entries of an apply task
+/// that died. The call reports the strongest failure noted, and a task lost counts as `Internal`.
+#[test]
+fn an_entry_below_a_failed_entry_fails_as_its_parent_did() {
+    let mut failures = Failures::new(4);
+    assert_eq!(
+        failures.entries.capacity(),
+        0,
+        "nothing held before a failure"
+    );
+    assert_eq!(
+        failures.of(0),
+        EntryFailure::Internal,
+        "an entry that reported nothing"
+    );
+
+    failures.note(1, EntryFailure::SlowedDown);
+    assert_eq!(failures.of(1), EntryFailure::SlowedDown);
+    assert_eq!(failures.of(2), EntryFailure::Internal);
+    assert_eq!(failures.strongest, EntryFailure::SlowedDown);
+
+    failures.note(2, failures.of(1));
+    assert_eq!(
+        failures.of(2),
+        EntryFailure::SlowedDown,
+        "a child of a slowed entry"
+    );
+    assert_eq!(failures.strongest, EntryFailure::SlowedDown);
+
+    failures.note(3, EntryFailure::Internal);
+    assert_eq!(failures.strongest, EntryFailure::Internal);
+
+    let mut lost = Failures::new(2);
+    lost.note(0, EntryFailure::SlowedDown);
+    lost.lost();
+    assert_eq!(lost.strongest, EntryFailure::Internal, "a task that died");
 }

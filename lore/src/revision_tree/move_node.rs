@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::SlowDown;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
@@ -29,13 +30,13 @@ use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
-use lore_revision::node::Node;
 use lore_revision::node::NodeID;
 use lore_revision::node::NodeIDExt;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::node::SiblingCycleGuard;
 use lore_revision::node::validate_node_name_for_store;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::MovesPermit;
 use lore_revision::state::State;
 use lore_revision::state::StateError;
 use lore_revision::state::StateNodeChildrenIterator;
@@ -44,7 +45,9 @@ use lore_storage::hash::hash_string;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::revision_tree::call::EntryFailure;
 use crate::revision_tree::call::revision_tree_call;
+use crate::revision_tree::call::state_failure;
 use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
 
@@ -79,6 +82,7 @@ pub struct LoreRevisionTreeMoveArgs {
 #[error_set]
 enum MoveError {
     InvalidArguments,
+    SlowDown,
 }
 
 impl MoveError {
@@ -95,6 +99,7 @@ impl EventError for MoveError {
     fn translated(&self) -> LoreError {
         match self {
             MoveError::InvalidArguments(_) => LoreError::InvalidArguments,
+            MoveError::SlowDown(_) => LoreError::SlowDown,
             MoveError::Internal(_) => LoreError::Internal,
         }
     }
@@ -135,6 +140,7 @@ fn batch_error_code(result: &Result<(), MoveError>) -> LoreErrorCode {
     match result {
         Ok(()) => LoreErrorCode::None,
         Err(MoveError::InvalidArguments(_)) => LoreErrorCode::InvalidArguments,
+        Err(MoveError::SlowDown(_)) => LoreErrorCode::SlowDown,
         Err(MoveError::Internal(_)) => LoreErrorCode::Internal,
     }
 }
@@ -150,15 +156,16 @@ fn reject(entry_id: u64, entry_index: usize, reason: &str) -> MoveError {
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the underlying
-/// failure as context. Not the caller's fault, so it reports `INTERNAL`.
+/// failure as context. Not the caller's fault, so it reports `SLOW_DOWN` for a `SlowDown` of
+/// the State, `INTERNAL` otherwise.
 fn reject_internal(
     entry_id: u64,
     entry_index: usize,
     error: StateError,
     context: &str,
 ) -> MoveError {
-    emit_move_error(entry_id, LoreErrorCode::Internal);
-    MoveError::internal_with_context(error, &format!("entry {entry_index}: {context}"))
+    emit_move_error(entry_id, EntryFailure::of(&error).code());
+    state_failure(error, &format!("entry {entry_index}: {context}"))
 }
 
 /// A validated entry, ready to apply without further checks. The name is not copied
@@ -182,9 +189,6 @@ fn entry_name(args: &LoreRevisionTreeMoveArgs, entry_index: usize) -> &str {
 /// Check that an existing node can take children, attributing any failure to
 /// `entry_id`. Runs once per destination per batch, for the first entry that names it.
 ///
-/// Returns the parent it read, which the caller keeps: the name checks start from the
-/// child chain it holds.
-///
 /// A discarded slot and a slot the allocator never handed out both read back as
 /// ordinary directories, so each is refused on its own terms: a child hung off a
 /// discarded slot is orphaned once the allocator reuses it, and since every non-root
@@ -196,7 +200,7 @@ async fn check_destination(
     destination_parent_id: NodeID,
     entry_id: u64,
     entry_index: usize,
-) -> Result<Node, MoveError> {
+) -> Result<(), MoveError> {
     let Ok(parent) = state.node(context.clone(), destination_parent_id).await else {
         return Err(reject(
             entry_id,
@@ -239,7 +243,7 @@ async fn check_destination(
             "destination parent id does not resolve to a named node",
         ));
     }
-    Ok(parent)
+    Ok(())
 }
 
 /// Whether moving `node_id` under `destination` closes a loop once every entry
@@ -294,12 +298,10 @@ async fn live_children(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     parent: NodeID,
-    parent_node: &Node,
     only: Option<u64>,
 ) -> Result<Vec<(u64, NodeID)>, StateError> {
     let mut children =
-        StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
-            .await?;
+        StateNodeChildrenIterator::new(state.clone(), context.clone(), parent).await?;
     let mut names = Vec::new();
     while let Some((node_id, node)) = children.next().await? {
         if node.is_staged_delete() || node.is_discarded() {
@@ -356,7 +358,7 @@ async fn plan_entries(
     // The destination parent of every node the batch moves, which is what the loop check
     // steps through and what tells a name check that a holder is on its way out.
     let mut moved: HashMap<NodeID, NodeID> = HashMap::with_capacity(entries.len());
-    let mut destinations: HashMap<NodeID, Node> = HashMap::new();
+    let mut destinations: HashSet<NodeID> = HashSet::new();
     let mut landing_count: HashMap<NodeID, usize> = HashMap::new();
 
     for (index, entry) in entries.iter().enumerate() {
@@ -406,20 +408,26 @@ async fn plan_entries(
         }
 
         let destination_parent_id = entry.destination_parent_id;
-        if let std::collections::hash_map::Entry::Vacant(slot) =
-            destinations.entry(destination_parent_id)
-        {
-            slot.insert(
-                check_destination(state, context, destination_parent_id, entry_id, index).await?,
-            );
+        if destinations.insert(destination_parent_id) {
+            check_destination(state, context, destination_parent_id, entry_id, index).await?;
         }
 
         let name_hash = hash_string(name);
         if node.parent == destination_parent_id && node.name_hash == name_hash {
             // The hash ignores case, so it takes the stored name to tell a move that
             // changes nothing from a rename that only changes case.
-            let current = match state.node_name_clone(context.clone(), entry.node_id).await {
-                Ok(current) => current,
+            match state
+                .node_name_is(context.clone(), entry.node_id, name)
+                .await
+            {
+                Ok(true) => {
+                    return Err(reject(
+                        entry_id,
+                        index,
+                        "the node is already under that parent by that name",
+                    ));
+                }
+                Ok(false) => {}
                 Err(error) => {
                     return Err(reject_internal(
                         entry_id,
@@ -428,33 +436,34 @@ async fn plan_entries(
                         "read the node's current name",
                     ));
                 }
-            };
-            if current == name {
-                return Err(reject(
-                    entry_id,
-                    index,
-                    "the node is already under that parent by that name",
-                ));
             }
         }
 
-        match closes_a_loop(state, context, &moved, destination_parent_id, entry.node_id).await {
-            Ok(true) => {
-                return Err(reject(
-                    entry_id,
-                    index,
-                    "the destination is the node itself or, once this batch is applied, one of \
-                     its descendants",
-                ));
-            }
-            Ok(false) => {}
-            Err(error) => {
-                return Err(reject_internal(
-                    entry_id,
-                    index,
-                    error,
-                    "walk the destination's ancestors",
-                ));
+        // Only a directory going to another parent can close a loop: a destination is a
+        // directory, a file holds no children, and a loop through the node's own parent needs
+        // another entry moving that parent below the node, which that entry's walk refuses,
+        // before this one or after it. The apply phase walks no directory again while every
+        // entry before it applied.
+        if node.is_directory() && node.parent != destination_parent_id {
+            match closes_a_loop(state, context, &moved, destination_parent_id, entry.node_id).await
+            {
+                Ok(true) => {
+                    return Err(reject(
+                        entry_id,
+                        index,
+                        "the destination is the node itself or, once this batch is applied, \
+                         one of its descendants",
+                    ));
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(reject_internal(
+                        entry_id,
+                        index,
+                        error,
+                        "walk the destination's ancestors",
+                    ));
+                }
             }
         }
 
@@ -487,20 +496,11 @@ async fn plan_entries(
             ));
         }
 
-        let parent_node = destinations[&item.destination_parent_id];
         let holders: Vec<NodeID> = if landing_count[&item.destination_parent_id] > 1 {
             if let std::collections::hash_map::Entry::Vacant(slot) =
                 snapshots.entry(item.destination_parent_id)
             {
-                match live_children(
-                    state,
-                    context,
-                    item.destination_parent_id,
-                    &parent_node,
-                    None,
-                )
-                .await
-                {
+                match live_children(state, context, item.destination_parent_id, None).await {
                     Ok(names) => {
                         slot.insert(names);
                     }
@@ -520,7 +520,6 @@ async fn plan_entries(
                 state,
                 context,
                 item.destination_parent_id,
-                &parent_node,
                 Some(item.name_hash),
             )
             .await
@@ -554,36 +553,41 @@ async fn plan_entries(
     Ok(planned)
 }
 
-/// Move every planned node, in batch order.
+/// Move every planned node, in batch order, under the moves permit the batch holds.
 ///
-/// Serial, because a move unlinks the node from one child chain and links it into
-/// another, which [`State::move_node`] documents as work that cannot overlap with
-/// another move touching either chain. Batch order is also what makes the plan's loop
-/// check binding: it settled each entry against the reparenting of the entries before
-/// it, which is the tree this phase produces.
+/// Serial, because batch order is what makes the plan's loop check binding: it settled
+/// each entry against the reparenting of the entries before it, which is the tree this
+/// phase produces. So each move takes the plan's walk of its destination's ancestors as
+/// done and its name's hash as computed, but for the moves after an entry that failed: the
+/// tree is then not the one the plan settled them against, and each walks again.
 ///
 /// The walk runs to completion whatever fails: an entry reports its own outcome, and
-/// the call reports how many entries did not finish, keeping the first failure as the
-/// reason. The per-entry terminal carries an error code alone, so the completion detail
-/// is the only place a caller learns what the tree refused.
+/// the call reports how many entries did not finish, keeping the first of the strongest
+/// failures as the reason: `SLOW_DOWN` where every failure was a `SlowDown` of the State,
+/// `INTERNAL` otherwise. The per-entry terminal carries an error code alone, so the
+/// completion detail is the only place a caller learns what the tree refused.
 #[lore_macro::test_pub]
 async fn apply_plan(
     args: &LoreRevisionTreeMoveArgs,
-    state: Arc<State>,
+    state: &Arc<State>,
     context: Arc<RepositoryContext>,
     planned: Vec<Planned>,
+    permit: &MovesPermit<'_>,
 ) -> Result<(), MoveError> {
     let total = planned.len();
     let mut applied = 0usize;
-    let mut failure: Option<StateError> = None;
+    // Boxed: rare, and held inline it would grow the future every move is awaited in.
+    let mut failure: Option<Box<StateError>> = None;
     for item in &planned {
         let name = entry_name(args, item.entry_index);
         match state
-            .move_node(
+            .node_move_staged(
                 context.clone(),
                 item.node_id,
                 item.destination_parent_id,
-                name,
+                (name, item.name_hash),
+                permit,
+                failure.is_none(),
             )
             .await
         {
@@ -592,16 +596,22 @@ async fn apply_plan(
                 applied += 1;
             }
             Err(error) => {
-                emit_move_error(item.entry_id, LoreErrorCode::Internal);
-                failure.get_or_insert(error);
+                let kind = EntryFailure::of(&error);
+                emit_move_error(item.entry_id, kind.code());
+                if failure
+                    .as_deref()
+                    .is_none_or(|kept| kind > EntryFailure::of(kept))
+                {
+                    failure = Some(Box::new(error));
+                }
             }
         }
     }
 
     if let Some(error) = failure {
         let failed = total - applied;
-        return Err(MoveError::internal_with_context(
-            error,
+        return Err(state_failure(
+            *error,
             &format!("{failed}/{total} node moves failed"),
         ));
     }
@@ -660,23 +670,25 @@ async fn apply_plan(
 /// Atomicity covers the rules checked here, which is every rule a caller can break
 /// through the arguments. A failure after the checks pass — a block that cannot be
 /// read, or a tree changing under the call — reports `INTERNAL` for that entry and for
-/// the batch, and may leave earlier entries applied: nothing is rolled back, the handle
-/// stays usable, and no revision is published until `commit`.
+/// the batch. An entry the tree gave up on under load, heavy concurrent change or a store
+/// asking it to slow down, reports `SLOW_DOWN`, in its checks or after, which a caller can
+/// retry, and so does the batch where nothing failed otherwise. Either may leave earlier
+/// entries applied: nothing is rolled back, the handle stays usable, and no revision is
+/// published until `commit`.
 ///
 /// Entries apply one at a time, in batch order, because a move rewrites the parent and
 /// sibling pointers of two chains where `add` only ever prepends to one. Work per entry
 /// is proportional to the moved subtree rather than to the one node named, since every
 /// node under a moved directory is recorded as moved.
 ///
-/// Concurrent calls are not serialized against each other, and a move is the edit that
-/// has the most to lose by it: two calls moving nodes that share a parent chain can
-/// interleave their unlinks and leave a node linked under one parent while its record
-/// names another. The net is the same one that catches concurrent adds — the pre-commit
-/// validator walks every staged directory and refuses a child whose parent link does not
-/// lead back to it — so the cost is a rejected commit rather than a published revision
-/// that is wrong. Moves that may touch one chain belong in one call, which applies them
-/// in order. A commit cannot interleave at all: it claims the handle exclusively, and a
-/// move holds a shared claim for its whole batch.
+/// Concurrent calls are serialized against each other: a call holds the tree's moves
+/// permit from before its checks to after its last move, so a batch is checked and applied
+/// against a tree no other move changes meanwhile, and two calls moving nodes of one
+/// chain, or one node, apply one after the other. Adds and modifications under their own
+/// calls may run alongside, but for a restore of a node below an added directory, which waits
+/// for the permit. A delete holds the permit for its whole batch too, so moves and deletes
+/// apply one after the other (H18). A commit cannot interleave at all: it claims the
+/// handle exclusively, and a move holds a shared claim for its whole batch.
 pub async fn move_node(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMoveArgs,
@@ -697,8 +709,14 @@ async fn move_batch(
     let context = internal.repository_context.clone();
     let access = internal.access_shared().await;
     let state = access.state();
+    // After the shared claim, as a commit waiting for its exclusive claim would otherwise wait
+    // on this permit's holder while that holder waits for its claim.
+    let permit = state
+        .moves_permit()
+        .await
+        .map_err(|error| MoveError::internal_with_context(error, "take the moves permit"))?;
     let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
-    apply_plan(&args, state, context, planned).await
+    apply_plan(&args, &state, context, planned, &permit).await
 }
 
 async fn move_node_impl(

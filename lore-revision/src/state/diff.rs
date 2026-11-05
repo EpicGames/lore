@@ -467,7 +467,13 @@ fn dispatch_subtree_diff(
         Ok(permit) => {
             lore_spawn!(
                 tasks,
-                diff_subtree_walk(subtree, flags, changes.clone(), filter_mode, Some(permit))
+                crate::subtask!(diff_subtree_walk(
+                    subtree,
+                    flags,
+                    changes.clone(),
+                    filter_mode,
+                    Some(permit)
+                ))
             );
         }
         Err(_) => pending.push(subtree),
@@ -722,7 +728,7 @@ fn diff_subtree_node_walk(
                             .holds_tracked_change(
                                 &to_nodes.repository,
                                 to_named_node.node,
-                                to_named_node.flags,
+                                to_named_node.flags(),
                             )
                             .await
                     }
@@ -1536,11 +1542,12 @@ async fn find_sorted_children(
                 .node(from.mapping.repository.clone(), from.mapping.node)
                 .await
         {
-            from_nodes.children.push(StateNamedNode {
-                node: from.mapping.node,
-                name: node.name_hash,
-                flags: NodeFlags::from_bits_retain(node.flags),
-            });
+            from_nodes.children.push(StateNamedNode::new(
+                from.mapping.node,
+                0,
+                node.name_hash,
+                NodeFlags::from_bits_retain(node.flags),
+            ));
         }
 
         let mut to_nodes = StateChildrenNodes {
@@ -1556,11 +1563,12 @@ async fn find_sorted_children(
                 .node(to.mapping.repository.clone(), to.mapping.node)
                 .await
         {
-            to_nodes.children.push(StateNamedNode {
-                node: to.mapping.node,
-                name: node.name_hash,
-                flags: NodeFlags::from_bits_retain(node.flags),
-            });
+            to_nodes.children.push(StateNamedNode::new(
+                to.mapping.node,
+                0,
+                node.name_hash,
+                NodeFlags::from_bits_retain(node.flags),
+            ));
         }
         directory_paths.from.pop();
         directory_paths.to.pop();
@@ -1572,7 +1580,7 @@ async fn find_sorted_children(
             let repository = from.mapping.repository.clone();
             let state = from.mapping.state.clone();
             let node = from.mapping.node;
-            lore_spawn!(async move {
+            lore_spawn!(crate::subtask!(async move {
                 let mut nodes = state
                     .collect_children_unsorted(
                         repository, node, false, /* No deleted nodes */
@@ -1581,13 +1589,13 @@ async fn find_sorted_children(
                     .await?;
                 named_node_sort(&mut nodes.children);
                 Ok::<_, StateError>(nodes)
-            })
+            }))
         };
         let to_nodes = {
             let repository = to.mapping.repository.clone();
             let state = to.mapping.state.clone();
             let node = to.mapping.node;
-            lore_spawn!(async move {
+            lore_spawn!(crate::subtask!(async move {
                 let mut nodes = state
                     .collect_children_unsorted(
                         repository, node, true, /* Include deleted nodes */
@@ -1596,7 +1604,7 @@ async fn find_sorted_children(
                     .await?;
                 named_node_sort(&mut nodes.children);
                 Ok::<_, StateError>(nodes)
-            })
+            }))
         };
 
         let from_nodes = from_nodes.await;

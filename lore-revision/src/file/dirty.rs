@@ -26,6 +26,7 @@ use crate::lore_trace;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeExtFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
@@ -35,7 +36,10 @@ use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
+use crate::state::Ext;
 use crate::state::LinkReference;
+use crate::state::Mark;
+use crate::state::NameChange;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -765,7 +769,10 @@ impl<'a> StagedParent<'a> {
     /// marker leaves no directory behind.
     async fn resolve(self, walk: &DirtyWalk) -> Result<NodeID, DirtyError> {
         match self.names.filter(|names| !names.is_empty()) {
-            Some(names) => ensure_dirty_parent_dirs(walk, self.base, names).await,
+            Some(names) => {
+                ensure_dirty_parent_dirs(&walk.repository, &walk.state_staged, self.base, names)
+                    .await
+            }
             None => Ok(self.base),
         }
     }
@@ -897,7 +904,15 @@ async fn dirty_path(
         let node_id = staged_node.unwrap_or(nodes.current);
 
         state_staged
-            .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyModify, true)
+            .node_mark(
+                repository,
+                node_id,
+                Mark::dirty(
+                    NodeFlags::DirtyModify,
+                    Ext::Set(NodeExtFlags::NoFlags),
+                    true,
+                ),
+            )
             .await
             .forward::<DirtyError>("Failed to mark node as dirty")?;
 
@@ -922,42 +937,23 @@ async fn dirty_path(
         )
         .await?;
     } else if let Some(staged_node) = staged_node {
-        // Not on disk + not in revision + exists in staged tree
-        let node = state_staged
+        // Not on disk + not in revision + exists in staged tree. The flag and the parent alone, so
+        // the record is not held across the awaits below.
+        let (dirty_add, parent) = state_staged
             .node(repository.clone(), staged_node)
             .await
-            .forward::<DirtyError>("Failed to get staged node")?;
-        if node.is_dirty_add() {
+            .forward::<DirtyError>("Failed to get staged node")
+            .map(|node| (node.is_dirty_add(), node.parent))?;
+        if dirty_add {
             lore_trace!(
                 "Dirty reverted add, discarding node: {}",
                 relative_path.as_str()
             );
-            // Clear dirty flags so the node is no longer marked
-            let block_index = NodeBlock::index(staged_node);
-            let node_index = Node::index(staged_node);
-            let block = state_staged
-                .block(repository.clone(), block_index)
+            crate::state::node_discard_fused(state_staged.clone(), repository.clone(), staged_node)
                 .await
-                .forward::<DirtyError>("Failed to get block")?;
-            {
-                let mut writer = block.write();
-                writer.node(node_index).clear_all_change_flags();
-                writer.mark_dirty();
-            }
-            state_staged.block_modified(block.clone(), block_index);
-            state_staged.mark_dirty();
+                .forward::<DirtyError>("Failed to discard reverted dirty add node")?;
 
-            // Discard the node from the tree (unlink from parent, reclaim slot)
-            crate::state::node_discard_patch(
-                state_staged.clone(),
-                repository.clone(),
-                staged_node,
-                |_discarded_node_id, _flags| {},
-            )
-            .await
-            .forward::<DirtyError>("Failed to discard reverted dirty add node")?;
-
-            crate::state::clear_propagation(state_staged, repository, node.parent)
+            crate::state::clear_propagation(state_staged, repository, parent)
                 .await
                 .forward::<DirtyError>("Failed to clear the marks above a reverted add")?;
 
@@ -1014,7 +1010,15 @@ async fn dirty_delete(
     stats.delete_count.fetch_add(1, Ordering::Relaxed);
 
     state
-        .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyDelete, true)
+        .node_mark(
+            &repository,
+            node_id,
+            Mark::dirty(
+                NodeFlags::DirtyDelete,
+                Ext::Set(NodeExtFlags::NoFlags),
+                true,
+            ),
+        )
         .await
         .forward::<DirtyError>("Failed to mark node as dirty delete")?;
 
@@ -1099,7 +1103,11 @@ async fn dirty_add(walk: &DirtyWalk, parent_staged: NodeID, name: &str) -> Resul
     // Mark with propagation so reused committed ancestors are marked up to root,
     // not left clean under a dirty child where a non-scan status walk prunes them.
     walk.state_staged
-        .node_mark_dirty(walk.repository.clone(), node_id, NodeFlags::DirtyAdd, true)
+        .node_mark(
+            &walk.repository,
+            node_id,
+            Mark::dirty(NodeFlags::DirtyAdd, Ext::Set(NodeExtFlags::NoFlags), true),
+        )
         .await
         .forward::<DirtyError>("Failed to mark dirty add and propagate to parents")?;
 
@@ -1130,7 +1138,11 @@ async fn dirty_add_directory(
         .forward::<DirtyError>("Failed to add dirty directory node")?;
 
     walk.state_staged
-        .node_mark_dirty(walk.repository.clone(), new_id, NodeFlags::DirtyAdd, true)
+        .node_mark(
+            &walk.repository,
+            new_id,
+            Mark::dirty(NodeFlags::DirtyAdd, Ext::Set(NodeExtFlags::NoFlags), true),
+        )
         .await
         .forward::<DirtyError>("Failed to mark dirty add directory and propagate to parents")?;
 
@@ -1144,63 +1156,90 @@ async fn dirty_add_directory(
 /// in the state tree as the untracked content they are and the ignore rules still apply to them.
 ///
 /// Reaches only where a walk starts: every node below one it has visited is a child of a node it
-/// holds. The caller is responsible for checking the full path against ignore filters.
+/// holds. The caller is responsible for checking the full path against ignore filters. A find
+/// that fails other than for a missing name returns its error, adding nothing for that name.
+///
+/// The scan's chain walks the same way but adds each directory with `DirtyAdd` in its record,
+/// marks only the first one's parent, and checks every name it adds before adding any; this marks
+/// each directory `DirtyAdd` after its add, climbing from it, and leaves the reserved names to the
+/// walk's entry and the other checks to the add.
+#[lore_macro::test_pub]
 async fn ensure_dirty_parent_dirs(
-    walk: &DirtyWalk,
+    repository: &Arc<RepositoryContext>,
+    state: &State,
     base: NodeID,
     parent_path: &str,
 ) -> Result<NodeID, DirtyError> {
-    let DirtyWalk {
-        repository,
-        state_staged: state,
-        ..
-    } = walk;
     let mut current_node = base;
 
-    for segment in parent_path.split('/').filter(|s| !s.is_empty()) {
+    // Split by hand: a `split('/')` iterator held across the awaits below costs this future 56
+    // bytes more than the rest of the path does.
+    let mut rest = parent_path;
+    while !rest.is_empty() {
+        let (segment, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        rest = tail;
+        if segment.is_empty() {
+            continue;
+        }
         let name_hash = crate::hash::hash_string(segment);
-        if let Ok(child_id) = state
+        // Only a name the directory lacks is added: a find that failed otherwise, as on a block
+        // that did not load, says nothing of the name, and the add checks none.
+        match state
             .find_subnode(repository.clone(), current_node, name_hash)
             .await
         {
-            current_node = child_id;
-        } else {
-            // A directory node carries no File or Link flag. Mark it with
-            // propagation so reused committed ancestors are marked up to root.
-            // A dirty add, not a bare dirty mark: the tree does not track a
-            // directory it creates here.
-            let dir_node = Node {
-                name_hash,
-                ..Default::default()
-            };
-            let new_id = state
-                .node_add(repository.clone(), current_node, dir_node, segment)
-                .await
-                .forward::<DirtyError>("Failed to create parent directory for dirty add")?;
-            state
-                .node_mark_dirty(repository.clone(), new_id, NodeFlags::DirtyAdd, true)
-                .await
-                .forward::<DirtyError>("Failed to mark created parent directory dirty")?;
-            current_node = new_id;
+            Ok(child_id) => {
+                current_node = child_id;
+                continue;
+            }
+            Err(error) if !error.is_node_not_found() => {
+                return Err(error)
+                    .forward::<DirtyError>("finding a parent directory of a dirty add");
+            }
+            Err(_) => {}
         }
+        // A directory node carries no File or Link flag. Mark it with
+        // propagation so reused committed ancestors are marked up to root.
+        // A dirty add, not a bare dirty mark: the tree does not track a
+        // directory it creates here.
+        let dir_node = Node {
+            name_hash,
+            ..Default::default()
+        };
+        let new_id = state
+            .node_add(repository.clone(), current_node, dir_node, segment)
+            .await
+            .forward::<DirtyError>("Failed to create parent directory for dirty add")?;
+        state
+            .node_mark(
+                repository,
+                new_id,
+                Mark::dirty(NodeFlags::DirtyAdd, Ext::Set(NodeExtFlags::NoFlags), true),
+            )
+            .await
+            .forward::<DirtyError>("Failed to mark created parent directory dirty")?;
+        current_node = new_id;
     }
 
     Ok(current_node)
 }
 
-/// Recursively mark all children of a moved directory as dirty-moved.
-/// Mirrors `mark_children_moved` in stage.rs.
+/// Marks every node below the moved directory `parent_node` dirty as moved, with `move_flag`, by
+/// the rules of `mark_children_moved` in `file/stage.rs`: a node added stays an addition, a node deleted
+/// is left as it is, unless the moved directory was deleted itself (`undelete`).
 async fn mark_children_dirty_moved(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     parent_node: NodeID,
     move_flag: NodeFlags,
+    undelete: bool,
 ) -> Result<(), crate::state::StateError> {
     fn mark_children_dirty_moved_recursive(
         repository: Arc<RepositoryContext>,
         state: Arc<State>,
         parent_node: NodeID,
         move_flag: NodeFlags,
+        undelete: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), crate::state::StateError>> + Send>,
     > {
@@ -1208,24 +1247,35 @@ async fn mark_children_dirty_moved(
             let children = state.node_children(repository.clone(), parent_node).await?;
 
             for child_id in children {
-                let child_node = state.node(repository.clone(), child_id).await?;
+                let (deleted, added, is_directory) = {
+                    let child = state.node(repository.clone(), child_id).await?;
+                    (child.is_deleted(), child.is_added(), child.is_directory())
+                };
+                if !undelete && deleted {
+                    continue;
+                }
 
-                let child_flag = if child_node.is_dirty_add() {
+                let child_flag = if added {
                     NodeFlags::DirtyAdd
                 } else {
                     move_flag
                 };
 
                 state
-                    .node_mark_dirty(repository.clone(), child_id, child_flag, false)
+                    .node_mark(
+                        &repository,
+                        child_id,
+                        Mark::dirty(child_flag, Ext::Set(NodeExtFlags::NoFlags), false),
+                    )
                     .await?;
 
-                if child_node.is_directory() {
+                if is_directory {
                     mark_children_dirty_moved_recursive(
                         repository.clone(),
                         state.clone(),
                         child_id,
                         move_flag,
+                        undelete,
                     )
                     .await?;
                 }
@@ -1235,7 +1285,7 @@ async fn mark_children_dirty_moved(
         })
     }
 
-    mark_children_dirty_moved_recursive(repository, state, parent_node, move_flag).await
+    mark_children_dirty_moved_recursive(repository, state, parent_node, move_flag, undelete).await
 }
 
 /// Recursively process a directory, marking each child as dirty based on filesystem state.
@@ -1448,6 +1498,13 @@ pub async fn dirty_move(
     if from_path.as_str() == to_path.as_str() {
         return Err(DirtyError::internal("Cannot move a path to itself"));
     }
+    // Lookups ignore case, so `A` to `a/b` moves a node below itself as well.
+    if to_path.is_below_ignore_case(&from_path) {
+        return Err(InvalidArguments {
+            reason: "Cannot move a path into itself".into(),
+        }
+        .into());
+    }
 
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -1458,150 +1515,59 @@ pub async fn dirty_move(
 
     let from_node = node_outside_links(&state, &repository, from_path.as_str()).await?;
 
-    let from_block_index = NodeBlock::index(from_node);
-    let from_node_index = Node::index(from_node);
-    let from_block = state
-        .block(repository.clone(), from_block_index)
-        .await
-        .forward::<DirtyError>("Failed deserializing state node block")?;
-    let mut node = from_block.node(from_node_index);
-    let old_parent = node.parent;
+    let (is_directory, added, deleted) = {
+        let node = state
+            .node(repository.clone(), from_node)
+            .await
+            .forward::<DirtyError>("Failed deserializing state node block")?;
+        (node.is_directory(), node.is_added(), node.is_deleted())
+    };
 
     let to_parent_id = parent_outside_links(&state, &repository, &to_path).await?;
 
-    // Unlink from old parent
-    if node.parent != to_parent_id {
-        let parent_block_index = NodeBlock::index(node.parent);
-        let parent_node_index = Node::index(node.parent);
-        let parent_block = state
-            .block(repository.clone(), parent_block_index)
-            .await
-            .forward::<DirtyError>("Failed deserializing state node block")?;
-        let parent_node = parent_block.node(parent_node_index);
-
-        if parent_node.child == from_node {
-            let dirtied = {
-                let mut writer = parent_block.write();
-                writer.node(parent_node_index).child = node.sibling;
-                writer.mark_dirty()
-            };
-            if dirtied {
-                state.block_modified(parent_block, parent_block_index);
-                state.mark_dirty();
-            }
-        } else {
-            let mut child_id = parent_node.child().unwrap_or_default();
-            let mut cycle = SiblingCycleGuard::new(node.parent);
-            while let Some(sibling) = {
-                let child = state
-                    .node(repository.clone(), child_id)
-                    .await
-                    .forward::<DirtyError>("Failed deserializing state node block")?;
-                child
-                    .walk_step(child_id, node.parent, &mut cycle)
-                    .forward::<DirtyError>("Invalid node hierarchy in dirty unlink walk")?;
-                child.sibling()
-            } {
-                if sibling == from_node {
-                    let child_block_index = NodeBlock::index(child_id);
-                    let child_node_index = Node::index(child_id);
-                    let child_block =
-                        state
-                            .block(repository.clone(), child_block_index)
-                            .await
-                            .forward::<DirtyError>("Failed deserializing state node block")?;
-                    let dirtied = {
-                        let mut writer = child_block.write();
-                        writer.node(child_node_index).sibling = node.sibling;
-                        writer.mark_dirty()
-                    };
-                    if dirtied {
-                        state.block_modified(child_block, child_block_index);
-                        state.mark_dirty();
-                    }
-                    break;
-                }
-                child_id = sibling;
-            }
-        }
-
-        // Link into new parent's child list
-        let new_parent_block_index = NodeBlock::index(to_parent_id);
-        let new_parent_node_index = Node::index(to_parent_id);
-        let new_parent_block = state
-            .block(repository.clone(), new_parent_block_index)
-            .await
-            .forward::<DirtyError>("Failed deserializing state node block")?;
-        let sibling_node_id = new_parent_block.node(new_parent_node_index).child;
-        let dirtied = {
-            let mut writer = new_parent_block.write();
-            writer.node(new_parent_node_index).child = from_node;
-            writer.mark_dirty()
-        };
-        if dirtied {
-            state.block_modified(new_parent_block, new_parent_block_index);
-            state.mark_dirty();
-        }
-        node.sibling = sibling_node_id;
-        node.parent = to_parent_id;
-    }
-
-    // Update name if changed
     let to_name = to_path.name();
     let from_name = from_path.name();
-    if from_name != to_name {
-        node.name_hash = crate::hash::hash_string(to_name);
-        from_block
-            .deserialize_nametable(repository.clone())
-            .await
-            .forward::<DirtyError>("Failed deserializing name table")?;
-        (node.name_offset, node.name_length) = from_block
-            .write()
-            .node_name_store(to_name, node.name_offset, node.name_length)
-            .forward::<DirtyError>("Failed to store node name")?;
-    }
-
-    // Write updated node back
-    let dirtied = {
-        let mut writer = from_block.write();
-        *writer.node(from_node_index) = node;
-        writer.mark_dirty()
+    let name = if from_name != to_name {
+        NameChange::Rename(to_name)
+    } else {
+        NameChange::Keep
     };
-    if dirtied {
-        state.block_modified(from_block, from_block_index);
-        state.mark_dirty();
-    }
-
-    // Mark the node as DirtyMove
-    let dirty_move_flag = if node.is_dirty_add() {
+    let dirty_move_flag = if added {
         NodeFlags::DirtyAdd
     } else {
         NodeFlags::DirtyMove
     };
+    let own = Mark::dirty(dirty_move_flag, Ext::Set(NodeExtFlags::NoFlags), true);
+    let left = state
+        .node_move(repository.clone(), from_node, to_parent_id, name, own)
+        .await
+        .forward::<DirtyError>("Failed to move the node")?;
     state
-        .node_mark_dirty(repository.clone(), from_node, dirty_move_flag, true)
+        .node_mark_destination(&repository, to_parent_id, own)
         .await
         .forward::<DirtyError>("Failed to mark node as dirty move")?;
 
     // If this is a directory move, recursively mark all children as dirty-moved
-    if node.is_directory() {
+    if is_directory {
         mark_children_dirty_moved(
             repository.clone(),
             state.clone(),
             from_node,
             dirty_move_flag,
+            deleted,
         )
         .await
         .forward::<DirtyError>("Failed to mark children as dirty moved")?;
     }
 
-    // Propagate dirty to source parent (child removed)
-    if old_parent != to_parent_id {
-        state
-            .node_mark_dirty(repository.clone(), old_parent, NodeFlags::Dirty, false)
-            .await
-            .forward::<DirtyError>("Failed to propagate dirty to source parent")?;
-    }
+    state
+        .node_mark_left(
+            &repository,
+            (left, to_parent_id),
+            Mark::dirty(NodeFlags::Dirty, Ext::Keep, false),
+        )
+        .await
+        .forward::<DirtyError>("Failed to propagate dirty to source parent")?;
 
     // Persist
     state.reparent_onto(current_revision);
@@ -1662,7 +1628,11 @@ pub async fn dirty_copy(
 
     // Propagate dirty to destination parent
     state
-        .node_mark_dirty(repository.clone(), to_parent_id, NodeFlags::Dirty, false)
+        .node_mark(
+            &repository,
+            to_parent_id,
+            Mark::dirty(NodeFlags::Dirty, Ext::Keep, false),
+        )
         .await
         .forward::<DirtyError>("Failed to propagate dirty to destination parent")?;
 

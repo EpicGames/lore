@@ -19,6 +19,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_storage::hash::hash_string;
 use zerocopy::IntoBytes;
 
 use crate::helper::test_store_create;
@@ -89,6 +90,7 @@ async fn snapshot(repository: &Arc<RepositoryContext>, address: Address) -> Hash
             Node {
                 address,
                 flags: NodeFlags::File.bits(),
+                name_hash: hash_string("probe.txt"),
                 ..Default::default()
             },
             "probe.txt",
@@ -323,6 +325,7 @@ async fn links_follow_recorded_snapshots_and_respect_repository_partition() {
                                 context: linked.id.into(),
                             },
                             child: ROOT_NODE,
+                            name_hash: hash_string("mounted"),
                             ..Default::default()
                         },
                         "mounted",

@@ -6,21 +6,28 @@
 //! looks up a [`crate::revision_tree::handle::RevisionTreeInternal`]
 //! instead of a `StoreInternal`. Every revision-tree verb goes through
 //! this helper so the in-flight counter protocol and the `Complete` /
-//! `End` event lifecycle apply uniformly.
+//! `End` event lifecycle apply uniformly. The verbs report a failure of the
+//! State through [`EntryFailure`] and [`state_failure`], so a `SlowDown`, which
+//! a caller can retry, reports `LORE_ERROR_CODE_SLOW_DOWN` on every verb.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Instant;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::SlowDown;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
+use lore_error_set::internal::SupportsInternalError;
 use lore_error_set::prelude::*;
 use lore_revision::event::EventError;
+use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
+use lore_revision::state::StateError;
 
 use crate::call::setup_execution;
 use crate::interface::LoreEventCallback;
@@ -71,15 +78,26 @@ impl EventError for DispatchError {
 /// All work (including spawned tasks) the verb initiates must complete
 /// before the returned future resolves — no background work outlives a
 /// data verb. Use `JoinSet` / `join_all` to await spawned futures before
-/// returning.
+/// returning. A dropped call's `JoinSet` aborts its tasks, which tokio drops only
+/// when it next polls them: a close does not wait for those, which only read the
+/// store and change the closed tree's in-memory state, and a commit waits for them
+/// through the claim's shares they hold, or through the claim the task that spawned
+/// them holds until they end.
 ///
 /// The verb reaches the handle's tree through
-/// [`access_shared`](crate::revision_tree::handle::RevisionTreeInternal::access_shared) or
+/// [`access_shared`](crate::revision_tree::handle::RevisionTreeInternal::access_shared),
+/// [`claim_shared`](crate::revision_tree::handle::RevisionTreeInternal::claim_shared) or
 /// [`access_exclusive`](crate::revision_tree::handle::RevisionTreeInternal::access_exclusive),
-/// which is where a call states whether it can share the handle. This helper does not
-/// take that lock: a verb holds it for as long as it uses the state, and taking it here
-/// as well would deadlock, since `tokio::sync::RwLock` is write-preferring and a second
-/// read waits behind a queued writer.
+/// which is where a call states whether it can share the handle; a verb spawning tasks
+/// that work on the tree hands them shares of one claim ([`SharedClaim`]), or spawns them
+/// from a task of its own that holds the claim, awaits every one of them, and that a
+/// dropped call does not stop, as the delete's batch does. This helper
+/// does not take that lock: a verb holds it for as long as it uses the state, and taking
+/// it here as well, or a second read in a task, would deadlock, since
+/// `tokio::sync::RwLock` is write-preferring and a second read waits behind a queued
+/// writer.
+///
+/// [`SharedClaim`]: crate::revision_tree::handle::SharedClaim
 #[lore_macro::test_pub]
 pub(crate) async fn revision_tree_call<Arg, T, F, Fut, ResT, ErrT, M>(
     globals: LoreGlobalArgs,
@@ -124,4 +142,80 @@ where
             status
         })
         .await
+}
+
+/// How an entry of a revision-tree verb failed, weakest first: a failure of ours outranks the
+/// State giving up under load, which a caller can retry, so an entry that failed both ways reports
+/// `Internal`. One byte, so a verb keeping one per entry keeps a byte per entry.
+#[lore_macro::test_pub]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum EntryFailure {
+    /// The entry has not failed.
+    None,
+    /// The State answered `SlowDown`: it gave up under concurrent changes, or its store asked it
+    /// to slow down.
+    SlowedDown,
+    /// Any other failure.
+    Internal,
+}
+
+impl EntryFailure {
+    /// How `error`, a State failure, fails the entry it met.
+    #[lore_macro::test_pub]
+    pub(crate) fn of(error: &StateError) -> Self {
+        if error.is_slow_down() {
+            Self::SlowedDown
+        } else {
+            Self::Internal
+        }
+    }
+
+    /// Takes in another failure of the same entry, keeping the stronger.
+    #[lore_macro::test_pub]
+    pub(crate) fn merge(&mut self, other: Self) {
+        *self = (*self).max(other);
+    }
+
+    /// Whether the entry failed.
+    #[lore_macro::test_pub]
+    pub(crate) fn failed(self) -> bool {
+        self != Self::None
+    }
+
+    /// The code the entry's terminal event reports.
+    #[lore_macro::test_pub]
+    pub(crate) fn code(self) -> LoreErrorCode {
+        match self {
+            Self::None => LoreErrorCode::None,
+            Self::SlowedDown => LoreErrorCode::SlowDown,
+            Self::Internal => LoreErrorCode::Internal,
+        }
+    }
+
+    /// The error of a call whose entries failed, the strongest of their failures `self`, with
+    /// `context`: `SlowDown` where each one slowed, `Internal` otherwise.
+    #[lore_macro::test_pub]
+    #[track_caller]
+    pub(crate) fn call_error<E: ErrorSet + SupportsInternalError>(self, context: &str) -> E {
+        match self {
+            Self::SlowedDown => state_failure(StateError::from(SlowDown), context),
+            Self::None | Self::Internal => E::internal(context),
+        }
+    }
+}
+
+/// A verb's error for `error`, a State failure, with `context`: a `SlowDown` kept as one, for a
+/// caller to retry, and every other failure taken as `Internal`.
+#[lore_macro::test_pub]
+#[track_caller]
+pub(crate) fn state_failure<E: ErrorSet + SupportsInternalError>(
+    error: StateError,
+    context: &str,
+) -> E {
+    if !error.is_slow_down() {
+        return E::internal_with_context(error, context);
+    }
+    let Err(error) = Err::<Infallible, _>(error).forward_any(context);
+    error
 }

@@ -5,6 +5,7 @@ mod operation_tests;
 mod rehash_bench;
 mod rehash_tests;
 mod statistics_level_tests;
+mod sweep_tests;
 mod walk_tests;
 mod weave_tests;
 

@@ -137,8 +137,16 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
                 let (parent, name) = to.rsplit_once('/').unwrap_or(("", to));
                 let parent = node_at(repository, &state, parent).await;
                 let node = node_at(repository, &state, from).await;
+                let permit = state.moves_permit().await.expect("the moves permit");
                 state
-                    .move_node(repository.clone(), node, parent, name)
+                    .node_move_staged(
+                        repository.clone(),
+                        node,
+                        parent,
+                        (name, hash_string(name)),
+                        &permit,
+                        false,
+                    )
                     .await
                     .expect("moving the node");
                 continue;
@@ -190,27 +198,20 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
             .address
             .context;
         state
-            .node_modify(
-                repository.clone(),
+            .node_modify_staged(
+                repository,
                 node,
-                mode,
-                version,
-                Address {
-                    hash: Hash::from_u64(version),
-                    context: file,
+                &lore_revision::state::Content {
+                    mode,
+                    size: version,
+                    address: Address {
+                        hash: Hash::from_u64(version),
+                        context: file,
+                    },
                 },
             )
             .await
-            .expect("modifying the file");
-        state
-            .node_mark_staged(
-                repository.clone(),
-                node,
-                NodeFlags::StagedModify,
-                NodeFlags::DirtyModify,
-            )
-            .await
-            .expect("staging the modification");
+            .expect("modifying and staging the file");
     }
     commit(repository, &state, base, branch_id()).await
 }
@@ -1310,29 +1311,32 @@ async fn renamed_and_pinned(repository: &Arc<RepositoryContext>, base: Hash, pin
     let state = revision_state(repository, base).await;
     let link = node_at(repository, &state, "Mount").await;
     state
-        .move_node(repository.clone(), link, ROOT_NODE, "mount")
-        .await
-        .expect("renaming the link");
-    let block_index = NodeBlock::index(link);
-    let block = state
-        .block(repository.clone(), block_index)
-        .await
-        .expect("reading the link");
-    let dirtied = {
-        let mut writer = block.write();
-        writer.node(Node::index(link)).address.hash = pin;
-        writer.mark_dirty()
-    };
-    if dirtied {
-        state.block_modified(block, block_index);
-        state.mark_dirty();
-    }
-    state
-        .node_mark_staged(
+        .node_move_staged(
             repository.clone(),
             link,
-            NodeFlags::StagedModify,
-            NodeFlags::DirtyModify,
+            ROOT_NODE,
+            ("mount", hash_string("mount")),
+            &state.moves_permit().await.expect("the moves permit"),
+            false,
+        )
+        .await
+        .expect("renaming the link");
+    state
+        .node_set_link_target(
+            repository,
+            link,
+            lore_revision::state::LinkPin::Revision(pin),
+        )
+        .await
+        .expect("pinning the link");
+    state
+        .node_mark(
+            repository,
+            link,
+            lore_revision::state::Mark::staged_and_dirty(
+                NodeFlags::StagedModify,
+                NodeFlags::DirtyModify,
+            ),
         )
         .await
         .expect("staging the pin");

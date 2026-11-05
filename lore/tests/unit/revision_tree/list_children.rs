@@ -33,6 +33,7 @@ use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
+use lore_storage::hash::hash_string;
 
 #[derive(Debug, Clone, PartialEq)]
 enum CapturedEvent {
@@ -161,6 +162,7 @@ async fn add_child(handle: LoreRevisionTree, name: &str, is_file: bool) -> NodeI
                 let flags = if is_file { NodeFlags::File.bits() } else { 0 };
                 let node = Node {
                     flags,
+                    name_hash: hash_string(name),
                     ..Default::default()
                 };
                 state
@@ -196,6 +198,7 @@ async fn add_file_with_metadata(
                     mode,
                     size,
                     address,
+                    name_hash: hash_string(name),
                     ..Default::default()
                 };
                 state
@@ -230,6 +233,7 @@ async fn add_link(
                 let (state, repository_context) = handle_state(handle);
                 let node = Node {
                     flags: NodeFlags::Link.bits(),
+                    name_hash: hash_string(name),
                     child: target_node,
                     address: Address {
                         hash: revision,
@@ -255,6 +259,7 @@ async fn seal_target(handle: LoreRevisionTree, child_name: &str) -> Hash {
     let (state, repository_context) = handle_state(handle);
     let child = Node {
         flags: NodeFlags::File.bits(),
+        name_hash: hash_string(child_name),
         ..Default::default()
     };
     state

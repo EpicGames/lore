@@ -755,6 +755,166 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// Commits `file` on a base, changes it on a feature branch and on main, and starts a merge
+    /// of the feature into main that leaves it in conflict.
+    async fn start_conflicted_merge(fixture: &DiffFixture, file: &str) {
+        fixture.write_file(file, b"base\n");
+        let base_revision = fixture.stage_and_commit("base").await;
+        let main_branch = fixture.main_branch_id;
+
+        let feature_branch = fixture.create_branch("feature").await;
+        fixture.write_file(file, b"feature\n");
+        fixture.stage_and_commit("feature change").await;
+
+        fixture.switch_to(main_branch, base_revision).await;
+        fixture.write_file(file, b"main\n");
+        fixture.stage_and_commit("main change").await;
+
+        Box::pin(branch::merge::merge_start(
+            fixture.repository.clone(),
+            &fixture.write_token,
+            feature_branch,
+            branch::merge::MergeStartOptions {
+                message: "merge feature into main".to_string(),
+                link_messages: std::collections::HashMap::new(),
+                no_commit: true,
+                scope: branch::merge::MergeScope::MainOnly,
+                inherit_metadata: Default::default(),
+            },
+        ))
+        .await
+        .expect("merge_start failed");
+    }
+
+    /// `file`'s node in the staged state.
+    async fn staged_node(fixture: &DiffFixture, file: &str) -> lore_revision::node::Node {
+        let (_current, staged, _branch) =
+            lore_revision::state::State::deserialize_current_and_staged(fixture.repository.clone())
+                .await
+                .expect("the states load");
+        let staged = staged.expect("the merge staged its changes");
+        let link = staged
+            .find_node_link(fixture.repository.clone(), file)
+            .await
+            .expect("the file is staged");
+        staged
+            .node(fixture.repository.clone(), link.node)
+            .await
+            .expect("the file's node reads")
+    }
+
+    /// `file` in the working tree, as a path argument.
+    fn path_argument(fixture: &DiffFixture, file: &str) -> LoreArray<LoreString> {
+        let path = fixture.repo_path.join(file);
+        LoreArray::from_vec(vec![LoreString::from(path.to_string_lossy().as_ref())])
+    }
+
+    /// Resolving a merge conflict marks its node resolved, and unresolving it marks it a conflict
+    /// again, each as the staged state records it.
+    #[tokio::test]
+    async fn a_merge_conflict_resolved_then_unresolved_records_each_in_the_staged_state() {
+        const FILE: &str = "shared.txt";
+
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+                start_conflicted_merge(&fixture, FILE).await;
+                assert!(
+                    staged_node(&fixture, FILE)
+                        .await
+                        .is_staged_merge_unresolved()
+                );
+
+                // Written without conflict markers, which would refuse the resolve.
+                fixture.write_file(FILE, b"merged\n");
+                branch::merge::merge_resolve(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    path_argument(&fixture, FILE),
+                    branch::merge::MergeType::BranchMerge,
+                )
+                .await
+                .expect("merge_resolve failed");
+                assert!(staged_node(&fixture, FILE).await.is_staged_merge_resolved());
+
+                branch::merge::merge_unresolve(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    path_argument(&fixture, FILE),
+                    branch::merge::MergeType::BranchMerge,
+                )
+                .await
+                .expect("merge_unresolve failed");
+                assert!(
+                    staged_node(&fixture, FILE)
+                        .await
+                        .is_staged_merge_unresolved()
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Unresolving a conflict resolved with mine or with theirs takes the side with the
+    /// resolution: the node is a plain conflict again, of neither side.
+    #[tokio::test]
+    async fn a_merge_conflict_resolved_with_a_side_then_unresolved_keeps_no_side() {
+        const FILE: &str = "shared.txt";
+
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                for mine in [true, false] {
+                    let fixture = DiffFixture::new().await;
+                    start_conflicted_merge(&fixture, FILE).await;
+
+                    let resolved = if mine {
+                        branch::merge::merge_resolve_mine(
+                            fixture.repository.clone(),
+                            &fixture.write_token,
+                            path_argument(&fixture, FILE),
+                        )
+                        .await
+                    } else {
+                        branch::merge::merge_resolve_theirs(
+                            fixture.repository.clone(),
+                            &fixture.write_token,
+                            path_argument(&fixture, FILE),
+                        )
+                        .await
+                    };
+                    resolved.expect("the resolve with a side");
+                    let node = staged_node(&fixture, FILE).await;
+                    assert!(node.is_staged_merge_resolved(), "mine: {mine}");
+                    assert_eq!(
+                        (node.is_staged_merge_mine(), node.is_staged_merge_theirs()),
+                        (mine, !mine)
+                    );
+
+                    branch::merge::merge_unresolve(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        path_argument(&fixture, FILE),
+                        branch::merge::MergeType::BranchMerge,
+                    )
+                    .await
+                    .expect("merge_unresolve failed");
+                    let node = staged_node(&fixture, FILE).await;
+                    assert!(node.is_staged_merge_unresolved(), "mine: {mine}");
+                    assert!(
+                        !node.is_staged_merge_mine() && !node.is_staged_merge_theirs(),
+                        "mine: {mine}: no side stays, flags {:#x}",
+                        node.flags
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// Paths where the merged feature branch still differs from main, under a
     /// full-tree diff. Empty means the two agree everywhere.
     async fn paths_divergent_from_main(
@@ -922,6 +1082,10 @@ mod tests {
         ("engine/lib/core/util/keep.txt", b"util\n"),
         ("engine/sub/deep/remove_deep.txt", b"remove deep\n"),
         ("engine/sub/gone/remove_gone.txt", b"remove gone\n"),
+        (
+            "engine/sub/gone/deeper/remove_deeper.txt",
+            b"remove deeper\n",
+        ),
     ];
 
     /// What main does to `engine/`: modifies a file, adds three (one in a new
@@ -1093,6 +1257,14 @@ mod tests {
                         .await
                         .expect("Failed to commit the merge");
                     }
+                    let merged = state::State::deserialize(fixture.repository.clone(), merged_rev)
+                        .await
+                        .expect("the merged State loads");
+                    let leaked = test_leaked_slots(&merged, &fixture.repository).await;
+                    assert!(
+                        leaked.is_empty(),
+                        "the merge under the view, no_commit {no_commit}, leaked {leaked:?}"
+                    );
                     let control_rev = merge_main_into_control(&fixture, &reshaped).await;
 
                     assert_eq!(
@@ -1521,6 +1693,97 @@ mod tests {
                     std::fs::read(&destination).expect("read renamed file"),
                     b"moved content\n",
                     "the rename destination holds the wrong content",
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A merge bringing in a rename inside a committed directory stages that directory, which the
+    /// move's realize marks once it relinks the node and the merge's stage of the moved node
+    /// marks again: the merge commit rehashes it, so its hash describes the file under its new
+    /// name.
+    #[tokio::test]
+    async fn merge_rename_inside_a_directory_rehashes_the_directory() {
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+
+                fixture.write_file("keep.txt", b"keep v1\n");
+                fixture.write_file("dir/a.txt", b"moved content\n");
+                fixture.write_file("dir/other.txt", b"other\n");
+                let base_revision = fixture.stage_and_commit("base").await;
+                let main_branch = fixture.main_branch_id;
+
+                let feature_branch = fixture.create_branch("feature").await;
+                fixture.write_file("keep.txt", b"keep v2 on feature\n");
+                let feature_rev = fixture.stage_and_commit("feature change").await;
+
+                fixture.switch_to(main_branch, base_revision).await;
+                fixture.write_file("keep.txt", b"keep v1\n");
+                fixture.stage_all().await;
+                fixture.stage_move("dir/a.txt", "dir/b.txt").await;
+                let renamed = fixture.commit("main renames a file in dir").await;
+
+                fixture.switch_to(feature_branch, feature_rev).await;
+                fixture.write_file("keep.txt", b"keep v2 on feature\n");
+                fixture.delete_file("dir/b.txt");
+                fixture.write_file("dir/a.txt", b"moved content\n");
+
+                let merged = Box::pin(merge_main_under_view(
+                    &fixture.repository,
+                    &fixture,
+                    main_branch,
+                    "merge main",
+                    false,
+                ))
+                .await;
+
+                let repository = fixture.repository.clone();
+                let directory_hash = async |revision: Hash| {
+                    let state =
+                        lore_revision::state::State::deserialize(repository.clone(), revision)
+                            .await
+                            .expect("the revision's state");
+                    assert!(
+                        state
+                            .find_node_link(repository.clone(), "dir/b.txt")
+                            .await
+                            .is_ok()
+                            != state
+                                .find_node_link(repository.clone(), "dir/a.txt")
+                                .await
+                                .is_ok(),
+                        "the revision holds one of the two names"
+                    );
+                    let link = state
+                        .find_node_link(repository.clone(), "dir")
+                        .await
+                        .expect("dir");
+                    state
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("dir")
+                        .address
+                        .hash
+                };
+                let merged_state =
+                    lore_revision::state::State::deserialize(repository.clone(), merged)
+                        .await
+                        .expect("the merged state");
+                assert!(
+                    merged_state
+                        .find_node_link(repository.clone(), "dir/b.txt")
+                        .await
+                        .is_ok(),
+                    "the merge holds the file under its new name"
+                );
+                assert_eq!(
+                    directory_hash(merged).await,
+                    directory_hash(renamed).await,
+                    "the merge commit rehashed dir as the rename's commit hashed it"
                 );
             }))
             .await

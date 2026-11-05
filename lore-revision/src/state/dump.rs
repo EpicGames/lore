@@ -28,7 +28,7 @@ pub async fn dump(
     max_depth: usize,
 ) -> Result<(), StateError> {
     // Dump out the merkle tree
-    let tree_hash = state.data.read().hash_tree;
+    let tree_hash = state.data_read().hash_tree;
     let tree = state.tree(repository.clone()).await?;
     event::LoreEvent::RepositoryStateDump(LoreRepositoryStateDumpEventData {
         revision_number: state.revision_number(),

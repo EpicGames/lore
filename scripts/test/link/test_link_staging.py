@@ -13,7 +13,12 @@ from link_helpers import (
     remount,
 )
 from lore_parsers import parse_status_json
-from test_utils import unstaged_entries, working_tree_files
+from test_utils import (
+    has_staged_anchor,
+    status_by_path,
+    unstaged_entries,
+    working_tree_files,
+)
 
 from lore import Lore
 
@@ -404,6 +409,65 @@ def test_link_staging(new_lore_repo):
     # Verify synchronized state matches all operations
     assert sync_test_repo.compare_file(repo, expected_file_path), (
         "Sync: File staged from within link should match"
+    )
+
+
+@pytest.mark.smoke
+def test_link_unstage_of_an_added_link_keeps_a_dirty_sibling_dirty(new_lore_repo):
+    """Unstaging an added link beside a dirtied file keeps the file dirty: the directories above
+    the link keep their dirty flag while the file below them holds one, so neither the flag nor
+    the staged state holding it is dropped."""
+    kept = "vendor/kept.txt"
+    link_path = "vendor/lib"
+    parent_repo = make_repo(
+        new_lore_repo, {kept: "kept\n", DEFAULT_PARENT_FILE: "baseline\n"}, "Baseline"
+    )
+    link_repo = make_repo(
+        new_lore_repo, {"linked.txt": "linked content\n"}, "Initial linked content"
+    )
+    parent_repo.write_files({kept: "edited\n"})
+    parent_repo.dirty([kept])
+    parent_repo.link_add(link_path, link_repo.get_id(), "/")
+
+    parent_repo.unstage(link_path)
+
+    entries = status_by_path(parent_repo)
+    assert entries.get(kept, {}).get("flagDirty") is True, (
+        f"Expected {kept} to stay dirty after the link's unstage, got: {entries}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_unstage_of_an_added_link_dirtied_through_its_mount_leaves_nothing(
+    new_lore_repo,
+):
+    """Unstaging an added link that an edit through its mount dirtied takes the link's dirty
+    flag with its staged ones: no directory above it stays dirty, so no staged state is left.
+
+    Unstaging an added link deletes the link's files from the mount, and refuses to delete one
+    that differs from the linked revision unless forced. `linked.txt` holds the edit, so the
+    unstage is forced to delete it with its local change."""
+    link_path = "vendor/lib"
+    parent_repo = make_repo(
+        new_lore_repo,
+        {"vendor/kept.txt": "kept\n", DEFAULT_PARENT_FILE: "baseline\n"},
+        "Baseline",
+    )
+    link_repo = make_repo(
+        new_lore_repo, {"linked.txt": "linked content\n"}, "Initial linked content"
+    )
+    parent_repo.link_add(link_path, link_repo.get_id(), "/")
+    linked_file = f"{link_path}/linked.txt"
+    parent_repo.write_files({linked_file: "edited through the mount\n"})
+    parent_repo.dirty([linked_file])
+
+    # Forced: the unstage deletes the link's files, and `linked.txt` holds a local change.
+    parent_repo.unstage(link_path, force=True)
+
+    entries = status_by_path(parent_repo)
+    assert entries == {}, f"Expected nothing staged or dirty, got: {entries}"
+    assert not has_staged_anchor(parent_repo), (
+        "Expected the unstage to leave no staged state"
     )
 
 

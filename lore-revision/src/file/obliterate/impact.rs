@@ -20,6 +20,8 @@ use crate::lore::Address;
 use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_warn;
+use crate::node::Node;
+use crate::node::NodeBlock;
 use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::state::State;
@@ -209,10 +211,11 @@ pub(super) async fn snapshot_affected(
         if !visited.insert((current.id, state.revision(), id)) {
             continue;
         }
-        let node = state
-            .node(current.clone(), id)
+        let block = state
+            .block(current.clone(), NodeBlock::index(id))
             .await
             .forward::<ObliterateError>("reading latest node")?;
+        let node = block.node(Node::index(id));
         if node.is_discarded() || node.is_staged_delete() {
             continue;
         }
@@ -242,10 +245,12 @@ pub(super) async fn snapshot_affected(
                 .forward::<ObliterateError>("reading linked revision")?;
             pending.push((linked, state, link.node));
         } else {
-            let mut iter =
-                StateNodeChildrenIterator::from_parent(state.clone(), current.clone(), id, &node)
-                    .await
-                    .forward::<ObliterateError>("reading latest children")?;
+            let (_, mut iter) = StateNodeChildrenIterator::with_parent_in(
+                state.clone(),
+                current.clone(),
+                id,
+                block,
+            );
             loop {
                 let Some((child, _)) = iter
                     .next()

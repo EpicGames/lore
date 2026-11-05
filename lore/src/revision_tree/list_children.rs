@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
+use lore_base::error::SlowDown;
 use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
 use lore_error_set::prelude::*;
@@ -29,7 +30,9 @@ use lore_revision::state::StateNodeChildrenWithNameIterator;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::revision_tree::call::EntryFailure;
 use crate::revision_tree::call::revision_tree_call;
+use crate::revision_tree::call::state_failure;
 use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_list_children`.
@@ -48,12 +51,14 @@ pub struct LoreRevisionTreeListChildrenArgs {
 #[error_set]
 enum ListChildrenError {
     InvalidArguments,
+    SlowDown,
 }
 
 impl EventError for ListChildrenError {
     fn translated(&self) -> LoreError {
         match self {
             ListChildrenError::InvalidArguments(_) => LoreError::InvalidArguments,
+            ListChildrenError::SlowDown(_) => LoreError::SlowDown,
             ListChildrenError::Internal(_) => LoreError::Internal,
         }
     }
@@ -108,23 +113,28 @@ fn invalid(reason: &str) -> ListChildrenError {
 }
 
 /// Resolve `parent_id` to the directory whose children should be listed,
-/// following links to their target revision. Returns `Ok(None)` when the id is
-/// unknown, resolves to a non-directory (leaf) node, or points through a link
-/// to a node that no longer exists. Following is bounded by `MAX_LINK_DEPTH`: a
-/// chain longer than that, or a cycle, fails with `InvalidArguments` rather than
-/// looping forever.
+/// following links to their target revision, answering
+/// `Some((state, repository, None))` for a discarded node, which lists as empty.
+/// Returns `Ok(None)` when the id is unknown, resolves to a non-directory (leaf)
+/// node, or points through a link to a node that no longer exists. Following is
+/// bounded by `MAX_LINK_DEPTH`: a chain longer than that, or a cycle, fails with
+/// `InvalidArguments` rather than looping forever.
 async fn resolve_listing_target(
     mut state: Arc<State>,
     mut repository: Arc<RepositoryContext>,
     mut node_id: NodeID,
-) -> Result<Option<(Arc<State>, Arc<RepositoryContext>, NodeID)>, ListChildrenError> {
+) -> Result<Option<(Arc<State>, Arc<RepositoryContext>, Option<NodeID>)>, ListChildrenError> {
     let mut link_depth = 0usize;
     loop {
         let Ok(node) = state.node(repository.clone(), node_id).await else {
             return Ok(None);
         };
+        // A discarded node lists as a freed slot does, as an empty directory, whatever it was.
+        if node.is_discarded() {
+            return Ok(Some((state, repository, None)));
+        }
         if node.is_directory() {
-            return Ok(Some((state, repository, node_id)));
+            return Ok(Some((state, repository, Some(node_id))));
         }
         if !node.is_link() {
             return Ok(None);
@@ -138,7 +148,7 @@ async fn resolve_listing_target(
         state = State::deserialize(repository.clone(), link.revision)
             .await
             .map_err(|error| {
-                ListChildrenError::internal_with_context(error, "deserialize link target state")
+                state_failure::<ListChildrenError>(error, "deserialize link target state")
             })?;
         node_id = link.node;
     }
@@ -156,19 +166,25 @@ async fn resolve_listing_target(
 /// parent node id or a non-directory (leaf) parent emits the header with
 /// `error_code = INVALID_ARGUMENTS` and a zeroed repository/revision, then fails.
 /// Iteration is streaming: at most one child is held in memory at a time. The
-/// verb materializes no bytes to disk.
+/// verb materializes no bytes to disk. It runs under the handle's shared claim,
+/// beside the handle's moves and deletions, so a child moved away may be left
+/// out or, where the walk loses its place, reported twice
+/// ([`StateNodeChildrenWithNameIterator::may_repeat`]).
 ///
 /// Node ids are opaque values issued by the API. An id the API never issued
 /// that happens to land on an unallocated slot of an existing block reads back
 /// as an empty directory rather than `INVALID_ARGUMENTS`; only ids resolving to
 /// a non-existent block or the reserved invalid sentinel are rejected.
 ///
-/// The header is the only id-carrying terminal: a failure that surfaces after a
-/// successful header has fired — a tree-block read error mid-iteration — is
-/// reported on the trailing `Complete{status:InvalidArguments}`, which carries no `id`. Such a
-/// mid-stream failure is therefore not attributable to this call on a
-/// multiplexed transport; callers treat a non-zero `Complete` after a successful
-/// header as "the listing was truncated".
+/// A failure of the tree's reads reports `INTERNAL`, and a walk the tree gave up
+/// on under load, heavy changes beside it or a store asking it to slow down,
+/// reports `SLOW_DOWN`, which a caller can retry. The header is the only
+/// id-carrying terminal: a failure that surfaces after a successful header has
+/// fired — a tree-block read error, or a walk given up, mid-iteration — is
+/// reported on the trailing `Complete`, which carries no `id`. Such a mid-stream
+/// failure is therefore not attributable to this call on a multiplexed
+/// transport; callers treat a non-zero `Complete` after a successful header as
+/// "the listing was truncated".
 pub async fn list_children(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeListChildrenArgs,
@@ -232,6 +248,7 @@ async fn list_children_impl(
                 Err(error) => {
                     let error_code = match error {
                         ListChildrenError::InvalidArguments(_) => LoreErrorCode::InvalidArguments,
+                        ListChildrenError::SlowDown(_) => LoreErrorCode::SlowDown,
                         ListChildrenError::Internal(_) => LoreErrorCode::Internal,
                     };
                     emit_begin(id, RepositoryId::default(), Hash::default(), error_code);
@@ -241,6 +258,10 @@ async fn list_children_impl(
 
             let begin_repository = list_repository.id;
             let begin_revision = list_state.revision();
+            let Some(list_node) = list_node else {
+                emit_begin(id, begin_repository, begin_revision, LoreErrorCode::None);
+                return Ok(());
+            };
 
             let mut children = match StateNodeChildrenWithNameIterator::new(
                 list_state,
@@ -255,9 +276,9 @@ async fn list_children_impl(
                         id,
                         RepositoryId::default(),
                         Hash::default(),
-                        LoreErrorCode::Internal,
+                        EntryFailure::of(&error).code(),
                     );
-                    return Err(ListChildrenError::internal_with_context(
+                    return Err(state_failure(
                         error,
                         "StateNodeChildrenWithNameIterator::new",
                     ));
@@ -273,7 +294,7 @@ async fn list_children_impl(
                     }
                     Ok(None) => break,
                     Err(error) => {
-                        return Err(ListChildrenError::internal_with_context(
+                        return Err(state_failure(
                             error,
                             "StateNodeChildrenWithNameIterator::next",
                         ));

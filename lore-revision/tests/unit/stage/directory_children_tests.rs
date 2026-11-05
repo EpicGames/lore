@@ -5,7 +5,7 @@ use lore_revision::stage::*;
 
 /// The children in sibling order, as `stage_directory` indexes them.
 fn children(entries: &[(NodeID, u64)]) -> DirectoryChildren {
-    DirectoryChildren::new(entries.to_vec())
+    DirectoryChildren::new(entries.to_vec(), None)
 }
 
 #[test]
@@ -74,21 +74,6 @@ fn a_claimed_child_is_still_held() {
     assert_eq!(children.claim(0xAA), None, "the listing offers no more");
     assert_eq!(children.holds(0xAA), Some(10), "the listing still holds it");
     assert_eq!(children.holds(0xCC), None, "a name it never held");
-}
-
-/// The head is the child the chain was headed by, which everything linked in
-/// since sits ahead of.
-#[test]
-fn the_listing_head_is_the_first_child_in_sibling_order() {
-    let mut indexed = children(&[(10, 0xAA), (11, 0xBB)]);
-    assert_eq!(indexed.listing_head, Some(10));
-    assert_eq!(indexed.claim(0xAA), Some(10));
-    assert_eq!(
-        indexed.listing_head,
-        Some(10),
-        "claiming the head does not move it"
-    );
-    assert_eq!(children(&[]).listing_head, None, "an empty listing");
 }
 
 #[test]

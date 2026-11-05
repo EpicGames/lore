@@ -7,6 +7,7 @@ import pytest
 from error_types import LocalChanges, LoreException
 from link_helpers import assert_crr_clean, make_parent_with_link, make_repo
 from lore_parsers import parse_status_json
+from test_utils import has_staged_anchor, status_by_path
 
 from lore import Lore
 
@@ -406,6 +407,31 @@ def test_link_reset_staged_add_into_existing_directory(new_lore_repo):
     assert main_repo.path_exists(link_path), (
         "Pre-existing committed directory must survive reset"
     )
+
+
+@pytest.mark.smoke
+def test_link_unstage_of_an_add_over_a_committed_directory_leaves_nothing(
+    new_lore_repo,
+):
+    """Unstaging a link added over a committed empty directory takes back the directory's staged
+    delete with its dirty flags: the directory stays, and no staged state is left."""
+    main_repo = make_repo(new_lore_repo, {"main.txt": "initial content\n"})
+    source_repo = make_repo(new_lore_repo, {"a.txt": "link source content\n"})
+    link_path = "linked"
+    main_repo.make_dirs(link_path)
+    main_repo.stage(scan=True)
+    main_repo.commit("add empty linked directory")
+    main_repo.push()
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+
+    main_repo.unstage(link_path)
+
+    entries = status_by_path(main_repo)
+    assert entries == {}, f"Expected nothing staged or dirty, got: {entries}"
+    assert not has_staged_anchor(main_repo), (
+        "Expected the unstage to leave no staged state"
+    )
+    assert main_repo.path_exists(link_path), "the committed directory stays"
 
 
 @pytest.mark.smoke

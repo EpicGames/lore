@@ -58,39 +58,88 @@ use crate::util::path::EntryPath;
 use crate::util::path::RelativePath;
 
 /// Find-or-create the directory node chain from `start` down to `path`, relative
-/// to it, marking newly created segments as dirty-add. A path-filtered scan can
+/// to it, marking newly created segments as dirty-add and the directory above the
+/// first of them dirty, with its ancestors. A path-filtered scan can
 /// enter a directory (or a file's parent) present on disk but absent from
 /// `state_from`; creating the chain lets adds discovered inside resolve their
-/// parent node. Returns the node for the final path segment.
+/// parent node. Returns the node for the final path segment. A find that fails
+/// other than for a missing name returns its error, adding nothing for that name.
+///
+/// A reserved name anywhere in `path` answers as no node. A name the tree holds is taken as it
+/// holds it, so one stored before a rule refused it still leads on; the names from the first one
+/// missing onward are checked as an add checks them before any is added, so a refusal adds
+/// nothing.
+///
+/// `lore dirty`'s chain, `ensure_dirty_parent_dirs` in `file/dirty.rs`, walks the same way but adds
+/// each directory with no flags, then marks it `DirtyAdd`, climbing from it, and checks no name
+/// before its add.
 ///
 /// `path` is generic so a caller spawning this future can hand over an owned path.
+#[lore_macro::test_pub]
 pub(crate) async fn ensure_scan_dir_chain(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     start: NodeID,
     path: impl AsRef<str>,
 ) -> Result<NodeID, StateError> {
+    if path.as_ref().split('/').any(is_reserved_node_name) {
+        return Err(NodeNotFound.into());
+    }
     let mut current_node = start;
-    for segment in path.as_ref().split('/').filter(|s| !s.is_empty()) {
-        if is_reserved_node_name(segment) {
-            return Err(NodeNotFound.into());
+    let mut marked = false;
+    // Split by hand: a `split('/')` iterator held across the awaits below costs this future 56
+    // bytes more than the rest of the path does.
+    let mut rest = path.as_ref();
+    while !rest.is_empty() {
+        let (segment, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        rest = tail;
+        if segment.is_empty() {
+            continue;
         }
         let name_hash = crate::hash::hash_string(segment);
-        if let Ok(child_id) = state
+        // Only a name the directory lacks is added: a find that failed otherwise, as on a block
+        // that did not load, says nothing of the name, and the add checks none. The add follows
+        // the match, so the find's answer is not held across its awaits.
+        match state
             .find_subnode(repository.clone(), current_node, name_hash)
             .await
         {
-            current_node = child_id;
-        } else {
-            let dir_node = Node {
-                flags: NodeFlags::DirtyAdd.bits(),
-                name_hash,
-                ..Default::default()
-            };
-            current_node = state
-                .node_add(repository.clone(), current_node, dir_node, segment)
-                .await
-                .forward::<StateError>("scan add: failed to create entry directory node")?;
+            Ok(child_id) => {
+                current_node = child_id;
+                continue;
+            }
+            Err(error) if !error.is_node_not_found() => return Err(error),
+            Err(_) => {}
+        }
+        if !marked {
+            for name in std::iter::once(segment).chain(rest.split('/')) {
+                if !name.is_empty() {
+                    validate_node_name_for_store(name)
+                        .forward::<StateError>("scan add: entry directory name not storable")?;
+                }
+            }
+        }
+        let dir_node = Node {
+            flags: NodeFlags::DirtyAdd.bits(),
+            name_hash,
+            ..Default::default()
+        };
+        let parent = current_node;
+        current_node = state
+            .node_add(repository.clone(), parent, dir_node, segment)
+            .await
+            .forward::<StateError>("scan add: failed to create entry directory node")?;
+        // The first add's directory marked at once, before a later add may fail; the adds after
+        // it go under directories added dirty.
+        if !marked {
+            marked = true;
+            state
+                .node_mark(
+                    &repository,
+                    parent,
+                    Mark::dirty(NodeFlags::Dirty, Ext::Keep, false),
+                )
+                .await?;
         }
     }
     Ok(current_node)
@@ -651,18 +700,13 @@ async fn record_observed_size(
     node_id: NodeID,
     observed: &FileInfo,
 ) -> Result<(), StateError> {
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-    let block = state.block(repository.clone(), block_index).await?;
-    let dirtied = {
-        let mut locked_block = block.write();
-        locked_block.node(node_index).size = observed.size();
-        locked_block.mark_dirty()
-    };
-    if dirtied {
-        state.block_modified(block, block_index);
-        state.mark_dirty();
-    }
+    let block = state
+        .block(repository.clone(), NodeBlock::index(node_id))
+        .await?;
+    state.node_change_owned(&block, node_id, |held| {
+        held.set_size(observed.size());
+        true
+    });
     Ok(())
 }
 
@@ -687,38 +731,6 @@ async fn emit_dirty_add_node_single(
         mark_settled(&state, &repository, node_id, SettledAction::Add, intent).await?;
     }
     emit_add_node_single(repository, state, node_id, path, changes, stats).await
-}
-
-/// Reports `node`, the directory at `path` that a marking walk added below the directory `parent`
-/// maps, and marks `parent` dirty.
-async fn report_new_directory(
-    parent: &NodeMapping,
-    node: NodeID,
-    path: &RelativePath,
-    intent: FilesystemDiffIntent,
-    changes: &ChangeSender,
-    stats: &FilesystemDiffStats,
-) -> Result<(), StateError> {
-    emit_dirty_add_node_single(
-        parent.repository.clone(),
-        parent.state.clone(),
-        node,
-        path,
-        changes,
-        stats,
-        intent,
-    )
-    .await?;
-    parent
-        .state
-        .node_mark_dirty(
-            parent.repository.clone(),
-            parent.node,
-            NodeFlags::Dirty,
-            false,
-        )
-        .await?;
-    Ok(())
 }
 
 /// Emit a single Add change for `node_id` as it stands, without marking it and without
@@ -852,7 +864,7 @@ async fn handle_single_file_compare_result(
                     && ctx.from_node.is_some_and(|n| n.is_dirty())
                 {
                     ctx.state_from
-                        .node_clear_dirty(ctx.repository_from.clone(), ctx.from_node_id)
+                        .node_clear(&ctx.repository_from, ctx.from_node_id, Clear::Dirty)
                         .await?;
                 }
             }
@@ -1003,11 +1015,12 @@ async fn diff_filesystem_directory(
                 StateChildrenNodes {
                     repository: repository.clone(),
                     state: state.clone(),
-                    children: vec![StateNamedNode {
-                        node: *node_id,
-                        name: node.name_hash,
-                        flags: NodeFlags::from_bits_retain(node.flags),
-                    }],
+                    children: vec![StateNamedNode::new(
+                        *node_id,
+                        0,
+                        node.name_hash,
+                        NodeFlags::from_bits_retain(node.flags),
+                    )],
                 }
             }
         } else {
@@ -1063,7 +1076,7 @@ async fn diff_filesystem_directory(
 }
 
 /// Emit a single `Delete` change for one node, reloading it so any dirty flags
-/// just persisted by [`State::node_mark_dirty`] are reflected in the record.
+/// just persisted by [`State::node_mark`] are reflected in the record.
 async fn emit_single_delete(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -1149,7 +1162,7 @@ async fn flush_pending_dir_deletes(
 /// When the intent marks dirty, every node a delete is emitted for — the
 /// materializing leaf and each flushed ancestor directory — is marked
 /// `DirtyDelete` so the persisted dirty-tracking state records the deletion at
-/// the granularity it is reported. `node_mark_dirty` short-circuits on a node
+/// the granularity it is reported. An unforced `node_mark` short-circuits on a node
 /// already carrying the base `Dirty` bit (which `DirtyDelete` includes), so a
 /// sibling's upward propagation never clobbers a directory's `DirtyDelete`.
 ///
@@ -1421,7 +1434,7 @@ async fn staged_entry(
         || stage.node_flags.contains(NodeFlags::StagedMerge)
         || node.is_staged_merge_unresolved();
     if node.is_staged_delete() {
-        state.node_clear_staged(repository.clone(), node_id).await?;
+        state.node_clear(repository, node_id, Clear::Staged).await?;
         mark_settled(
             state,
             repository,
@@ -1511,7 +1524,12 @@ async fn diff_filesystem_directory_walk(
                         let named = &node_list.children[index];
                         node_list
                             .state
-                            .tracks_as(&node_list.repository, named.node, named.flags, is_directory)
+                            .tracks_as(
+                                &node_list.repository,
+                                named.node,
+                                named.flags(),
+                                is_directory,
+                            )
                             .await
                     }
                     None => Ok(false),
@@ -2645,14 +2663,26 @@ fn diff_filesystem_new_entries<'a>(
                         )
                         .await
                         .forward::<StateError>("scan add: failed to add new directory node")?;
+                    // Marked before the walk below, the walk below an excluded directory included,
+                    // so a failure there leaves no add under a clean directory. Discarding an
+                    // excluded directory the walk added nothing below clears the mark again.
+                    ctx.from
+                        .state
+                        .node_mark(
+                            &ctx.from.repository,
+                            ctx.from.node,
+                            Mark::dirty(NodeFlags::Dirty, Ext::Keep, false),
+                        )
+                        .await?;
                     if !child_states.excluded(ctx.filter_mode) {
-                        report_new_directory(
-                            &ctx.from,
+                        emit_dirty_add_node_single(
+                            ctx.from.repository.clone(),
+                            ctx.from.state.clone(),
                             dir_from_root,
                             &child_file_path,
-                            ctx.intent,
                             changes,
                             stats,
+                            ctx.intent,
                         )
                         .await?;
                     }
@@ -2760,10 +2790,13 @@ async fn diff_filesystem_subtree_dispatch(
 ) -> Result<(), StateError> {
     if let Ok(permit) = diff_filesystem_task_semaphore().clone().try_acquire_owned() {
         let changes = changes.clone();
-        lore_spawn!(tasks, async move {
-            let _permit = permit;
-            diff_filesystem_subtree_recurse(subtree, &changes).await
-        });
+        lore_spawn!(
+            tasks,
+            crate::subtask!(async move {
+                let _permit = permit;
+                diff_filesystem_subtree_recurse(subtree, &changes).await
+            })
+        );
     } else {
         stats.append(diff_filesystem_subtree_recurse(subtree, changes).await?);
     }
@@ -2787,10 +2820,13 @@ async fn diff_filesystem_new_excluded_dispatch(
 ) -> Result<(), StateError> {
     if let Ok(permit) = diff_filesystem_task_semaphore().clone().try_acquire_owned() {
         let changes = changes.clone();
-        lore_spawn!(tasks, async move {
-            let _permit = permit;
-            diff_filesystem_new_excluded_directory(subtree, parent, &changes).await
-        });
+        lore_spawn!(
+            tasks,
+            crate::subtask!(async move {
+                let _permit = permit;
+                diff_filesystem_new_excluded_directory(subtree, parent, &changes).await
+            })
+        );
     } else {
         stats.append(diff_filesystem_new_excluded_directory(subtree, parent, changes).await?);
     }
@@ -2816,7 +2852,18 @@ async fn diff_filesystem_new_excluded_directory(
         Some(discards) if stats.file_add.load(Ordering::Relaxed) == 0 => {
             discards.queue(parent.state, parent.repository, vec![node]);
         }
-        _ => report_new_directory(&parent, node, &path, intent, changes, &stats).await?,
+        _ => {
+            emit_dirty_add_node_single(
+                parent.repository,
+                parent.state,
+                node,
+                &path,
+                changes,
+                &stats,
+                intent,
+            )
+            .await?;
+        }
     }
     Ok(stats)
 }

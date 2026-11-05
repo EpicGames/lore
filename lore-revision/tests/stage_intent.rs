@@ -1787,4 +1787,55 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// A staging walk records a tracked file it finds changed as both staged and dirty
+    /// modified: the dirty action stands beside the staged one, as every stage records it.
+    #[tokio::test]
+    async fn a_staging_walk_records_a_modify_staged_and_dirty() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let file = fixture.path.join("tracked.txt");
+                test_file_write(&file, b"committed");
+                test_commit_tree(&fixture, "Seed").await;
+                test_file_write(&file, b"changed since the commit");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let changes = test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                let modified = changes
+                    .iter()
+                    .find(|change| change.path().as_str() == "tracked.txt")
+                    .expect("the walk must report the changed file");
+                let node = staged
+                    .node(repository.clone(), modified.from.mapping.node)
+                    .await
+                    .expect("the staged node must read back");
+                let flags = NodeFlags::from_bits_retain(node.flags);
+                assert!(
+                    flags.contains(NodeFlags::StagedModify),
+                    "the staged action, flags {:x}",
+                    node.flags
+                );
+                assert!(
+                    flags.contains(NodeFlags::DirtyModify),
+                    "the dirty action beside it, flags {:x}",
+                    node.flags
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }

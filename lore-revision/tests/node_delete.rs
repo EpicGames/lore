@@ -13,6 +13,8 @@ mod tests {
     use lore_base::types::Hash;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
+    use lore_revision::state::Content;
+    use lore_revision::state::Mark;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
@@ -203,7 +205,7 @@ mod tests {
                     .await
                     .expect("the block must be readable");
                 block
-                    .write()
+                    .write_for_tests()
                     .discard_node(block_index, Node::index(node_id));
 
                 state
@@ -240,7 +242,7 @@ mod tests {
     /// revision the handle was loaded from, so what is staged is a change to it.
     /// A zero context preserves the identity it already had.
     #[tokio::test]
-    async fn node_undelete_returns_a_node_as_a_modification() {
+    async fn node_restore_returns_a_node_as_a_modification() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         runtime()
@@ -265,12 +267,14 @@ mod tests {
                     .expect("staging the deletion must succeed");
 
                 state
-                    .node_undelete(
-                        repository.clone(),
+                    .node_restore(
+                        &repository,
                         node_id,
-                        0o600,
-                        4096,
-                        address(2, Context::default()),
+                        &Content {
+                            mode: 0o600,
+                            size: 4096,
+                            address: address(2, Context::default()),
+                        },
                     )
                     .await
                     .expect("restoring the node must succeed");
@@ -311,7 +315,7 @@ mod tests {
     /// Restoring is only meaningful for a node on its way out. Letting it run on a
     /// live node would rewrite its content while calling the edit a restore.
     #[tokio::test]
-    async fn node_undelete_refuses_a_node_that_is_not_staged_for_deletion() {
+    async fn node_restore_refuses_a_node_that_is_not_staged_for_deletion() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         runtime()
@@ -331,12 +335,14 @@ mod tests {
                     .expect("adding the file must succeed");
 
                 state
-                    .node_undelete(
-                        repository.clone(),
+                    .node_restore(
+                        &repository,
                         node_id,
-                        0o600,
-                        4096,
-                        address(2, Context::default()),
+                        &Content {
+                            mode: 0o600,
+                            size: 4096,
+                            address: address(2, Context::default()),
+                        },
                     )
                     .await
                     .expect_err("a live node must not be restorable");
@@ -348,7 +354,7 @@ mod tests {
     /// A directory carries no content of its own, so a restore drops the size and
     /// address it is handed rather than storing values a commit would recompute.
     #[tokio::test]
-    async fn node_undelete_drops_the_fields_a_directory_does_not_carry() {
+    async fn node_restore_drops_the_fields_a_directory_does_not_carry() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         runtime()
@@ -372,12 +378,14 @@ mod tests {
                     .expect("staging the deletion must succeed");
 
                 state
-                    .node_undelete(
-                        repository.clone(),
+                    .node_restore(
+                        &repository,
                         node_id,
-                        0o700,
-                        4096,
-                        address(2, file_id()),
+                        &Content {
+                            mode: 0o700,
+                            size: 4096,
+                            address: address(2, file_id()),
+                        },
                     )
                     .await
                     .expect("restoring the directory must succeed");
@@ -402,7 +410,7 @@ mod tests {
     /// every ancestor is marked so a commit walking down from the root reaches it.
     /// The root node itself is never flagged — the walk stops above it.
     #[tokio::test]
-    async fn node_mark_staged_records_the_pair_and_marks_the_ancestors() {
+    async fn a_staged_and_dirty_mark_records_the_pair_and_marks_the_ancestors() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         runtime()
@@ -431,11 +439,10 @@ mod tests {
                     .expect("adding the file must succeed");
 
                 state
-                    .node_mark_staged(
-                        repository.clone(),
+                    .node_mark(
+                        &repository,
                         node_id,
-                        NodeFlags::StagedAdd,
-                        NodeFlags::DirtyAdd,
+                        Mark::staged_and_dirty(NodeFlags::StagedAdd, NodeFlags::DirtyAdd),
                     )
                     .await
                     .expect("marking must succeed");

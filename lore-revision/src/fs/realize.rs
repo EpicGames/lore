@@ -49,7 +49,6 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
-use crate::node::SiblingCycleGuard;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::repository::BASE_SUFFIX;
 use crate::repository::MINE_SUFFIX;
@@ -66,6 +65,8 @@ use crate::revision::sync::SyncVerifyArgs;
 use crate::revision::sync::SyncVerifyStats;
 use crate::stage;
 use crate::state;
+use crate::state::Mark;
+use crate::state::NameChange;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
 use crate::state::State;
@@ -2346,7 +2347,7 @@ fn realize_change_modify_add(
             if change.action == change::FileAction::Move
                 && let Some(from_path) = change.move_source()
             {
-                let from_node_id = state_stage
+                let from_node = state_stage
                     .find_node_link(repository.clone(), from_path.as_str())
                     .await
                     .forward::<SyncError>("Failed to stage change")?
@@ -2354,9 +2355,9 @@ fn realize_change_modify_add(
                 relink_moved_node(
                     &state_stage,
                     &repository,
-                    &change,
                     from_path,
-                    from_node_id,
+                    from_node,
+                    path,
                     is_merge,
                 )
                 .await?;
@@ -2450,150 +2451,53 @@ async fn clone_added_link(
     .forward::<SyncError>("Failed to sync link")
 }
 
-/// Stages a realized move by relinking `from_node_id`, the staged node at `from_path`, under
-/// the path the change moves it to, keeping its identity, and marks it staged as a move.
-/// Answers with the node's new parent.
+/// Stages a realized move by relinking `from_node`, the staged node at `from_path`, to `to_path`,
+/// keeping its identity; marks it staged as a move and stages the directory it left. Answers with
+/// the node's new parent.
 ///
 /// A function of its own because its locals live across several awaits: kept in
 /// [`realize_change_modify_add`] they would take space in the future of every change realized.
+#[lore_macro::test_pub]
 pub(crate) async fn relink_moved_node(
     state_stage: &Arc<State>,
     repository: &Arc<RepositoryContext>,
-    change: &NodeChange,
     from_path: &RelativePath,
-    from_node_id: NodeID,
+    from_node: NodeID,
+    to_path: &RelativePath,
     is_merge: bool,
 ) -> Result<NodeID, SyncError> {
-    // Relinking keeps the existing node, which preserves its identity and from_path tracking.
-    let block_index = NodeBlock::index(from_node_id);
-    let node_index = Node::index(from_node_id);
-    let block = state_stage
-        .block(repository.clone(), block_index)
+    let new_parent_id = state_stage
+        .find_node_link(repository.clone(), to_path.parent().unwrap_or(""))
         .await
-        .forward::<SyncError>("Failed deserializing state node block")?;
-    let mut from_node = block.node(node_index);
+        .forward::<SyncError>("Failed to stage change")?
+        .node;
 
-    // Determine the new parent node
-    let mut parent_path = change.path().clone();
-    parent_path.pop();
-    let new_parent_node_link = state_stage
-        .find_node_link(repository.clone(), parent_path.as_str())
-        .await
-        .forward::<SyncError>("Failed to stage change")?;
-    let new_parent_id = new_parent_node_link.node;
-
-    // Unlink the node from its current parent
-    if from_node.parent != new_parent_id {
-        let old_parent_block_index = NodeBlock::index(from_node.parent);
-        let old_parent_node_index = Node::index(from_node.parent);
-        let old_parent_block = state_stage
-            .block(repository.clone(), old_parent_block_index)
-            .await
-            .forward::<SyncError>("Failed deserializing state node block")?;
-        let old_parent_node = old_parent_block.node(old_parent_node_index);
-
-        if old_parent_node.child == from_node_id {
-            let dirtied = {
-                let mut block = old_parent_block.write();
-                block.node(old_parent_node_index).child = from_node.sibling;
-                block.mark_dirty()
-            };
-            if dirtied {
-                state_stage.block_modified(old_parent_block, old_parent_block_index);
-                state_stage.mark_dirty();
-            }
-        } else {
-            let old_parent_id = from_node.parent;
-            let mut child_id = old_parent_node.child().unwrap_or_default();
-            let mut cycle = SiblingCycleGuard::new(old_parent_id);
-            while let Some(sibling) = {
-                let child = state_stage
-                    .node(repository.clone(), child_id)
-                    .await
-                    .forward::<SyncError>("Failed deserializing state node block")?;
-                child
-                    .walk_step(child_id, old_parent_id, &mut cycle)
-                    .forward::<SyncError>("Invalid node hierarchy in revision state")?;
-                child.sibling()
-            } {
-                if sibling == from_node_id {
-                    let child_block_index = NodeBlock::index(child_id);
-                    let child_node_index = Node::index(child_id);
-                    let child_block = state_stage
-                        .block(repository.clone(), child_block_index)
-                        .await
-                        .forward::<SyncError>("Failed deserializing state node block")?;
-                    let dirtied = {
-                        let mut block = child_block.write();
-                        block.node(child_node_index).sibling = from_node.sibling;
-                        block.mark_dirty()
-                    };
-                    if dirtied {
-                        state_stage.block_modified(child_block, child_block_index);
-                        state_stage.mark_dirty();
-                    }
-                    break;
-                }
-                child_id = sibling;
-            }
-        }
-
-        // Relink the same node to the new parent under the new path
-        let new_parent_block_index = NodeBlock::index(new_parent_id);
-        let new_parent_node_index = Node::index(new_parent_id);
-        let new_parent_block = state_stage
-            .block(repository.clone(), new_parent_block_index)
-            .await
-            .forward::<SyncError>("Failed deserializing state node block")?;
-        let sibling_node_id;
-        let dirtied = {
-            let mut block = new_parent_block.write();
-            let parent_node = block.node(new_parent_node_index);
-            sibling_node_id = parent_node.child;
-            parent_node.child = from_node_id;
-            block.mark_dirty()
-        };
-        if dirtied {
-            state_stage.block_modified(new_parent_block, new_parent_block_index);
-            state_stage.mark_dirty();
-        }
-        from_node.sibling = sibling_node_id;
-        from_node.parent = new_parent_id;
-    }
-
-    // Update node name if changed
     let from_name = from_path.name();
-    let to_name = change.path().name();
-    if from_name != to_name {
-        block
-            .deserialize_nametable(repository.clone())
-            .await
-            .forward::<SyncError>("Failed deserializing state node block")?;
-        from_node.name_hash = hash::hash_string(to_name);
-        (from_node.name_offset, from_node.name_length) = block
-            .write()
-            .node_name_store(to_name, from_node.name_offset, from_node.name_length)
-            .forward::<SyncError>("Failed to store node name")?;
-    }
-
-    // Write back updated node data
-    let dirtied = {
-        let mut block = block.write();
-        *block.node(node_index) = from_node;
-        block.mark_dirty()
+    let to_name = to_path.name();
+    let name = if from_name != to_name {
+        NameChange::Rename(to_name)
+    } else {
+        NameChange::Keep
     };
-    if dirtied {
-        state_stage.block_modified(block, block_index);
-        state_stage.mark_dirty();
-    }
-
-    // Mark the node with StagedMove and StagedMerge flags
     let mut mark_flags = NodeFlags::StagedMove;
     if is_merge {
         mark_flags |= NodeFlags::StagedMerge;
     }
+    let own = Mark::staged(mark_flags, true);
+    let left = state_stage
+        .node_move(repository.clone(), from_node, new_parent_id, name, own)
+        .await
+        .forward::<SyncError>("Failed to stage change")?;
     state_stage
-        .node_mark(repository.clone(), from_node_id, mark_flags, true)
+        .node_mark_destination(repository, new_parent_id, own)
+        .await
+        .forward::<SyncError>("Failed to stage change")?;
+    state_stage
+        .node_mark_left(
+            repository,
+            (left, new_parent_id),
+            Mark::staged(NodeFlags::Staged, false),
+        )
         .await
         .forward::<SyncError>("Failed to stage change")?;
 

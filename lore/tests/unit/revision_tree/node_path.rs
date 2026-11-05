@@ -25,6 +25,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_storage::hash::hash_string;
 
 #[derive(Debug, Clone, PartialEq)]
 enum CapturedEvent {
@@ -101,6 +102,7 @@ async fn add_under(handle: LoreRevisionTree, parent: NodeID, name: &str, is_file
     let flags = if is_file { NodeFlags::File.bits() } else { 0 };
     let node = Node {
         flags,
+        name_hash: hash_string(name),
         ..Default::default()
     };
     state

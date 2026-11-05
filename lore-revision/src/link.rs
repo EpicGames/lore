@@ -36,6 +36,7 @@ use crate::lore_info;
 use crate::lore_trace;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeExtFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
@@ -50,7 +51,11 @@ use crate::revision::sync::SyncVerifyArgs;
 use crate::revision::sync::sync_verify_filesystem;
 use crate::stage;
 use crate::state;
+use crate::state::Clear;
+use crate::state::Ext;
+use crate::state::LinkPin;
 use crate::state::LinkReference;
+use crate::state::Mark;
 use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateError;
@@ -893,29 +898,13 @@ pub async fn update_link_pin_by_node(
     new_signature: Hash,
     node_id: NodeID,
 ) -> Result<(), StateError> {
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-
-    let block = state.block(repository.clone(), block_index).await?;
-
-    {
-        let mut block_writer = block.write();
-        let node = block_writer.node(node_index);
-        node.address.hash = new_signature;
-        block_writer.mark_dirty();
-    }
-
-    // Always re-mark the state as dirty here, even when `mark_dirty()` reports
-    // the block was already dirty. `NodeBlockFlags::Dirty` is runtime state that
-    // is never written, and `State::serialize` leaves it set on the in-memory
-    // block until it has written everything. So a sequence
-    // of `update_link_pin_by_node` -> `serialize` -> `update_link_pin_by_node`
-    // -> `serialize` would leave the state-level dirty flag clear on the
-    // second pass and `State::serialize` would early-return the previous
-    // hash. This bit is what `merge_resolve` hits when resolving multiple
-    // paths inside a link in one CLI invocation.
-    state.block_modified(block.clone(), block_index);
-    state.mark_dirty();
+    // A sequence of `update_link_pin_by_node` -> `serialize` -> `update_link_pin_by_node` ->
+    // `serialize`, which `merge_resolve` runs resolving several paths inside a link in one CLI
+    // invocation, writes each pin: the save's release leaves the block clean, so the next repin
+    // registers it again (`node_set_link_target`).
+    state
+        .node_set_link_target(&repository, node_id, LinkPin::Revision(new_signature))
+        .await?;
 
     state
         .link_update(repository, link_repo_id, branch, new_signature, node_id)
@@ -942,9 +931,17 @@ pub async fn repin_link_node(
     )
     .await?;
     if mark.intersects(NodeFlags::StagedBits) {
-        state.node_mark(repository, node_id, mark, true).await
+        state
+            .node_mark(&repository, node_id, Mark::staged(mark, true))
+            .await
     } else {
-        state.node_mark_dirty(repository, node_id, mark, true).await
+        state
+            .node_mark(
+                &repository,
+                node_id,
+                Mark::dirty(mark, Ext::Set(NodeExtFlags::NoFlags), true),
+            )
+            .await
     }
 }
 
@@ -1030,7 +1027,7 @@ pub async fn settle_linked_staged_state(
         link_node,
     )
     .await?;
-    state.node_clear_dirty(repository, link_node).await
+    state.node_clear(&repository, link_node, Clear::Dirty).await
 }
 
 /// Reserializes a tracked link's state and updates the parent repository's
@@ -1436,10 +1433,9 @@ pub async fn drain_link_tracker(
         if mark_staged {
             parent_state
                 .node_mark(
-                    parent_repository,
+                    &parent_repository,
                     link_context.link_node_id,
-                    NodeFlags::Staged,
-                    true,
+                    Mark::staged(NodeFlags::Staged, true),
                 )
                 .await?;
         }

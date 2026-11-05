@@ -1125,7 +1125,7 @@ mod tests {
                         .await
                         .expect("Failed to read a block");
                     block
-                        .deserialize_nametable(repository.clone())
+                        .deserialize_nametable_for_tests(repository.clone())
                         .await
                         .expect("Failed to read a name table");
                     let index = node::Node::index(node);
@@ -1296,7 +1296,7 @@ mod tests {
             .await
             .expect("read block");
         block
-            .deserialize_nametable(repository.clone())
+            .deserialize_nametable_for_tests(repository.clone())
             .await
             .expect("read name table");
         let index = node::Node::index(node);

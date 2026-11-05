@@ -17,6 +17,7 @@ use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::ROOT_NODE;
 use crate::state::NodeMapping;
+use crate::state::OwnFlags;
 use crate::state::State;
 
 /// Removes a staged link add from the registry and the link's files from the mount, where they
@@ -90,21 +91,11 @@ pub(crate) async fn reset_staged_add_link(
                 .internal("recreating the placeholder directory")?;
         }
 
-        let block_index = NodeBlock::index(committed_node_id);
-        let node_index = Node::index(committed_node_id);
         let block = state_staged
-            .block(repository.clone(), block_index)
+            .block(repository.clone(), NodeBlock::index(committed_node_id))
             .await
             .forward::<LinkError>("Failed deserializing state node block")?;
-        let dirtied = {
-            let mut block_writer = block.write();
-            block_writer.node(node_index).clear_all_change_flags();
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            state_staged.block_modified(block, block_index);
-            state_staged.mark_dirty();
-        }
+        state_staged.node_clear_own(&block, committed_node_id, OwnFlags::Change);
 
         return Ok(());
     }

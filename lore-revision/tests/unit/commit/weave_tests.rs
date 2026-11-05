@@ -11,6 +11,9 @@ use lore_revision::commit::BasedOn;
 use lore_revision::commit::weave_history;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::Content;
+use lore_revision::state::Mark;
+use lore_revision::state::Rewrite;
 use lore_revision::state::State;
 
 use crate::helper::in_memory;
@@ -157,15 +160,23 @@ async fn weaving_a_merge_of_divergent_history_records_the_remote_history_on_a_re
             context: Context::default(),
         };
         remote
-            .node_modify(repository.clone(), renamed, 0o644, 11, changed)
+            .node_rewrite(
+                &repository,
+                renamed,
+                &Content {
+                    mode: 0o644,
+                    size: 11,
+                    address: changed,
+                },
+                Rewrite::Plain,
+            )
             .await
             .expect("modifying the file");
         remote
-            .node_mark_staged(
-                repository.clone(),
+            .node_mark(
+                &repository,
                 renamed,
-                NodeFlags::StagedModify,
-                NodeFlags::DirtyModify,
+                Mark::staged_and_dirty(NodeFlags::StagedModify, NodeFlags::DirtyModify),
             )
             .await
             .expect("staging the modification");
@@ -173,7 +184,14 @@ async fn weaving_a_merge_of_divergent_history_records_the_remote_history_on_a_re
 
         let local = revision_state(&repository, base).await;
         local
-            .move_node(repository.clone(), renamed, ROOT_NODE, "b.txt")
+            .node_move_staged(
+                repository.clone(),
+                renamed,
+                ROOT_NODE,
+                ("b.txt", lore_storage::hash::hash_string("b.txt")),
+                &local.moves_permit().await.expect("the moves permit"),
+                false,
+            )
             .await
             .expect("renaming the file");
         let local_latest = commit(&repository, &local, base, main).await;
@@ -290,7 +308,14 @@ async fn weaving_a_revision_on_its_first_parent_records_history_on_a_renamed_dir
         let second = commit(&repository, &state, first, main).await;
 
         state
-            .move_node(repository.clone(), renamed, ROOT_NODE, "e")
+            .node_move_staged(
+                repository.clone(),
+                renamed,
+                ROOT_NODE,
+                ("e", lore_storage::hash::hash_string("e")),
+                &state.moves_permit().await.expect("the moves permit"),
+                false,
+            )
             .await
             .expect("renaming the directory");
         let third = commit(&repository, &state, second, main).await;
@@ -393,11 +418,24 @@ async fn modify(
     staged: NodeFlags,
 ) {
     state
-        .node_modify(repository.clone(), node_id, 0o644, 11, address)
+        .node_rewrite(
+            repository,
+            node_id,
+            &Content {
+                mode: 0o644,
+                size: 11,
+                address,
+            },
+            Rewrite::Plain,
+        )
         .await
         .expect("modifying the file");
     state
-        .node_mark_staged(repository.clone(), node_id, staged, NodeFlags::DirtyModify)
+        .node_mark(
+            repository,
+            node_id,
+            Mark::staged_and_dirty(staged, NodeFlags::DirtyModify),
+        )
         .await
         .expect("staging the modification");
 }

@@ -28,6 +28,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_storage::hash::hash_string;
 
 #[derive(Debug, Clone, PartialEq)]
 enum CapturedEvent {
@@ -112,6 +113,7 @@ async fn add_file(
         mode,
         size,
         address,
+        name_hash: hash_string(name),
         ..Default::default()
     };
     state
@@ -224,6 +226,7 @@ async fn node_info_returns_a_directory_record_for_a_subdirectory() {
         let (state, repository) = handle_state(handle);
         let node = Node {
             flags: 0,
+            name_hash: hash_string("subdir"),
             ..Default::default()
         };
         state

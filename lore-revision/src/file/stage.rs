@@ -13,7 +13,6 @@ use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
-use crate::hash::hash_string;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
 use crate::layer;
@@ -22,11 +21,8 @@ use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_limit_drain_tasks;
-use crate::node::Node;
-use crate::node::NodeBlock;
 use crate::node::NodeFlags;
 use crate::node::ROOT_NODE;
-use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -41,6 +37,9 @@ use crate::stage::StageError;
 use crate::stage::StageOptions;
 use crate::stage::StageStats;
 use crate::state;
+use crate::state::Ext;
+use crate::state::Mark;
+use crate::state::NameChange;
 use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::fan_out;
@@ -707,6 +706,13 @@ pub async fn stage(
         )
         .await?;
 
+        // Before the save, with every walk drained, as nothing else frees a slot a walk left
+        // detached or in flight (C15).
+        state
+            .node_sweep_detached(&repository)
+            .await
+            .forward::<StageError>("Failed to free the detached slots")?;
+
         state.reparent_onto(current_revision);
 
         let signature = state
@@ -985,14 +991,17 @@ async fn resolve_stage_target(
     Ok(ResolvedTarget::Single(relative_path))
 }
 
-/// Recursively mark all children of a directory node as moved.
-/// This is called when a directory is moved to ensure all contained files
-/// and subdirectories also have the move flag set.
+/// Marks every node below the moved directory `parent_node` staged as moved, with `move_flag`. A
+/// node added, staged or dirty, stays an addition. A node deleted, staged or dirty, is left as it
+/// is and not descended into, as a mark of the move would take the deletion off it: the two halves
+/// share their action bits. Where the moved directory was deleted itself (`undelete`), every node
+/// below carries its deletion, which the move takes off them all.
 async fn mark_children_moved(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     parent_node: crate::node::NodeID,
     move_flag: NodeFlags,
+    undelete: bool,
 ) -> Result<(), crate::state::StateError> {
     use std::future::Future;
     use std::pin::Pin;
@@ -1002,32 +1011,36 @@ async fn mark_children_moved(
         state: Arc<State>,
         parent_node: crate::node::NodeID,
         move_flag: NodeFlags,
+        undelete: bool,
     ) -> Pin<Box<dyn Future<Output = Result<(), crate::state::StateError>> + Send>> {
         Box::pin(async move {
             let children = state.node_children(repository.clone(), parent_node).await?;
 
             for child_id in children {
-                let child_node = state.node(repository.clone(), child_id).await?;
+                let (deleted, added, is_directory) = {
+                    let child = state.node(repository.clone(), child_id).await?;
+                    (child.is_deleted(), child.is_added(), child.is_directory())
+                };
+                if !undelete && deleted {
+                    continue;
+                }
 
-                // Determine the appropriate flag for this child
-                let child_flag = if child_node.is_staged_add() {
+                let child_flag = if added {
                     NodeFlags::StagedAdd
                 } else {
                     move_flag
                 };
-
-                // Mark the child node
                 state
-                    .node_mark(repository.clone(), child_id, child_flag, false)
+                    .node_mark(&repository, child_id, Mark::staged(child_flag, false))
                     .await?;
 
-                // Recurse into directories
-                if child_node.is_directory() {
+                if is_directory {
                     mark_children_moved_recursive(
                         repository.clone(),
                         state.clone(),
                         child_id,
                         move_flag,
+                        undelete,
                     )
                     .await?;
                 }
@@ -1037,7 +1050,7 @@ async fn mark_children_moved(
         })
     }
 
-    mark_children_moved_recursive(repository, state, parent_node, move_flag).await
+    mark_children_moved_recursive(repository, state, parent_node, move_flag, undelete).await
 }
 
 /// Marks each of `paths` as merged, reporting the counts staged so far while one runs.
@@ -1179,6 +1192,13 @@ pub async fn stage_move(
     if from_path.as_str() == to_path.as_str() {
         return Err(StageError::internal("Cannot move a path to itself"));
     }
+    // Lookups ignore case, so `A` to `a/b` moves a node below itself as well.
+    if to_path.is_below_ignore_case(&from_path) {
+        return Err(crate::errors::InvalidArguments {
+            reason: "Cannot move a path into itself".into(),
+        }
+        .into());
+    }
 
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -1190,52 +1210,73 @@ pub async fn stage_move(
     let state = state_staged.unwrap_or(state_current);
 
     // Find from node (must exist, optionally already staged for delete)
-    let from_node_link = state
-        .find_node_link(repository.clone(), from_path.as_str())
-        .await
-        .forward_with::<StageError, _>(|| {
-            format!("Path {from_path} does not exist in repository ")
-        })?;
-    if !from_node_link.is_valid() {
-        return Err(StageError::internal(format!(
-            "Path {from_path} does not exist in repository "
-        )));
-    }
-    if from_node_link.repository != repository.id {
-        // TODO(vri): UCS-18009 - Implement stage move for linked changes
-        // The lookup crossed a link, so the node it answers with is numbered by that
-        // repository's state and names nothing in this one. Everything below reads and
-        // relinks it here.
-        return Err(StageError::internal(
-            "Links not yet implemented, cannot perform actions in other repositories",
-        ));
-    }
+    let from_node = {
+        let link = state
+            .find_node_link(repository.clone(), from_path.as_str())
+            .await
+            .forward_with::<StageError, _>(|| {
+                format!("Path {from_path} does not exist in repository ")
+            })?;
+        if !link.is_valid() {
+            return Err(StageError::internal(format!(
+                "Path {from_path} does not exist in repository "
+            )));
+        }
+        if link.repository != repository.id {
+            // TODO(vri): UCS-18009 - Implement stage move for linked changes
+            // The lookup crossed a link, so the node it answers with is numbered by that
+            // repository's state and names nothing in this one. Everything below reads and
+            // relinks it here.
+            return Err(StageError::internal(
+                "Links not yet implemented, cannot perform actions in other repositories",
+            ));
+        }
+        link.node
+    };
 
-    let from_node = state
-        .node(repository.clone(), from_node_link.node)
-        .await
-        .forward::<StageError>("Failed deserializing state node block")?;
+    let (is_directory, is_file, added, deleted, dirty) = {
+        let node = state
+            .node(repository.clone(), from_node)
+            .await
+            .forward::<StageError>("Failed deserializing state node block")?;
+        (
+            node.is_directory(),
+            node.is_file(),
+            node.is_added(),
+            node.is_deleted(),
+            node.is_dirty(),
+        )
+    };
 
     if !execution_context().globals().force()
         && repository
             .filter
-            .emit_excludes(&to_path, !from_node.is_file(), FilterMode::Full)
+            .emit_excludes(&to_path, !is_file, FilterMode::Full)
     {
         return Err(StageError::internal(format!("Ignored path {to_path}")));
     }
 
     // Find to node (optional)
-    let to_node_link = state
-        .find_node_link(repository.clone(), to_path.as_str())
-        .await
-        .unwrap_or_default();
+    let to_node = {
+        let link = state
+            .find_node_link(repository.clone(), to_path.as_str())
+            .await
+            .unwrap_or_default();
+        if link.is_valid() && link.repository != repository.id {
+            // TODO(vri): UCS-18009 - Implement stage move for linked changes
+            return Err(StageError::internal(
+                "Links not yet implemented, cannot perform actions in other repositories",
+            ));
+        }
+        link.is_valid().then_some(link.node)
+    };
 
     let stats = Arc::new(StageStats::default());
 
     let mut parent_options = options;
     parent_options.no_children = true;
 
-    let parent_node_link = with_operation(repository.file_system(), async |operation| {
+    let parent = with_operation(repository.file_system(), async |operation| {
         let to_info = operation
             .file_info(&to_path)
             .await
@@ -1246,36 +1287,11 @@ pub async fn stage_move(
             )));
         }
 
-        if from_node.is_directory() && !to_info.is_dir() {
+        if is_directory && !to_info.is_dir() {
             return Err(StageError::internal("Cannot move a directory to a file"));
         }
-        if !from_node.is_directory() && to_info.is_dir() {
+        if !is_directory && to_info.is_dir() {
             return Err(StageError::internal("Cannot move a file to a directory"));
-        }
-
-        if to_node_link.is_valid() {
-            // Stage existing target node as deleted, it is being replaced by the source file
-            lore_debug!(
-                "Staging existing target node {} as deleted",
-                to_node_link.node
-            );
-            if to_node_link.repository != repository.id {
-                // TODO(vri): UCS-18009 - Implement stage move for linked changes
-                return Err(StageError::internal(
-                    "Links not yet implemented, cannot perform actions in other repositories",
-                ));
-            }
-
-            stage::stage_delete(
-                repository.clone(),
-                state.clone(),
-                to_path.clone(),
-                to_node_link.node,
-                options.node_flags,
-                stats.clone(),
-                None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
-            )
-            .await?;
         }
 
         // Make sure the target parent node exist
@@ -1304,212 +1320,99 @@ pub async fn stage_move(
         ))
         .await
     })
-    .await?;
+    .await?
+    .node;
 
-    let block_index = NodeBlock::index(from_node_link.node);
-    let node_index = Node::index(from_node_link.node);
-    let block = state
-        .block(repository.clone(), block_index)
-        .await
-        .forward::<StageError>("Failed deserializing state node block")?;
-    let mut node = block.node(node_index);
-
-    if node.parent != parent_node_link.node {
-        // Unlink it from the previous parent child list
-        lore_debug!(
-            "Unlink node {} from previous parent node: {}",
-            from_node_link.node,
-            node.parent
-        );
-        let parent_block_index = NodeBlock::index(node.parent);
-        let parent_node_index = Node::index(node.parent);
-        let parent_block = state
-            .block(repository.clone(), parent_block_index)
-            .await
-            .forward::<StageError>("Failed deserializing state node block")?;
-        let parent_node = parent_block.node(parent_node_index);
-        if parent_node.child == from_node_link.node {
-            lore_debug!(
-                "Parent {} child node match, new child node: {}",
-                node.parent,
-                node.sibling
-            );
-            let dirtied = {
-                let mut block_writer = parent_block.write();
-                block_writer.node(parent_node_index).child = node.sibling;
-                block_writer.mark_dirty()
-            };
-            if dirtied {
-                state.block_modified(parent_block, parent_block_index);
-                state.mark_dirty();
-            }
-        } else {
-            lore_debug!(
-                "Parent {} child node does not match, find in sibling list",
-                node.parent
-            );
-            let mut found = false;
-            let parent_id = node.parent;
-            let mut child_id = parent_node.child().unwrap_or_default();
-            let mut cycle = SiblingCycleGuard::new(parent_id);
-            while let Some(sibling) = {
-                let child = state
-                    .node(repository.clone(), child_id)
-                    .await
-                    .forward::<StageError>("Failed deserializing state node block")?;
-                child
-                    .walk_step(child_id, parent_id, &mut cycle)
-                    .forward::<StageError>("Invalid node hierarchy in stage walk")?;
-                child.sibling()
-            } {
-                if sibling == from_node_link.node {
-                    lore_debug!(
-                        "Node {} sibling match, replace with new sibling {}",
-                        child_id,
-                        node.sibling
-                    );
-                    let child_block_index = NodeBlock::index(child_id);
-                    let child_node_index = Node::index(child_id);
-                    let child_block =
-                        state
-                            .block(repository.clone(), child_block_index)
-                            .await
-                            .forward::<StageError>("Failed deserializing state node block")?;
-                    let dirtied = {
-                        let mut block_writer = child_block.write();
-                        block_writer.node(child_node_index).sibling = node.sibling;
-                        block_writer.mark_dirty()
-                    };
-                    if dirtied {
-                        state.block_modified(child_block, child_block_index);
-                        state.mark_dirty();
-                    }
-                    found = true;
-                    break;
-                }
-                lore_debug!(
-                    "Node {} sibling does not match, move to {}",
-                    child_id,
-                    sibling
-                );
-                child_id = sibling;
-            }
-            if !found {
-                return Err(StageError::internal(
-                    "Node not found in child node list, inconsistent repository state",
-                ));
-            }
-        }
-
-        // Inject it into the new parent child list
-        lore_debug!(
-            "Link node {} to new parent node {} child list",
-            from_node_link.node,
-            parent_node_link.node
-        );
-        let parent_block_index = NodeBlock::index(parent_node_link.node);
-        let parent_node_index = Node::index(parent_node_link.node);
-        let parent_block = state
-            .block(repository.clone(), parent_block_index)
-            .await
-            .forward::<StageError>("Failed deserializing state node block")?;
-        let sibling_node_id = parent_block.node(parent_node_index).child;
-        let dirtied = {
-            let mut block_writer = parent_block.write();
-            block_writer.node(parent_node_index).child = from_node_link.node;
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            state.block_modified(parent_block, parent_block_index);
-            state.mark_dirty();
-        }
-
-        lore_debug!(
-            "Update node {} sibling node to {}",
-            from_node_link.node,
-            sibling_node_id
-        );
-        node.sibling = sibling_node_id;
-    }
-
-    // Set the new node metadata - parent node and name (sibling node set above)
-    {
-        lore_debug!(
-            "Update node {} parent to node {}",
-            from_node_link.node,
-            parent_node_link.node
-        );
-        node.parent = parent_node_link.node;
-
-        let from_name = from_path.name();
-        let to_name = to_path.name();
-        if from_name != to_name {
-            // Rename the from node
-            block
-                .deserialize_nametable(repository.clone())
-                .await
-                .forward::<StageError>("Failed deserializing name table")?;
-            lore_debug!(
-                "Rename node {}: {} -> {}",
-                from_node_link.node,
-                from_name,
-                to_name
-            );
-            node.name_hash = hash_string(to_name);
-            (node.name_offset, node.name_length) = block
-                .write()
-                .node_name_store(to_name, node.name_offset, node.name_length)
-                .forward::<StageError>("Storing renamed node name")?;
-        }
-    }
-
-    let dirtied = {
-        let mut block_writer = block.write();
-        *block_writer.node(node_index) = node;
-        block_writer.mark_dirty()
+    let from_name = from_path.name();
+    let to_name = to_path.name();
+    let name = if from_name != to_name {
+        NameChange::Rename(to_name)
+    } else {
+        NameChange::Keep
     };
-    if dirtied {
-        state.block_modified(block, block_index);
-        state.mark_dirty();
-    }
-
-    // Mark from node as moved
-    let move_flag = if from_node.is_staged_add() {
+    let move_flag = if added {
         NodeFlags::StagedAdd
     } else {
         NodeFlags::StagedMove
     };
-    state
-        .node_mark(
+    let own = Mark::staged(move_flag, true);
+    let left = state
+        .node_move(repository.clone(), from_node, parent, name, own)
+        .await
+        .forward::<StageError>("Failed to move the node")?;
+    // A target the move replaces is staged as deleted once the node has left it, as its deletion
+    // reaches every node below it: a directory moved over the one above it was below it until
+    // now. A rename of the case alone finds the node itself as its target.
+    if let Some(target) = to_node.filter(|target| *target != from_node) {
+        lore_debug!("Staging existing target node {} as deleted", target);
+        stage::stage_delete(
             repository.clone(),
-            from_node_link.node,
-            move_flag,
-            true, /* Mark dirty */
+            state.clone(),
+            to_path,
+            target,
+            options.node_flags,
+            stats.clone(),
+            None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
+        )
+        .await?;
+    }
+    // The climb takes a dirty half too where the node moved is dirty, as a dirty node's ancestors
+    // are, which a walk of the dirty flags relies on to reach it.
+    state
+        .node_mark_destination(
+            &repository,
+            parent,
+            Mark {
+                dirty: dirty.then_some((NodeFlags::Dirty, Ext::Keep, false)),
+                ..own
+            },
         )
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
 
     // If this is a directory move, recursively mark all children as moved
-    if from_node.is_directory() {
+    if is_directory {
         mark_children_moved(
             repository.clone(),
             state.clone(),
-            from_node_link.node,
+            from_node,
             move_flag,
+            deleted,
         )
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
     }
+    // A directory with no address, as a scan, `lore dirty` or the VFS adds one and no commit or
+    // realize has given it one, is left as it is: unstaged, the commit drops it, which a staged
+    // mark would make it keep; staged, it holds the mark already.
+    let left_committed = left != parent
+        && left != ROOT_NODE
+        && !state
+            .node(repository.clone(), left)
+            .await
+            .forward::<StageError>("Failed deserializing state node block")?
+            .address
+            .is_zero();
+    if left_committed {
+        state
+            .node_mark_left(
+                &repository,
+                (left, parent),
+                Mark::staged(NodeFlags::Staged, false),
+            )
+            .await
+            .forward::<StageError>("Failed to stage the directory the node left")?;
+    }
 
     #[allow(clippy::collapsible_else_if)]
-    if from_node.is_staged_add() {
-        if from_node.is_directory() {
+    if added {
+        if is_directory {
             stats.directory_add_count.fetch_add(1, Ordering::Relaxed);
         } else {
             stats.file_add_count.fetch_add(1, Ordering::Relaxed);
         }
     } else {
-        if from_node.is_directory() {
+        if is_directory {
             stats.directory_move_count.fetch_add(1, Ordering::Relaxed);
         } else {
             stats.file_move_count.fetch_add(1, Ordering::Relaxed);

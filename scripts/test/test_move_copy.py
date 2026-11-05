@@ -1324,6 +1324,43 @@ class TestFileMoveCore:
         )
 
     @pytest.mark.smoke
+    def test_move_out_of_a_directory_leaves_it(self, new_lore_repo):
+        """A file moved out of a directory other than the root leaves that directory.
+
+        The commit records the directory it left without it, so syncing between the revisions
+        before and after the move takes the file from one directory to the other, each way.
+        """
+        repo: Lore = new_lore_repo()
+
+        create_file_with_content(
+            repo, posix_join("dir", "keep.txt"), "Kept where it is\n"
+        )
+        original_path = posix_join("dir", "moved.txt")
+        create_file_with_content(repo, original_path, "Moved out of its directory\n")
+        before = repo.revision_info(offline=True).signature
+
+        new_path = posix_join("other", "moved.txt")
+        repo.make_dirs("other")
+        repo.move(original_path, new_path)
+        repo.file_stage_move(original_path, new_path, offline=True)
+        repo.commit("Move file out of a directory", offline=True)
+        after = repo.revision_info(offline=True).signature
+
+        repo.sync(before, offline=True)
+        assert repo.file_exists(original_path), (
+            f"DIAGNOSTIC: '{original_path}' is not back in its directory after syncing to the "
+            f"revision before the move"
+        )
+        repo.sync(after, offline=True)
+        assert not repo.file_exists(original_path), (
+            f"DIAGNOSTIC: '{original_path}' is still in its directory after syncing to the "
+            f"revision that moved it to '{new_path}'"
+        )
+        assert repo.file_exists(new_path), (
+            f"DIAGNOSTIC: '{new_path}' is missing after syncing to the revision that moved it there"
+        )
+
+    @pytest.mark.smoke
     def test_multiple_sequential_moves(self, new_lore_repo):
         """REQ-F-6: Multiple sequential moves track all locations.
 

@@ -5,7 +5,8 @@
 //! The `lore_revision_tree_*` namespace exposes a handle-based surface that
 //! reads and constructs revisions directly in memory, keyed on opaque node
 //! ids. The module groups one file per verb plus [`handle`] (POD type and
-//! process-global registry) and [`call`] (the shared dispatcher).
+//! process-global registry) and [`call`] (the shared dispatcher, and the codes
+//! a verb reports a failure of the State with).
 
 pub mod add;
 #[cfg(not(feature = "test-util"))]

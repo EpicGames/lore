@@ -2841,9 +2841,10 @@ typedef struct lore_revision_tree_resolve_path_complete_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_resolve_path_complete_event_data_t;
 
-// Per-child event from `list_children`. One event is emitted per entry;
-// the caller correlates entries by `id` and detects end-of-list via the
-// trailing `Complete` event.
+// Per-child event from `list_children`, one per child the listing reaches;
+// moves and deletions on the same handle beside the listing may have a child
+// reported twice (`lore_revision_tree_list_children`). The caller correlates
+// entries by `id` and detects end-of-list via the trailing `Complete` event.
 typedef struct lore_revision_tree_child_event_data_t {
   // Correlation id of the originating call.
   uint64_t id;
@@ -2943,7 +2944,7 @@ typedef struct lore_revision_tree_delete_complete_event_data_t {
   // Correlation id of the entry this reports, not of the call.
   uint64_t entry_id;
   // How many nodes the entry's subtree removed, staged and discarded
-  // together. Zero on failure, since nothing was removed.
+  // together. Zero on failure, whatever part of the subtree was removed.
   uint64_t node_count;
   // The outcome of the call.
   enum lore_error_code_t error_code;
@@ -12903,9 +12904,15 @@ void lore_revision_tree_resolve_path_async(const struct lore_global_args_t *glob
 
 // Stream the children of a directory node in a loaded revision tree.
 //
+// Moves and deletions on the same handle may run beside the listing: a child
+// moved away meanwhile may be left out, and a child may be reported twice. A
+// caller that needs each child once drops repeats by `node_id`. A listing the
+// tree gave up on under load, heavy changes beside it or a store asking it to
+// slow down, completes with `LORE_ERROR_CODE_SLOW_DOWN`, which a caller can retry.
+//
 // | Terminal event                       | Payload                                | Notes                                                          |
 // |--------------------------------------|----------------------------------------|----------------------------------------------------------------|
-// | `LORE_EVENT_REVISION_TREE_CHILD`     | `lore_revision_tree_child_event_data_t` | One per child; an empty directory emits none before `Complete` |
+// | `LORE_EVENT_REVISION_TREE_CHILD`     | `lore_revision_tree_child_event_data_t` | One per child reached; an empty directory emits none before `Complete` |
 int32_t lore_revision_tree_list_children(const struct lore_global_args_t *globals,
                                          const struct lore_revision_tree_list_children_args_t *args,
                                          struct lore_event_callback_config_t callback);
@@ -12964,7 +12971,12 @@ void lore_revision_tree_node_path_async(const struct lore_global_args_t *globals
 // entry is checked before any node is created, so one bad entry rejects the
 // call and creates nothing; the reason names the offending entry's batch index,
 // which a caller leaving `entry_id` at zero has no other way to identify. A failure
-// after those checks pass is internal and may leave part of the batch created.
+// after those checks pass reports `LORE_ERROR_CODE_INTERNAL` and may leave part of
+// the batch created. An entry the tree gave up on under load, in its checks or
+// after, reports `LORE_ERROR_CODE_SLOW_DOWN` instead, and so do the entries parented
+// onto it. The load is heavy concurrent change on the handle, or a store asking the
+// tree to slow down, and a caller can retry. The batch reports
+// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // A link entry's target revision is not resolved here, so a link naming a
 // revision that cannot be read is accepted and fails only when something later
@@ -12989,32 +13001,44 @@ void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
 // is checked before any node is touched, so one bad entry rejects the call and
 // leaves every subtree in place; the reason names the offending entry's batch
 // index, which a caller leaving `entry_id` at zero has no other way to
-// identify. A failure after those checks pass is internal and may leave part of
-// the batch removed.
+// identify. A failure after those checks pass reports `LORE_ERROR_CODE_INTERNAL`
+// and may leave part of the batch removed. An entry the tree gave up on under
+// load, heavy concurrent change on the handle or a store asking it to slow down,
+// reports `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch
+// reports `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // A node the loaded revision holds is **staged** for deletion and stays in the
 // tree: it keeps its name and its place among its siblings, still lists through
 // `lore_revision_tree_list_children`, and reports
 // `LORE_NODE_STAGED_ACTION_DELETE` in its `staged_action`. The commit that
 // freezes the tree is what drops it. A node added through this handle is in no
-// revision yet, so it is discarded outright instead, freeing its name and its
-// node id. A link is removed as one node — its subtree belongs to the linked
-// repository's tree.
+// revision yet, so it leaves the tree outright instead: it stops being listed,
+// `lore_revision_tree_node_info` answers for it as for a freed id, and the next
+// commit that goes ahead frees its node id. A link is removed as one node — its
+// subtree belongs to the linked repository's tree.
 //
 // A staged deletion is reversible: `lore_revision_tree_add` of the same name
 // under the same parent with the same kind restores the node. A zero
 // `address.context` on that add preserves the node's `file_id`; supplying one
 // replaces it, as on `lore_revision_tree_modify`. Only the named node comes back
 // — restoring a directory leaves its children staged for deletion, so each has to
-// be added back in turn. A discarded node is not restorable, since its id is
-// gone.
+// be added back in turn. An added node that left the tree is not restorable:
+// adding its name again creates a new node.
 //
-// Staging fans out one depth level at a time; discarding an added node rewrites
-// sibling pointers and so runs serially, deepest first. Memory while the call
-// runs is proportional to the widest level of the subtrees being removed rather
-// than to the entry count, since a level is collected before it is staged. The
-// root cannot be deleted, and an entry whose ancestor another entry deletes is
-// rejected rather than removed twice.
+// Staging fans out one depth level at a time over at most one task per
+// processor. Each added subtree is checked whole, then detached from its
+// directory in one step; detaches from one directory run one after another. An
+// added subtree holding a live node the loaded revision holds, moved there, fails
+// its entry with nothing detached. Memory while the call runs is proportional to
+// the entry count times the tasks the work spreads over, plus two adjacent depth
+// levels of the tracked subtrees being removed, plus one record per added subtree
+// root found. Entries report in entry order once the whole batch has been walked.
+// The root cannot be deleted, and an entry whose ancestor another entry deletes
+// is rejected rather than removed twice.
+//
+// A delete or move call waits for any other delete or move call on the same handle
+// to finish, so they apply one after the other, each checking its entries against
+// the tree the one before left.
 //
 // | Terminal event                              | Payload                                           | Notes                                                    |
 // |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
@@ -13033,8 +13057,11 @@ void lore_revision_tree_delete_async(const struct lore_global_args_t *globals,
 // revision tree. Every entry is checked before any node is rewritten, so one bad
 // entry rejects the call and leaves every target untouched; the reason names the
 // offending entry's batch index, which a caller leaving `entry_id` at zero has no
-// other way to identify. A failure after those checks pass is internal and may
-// leave part of the batch rewritten.
+// other way to identify. A failure after those checks pass reports
+// `LORE_ERROR_CODE_INTERNAL` and may leave part of the batch rewritten. An entry
+// the tree gave up on under load, a store asking it to slow down, reports
+// `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch reports
+// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // Only a file is modifiable: a directory's size and address are derived at
 // commit and a link's address is its target. A zero `address.context` preserves
@@ -13061,7 +13088,11 @@ void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
 // before any node is moved, so one bad entry rejects the call and leaves every node
 // where it was; the reason names the offending entry's batch index, which a caller
 // leaving `entry_id` at zero has no other way to identify. A failure after those checks
-// pass is internal and may leave earlier entries applied.
+// pass reports `LORE_ERROR_CODE_INTERNAL` and may leave earlier entries applied. An entry
+// the tree gave up on under load, in its checks or after, reports
+// `LORE_ERROR_CODE_SLOW_DOWN` instead. The load is heavy concurrent change on the handle,
+// or a store asking the tree to slow down, and a caller can retry. The batch reports
+// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 //
 // A move keeps the node: its node id, its `file_id` and its children come along, and
 // the change is recorded as a move rather than as a deletion and an addition, so the
@@ -13083,10 +13114,9 @@ void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
 //
 // Entries apply one at a time, in batch order, because a move rewrites the parent and
 // sibling pointers of two child chains where `lore_revision_tree_add` only prepends to
-// one. For the same reason concurrent calls have more to lose here than on `add` or
-// `modify`: two calls moving nodes that share a parent chain can interleave their
-// unlinks, which the pre-commit validator then refuses. Moves that may touch one parent
-// chain belong in one call.
+// one. A delete or move call waits for any other delete or move call on the same handle
+// to finish, so they apply one after the other, each checking its entries against the
+// tree the one before left.
 //
 // | Terminal event                            | Payload                                          | Notes                                                       |
 // |-------------------------------------------|--------------------------------------------------|-------------------------------------------------------------|

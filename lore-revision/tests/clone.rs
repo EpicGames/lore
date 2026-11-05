@@ -72,7 +72,7 @@ mod tests {
             sibling: 0,
             name_offset: 0,
             name_length: 0,
-            reserved: 0,
+            ext_flags: 0,
             name_hash: 0,
             size: 0,
             address: Address::default(),

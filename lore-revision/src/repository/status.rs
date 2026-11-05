@@ -56,6 +56,7 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
+use crate::state::Clear;
 use crate::state::State;
 use crate::util::fan_out;
 use crate::util::path::RelativePath;
@@ -618,9 +619,10 @@ async fn dirty_change_is_modified(
         node_state
             .mapping
             .state
-            .node_clear_dirty(
-                node_state.mapping.repository.clone(),
+            .node_clear(
+                &node_state.mapping.repository,
                 node_state.mapping.node,
+                Clear::Dirty,
             )
             .await
             .forward::<StatusError>("clearing stale dirty flag")?;

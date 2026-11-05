@@ -253,7 +253,6 @@ async fn set_file_task(
 
         if dirtied {
             state.block_file_metadata_modified(metadata_block, metadata_block_index);
-            state.mark_dirty();
         }
 
         break;

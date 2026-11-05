@@ -8,11 +8,14 @@ use lore_base::types::ZeroHeapAlloc;
 use lore_revision::node::Node;
 use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeBlockData;
+use lore_revision::node::NodeExtFlags;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::is_reserved_node_name;
 use lore_revision::state::DirtyWalkOptions;
+use lore_revision::state::Ext;
+use lore_revision::state::Mark;
 use lore_revision::state::State;
 use lore_revision::state::StateNodeChildrenWithNameIterator;
 use lore_revision::state::collect_dirty_paths_inner;
@@ -87,7 +90,7 @@ fn node_name_store_refuses_a_reserved_name() {
     for name in RESERVED_NAMES {
         let block = NodeBlock::new_zeroed();
         let err = block
-            .write()
+            .write_for_tests()
             .node_name_store(name, 0, 0)
             .expect_err("a reserved name must be refused");
         assert!(err.is_invalid_arguments(), "{name:?}: {err:?}");
@@ -99,7 +102,7 @@ fn node_name_store_accepts_a_name_that_only_resembles_a_reserved_one() {
     for name in UNRESERVED_NAMES {
         let block = NodeBlock::new_zeroed();
         block
-            .write()
+            .write_for_tests()
             .node_name_store(name, 0, 0)
             .unwrap_or_else(|err| panic!("{name:?} must be accepted: {err:?}"));
     }
@@ -168,7 +171,7 @@ async fn a_walk_skips_a_node_carrying_a_planted_reserved_name() {
                 .await
                 .expect("the block must read back");
             {
-                let mut writer = block.write();
+                let mut writer = block.write_for_tests();
                 let node = writer.node(Node::index(planted));
                 let (offset, length) = (node.name_offset, node.name_length);
                 node.name_hash = hash_string(".URC");
@@ -180,7 +183,7 @@ async fn a_walk_skips_a_node_carrying_a_planted_reserved_name() {
                 node.name_length = length;
                 writer.mark_dirty();
             }
-            state.block_modified(block, block_index);
+            state.block_modified_for_tests(block, block_index);
 
             assert!(
                 state
@@ -249,7 +252,11 @@ async fn a_walk_skips_a_node_carrying_a_planted_reserved_name() {
                 .expect("alpha must resolve");
             for node in [alpha, planted] {
                 state
-                    .node_mark_dirty(repository.clone(), node, NodeFlags::DirtyAdd, true)
+                    .node_mark(
+                        &repository,
+                        node,
+                        Mark::dirty(NodeFlags::DirtyAdd, Ext::Set(NodeExtFlags::NoFlags), true),
+                    )
                     .await
                     .expect("marking dirty must succeed");
             }
