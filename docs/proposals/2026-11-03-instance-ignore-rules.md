@@ -5,7 +5,7 @@ authors:
   - Zack Neyland
 status: Draft
 created: 2026-11-03
-updated: 2026-11-03
+updated: 2026-11-05
 discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1111
 ---
 
@@ -29,8 +29,8 @@ other users do not build, which would be wrong for everyone else in `.loreignore
   those outputs, such as `**/Binaries/` patterns, also match directories where the repository tracks files
   for others: 955 tracked files under `Engine/Binaries/DotNET`, 526 under `Engine/Binaries/Win64` and 474
   under `Engine/Binaries/Linux`, counted from the repository's tree at the revision measured. An ignore rule
-  hides new files that other users add there, and their edits under it (see Proposed Design), so a rule
-  that suits one working tree is a risk for every other.
+  hides new files that other users add there (see Proposed Design), so a rule that suits one working tree
+  is a risk for every other.
 - **Today each user carries them by hand.** The user either lives with the noise in every scan, or edits
   `.loreignore` locally and keeps that edit out of every commit.
 
@@ -68,8 +68,9 @@ other users do not build, which would be wrong for everyone else in `.loreignore
   `.loreignore` does: the working-directory operations (`status`, the dirty scan, `stage`, `unstage`,
   `lock`, and `diff` against the working tree), and not the committed-state ones (`sync`, `switch`,
   `reset`, and `diff` between revisions), as [system design §12.3-12.4](../explanation/system-design.md)
-  describes. That includes tracked files: like a `.loreignore` rule, a rule here hides changes to tracked
-  files under it from those operations, and the global `--force` flag stages them anyway.
+  describes. Like a `.loreignore` rule, a rule here applies only to paths the tree does not track
+  ([ADR-00027](../developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)): changes to
+  tracked files under it keep flowing through, and the global `--force` flag stages an untracked file anyway.
 - **Never committed.** Lore excludes its own directory in the ignore filter it builds (`filter::load` in
   `lore-revision/src/filter.rs`), so the file never reaches a commit. (Goal 2.)
 
@@ -93,8 +94,8 @@ other users do not build, which would be wrong for everyone else in `.loreignore
 - **Memory** — Preserved: its rules join the ignore filter, sized by the number of rules.
 - **Statelessness** — Preserved: no state outside the instance's filter.
 - **Determinism** — Two instances with different `ignore` files can report and stage different changes for
-  the same tree, including changes to tracked files the file hides. That is the purpose of the file, and it
-  is the same property `.loreignore` already has across revisions. History and the committed-state
+  the same tree, as an untracked file one excludes stays out of its status and stage. That is the purpose
+  of the file, and it is the same property `.loreignore` already has across revisions. History and the committed-state
   operations are unchanged.
 - **Observability** — An exclusion event cannot tell this file's rules from `.loreignore`'s: both carry
   `FilterReason::Ignore`.
@@ -106,7 +107,7 @@ N/A — no breaking changes, no migration required.
 ## Security Considerations
 
 No change to the trust model. The file is the user's own, in the instance's directory, with the user's
-permissions, and it can only exclude. A rule can hide a change, to a tracked file as well, from the user's
+permissions, and it can only exclude. A rule can hide an untracked file from the user's
 own status and stage in that one instance, exactly as a local edit to `.loreignore` can today; it changes
 nothing another instance or the server sees.
 
@@ -125,9 +126,9 @@ excludes are reported to event consumers in the process, such as bindings and in
 
 **Risks**
 
-- **Risk:** a rule hides changes to tracked files under it, which a scanning stage then leaves out of a
-  commit — *mitigation:* the scope is the same as `.loreignore`'s, which has the same effect today; the
-  user's own rules decide it, and `lore --force stage <path>` stages such a change.
+- **Risk:** a rule hides a new file the user meant to add, which a scanning stage then leaves out of a
+  commit — *mitigation:* the scope is the same as `.loreignore`'s, and changes to tracked files are never
+  hidden; the user's own rules decide it, and `lore --force stage <path>` stages such a file.
 - **Risk:** a file Lore cannot decode stops every command that loads the instance's filter — *mitigation:* the error
   names the file, which is the user's own to fix, as a malformed `.loreignore` does today.
 - **Risk:** a user forgets a rule there, and a new file they meant to add is not reported — *mitigation:*
@@ -148,7 +149,7 @@ stage away from a commit that imposes the rules on everyone.
 ### Add the rules to `.loreignore`
 
 *Rejected because:* the rules are right for one working tree and wrong for others. On the repository above
-they would hide new files others add, and their edits, in directories where the repository tracks about
+they would hide new files others add in directories where the repository tracks about
 2,000 files.
 
 ### Exclude the paths through the instance's view

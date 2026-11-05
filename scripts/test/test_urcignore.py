@@ -431,12 +431,12 @@ def _without_warnings(output: str) -> str:
 @pytest.mark.smoke
 def test_instance_ignore_rules(new_lore_repo):
     """
-    The `ignore` file in the instance's Lore directory excludes entries from
-    the working-directory operations as `.loreignore` does, tracked files
-    included, without being committed: an untracked file under a rule drops
-    out of `status --scan`, an edit to a tracked file under it is hidden from
-    status, diff and a scanning stage, and `--force stage` still stages it. A
-    `!` line is skipped with a warning naming it.
+    The `ignore` file in the instance's Lore directory excludes untracked
+    entries from the working-directory operations as `.loreignore` does,
+    without being committed: an untracked file under a rule drops out of
+    `status --scan` and a scanning stage, an edit to a tracked file under it
+    still flows through, and `--force stage` stages the untracked file. A `!`
+    line is skipped with a warning naming it.
     """
     repo: Lore = new_lore_repo()
     repo.write_files(
@@ -466,26 +466,38 @@ def test_instance_ignore_rules(new_lore_repo):
         f"no warning names the skipped re-inclusion:\n{output}"
     )
     entries = _without_warnings(output)
-    assert "Binaries" not in entries, (
-        f"status --scan reports entries the instance ignore file excludes:\n{output}"
+    assert "editor" not in entries, (
+        f"status --scan reports an untracked file the instance ignore file excludes:\n{output}"
     )
     assert "notes.txt" in entries, "status --scan should report notes.txt"
+    assert "tool.exe" in entries, (
+        f"status --scan should report an edit to a tracked file under a rule:\n{output}"
+    )
 
     diff = _without_warnings(repo.diff())
     assert "notes.txt" in diff, "diff should report notes.txt"
-    assert "tool.exe" not in diff, (
-        f"diff reports an edit under an instance ignore rule:\n{diff}"
-    )
+    assert "tool.exe" in diff, f"diff should report an edit to a tracked file:\n{diff}"
 
     repo.stage(scan=True)
     output = _without_warnings(repo.status())
-    verify_operations_in_status(output, [(Operation.MODIFY, "notes.txt")])
-    assert "Binaries" not in output, (
-        f"a scanning stage staged entries the instance ignore file excludes:\n{output}"
+    verify_operations_in_status(
+        output,
+        [
+            (Operation.MODIFY, "Binaries/Win64/tool.exe"),
+            (Operation.MODIFY, "notes.txt"),
+        ],
+    )
+    assert "editor" not in output, (
+        f"a scanning stage staged an untracked file the instance ignore file excludes:\n{output}"
     )
     assert ".lore" not in output, "the instance ignore file must never be staged"
 
-    repo.stage("Binaries/Win64/tool.exe", force=True)
+    repo.stage("Binaries/Mac/editor", force=True)
     verify_operations_in_status(
-        repo.status(), [(Operation.MODIFY, "Binaries/Win64/tool.exe")]
+        repo.status(),
+        [
+            (Operation.MODIFY, "Binaries/Win64/tool.exe"),
+            (Operation.ADD, "Binaries/Mac/editor"),
+            (Operation.MODIFY, "notes.txt"),
+        ],
     )
