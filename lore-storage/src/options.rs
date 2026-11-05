@@ -9,8 +9,13 @@ use crate::fragment_flags::FragmentFlags;
 pub struct WriteOptions {
     /// This fragment stores a revision state
     pub revision_state: bool,
-    /// This fragment should be cached locally with payload if possible
+    /// This fragment should be cached locally with payload if possible. Recorded in the fragment's
+    /// flags, so it travels with the fragment and every store that fetches it caches it too.
     pub local_cache_priority: bool,
+    /// Keep the payload in this store even where the write makes it durable on the remote,
+    /// without asking anyone else to cache it: unlike `local_cache_priority`, it is not recorded in
+    /// the fragment.
+    pub keep_local: bool,
     /// Allow attempting to write the fragment to a remote
     pub remote_write: bool,
     /// Fixed size chunking if nonzero
@@ -46,6 +51,18 @@ impl WriteOptions {
     pub fn with_local_cache_priority(mut self) -> Self {
         self.local_cache_priority = true;
         self
+    }
+
+    /// See [`WriteOptions::keep_local`].
+    pub fn with_keep_local(mut self) -> Self {
+        self.keep_local = true;
+        self
+    }
+
+    /// Whether the write keeps the payload in this store once it is durable on the remote: asked
+    /// for by [`WriteOptions::local_cache_priority`] or [`WriteOptions::keep_local`].
+    pub fn cache_local(&self) -> bool {
+        self.local_cache_priority || self.keep_local
     }
 
     pub fn with_remote_write(mut self) -> Self {

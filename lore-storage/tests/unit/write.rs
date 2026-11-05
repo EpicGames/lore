@@ -78,6 +78,28 @@ fn remote_put_retry_accepts_arc_storage_session_and_is_send() {
     ensure_spawn_ok(remote_put_retry);
 }
 
+/// `keep_local` keeps the payload in the writing store without recording anything in the fragment,
+/// so the stores that fetch the fragment later do not cache it on its account, as they do for
+/// `local_cache_priority`.
+#[test]
+fn keeping_a_payload_local_is_not_recorded_in_the_fragment() {
+    let kept = WriteOptions::default().with_keep_local();
+    assert!(kept.cache_local());
+    assert_eq!(
+        kept.as_u32() & FragmentFlags::PayloadLocalCachePriority.bits(),
+        0
+    );
+
+    let prioritized = WriteOptions::default().with_local_cache_priority();
+    assert!(prioritized.cache_local());
+    assert_ne!(
+        prioritized.as_u32() & FragmentFlags::PayloadLocalCachePriority.bits(),
+        0
+    );
+
+    assert!(!WriteOptions::default().cache_local());
+}
+
 async fn make_test_store() -> (TempDir, Arc<dyn ImmutableStore>) {
     let dir = TempDir::new("lore-storage-follower-test-");
     let store = LocalImmutableStore::new(

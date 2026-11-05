@@ -119,8 +119,18 @@ pub fn counted_write_context() -> lore_storage::WriteContext {
 
 /// Construct [`WriteOptions`] from a repository context. Writes reach the remote only where the
 /// context uploads and the call is not a dry run.
+///
+/// A repository that caches content locally ([`RepositoryContext::disable_cache`] unset, as every
+/// SWFS instance's is) keeps the payloads it writes as it keeps those it reads, even one the write
+/// makes durable on the remote. Without it the store keeps the entry and drops the payload, which a
+/// plain instance can afford, as its working tree holds the file, and an SWFS instance cannot: it
+/// serves the file from the store, offline. Kept with [`WriteOptions::with_keep_local`] rather than
+/// `local_cache_priority`, which the fragment records and every store fetching it then honours.
 pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> WriteOptions {
-    let flags = WriteOptions::default();
+    let mut flags = WriteOptions::default();
+    if !repository.disable_cache() {
+        flags = flags.with_keep_local();
+    }
     let dry_run =
         crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run());
     if !repository.disable_upload() && !dry_run {
