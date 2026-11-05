@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use lore_base::error::InvalidPath;
+use lore_base::error::NotSupported;
 use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
 
@@ -42,9 +43,32 @@ pub enum MountManagerError {
 pub struct MountManager {
     mounted_paths: DashMap<MountPath, Mount>,
     swfs_id_lookup: DashMap<WrappedHandle, Arc<SwfsInterface>>,
+    /// Held across the check against [`Self::MOUNT_LIMIT`] and the mount that follows it, so two
+    /// instances created at once cannot both take the last place.
+    creating: tokio::sync::Mutex<()>,
 }
 
 impl MountManager {
+    /// The most SWFS instances a service mounts. The SWFS driver attaches about eight mounts, and
+    /// the library parks the process that asks for one more, so the client hangs or loses its
+    /// connection with no way back. The driver's limit is machine-wide, which this count of the
+    /// service's own mounts does not see.
+    pub(crate) const MOUNT_LIMIT: usize = 8;
+
+    /// Refuses another SWFS instance once this service mounts [`Self::MOUNT_LIMIT`] of them.
+    pub fn refuse_past_mount_limit(&self) -> Result<(), NotSupported> {
+        if self.mount_count() < Self::MOUNT_LIMIT {
+            return Ok(());
+        }
+        Err(NotSupported {
+            operation: format!(
+                "mounting another SWFS instance: this service already mounts {}, the most SWFS \
+                 supports at once",
+                self.mount_count()
+            ),
+        })
+    }
+
     /// Mounts every SWFS instance of the stores in `entries`. A store that cannot be opened or
     /// listed, and an instance whose config cannot be read, are logged and skipped rather than
     /// stopping the rest.
@@ -133,6 +157,7 @@ impl MountManager {
         Ok(Arc::new(MountManager {
             mounted_paths,
             swfs_id_lookup: lookup,
+            creating: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -178,12 +203,17 @@ impl MountManager {
     ) -> Result<PathBuf, MountManagerError> {
         let mount_path = MountPath::new(repository_path)
             .forward::<MountManagerError>("Failed to make mount path")?;
+        let _creating = self.creating.lock().await;
         if self.mounted_paths.contains_key(&mount_path) {
             return Err(MountManagerError::internal(format!(
                 "Mount already exists for path {}",
                 repository_path.display()
             )));
         }
+        // Create and clone refuse an instance past the limit before making any of it; this
+        // catches one that raced another to the last place.
+        self.refuse_past_mount_limit()
+            .map_err(|refused| MountManagerError::internal(refused.to_string()))?;
         let dot_lore = external_dir_for_instance(instance_id)
             .forward::<MountManagerError>("Unable to get external directory")?
             .join(DOT_LORE);
@@ -211,6 +241,28 @@ impl MountManager {
     /// Returns the number of currently mounted SWFS paths.
     pub fn mount_count(&self) -> usize {
         self.mounted_paths.len()
+    }
+
+    /// The mount `path` lies inside, below its root, if any.
+    ///
+    /// Compared as text, case folded and with separators made alike, rather than canonicalized:
+    /// canonicalizing a path inside a mount is what fails.
+    pub fn mount_containing(&self, path: &Path) -> Option<PathBuf> {
+        let normalize = |path: &Path| {
+            let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+            text.strip_prefix(r"\\?\")
+                .map_or(text.clone(), str::to_owned)
+                .trim_end_matches('\\')
+                .to_owned()
+        };
+        let target = normalize(path);
+        self.mounted_paths.iter().find_map(|entry| {
+            let root = normalize(entry.key().as_ref());
+            target
+                .strip_prefix(&root)
+                .is_some_and(|rest| rest.starts_with('\\'))
+                .then(|| entry.key().as_ref().to_path_buf())
+        })
     }
 
     /// Check if a path is currently mounted.

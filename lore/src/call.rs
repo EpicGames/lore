@@ -247,7 +247,15 @@ async fn prepare_repository_call(
 
     let execution = setup_execution(globals, callback);
 
-    let dotpath = get_dot_lore_path(&repository_path).map_err(|err| err.ffi_code())?;
+    // Inside the call's scope, so the metadata of an instance kept in the global directory, as an
+    // SWFS instance's is, is looked for in the directory the call carries: a service relaying
+    // calls for another global directory would otherwise look in its own.
+    let dotpath = LORE_CONTEXT
+        .scope(execution.clone(), async {
+            get_dot_lore_path(&repository_path)
+        })
+        .await
+        .map_err(|err| err.ffi_code())?;
     if !dotpath.is_dir() {
         let err = RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),

@@ -214,6 +214,11 @@ pub(crate) async fn create_with_metadata(
         }));
     }
 
+    repository::refuse_nesting_in_swfs_mount(path)?;
+    if options.vfs_options.vfs_type.is_swfs() {
+        repository::refuse_swfs_nested_in_repository(path)?;
+        repository::refuse_swfs_past_mount_limit()?;
+    }
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
         let existing_repository_is_swfs =

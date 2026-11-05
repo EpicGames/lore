@@ -998,16 +998,20 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
+    let swfs = options
+        .vfs_options
+        .as_ref()
+        .is_some_and(|vfs| vfs.vfs_type.is_swfs());
     // An SWFS clone mounts the repository, and a mount cannot be removed again.
-    if call.dry_run()
-        && options
-            .vfs_options
-            .as_ref()
-            .is_some_and(|vfs| vfs.vfs_type.is_swfs())
-    {
+    if call.dry_run() && swfs {
         return Err(CloneError::from(InvalidArguments {
             reason: "--dry-run is not supported for an SWFS clone".to_string(),
         }));
+    }
+    repository::refuse_nesting_in_swfs_mount(path)?;
+    if swfs {
+        repository::refuse_swfs_nested_in_repository(path)?;
+        repository::refuse_swfs_past_mount_limit()?;
     }
 
     let existing_dot_dir = get_dot_lore_path(path)?;

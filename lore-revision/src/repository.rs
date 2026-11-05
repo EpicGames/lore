@@ -1529,6 +1529,68 @@ pub const MINE_SUFFIX: &str = "~mine";
 /// automerge removes the ones it wrote.
 pub const MERGE_ARTIFACT_SUFFIXES: [&str; 3] = [MINE_SUFFIX, THEIRS_SUFFIX, BASE_SUFFIX];
 
+/// Refuses another SWFS instance once the service mounts as many as SWFS supports
+/// ([`MountManager::MOUNT_LIMIT`](crate::fs::mount_manager::MountManager::MOUNT_LIMIT)).
+///
+/// An early check, so a create or clone that would be refused fails before any of the instance is
+/// made rather than after the setup work. It claims nothing: two instances can both pass it, and
+/// [`MountManager::create_mount`](crate::fs::mount_manager::MountManager::create_mount) checks
+/// again under a lock as it mounts, which is what keeps the count within the limit. Outside a
+/// service there is no mount to count, and creating the instance is refused there anyway.
+pub(crate) fn refuse_swfs_past_mount_limit() -> Result<(), NotSupported> {
+    match MountManagerState::mount_manager() {
+        Some(manager) => manager.refuse_past_mount_limit(),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a repository at `path` inside an SWFS instance's mount, whether or not it is an SWFS
+/// instance itself.
+///
+/// A nested repository is an instance with its own state whose working tree lies in the parent's,
+/// unknown to it: inside a mount, its files would live in the parent's SWFS write cache. Links and
+/// layers are a separate kind of nesting, the parent's own content its operations realize, and
+/// are not refused here.
+pub(crate) fn refuse_nesting_in_swfs_mount(
+    path: &std::path::Path,
+) -> Result<(), crate::errors::InvalidArguments> {
+    if let Some(mount) =
+        MountManagerState::mount_manager().and_then(|manager| manager.mount_containing(path))
+    {
+        return Err(crate::errors::InvalidArguments {
+            reason: format!(
+                "unable to put a repository at {} inside the SWFS instance at {}: an SWFS \
+                 instance holds no nested repository with its own state",
+                path.display(),
+                mount.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses an SWFS instance at `path` inside another repository's working tree, where it would be
+/// a mount the parent's walks cross.
+pub(crate) fn refuse_swfs_nested_in_repository(
+    path: &std::path::Path,
+) -> Result<(), crate::errors::InvalidArguments> {
+    if let Some(parent) = path
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join(DOT_LORE).is_dir() || ancestor.join(DOT_URC).is_dir())
+    {
+        return Err(crate::errors::InvalidArguments {
+            reason: format!(
+                "unable to put an SWFS instance at {} inside the repository at {}: an SWFS \
+                 instance cannot be nested in another repository",
+                path.display(),
+                parent.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
     if let Some(mount_manager) = MountManagerState::mount_manager() {
         match mount_manager.check_for_external_lore_dir(path) {

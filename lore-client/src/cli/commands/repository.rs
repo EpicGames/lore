@@ -117,7 +117,9 @@ pub enum VfsType {
     None,
     /// Use whichever VFS system is preferred based on the user's system.
     Default,
-    /// Use Epic's Split Write File System as the Virtual File System.
+    /// Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its
+    /// content in the shared store made for its remote, so it needs a reachable remote: it cannot
+    /// be created offline, or for a repository with no remote.
     Swfs,
 }
 

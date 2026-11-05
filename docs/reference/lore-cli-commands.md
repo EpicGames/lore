@@ -357,7 +357,9 @@ Create a repository in the given directory
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
 * `--use-shared-store` — Use the shared store rather than create a local immutable store
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
@@ -396,7 +398,9 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
@@ -2188,7 +2192,9 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
