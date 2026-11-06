@@ -162,3 +162,29 @@ def test_branch_metadata_set_binary_outside_repository(new_lore_repo, scratch_di
     assert restored.read_bytes() == payload, (
         "The payload read back from the store must match the file outside the repository"
     )
+
+
+ZERO_ADDRESS = "0" * 64 + "-" + "0" * 32
+
+
+@pytest.mark.smoke
+def test_branch_metadata_set_binary_empty(new_lore_repo):
+    """An empty file is a binary value too: its content is stored under the zero hash, which
+    names no blob for the server to hold."""
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("empty.bin", "wb"):
+        pass
+
+    repo.branch_metadata_set(["empty-key", "empty.bin"], branch="main", binary=True)
+
+    events = get_metadata_events(
+        repo.branch_metadata_get("empty-key", branch="main", json=True)
+    )
+    assert len(events) == 1, f"Expected 1 metadata event, got {len(events)}"
+    assert events[0]["value"]["tagName"] == "address", (
+        f"Binary metadata must record an address.\nGot: {events[0]['value']}"
+    )
+    assert events[0]["value"]["data"] == ZERO_ADDRESS, (
+        f"An empty file must record the zero address.\nGot: {events[0]['value']}"
+    )

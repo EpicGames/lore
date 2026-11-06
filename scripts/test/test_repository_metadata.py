@@ -203,6 +203,24 @@ def test_repository_metadata_set_binary(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_repository_metadata_set_binary_empty(new_lore_repo):
+    """An empty file is a binary value too: its content is stored under the zero hash, which
+    names no blob for the server to hold."""
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("empty.bin", "wb"):
+        pass
+
+    repo.repository_metadata_set(
+        ["empty-key", os.path.join(repo.path, "empty.bin")], binary=True
+    )
+
+    events = get_metadata_events(repo.repository_metadata_get("empty-key", json=True))
+    assert len(events) == 1
+    assert events[0]["value"]["tagName"] == "address"
+
+
+@pytest.mark.smoke
 def test_repository_metadata_get_all_includes_user_and_builtin(new_lore_repo):
     """Verify that listing all metadata returns both built-in and user-defined keys."""
     repo: Lore = new_lore_repo()

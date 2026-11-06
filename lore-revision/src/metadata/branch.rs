@@ -149,7 +149,11 @@ fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<A
 
     metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
         if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
-            addresses.push(value.into());
+            let address: Address = value.into();
+            // Empty content is stored as the zero hash, which names no blob to upload.
+            if !address.hash.is_zero() {
+                addresses.push(address);
+            }
         }
     });
 
