@@ -9,14 +9,17 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use dashmap::DashSet;
+use lore_base::log::LoreLogLevel;
 use lore_error_set::error_set;
 use swfs_api::SWFSHandle;
 
+use crate::event::LoreErrorDetail;
 use crate::fs::swfs::handle_gate::HandleGate;
 use crate::fs::swfs::handle_gate::HandleGateGuard;
 use crate::fs::swfs::mount_resources::MountResources;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
 use crate::fs::swfs::paths::RelativePathKey;
+use crate::service_state::ServiceStateImpl;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct WrappedHandle(#[allow(unused)] SWFSHandle);
@@ -83,6 +86,18 @@ impl SwfsInterface {
     pub fn lookup_key(&self) -> WrappedHandle {
         self.handle.clone()
     }
+
+    /// Logs `error` and keeps it for the service's status, for code that can't propagate an error
+    /// upwards by returning it, such as callbacks from SWFS.
+    pub(crate) fn handle_lore_error(
+        error: impl lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
+    ) {
+        let message = LoreErrorDetail::from_error(&error).message_with_trace();
+        // Logged as well as kept for the service's status, as `handle_swfs_error` does: a
+        // `read_file` that fails here is served as zeros.
+        crate::lore_error!("SWFS callback failed: {message}");
+        ServiceStateImpl::global().push_log(LoreLogLevel::Error, message);
+    }
 }
 
 impl Drop for SwfsInterface {
@@ -148,7 +163,6 @@ mod swfs_impl {
     use tokio::task::yield_now;
 
     use super::*;
-    use crate::event::LoreErrorDetail;
     use crate::fs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::api_interface::swfs_api::SWFSCallbacks;
     use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
@@ -166,6 +180,7 @@ mod swfs_impl {
     use crate::fs::swfs::file::SwfsFileArray;
     use crate::fs::swfs::mount_resources::MountResources;
     use crate::fs::swfs::mount_resources::SwfsWorkError;
+    use crate::fs::swfs::panic_guard::panic_guard_swfs_callback;
     use crate::fs::swfs::paths::SwfsPath;
     use crate::fs::swfs::state::written_files;
     use crate::lore_debug;
@@ -329,6 +344,7 @@ mod swfs_impl {
             read_offset: swfs_u64,
             num_bytes_to_read: swfs_u64,
         ) -> swfs_u64 {
+            self.resources.callbacks().record_read_file();
             let file = unsafe { &mut *file };
             let file_name = unsafe { CStr::from_ptr(file.path).to_string_lossy() };
             let out_buffer = unsafe {
@@ -357,6 +373,7 @@ mod swfs_impl {
         }
 
         fn fill_dir_begin(&self, path: *const c_char) {
+            self.resources.callbacks().record_directory_evaluation();
             let Some(handle) = Self::handle_lore_result(self.handle()) else {
                 return;
             };
@@ -407,18 +424,20 @@ mod swfs_impl {
         ) -> bool {
             let source_filename = unsafe { CStr::from_ptr(source_filename) };
             let error_message = unsafe { CStr::from_ptr(error_message) };
+            let message = format!(
+                "SWFS Error ({}): {}::{}: {}",
+                error_code,
+                source_filename.to_string_lossy(),
+                source_line_number,
+                error_message.to_string_lossy()
+            );
+            // Logged as well as kept for the service's status: the status is only read when asked
+            // for, and SWFS serves a read it could not complete as zeros, so this may be the only
+            // trace of a file served wrong.
+            crate::lore_error!("{message}");
             // SWFS calls this from C with nothing of ours to carry the state,
             // so this is one of the paths that reaches for the global.
-            ServiceStateImpl::global().push_log(
-                LoreLogLevel::Error,
-                format!(
-                    "SWFS Error ({}): {}::{}: {}",
-                    error_code,
-                    source_filename.to_string_lossy(),
-                    source_line_number,
-                    error_message.to_string_lossy()
-                ),
-            );
+            ServiceStateImpl::global().push_log(LoreLogLevel::Error, message);
             false
         }
 
@@ -438,14 +457,6 @@ mod swfs_impl {
                 }
             }
         }
-
-        fn handle_lore_error(
-            error: impl lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
-        ) {
-            let error_detail = LoreErrorDetail::from_error(&error);
-            ServiceStateImpl::global()
-                .push_log(LoreLogLevel::Error, error_detail.message_with_trace());
-        }
     }
 
     fn lookup_handle(handle: SWFSHandle) -> Result<Arc<SwfsInterface>, SwfsInterfaceError> {
@@ -460,32 +471,42 @@ mod swfs_impl {
     }
 
     /// Creates a C function that takes an `SWFSHandle` as its first argument and calls the associated
-    /// method on that handle's `SwfsInterface`.
+    /// method on that handle's `SwfsInterface`, under [`panic_guard_swfs_callback`].
     macro_rules! handle_redirect {
             ($fn_name:ident, $interface_fn_name:ident, ($($arg_name:ident: $arg_ty:ty),* $(,)?) -> $ret_ty:ty) => {
                 #[unsafe(no_mangle)]
                 pub unsafe extern "C" fn $fn_name(handle: SWFSHandle, $($arg_name: $arg_ty),*) -> $ret_ty {
-                    let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) else {
-                        return Default::default();
-                    };
-                    // Held for the whole callback, so a close waits for it to finish.
-                    let Ok(_use) = interface.handle() else {
-                        return Default::default();
-                    };
-                    interface.$interface_fn_name($($arg_name),*)
+                    panic_guard_swfs_callback(
+                        stringify!($interface_fn_name),
+                        || {
+                            let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) else {
+                                return Default::default();
+                            };
+                            // Held for the whole callback, so a close waits for it to finish.
+                            let Ok(_use) = interface.handle() else {
+                                return Default::default();
+                            };
+                            interface.$interface_fn_name($($arg_name),*)
+                        },
+                    )
                 }
             };
             ($fn_name:ident, $interface_fn_name:ident, ($($arg_name:ident: $arg_ty:ty),* $(,)?)) => {
                 #[unsafe(no_mangle)]
                 pub unsafe extern "C" fn $fn_name(handle: SWFSHandle, $($arg_name: $arg_ty),*) {
-                    let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) else {
-                        return;
-                    };
-                    // Held for the whole callback, so a close waits for it to finish.
-                    let Ok(_use) = interface.handle() else {
-                        return;
-                    };
-                    interface.$interface_fn_name($($arg_name),*)
+                    panic_guard_swfs_callback(
+                        stringify!($interface_fn_name),
+                        || {
+                            let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) else {
+                                return;
+                            };
+                            // Held for the whole callback, so a close waits for it to finish.
+                            let Ok(_use) = interface.handle() else {
+                                return;
+                            };
+                            interface.$interface_fn_name($($arg_name),*)
+                        },
+                    )
                 }
             };
         }
@@ -507,11 +528,13 @@ mod swfs_impl {
         source_line_number: c_int,
         error_message: *const c_char,
     ) -> bool {
-        SwfsInterface::handle_swfs_error(
-            error_code,
-            source_filename,
-            source_line_number,
-            error_message,
-        )
+        panic_guard_swfs_callback("error_callback", || {
+            SwfsInterface::handle_swfs_error(
+                error_code,
+                source_filename,
+                source_line_number,
+                error_message,
+            )
+        })
     }
 }
