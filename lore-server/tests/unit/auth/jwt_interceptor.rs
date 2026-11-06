@@ -58,6 +58,7 @@ fn interceptor() -> JWTInterceptor {
         jwt_issuer: None,
         jwt_audience: Some(vec!["Lore".to_string()]),
         jwt_typ: None,
+        exchange_issuer: None,
     }))
 }
 
@@ -317,6 +318,7 @@ fn token_verification_refuses_a_verifier_with_unsigned_identity() {
         jwt_issuer: None,
         jwt_audience: None,
         jwt_typ: None,
+        exchange_issuer: None,
     };
     assert!(TokenVerification::new(Some(verifier), true).is_err());
 }

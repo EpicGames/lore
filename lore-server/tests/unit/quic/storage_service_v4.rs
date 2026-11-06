@@ -238,6 +238,7 @@ mod authorized_session {
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }
     }
 

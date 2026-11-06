@@ -656,6 +656,7 @@ mod behind_the_interceptor {
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }));
         let inner = Inner::default();
         let mut stack = InterceptedService::new(

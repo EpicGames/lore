@@ -21,6 +21,7 @@ use lore_telemetry::TraceConfigError;
 use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
+use crate::auth::jwk::is_issuer_url;
 use crate::authnz::repository_authorizer::AuthorizerSelection;
 use crate::authnz::repository_authorizer::select_repository_authorizer;
 use crate::authnz::repository_catalog::select_repository_catalog;
@@ -267,10 +268,11 @@ fn validate_oidc_config(
             AuthorizerSelection::AllowAll | AuthorizerSelection::AuthClient => Ok(()),
         };
     };
-    let is_issuer_url = auth.jwt_issuer.first().is_some_and(|issuer| {
-        reqwest::Url::parse(issuer).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-    });
-    if !is_issuer_url {
+    if !auth
+        .jwt_issuer
+        .first()
+        .is_some_and(|issuer| is_issuer_url(issuer))
+    {
         return error(
             "server.auth.oidc requires the first server.auth.jwt_issuer entry to be the \
              provider's issuer URL",
@@ -308,6 +310,14 @@ fn validate_oidc_config(
                 "{setting} must contain {PARTITION_PLACEHOLDER}, which stands for the partition ID"
             ));
         }
+    }
+    if oidc
+        .token_exchange_issuer
+        .as_deref()
+        .filter(|issuer| !issuer.is_empty())
+        .is_some_and(|issuer| !is_issuer_url(issuer))
+    {
+        return error("server.auth.oidc.token_exchange_issuer must be an http or https issuer URL");
     }
     if is_set(&oidc.token_exchange_issuer) && !has_template {
         return error(
@@ -466,6 +476,18 @@ pub struct OidcSettings {
 }
 
 impl AuthSettings {
+    /// The `[server.auth.oidc]` `token_exchange_issuer` when it names an issuer `jwt_issuer`
+    /// doesn't: a separate token service, whose tokens are verified against its own keys.
+    pub fn separate_exchange_issuer(&self) -> Option<&str> {
+        let issuer = self
+            .oidc
+            .as_ref()?
+            .token_exchange_issuer
+            .as_deref()
+            .filter(|issuer| !issuer.is_empty())?;
+        (!self.jwt_issuer.iter().any(|accepted| accepted == issuer)).then_some(issuer)
+    }
+
     pub fn implicit_actions(&self) -> Vec<crate::authnz::repository_authorizer::Action> {
         self.implicit_actions
             .clone()

@@ -27,6 +27,7 @@ use opentelemetry::KeyValue;
 use serde::Deserialize;
 use smallvec::SmallVec;
 use thiserror::Error;
+use tracing::Instrument;
 use tracing::info;
 use tracing::warn;
 
@@ -68,7 +69,9 @@ pub enum JWKServiceError {
          for OIDC discovery"
     )]
     EndpointUnresolvable,
-    #[error("OIDC discovery document names issuer '{actual}', but jwt_issuer expects '{expected}'")]
+    #[error(
+        "OIDC discovery document names issuer '{actual}', but the configured issuer is '{expected}'"
+    )]
     DiscoveryIssuerMismatch { expected: String, actual: String },
     #[error(
         "OIDC discovery returned jwks_uri '{jwks_uri}', which this server will not fetch keys \
@@ -359,7 +362,7 @@ pub async fn fetch_discovery_document(issuer: &str) -> Result<DiscoveryDocument,
         warn!(
             expected = %issuer,
             actual = %document.issuer,
-            "OIDC discovery document names a different issuer than jwt_issuer"
+            "OIDC discovery document names a different issuer than the configured one"
         );
         return Err(JWKServiceError::DiscoveryIssuerMismatch {
             expected: issuer.to_string(),
@@ -367,6 +370,12 @@ pub async fn fetch_discovery_document(issuer: &str) -> Result<DiscoveryDocument,
         });
     }
     Ok(document)
+}
+
+/// Whether `issuer` is an http or https URL, which an issuer whose keys are found through
+/// OIDC discovery must be.
+pub fn is_issuer_url(issuer: &str) -> bool {
+    reqwest::Url::parse(issuer).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 /// Whether a discovered `jwks_uri` may be fetched from.
@@ -438,10 +447,7 @@ impl JwkServiceImpl {
 
         let issuer = issuers
             .and_then(|issuers| issuers.first())
-            .filter(|issuer| {
-                reqwest::Url::parse(issuer)
-                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-            })
+            .filter(|issuer| is_issuer_url(issuer))
             .ok_or(JWKServiceError::EndpointUnresolvable)?;
 
         if let Some([_]) = issuers {
@@ -555,6 +561,19 @@ impl JwkServiceImpl {
         // way out so a healthy interval is measured from completion.
         self.mark_refreshed();
 
+        // At the server's default level, so the warnings of a fetch name the key set they
+        // are about, which tells apart those of a server with a separate token exchange
+        // issuer. Built only once a fetch is due, which the throttle bounds.
+        let span = tracing::warn_span!(
+            "jwks",
+            issuer = self.discovery_issuer.as_deref(),
+            endpoint = self.settings.endpoint.as_deref()
+        );
+        self.fetch_and_publish().instrument(span).await
+    }
+
+    /// Fetch the key set and replace the cache with it. The caller holds `refresh`.
+    async fn fetch_and_publish(&self) -> Result<(), JWKServiceError> {
         let (endpoint, endpoint_source) = self.resolve_jwks_endpoint().await?;
         let endpoint = reqwest::Url::parse(&endpoint).map_err(|e| {
             warn!("failed to parse JWKS endpoint as a URL: {e:?}");

@@ -320,6 +320,7 @@ mod jwt_verifier {
         served: std::sync::Mutex<String>,
         rotates_to: Option<String>,
         refreshes: std::sync::atomic::AtomicUsize,
+        lookups: std::sync::atomic::AtomicUsize,
     }
 
     impl RotatingJWKService {
@@ -328,6 +329,7 @@ mod jwt_verifier {
                 served: std::sync::Mutex::new(served.to_string()),
                 rotates_to: rotates_to.map(str::to_string),
                 refreshes: std::sync::atomic::AtomicUsize::new(0),
+                lookups: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -335,7 +337,14 @@ mod jwt_verifier {
             self.refreshes.load(std::sync::atomic::Ordering::Relaxed)
         }
 
+        /// How often a key was looked up, from the cache or not.
+        fn lookups(&self) -> usize {
+            self.lookups.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
         fn current(&self) -> (DecodingKey, Algorithm) {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let served = self.served.lock().expect("served key");
             (
                 DecodingKey::from_secret(served.as_bytes()),
@@ -381,6 +390,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }
     }
 
@@ -519,6 +529,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }
     }
 
@@ -590,6 +601,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         };
 
         let forged = {
@@ -723,6 +735,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         };
 
         let authn_string_audience = json!({
@@ -763,6 +776,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["urc.example.com".to_string(), "URC_test".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         };
 
         let base_authz_token = mock_authz_token(vec!["URC_test".to_string()]);
@@ -800,6 +814,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["urc.example.com".to_string(), "Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         };
         let (original_authz_token, encoded_authz_token) =
             make_authz_token_with_audience(vec!["Lore".to_string()]);
@@ -824,6 +839,7 @@ mod jwt_verifier {
             jwt_issuer: Some(issuers),
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }
     }
 
@@ -894,6 +910,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         };
 
         let minimal_claims = json!({
@@ -937,6 +954,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(common_audience.clone()),
             jwt_typ: None,
+            exchange_issuer: None,
         };
 
         let (original_token, encoded_token) = make_authz_token_with_audience(common_audience);
@@ -963,6 +981,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["Lore".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         };
 
         let (original_token, encoded_token) =
@@ -989,6 +1008,7 @@ mod jwt_verifier {
             jwt_issuer: None,
             jwt_audience: Some(vec!["skein".to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         };
 
         let (_, encoded_token) = make_authz_token_with_audience(vec!["Lore".to_string()]);
@@ -1018,6 +1038,7 @@ mod jwt_verifier {
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
                 jwt_typ: None,
+                exchange_issuer: None,
             }
         }
 
@@ -1141,6 +1162,7 @@ mod jwt_verifier {
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
                 jwt_typ: None,
+                exchange_issuer: None,
             };
             let verified = verifier
                 .try_verify_token_cached(&token_with(&[(IDENTITY_CLAIM, json!("stable-oid"))]))
@@ -1170,6 +1192,7 @@ mod jwt_verifier {
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
                 jwt_typ,
+                exchange_issuer: None,
             }
         }
 
@@ -1184,6 +1207,7 @@ mod jwt_verifier {
                 jwt_issuer: None,
                 jwt_audience: Some(vec!["Lore".to_string()]),
                 jwt_typ,
+                exchange_issuer: None,
             }
         }
 
@@ -1292,6 +1316,225 @@ mod jwt_verifier {
                 .try_verify_token_cached(&encode_jwt_with_typ(Some("JWT")))
                 .expect_err("refused, not deferred");
             assert!(matches!(error, JwtVerifierError::TypNotAccepted));
+        }
+    }
+
+    /// A deployment whose token exchange issuer is a separate service that signs with keys
+    /// of its own, beside the login issuer.
+    mod exchange_issuer {
+        use super::*;
+
+        const LOGIN_ISSUER: &str = "https://login.example.com";
+        const LOGIN_SECRET: &str = "login-secret";
+        const EXCHANGE_ISSUER: &str = "https://exchange.example.com";
+        const EXCHANGE_SECRET: &str = "exchange-secret";
+
+        fn verifier(login: Arc<RotatingJWKService>, exchange: Arc<dyn JWKService>) -> JwtVerifier {
+            JwtVerifier {
+                jwk_service: login,
+                jwt_issuer: Some(vec![LOGIN_ISSUER.to_string()]),
+                jwt_audience: Some(vec!["Lore".to_string()]),
+                jwt_typ: None,
+                exchange_issuer: Some(ExchangeIssuer {
+                    issuer: EXCHANGE_ISSUER.to_string(),
+                    jwk_service: exchange,
+                }),
+            }
+        }
+
+        /// Serves `secret` for every key id and counts the lookups, so a test can tell which
+        /// signer's keys a token was checked against.
+        fn keys(secret: &str) -> Arc<RotatingJWKService> {
+            Arc::new(RotatingJWKService::new(secret, None))
+        }
+
+        fn token(issuer: &str, signed_with: &str) -> String {
+            let mut claims = mock_authz_token(vec!["Lore".to_string()]);
+            claims.issuer = issuer.to_string();
+            encode_jwt_signed_with(signed_with, &claims)
+        }
+
+        fn fails_with(error: &JwtVerifierError, kind: jsonwebtoken::errors::ErrorKind) -> bool {
+            matches!(error, JwtVerifierError::ValidationFailed(inner) if *inner.kind() == kind)
+        }
+
+        fn is_signature_failure(error: &JwtVerifierError) -> bool {
+            fails_with(error, jsonwebtoken::errors::ErrorKind::InvalidSignature)
+        }
+
+        #[tokio::test]
+        async fn each_issuer_verifies_against_its_own_keys() {
+            let login = keys(LOGIN_SECRET);
+            let exchange = keys(EXCHANGE_SECRET);
+            let verifier = verifier(login.clone(), exchange.clone());
+
+            let verified = verifier
+                .verify_token(&token(EXCHANGE_ISSUER, EXCHANGE_SECRET))
+                .await
+                .expect("the exchange issuer's token verifies");
+            assert_eq!(verified.issuer, EXCHANGE_ISSUER);
+            assert_eq!((login.lookups(), exchange.lookups()), (0, 1));
+
+            let verified = verifier
+                .verify_token(&token(LOGIN_ISSUER, LOGIN_SECRET))
+                .await
+                .expect("the login issuer's token verifies");
+            assert_eq!(verified.issuer, LOGIN_ISSUER);
+            assert_eq!((login.lookups(), exchange.lookups()), (1, 1));
+        }
+
+        /// The login issuer's keys can't mint a partition-scoped token in the exchange
+        /// issuer's name.
+        #[tokio::test]
+        async fn a_token_naming_the_exchange_issuer_signed_by_the_login_issuer_is_refused() {
+            let login = keys(LOGIN_SECRET);
+            let verifier = verifier(login.clone(), keys(EXCHANGE_SECRET));
+
+            let error = verifier
+                .verify_token(&token(EXCHANGE_ISSUER, LOGIN_SECRET))
+                .await
+                .expect_err("refused");
+            assert!(is_signature_failure(&error), "{error:?}");
+            assert_eq!(login.lookups(), 0);
+        }
+
+        /// The exchange issuer's keys can't mint a token in the login issuer's name.
+        #[tokio::test]
+        async fn a_token_naming_the_login_issuer_signed_by_the_exchange_issuer_is_refused() {
+            let exchange = keys(EXCHANGE_SECRET);
+            let verifier = verifier(keys(LOGIN_SECRET), exchange.clone());
+
+            let error = verifier
+                .verify_token(&token(LOGIN_ISSUER, EXCHANGE_SECRET))
+                .await
+                .expect_err("refused");
+            assert!(is_signature_failure(&error), "{error:?}");
+            assert_eq!(exchange.lookups(), 0);
+        }
+
+        /// A token naming an issuer that is neither goes to the login issuer's keys: signed
+        /// with them it fails the `iss` check, signed by the exchange issuer its signature.
+        #[tokio::test]
+        async fn a_token_naming_another_issuer_is_refused() {
+            let verifier = verifier(keys(LOGIN_SECRET), keys(EXCHANGE_SECRET));
+
+            let error = verifier
+                .verify_token(&token("https://attacker.example.com", LOGIN_SECRET))
+                .await
+                .expect_err("refused");
+            assert!(
+                fails_with(&error, jsonwebtoken::errors::ErrorKind::InvalidIssuer),
+                "{error:?}"
+            );
+            let error = verifier
+                .verify_token(&token("https://attacker.example.com", EXCHANGE_SECRET))
+                .await
+                .expect_err("refused");
+            assert!(is_signature_failure(&error), "{error:?}");
+        }
+
+        /// An `iss` that is absent or not a string names no issuer, so the token goes to the
+        /// login issuer's keys, where it fails, and never reaches the exchange issuer's.
+        #[tokio::test]
+        async fn a_token_without_a_string_issuer_never_reaches_the_exchange_keys() {
+            let exchange = keys(EXCHANGE_SECRET);
+            let verifier = verifier(keys(LOGIN_SECRET), exchange.clone());
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            for iss in [None, Some(json!(7)), Some(json!([EXCHANGE_ISSUER]))] {
+                let mut claims =
+                    json!({"sub": "the u", "aud": "Lore", "iat": now, "exp": now + 60});
+                if let Some(iss) = iss.clone() {
+                    claims["iss"] = iss;
+                }
+                for secret in [LOGIN_SECRET, EXCHANGE_SECRET] {
+                    verifier
+                        .verify_token(&encode_jwt_signed_with(secret, &claims))
+                        .await
+                        .expect_err(&format!("iss {iss:?} is refused"));
+                }
+            }
+            assert_eq!(exchange.lookups(), 0);
+        }
+
+        /// `\/` is a valid escape of `/` in JSON, and some encoders write it. The token still
+        /// names the exchange issuer.
+        #[tokio::test]
+        async fn an_escaped_issuer_still_selects_the_exchange_keys() {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+            let exchange = keys(EXCHANGE_SECRET);
+            let verifier = verifier(keys(LOGIN_SECRET), exchange.clone());
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let claims = format!(
+                r#"{{"iss":"{}","sub":"the u","aud":"Lore","iat":{now},"exp":{}}}"#,
+                EXCHANGE_ISSUER.replace('/', "\\/"),
+                now + 60
+            );
+            let unsigned = format!(
+                "{}.{}",
+                URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","kid":"the kid"}"#),
+                URL_SAFE_NO_PAD.encode(&claims)
+            );
+            let signature = jsonwebtoken::crypto::sign(
+                unsigned.as_bytes(),
+                &EncodingKey::from_secret(EXCHANGE_SECRET.as_bytes()),
+                AGREED_UPON_ALGORITHM,
+            )
+            .unwrap();
+
+            verifier
+                .verify_token(&format!("{unsigned}.{signature}"))
+                .await
+                .expect("verifies against the exchange issuer's keys");
+            assert_eq!(exchange.lookups(), 1);
+        }
+
+        /// A key the exchange issuer rotates under an unchanged key id is re-fetched from the
+        /// exchange issuer, never from the login issuer.
+        #[tokio::test]
+        async fn a_key_the_exchange_issuer_rotates_is_refetched_from_it() {
+            let login = keys(LOGIN_SECRET);
+            let exchange = Arc::new(RotatingJWKService::new(
+                "rotated-out-secret",
+                Some(EXCHANGE_SECRET),
+            ));
+            let verifier = verifier(login.clone(), exchange.clone());
+
+            verifier
+                .verify_token(&token(EXCHANGE_ISSUER, EXCHANGE_SECRET))
+                .await
+                .expect("the rotated key verifies");
+            assert_eq!(exchange.refreshes(), 1);
+            assert_eq!(login.lookups(), 0);
+            assert_eq!(login.refreshes(), 0);
+        }
+
+        #[test]
+        fn the_cached_path_selects_the_same_keys() {
+            let login = keys(LOGIN_SECRET);
+            let exchange = keys(EXCHANGE_SECRET);
+            let verifier = verifier(login.clone(), exchange.clone());
+
+            let verified = verifier
+                .try_verify_token_cached(&token(EXCHANGE_ISSUER, EXCHANGE_SECRET))
+                .expect("verifies")
+                .expect("answered from the cache");
+            assert_eq!(verified.issuer, EXCHANGE_ISSUER);
+            assert_eq!((login.lookups(), exchange.lookups()), (0, 1));
+
+            let deferred = verifier
+                .try_verify_token_cached(&token(EXCHANGE_ISSUER, LOGIN_SECRET))
+                .expect("a signature failure defers to the async path");
+            assert!(deferred.is_none());
+            assert_eq!(login.lookups(), 0);
         }
     }
 }

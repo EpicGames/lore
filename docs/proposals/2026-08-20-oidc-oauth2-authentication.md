@@ -979,6 +979,12 @@ that. So when `jwt_issuer` holds an https URL the server fetches
 `iss` against the same value. `[server.auth.jwk].endpoint` stays as the override for providers with
 non-standard discovery.
 
+A `token_exchange_issuer` that `jwt_issuer` doesn't list is a separate token service with keys of
+its own. The server discovers them the same way, from `<token_exchange_issuer>`, and verifies a token
+whose `iss` names the service against those keys only, and every other token against the
+`jwt_issuer` keys only, so neither can sign tokens in the other's name. `[server.auth.jwk].endpoint`
+applies to the `jwt_issuer` keys alone.
+
 `[server.auth]` therefore gains `permission_claim`, `implicit_actions`, `baseline_access`,
 `repository_catalog`, `repository_catalog_url`, `resource_claim`, `resource_id_claim`,
 `resource_id_template` and `resource_wildcard`. `permission_claim` and `implicit_actions` are

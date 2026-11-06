@@ -72,6 +72,7 @@ fn make_verifier(jwk_service: MockTestJWKService) -> JwtVerifier {
         jwt_issuer: None,
         jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
         jwt_typ: None,
+        exchange_issuer: None,
     }
 }
 

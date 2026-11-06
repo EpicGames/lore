@@ -281,6 +281,80 @@ fn settings_with_oidc_keys(authorizer_keys: &str, oidc_keys: &str) -> Settings {
     .expect("[server.auth.oidc] must parse")
 }
 
+/// Only an exchange issuer `jwt_issuer` doesn't list gets keys of its own.
+#[test]
+fn a_separate_exchange_issuer_is_one_jwt_issuer_does_not_list() {
+    let separate_exchange_issuer = |oidc_keys: &str| {
+        settings_with_oidc_keys(TIER_2, oidc_keys)
+            .server
+            .auth
+            .expect("[server.auth] is present")
+            .separate_exchange_issuer()
+            .map(str::to_string)
+    };
+    let template = r#"resource_template = "https://lore.example.com/partitions/{id}""#;
+
+    assert_eq!(
+        separate_exchange_issuer(&format!(
+            "{template}\ntoken_exchange_issuer = \"https://sts.example.com\""
+        )),
+        Some("https://sts.example.com".to_string())
+    );
+    for not_separate in [
+        String::new(),
+        "token_exchange_issuer = \"\"".to_string(),
+        "token_exchange_issuer = \"https://auth.example.com\"".to_string(),
+    ] {
+        assert_eq!(
+            separate_exchange_issuer(&format!("{template}\n{not_separate}")),
+            None,
+            "{not_separate}"
+        );
+    }
+
+    // During an issuer cutover the exchange issuer can be the second jwt_issuer entry, whose
+    // tokens the jwt_issuer keys verify.
+    let cutover = settings_with_auth_keys(&format!(
+        r#"
+            jwt_issuer = ["https://auth.example.com", "https://sts.example.com"]
+            jwt_audience = ["lore-service"]
+            {TIER_2}
+
+            [server.auth.oidc]
+            client_id = "lore-cli"
+            {template}
+            token_exchange_issuer = "https://sts.example.com"
+        "#
+    ))
+    .expect("must parse")
+    .server
+    .auth
+    .expect("[server.auth] is present");
+    assert_eq!(cutover.separate_exchange_issuer(), None);
+}
+
+/// The exchange issuer's keys are found through its discovery document, which only an
+/// issuer URL has.
+#[test]
+fn a_token_exchange_issuer_that_is_not_a_url_fails_validation() {
+    for issuer in ["sts", "ftp://sts.example.com"] {
+        let settings = settings_with_oidc_keys(
+            TIER_2,
+            &format!(
+                "resource_template = \"https://lore.example.com/partitions/{{id}}\"\n\
+                 token_exchange_issuer = \"{issuer}\""
+            ),
+        );
+        assert!(validate_auth_config(&settings).is_err(), "{issuer}");
+    }
+    let settings = settings_with_oidc_keys(
+        TIER_2,
+        "resource_template = \"https://lore.example.com/partitions/{id}\"\n\
+         token_exchange_issuer = \"https://sts.example.com\"",
+    );
+    assert!(validate_auth_config(&settings).is_ok());
+}
+
 #[test]
 fn oidc_settings_default_to_no_scopes_and_not_preferred() {
     let settings = settings_with_oidc_keys(TIER_1, "");
@@ -508,7 +582,7 @@ fn oidc_client_id_is_required_and_not_empty() {
 /// Minimal loadable settings with the given `[server.auth]` keys, for the
 /// startup-validation tests. `Settings` deserializes with a `'static`
 /// bound, so the assembled TOML is leaked; each test builds one.
-fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
+pub(crate) fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
     let config = format!(
         r#"
             [server]

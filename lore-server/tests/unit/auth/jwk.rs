@@ -858,6 +858,7 @@ struct DiscoveryState {
     oversized: bool,
     redirect: bool,
     redirect_jwks: bool,
+    jwks: &'static str,
     discovery_requests: Arc<AtomicUsize>,
     jwks_requests: Arc<AtomicUsize>,
 }
@@ -915,7 +916,7 @@ async fn discovered_jwks_handler(State(state): State<DiscoveryState>) -> axum::r
         return axum::response::Redirect::temporary(&format!("{}/moved-jwks", state.base))
             .into_response();
     }
-    STUB_JWKS.to_string().into_response()
+    state.jwks.to_string().into_response()
 }
 
 async fn moved_jwks_handler() -> String {
@@ -929,12 +930,36 @@ async fn spawn_discovery_provider(
     spawn_discovery_provider_serving(issuer_override, None, oversized, false, false).await
 }
 
+/// A provider serving `jwks` in place of [`STUB_JWKS`].
+async fn spawn_discovery_provider_with_jwks(jwks: &'static str) -> DiscoveryProvider {
+    spawn_provider(None, None, false, false, false, jwks).await
+}
+
 async fn spawn_discovery_provider_serving(
     issuer_override: Option<String>,
     jwks_uri_override: Option<String>,
     oversized: bool,
     redirect: bool,
     redirect_jwks: bool,
+) -> DiscoveryProvider {
+    spawn_provider(
+        issuer_override,
+        jwks_uri_override,
+        oversized,
+        redirect,
+        redirect_jwks,
+        STUB_JWKS,
+    )
+    .await
+}
+
+async fn spawn_provider(
+    issuer_override: Option<String>,
+    jwks_uri_override: Option<String>,
+    oversized: bool,
+    redirect: bool,
+    redirect_jwks: bool,
+    jwks: &'static str,
 ) -> DiscoveryProvider {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -950,6 +975,7 @@ async fn spawn_discovery_provider_serving(
         oversized,
         redirect,
         redirect_jwks,
+        jwks,
         discovery_requests: Arc::new(AtomicUsize::new(0)),
         jwks_requests: Arc::new(AtomicUsize::new(0)),
     };
@@ -972,6 +998,24 @@ async fn spawn_discovery_provider_serving(
     });
 
     provider
+}
+
+/// A token from `issuer` for `alice`, valid for a minute, signed with HS256 under the key
+/// id the stub key sets use.
+fn signed_token(issuer: &str, secret: &[u8]) -> String {
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+    header.kid = Some("sig".to_string());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = json!({"iss": issuer, "sub": "alice", "aud": "Lore", "iat": now, "exp": now + 60});
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret),
+    )
+    .expect("encode test token")
 }
 
 fn discovering_service(provider: &DiscoveryProvider) -> JwkServiceImpl {
@@ -997,28 +1041,9 @@ async fn keys_resolve_through_discovery_and_a_token_verifies() {
         jwt_issuer: Some(vec![provider.base.clone()]),
         jwt_audience: Some(vec!["Lore".to_string()]),
         jwt_typ: None,
+        exchange_issuer: None,
     };
-    let token = {
-        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
-        header.kid = Some("sig".to_string());
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let claims = json!({
-            "iss": provider.base,
-            "sub": "alice",
-            "aud": "Lore",
-            "iat": now,
-            "exp": now + 60,
-        });
-        jsonwebtoken::encode(
-            &header,
-            &claims,
-            &jsonwebtoken::EncodingKey::from_secret(b"the-secret"),
-        )
-        .expect("encode test token")
-    };
+    let token = signed_token(&provider.base, b"the-secret");
 
     let verified = verifier
         .verify_token(&token)
@@ -1283,4 +1308,124 @@ async fn an_oversized_jwks_response_is_refused() {
         service.get_cached_key("cached").is_some(),
         "an oversized response must not cost the cached keys"
     );
+}
+
+/// The verifier the server builds from `[server.auth]`, with a token exchange issuer apart
+/// from the login issuer. Both providers serve one HS256 key under the same key id, so only
+/// choosing the keys by `iss` keeps one provider's key from verifying the other's tokens.
+mod separate_exchange_issuer {
+    use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::auth::jwt::JwtVerifierError;
+    use lore_server::settings::AuthSettings;
+
+    use super::*;
+
+    /// `other-secret`, under the key id [`STUB_JWKS`] uses.
+    const OTHER_JWKS: &str =
+        r#"{"keys":[{"kty":"oct","use":"sig","kid":"sig","alg":"HS256","k":"b3RoZXItc2VjcmV0"}]}"#;
+
+    fn auth(login: &str, exchange: &str, jwk_endpoint: Option<&str>) -> AuthSettings {
+        let jwk = jwk_endpoint
+            .map(|endpoint| format!("[server.auth.jwk]\nendpoint = \"{endpoint}\""))
+            .unwrap_or_default();
+        crate::settings::settings_with_auth_keys(&format!(
+            r#"
+                jwt_issuer = "{login}"
+                jwt_audience = ["Lore"]
+                resource_claim = "resources"
+
+                [server.auth.oidc]
+                client_id = "lore-cli"
+                resource_template = "https://lore.example.com/partitions/{{id}}"
+                token_exchange_issuer = "{exchange}"
+
+                {jwk}
+            "#
+        ))
+        .expect("[server.auth] parses")
+        .server
+        .auth
+        .expect("[server.auth] is present")
+    }
+
+    fn is_signature_failure(error: &JwtVerifierError) -> bool {
+        matches!(error, JwtVerifierError::ValidationFailed(inner)
+            if *inner.kind() == jsonwebtoken::errors::ErrorKind::InvalidSignature)
+    }
+
+    #[tokio::test]
+    async fn each_issuer_verifies_only_its_own_tokens() {
+        let login = spawn_discovery_provider(None, false).await;
+        let exchange = spawn_discovery_provider_with_jwks(OTHER_JWKS).await;
+        let verifier = JwtVerifier::from_settings(&auth(&login.base, &exchange.base, None))
+            .await
+            .expect("both key sets are fetched");
+
+        verifier
+            .verify_token(&signed_token(&login.base, b"the-secret"))
+            .await
+            .expect("the login issuer's token verifies");
+        verifier
+            .verify_token(&signed_token(&exchange.base, b"other-secret"))
+            .await
+            .expect("the exchange issuer's token verifies");
+        for forged in [
+            signed_token(&exchange.base, b"the-secret"),
+            signed_token(&login.base, b"other-secret"),
+        ] {
+            let error = verifier
+                .verify_token(&forged)
+                .await
+                .expect_err("a token signed in the other issuer's name is refused");
+            assert!(is_signature_failure(&error), "{error:?}");
+        }
+    }
+
+    /// `[server.auth.jwk].endpoint` names the login issuer's keys, which must never verify a
+    /// token in the exchange issuer's name.
+    #[tokio::test]
+    async fn the_jwk_endpoint_never_serves_the_exchange_issuer() {
+        let login = spawn_discovery_provider(None, false).await;
+        let exchange = spawn_discovery_provider_with_jwks(OTHER_JWKS).await;
+        let endpoint = format!("{}/jwks", login.base);
+        let verifier =
+            JwtVerifier::from_settings(&auth(&login.base, &exchange.base, Some(&endpoint)))
+                .await
+                .expect("both key sets are fetched");
+
+        let error = verifier
+            .verify_token(&signed_token(&exchange.base, b"the-secret"))
+            .await
+            .expect_err("the login issuer's key doesn't verify the exchange issuer's tokens");
+        assert!(is_signature_failure(&error), "{error:?}");
+        verifier
+            .verify_token(&signed_token(&exchange.base, b"other-secret"))
+            .await
+            .expect("the exchange issuer's token verifies");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_exchange_issuer_fails_construction() {
+        let login = spawn_discovery_provider(None, false).await;
+        let exchange = spawn_discovery_provider_with_jwks(OTHER_JWKS).await;
+        let unreachable = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            format!("http://{}", listener.local_addr().expect("address"))
+        };
+
+        JwtVerifier::from_settings(&auth(&login.base, &exchange.base, None))
+            .await
+            .expect("with the exchange issuer reachable, construction succeeds");
+        let Err(error) = JwtVerifier::from_settings(&auth(&login.base, &unreachable, None)).await
+        else {
+            panic!("an unreachable exchange issuer fails construction");
+        };
+        assert!(
+            matches!(
+                error.downcast_ref::<JWKServiceError>(),
+                Some(JWKServiceError::InternalError)
+            ),
+            "{error:#}"
+        );
+    }
 }
