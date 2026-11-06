@@ -6893,9 +6893,8 @@ def test_reset_dirty_delete_nested_restores(new_lore_repo):
 
 @pytest.mark.smoke
 def test_reset_discards_the_unstaged_add_that_replaced_a_path(new_lore_repo):
-    """A path replaced by one of the other kind, staged and unstaged, leaves the
-    replacement a dirty add beside the original. Resetting the path, or the
-    directory holding it, restores the original and discards the add."""
+    """A path replaced by one of the other kind, staged, unstaged and then
+    removed is restored by resetting the path, or the directory holding it."""
     repo: Lore = new_lore_repo()
     commit_base(repo, {"shared/a.txt": "committed\n", "entry": "committed\n"})
 

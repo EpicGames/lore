@@ -531,6 +531,33 @@ def test_link_reset_puts_back_a_link_a_file_replaced(new_lore_repo, staged):
 
 
 @pytest.mark.smoke
+def test_link_forced_unstage_puts_back_a_link_a_staged_file_replaced(new_lore_repo):
+    """A forced `unstage` of a link whose mount a staged file replaced puts the link back, in the
+    registry and on disk, and discards the file's add."""
+    linked = {"shared/linked.txt": "linked\n", "shared/sub/deep.txt": "deep\n"}
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo,
+        "shared",
+        {path.removeprefix("shared/"): content for path, content in linked.items()},
+    )
+
+    parent.rmtree("shared")
+    parent.write_files({"shared": "file\n"})
+    parent.stage("shared", scan=True)
+    parent.unstage("shared", force=True)
+
+    assert_crr_clean(
+        parent,
+        expected_files_present=[],
+        expected_files_absent=[],
+        expected_link_registry={link_repo.get_id(): True},
+    )
+    for path, content in linked.items():
+        with parent.open_file(path) as f:
+            assert f.read() == content, f"{path} must hold the linked content"
+
+
+@pytest.mark.smoke
 @pytest.mark.parametrize(
     ("change", "refused"),
     [

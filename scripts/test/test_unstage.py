@@ -476,3 +476,70 @@ def test_restage_after_unstage_promotes_dirty_add_back_to_staged_add(new_lore_re
         "after re-stage, file.txt should be a staged dirty add again "
         f"(equivalent to its post-original-stage state), got {entry}"
     )
+
+
+REPLACEMENTS = {
+    "file_to_directory": (
+        {"entry": "committed\n"},
+        {"entry/inner.txt": "inner\n"},
+        {
+            ("entry", "add", False),
+            ("entry/inner.txt", "add", True),
+            ("entry", "delete", True),
+        },
+    ),
+    "directory_to_file": (
+        {"entry/inner.txt": "committed\n"},
+        {"entry": "replaced\n"},
+        {
+            ("entry", "add", True),
+            ("entry", "delete", False),
+            ("entry/inner.txt", "delete", True),
+        },
+    ),
+}
+
+
+def replace_committed_entry(repo: Lore, committed: dict, replacement: dict) -> None:
+    repo.write_files(committed)
+    repo.stage(scan=True, offline=True)
+    repo.commit("base", offline=True)
+    if repo.file_exists("entry"):
+        repo.remove_file("entry")
+    else:
+        repo.rmtree("entry")
+    repo.write_files(replacement)
+
+
+def scanned_changes(repo: Lore) -> list[tuple]:
+    entries = parse_status_json(repo.status(scan=True, json=True, offline=True))
+    return sorted((to_posix(e["path"]), e["action"], e["type"]) for e in entries)
+
+
+def committed_delta(repo: Lore) -> set[tuple]:
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    return {(to_posix(d["path"]), d["action"], d["flagFile"]) for d in deltas}
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("target", [".", "entry"])
+@pytest.mark.parametrize("replacement", REPLACEMENTS.keys())
+def test_unstage_of_a_staged_replacement_leaves_it_untracked(
+    new_lore_repo, replacement, target
+):
+    """Unstaging a path replaced by one of the other kind returns it to the
+    never-staged state, so staging the path again commits the replacement."""
+    committed, replaced, delta = REPLACEMENTS[replacement]
+    repo: Lore = new_lore_repo()
+    replace_committed_entry(repo, committed, replaced)
+    never_staged = scanned_changes(repo)
+
+    repo.stage("entry", scan=True, offline=True)
+    repo.unstage(target, offline=True)
+    assert scanned_changes(repo) == never_staged
+
+    repo.stage("entry", scan=True, offline=True)
+    repo.commit("replace", offline=True)
+    assert committed_delta(repo) == delta

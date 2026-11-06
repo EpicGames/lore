@@ -18,6 +18,7 @@ pub mod stream;
 
 use core::str;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::future::Future;
 use std::io::Write;
@@ -4013,6 +4014,33 @@ impl State {
             dirty_adds.dedup();
         }
         Ok(dirty_adds)
+    }
+
+    /// The name hashes of the children of `parent_node` staged for delete.
+    pub(crate) async fn node_staged_delete_name_hashes(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+    ) -> Result<HashSet<u64>, StateError> {
+        let block = self
+            .block(repository.clone(), NodeBlock::index(parent_node))
+            .await?;
+        let (parent, changes) = block.node_with_chain_head(parent_node);
+        let mut name_hashes = HashSet::new();
+        self.walk_children(
+            repository,
+            parent.child(),
+            ChainWalk::new(parent_node, block, changes),
+            None,
+            |_, child| {
+                if child.is_staged_delete() {
+                    name_hashes.insert(child.name_hash);
+                }
+                None::<()>
+            },
+        )
+        .await?;
+        Ok(name_hashes)
     }
 
     /// The first child of `parent_node` carrying `name_hash` ahead of `stop_at` in its chain. A
