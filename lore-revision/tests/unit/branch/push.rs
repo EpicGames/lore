@@ -506,3 +506,38 @@ mod duplicate_association {
         assert_eq!(duplicated.flags & DURABLE, 0);
     }
 }
+
+/// Uploading the payloads the peer is missing.
+mod upload {
+    use lore_base::error::NotAuthorized;
+
+    use super::*;
+    use crate::branch::with_execution;
+    use crate::immutable::session_tests::refusing_session;
+
+    /// An upload the peer refuses fails the push with the refusal.
+    #[tokio::test]
+    async fn an_upload_the_peer_refuses_fails_the_push_with_the_refusal() {
+        let pushed = with_execution(async {
+            let repository = null_repository().await;
+            let wanted = address(0xE1);
+            store_local(&repository, wanted).await;
+            push_fragments(
+                repository,
+                refusing_session(ProtocolError::from(NotAuthorized)),
+                PushQueryResult {
+                    absent: vec![wanted],
+                    ..PushQueryResult::default()
+                },
+                Arc::new(PushProgress::new(Arc::new(PushStats::new(false)))),
+            )
+            .await
+        })
+        .await;
+
+        assert!(
+            pushed.as_ref().is_err_and(|err| err.is_not_authorized()),
+            "got {pushed:?}"
+        );
+    }
+}

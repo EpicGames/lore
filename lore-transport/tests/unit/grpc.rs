@@ -182,6 +182,46 @@ fn a_missing_address_round_trips_through_the_headers() {
     );
 }
 
+/// `Unauthenticated` maps to `NotAuthenticated`.
+#[test]
+fn unauthenticated_maps_to_not_authenticated() {
+    let error = ProtocolError::from(Status::unauthenticated("authorization header required"));
+    assert!(error.is_not_authenticated(), "{error:?}");
+}
+
+/// A refusal keeps the remote's reason for it on its trace.
+#[test]
+fn a_refusal_keeps_the_remotes_reason_on_its_trace() {
+    for status in [
+        Status::unauthenticated("the token expired"),
+        Status::permission_denied("the token expired"),
+    ] {
+        let error = ProtocolError::from(status);
+        assert!(
+            error.trace().locations().iter().any(|location| location
+                .context()
+                .is_some_and(|context| context.contains("the token expired"))),
+            "{error:?}"
+        );
+    }
+}
+
+/// A refusal the remote gives no reason for adds no context to the trace.
+#[test]
+fn a_refusal_without_a_reason_adds_no_context() {
+    for status in [Status::unauthenticated(""), Status::permission_denied("")] {
+        let error = ProtocolError::from(status);
+        assert!(
+            error
+                .trace()
+                .locations()
+                .iter()
+                .all(|location| location.context().is_none()),
+            "{error:?}"
+        );
+    }
+}
+
 /// `NotFound` names an absent object, which a caller recovers from by
 /// creating it, and never an address.
 #[test]

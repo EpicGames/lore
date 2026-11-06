@@ -2689,6 +2689,8 @@ dependencies = [
  "async-trait",
  "lore-base",
  "lore-error-set",
+ "lore-macro",
+ "lore-notification",
  "lore-proto",
  "lore-revision",
  "lore-storage",

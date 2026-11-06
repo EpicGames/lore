@@ -7,7 +7,10 @@ from subprocess import CalledProcessError
 class ServerException(Exception): ...
 
 
-class LoreException(Exception): ...
+class LoreException(Exception):
+    """A failed Lore command. `returncode` is its exit status where the command ran."""
+
+    returncode: int | None = None
 
 
 class ServerConnectionError(LoreException): ...

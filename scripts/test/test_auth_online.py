@@ -33,7 +33,7 @@ from types import SimpleNamespace
 
 import grpc
 import pytest
-from error_types import LoreException
+from error_types import LoreException, NotAuthenticatedError
 from grpc_probe import REVISION_INFO, STORAGE_QUERY, call, repository_metadata
 from protobuf_wire import (
     encode_bytes_field,
@@ -398,12 +398,14 @@ def test_api_key_login_authenticates_second_user(auth_env, make_actor):
 
 @pytest.mark.smoke
 def test_unknown_api_key_is_rejected(auth_env, make_actor):
-    """No rule matches an unknown key, so the exchange is refused."""
+    """No rule matches an unknown key, so the exchange is refused as
+    `NotAuthenticated`."""
     actor = make_actor("intruder")
     repo = actor.make_repo()
 
-    with pytest.raises(LoreException):
+    with pytest.raises(NotAuthenticatedError) as refused:
         login_api_key(repo, auth_env.remote_url, "not-a-real-key")
+    assert refused.value.returncode == 16, refused.value
 
 
 @pytest.mark.smoke
@@ -1276,8 +1278,8 @@ def test_cli_push_and_sync_follow_the_grant(auth_env, make_actor):
 def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
     """`lore notification subscribe` under the online rules: a granted
     member's subscription is accepted and receives the owner's lock events
-    until its listen window closes; once revoked, the subscribe bails out
-    early with an error instead of holding a stream open."""
+    until its listen window closes; once revoked, the subscribe fails at once
+    as `NotAuthorized` instead of holding a stream open."""
     mock = auth_env.mock
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
     commit_file(owner.repo, "watched.txt", "watched content")
@@ -1311,12 +1313,13 @@ def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
     # its empty `resources` claim, refuses the body-declared partition, and
     # the CLI bails out instead of listening.
     unscoped = mock.mint_token(USER2, resources=[])
-    with pytest.raises(LoreException):
+    with pytest.raises(LoreException) as refused:
         member.repo.run(
             ["notification", "subscribe", "3"],
             identity_token=unscoped,
             access_token=unscoped,
         )
+    assert refused.value.returncode == 17, refused.value
 
 
 # ---------------------------------------------------------------------------

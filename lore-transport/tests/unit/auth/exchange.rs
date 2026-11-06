@@ -602,13 +602,11 @@ mod refused {
 }
 
 /// An implementation that refuses the login token reports `NotAuthenticated`, and the
-/// exchange passes it on as such rather than as an internal failure, so the caller can
-/// tell that logging in again fixes it. The same holds for a refused partition and
-/// `NotAuthorized`.
+/// exchange passes it on as such, with the remote's reason on its trace, rather than as an
+/// internal failure, so the caller can tell that logging in again fixes it. The same holds
+/// for a refused partition and `NotAuthorized`.
 #[tokio::test]
 async fn a_refusal_of_the_login_token_stays_not_authenticated() {
-    use lore_base::error::NotAuthenticated;
-    use lore_base::error::NotAuthorized;
     use lore_transport::error::ProtocolError;
     use lore_transport::traits::Authentication;
     use lore_transport::types::AuthSession;
@@ -618,6 +616,9 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
 
     /// `sub` alice, `aud` example.com, expiring in 2033.
     const AUTHN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
+
+    /// The reason the stub's remote gives for each refusal.
+    const REASON: &str = "the login expired";
 
     /// Refuses every exchange with the error it holds.
     struct Refusing(fn() -> ProtocolError);
@@ -727,7 +728,7 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
         )
         .await
         .expect_err("the stub refuses the exchange");
-        assert!(check(&refused), "{auth_url}: {refused}");
+        assert_refusal(auth_url, &refused, check);
 
         let refused = exchange_custom_resource(
             &endpoint,
@@ -739,18 +740,28 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
         )
         .await
         .expect_err("the stub refuses the exchange");
-        assert!(check(&refused), "{auth_url}: {refused}");
+        assert_refusal(auth_url, &refused, check);
+    }
+
+    fn assert_refusal(auth_url: &str, refused: &ExchangeError, check: fn(&ExchangeError) -> bool) {
+        assert!(check(refused), "{auth_url}: {refused}");
+        assert!(
+            refused.trace().locations().iter().any(|location| location
+                .context()
+                .is_some_and(|context| context.contains(REASON))),
+            "{auth_url}: {refused:?}"
+        );
     }
 
     assert_refused_as(
         "stub-auth://auth.refused-login.test.invalid",
-        || NotAuthenticated.into(),
+        || tonic::Status::unauthenticated(REASON).into(),
         ExchangeError::is_not_authenticated,
     )
     .await;
     assert_refused_as(
         "stub-auth://auth.refused-partition.test.invalid",
-        || NotAuthorized.into(),
+        || tonic::Status::permission_denied(REASON).into(),
         ExchangeError::is_not_authorized,
     )
     .await;

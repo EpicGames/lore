@@ -148,16 +148,20 @@ pub async fn reset(
         branch
     };
 
-    let branch = branch::resolve(repository.clone(), branch.as_str())
-        .await
-        .map_err(|err| {
-            ResetError::BranchNotFound(
+    let branch = match branch::resolve(repository.clone(), branch.as_str()).await {
+        Ok(resolved) => resolved,
+        Err(err) if err.is_not_authenticated() || err.is_not_authorized() => {
+            return Err(err).forward_any("resolving branch");
+        }
+        Err(err) => {
+            return Err(ResetError::BranchNotFound(
                 BranchNotFound {
                     branch: branch.clone(),
                 }
                 .chain_err_from(err, "resolving branch"),
-            )
-        })?;
+            ));
+        }
+    };
 
     let branch_metadata = branch::metadata(repository.clone(), branch.id)
         .await

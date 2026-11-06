@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Probes a test reads and arms inside the library, built with the `test-util` feature.
+//! Probes a test reads and arms inside the library, and fixtures tests build on, built with the
+//! `test-util` feature.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -10,6 +12,26 @@ use tokio::sync::Notify;
 
 use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FsError;
+use crate::repository::RemoteState;
+use crate::repository::RepositoryContext;
+
+/// A path-less context on fresh in-memory stores whose remote is in `state`, so everything but
+/// the remote is valid.
+pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+    let (immutable, mutable) = crate::repository::create_client_memory_stores()
+        .await
+        .expect("in-memory stores should be creatable");
+    Arc::new(RepositoryContext::new_with_state(
+        None,
+        immutable,
+        mutable,
+        crate::lore::RepositoryId::default(),
+        crate::instance::InstanceId::default(),
+        state,
+        Arc::default(),
+        None,
+    ))
+}
 
 /// The tasks one walk spawns: counts those live, for a test to read the peak, holds each one
 /// before its work until released, so a test can see the tasks pile up, fails a listing where a

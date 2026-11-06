@@ -407,6 +407,7 @@ impl PushStats {
 /// those facts are recorded in one place whichever event reports them.
 /// `fragment_count` and `bytes_queued` are this revision's alone: the fragments it
 /// has to register, and the payload bytes it has loaded to send.
+#[lore_macro::test_pub]
 pub(crate) struct PushProgress {
     fragment_count: AtomicUsize,
     bytes_queued: AtomicU64,
@@ -417,6 +418,7 @@ pub(crate) struct PushProgress {
 
 impl PushProgress {
     /// Start a revision's progress from where the push-wide counters stand now.
+    #[lore_macro::test_pub]
     pub(crate) fn new(stats: Arc<PushStats>) -> Self {
         Self {
             fragment_count: AtomicUsize::new(0),
@@ -1690,6 +1692,7 @@ async fn mark_present_durable(repository: &Arc<RepositoryContext>, present: Vec<
 
 /// Register every fragment the peer is missing, transferring a payload only where it has no
 /// association to duplicate. Addresses the peer already holds are marked durable alongside.
+#[lore_macro::test_pub]
 pub(crate) async fn push_fragments(
     repository: Arc<RepositoryContext>,
     storage: Arc<StorageSession>,
@@ -1751,8 +1754,11 @@ pub(crate) async fn push_fragments(
             immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
                 .await
                 .map_err(|err| {
-                    if err.is_disconnected() {
-                        PushError::from(Disconnected)
+                    if err.is_disconnected()
+                        || err.is_not_authenticated()
+                        || err.is_not_authorized()
+                    {
+                        err.forward("putting fragment to remote")
                     } else {
                         PushError::internal_with_context(err, "putting fragment to remote")
                     }

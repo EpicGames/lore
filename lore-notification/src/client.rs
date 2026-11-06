@@ -32,6 +32,7 @@ use lore_revision::notification::NotificationError;
 use lore_revision::notification::NotificationSubscription;
 use lore_revision::util;
 use lore_transport::Connection;
+use lore_transport::ProtocolError;
 use lore_transport::grpc;
 use lore_transport::grpc::AuthzInterceptor;
 use lore_transport::grpc::Channel;
@@ -156,9 +157,7 @@ impl NotificationClient {
                 }
                 Err(err) => {
                     lore_debug!("Subscription to stream failure: {err:?}");
-                    if err.code() == tonic::Code::Unauthenticated {
-                        return Err(err).internal("not authorized for notifications")?;
-                    }
+                    subscribe_retryable(err)?;
                     if !retry.wait().await {
                         return Err(NotificationError::internal("subscribing to stream"));
                     }
@@ -167,6 +166,20 @@ impl NotificationClient {
             }
         }
     }
+}
+
+/// `Ok` when a subscribe that failed with `status` is worth another attempt. A refusal of the
+/// credentials, `Unauthenticated` or `PermissionDenied`, is the error the subscribe fails with.
+#[lore_macro::test_pub]
+fn subscribe_retryable(status: tonic::Status) -> Result<(), NotificationError> {
+    if matches!(
+        status.code(),
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied
+    ) {
+        return Err(ProtocolError::from(status))
+            .forward_any("subscribing to the notification stream");
+    }
+    Ok(())
 }
 
 #[async_trait]

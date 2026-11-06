@@ -7,48 +7,32 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::error::Disconnected;
+use lore_base::error::NotAuthenticated;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
+use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_revision::immutable::*;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::RemoteState;
-use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::context_with_state;
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 
-/// A context carrying the given remote state, on in-memory stores so
-/// everything but the remote is valid.
-pub(super) async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
-    let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
-        .await
-        .expect("in-memory stores should be creatable");
-    Arc::new(RepositoryContext::new_with_state(
-        None,
-        immutable,
-        mutable,
-        lore_revision::lore::RepositoryId::default(),
-        lore_revision::instance::InstanceId::default(),
-        state,
-        Arc::default(),
-        None,
-    ))
-}
-
 /// Build and run the future `body` returns under an execution context, which is where the
 /// correlation id a session is attributed to comes from. The future is built inside the
 /// context, as a wrapper resolves its session when built.
-pub(super) async fn under_execution_context<F: Future>(body: impl FnOnce() -> F) -> F::Output {
+pub(crate) async fn under_execution_context<F: Future>(body: impl FnOnce() -> F) -> F::Output {
     under_globals(LoreGlobalArgs::default(), body).await
 }
 
 /// [`under_execution_context`] with the command's `globals`.
-pub(super) async fn under_globals<F: Future>(
+pub(crate) async fn under_globals<F: Future>(
     globals: LoreGlobalArgs,
     body: impl FnOnce() -> F,
 ) -> F::Output {
@@ -96,6 +80,35 @@ pub(super) fn counting_session(resolutions: Arc<AtomicUsize>) -> Arc<StorageSess
             ))
         }
     }))
+}
+
+/// A session whose start the remote refuses with `refusal`, so every request on it fails with it.
+pub(crate) fn refusing_session(refusal: ProtocolError) -> Arc<StorageSession> {
+    Arc::new(StorageSession::pending(move || {
+        let refusal = refusal.clone();
+        async move { Err(refusal) }
+    }))
+}
+
+/// A fragment upload the remote refuses fails with the refusal.
+#[tokio::test]
+async fn an_upload_the_remote_refuses_fails_with_the_refusal() {
+    let session = refusing_session(ProtocolError::from(NotAuthenticated));
+
+    let stored = under_execution_context(|| {
+        store_raw_remote_retry(
+            session,
+            absent_address(),
+            Fragment::default(),
+            Some(Bytes::from_static(b"payload")),
+        )
+    })
+    .await;
+
+    assert!(
+        stored.as_ref().is_err_and(|err| err.is_not_authenticated()),
+        "got {stored:?}"
+    );
 }
 
 /// What a read or write ends up using comes from the pool the context holds, one session of

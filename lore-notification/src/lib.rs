@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+#[cfg(not(feature = "test-util"))]
 mod client;
+#[cfg(feature = "test-util")]
+pub mod client;
 
 pub fn initialize() {
     let service = Arc::new(client::NotificationService);

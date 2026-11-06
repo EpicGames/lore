@@ -22,10 +22,9 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use lore_base::error::Disconnected;
 use lore_base::error::NoRemote;
-use lore_revision::lore::RepositoryId;
 use lore_revision::protocol::RemoteFuture;
 use lore_revision::repository::RemoteState;
-use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::context_with_state;
 use lore_transport::ProtocolError;
 
 fn disconnected() -> ProtocolError {
@@ -41,25 +40,6 @@ fn no_remote() -> ProtocolError {
 fn ready_remote(result: Result<Arc<lore_transport::Connection>, ProtocolError>) -> RemoteFuture {
     let fut: BoxFuture<'static, _> = async move { result }.boxed();
     fut.shared()
-}
-
-/// Build a minimal `RepositoryContext` carrying the given `RemoteState`. We construct
-/// in-memory stores so the rest of the context is valid, but only `remote()` is
-/// exercised.
-async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
-    let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
-        .await
-        .expect("in-memory stores should be creatable");
-    Arc::new(RepositoryContext::new_with_state(
-        None,
-        immutable,
-        mutable,
-        RepositoryId::default(),
-        lore_revision::instance::InstanceId::default(),
-        state,
-        Arc::default(),
-        None,
-    ))
 }
 
 /// Nothing is cached until something resolves it, so the first reader or

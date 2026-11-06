@@ -40,12 +40,13 @@ struct Page {
 
 /// A remote holding one branch at `latest`, which answers a revision list with the page
 /// registered for its anchor and counts the revision lists it is asked for. An anchor with no
-/// page is not found.
+/// page is not found. A remote with a `refusal` answers every branch query with it.
 pub(crate) struct PagedRemote {
     branch: BranchId,
     latest: Hash,
     pages: Vec<Page>,
     lists: AtomicUsize,
+    refusal: Option<ProtocolError>,
 }
 
 impl PagedRemote {
@@ -55,7 +56,14 @@ impl PagedRemote {
             latest,
             pages: Vec::new(),
             lists: AtomicUsize::new(0),
+            refusal: None,
         }
+    }
+
+    /// Answer every branch query with `refusal`.
+    pub(crate) fn refusing(mut self, refusal: ProtocolError) -> Self {
+        self.refusal = Some(refusal);
+        self
     }
 
     /// Answer `anchor` with `items`, newest first, and `older` as the cursor to the page
@@ -195,6 +203,9 @@ impl Revision for PagedRemote {
         branch: Option<BranchId>,
         _: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError> {
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
         assert_eq!(branch, Some(self.branch), "the remote's branch is queried");
         Ok(BranchQueryResponse {
             id: self.branch,

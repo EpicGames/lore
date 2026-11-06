@@ -792,16 +792,20 @@ pub async fn reset_to_last_merged(
     let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
 
     let branch_name = branch.to_string();
-    let branch = branch::resolve(repository.clone(), branch.as_str())
-        .await
-        .map_err(|err| {
-            ResetError::BranchNotFound(
+    let branch = match branch::resolve(repository.clone(), branch.as_str()).await {
+        Ok(resolved) => resolved,
+        Err(err) if err.is_not_authenticated() || err.is_not_authorized() => {
+            return Err(err).forward_any("resolving branch for last-merged reset");
+        }
+        Err(err) => {
+            return Err(ResetError::BranchNotFound(
                 BranchNotFound {
                     branch: branch_name.clone(),
                 }
                 .chain_err_from(err, "branch for last-merged reset not found"),
-            )
-        })?;
+            ));
+        }
+    };
 
     let branch_current = current_branch;
     if branch.id == branch_current {

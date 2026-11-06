@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use lore_base::error::NotAuthenticated;
+use lore_base::error::NotAuthorized;
 use lore_base::types::LockResource;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
@@ -22,7 +24,10 @@ use crate::lore_debug;
 use crate::repository::RepositoryContext;
 
 #[error_set]
-pub enum NotificationError {}
+pub enum NotificationError {
+    NotAuthenticated,
+    NotAuthorized,
+}
 
 impl crate::event::EventError for NotificationError {}
 
@@ -191,10 +196,16 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
         stale.shutdown().await;
     }
 
-    let Ok(remote) = repository.remote().await else {
-        return Err(NotificationError::internal(
-            "notifications not available when offline",
-        ));
+    let remote = match repository.remote().await {
+        Ok(remote) => remote,
+        Err(err) if err.is_refusal() => {
+            return Err(err).forward_any("connecting to remote for notifications");
+        }
+        Err(_) => {
+            return Err(NotificationError::internal(
+                "notifications not available when offline",
+            ));
+        }
     };
 
     let remote_url = remote.remote_url.to_string();

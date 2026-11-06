@@ -13,6 +13,7 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
+use lore_base::types::KeyType;
 use lore_base::types::Partition;
 use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::storage::v1 as storage_v1;
@@ -30,11 +31,12 @@ use tonic::Streaming;
 
 const TEST_PAYLOAD: &[u8] = b"rotation test payload";
 
-/// How the first `Get` stream a test server accepts is killed.
+/// How a test server fails: the first `Get` stream it accepts, or every unary request.
 ///
-/// Both leave requests unanswered with no per-request attribution, but they reach the
-/// client through different code: a clean end is `Streaming` reporting exhaustion, a status
-/// is the terminal `Err` arm. Real connection failures take the latter shape.
+/// [`CleanEnd`](Self::CleanEnd) and [`TerminalStatus`](Self::TerminalStatus) both leave requests
+/// unanswered with no per-request attribution, but they reach the client through different code: a
+/// clean end is `Streaming` reporting exhaustion, a status is the terminal `Err` arm. Real
+/// connection failures take the latter shape.
 #[derive(Clone, Copy)]
 enum KillMode {
     /// End the response body with nothing on it.
@@ -47,6 +49,8 @@ enum KillMode {
     RefuseFirstOpen,
     /// Answer with a populated fragment and payload *and* a failure status.
     ErrorBesidePayload,
+    /// Answer every unary request with this code.
+    RefuseUnary(tonic::Code),
 }
 
 /// Kills the first `Get` stream it accepts, then serves every later stream normally. Records the
@@ -63,6 +67,16 @@ struct StreamKillingServer {
 const COPY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
+
+impl StreamKillingServer {
+    /// The answer to a unary request: the code of [`KillMode::RefuseUnary`], else `Unimplemented`.
+    fn unary_answer(&self) -> Status {
+        match self.kill_mode {
+            KillMode::RefuseUnary(code) => Status::new(code, "refused by the test server"),
+            _ => Status::unimplemented("not used by this test"),
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl StorageServiceV1 for StreamKillingServer {
@@ -205,35 +219,35 @@ impl StorageServiceV1 for StreamKillingServer {
         &self,
         _request: Request<storage_v1::QueryRequest>,
     ) -> Result<Response<storage_v1::QueryResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        Err(self.unary_answer())
     }
 
     async fn verify(
         &self,
         _request: Request<storage_v1::VerifyRequest>,
     ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        Err(self.unary_answer())
     }
 
     async fn mutable_load(
         &self,
         _request: Request<storage_v1::MutableLoadRequest>,
     ) -> Result<Response<storage_v1::MutableLoadResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        Err(self.unary_answer())
     }
 
     async fn mutable_store(
         &self,
         _request: Request<storage_v1::MutableStoreRequest>,
     ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        Err(self.unary_answer())
     }
 
     async fn mutable_compare_and_swap(
         &self,
         _request: Request<storage_v1::MutableCompareAndSwapRequest>,
     ) -> Result<Response<storage_v1::MutableCompareAndSwapResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        Err(self.unary_answer())
     }
 }
 
@@ -476,6 +490,60 @@ async fn a_failure_status_wins_over_a_populated_payload() {
         err.is_not_found(),
         "the server's code must survive, got {err:?}",
     );
+}
+
+/// A unary storage request the server answers with `Unauthenticated` or `PermissionDenied` fails
+/// with that refusal of the credentials.
+#[tokio::test]
+async fn a_refused_unary_request_fails_with_the_refusal() {
+    let ctx = test_context();
+    let key = Hash::from([0x88u8; 32]);
+    let address = Address::zero_context_hash(key);
+    type Refused = fn(&ProtocolError) -> bool;
+    let cases: [(tonic::Code, Refused); 2] = [
+        (
+            tonic::Code::Unauthenticated,
+            ProtocolError::is_not_authenticated,
+        ),
+        (
+            tonic::Code::PermissionDenied,
+            ProtocolError::is_not_authorized,
+        ),
+    ];
+    for (code, refused) in cases {
+        let (service, _, _) = start_test_service(KillMode::RefuseUnary(code)).await;
+        let failures = [
+            ("query", service.query(&ctx, &[address]).await.err()),
+            ("verify", service.verify(&ctx, &address, false).await.err()),
+            (
+                "mutable_load",
+                service
+                    .mutable_load(&ctx, &key, KeyType::Resolve)
+                    .await
+                    .err(),
+            ),
+            (
+                "mutable_store",
+                service
+                    .mutable_store(&ctx, key, key, KeyType::Resolve)
+                    .await
+                    .err(),
+            ),
+            (
+                "mutable_compare_and_swap",
+                service
+                    .mutable_compare_and_swap(&ctx, key, key, key, KeyType::Resolve)
+                    .await
+                    .err(),
+            ),
+        ];
+        for (request, failure) in failures {
+            assert!(
+                failure.as_ref().is_some_and(refused),
+                "{request} answered {code:?} failed with {failure:?}",
+            );
+        }
+    }
 }
 
 /// A refused open must not poison the cache for later requests.

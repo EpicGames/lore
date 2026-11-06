@@ -277,6 +277,9 @@ pub async fn store_raw_remote_retry(
             Err(ProtocolError::Disconnected(_)) => {
                 return Err(Disconnected.into());
             }
+            Err(err) if err.is_refusal() => {
+                return Err(err.forward("storing fragment to remote"));
+            }
             Err(err) => {
                 return Err(ImmutableError::internal_with_context(
                     err,

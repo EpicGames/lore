@@ -368,6 +368,17 @@ impl RemoteMutableStore {
         }
     }
 
+    /// A store whose connection for `partition` is `connection`.
+    #[cfg(feature = "test-util")]
+    pub fn with_connection(
+        partition: Partition,
+        connection: Arc<lore_transport::Connection>,
+    ) -> Self {
+        RemoteMutableStore {
+            connections: protocol::RemoteConnections::with_connection(partition, connection),
+        }
+    }
+
     /// A session for ops on `partition`, as [`remote_session`] takes it.
     fn session(
         &self,
@@ -396,15 +407,12 @@ impl store::MutableStore for RemoteMutableStore {
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
         let session = self.session(partition).await?;
-        session
-            .mutable_load(&key, key_type)
-            .await
-            .map_err(|err| match err {
-                ProtocolError::NotFound(_) => {
-                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(key)))
-                }
-                other => StoreError::internal_with_context(other, "Remote mutable load failed"),
-            })
+        match session.mutable_load(&key, key_type).await {
+            Err(ProtocolError::NotFound(_)) => Err(StoreError::from(AddressNotFound::from(
+                Address::zero_context_hash(key),
+            ))),
+            loaded => loaded.forward("Remote mutable load failed"),
+        }
     }
 
     async fn list(

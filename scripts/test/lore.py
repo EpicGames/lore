@@ -422,7 +422,9 @@ class Lore:
                     sleep(attempt)
                     if attempt < max_attempts:
                         continue
-                raise error_type(f"Command: {command_string}\n{output}") from None
+                error = error_type(f"Command: {command_string}\n{output}")
+                error.returncode = e.returncode
+                raise error from None
             except Exception as e:
                 logger.critical(f"Unknown error: {e}")
                 raise UnknownLoreError(str(e)) from None

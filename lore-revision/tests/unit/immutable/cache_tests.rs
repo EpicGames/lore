@@ -17,6 +17,7 @@ use lore_revision::immutable::*;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::context_with_state;
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
 
@@ -24,7 +25,6 @@ use super::serving::Serving;
 use super::serving::remote_copy;
 use super::serving::serving_remote;
 use super::serving::serving_session;
-use super::session_tests::context_with_state;
 use super::session_tests::under_execution_context;
 use super::session_tests::under_globals;
 

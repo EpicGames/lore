@@ -740,6 +740,9 @@ async fn verify_fragment_remote(
                 },
             )
             .send();
+            if e.is_refusal() {
+                return Err(e.forward("verifying fragment on remote"));
+            }
             Err(RepositoryError::internal(format!(
                 "Repository verification failed: {error_msg}"
             )))

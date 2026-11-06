@@ -33,6 +33,7 @@ mod lock;
 mod merge;
 mod metadata;
 mod node;
+mod notification;
 mod paged_remote;
 mod protocol;
 mod relay;

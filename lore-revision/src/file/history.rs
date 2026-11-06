@@ -389,14 +389,17 @@ async fn find_start_revision(
         }
     } else {
         let branch_name = options.branch.clone().unwrap_or_default();
-        let resolved = branch::resolve(repository.clone(), branch_name.as_str())
-            .await
-            .map_err(|_err| {
-                FileHistoryError::from(BranchNotFound {
+        match branch::resolve(repository.clone(), branch_name.as_str()).await {
+            Ok(resolved) => resolved.id,
+            Err(err) if err.is_not_authenticated() || err.is_not_authorized() => {
+                return Err(err).forward_any("resolving branch");
+            }
+            Err(_err) => {
+                return Err(FileHistoryError::from(BranchNotFound {
                     branch: branch_name,
-                })
-            })?;
-        resolved.id
+                }));
+            }
+        }
     };
 
     if execution_context().globals().offline_or_local() {

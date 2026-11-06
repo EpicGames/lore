@@ -1166,3 +1166,238 @@ async fn each_relayed_diff_item_is_held_once() {
     }))
     .await;
 }
+
+/// Resolving a branch through the remote, where the instance does not hold it.
+mod resolve_through_the_remote {
+    use std::fmt::Debug;
+    use std::path::PathBuf;
+
+    use lore_base::error::BranchNotFound;
+    use lore_base::error::Disconnected;
+    use lore_base::error::NotAuthenticated;
+    use lore_base::error::NotAuthorized;
+    use lore_base::test_util::TempDir;
+    use lore_error_set::FfiError;
+    use lore_revision::file::history::HistoryOptions;
+    use lore_revision::file::reset::ResetMergeSide;
+    use lore_revision::file::reset::ResetOptions;
+    use lore_revision::instance::InstanceId;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::interface::LoreString;
+    use lore_revision::repository::RemoteState;
+    use lore_revision::repository::RepositoryPaths;
+    use lore_revision::test_util::context_with_state;
+    use lore_transport::ProtocolError;
+
+    use super::*;
+    use crate::helper::in_memory;
+    use crate::immutable::session_tests::under_globals;
+    use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::client_and_writer;
+
+    /// Globals for a lookup that consults only the remote where `remote_only`, and prefers what
+    /// the instance holds otherwise.
+    fn globals(remote_only: bool) -> LoreGlobalArgs {
+        LoreGlobalArgs {
+            remote: remote_only as u8,
+            ..LoreGlobalArgs::default()
+        }
+    }
+
+    /// A lookup that reaches the remote fails with the remote's refusal of the credentials,
+    /// whether the remote refuses the connect or the query, by name or by id, with `--remote` or
+    /// without.
+    #[tokio::test]
+    async fn a_lookup_the_remote_refuses_fails_with_the_refusal() {
+        let id = branch_id(7).to_string();
+        let mut unrefused = Vec::new();
+        for remote_only in [false, true] {
+            for branch in ["refused", id.as_str()] {
+                let refused_connect =
+                    context_with_state(RemoteState::Failed(ProtocolError::from(NotAuthorized)))
+                        .await;
+                let (refused_query, _) = client_and_writer(Arc::new(
+                    PagedRemote::new(branch_id(7), Hash::default())
+                        .refusing(ProtocolError::from(NotAuthorized)),
+                ))
+                .await;
+                for (refused, repository) in
+                    [("connect", refused_connect), ("query", refused_query)]
+                {
+                    let resolved =
+                        under_globals(globals(remote_only), || resolve(repository, branch)).await;
+                    if !resolved.as_ref().is_err_and(|err| err.is_not_authorized()) {
+                        unrefused.push(format!(
+                            "{branch} with its {refused} refused, remote only {remote_only}: \
+                             got {resolved:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(unrefused.is_empty(), "{unrefused:#?}");
+    }
+
+    /// A lookup whose connect fails for any reason but a refusal finds no branch: by name, or by
+    /// id with `--remote`, it fails as `BranchNotFound`, and by id otherwise it answers the id
+    /// alone.
+    #[tokio::test]
+    async fn a_lookup_without_a_reachable_remote_finds_no_branch() {
+        let id = branch_id(7);
+        let id_text = id.to_string();
+        for (remote_only, branch, answered) in [
+            (false, "unreachable", None),
+            (true, "unreachable", None),
+            (true, id_text.as_str(), None),
+            (false, id_text.as_str(), Some(id)),
+        ] {
+            let repository =
+                context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+            let resolved =
+                under_globals(globals(remote_only), || resolve(repository, branch)).await;
+            match answered {
+                Some(id) => assert!(
+                    resolved
+                        .as_ref()
+                        .is_ok_and(|status| status.id == id && status.latest.is_zero()),
+                    "{branch}, remote only {remote_only}: got {resolved:?}"
+                ),
+                None => assert!(
+                    resolved
+                        .as_ref()
+                        .is_err_and(|err| err.is_branch_not_found()),
+                    "{branch}, remote only {remote_only}: got {resolved:?}"
+                ),
+            }
+        }
+    }
+
+    /// An instance on in-memory stores, rooted at the directory returned with it, whose current
+    /// branch is set and whose connect to the remote fails with `failure`.
+    async fn instance_whose_connect_fails(
+        failure: ProtocolError,
+    ) -> (TempDir, Arc<RepositoryContext>) {
+        let root = TempDir::new("refused-lookup-");
+        let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        let repository = Arc::new(
+            RepositoryContext::new_with_state(
+                Some(RepositoryPaths::new(
+                    root.path().to_path_buf(),
+                    root.child(".lore"),
+                )),
+                immutable,
+                mutable,
+                lore_revision::lore::RepositoryId::default(),
+                InstanceId::default(),
+                RemoteState::Failed(failure),
+                Arc::default(),
+                None,
+            )
+            .with_write_token(in_memory::token()),
+        );
+        lore_revision::instance::store_current_anchor_branch(&repository, branch_id(1))
+            .await
+            .expect("the current branch should be storable");
+        (root, repository)
+    }
+
+    /// The FFI code of `BranchNotFound`.
+    fn branch_not_found() -> i32 {
+        BranchNotFound {
+            branch: String::new(),
+        }
+        .ffi_code()
+    }
+
+    /// The connect failures for which `command`, run on an instance whose connect to the remote
+    /// fails that way, does not fail with the code expected of it: the refusal's own for a
+    /// refusal, and `not_found` for a remote it cannot reach.
+    async fn codes_that_differ<T, E, F>(
+        not_found: i32,
+        command: impl Fn(Arc<RepositoryContext>, PathBuf) -> F,
+    ) -> Vec<String>
+    where
+        T: Debug,
+        E: FfiError + Debug,
+        F: Future<Output = Result<T, E>>,
+    {
+        let command = &command;
+        let mut differing = Vec::new();
+        for (failure, expected) in [
+            (
+                ProtocolError::from(NotAuthenticated),
+                NotAuthenticated.ffi_code(),
+            ),
+            (ProtocolError::from(NotAuthorized), NotAuthorized.ffi_code()),
+            (ProtocolError::from(Disconnected), not_found),
+        ] {
+            let described = format!("{failure:?}");
+            let result = under_globals(globals(false), || async move {
+                let (root, repository) = instance_whose_connect_fails(failure).await;
+                command(repository, root.path().to_path_buf()).await
+            })
+            .await;
+            if result.as_ref().err().map(FfiError::ffi_code) != Some(expected) {
+                differing.push(format!("{described}: got {result:?}"));
+            }
+        }
+        differing
+    }
+
+    /// `lore file history --branch` fails with the remote's refusal of the branch lookup, and
+    /// with `BranchNotFound` where the remote cannot be reached.
+    #[tokio::test]
+    async fn file_history_fails_with_a_refused_branch_lookup() {
+        let differing = codes_that_differ(branch_not_found(), |repository, root| {
+            lore_revision::file::history::history(
+                repository,
+                root.join("file").to_string_lossy().into_owned(),
+                HistoryOptions {
+                    revision: None,
+                    branch: Some("refused".to_string()),
+                    length: 0,
+                    depth: 0,
+                },
+            )
+        })
+        .await;
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+
+    /// `lore branch reset` fails with the remote's refusal of the branch lookup, and with
+    /// `BranchNotFound` where the remote cannot be reached.
+    #[tokio::test]
+    async fn branch_reset_fails_with_a_refused_branch_lookup() {
+        let differing = codes_that_differ(branch_not_found(), |repository, _| async move {
+            lore_revision::branch::reset::reset(
+                repository,
+                &in_memory::token(),
+                "refused".to_string(),
+                String::new(),
+            )
+            .await
+        })
+        .await;
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+
+    /// `lore file reset` to the last merge of a branch fails with the remote's refusal of the
+    /// branch lookup, and with `BranchNotFound` where the remote cannot be reached.
+    #[tokio::test]
+    async fn file_reset_to_last_merged_fails_with_a_refused_branch_lookup() {
+        let differing = codes_that_differ(branch_not_found(), |repository, _| {
+            lore_revision::file::reset::reset_to_last_merged(
+                repository,
+                LoreArray::default(),
+                LoreString::from("refused"),
+                ResetMergeSide::default(),
+                ResetOptions::default(),
+            )
+        })
+        .await;
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+}

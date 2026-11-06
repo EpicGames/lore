@@ -1112,15 +1112,10 @@ async fn resolve_remote(
     repository: Arc<RepositoryContext>,
     branch: &str,
 ) -> Result<BranchStatus, BranchError> {
-    let branch_input = branch;
-    let remote = repository.remote().await.map_err(|err| {
-        BranchError::BranchNotFound(
-            BranchNotFound {
-                branch: branch_input.to_string(),
-            }
-            .chain_err_from(err, "remote unavailable for branch lookup"),
-        )
-    })?;
+    let remote = repository
+        .remote()
+        .await
+        .map_err(|err| remote_lookup_failure(err, branch))?;
     let service = remote
         .revision(repository.id)
         .await
@@ -1130,6 +1125,31 @@ async fn resolve_remote(
     } else {
         service.branch_query(None, Some(branch)).await
     };
+    queried_status(response, branch)
+}
+
+/// `err`, the failed connect of a lookup of `branch` on the remote, as the lookup's failure. A
+/// refusal of the credentials passes on; any other failure is `BranchNotFound`, as the branch is
+/// unknown without the remote.
+fn remote_lookup_failure(err: ProtocolError, branch: &str) -> BranchError {
+    if err.is_refusal() {
+        return err.forward("connecting to remote for branch lookup");
+    }
+    BranchError::BranchNotFound(
+        BranchNotFound {
+            branch: branch.to_string(),
+        }
+        .chain_err_from(err, "remote unavailable for branch lookup"),
+    )
+}
+
+/// The status of `branch` from the remote's `response` to a query for it. A branch the remote does
+/// not hold is `BranchNotFound`, a refusal of the credentials passes on, and any other failure is
+/// internal.
+fn queried_status(
+    response: Result<lore_transport::BranchQueryResponse, ProtocolError>,
+    branch: &str,
+) -> Result<BranchStatus, BranchError> {
     match response {
         Ok(response) => Ok(BranchStatus {
             id: response.id,
@@ -1139,8 +1159,9 @@ async fn resolve_remote(
             deleted: response.deleted,
         }),
         Err(ProtocolError::NotFound(_)) => Err(BranchError::from(BranchNotFound {
-            branch: branch_input.to_string(),
+            branch: branch.to_string(),
         })),
+        Err(err) if err.is_refusal() => Err(err.forward("querying branch on remote")),
         Err(err) => Err(BranchError::internal_with_context(
             err,
             "Failed to get information from remote",
@@ -1160,48 +1181,22 @@ async fn resolve_default(
     repository: Arc<RepositoryContext>,
     branch: &str,
 ) -> Result<BranchStatus, BranchError> {
-    let branch_input = branch;
     let id = if let Ok(id) = Context::from_str(branch) {
         id
-    } else if let Ok(branch) = branch::load_name_to_id(repository.clone(), branch).await {
-        branch
+    } else if let Ok(id) = branch::load_name_to_id(repository.clone(), branch).await {
+        id
     } else {
-        let remote = repository.remote().await.map_err(|err| {
-            BranchError::BranchNotFound(
-                BranchNotFound {
-                    branch: branch_input.to_string(),
-                }
-                .chain_err_from(err, "remote unavailable for branch lookup"),
-            )
-        })?;
-        match remote
+        let remote = repository
+            .remote()
+            .await
+            .map_err(|err| remote_lookup_failure(err, branch))?;
+        let response = remote
             .revision(repository.id)
             .await
             .forward::<BranchError>("Failed to connect to remote revision service")?
             .branch_query(None, Some(branch))
-            .await
-        {
-            Ok(response) => {
-                return Ok(BranchStatus {
-                    id: response.id,
-                    latest: response.latest,
-                    metadata: response.metadata,
-                    local: false,
-                    deleted: response.deleted,
-                });
-            }
-            Err(ProtocolError::NotFound(_)) => {
-                return Err(BranchError::from(BranchNotFound {
-                    branch: branch_input.to_string(),
-                }));
-            }
-            Err(err) => {
-                return Err(BranchError::internal_with_context(
-                    err,
-                    "Failed to get information from remote",
-                ));
-            }
-        }
+            .await;
+        return queried_status(response, branch);
     };
 
     if let Ok(metadata) = metadata_hash(repository.clone(), id).await {
@@ -1218,10 +1213,16 @@ async fn resolve_default(
         });
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(status) = load_remote(remote, repository.id, id).await
-    {
-        return Ok(status);
+    match repository.remote().await {
+        Ok(remote) => match load_remote(remote, repository.id, id).await {
+            Ok(status) => return Ok(status),
+            Err(err) if err.is_not_authenticated() || err.is_not_authorized() => return Err(err),
+            Err(_) => {}
+        },
+        Err(err) if err.is_refusal() => {
+            return Err(err.forward("connecting to remote for branch lookup"));
+        }
+        Err(_) => {}
     }
 
     Ok(BranchStatus {
