@@ -271,6 +271,32 @@ async fn a_tracked_file_a_link_now_stands_at_is_deleted() {
         .await;
 }
 
+/// A path the operation cannot describe is not one that is gone: marking it as deleted would
+/// stage the removal of a file that is there, so the walk reports the failure instead.
+#[tokio::test]
+async fn a_path_the_operation_cannot_describe_fails_the_walk() {
+    let filesystem = Arc::new(TestFilesystemProvider::failing_file_info());
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Making test stores");
+    let repository = Arc::new(RepositoryContext::new(
+        default_repository_creation_args(immutable_store, mutable_store)
+            .with_filesystem_provider(filesystem),
+    ));
+    let paths = vec![RelativePathBuf::new().push_and_freeze("tracked.txt")];
+
+    let result = LORE_CONTEXT
+        .scope(execution, async move {
+            let state = State::new();
+            dirty_relative_paths_in(repository, state.clone(), state, paths).await
+        })
+        .await;
+
+    assert!(
+        result.is_err(),
+        "the walk treated a path it could not describe as absent"
+    );
+}
+
 /// A repository rooted at `path`, with the stores and execution context a walk needs.
 #[cfg(unix)]
 async fn working_tree_repository(

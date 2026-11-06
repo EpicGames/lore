@@ -1359,6 +1359,9 @@ pub mod test_util {
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
         pub finalize_fails: bool,
         pub write_fails: bool,
+        /// Whether the provider cannot describe any path, as one that cannot stat the working
+        /// tree.
+        pub file_info_fails: bool,
         pub holds_paths: bool,
         /// Whether the provider cannot name the content at any path.
         pub content_source_fails: bool,
@@ -1455,6 +1458,9 @@ pub mod test_util {
         /// otherwise what the provider was told to hold.
         async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
+            if self.file_info_fails {
+                return Err(FsError::internal("File information failed"));
+            }
             match &self.reads {
                 Some(reads) => reads.file_info(path).await,
                 None => Ok(self.held()),

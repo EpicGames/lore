@@ -566,8 +566,8 @@ async fn staged_node(walk: &DirtyWalk, nodes: DirtyNodes) -> Option<Node> {
 /// the working tree holds there, else as the node the staged tree holds, a link as a directory, and
 /// as a directory where neither holds anything. A path the trees track is past the ignore slot. A
 /// path the filter leaves out whatever it holds is answered before the working tree is read where
-/// the trees do not track it. A path the operation cannot describe holds nothing the walk can mark,
-/// which is the answer an absent one gives.
+/// the trees do not track it. A path the operation cannot describe is an error and not an absent
+/// path: reading it as absent would mark a file that is there as deleted.
 #[lore_macro::test_pub]
 async fn dirty_named_path(
     walk: &DirtyWalk,
@@ -625,7 +625,7 @@ async fn dirty_resolved_path(
             .operation
             .file_info(path)
             .await
-            .unwrap_or(FileInfo::NotExist);
+            .forward_any::<DirtyError>("Failed to describe a path in the working tree")?;
         let staged = staged_node(walk, nodes).await;
         let is_directory = if info.exists() {
             info.is_dir()

@@ -1489,24 +1489,25 @@ fn resolve_scan_target(
             });
         }
 
-        let Some(info) = operation
-            .file_info(&path)
-            .await
-            .ok()
-            .filter(|info| info.exists())
-        else {
-            if report_ignored {
-                emit_path_ignore(path.as_str()).await;
+        // A path that cannot be described is kept, so that the scan reports it, rather than
+        // dropped with the paths that are not there.
+        let info = match operation.file_info(&path).await {
+            Ok(info) if !info.exists() => {
+                if report_ignored {
+                    emit_path_ignore(path.as_str()).await;
+                }
+                lore_trace!("Ignoring invalid path: {path}");
+                return None;
             }
-            lore_trace!("Ignoring invalid path: {path}");
-            return None;
+            Ok(info) => Some(info),
+            Err(_) => None,
         };
 
         let filter = &repository.filter;
         let (_, excluded) = filter.child_excludes_tree(
             filter.parent_exclusion_states(&path),
             &path,
-            info.is_dir(),
+            info.is_some_and(|info| info.is_dir()),
             FilterMode::Full,
         );
         Some(ScanTarget {

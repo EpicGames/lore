@@ -57,6 +57,7 @@ pub struct TestFilesystemProvider {
     finalize_fails: bool,
     committed_fails: bool,
     write_fails: bool,
+    file_info_fails: bool,
     content_source_fails: bool,
     content_source_missing: bool,
     holds_paths: bool,
@@ -81,6 +82,14 @@ impl TestFilesystemProvider {
     pub fn failing_content_sources() -> TestFilesystemProvider {
         Self {
             content_source_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations cannot describe any path.
+    pub fn failing_file_info() -> TestFilesystemProvider {
+        Self {
+            file_info_fails: true,
             ..Self::new()
         }
     }
@@ -203,6 +212,7 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_events: self.finalize_events.clone(),
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
+                file_info_fails: self.file_info_fails,
                 content_source_fails: self.content_source_fails,
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,

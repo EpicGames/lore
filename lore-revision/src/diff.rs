@@ -188,7 +188,8 @@ async fn diff_filesystem_paths_in(
                 exists_in_filesystem = operation
                     .file_info(&repository_path)
                     .await
-                    .is_ok_and(|info| info.exists());
+                    .forward_any::<DiffError>("Failed to describe a path to diff")?
+                    .exists();
             }
 
             if !exists_in_state && !exists_in_filesystem {

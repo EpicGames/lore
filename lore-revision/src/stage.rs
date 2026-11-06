@@ -599,11 +599,13 @@ pub(crate) async fn stage_filesystem_path(
     let staged_info = if let Some(info) = resolved_info {
         Some(info)
     } else {
-        operation
+        // A path the operation cannot describe is an error and not a missing path: reading it as
+        // missing would stage the deletion of a file that is there.
+        let info = operation
             .file_info(&full_relative_path)
             .await
-            .ok()
-            .filter(|info| info.exists())
+            .forward_any::<StageError>("Failed to describe a path to stage")?;
+        info.exists().then_some(info)
     };
 
     let force = execution_context().globals().force();

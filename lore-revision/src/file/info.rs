@@ -294,15 +294,19 @@ async fn info_path(
 
         let mut is_deleted = false;
         if local_filtered.local_size == 0 {
-            match operation.file_info(&path).await {
-                Ok(info) if info.is_file() => {
+            let described = operation
+                .file_info(&path)
+                .await
+                .forward_any::<InfoError>("Failed to describe a file")?;
+            match described {
+                info if info.is_file() => {
                     let (comparison, local_hash) =
                         compare_to_node(&operation, &repository, &node, info.size(), &path).await?;
                     local_filtered.local_size = info.size();
                     local_filtered.local_hash = local_hash;
                     local_filtered.comparison = Some(comparison);
                 }
-                Ok(info) if info.exists() => {}
+                info if info.exists() => {}
                 _ => is_deleted = true,
             }
         }
@@ -363,7 +367,7 @@ async fn info_path(
         let info = operation
             .file_info(&path)
             .await
-            .unwrap_or(FileInfo::NotExist);
+            .forward_any::<InfoError>("Failed to describe a path")?;
         if info.exists() {
             event::LoreEvent::FileInfo(LoreFileInfoEventData {
                 path: path.into(),
@@ -477,7 +481,7 @@ async fn calculate_local_filtered_size_hash(
         let info = operation
             .file_info(&relative_path)
             .await
-            .unwrap_or(FileInfo::NotExist);
+            .forward_any::<InfoError>("Failed to describe a file")?;
         if !info.is_file() {
             return Ok(LocalFiltered {
                 filtered_size: node.size,
@@ -510,7 +514,7 @@ async fn calculate_local_filtered_size_hash(
                 let local_info = local_size_operation
                     .file_info(&local_size_relative_path)
                     .await
-                    .unwrap_or(FileInfo::NotExist);
+                    .forward_any::<InfoError>("Failed to describe a path")?;
                 calculate_local_size_recurse(
                     local_size_operation,
                     local_size_repository,

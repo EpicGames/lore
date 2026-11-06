@@ -1991,7 +1991,8 @@ async fn purge_untracked_children(
     if !operation
         .file_info(directory_path)
         .await
-        .is_ok_and(|info| info.is_dir())
+        .forward_any::<ResetError>("Failed to describe a directory to purge")?
+        .is_dir()
     {
         return Ok(());
     }
