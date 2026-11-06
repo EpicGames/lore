@@ -136,8 +136,9 @@ The file is optional; when it's absent, Lore uses the defaults below.
 | --- | --- | --- | --- |
 | `executable` | string | unset | Path of the `lore` executable to run as the [background service](lore-cli-commands.md#lore-service). |
 | `use_automatically` | boolean | `false` | Whether commands are carried out by the service rather than in the process you ran. |
+| `idle_connection_timeout` | integer (seconds) | `300` | Seconds the service keeps a connection to a remote open once no command is using it. |
 
-**Both are required.** Commands are carried out by the service only when `use_automatically` is on *and* an executable is named. Turning the setting on by itself changes nothing, and Lore says so on each command rather than leaving you to wonder.
+**`executable` and `use_automatically` are both required.** Commands are carried out by the service only when `use_automatically` is on *and* an executable is named. Turning the setting on by itself changes nothing, and Lore says so on each command rather than leaving you to wonder.
 
 ```toml
 [service]
@@ -168,6 +169,13 @@ Steps 3 and 4 serve `lore service start`, which asks for a service outright and 
 If none of those resolve, starting a service fails and names both places one can be set. Running `lore service run` by hand always serves from the build you ran, whatever this setting says; the service reports on startup when that isn't the configured one.
 
 `use_automatically` is what turns the service on and leaves it on. `LORE_USE_SERVICE` overrides it for a single command, and reads `0`, `false`, `no` and `off` as off — so `LORE_USE_SERVICE=0 lore status` runs in the process you ran even where the setting turns the service on. A blank value reads as unset and defers to the setting, as a blank `executable` does. Turning it on through the environment still requires an executable to be named, in either of the two places above.
+
+`idle_connection_timeout` decides how long a connection outlives the commands that use it. A command to a remote the service already has a connection to reuses it, rather than connecting and authenticating again. Once no command has used a connection for this many seconds, the service closes it, and the server releases it. It closes within a minute after the timeout has passed, and the next command to that remote connects again. With `0`, a connection closes within a second or two after the last command using it finishes. A connection that a mount or a notification subscription holds stays open for as long as that holds it. The service reads the setting when it starts, and so does a program that runs the service through the C API.
+
+```toml
+[service]
+idle_connection_timeout = 600
+```
 
 ### Giving a run its own service
 

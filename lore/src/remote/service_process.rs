@@ -139,8 +139,8 @@ fn resolve_service_executable(
 /// the call. Most callers have none set, so a config Lore cannot read is reported
 /// and stepped over.
 pub async fn service_executable() -> Result<PathBuf, ServiceProcessError> {
-    let from_config = match GlobalConfig::load().await {
-        Ok(config) => config.service_executable().map(str::to_string),
+    let config = match GlobalConfig::load().await {
+        Ok(config) => Some(config),
         Err(error) => {
             lore_warn!(
                 "Could not read {SERVICE_EXECUTABLE_SETTING} from the global config: {error}"
@@ -148,10 +148,17 @@ pub async fn service_executable() -> Result<PathBuf, ServiceProcessError> {
             None
         }
     };
+    service_executable_in(config.as_ref())
+}
 
+/// The executable to start the service with, from the environment variable or `config`, which is
+/// `None` for a config that could not be read.
+pub(crate) fn service_executable_in(
+    config: Option<&GlobalConfig>,
+) -> Result<PathBuf, ServiceProcessError> {
     resolve_service_executable(
         std::env::var_os(SERVICE_EXECUTABLE_VAR),
-        from_config.as_deref(),
+        config.and_then(GlobalConfig::service_executable),
     )
 }
 
@@ -207,9 +214,7 @@ pub(crate) fn report_settings_update_that_will_not_relay(config: &GlobalConfig) 
         return;
     }
 
-    let exec_from_env = std::env::var_os(SERVICE_EXECUTABLE_VAR);
-    let exec_from_config = config.service_executable();
-    if resolve_service_executable(exec_from_env, exec_from_config).is_ok() {
+    if service_executable_in(Some(config)).is_ok() {
         return;
     }
 

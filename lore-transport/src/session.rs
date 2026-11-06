@@ -203,6 +203,14 @@ impl StorageSession {
         }
     }
 
+    /// Whether this session was started on `connection`, which it then holds.
+    fn started_on(&self, connection: &Arc<Connection>) -> bool {
+        matches!(
+            &self.inner,
+            SessionInner::Resolved(resolved) if Arc::ptr_eq(&resolved.connection, connection)
+        )
+    }
+
     /// Read from the resolved session, driving the pending resolver on first call. Every method
     /// needing the server-side session goes through here, so one resolution serves whatever is
     /// asked of a pending session. A pooled session reads from the next session of its pool when
@@ -579,6 +587,17 @@ impl SessionPool {
     fn next_index(&self) -> usize {
         self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len()
     }
+
+    /// How many of this pool's sessions were started on `connection` and are held by this pool
+    /// alone: the references to `connection` the pool keeps that nothing else reaches. A session
+    /// started on another connection holds no reference to this one and is left out, so a pool
+    /// whose sessions are on other connections makes `connection` look held rather than unused.
+    fn sessions_on_held_only_here(&self, connection: &Arc<Connection>) -> usize {
+        self.sessions
+            .iter()
+            .filter(|session| Arc::strong_count(session) == 1 && session.started_on(connection))
+            .count()
+    }
 }
 
 /// The session pool an owner holds for each partition it uses: the one started for the latest
@@ -623,6 +642,16 @@ impl PartitionSessions {
             pool.mark_stale();
         }
         self.pools.clear();
+    }
+
+    /// How many references to `connection` the pools held here keep that nothing else reaches:
+    /// one for each session started on it that its pool alone holds, in a pool held here alone.
+    pub(crate) fn references_held_only_here(&self, connection: &Arc<Connection>) -> usize {
+        self.pools
+            .iter()
+            .filter(|pool| Arc::strong_count(pool.value()) == 1)
+            .map(|pool| pool.sessions_on_held_only_here(connection))
+            .sum()
     }
 }
 

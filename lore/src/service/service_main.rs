@@ -11,7 +11,12 @@ use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
 use lore_revision::event::EventError;
 use lore_revision::fs::mount_manager_state::MountManagerState;
+use lore_revision::global::DEFAULT_IDLE_CONNECTION_TIMEOUT;
+use lore_revision::global::GlobalConfig;
+use lore_revision::lore_warn;
 use lore_revision::service_state::ServiceStateImpl;
+use lore_revision::util::config::SaveableConfig;
+use lore_transport::connection::close_idle_connections;
 
 use crate::interface::LoreGlobalArgs;
 use crate::remote::connection::ConnectionId;
@@ -24,7 +29,7 @@ use crate::remote::service_process::ServiceStartGuard;
 use crate::remote::service_process::ServiceStopRequest;
 use crate::remote::service_process::begin_service_start;
 use crate::remote::service_process::register_service_process;
-use crate::remote::service_process::service_executable;
+use crate::remote::service_process::service_executable_in;
 use crate::remote::service_process::wait_until_a_service_is_listening;
 use crate::remote::service_socket_name;
 use crate::service::initialization::initialize_service;
@@ -110,12 +115,21 @@ pub async fn service_main(
         }
     };
     println!("{LISTENING_MESSAGE}");
-    report_build_that_is_not_the_configured_one().await;
+    let idle_connection_timeout = {
+        let config = service_config().await;
+        report_build_that_is_not_the_configured_one(config.as_ref());
+        config.as_ref().map_or(
+            DEFAULT_IDLE_CONNECTION_TIMEOUT,
+            GlobalConfig::service_idle_connection_timeout,
+        )
+    };
 
     // Recorded once the socket is bound, so that a process which lost it never
     // claims to be the service for the moments before it exits.
     register_service_process(&start);
     let stop_request = start.stop_request();
+
+    let _idle_connections = close_idle_connections(idle_connection_timeout);
 
     // Declared after `start` and `mounts`, so that it drops first: the accept loop is
     // told to end before the process stops being one that runs a service, and before the
@@ -176,6 +190,21 @@ pub async fn service_main(
     mounts.close().await;
 
     Ok(())
+}
+
+/// The global config the service reads its settings from when it starts. A config that cannot be
+/// read leaves each setting at its default, since the service runs either way.
+async fn service_config() -> Option<GlobalConfig> {
+    match GlobalConfig::load().await {
+        Ok(config) => Some(config),
+        Err(error) => {
+            lore_warn!(
+                "Could not read the [service] settings from the global config, leaving them at \
+                 their defaults: {error}"
+            );
+            None
+        }
+    }
 }
 
 /// Runs `close` when the service ends, however it ends: the service closes its SWFS mounts with it.
@@ -303,13 +332,13 @@ async fn refuse_claimed_socket(start: &ServiceStartGuard) -> ServiceMainError {
 }
 
 /// Reports serving from a build other than the one that would be started
-/// automatically, which is the one the global config names when it names any.
+/// automatically, which is the one `config` names when it names any.
 ///
 /// Running a service from a chosen build is allowed: whoever ran this command
 /// picked it. What is not wanted is silence about it afterwards, when a service
 /// started long ago from a stale path is serving a machine and nothing says so.
-async fn report_build_that_is_not_the_configured_one() {
-    let Ok(configured) = service_executable().await else {
+fn report_build_that_is_not_the_configured_one(config: Option<&GlobalConfig>) {
+    let Ok(configured) = service_executable_in(config) else {
         return;
     };
     let Ok(running) = std::env::current_exe() else {

@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -77,6 +78,7 @@ pub(crate) struct TestStorageServer {
     presented: Arc<parking_lot::Mutex<Vec<String>>>,
     reading: tokio::sync::watch::Sender<bool>,
     fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
+    closed: Arc<AtomicUsize>,
     endpoint: quinn::Endpoint,
 }
 
@@ -233,14 +235,16 @@ impl TestStorageServer {
         let presented: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
         let reading = tokio::sync::watch::Sender::new(true);
         let fault: Arc<parking_lot::Mutex<Option<StreamFault>>> = Arc::default();
+        let closed: Arc<AtomicUsize> = Arc::default();
 
         let accepting = endpoint.clone();
-        let (accepted, accepted_sessions, logged, read, armed) = (
+        let (accepted, accepted_sessions, logged, read, armed, ended) = (
             gets.clone(),
             sessions.clone(),
             presented.clone(),
             reading.subscribe(),
             fault.clone(),
+            closed.clone(),
         );
         lore_spawn!(async move {
             while let Some(incoming) = accepting.accept().await {
@@ -261,6 +265,7 @@ impl TestStorageServer {
                         presented: logged.clone(),
                         reading: read.clone(),
                         fault: armed.clone(),
+                        closed: ended.clone(),
                     }),
                 ));
             }
@@ -273,6 +278,7 @@ impl TestStorageServer {
             presented,
             reading,
             fault,
+            closed,
             endpoint,
         }
     }
@@ -291,6 +297,11 @@ impl TestStorageServer {
     /// Connections accepted so far.
     pub fn accepted_connections(&self) -> usize {
         self.gets.lock().len()
+    }
+
+    /// Accepted connections that have closed so far.
+    pub fn closed_connections(&self) -> usize {
+        self.closed.load(Ordering::Relaxed)
     }
 
     /// The authorizations session starts presented so far, in order.
@@ -401,7 +412,7 @@ impl TestStorageServer {
 
 /// What the streams of one connection share: the `get`s it served, the lock that serves them one
 /// at a time, its sessions, how it answers, and the server's record of authorizations presented,
-/// whether it reads payloads and its armed fault.
+/// whether it reads payloads, its armed fault and its count of closed connections.
 struct Served {
     gets: Arc<AtomicU64>,
     serial: tokio::sync::Mutex<()>,
@@ -410,12 +421,14 @@ struct Served {
     presented: Arc<parking_lot::Mutex<Vec<String>>>,
     reading: tokio::sync::watch::Receiver<bool>,
     fault: Arc<parking_lot::Mutex<Option<StreamFault>>>,
+    closed: Arc<AtomicUsize>,
 }
 
 async fn serve_connection(connection: quinn::Connection, served: Arc<Served>) {
     while let Ok((send, recv)) = connection.accept_bi().await {
         lore_spawn!(serve_stream(send, recv, served.clone()));
     }
+    served.closed.fetch_add(1, Ordering::Relaxed);
 }
 
 async fn serve_stream(
@@ -431,6 +444,7 @@ async fn serve_stream(
         presented,
         reading,
         fault,
+        closed: _,
     } = &*served;
     let mut reading = reading.clone();
     let mut header_bytes = [0u8; COMMAND_HEADER_SIZE_V4];

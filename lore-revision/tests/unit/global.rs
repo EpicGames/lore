@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
 use lore_revision::global::*;
 
 /// Every field written and read back through TOML, so that a field added
@@ -15,11 +17,16 @@ fn a_fully_populated_config_survives_a_round_trip() {
         .set_default_path_for_remote_url("lore://example", "/srv/shared")
         .expect("the shared store path must be settable");
     config.service.executable = Some("/opt/lore/1.9/bin/lore".to_string());
+    config.service.idle_connection_timeout = Some(42);
 
     let written = toml::to_string(&config).expect("the config must be writable as TOML");
     let read: GlobalConfig = toml::from_str(&written).expect("and readable back");
 
     assert_eq!(read.service_executable(), Some("/opt/lore/1.9/bin/lore"));
+    assert_eq!(
+        read.service_idle_connection_timeout(),
+        Duration::from_secs(42)
+    );
     assert!(read.use_shared_store_automatically());
     assert_eq!(read.all_default_shared_stores().count(), 1);
 }

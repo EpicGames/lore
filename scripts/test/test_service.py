@@ -775,6 +775,86 @@ def catches_sigterm(pid: int) -> bool:
     return bool(int(caught.split()[1], 16) & (1 << (signal.SIGTERM - 1)))
 
 
+# Seconds the service keeps a connection open once no command is using it, in the
+# test that closes them: long enough for the next command to reach it first.
+IDLE_CONNECTION_TIMEOUT = 5
+
+
+def udp_sockets(pid: int) -> set[str]:
+    """The inodes of the UDP sockets the process holds open, read from /proc."""
+    udp = set()
+    for table in ("/proc/net/udp", "/proc/net/udp6"):
+        if not os.path.exists(table):
+            continue
+        with open(table) as entries:
+            next(entries)
+            udp.update(entry.split()[9] for entry in entries)
+    held = set()
+    for descriptor in Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            target = os.readlink(descriptor)
+        except OSError:
+            continue
+        if target.startswith("socket:["):
+            held.add(target[len("socket:[") : -1])
+    return held & udp
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    platform.system() != "Linux", reason="reads the service's sockets from /proc"
+)
+def test_the_service_closes_connections_no_command_has_used_for_the_timeout(
+    new_lore_repo, lore_service_runner, global_dir_name
+):
+    """The service keeps the connections a command opened for the next command,
+    which reuses them, and closes them once no command has used them for
+    `[service] idle_connection_timeout` seconds. A command after that connects
+    again.
+
+    Read from the service's UDP sockets, one for each storage connection, so a
+    connection the service closed but still holds would show as open.
+    """
+    config = Path(global_dir_name) / "config" / "config.toml"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        f"[service]\nidle_connection_timeout = {IDLE_CONNECTION_TIMEOUT}\n",
+        encoding="utf-8",
+    )
+    service = lore_service_runner.start()
+    before = udp_sockets(service.pid)
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    with repo.open_file("pushed.txt", "w+") as written:
+        written.write("pushed\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Add pushed.txt", offline=True)
+
+    repo.push()
+    opened = udp_sockets(service.pid) - before
+    assert opened, "the push left no storage connection open in the service"
+
+    repo.sync()
+    used = monotonic()
+    assert udp_sockets(service.pid) - before == opened, (
+        "the sync connected again rather than reusing the push's connections"
+    )
+
+    deadline = used + IDLE_CONNECTION_TIMEOUT + 30
+    while udp_sockets(service.pid) & opened and monotonic() < deadline:
+        sleep(0.2)
+    assert not udp_sockets(service.pid) & opened, (
+        "the service kept its connections open past the timeout"
+    )
+    assert monotonic() - used >= IDLE_CONNECTION_TIMEOUT - 1, (
+        "the service closed its connections before the timeout"
+    )
+
+    repo.sync()
+    assert udp_sockets(service.pid) - before - opened, (
+        "the sync after the connections closed opened none"
+    )
+
+
 @pytest.mark.smoke
 @pytest.mark.skipif(
     platform.system() != "Linux", reason="reads the signal mask from /proc"

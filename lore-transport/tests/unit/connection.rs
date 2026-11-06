@@ -974,8 +974,10 @@ fn resolved_user_fields() {
     assert_eq!(user.user_name, "Bob");
 }
 
-/// The connection cache: the connections it hands to calls, and the connections it takes out.
+/// The connection cache: the connections it hands to calls, the connections it takes out, and the
+/// checks that close those no call has used for a while.
 mod cache {
+    use std::collections::HashMap;
     use std::sync::Weak;
     use std::sync::atomic::Ordering;
 
@@ -988,11 +990,28 @@ mod cache {
     use lore_transport::traits::Repository;
     use lore_transport::traits::Revision;
     use lore_transport::traits::Storage;
+    use tokio::time::Instant;
 
     use super::*;
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
     use crate::quic::storage_service::test_server::wait_until;
+
+    const IDLE: Duration = Duration::from_secs(300);
+
+    /// A cache holding only `connection`, as the connection cache holds it.
+    fn cache_of(connection: Arc<Connection>) -> HashMap<ConnectionKey, Arc<Connection>> {
+        HashMap::from([(
+            (
+                "lore://idle.test.invalid".to_string(),
+                String::new(),
+                false,
+                String::new(),
+                AuthMode::Auto,
+            ),
+            connection,
+        )])
+    }
 
     /// Runs `test` in an execution context, as a call runs.
     async fn in_a_call(test: impl Future<Output = ()>) {
@@ -1339,5 +1358,209 @@ mod cache {
             }
         })
         .await;
+    }
+
+    #[test]
+    fn idle_checks_run_ten_times_per_timeout_from_once_a_second_to_twice_a_minute() {
+        for (idle, interval) in [(300, 30), (60, 6), (2, 1), (0, 1), (3600, 30)] {
+            assert_eq!(
+                idle_check_interval(Duration::from_secs(idle)),
+                Duration::from_secs(interval),
+                "for a timeout of {idle} s"
+            );
+        }
+    }
+
+    /// A connection is in use by the call that opened it until a check finds no call holding it,
+    /// and is taken once no call has used it for the timeout from that check.
+    #[test]
+    fn an_unused_connection_is_taken_once_idle_for_the_timeout() {
+        let mut cache = cache_of(Connection::detached(Vec::new()));
+        let released = Instant::now();
+
+        assert!(take_unused(&mut cache, IDLE, released).is_empty());
+        assert!(take_unused(&mut cache, IDLE, released + IDLE - Duration::from_secs(1)).is_empty());
+        assert_eq!(take_unused(&mut cache, IDLE, released + IDLE).len(), 1);
+        assert!(cache.is_empty(), "a taken connection was left in the cache");
+    }
+
+    /// A call holding a connection keeps it however long it holds it, and the timeout runs from
+    /// the first check after the call stops holding it.
+    #[test]
+    fn a_held_connection_is_taken_only_once_idle_for_the_timeout_after_its_release() {
+        let connection = Connection::detached(Vec::new());
+        let mut cache = cache_of(connection.clone());
+        let start = Instant::now();
+
+        assert!(take_unused(&mut cache, IDLE, start).is_empty());
+        assert!(
+            take_unused(&mut cache, IDLE, start + 10 * IDLE).is_empty(),
+            "a connection a call holds was taken"
+        );
+
+        drop(connection);
+        let released = start + 10 * IDLE + Duration::from_secs(1);
+        assert!(take_unused(&mut cache, IDLE, released).is_empty());
+        assert!(
+            take_unused(&mut cache, IDLE, released + IDLE - Duration::from_secs(1)).is_empty(),
+            "the timeout ran from the last check that found the connection held"
+        );
+        assert_eq!(take_unused(&mut cache, IDLE, released + IDLE).len(), 1);
+    }
+
+    /// A call that takes a connection from the cache between two checks has used it, though no
+    /// check found it held: the timeout runs from the check after the take. Both the lookup by the
+    /// full key and the one by URL alone, for a call that has no identity yet, take it.
+    #[test]
+    fn a_connection_taken_from_the_cache_between_checks_was_in_use() {
+        for (cached_as, looked_up_as) in [("", ""), ("alice", "")] {
+            let remote = format!("lore://idle-taken-as-{cached_as}.test.invalid");
+            let mut cache = cache_of(Connection::detached(Vec::new()));
+            let start = Instant::now();
+            assert!(take_unused(&mut cache, IDLE, start).is_empty());
+
+            let connection = cache
+                .values()
+                .next()
+                .expect("the cached connection")
+                .clone();
+            add_connection(
+                &remote,
+                cached_as,
+                false,
+                AuthMode::Auto,
+                connection.clone(),
+            );
+            let taken = find_connection(&remote, looked_up_as, false, AuthMode::Auto);
+            assert!(
+                taken.is_some_and(|taken| Arc::ptr_eq(&taken, &connection)),
+                "looked up as {looked_up_as:?}"
+            );
+            remove_connection(connection);
+
+            assert!(
+                take_unused(&mut cache, IDLE, start + IDLE).is_empty(),
+                "a connection taken as {looked_up_as:?} since the last check was taken as unused"
+            );
+            assert_eq!(take_unused(&mut cache, IDLE, start + 2 * IDLE).len(), 1);
+        }
+    }
+
+    /// A connection cached under a key a live connection is cached under takes the live one, and so
+    /// restarts its timeout as a lookup does.
+    #[test]
+    fn a_connection_cached_under_a_live_ones_key_takes_it() {
+        let remote = "lore://idle-taken-by-adding.test.invalid";
+        let mut cache = cache_of(Connection::detached(Vec::new()));
+        let start = Instant::now();
+        assert!(take_unused(&mut cache, IDLE, start).is_empty());
+
+        let connection = cache
+            .values()
+            .next()
+            .expect("the cached connection")
+            .clone();
+        add_connection(remote, "", false, AuthMode::Auto, connection.clone());
+        add_connection(
+            remote,
+            "",
+            false,
+            AuthMode::Auto,
+            Connection::detached(Vec::new()),
+        );
+        remove_connection(connection);
+
+        assert!(
+            take_unused(&mut cache, IDLE, start + IDLE).is_empty(),
+            "a connection taken by a second add since the last check was taken as unused"
+        );
+        assert_eq!(take_unused(&mut cache, IDLE, start + 2 * IDLE).len(), 1);
+    }
+
+    /// The sessions of a pool the connection pins hold the connection back, and a call holds the
+    /// connection through them only by holding the pool or one of its sessions. Each hold spans two
+    /// checks, the timeout apart: the first check after a change only records it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pools_a_connection_pins_hold_it_only_for_a_call_holding_them() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let connection = Connection::detached(server.connect(2).await);
+            let pool = connection
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pinned pool");
+            let mut cache = cache_of(connection);
+            let start = Instant::now();
+
+            for look in 0..2u32 {
+                assert!(
+                    take_unused(&mut cache, IDLE, start + look * IDLE).is_empty(),
+                    "taken while a call held a pool it pins"
+                );
+            }
+
+            let session = pool.pick();
+            drop(pool);
+            for look in 2..4u32 {
+                assert!(
+                    take_unused(&mut cache, IDLE, start + look * IDLE).is_empty(),
+                    "taken while a call held a session of a pool it pins"
+                );
+            }
+
+            drop(session);
+            assert!(take_unused(&mut cache, IDLE, start + 4 * IDLE).is_empty());
+            assert_eq!(
+                take_unused(&mut cache, IDLE, start + 5 * IDLE).len(),
+                1,
+                "the pool it pins held the connection with no call holding the pool"
+            );
+        })
+        .await;
+    }
+
+    /// Closing an unused connection frees it, though the pool it pins holds it, and closes its
+    /// storage connections, so the server releases them. It is stale, so nothing reuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn closing_an_unused_connection_frees_it_and_closes_its_storage_at_the_server() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let connection = with_a_pinned_pool(&server).await;
+
+            connection.close_unused().await;
+
+            assert!(connection.stale.load(Ordering::Relaxed));
+            assert_eq!(
+                Arc::strong_count(&connection),
+                1,
+                "the sessions of the pool it pins still hold the connection"
+            );
+            wait_until(
+                || server.closed_connections() == 2,
+                "the server's storage connections were left open",
+            )
+            .await;
+        })
+        .await;
+    }
+
+    /// With a timeout of zero, a connection is taken at the check after the first one that finds no
+    /// call holding it, so no single check's counts close it.
+    #[test]
+    fn with_no_timeout_a_connection_is_taken_at_the_second_check_that_finds_no_call_holding_it() {
+        let connection = Connection::detached(Vec::new());
+        let mut cache = cache_of(connection.clone());
+        let start = Instant::now();
+
+        assert!(
+            take_unused(&mut cache, Duration::ZERO, start).is_empty(),
+            "taken while a call held it"
+        );
+        drop(connection);
+        assert!(
+            take_unused(&mut cache, Duration::ZERO, start).is_empty(),
+            "taken at the first check that found no call holding it"
+        );
+        assert_eq!(take_unused(&mut cache, Duration::ZERO, start).len(), 1);
     }
 }

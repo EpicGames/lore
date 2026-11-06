@@ -6,10 +6,12 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use lore_base::env::AUTH_PATH_VAR;
 use lore_base::lore_debug;
 use lore_base::lore_spawn_net;
+use lore_base::lore_spawn_net_nocontext;
 use lore_base::lore_trace;
 use lore_base::lore_warn;
 use lore_base::runtime::shutdown_block_on;
@@ -17,6 +19,8 @@ use lore_base::types::*;
 use lore_error_set::prelude::*;
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
+use tokio_util::task::AbortOnDropHandle;
 use url::Url;
 
 use crate::auth;
@@ -111,6 +115,7 @@ pub(crate) type CredentialStore = String;
 /// was opened in. The mode is part of it because the lookup runs before the environment is
 /// fetched, so the path the mode resolves to is not yet known; a call in another mode opens its
 /// own connection rather than being served one that may be on the other path.
+#[lore_macro::test_pub]
 type ConnectionKey = (
     String,
     String,
@@ -174,7 +179,8 @@ pub(crate) fn credential_store() -> CredentialStore {
 }
 
 /// The live connection cached for the key, or for the URL alone where the call has no identity
-/// yet. A stale connection cached under the key is taken out and [retired](retire).
+/// yet, recorded as taken for the idle checks. A stale connection cached under the key is taken out
+/// and [retired](retire).
 pub fn find_connection(
     remote_url: &str,
     identity: &str,
@@ -198,6 +204,7 @@ pub fn find_connection(
     );
     if let Some(connection) = map.get(&key) {
         if !connection.stale.load(Ordering::Relaxed) {
+            connection.record_taken();
             return Some(connection.clone());
         }
         if let Some(stale) = map.remove(&key) {
@@ -224,7 +231,10 @@ pub fn find_connection(
                 auth_mode,
             ) && !c.stale.load(Ordering::Relaxed)
         })
-        .map(|(_, c)| c.clone())
+        .map(|(_, c)| {
+            c.record_taken();
+            c.clone()
+        })
 }
 
 /// Caches `connection` and returns it, unless a live connection is cached under its key already,
@@ -247,6 +257,7 @@ pub fn add_connection(
     let mut map = CONNECTION_MAP.lock();
     match map.get_or_insert_with(HashMap::new).entry(key) {
         Entry::Occupied(cached) if !cached.get().stale.load(Ordering::Relaxed) => {
+            cached.get().record_taken();
             cached.get().clone()
         }
         Entry::Occupied(mut cached) => {
@@ -273,10 +284,11 @@ fn retire(connection: &Connection) {
     connection.session_cache.clear();
 }
 
-/// Time allowed for the close frames to reach the peer before shutdown proceeds without
-/// them. The cost of expiring is a server-side session lingering to its idle timeout, not
-/// lost data, so this is shorter than the runtime shutdown timeout it runs ahead of.
-const DROP_CONNECTIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Time allowed for closing connections to flush their close frames to the peer. Expiring leaves
+/// the server's session to its idle timeout rather than losing data, so this is shorter than the
+/// runtime shutdown timeout. A connection whose close expires is closed without the wait when it
+/// is dropped.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 pub fn drop_connections() {
     if let Some(map) = CONNECTION_MAP.lock().take() {
@@ -286,17 +298,15 @@ pub fn drop_connections() {
         let completed = shutdown_block_on(
             async move {
                 for connection in map {
-                    let _ = connection.1.cancel_connect().await;
-                    // Drain in-flight streams and flush transport close frames to the peer
-                    // before the runtime goes away. Without this, the server logs every
-                    // outstanding stream read as a transport error on client exit. Retired
-                    // after the close, so the session stops that dropping its pins sends find
-                    // no streams to hold the close back.
-                    connection.1.close_transport().await;
+                    // Flush the transport close frames to the peer before the runtime goes away.
+                    // Without this, the server logs every outstanding stream read as a transport
+                    // error on client exit. Retired after the close, so the session stops that
+                    // dropping its pins sends find no streams to hold the close back.
+                    connection.1.close().await;
                     retire(&connection.1);
                 }
             },
-            DROP_CONNECTIONS_WAIT,
+            CLOSE_WAIT,
         );
         if !completed {
             lore_base::lore_warn!(
@@ -304,6 +314,81 @@ pub fn drop_connections() {
                  streams as transport errors"
             );
         }
+    }
+}
+
+/// How often [`close_idle_connections`] checks for connections that no call has used for `idle`: a
+/// tenth of `idle`, and from one to thirty seconds.
+#[lore_macro::test_pub]
+fn idle_check_interval(idle: Duration) -> Duration {
+    (idle / 10).clamp(Duration::from_secs(1), Duration::from_secs(30))
+}
+
+/// Takes out of `connections` each connection that no call has used for `idle` at `now`, counting
+/// the reference `connections` holds as none.
+#[lore_macro::test_pub]
+fn take_unused(
+    connections: &mut HashMap<ConnectionKey, Arc<Connection>>,
+    idle: Duration,
+    now: Instant,
+) -> Vec<Arc<Connection>> {
+    let mut unused = Vec::new();
+    connections.retain(|_, connection| {
+        let keep = !connection.unused_for(idle, now);
+        if !keep {
+            unused.push(connection.clone());
+        }
+        keep
+    });
+    unused
+}
+
+/// Closes each cached connection that no call has used for `idle`, on a task of the network
+/// runtime that runs until the returned handle is dropped. A connection starts to close no sooner
+/// than `idle` after no call holds it, and at most two [`idle_check_interval`]s later. A call after
+/// that opens a new one. The checks and the closes they start belong to no call, so they run
+/// without the `LORE_CONTEXT` of the call that starts them, which would report them as its own.
+///
+/// Until then the connection stays open, kept alive on both ends by its keep-alives. Closing it
+/// takes it out of the cache, drops the session pools it pins and closes its storage connections,
+/// so the server releases them at once. Its gRPC connection closes once no other connection to the
+/// same host uses it.
+pub fn close_idle_connections(idle: Duration) -> AbortOnDropHandle<()> {
+    AbortOnDropHandle::new(lore_spawn_net_nocontext!(check_idle_connections(idle)))
+}
+
+/// Checks for connections that no call has used for `idle` every [`idle_check_interval`], and
+/// closes each on a task of its own, so a slow close holds back no check.
+async fn check_idle_connections(idle: Duration) {
+    let mut checks = tokio::time::interval(idle_check_interval(idle));
+    checks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        checks.tick().await;
+        let unused = match CONNECTION_MAP.lock().as_mut() {
+            Some(connections) => take_unused(connections, idle, Instant::now()),
+            None => continue,
+        };
+        for connection in unused {
+            lore_spawn_net_nocontext!(close_idle(connection, idle));
+        }
+    }
+}
+
+/// Closes `connection`, which no call has used for `idle`, allowing it [`CLOSE_WAIT`].
+async fn close_idle(connection: Arc<Connection>, idle: Duration) {
+    lore_debug!(
+        "Closing the connection to {}, which no command has used for {} s",
+        connection.remote_url,
+        idle.as_secs()
+    );
+    if tokio::time::timeout(CLOSE_WAIT, connection.close_unused())
+        .await
+        .is_err()
+    {
+        lore_warn!(
+            "Timed out closing the idle connection to {}",
+            connection.remote_url
+        );
     }
 }
 
@@ -971,6 +1056,15 @@ fn hold_subtask(subtask_aborts: &SubtaskAborts, subtask: tokio::task::AbortHandl
     }
 }
 
+/// A connection's use, as [`Connection::unused_for`] records it.
+struct Usage {
+    /// The time of the last check that found the connection in use or taken since the check before
+    /// it, or of the first check after that.
+    last: Instant,
+    /// Whether the connection was in use at the last check, or has been taken since.
+    in_use: bool,
+}
+
 /// Connection over a protocol
 pub struct Connection {
     pub remote_url: Url,
@@ -1012,6 +1106,8 @@ pub struct Connection {
     /// Permits for the gets callers run over this connection to cache fragments ahead of a read,
     /// made by the first caller to ask ([`Self::cache_get_permits`]); `None` for no cap.
     cache_gets: std::sync::OnceLock<Option<Arc<tokio::sync::Semaphore>>>,
+    /// What [`Self::unused_for`] has recorded of the connection's use.
+    usage: Mutex<Usage>,
     /// Set once the connection is out of the cache, after which it pins no session pool.
     retired: std::sync::atomic::AtomicBool,
 }
@@ -1067,6 +1163,11 @@ impl Connection {
             connector: tokio::sync::Mutex::new(None),
             stale: std::sync::atomic::AtomicBool::new(false),
             cache_gets: std::sync::OnceLock::new(),
+            // In use by the call that opens it.
+            usage: Mutex::new(Usage {
+                last: Instant::now(),
+                in_use: true,
+            }),
             retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -1232,14 +1333,60 @@ impl Connection {
         connector.setup_handle
     }
 
-    /// Gracefully drain the transport connections held by this `Connection`.
-    /// Intended to run during library shutdown so that in-flight streams finish
-    /// and close frames reach the peer before the process exits.
+    /// Closes the storage transport connections held by this `Connection`, waiting until the close
+    /// frames reach the peer.
     pub async fn close_transport(&self) {
         let storage = self.storage.read().clone();
         if let Some(storage) = storage {
             storage.close_all().await;
         }
+    }
+
+    /// Records that a call has taken this connection from the cache, for the next check to count as
+    /// use.
+    fn record_taken(&self) {
+        self.usage.lock().in_use = true;
+    }
+
+    /// Whether anything holds this connection beyond the cache's one reference and the session
+    /// pools it pins. A pinned pool's sessions hold the connection they were started on, so a
+    /// caller holds it through them only when it holds the pool or one of its sessions.
+    fn held_beyond_the_cache(self: &Arc<Self>) -> bool {
+        Arc::strong_count(self) > 1 + self.session_cache.references_held_only_here(self)
+    }
+
+    /// Whether no call has used this cached connection for `idle` at `now`, recording what this
+    /// check finds. Anything holding it beyond the cache and the pools it pins is a call using it,
+    /// and so is a call that has taken it since the last check. The time runs from the first check
+    /// after that, so it never starts while a call holds the connection. Only a check after one
+    /// that found the connection unused answers yes, so no single check's counts close it.
+    fn unused_for(self: &Arc<Self>, idle: Duration, now: Instant) -> bool {
+        let held = self.held_beyond_the_cache();
+        let mut usage = self.usage.lock();
+        let was_in_use = usage.in_use;
+        if held || was_in_use {
+            usage.last = now;
+        }
+        usage.in_use = held;
+        !held && !was_in_use && now.saturating_duration_since(usage.last) >= idle
+    }
+
+    /// Closes this connection, which no call holds: marks it stale, so nothing takes it again, drops
+    /// the session pools it pins, whose sessions hold it, and closes its storage connections, so the
+    /// server releases them at once.
+    #[lore_macro::test_pub]
+    async fn close_unused(&self) {
+        // Before the first await, so a close cut short by its timeout still frees the connection.
+        self.stale.store(true, Ordering::Relaxed);
+        retire(self);
+        self.close().await;
+    }
+
+    /// Cancels this connection's connect and closes its storage transport, flushing the close
+    /// frames to the peer.
+    async fn close(&self) {
+        let _ = self.cancel_connect().await;
+        self.close_transport().await;
     }
 
     /// Returns the frozen storage connector, or error if not connected.

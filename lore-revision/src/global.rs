@@ -5,6 +5,7 @@ pub mod external_dir;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use lore_base::directories::project_directory;
 use lore_base::env::GLOBAL_PATH_VAR;
@@ -80,7 +81,15 @@ pub struct ServiceConfig {
     /// This is what turns the service on for a machine and leaves it on, which
     /// is most of the point of having one. Unset is off.
     pub use_automatically: Option<bool>,
+    /// Seconds the service keeps a connection to a remote open once no command
+    /// is using it, so that the next command reuses it rather than connecting
+    /// again. Unset is [`DEFAULT_IDLE_CONNECTION_TIMEOUT`].
+    pub idle_connection_timeout: Option<u64>,
 }
+
+/// How long the service keeps an unused connection open when
+/// `[service] idle_connection_timeout` is unset.
+pub const DEFAULT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[lore_macro::test_pub]
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -147,6 +156,14 @@ impl GlobalConfig {
     /// Whether commands are carried out by the service. Unset is off.
     pub fn use_service_automatically(&self) -> bool {
         self.service.use_automatically.unwrap_or(false)
+    }
+
+    /// How long the service keeps a connection to a remote open once no command
+    /// is using it.
+    pub fn service_idle_connection_timeout(&self) -> Duration {
+        self.service
+            .idle_connection_timeout
+            .map_or(DEFAULT_IDLE_CONNECTION_TIMEOUT, Duration::from_secs)
     }
 }
 
