@@ -121,6 +121,7 @@ If either build or tests fail:
 - Always build before running tests to ensure binaries are up-to-date
 - The smoke tests require both `loreserver` and `lore` binaries from `./target/${BUILD_MODE}/`
 - **The default build mode is `release`**, with or without a filter, as `testing.md` describes. Pass `debug` to override it.
+- Tests marked `swfs` need the EpicVFS driver (Windows only). If the machine lacks the driver, use `-m "smoke and not swfs"` in place of `-m=smoke`.
 - Read relevant code standards from `docs/developing/code-standards/` when fixing issues
 - **Use a 20-minute timeout** for both build and test commands as they can take a while
 - **Do not use `head` or `tail`** to view build or test output. Instead, redirect output to a timestamped temp file (e.g., `cargo build --release -p lore-client -p lore-server --bin lore --bin loreserver 2>&1 | tee /tmp/smoke-build-20260303-1425.log`) and use the Read tool to inspect the results. The timestamp disambiguates concurrent runs.

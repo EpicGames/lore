@@ -23,7 +23,8 @@ def _clone_swfs_instance(
 ) -> tuple[Lore, dict[str, bytes]]:
     """Clone a repository into a SWFS instance mounted by the service.
 
-    Callers are gated on `--swfs`, which promises a Lore built with SWFS support.
+    Callers are marked `swfs`: they need the epicvfs driver, which the harness can't
+    see or start.
     """
     lore_service_runner.start()
 
@@ -258,8 +259,9 @@ class TestInstanceDelete:
         assert os.path.exists(os.path.join(repo.path, "test.txt"))
 
     @pytest.mark.skipif(
-        "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+        sys.platform != "win32", reason="swfs is only available on Windows"
     )
+    @pytest.mark.swfs
     def test_instance_delete_unmounts_and_removes_swfs_instance(
         self, new_lore_repo, lore_service_runner, scratch_dir
     ):
@@ -304,7 +306,9 @@ class TestInstanceMove:
         assert repo.path in listed or repo.path.replace("\\", "/") in listed, (
             f"Instance should still be registered at the source. Output: {listed}"
         )
-        assert str(target) not in listed and str(target).replace("\\", "/") not in listed
+        assert (
+            str(target) not in listed and str(target).replace("\\", "/") not in listed
+        )
 
     def test_instance_move_fails_if_parent_missing(self, new_lore_repo, scratch_dir):
         """Moving to a path with non-existent parent should fail."""
@@ -329,7 +333,9 @@ class TestInstanceMove:
         assert repo.path in listed or repo.path.replace("\\", "/") in listed, (
             f"Instance should still be registered at the source. Output: {listed}"
         )
-        assert str(target) not in listed and str(target).replace("\\", "/") not in listed
+        assert (
+            str(target) not in listed and str(target).replace("\\", "/") not in listed
+        )
 
     def test_instance_move_succeeds_for_regular_instance(
         self, new_lore_repo, scratch_dir
@@ -402,7 +408,9 @@ class TestInstanceMove:
         target = working_directory / "moved_repo"
         assert os.path.isdir(target / ".lore") or os.path.isdir(target / ".urc")
         assert not os.path.exists(original_path)
-        listed = repo.repository_instance_list(path=str(target), cwd=str(working_directory))
+        listed = repo.repository_instance_list(
+            path=str(target), cwd=str(working_directory)
+        )
         assert str(target) in listed or str(target).replace("\\", "/") in listed, (
             f"Instance should be registered at the resolved target. Output: {listed}"
         )
@@ -423,7 +431,9 @@ class TestInstanceMove:
             f"The instance should be at {target}"
         )
         assert not os.path.exists(original_path)
-        listed = repo.repository_instance_list(path=str(target), cwd=str(working_directory))
+        listed = repo.repository_instance_list(
+            path=str(target), cwd=str(working_directory)
+        )
         assert str(target) in listed or str(target).replace("\\", "/") in listed, (
             f"Instance should be registered at the resolved target. Output: {listed}"
         )
@@ -610,8 +620,9 @@ class TestInstanceMove:
         assert not os.path.exists(target)
 
     @pytest.mark.skipif(
-        "not config.getoption('--swfs')", reason="Test requires --swfs flag"
+        sys.platform != "win32", reason="swfs is only available on Windows"
     )
+    @pytest.mark.swfs
     def test_instance_move_remounts_swfs_instance(
         self, new_lore_repo, lore_service_runner, scratch_dir
     ):

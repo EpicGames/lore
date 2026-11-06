@@ -69,6 +69,12 @@ For smoke tests:
 uv run pytest
 ```
 
+The SWFS tests need the EpicVFS driver, which is not publicly available. If you don't have it, skip them:
+
+```sh
+uv run pytest -m "smoke and not swfs"
+```
+
 ## Before you code
 
 For anything beyond a trivial fix, **open a GitHub Issue before writing code:**

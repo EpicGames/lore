@@ -394,6 +394,9 @@ uv run pytest scripts/test/ --lore-client-binary=release --lore-server-binary=re
 # Run only tests marked as smoke
 uv run pytest scripts/test/ -m smoke
 
+# Run smoke tests on a machine without the EpicVFS driver (skips SWFS tests)
+uv run pytest scripts/test/ -m "smoke and not swfs"
+
 # Run tests in parallel (uses pytest-xdist)
 uv run pytest scripts/test/ -n auto
 
@@ -411,13 +414,12 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--disable-local-server` | `false` | Use external server |
 | `--disable-auto-server` | `false` | Don't auto start the server |
 | `--keep-test-data` | `false` | Leave repositories, stores and server roots on disk |
-| `--swfs` | `false` | Run the tests that mount through SWFS |
 
 ### Running the SWFS tests
 
-`test_swfs.py` skips its mounting tests unless `--swfs` says to run them. They
-run on Windows and need two preconditions, the second of which is arranged
-outside the harness and not visible from it:
+The mounting tests in `test_swfs.py` carry the `swfs` marker and run on Windows,
+where they need two preconditions, the second of which is arranged outside the
+harness and not visible from it:
 
 1. The SWFS library, which every x86-64 Windows build links: `swfs_d.lib` for a
    `dev` profile build and `swfs.lib` for any other. It is read from
@@ -430,7 +432,8 @@ outside the harness and not visible from it:
 
 Without the driver a mount does not fail, it hangs: the SWFS library parks the
 service process, so the client relaying to it blocks until the per-test timeout
-kills the worker. That is what `--swfs` defaulting off avoids.
+kills the worker. A machine without the driver should deselect the tests with
+`-m "smoke and not swfs"`.
 
 ### Running every test through one service
 
@@ -497,6 +500,7 @@ is legitimately slower.
 | Marker | Description |
 | --- | --- |
 | `@pytest.mark.smoke` | Smoke tests for basic functionality |
+| `@pytest.mark.swfs` | Tests that need the EpicVFS driver, which is available only on Windows machines where it is installed. Deselect with `-m "smoke and not swfs"` if you don't have the driver. |
 | `@pytest.mark.slow` | Slow running tests |
 | `@pytest.mark.disable_auto_server` | Tests requiring the `--disable-auto-server` flag |
 

@@ -339,8 +339,8 @@ def test_clone_force_dry_run_keeps_the_existing_clone(new_lore_repo, scratch_dir
 
 @pytest.mark.smoke
 def test_clone_dry_run_with_swfs_is_refused(new_lore_repo, scratch_dir):
-    """`repository clone --dry-run --vfs swfs` fails before it mounts anything. Runs without
-    `--swfs`, since the refusal comes before any SWFS call."""
+    """`repository clone --dry-run --vfs swfs` fails before it mounts anything. Not marked
+    `swfs`, since the refusal comes before any SWFS call."""
     repo: Lore = new_lore_repo()
     target = scratch_dir("swfs")
 
