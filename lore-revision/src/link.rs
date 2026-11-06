@@ -1560,30 +1560,58 @@ pub struct LinkPinChange {
     pub tracking_to: bool,
 }
 
-/// Drops stale registry entries whose node is gone from the tree.
-async fn link_pins_by_path(
+/// A link in a revision's registry, with its path and the node it mounts.
+pub struct LinkAtPath {
+    pub path: String,
+    pub reference: LinkReference,
+    pub mount_source: Option<NodeID>,
+}
+
+/// Each link in `state`'s registry. Drops stale registry entries whose node is
+/// gone from the tree.
+pub async fn link_pins_by_path(
     state: &Arc<State>,
     repository: Arc<RepositoryContext>,
-) -> Result<Vec<(String, LinkReference)>, LinkError> {
+) -> Result<Vec<LinkAtPath>, LinkError> {
     let links = state
         .link_list(repository.clone())
         .await
         .forward::<LinkError>("Failed to list links")?;
+    links_at_paths(state, repository, &links).await
+}
 
+/// A function of its own so its loop's locals, which cross two awaits, are not
+/// reserved while [`link_pins_by_path`] reads the registry.
+async fn links_at_paths(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    links: &[LinkReference],
+) -> Result<Vec<LinkAtPath>, LinkError> {
     let mut pins = Vec::with_capacity(links.len());
-    for link_reference in links.iter() {
-        match state
+    for link_reference in links {
+        let path = match state
             .node_path(repository.clone(), link_reference.local_node())
             .await
         {
-            Ok(path) => pins.push((path, *link_reference)),
+            Ok(path) => path,
             Err(err) => {
                 lore_debug!(
                     "Skipping link registry entry for node {} with no resolvable path: {err}",
                     link_reference.local_node(),
                 );
+                continue;
             }
-        }
+        };
+        let mount_source = state
+            .node(repository.clone(), link_reference.local_node())
+            .await
+            .forward::<LinkError>("Failed to read link node")?
+            .mount_source();
+        pins.push(LinkAtPath {
+            path,
+            reference: *link_reference,
+            mount_source,
+        });
     }
     Ok(pins)
 }
@@ -1600,34 +1628,55 @@ pub async fn diff_link_pins(
     state_to: &Arc<State>,
 ) -> Result<Vec<LinkPinChange>, LinkError> {
     let from_pins = link_pins_by_path(state_from, repository.clone()).await?;
-    let to_pins = link_pins_by_path(state_to, repository.clone()).await?;
+    let to_pins = link_pins_by_path(state_to, repository).await?;
+    Ok(link_pin_changes(&from_pins, &to_pins))
+}
 
-    let mut changes = Vec::new();
+/// [`diff_link_pins`] over the pins [`link_pins_by_path`] returned.
+pub fn link_pin_changes(from_pins: &[LinkAtPath], to_pins: &[LinkAtPath]) -> Vec<LinkPinChange> {
+    to_pins
+        .iter()
+        .filter_map(|to| {
+            let from_reference = &from_pins
+                .iter()
+                .find(|from| from.path == to.path)?
+                .reference;
+            let to_reference = &to.reference;
+            (from_reference.signature() != to_reference.signature()
+                || from_reference.branch() != to_reference.branch())
+            .then(|| LinkPinChange {
+                link_path: to.path.clone(),
+                link_repository: to_reference.repository(),
+                revision_from: from_reference.signature(),
+                revision_to: to_reference.signature(),
+                tracking_from: from_reference.is_tracking(),
+                tracking_to: to_reference.is_tracking(),
+            })
+        })
+        .collect()
+}
 
-    for (path, to_reference) in to_pins.iter() {
-        let Some(from_reference) = from_pins
-            .iter()
-            .find(|(from_path, _)| from_path == path)
-            .map(|(_, from_reference)| from_reference)
-        else {
-            continue;
-        };
-        if from_reference.signature() == to_reference.signature()
-            && from_reference.branch() == to_reference.branch()
-        {
-            continue;
-        }
-        changes.push(LinkPinChange {
-            link_path: path.clone(),
-            link_repository: to_reference.repository(),
-            revision_from: from_reference.signature(),
-            revision_to: to_reference.signature(),
-            tracking_from: from_reference.is_tracking(),
-            tracking_to: to_reference.is_tracking(),
-        });
-    }
-
-    Ok(changes)
+/// Repositories of the links that differ between `from_pins` and `to_pins`: a
+/// path with a link on one side only, or with another repository, branch, pin
+/// or mount source.
+pub fn touched_link_repositories<'a>(
+    from_pins: &'a [LinkAtPath],
+    to_pins: &'a [LinkAtPath],
+) -> impl Iterator<Item = RepositoryId> + 'a {
+    let unmatched = |pins: &'a [LinkAtPath], others: &'a [LinkAtPath]| {
+        pins.iter()
+            .filter(move |link| {
+                !others.iter().any(|other| {
+                    other.path == link.path
+                        && other.reference.repository() == link.reference.repository()
+                        && other.reference.branch() == link.reference.branch()
+                        && other.reference.signature() == link.reference.signature()
+                        && other.mount_source == link.mount_source
+                })
+            })
+            .map(|link| link.reference.repository())
+    };
+    unmatched(from_pins, to_pins).chain(unmatched(to_pins, from_pins))
 }
 
 /// Returns true if `staged_node` is a staged link pin or mount change (an update

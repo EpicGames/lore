@@ -92,6 +92,11 @@ message RevisionDiffHeader {
 // server discovers linked repositories during the walk. Each
 // `DiffPartition` is emitted strictly before the first `DiffChange` or
 // `DiffConflict` half that references its index.
+//
+// A link the diff adds, removes, re-pins or remounts on either side
+// announces a `DiffPartition` for its repository whatever the caller's
+// link-read access. A stream with no `DiffPartition` is the same for every
+// caller.
 message RevisionDiffResponse {
   oneof payload {
     // Header echoing the resolved revisions.

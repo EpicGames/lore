@@ -11,6 +11,7 @@ from thin_client import (
     NODE_TYPE_FILE,
     NODE_TYPE_LINK,
     revision_diff,
+    revision_diff_with_partitions,
     revision_tree,
 )
 
@@ -923,3 +924,47 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
             f"Mount path {link_path} mounts {link_repo.get_id()}, so its entries "
             f"must be partitioned there, got {mount_changes}"
         )
+
+
+@pytest.mark.smoke
+def test_thin_client_three_way_diff_partitions_pin_moved_over_unchanged_content(
+    new_lore_repo, lore_grpc_target
+):
+    """A branch that moves a link's pin to a revision with the same mounted
+    content diverges from main in a 3-way diff. The content walk finds nothing
+    under the link, and the stream must still announce the linked repository,
+    as it does to a caller who may not read it."""
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "mounted/stable.txt": "stable mounted content\n",
+            "outside/v1.txt": "outside v1\n",
+        },
+    )
+    pin_v1 = link_repo.branch_info().local_latest
+    link_repo.write_commit_push("v2 changes only outside/", {"outside/v2.txt": "v2\n"})
+    pin_v2 = link_repo.branch_info().local_latest
+
+    repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
+    link_path = "libs/shared"
+    repo.link_add(link_path, link_repo.get_id(), "/mounted", pin=pin_v1)
+    repo.commit("Add link at v1, mounting mounted/")
+    repo.push()
+
+    repo.branch_create("feature")
+    repo.link_update(link_path, pin=pin_v2)
+    repo.commit("Move the pin to v2 (no mounted/ change)")
+    repo.push()
+    repository_id, source = _wire_identity(repo)
+
+    repo.branch_switch("main")
+    repo.write_commit_push("Diverge main", {"README.txt": "main moved on\n"})
+    _, target = _wire_identity(repo)
+
+    _, partitions = revision_diff_with_partitions(
+        lore_grpc_target, repository_id, source, target
+    )
+    assert partitions == [link_repo.get_id()], (
+        f"The moved pin names revisions of {link_repo.get_id()}, so the stream "
+        f"must announce it, got {partitions}"
+    )

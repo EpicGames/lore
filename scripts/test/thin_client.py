@@ -115,6 +115,9 @@ class _PartitionTable:
     def resolve(self, index: int) -> str:
         return self._by_index.get(index, f"unannounced-index-{index}")
 
+    def announced(self) -> list[str]:
+        return [repository for index, repository in self._by_index.items() if index]
+
 
 def _payloads(response: bytes, payload_field: int) -> list[dict]:
     """The parsed sub-messages one response message carries under
@@ -230,6 +233,27 @@ def revision_diff(
     """Every `DiffChange` the server streams between the two revisions, in
     stream order. `authorization` is the bearer token for an auth-enabled
     server."""
+    changes, _ = revision_diff_with_partitions(
+        grpc_target,
+        repository_id,
+        signature_from,
+        signature_to,
+        timeout,
+        authorization,
+    )
+    return changes
+
+
+def revision_diff_with_partitions(
+    grpc_target: str,
+    repository_id: bytes,
+    signature_from: bytes,
+    signature_to: bytes,
+    timeout: float = 30.0,
+    authorization: str | None = None,
+) -> tuple[list[DiffChange], list[str]]:
+    """`revision_diff`, with the hex repository ids the stream announces as
+    partitions, in announcement order."""
     request = encode_bytes_field(
         _DIFF_REQUEST_SIGNATURE_FROM, signature_from
     ) + encode_bytes_field(_DIFF_REQUEST_SIGNATURE_TO, signature_to)
@@ -249,4 +273,4 @@ def revision_diff(
         signature_to.hex(),
         len(changes),
     )
-    return changes
+    return changes, partitions.announced()

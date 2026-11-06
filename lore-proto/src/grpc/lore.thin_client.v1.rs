@@ -84,7 +84,8 @@ impl ::prost::Name for DiffConflict {
 /// the stable index that `DiffChange.link_repository_index` will use to
 /// reference it for the remainder of this stream. Server emits each entry
 /// at most once, in discovery order starting at index 1, strictly before
-/// the first `DiffChange` (or `DiffConflict` half) that references it.
+/// the first `DiffChange` (or `DiffConflict` half) that references it. An
+/// entry for a link the diff touches may have no change referencing it.
 /// Index 0 is reserved for the parent partition and never announced.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DiffPartition {
@@ -672,6 +673,11 @@ impl ::prost::Name for RevisionDiffHeader {
 /// server discovers linked repositories during the walk. Each
 /// `DiffPartition` is emitted strictly before the first `DiffChange` or
 /// `DiffConflict` half that references its index.
+///
+/// A link the diff adds, removes, re-pins or remounts on either side
+/// announces a `DiffPartition` for its repository whatever the caller's
+/// link-read access. A stream with no `DiffPartition` is the same for every
+/// caller.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RevisionDiffResponse {
     #[prost(oneof = "revision_diff_response::Payload", tags = "1, 2, 3, 4")]
