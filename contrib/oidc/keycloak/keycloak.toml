@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+[server.auth]
+jwt_issuer = "http://localhost:8180/realms/lore"
+# Added by the realm's audience mapper. The client sends a token only to a
+# server whose host the token's `aud` names.
+jwt_audience = ["https://localhost"]
+permission_claim = "realm_access.roles"
+
+[server.auth.oidc]
+client_id = "lore-cli"
+scopes = ["openid"]
+
+[immutable_store.local]
+path = "/tmp/lore-oidc-demo/keycloak-server"
+
+[mutable_store.local]
+path = "/tmp/lore-oidc-demo/keycloak-server"
+
+[telemetry.logger]
+format = "text"
