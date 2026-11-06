@@ -60,10 +60,22 @@ async fn provider(
 async fn login(
     provider: &RecordingProvider,
 ) -> Result<AuthenticationToken, lore_transport::ProtocolError> {
+    login_requesting(provider, &[]).await
+}
+
+/// Logs in with the server advertising `client_credentials_scopes`.
+async fn login_requesting(
+    provider: &RecordingProvider,
+    client_credentials_scopes: &[&str],
+) -> Result<AuthenticationToken, lore_transport::ProtocolError> {
     let oidc = Oidc {
         issuer: provider.issuer.clone(),
         client_id: "lore-cli".to_owned(),
         scopes: vec!["openid".to_owned()],
+        client_credentials_scopes: client_credentials_scopes
+            .iter()
+            .map(|scope| scope.to_string())
+            .collect(),
         ..Default::default()
     };
     OidcAuthentication::new(oidc)
@@ -109,6 +121,36 @@ async fn without_listed_methods_the_credentials_go_in_the_basic_header() {
         authn.token,
         access_token(&provider.issuer, SERVICE_ACCOUNT, "CI Bot")
     );
+}
+
+/// The scopes the server advertises for this grant are sent as one `scope`, empty entries
+/// left out, and the login scopes never are.
+#[tokio::test]
+async fn the_advertised_client_credentials_scopes_are_requested() {
+    let provider = provider(None, token_response).await;
+
+    login_requesting(&provider, &["lore", "", "ci"])
+        .await
+        .expect("the login succeeds");
+
+    let requests = provider.requests_to("/token");
+    assert_eq!(requests.len(), 1);
+    let form = requests[0].form();
+    assert_eq!(form.get("scope").map(String::as_str), Some("lore ci"));
+    assert_eq!(form.len(), 2, "{form:?}");
+}
+
+/// Scopes that are all empty request no scope.
+#[tokio::test]
+async fn empty_client_credentials_scopes_request_none() {
+    let provider = provider(None, token_response).await;
+
+    login_requesting(&provider, &[""])
+        .await
+        .expect("the login succeeds");
+
+    let form = provider.requests_to("/token")[0].form();
+    assert!(!form.contains_key("scope"), "{form:?}");
 }
 
 /// A provider listing only `client_secret_post` gets the credentials in the form, and no

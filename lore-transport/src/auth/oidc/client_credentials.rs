@@ -60,9 +60,9 @@ pub fn basic_authorization(client_id: &str, client_secret: &str) -> String {
     format!("Basic {}", STANDARD.encode(credentials))
 }
 
-/// Requests a token for the client `client_id` names. No scope is sent, so the provider
-/// grants the client's default scopes. A refusal of the credentials, `invalid_client`, is
-/// [`NotAuthenticated`].
+/// Requests a token for the client `client_id` names, with `scopes` as the `scope` (RFC 6749
+/// §4.4.2). With no scopes no `scope` is sent, so the provider grants the client's default
+/// scopes. A refusal of the credentials, `invalid_client`, is [`NotAuthenticated`].
 ///
 /// A refresh token in the answer is dropped. Refreshing it needs the client's secret, which
 /// is not stored, and RFC 6749 §4.4.3 has the provider issue none.
@@ -70,8 +70,12 @@ pub async fn login(
     document: &DiscoveryDocument,
     client_id: &str,
     client_secret: &str,
+    scopes: &[String],
 ) -> Result<AuthenticationToken, ProtocolError> {
     let mut form = vec![("grant_type", GRANT_TYPE.to_owned())];
+    if let Some(scope) = token::join_scopes(scopes.iter().map(String::as_str)) {
+        form.push(("scope", scope));
+    }
     let authorization = match auth_method(document)? {
         ClientAuthMethod::Basic => Some(basic_authorization(client_id, client_secret)),
         ClientAuthMethod::Post => {

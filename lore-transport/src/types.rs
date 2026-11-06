@@ -109,7 +109,7 @@ pub struct Oidc {
     pub issuer: String,
     /// The public client ID presented to the provider.
     pub client_id: String,
-    /// Default scopes to request at login. Empty leaves the choice to the client.
+    /// Default scopes to request at an interactive (device) login. Empty leaves the choice to the client.
     pub scopes: Vec<String>,
     /// Whether a client takes the OIDC path by default rather than `auth_url`.
     pub preferred: bool,
@@ -119,6 +119,8 @@ pub struct Oidc {
     pub scope_template: Option<String>,
     /// The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens.
     pub token_exchange_issuer: Option<String>,
+    /// Scopes to request with the client credentials grant. Empty requests none.
+    pub client_credentials_scopes: Vec<String>,
 }
 
 /// A compression mode as it arrives from a server, held as the number it was sent as: the codec

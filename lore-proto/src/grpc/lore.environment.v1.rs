@@ -95,6 +95,12 @@ pub struct Oidc {
     #[deprecated]
     #[prost(string, tag = "8")]
     pub identity_claim: ::prost::alloc::string::String,
+    /// Scopes to request with the client credentials grant. Empty requests none,
+    /// leaving the client's default scopes to the provider.
+    #[prost(string, repeated, tag = "9")]
+    pub client_credentials_scopes: ::prost::alloc::vec::Vec<
+        ::prost::alloc::string::String,
+    >,
 }
 impl ::prost::Name for Oidc {
     const NAME: &'static str = "Oidc";

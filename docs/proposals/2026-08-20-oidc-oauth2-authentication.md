@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-10-30
+updated: 2026-11-06
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -465,7 +465,8 @@ The rest of this proposal calls the first four fields
 | --- | --- | --- |
 | `issuer` | The first `[server.auth] jwt_issuer` entry, once its discovery document names the same issuer | Issuer URL. The client fetches `<issuer>/.well-known/openid-configuration`. |
 | `client_id` | `[server.auth.oidc]` | The public client ID Lorelib presents. |
-| `scopes` | `[server.auth.oidc]` | Default scopes to request. |
+| `scopes` | `[server.auth.oidc]` | Default scopes to request at a user login. |
+| `client_credentials_scopes` | `[server.auth.oidc]` | Scopes to request with the client credentials grant. |
 | `preferred` | `[server.auth.oidc]` | Whether a client that expresses no preference should take the OIDC path. Absent or false keeps it on `auth_url` while both are advertised. |
 | `resource_template` | `[server.auth.oidc]` | How to name a partition as an [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource, for example `https://lore.example.com/partitions/{id}`. The standard form and the default. |
 | `scope_template` | `[server.auth.oidc]` | How to name a partition as a scope value instead, for example `partition:{id}`. For providers that reject `resource` or never see it on the exchange grant. |
@@ -541,7 +542,7 @@ leaves the other path's credentials intact. The setting retires with the gRPC pa
 | `GetAuthSession` polling | [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) token request, `grant_type=urn:ietf:params:oauth:grant-type:device_code`. Honors `interval`, `slow_down`, `expired_token`, `access_denied`. |
 | `ExchangeAPIKeyForUserToken` | [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) token exchange with a Lore-specific `subject_token_type` naming the API key. Keeps the user binding, which `client_credentials` cannot express. See below. |
 | `ExchangeExternalTokenForUserToken(token, token_type)` | [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) token exchange. `token_type` becomes a `subject_token_type` URI. |
-| (new) | `client_credentials` grant, for machine identities registered at the provider. Nothing migrates onto it. It is what a deployment on a stock provider uses for CI. |
+| (new) | `client_credentials` grant, for machine identities registered at the provider. Nothing migrates onto it. It is what a deployment on a stock provider uses for CI. It requests `client_credentials_scopes` rather than `scopes`, which can hold values only a user login may request. |
 | `ExchangeUserTokenForMultiresourceToken(resource_id[])` | [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) token exchange with `resource` ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)) naming the partition, or the verbatim resource for non-partition callers (D2). Sent to whatever `token_exchange_issuer` names. |
 | `RefreshAuthSession` | `refresh_token` grant. Fills in `Authentication::refresh_authentication`, which currently returns `NotSupported`. |
 | `GetUserInfo`, `GetUserId`, `GetProviderUserId` | Moves off the auth path entirely, see D7. `GetProviderUserId` maps an internal ID to the upstream provider's ID. With an external issuer the provider's `sub` *is* the ID, so it has no successor. |

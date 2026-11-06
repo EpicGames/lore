@@ -457,9 +457,13 @@ pub struct AuthSettings {
 pub struct OidcSettings {
     /// The public client ID clients present to the provider.
     pub client_id: String,
-    /// Default scopes clients request at login.
+    /// Default scopes clients request at an interactive (device) login.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Scopes clients request with the client credentials grant, for a provider that adds
+    /// the claims Lore reads only for a requested scope. Empty requests none.
+    #[serde(default)]
+    pub client_credentials_scopes: Vec<String>,
     /// Whether a client should default to OIDC login or use gRPC auth at
     /// at `[environment.endpoint] auth_url`.
     #[serde(default)]

@@ -49,6 +49,7 @@ fn an_advertised_provider_maps_empty_strings_to_none() {
         resource_template: "https://lore.example.com/partitions/{id}".to_string(),
         scope_template: String::new(),
         token_exchange_issuer: "https://auth.example.com".to_string(),
+        client_credentials_scopes: vec!["lore".to_string()],
         ..Default::default()
     }));
     assert_eq!(
@@ -61,6 +62,7 @@ fn an_advertised_provider_maps_empty_strings_to_none() {
             resource_template: Some("https://lore.example.com/partitions/{id}".to_string()),
             scope_template: None,
             token_exchange_issuer: Some("https://auth.example.com".to_string()),
+            client_credentials_scopes: vec!["lore".to_string()],
         })
     );
 }

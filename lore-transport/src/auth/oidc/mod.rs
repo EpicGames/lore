@@ -345,7 +345,13 @@ impl Authentication for OidcAuthentication {
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
         let document = self.discover(auth_url).await?;
-        client_credentials::login(&document, client_id, client_secret).await
+        client_credentials::login(
+            &document,
+            client_id,
+            client_secret,
+            &self.oidc.client_credentials_scopes,
+        )
+        .await
     }
 
     /// Nothing is sent when the provider's endpoints cannot be discovered, so that failure is

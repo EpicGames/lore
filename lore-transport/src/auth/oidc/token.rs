@@ -225,3 +225,14 @@ fn refresh_deadline(expires_in: Option<u64>) -> u64 {
     now.saturating_add(expires_in.saturating_mul(1000))
         .min(i64::MAX as u64)
 }
+
+/// The `scope` parameter (RFC 6749 §3.3) joining the non-empty entries of `scopes`, or `None`
+/// when there are none.
+pub(crate) fn join_scopes<'a>(scopes: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let scope = scopes
+        .into_iter()
+        .filter(|scope| !scope.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!scope.is_empty()).then_some(scope)
+}

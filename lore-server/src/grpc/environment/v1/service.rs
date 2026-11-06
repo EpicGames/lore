@@ -58,6 +58,7 @@ fn oidc_to_proto(oidc: &lore_transport::Oidc) -> Oidc {
         resource_template: oidc.resource_template.clone().unwrap_or_default(),
         scope_template: oidc.scope_template.clone().unwrap_or_default(),
         token_exchange_issuer: oidc.token_exchange_issuer.clone().unwrap_or_default(),
+        client_credentials_scopes: oidc.client_credentials_scopes.clone(),
         // `identity_claim` (8) is deprecated and left empty.
         ..Default::default()
     }

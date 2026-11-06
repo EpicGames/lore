@@ -19,6 +19,8 @@ fn the_provider_is_advertised_only_when_resolved() {
     environment.oidc = Some(lore_transport::Oidc {
         issuer: "https://auth.example.com".to_string(),
         client_id: "lore-cli".to_string(),
+        scopes: vec!["openid".to_string()],
+        client_credentials_scopes: vec!["lore".to_string()],
         ..Default::default()
     });
     assert_eq!(
@@ -26,6 +28,8 @@ fn the_provider_is_advertised_only_when_resolved() {
         Some(Oidc {
             issuer: "https://auth.example.com".to_string(),
             client_id: "lore-cli".to_string(),
+            scopes: vec!["openid".to_string()],
+            client_credentials_scopes: vec!["lore".to_string()],
             ..Default::default()
         })
     );

@@ -71,6 +71,7 @@ async fn the_discovered_issuer_is_advertised_with_the_configured_fields() {
                 preferred = true
                 token_exchange_issuer = "https://sts.example.com"
                 scope_template = "partition:{id}"
+                client_credentials_scopes = ["lore"]
                 "#,
         ),
     );
@@ -90,6 +91,7 @@ async fn the_discovered_issuer_is_advertised_with_the_configured_fields() {
             resource_template: None,
             scope_template: Some("partition:{id}".to_string()),
             token_exchange_issuer: Some("https://sts.example.com".to_string()),
+            client_credentials_scopes: vec!["lore".to_string()],
         }
     );
 }

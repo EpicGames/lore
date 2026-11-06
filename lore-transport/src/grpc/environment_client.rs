@@ -86,6 +86,7 @@ fn oidc_from_proto(oidc: lore_proto::lore::environment::v1::Oidc) -> Option<Oidc
         resource_template: non_empty(oidc.resource_template),
         scope_template: non_empty(oidc.scope_template),
         token_exchange_issuer: non_empty(oidc.token_exchange_issuer),
+        client_credentials_scopes: oidc.client_credentials_scopes,
     })
 }
 

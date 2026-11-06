@@ -40,16 +40,11 @@ struct AuthorizationResponse {
 
 /// The scope a login asks for: the server's default scopes, and [`OFFLINE_ACCESS_SCOPE`].
 pub fn scope(oidc: &Oidc) -> String {
-    let mut scopes: Vec<&str> = oidc
-        .scopes
-        .iter()
-        .map(String::as_str)
-        .filter(|scope| !scope.is_empty())
-        .collect();
+    let mut scopes: Vec<&str> = oidc.scopes.iter().map(String::as_str).collect();
     if !scopes.contains(&OFFLINE_ACCESS_SCOPE) {
         scopes.push(OFFLINE_ACCESS_SCOPE);
     }
-    scopes.join(" ")
+    token::join_scopes(scopes).unwrap_or_default()
 }
 
 /// Opens a login session at the provider's device authorization endpoint. The session's

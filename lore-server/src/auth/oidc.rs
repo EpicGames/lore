@@ -36,5 +36,6 @@ pub async fn advertised_oidc(
         resource_template,
         scope_template,
         token_exchange_issuer,
+        client_credentials_scopes: oidc.client_credentials_scopes.clone(),
     }))
 }

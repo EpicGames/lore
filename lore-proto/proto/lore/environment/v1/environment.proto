@@ -82,6 +82,9 @@ message Oidc {
   // Deprecated and left empty: the user identity is read from the token
   // itself, its `identity` claim or else `sub`. Kept so older peers decode.
   string identity_claim = 8 [deprecated = true];
+  // Scopes to request with the client credentials grant. Empty requests none,
+  // leaving the client's default scopes to the provider.
+  repeated string client_credentials_scopes = 9;
 }
 
 // Composite environment record returned by EnvironmentGet.
