@@ -26,7 +26,7 @@ use lore_base::runtime::LoreTaskLifecycleEvent;
 use lore_base::runtime::LoreTaskSpawn;
 use lore_base::runtime::TaskLifecycleObserver;
 use lore_base::runtime::runtime;
-use lore_base::runtime::runtime_with_settings;
+use lore_base::runtime::serving_runtime;
 use lore_base::runtime::set_task_lifecycle_observer;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_revision::cluster::topology::Topology;
@@ -188,6 +188,14 @@ pub struct Cli {
 /// // Base server with no plugins
 /// lore_server::server::server_main(ServerConfig::default()).unwrap();
 /// ```
+/// The runtime the server runs on, sized for serving as `settings.tokio` configures it (see
+/// [`serving_runtime`]). Runs before anything else in the server builds a runtime, since each is
+/// sized once.
+#[lore_macro::test_pub]
+fn server_runtime(settings: &Settings) -> tokio::runtime::Handle {
+    serving_runtime(settings.tokio.clone())
+}
+
 pub fn server_main(config: ServerConfig) -> Result<()> {
     set_fallback_user_agent_product("lore-server".to_string());
     assume_server_policies();
@@ -198,17 +206,7 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
 
     lore_base::log::set_log_callback(Some(server_log_dispatch));
 
-    // Server default: one net-runtime thread per processor — serving
-    // thousands of concurrent client connections is its normal case. An
-    // explicit `tokio.net_threads` config (seeded first inside
-    // runtime_with_settings) wins over this default.
-    let runtime_handle = match settings.tokio.as_ref() {
-        Some(tokio) => runtime_with_settings(Some(tokio.clone())),
-        None => runtime(),
-    };
-    let _ = lore_base::runtime::set_net_threads_default(
-        std::thread::available_parallelism().map_or(2, |count| count.get()),
-    );
+    let runtime_handle = server_runtime(&settings);
     let result = runtime_handle.block_on({
         let execution = setup_execution(module_path!(), String::default(), String::default());
         #[allow(clippy::large_futures)]

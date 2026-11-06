@@ -585,23 +585,52 @@ static NET_THREADS_DEFAULT: OnceLock<usize> = OnceLock::new();
 #[lore_macro::test_pub]
 const DEFAULT_NET_THREADS: usize = 2;
 
-/// Requests a process-default net-runtime thread count — the server asks for one
-/// per processor, since serving thousands of concurrent client connections is its
-/// normal case. A thread limit still bounds the count granted. Must run before
-/// the net runtime is first used; returns false if a default was already set.
+/// Requests a process-default net-runtime thread count, as [`serving_runtime`] does
+/// for one per processor. A thread limit still bounds the count granted. Must run before
+/// either runtime is built, since both are sized from it; returns false if a
+/// default was already set.
 pub fn set_net_threads_default(count: usize) -> bool {
     NET_THREADS_DEFAULT.set(count.max(1)).is_ok()
 }
 
+/// The storage connections a process sizes its runtimes for — see [`threads_for_connections`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetConnections {
+    /// A process that opens this many storage connections to a remote.
+    Opened(usize),
+    /// A process that serves commands which each open up to this many.
+    Served(usize),
+}
+
+/// The storage connections the process sized its runtimes for — see
+/// [`set_net_connections`]. `None` for a process that set none.
+static NET_CONNECTIONS: OnceLock<Option<NetConnections>> = OnceLock::new();
+
+/// Sizes the core and net runtimes for `connections`, as [`threads_for_connections`] divides
+/// them. An explicit net request (`LORE_NET_THREADS`, the `net_threads` setting or
+/// [`set_net_threads_default`]) takes precedence, and a thread limit bounds the total. A process
+/// that sets none keeps one core thread per processor and [`DEFAULT_NET_THREADS`]. Returns false,
+/// and changes nothing, once a runtime is built or the connections are set, so both runtimes are
+/// sized for the same ones.
+pub fn set_net_connections(connections: NetConnections) -> bool {
+    NET_CONNECTIONS.set(Some(connections)).is_ok()
+}
+
+/// Settles the connections the runtimes are sized for, as none when none were set.
+fn settle_net_connections() {
+    NET_CONNECTIONS.get_or_init(|| None);
+}
+
 /// An explicit net-thread request: `LORE_NET_THREADS` if set, else the
 /// process-configured default (e.g. the server's one-per-processor). `None`
-/// leaves the net pool at [`DEFAULT_NET_THREADS`].
+/// leaves the net pool at [`DEFAULT_NET_THREADS`], or sized for the process's
+/// storage connections.
 fn requested_net_threads() -> Option<usize> {
     env_thread_override("LORE_NET_THREADS").or_else(|| NET_THREADS_DEFAULT.get().copied())
 }
 
 /// Net runtime worker threads: the net share of the thread budget, which an
-/// explicit request raises (see [`thread_counts`]).
+/// explicit request or the storage connections raise (see [`thread_counts`]).
 pub fn default_net_threads() -> usize {
     budget_thread_counts().net
 }
@@ -627,10 +656,13 @@ pub fn net_runtime() -> Handle {
 }
 
 fn build_net_runtime() -> tokio::runtime::Runtime {
+    settle_net_connections();
+    let threads = default_net_threads();
+    crate::lore_debug!("Net runtime: {threads} workers");
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
-        .worker_threads(default_net_threads())
+        .worker_threads(threads)
         .max_blocking_threads(NET_BLOCKING_THREADS)
         .thread_keep_alive(Duration::from_secs(default_thread_keep_alive()))
         .thread_name_fn(|| {
@@ -714,8 +746,9 @@ pub struct ThreadCounts {
     /// runtime's pool plus the net runtime's [`NET_BLOCKING_THREADS`].
     pub blocking: usize,
     /// Net runtime worker threads. [`set_net_threads_default`] and
-    /// `LORE_NET_THREADS` raise this pool's ideal — the server asks for one per
-    /// processor — but a thread limit still bounds what it is granted.
+    /// `LORE_NET_THREADS` set this pool's ideal — the server asks for one per
+    /// processor — and [`set_net_connections`] raises it, but a thread limit
+    /// bounds what it is granted.
     pub net: usize,
     /// The lore-io syscall pool, which every file operation dispatches through.
     /// `LORE_IO_POOL_THREADS` raises its ideal.
@@ -848,28 +881,73 @@ fn apply_thread_limit(requested: ThreadCounts) -> ThreadCounts {
     }
 }
 
-/// Per-pool sizes before any limit: the core-count defaults with an explicit net
-/// request substituted.
-fn requested_thread_counts() -> ThreadCounts {
-    let mut counts = default_thread_counts(processor_count(), lore_io::requested_max_threads());
-    if let Some(net) = requested_net_threads() {
-        counts.net = net;
+/// The core and net pools for a process sized for `connections`, from the `defaults` for its
+/// processor count.
+///
+/// The core runtime runs one thread fewer than `defaults`, which leaves a processor for the net
+/// runtime, and never fewer than [`MIN_THREADS_PER_POOL`]. The net runtime takes one thread for
+/// each connection, since each connection's QUIC endpoint receives and decrypts on a task of its
+/// own, and never fewer than its default. It takes at most half of the core and net threads
+/// together, rounded down. A process that opens the connections takes these threads from the core
+/// runtime, so it runs as many CPU-bound threads as with one connection: 10 connections on 8
+/// processors run 5 core and 4 net threads. A process that serves them adds them to the core
+/// runtime, since the commands it serves may open fewer: 7 core and 4 net threads.
+#[lore_macro::test_pub]
+fn threads_for_connections(defaults: ThreadCounts, connections: NetConnections) -> ThreadCounts {
+    let worker = defaults.worker.saturating_sub(1).max(MIN_THREADS_PER_POOL);
+    let shared = worker + defaults.net;
+    let (NetConnections::Opened(count) | NetConnections::Served(count)) = connections;
+    let net = count.clamp(defaults.net, (shared / 2).max(defaults.net));
+    ThreadCounts {
+        worker: match connections {
+            NetConnections::Opened(_) => shared - net,
+            NetConnections::Served(_) => worker,
+        },
+        net,
+        ..defaults
     }
-    counts
 }
 
-/// Per-pool counts from the core count, an explicit net request, and the limit.
+/// Per-pool sizes before any limit: `defaults`, with an explicit `net_request`
+/// substituted, or else sized for the process's storage `connections` where it set any.
+#[lore_macro::test_pub]
+fn requested_counts(
+    defaults: ThreadCounts,
+    net_request: Option<usize>,
+    connections: Option<NetConnections>,
+) -> ThreadCounts {
+    match (net_request, connections) {
+        (Some(net), _) => ThreadCounts { net, ..defaults },
+        (None, Some(connections)) => threads_for_connections(defaults, connections),
+        (None, None) => defaults,
+    }
+}
+
+/// Per-pool sizes before any limit, for this process (see [`requested_counts`]).
+fn requested_thread_counts() -> ThreadCounts {
+    requested_counts(
+        default_thread_counts(processor_count(), lore_io::requested_max_threads()),
+        requested_net_threads(),
+        NET_CONNECTIONS.get().copied().flatten(),
+    )
+}
+
+/// Per-pool counts from the core count, an explicit net request or the storage
+/// connections, and the limit.
 fn budget_thread_counts() -> ThreadCounts {
     apply_thread_limit(requested_thread_counts())
 }
 
 /// Per-pool thread counts Lore sizes its runtime for.
 ///
-/// `LORE_NET_THREADS` and [`set_net_threads_default`] raise the net pool's ideal,
-/// and `LORE_IO_POOL_THREADS` the syscall pool's; worker follows the core count
-/// and blocking is a small fixed count. Whatever the ideals, a thread limit is a
-/// ceiling on their total rather than a starting point to negotiate from: the
-/// pools are scaled to fit it, down to [`MIN_THREADS_PER_POOL`] each.
+/// `LORE_NET_THREADS` and [`set_net_threads_default`] set the net pool's ideal,
+/// with worker at the core count; otherwise the connections [`set_net_connections`]
+/// sets size both, as [`threads_for_connections`] divides them, and a process that
+/// sets none keeps the defaults. `LORE_IO_POOL_THREADS` raises the
+/// syscall pool's ideal, and blocking is a small fixed count. Whatever the ideals,
+/// a thread limit is a ceiling on their total rather than a starting point to
+/// negotiate from: the pools are scaled to fit it, down to [`MIN_THREADS_PER_POOL`]
+/// each.
 pub fn thread_counts() -> ThreadCounts {
     budget_thread_counts()
 }
@@ -909,8 +987,9 @@ pub struct TokioSettings {
     #[serde(default = "default_thread_keep_alive")]
     pub thread_keep_alive_seconds: u64,
     pub worker_threads: Option<usize>,
-    /// Net runtime worker threads; `None` keeps the process default (2 on
-    /// clients, one per processor where the server sets it).
+    /// Net runtime worker threads; `None` keeps the process default: 2, or one per
+    /// storage connection [`set_net_connections`] sets, up to half the core and net
+    /// threads together, or one per processor in a [`serving_runtime`].
     #[serde(default)]
     pub net_threads: Option<usize>,
 }
@@ -944,6 +1023,22 @@ impl TokioSettings {
             net_threads: None,
         }
     }
+}
+
+/// Returns a handle to the core runtime of a process that serves, building it with `settings`
+/// if none exists: one core thread and one net thread per processor, since serving thousands of
+/// concurrent client connections is its normal case. `settings.net_threads` and
+/// `LORE_NET_THREADS` set the net threads instead, and a thread limit bounds the total. The net
+/// threads are set before the runtime is built, since both runtimes are sized from them once.
+pub fn serving_runtime(settings: Option<TokioSettings>) -> Handle {
+    let _ = set_net_threads_default(
+        settings
+            .as_ref()
+            .and_then(|settings| settings.net_threads)
+            .filter(|&count| count > 0)
+            .unwrap_or_else(processor_count),
+    );
+    runtime_with_settings(settings)
 }
 
 /// Returns a handle to the shared tokio runtime, creating it lazily with default settings.
@@ -1006,7 +1101,14 @@ fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtim
     if let Some(net_threads) = settings.net_threads.filter(|&count| count > 0) {
         let _ = NET_THREADS_DEFAULT.set(net_threads);
     }
+    settle_net_connections();
     let counts = core_thread_counts(&settings);
+    crate::lore_debug!(
+        "Core runtime: {} workers, {} blocking; syscall pool: {}",
+        counts.worker,
+        core_blocking_threads(counts),
+        counts.io
+    );
     // The syscall pool builds itself on the first file operation, which in every Lore process
     // happens on this runtime and so after this point.
     lore_io::set_max_threads(counts.io);

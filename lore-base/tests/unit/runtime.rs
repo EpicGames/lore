@@ -273,6 +273,118 @@ fn a_net_request_is_scaled_by_the_limit() {
     );
 }
 
+/// Sizing for storage connections gives the core runtime one thread fewer than the
+/// processor count, down to the floor, and the net runtime a thread for each
+/// connection, from its default up to half of the two together. A process that
+/// opens the connections takes those threads from the core runtime, so it runs as
+/// many CPU-bound threads as with one connection; one that serves them adds them.
+#[test]
+fn connections_divide_the_shared_threads_at_every_core_count() {
+    for cores in 1..=256 {
+        let defaults = default_thread_counts(cores, IO_REQUEST);
+        let one = threads_for_connections(defaults, NetConnections::Opened(1));
+        assert_eq!(
+            (one.worker, one.net),
+            ((cores - 1).max(MIN_THREADS_PER_POOL), DEFAULT_NET_THREADS),
+            "one connection on {cores} cores"
+        );
+        for connections in 1..=10 {
+            let opened = threads_for_connections(defaults, NetConnections::Opened(connections));
+            let served = threads_for_connections(defaults, NetConnections::Served(connections));
+            let case =
+                format!("{connections} connections on {cores} cores gave {opened:?}, {served:?}");
+            assert_eq!(opened.worker + opened.net, one.worker + one.net, "{case}");
+            assert!(opened.net >= DEFAULT_NET_THREADS, "{case}");
+            assert!(opened.net <= connections.max(DEFAULT_NET_THREADS), "{case}");
+            assert!(opened.worker >= opened.net, "{case}");
+            assert_eq!(
+                (served.worker, served.net),
+                (one.worker, opened.net),
+                "{case}"
+            );
+            for counts in [opened, served] {
+                assert_eq!(
+                    (counts.blocking, counts.io),
+                    (defaults.blocking, defaults.io),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// (core, net) threads from small to large hosts, for 1, 4 and 10 opened
+/// connections and for the service's 10 served ones: few cores keep the floor, and
+/// a host with enough cores gives each connection a thread at little cost to the
+/// core runtime.
+#[test]
+fn connections_on_small_and_large_hosts() {
+    use NetConnections::Opened;
+    use NetConnections::Served;
+    let sized = |cores, connections| {
+        let counts = threads_for_connections(default_thread_counts(cores, IO_REQUEST), connections);
+        (counts.worker, counts.net)
+    };
+    for (cores, expected) in [
+        (1, [(2, 2), (2, 2), (2, 2), (2, 2)]),
+        (2, [(2, 2), (2, 2), (2, 2), (2, 2)]),
+        (4, [(3, 2), (3, 2), (3, 2), (3, 2)]),
+        (8, [(7, 2), (5, 4), (5, 4), (7, 4)]),
+        (16, [(15, 2), (13, 4), (9, 8), (15, 8)]),
+        (32, [(31, 2), (29, 4), (23, 10), (31, 10)]),
+        (128, [(127, 2), (125, 4), (119, 10), (127, 10)]),
+    ] {
+        assert_eq!(
+            [Opened(1), Opened(4), Opened(10), Served(10)]
+                .map(|connections| sized(cores, connections)),
+            expected,
+            "{cores} cores"
+        );
+    }
+}
+
+/// An explicit net request, as a serving process's one per processor or
+/// `LORE_NET_THREADS` makes, takes precedence over the connections and leaves the
+/// core runtime at one thread per processor. Without one the pools are sized for
+/// the connections, and a process that set none keeps the defaults.
+#[test]
+fn an_explicit_net_request_takes_precedence_over_the_connections() {
+    let defaults = default_thread_counts(16, IO_REQUEST);
+    assert_eq!(requested_counts(defaults, None, None), defaults);
+    assert_eq!(
+        requested_counts(defaults, Some(16), None),
+        ThreadCounts {
+            net: 16,
+            ..defaults
+        }
+    );
+    for connections in [
+        NetConnections::Opened(1),
+        NetConnections::Opened(10),
+        NetConnections::Served(10),
+    ] {
+        assert_eq!(
+            requested_counts(defaults, None, Some(connections)),
+            threads_for_connections(defaults, connections)
+        );
+        assert_eq!(
+            requested_counts(defaults, Some(16), Some(connections)),
+            ThreadCounts {
+                net: 16,
+                ..defaults
+            }
+        );
+    }
+}
+
+/// Building a runtime settles the connections, so both runtimes are sized for the
+/// same ones: connections set afterwards are refused.
+#[test]
+fn connections_are_refused_once_a_runtime_exists() {
+    let _ = net_runtime();
+    assert!(!set_net_connections(NetConnections::Opened(4)));
+}
+
 /// The limit is a ceiling on the total whatever the per-pool requests are, so
 /// no knob can raise the process above what an embedder asked for. The
 /// per-pool floor is a property of scaling down rather than of every result:

@@ -42,4 +42,8 @@ fn sizing_for_relaying_builds_the_runtime_with_the_fewest_workers() {
         expected,
         "the runtime must be built with the relaying worker count"
     );
+    assert!(
+        !lore::size_threads_for_connections(10),
+        "a process that relays keeps the runtime it built for relaying"
+    );
 }

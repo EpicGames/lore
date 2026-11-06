@@ -42,6 +42,12 @@ use crate::types::*;
 pub static MAX_STORAGE_CONNECTIONS: usize = 10;
 pub static DEFAULT_PROTOCOL: &str = "lores";
 
+/// The storage connections a command opens to a remote when it asks for `requested`: 0 for the
+/// default of one, and at most [`MAX_STORAGE_CONNECTIONS`].
+pub fn storage_connection_count(requested: usize) -> usize {
+    requested.clamp(1, MAX_STORAGE_CONNECTIONS)
+}
+
 /// Start delay in reconnect loop, in milliseconds
 pub static RECONNECT_START_DELAY: u64 = 1_000;
 /// Maximum wait time between reconnect attempts, in milliseconds
@@ -559,7 +565,7 @@ async fn connect_impl(
 
             // Storage connections are always created -- they're repository-agnostic.
             // Per-repository auth is handled by session_start().
-            let max_connections = max_connections.clamp(1, MAX_STORAGE_CONNECTIONS);
+            let max_connections = storage_connection_count(max_connections);
             lore_trace!(
                 "Connecting storage service to {storage_url} using {max_connections} connections"
             );

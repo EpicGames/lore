@@ -701,7 +701,7 @@ async fn connect_cost(counts: &str) {
             let elapsed = started.elapsed();
             println!(
                 "round {round}: {} connections usable in {} ms",
-                count.clamp(1, lore_transport::MAX_STORAGE_CONNECTIONS),
+                lore_transport::connection::storage_connection_count(count),
                 elapsed.as_millis()
             );
             drop(pool);
