@@ -12,6 +12,16 @@ mod provider;
 
 use lore_transport::auth::oidc::*;
 
+/// The port stays reserved while the value lives, so a listener another test binds to port 0
+/// cannot be handed it, and a connection to it is refused.
+#[test]
+fn a_closed_port_is_reserved_and_refuses_connections() {
+    let closed = provider::closed_port();
+
+    assert!(std::net::TcpListener::bind(("127.0.0.1", closed.port)).is_err());
+    assert!(std::net::TcpStream::connect(("127.0.0.1", closed.port)).is_err());
+}
+
 /// A body longer than the log excerpt is cut, and says so.
 #[test]
 fn a_long_body_is_excerpted_for_the_log() {

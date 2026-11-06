@@ -200,17 +200,12 @@ async fn an_endpoint_naming_another_issuer_is_refused() {
     assert!(provider.requests_to("/token").is_empty());
 }
 
-/// A port nothing listens on, for an endpoint that refuses the connection.
-fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
-    listener.local_addr().expect("the bound address").port()
-}
-
 /// A token endpoint that refuses the connection received nothing, so the failure is
 /// `Disconnected` and the refresh token unspent.
 #[tokio::test]
 async fn a_grant_that_cannot_connect_is_disconnected() {
-    let token_endpoint_base = format!("http://127.0.0.1:{}", closed_port());
+    let closed = closed_port();
+    let token_endpoint_base = closed.url.clone();
     let provider =
         spawn_recording_provider(move |issuer, _, _| json(&document(issuer, &token_endpoint_base)))
             .await;

@@ -463,12 +463,14 @@ async fn an_answer_in_no_known_shape_fails_the_poll() {
 /// gRPC auth service is.
 #[tokio::test]
 async fn an_unreachable_endpoint_is_a_disconnection() {
-    let provider = spawn_recording_provider(|issuer, _, _| {
+    let closed = closed_port();
+    let unreachable = closed.url.clone();
+    let provider = spawn_recording_provider(move |issuer, _, _| {
         json(&serde_json::json!({
             "issuer": issuer,
-            "token_endpoint": "http://127.0.0.1:9/token",
+            "token_endpoint": format!("{unreachable}/token"),
             "jwks_uri": format!("{issuer}/jwks"),
-            "device_authorization_endpoint": "http://127.0.0.1:9/device",
+            "device_authorization_endpoint": format!("{unreachable}/device"),
         }))
     })
     .await;
@@ -477,7 +479,7 @@ async fn an_unreachable_endpoint_is_a_disconnection() {
     let failed = auth
         .start_auth_session(&endpoint, "client-state", "corr")
         .await
-        .expect_err("nothing listens on the discard port");
+        .expect_err("nothing listens");
 
     assert!(failed.is_disconnected(), "{failed}");
 }

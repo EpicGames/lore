@@ -81,9 +81,11 @@ async fn a_document_naming_another_issuer_is_refused() {
 /// A trailing slash is part of the issuer, so a document that drops it names a different one.
 #[tokio::test]
 async fn the_issuer_must_match_exactly() {
-    let provider = spawn_provider(conforming).await;
+    // A bare origin, since a parsed URL treats `http://host:port` and `http://host:port/` as
+    // equal, and only a string comparison tells them apart.
+    let provider = spawn_provider(|issuer, _| json(&document(&origin(issuer), issuer))).await;
 
-    let result = discover(&format!("{}/", provider.issuer)).await;
+    let result = discover(&format!("{}/", origin(&provider.issuer))).await;
 
     assert!(
         matches!(result, Err(DiscoveryError::IssuerMismatch { .. })),
@@ -130,7 +132,7 @@ async fn a_cross_origin_redirect_reports_only_the_target_origin() {
     let Err(DiscoveryError::CrossOriginRedirect { target_origin, .. }) = result else {
         panic!("{result:?}");
     };
-    assert_eq!(target_origin, elsewhere.issuer);
+    assert_eq!(target_origin, origin(&elsewhere.issuer));
 }
 
 #[tokio::test]

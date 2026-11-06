@@ -125,14 +125,10 @@ async fn an_unavailable_provider_fails_the_revocation() {
     assert!(failed.to_string().contains("503"), "{failed}");
 }
 
-fn closed_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a port");
-    listener.local_addr().expect("the bound address").port()
-}
-
 #[tokio::test]
 async fn an_unreachable_revocation_endpoint_is_disconnected() {
-    let endpoint_base = format!("http://127.0.0.1:{}", closed_port());
+    let closed = closed_port();
+    let endpoint_base = closed.url.clone();
     let provider =
         spawn_recording_provider(move |issuer, _, _| json(&document(issuer, &endpoint_base))).await;
 
