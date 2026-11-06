@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+issuer: http://localhost:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+oauth2:
+  grantTypes:
+    - authorization_code
+    - refresh_token
+    - urn:ietf:params:oauth:grant-type:device_code
+    # Only a confidential client can use it, and the CI client is the only one.
+    - client_credentials
+
+enablePasswordDB: true
+
+staticClients:
+  - id: lore-cli
+    name: Lore CLI
+    public: true
+    # The device grant finishes through Dex's own callback, which has to be
+    # registered on the client.
+    redirectURIs: ["/dex/device/callback"]
+  # Dex puts only client IDs in `aud`. Requesting the cross-client scope
+  # `audience:server:client_id:https://localhost`, which dex.toml advertises,
+  # adds this client's ID to `aud`. It's public, so it has no secret and can't
+  # get tokens of its own.
+  - id: https://localhost
+    name: Lore Server
+    public: true
+    trustedPeers: ["lore-cli"]
+  # Tier 2 only: the CI client. A client credentials token's `aud` is the client
+  # ID alone, and the Lore client sends a token only to a host its `aud` names, so
+  # the ID is a URL on that host. Dex names the client in `sub` as
+  # ChRodHRwczovL2xvY2FsaG9zdC9jaQ, the key grants.json uses.
+  - id: https://localhost/ci
+    name: Lore CI
+    secret: lore-ci-secret
+
+# Each password is the user name.
+staticPasswords:
+  - email: alice@example.com
+    username: alice
+    userID: alice
+    hash: "$2b$10$CX6f0n75MhP9rx13nZoOp.fI.omRDo3tzqDUjAYmZC0Z7SE9FATvO"
+    groups: ["admin"]
+  - email: bob@example.com
+    username: bob
+    userID: bob
+    hash: "$2b$10$ttCXomjc0UD.L0jxcWwOceA1jHNTKzy1B6isSULVM0Njq3Gc6CJwe"
+    groups: ["obliterate"]

@@ -1,0 +1,23 @@
+{
+  "CgVhbGljZRIFbG9jYWw": {
+    "*": [
+      "write",
+      "admin"
+    ]
+  },
+  "CgNib2ISBWxvY2Fs": {
+    "11111111111111111111111111111111": [
+      "write",
+      "obliterate"
+    ],
+    "22222222222222222222222222222222": [
+      "read"
+    ]
+  },
+  "ChRodHRwczovL2xvY2FsaG9zdC9jaQ": {
+    "11111111111111111111111111111111": [
+      "write",
+      "push-protected"
+    ]
+  }
+}

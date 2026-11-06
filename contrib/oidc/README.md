@@ -8,6 +8,7 @@ to the provider.
 | Directory | Provider |
 | --- | --- |
 | [`keycloak/`](keycloak/README.md) | [Keycloak](https://www.keycloak.org) |
+| [`dex/`](dex/README.md) | [Dex](https://dexidp.io) |
 
 Each provider runs as Tier 1, where the server reads each caller's actions from a claim in the
 login token and applies them to every repository, and as Tier 2, where the client exchanges its
@@ -33,7 +34,7 @@ Every provider has the same users:
 | --- | --- | --- |
 | `alice@example.com` | `alice` | `admin` |
 | `bob@example.com` | `bob` | `obliterate` |
-| CI client | secret `lore-ci-secret` | `push-protected` |
+| CI client | secret `lore-ci-secret` | `push-protected`, on Dex in Tier 2 only |
 
 In Tier 1, every token holder gets `read`, and `write` through the server's default
 `implicit_actions`. The provider's roles or groups add the rest:
@@ -133,7 +134,9 @@ The server refuses both. `lore branch unprotect` needs `admin`, unless you creat
 
 ### As the CI client
 
-The CI client logs in with the client credentials grant, with no browser:
+The CI client logs in with the client credentials grant, with no browser. On Keycloak its client
+ID is `lore-ci`. Dex can't give a client a role, so its CI client works in
+[Tier 2](#tier-2) only, under the client ID its [README](dex/README.md#the-ci-client) names.
 
 ```bash
 export LORE_AUTH_PATH=/tmp/lore-oidc-demo/ci
@@ -176,7 +179,8 @@ it asks the server, so don't try this on content you want to keep.
 The server takes the caller's identity from the token's `identity` claim, and from `sub` when the
 token has none. The client records the same value as the creator and committer of each revision.
 Keycloak adds an `identity` claim with the user name, which users can't change there. The
-revisions above then name `alice`, and the CI client's user, `service-account-lore-ci`. The grants of [Tier 2](#tier-2) name users by the same
+revisions above then name `alice`, and the CI client's user, `service-account-lore-ci`. Dex can't add the claim, so revisions there
+name its `sub`, which is stable too. The grants of [Tier 2](#tier-2) name users by the same
 identity.
 
 ## Tier 2
@@ -263,7 +267,8 @@ in `game`, and can't reach `tools`: `lore clone lore://localhost:41337/tools` fa
 
 The service reads `grants.json` on every exchange, but the client keeps an exchanged token until it
 expires, within five minutes, and exchanges again only then. A grant you add or remove therefore
-applies to a user within five minutes. Give bob `write` on `tools` under his identity, `bob`, and his push there succeeds once his current token for `tools` has expired:
+applies to a user within five minutes. Give bob `write` on `tools` under his identity, `bob`, or his
+`sub` on Dex, and his push there succeeds once his current token for `tools` has expired:
 
 ```json
 "22222222222222222222222222222222": ["write"]

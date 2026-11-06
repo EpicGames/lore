@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+name: lore-oidc-dex
+
+services:
+  dex:
+    # v2.46.0 is the first release that reads `groups` on static passwords.
+    image: ghcr.io/dexidp/dex:v2.46.1
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    ports:
+      - "127.0.0.1:5556:5556"
+    volumes:
+      - ./config.yaml:/etc/dex/config.yaml:ro
+
+  # The token exchange service dex-tier2.toml names. `docker compose --profile tier2 up -d`
+  # starts it.
+  exchange:
+    image: node:22-alpine
+    profiles: [tier2]
+    user: node
+    command: ["node", "/srv/exchange/server.js"]
+    environment:
+      # Inside the container; compose publishes the port on 127.0.0.1.
+      HOST: 0.0.0.0
+      LOGIN_ISSUERS: http://localhost:5556/dex
+      PROVIDER_URL: http://dex:5556
+      LOGIN_AUDIENCES: https://localhost,https://localhost/ci
+      GRANTS_FILE: /srv/grants.json
+    ports:
+      - "127.0.0.1:8190:8190"
+    volumes:
+      - ../exchange:/srv/exchange:ro
+      - ./grants.json:/srv/grants.json:ro

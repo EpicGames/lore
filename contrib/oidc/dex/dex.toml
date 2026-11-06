@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+[server.auth]
+jwt_issuer = "http://localhost:5556/dex"
+jwt_audience = ["https://localhost"]
+permission_claim = "groups"
+
+[server.auth.oidc]
+client_id = "lore-cli"
+# Dex adds `name` and `groups` to the token only when the client requests the
+# `profile` and `groups` scopes, and `https://localhost` to `aud` only through
+# the cross-client scope. See config.yaml.
+scopes = ["openid", "profile", "groups", "audience:server:client_id:https://localhost"]
+
+[immutable_store.local]
+path = "/tmp/lore-oidc-demo/dex-server"
+
+[mutable_store.local]
+path = "/tmp/lore-oidc-demo/dex-server"
+
+[telemetry.logger]
+format = "text"
