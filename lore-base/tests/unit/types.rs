@@ -767,3 +767,38 @@ mod validate_response {
         assert!(validate_fragment_response(&fragment).is_err());
     }
 }
+
+mod pass_through_hasher {
+    use std::hash::BuildHasher;
+    use std::hash::BuildHasherDefault;
+
+    use super::*;
+
+    /// A `Hash` writes its bytes last, so a set of hashes buckets on their leading eight bytes. A
+    /// write after them would replace them as the hash.
+    #[test]
+    fn a_hash_hashes_to_its_leading_eight_bytes() {
+        let hash = Hash::from(std::array::from_fn::<u8, 32, _>(|index| index as u8 + 1));
+        let leading: [u8; 8] = hash.as_bytes()[..8].try_into().unwrap();
+        assert_eq!(
+            BuildHasherDefault::<PassThroughHasher>::default().hash_one(hash),
+            u64::from_ne_bytes(leading)
+        );
+    }
+
+    #[test]
+    fn a_u64_key_hashes_to_itself() {
+        let key = 0x0123_4567_89ab_cdef_u64;
+        assert_eq!(
+            BuildHasherDefault::<PassThroughHasher>::default().hash_one(key),
+            key
+        );
+    }
+
+    /// A write shorter than eight bytes, such as a flag's, would make a key hash to few values.
+    #[test]
+    #[should_panic(expected = "writes at least eight")]
+    fn a_short_write_is_refused() {
+        BuildHasherDefault::<PassThroughHasher>::default().hash_one((Hash::default(), true));
+    }
+}

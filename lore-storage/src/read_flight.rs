@@ -13,6 +13,7 @@ use crate::read::Loaded;
 use crate::types::Address;
 use crate::types::Hash;
 use crate::types::Partition;
+use crate::types::PassThroughHasher;
 use crate::write::StoreInFlightKey;
 
 /// Outcome the read single-flight leader publishes to its followers: `None`
@@ -41,6 +42,9 @@ struct ReadFlightKey {
     trusted: bool,
 }
 
+/// Writes one word, which [`PassThroughHasher`] takes as the hash: the first eight bytes of the
+/// content hash, which is uniform already, folded with the partition's where the key carries one
+/// and with its trust.
 impl std::hash::Hash for ReadFlightKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         let partition = self
@@ -54,26 +58,6 @@ fn leading_word(bytes: &[u8]) -> u64 {
     let mut word = [0; 8];
     word.copy_from_slice(&bytes[..8]);
     u64::from_le_bytes(word)
-}
-
-/// Hashes a [`ReadFlightKey`] to the first eight bytes of its content hash, folded with the
-/// partition's where the key carries one and with its trust: the content hash is uniform already.
-/// The key writes that word alone, so nothing writes bytes.
-#[derive(Default)]
-struct PassThroughHasher(u64);
-
-impl Hasher for PassThroughHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, _bytes: &[u8]) {
-        unreachable!("ReadFlightKey hashes itself with write_u64");
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 ^= value;
-    }
 }
 
 /// A read in flight: the leader's partition and address, and the channel its outcome goes out on,

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::borrow::Cow;
+use std::hash::BuildHasherDefault;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -8,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use dashmap::DashMap;
+use lore_base::types::PassThroughHasher;
 use lore_error_set::prelude::*;
 use serde::Serialize;
 use smallvec::SmallVec;
@@ -761,38 +763,6 @@ impl RuleNode {
 #[lore_macro::test_pub]
 const SCANNED_CHILDREN: usize = 16;
 
-/// Passes a `u64` key straight through.
-///
-/// The key is already an xxh3 digest of a path, so hashing it again would be a
-/// second pass over the only thing the map looks at.
-#[derive(Clone, Copy, Default)]
-struct DigestHasher(u64);
-
-impl std::hash::Hasher for DigestHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, _: &[u8]) {
-        debug_assert!(false, "the ancestor memo is keyed by u64 alone");
-    }
-
-    fn write_u64(&mut self, value: u64) {
-        self.0 = value;
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct DigestHashBuilder;
-
-impl std::hash::BuildHasher for DigestHashBuilder {
-    type Hasher = DigestHasher;
-
-    fn build_hasher(&self) -> DigestHasher {
-        DigestHasher(0)
-    }
-}
-
 /// A folded ancestor chain: where the fold got to, and how deep it went.
 #[derive(Clone, Copy, Debug)]
 struct Ancestor {
@@ -824,7 +794,7 @@ struct Ancestor {
 /// overlap; a query only ever loads, and stores when it finds a mismatch.
 #[derive(Clone, Debug, Default)]
 struct AncestorMemo {
-    entries: Arc<DashMap<u64, Ancestor, DigestHashBuilder>>,
+    entries: Arc<DashMap<u64, Ancestor, BuildHasherDefault<PassThroughHasher>>>,
     lines: Arc<AtomicU64>,
 }
 

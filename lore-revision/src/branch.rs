@@ -9,6 +9,8 @@ pub mod push;
 pub mod reset;
 
 use std::cmp::PartialEq;
+use std::collections::HashSet;
+use std::hash::BuildHasherDefault;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str;
@@ -22,6 +24,7 @@ use futures::StreamExt;
 use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_base::types::BranchPoint;
+use lore_base::types::PassThroughHasher;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::MatchedProtocolError;
@@ -3515,14 +3518,10 @@ async fn find_common_revision_in_history_lines(
     // Spelled out rather than aliased: a type alias naming a `HashSet` with a
     // hasher is an item cbindgen parses, and it cannot represent a second type
     // parameter on it.
-    let mut self_lookup: std::collections::HashSet<
-        Hash,
-        std::hash::BuildHasherDefault<RevisionHasher>,
-    > = self_line.iter().copied().collect();
-    let mut other_lookup: std::collections::HashSet<
-        Hash,
-        std::hash::BuildHasherDefault<RevisionHasher>,
-    > = other_line.iter().copied().collect();
+    let mut self_lookup: HashSet<Hash, BuildHasherDefault<PassThroughHasher>> =
+        self_line.iter().copied().collect();
+    let mut other_lookup: HashSet<Hash, BuildHasherDefault<PassThroughHasher>> =
+        other_line.iter().copied().collect();
 
     let mut self_ended = false;
     let mut other_ended = false;
@@ -3579,25 +3578,6 @@ async fn find_common_revision_in_history_lines(
                 }
             }
         );
-    }
-}
-
-/// A revision hash is already uniformly distributed, so its leading bytes are as
-/// good a bucket index as anything derived from all 32 - and free. Hashing the
-/// hash again is the cost this avoids.
-#[derive(Default)]
-struct RevisionHasher(u64);
-
-impl std::hash::Hasher for RevisionHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        let mut leading = [0u8; 8];
-        let taken = bytes.len().min(leading.len());
-        leading[..taken].copy_from_slice(&bytes[..taken]);
-        self.0 = u64::from_ne_bytes(leading);
-    }
-
-    fn finish(&self) -> u64 {
-        self.0
     }
 }
 

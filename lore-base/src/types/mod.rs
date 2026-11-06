@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 pub mod branch_types;
 pub mod fragment_flags;
+pub mod hasher;
 pub mod lock_types;
 pub mod store_types;
 pub mod typed_bytes;
@@ -14,6 +15,7 @@ use std::str::FromStr;
 pub use branch_types::*;
 use bytes::Bytes;
 pub use fragment_flags::*;
+pub use hasher::*;
 pub use lock_types::*;
 use rand::Rng;
 use rand::distr::Distribution;
