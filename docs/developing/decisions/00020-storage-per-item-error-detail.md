@@ -1,6 +1,7 @@
 ---
 status: accepted
 date: 2026-09-16
+amended: 2026-11-05
 deciders: Raghav Narula
 ---
 
@@ -44,6 +45,7 @@ Chosen option: "Carry a `LoreErrorDetail` on each per-item event, and return `St
 - Good, because a successful item allocates nothing. The default detail is a null pointer and a zero length.
 - Bad, because it breaks the C ABI and the wire format. `LoreErrorDetail` is 40 bytes where the enum was 4, so a struct grows by 32 or 40 bytes depending on how its padding falls, and every consumer must recompile.
 - Bad, because `copy`, `get_metadata` and `obliterate` still route a `ProtocolError` through `protocol_error_to_storage`, which folds authorization, maintenance and not-supported failures into `NotConnected`. Narrowing that has to move together with `lore-storage/src/read.rs`, which uses `NotConnected` as its stale-session retry trigger.
+  - Amended 2026-11-05: authorization failures are not folded. `protocol_error_to_storage` maps a refusal to `NotAuthenticated` or `NotAuthorized` with the source's trace, which carries the remote's reason where the transport gives one, and `lore-storage/src/read.rs` retries a refusal once, on a fresh session and without back-off, since an expired token is refused and a fresh session can carry a fresh one. Maintenance and not-supported failures still fold into `NotConnected`, which stays the stale-session retry trigger for up to five retries.
 - Neutral, because the revision-tree events keep `LoreErrorCode`, so a second ABI break is queued behind this one.
 
 ## More Information

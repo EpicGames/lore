@@ -152,7 +152,8 @@ impl StorageSession {
     /// the parent `Connection`'s session pool cache, so no resolution hands out
     /// a pool holding session ids the server may not know. Call this after the
     /// transport surfaces a `NotConnected`/`Failed` server response indicating
-    /// the session-id is no longer known server-side.
+    /// the session-id is no longer known server-side, or after a refusal, so the
+    /// next resolution presents the current token.
     pub async fn invalidate(&self) {
         match &self.inner {
             SessionInner::Pending {

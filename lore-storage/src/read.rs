@@ -124,10 +124,10 @@ impl Drop for RemoteFetchGuard {
     }
 }
 
-/// Fetch a fragment from a remote session with retry on `SlowDown` and on `NotConnected`, which
-/// the storage layer maps every failure of the session but a miss, `Disconnected` and `SlowDown`
-/// to ([`protocol_error_to_storage`](crate::error::protocol_error_to_storage)). A `NotConnected`
-/// invalidates the session before its retry, so a lazy one starts its server-side sessions again.
+/// Fetch a fragment from a remote session. A `SlowDown` is retried with back-off, and a
+/// `NotConnected` or a refusal, as
+/// [`protocol_error_to_storage`](crate::error::protocol_error_to_storage) maps a failure of the
+/// session, is retried on a fresh session as [`SessionRetries::retry`] bounds and paces it.
 ///
 /// `Disconnected` is deliberately not retried here: on both transports it means the
 /// transport already exhausted its own reconnect-and-reissue and gave up, so the remote
@@ -144,7 +144,7 @@ async fn remote_get_retry(
         return Ok(served);
     }
     let mut retry = crate::store_retry();
-    let mut stale_session_retries: u32 = 0;
+    let mut session_retries = SessionRetries::default();
     loop {
         debug_assert!(
             !address.hash.is_zero(),
@@ -164,27 +164,67 @@ async fn remote_get_retry(
             }
             Err(err) => {
                 let storage_err = crate::error::protocol_error_to_storage(err, address);
-                if matches!(storage_err, StorageError::NotConnected(_))
-                    && stale_session_retries < MAX_STALE_SESSION_RETRIES
+                if !session_retries
+                    .retry(&storage_err, session, &mut retry)
+                    .await
                 {
-                    stale_session_retries += 1;
-                    session.invalidate().await;
-                    if !retry.wait().await {
-                        return Err(storage_err);
-                    }
-                    continue;
+                    return Err(storage_err);
                 }
-                return Err(storage_err);
             }
         }
     }
 }
 
-/// Bound on retries for `StorageError::NotConnected` in `remote_get_retry`.
+/// Bound on retries for `StorageError::NotConnected` in a remote read ([`SessionRetries`]).
 /// Picked so a genuinely permanent server-side failure surfaces quickly
 /// rather than looping through the full `store_retry` backoff schedule (60
-/// attempts up to 10 s apart).
-const MAX_STALE_SESSION_RETRIES: u32 = 5;
+/// attempts, up to 1 s apart).
+const MAX_STALE_SESSION_RETRIES: u8 = 5;
+
+/// The retries a remote read has made on a fresh session ([`StorageSession::invalidate`]).
+#[derive(Default)]
+struct SessionRetries {
+    /// Retries of a `NotConnected`, a session the server may no longer know.
+    stale: u8,
+    /// Whether a refusal was retried.
+    refused: bool,
+}
+
+impl SessionRetries {
+    /// Whether a read that failed with `err` is retried on a fresh session, counting the retry: a
+    /// `NotConnected` up to [`MAX_STALE_SESSION_RETRIES`] times, and a refusal once, since an
+    /// expired token is refused and a fresh session can carry a fresh one.
+    fn admit(&mut self, err: &StorageError) -> bool {
+        match err {
+            StorageError::NotConnected(_) if self.stale < MAX_STALE_SESSION_RETRIES => {
+                self.stale += 1;
+                true
+            }
+            StorageError::NotAuthenticated(_) | StorageError::NotAuthorized(_) if !self.refused => {
+                self.refused = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a read that failed with `err` is retried, readying the retry. An admitted failure
+    /// ([`admit`](Self::admit)) invalidates `session`, so a lazy one starts its server-side
+    /// sessions again. A `NotConnected` then waits on `back_off`, and is not retried once that is
+    /// spent; a refusal is retried at once, as only a fresh session can change its outcome.
+    async fn retry(
+        &mut self,
+        err: &StorageError,
+        session: &StorageSession,
+        back_off: &mut crate::Retry,
+    ) -> bool {
+        if !self.admit(err) {
+            return false;
+        }
+        session.invalidate().await;
+        !err.is_not_connected() || back_off.wait().await
+    }
+}
 
 /// Outcome of probing the local store for a fragment, distinguishing a plain miss (nothing to
 /// report, fall through to remote) from data that was found but fails its size check or to
@@ -2184,8 +2224,9 @@ pub fn read_resolved_into_file(
     }
 }
 
-/// [`remote_get_retry`] for `get_resolved`: back off on `SlowDown`, recover from a stale
-/// session id by invalidating and retrying. `key` supplies error context only.
+/// [`remote_get_retry`] for `get_resolved`: back off on `SlowDown`, and retry a stale session id
+/// or a refusal on a fresh session as [`SessionRetries::retry`] bounds and paces them. `key`
+/// supplies error context only.
 async fn remote_get_resolved_retry(
     session: &StorageSession,
     key: Hash,
@@ -2198,7 +2239,7 @@ async fn remote_get_resolved_retry(
         return Ok(served);
     }
     let mut retry = crate::store_retry();
-    let mut stale_session_retries: u32 = 0;
+    let mut session_retries = SessionRetries::default();
     let key_address = Address { hash: key, context };
     loop {
         debug_assert!(!key.is_zero(), "Cannot resolve zero key from store");
@@ -2211,17 +2252,12 @@ async fn remote_get_resolved_retry(
             }
             Err(err) => {
                 let storage_err = crate::error::protocol_error_to_storage(err, key_address);
-                if matches!(storage_err, StorageError::NotConnected(_))
-                    && stale_session_retries < MAX_STALE_SESSION_RETRIES
+                if !session_retries
+                    .retry(&storage_err, session, &mut retry)
+                    .await
                 {
-                    stale_session_retries += 1;
-                    session.invalidate().await;
-                    if !retry.wait().await {
-                        return Err(storage_err);
-                    }
-                    continue;
+                    return Err(storage_err);
                 }
-                return Err(storage_err);
             }
         }
     }

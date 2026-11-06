@@ -29,6 +29,7 @@ use lore_storage::options::ReadOptions;
 use lore_storage::read::*;
 use lore_storage::store_types::PayloadRead;
 use lore_storage::write::try_acquire_in_flight;
+use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 
 async fn make_test_store() -> (TempDir, Arc<dyn ImmutableStore>) {
@@ -4625,6 +4626,191 @@ async fn a_failing_remote_fetch_into_a_buffer_fetches_once() {
 
     assert!(read.is_err());
     assert_eq!(lore_storage::test_util::counts().0, 1, "fetches");
+}
+
+/// Whether a storage error reports a given refusal.
+type ReportsRefusal = fn(&StorageError) -> bool;
+
+/// The refusals a remote answers, each with a reason on its trace as the transport gives one, and
+/// the predicate a storage error reporting it meets.
+fn refusals() -> [(ProtocolError, ReportsRefusal); 2] {
+    use lore_error_set::ErrorSet;
+    let with_reason = |mut refusal: ProtocolError| {
+        refusal.push_trace(lore_error_set::Location::with_context(
+            file!(),
+            line!(),
+            column!(),
+            Arc::from("the token expired"),
+        ));
+        refusal
+    };
+    [
+        (
+            with_reason(ProtocolError::from(lore_base::error::NotAuthorized)),
+            StorageError::is_not_authorized,
+        ),
+        (
+            with_reason(ProtocolError::from(lore_base::error::NotAuthenticated)),
+            StorageError::is_not_authenticated,
+        ),
+    ]
+}
+
+/// A session that answers every resolution with `error`, and the count of its resolutions. A
+/// failed resolution is held until the session is invalidated, so each resolution after the first
+/// is a request made on a fresh session.
+fn failing_session(error: ProtocolError) -> (Arc<StorageSession>, Arc<AtomicU64>) {
+    let resolutions = Arc::new(AtomicU64::new(0));
+    let counted = resolutions.clone();
+    let session = Arc::new(StorageSession::pending(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+        let error = error.clone();
+        async move { Err(error) }
+    }));
+    (session, resolutions)
+}
+
+/// A fetch the remote refuses is retried once, at once, on a fresh session, since an expired token
+/// is refused and a fresh session can carry a fresh one, and then fails with the refusal and its
+/// trace.
+#[tokio::test(start_paused = true)]
+async fn a_refused_remote_get_is_retried_once() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _, _) = make_input(0xF3);
+    for (refusal, reports_refusal) in refusals() {
+        let source = refusal.trace().locations().to_vec();
+        let (session, resolutions) = failing_session(refusal);
+        let start = tokio::time::Instant::now();
+
+        let err = load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            Some(session),
+        )
+        .await
+        .expect_err("the remote refuses the fetch");
+
+        assert_eq!(
+            resolutions.load(Ordering::Relaxed),
+            2,
+            "gets, failing with {err:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO, "the refusal backed off");
+        assert!(reports_refusal(&err), "{err:?}");
+        assert!(err.trace().locations().starts_with(&source), "{err:?}");
+    }
+}
+
+/// A fetch failing with `NotConnected` is retried five times on a fresh session, backing off
+/// before each retry, and then fails with `NotConnected`.
+#[tokio::test(start_paused = true)]
+async fn a_not_connected_remote_get_is_retried_five_times_with_back_off() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _, _) = make_input(0xF5);
+    let (session, resolutions) =
+        failing_session(ProtocolError::internal("the server knows no such session"));
+    let start = tokio::time::Instant::now();
+
+    let err = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        Some(session),
+    )
+    .await
+    .expect_err("the session never resolves");
+
+    assert_eq!(
+        resolutions.load(Ordering::Relaxed),
+        6,
+        "gets, failing with {err:?}"
+    );
+    assert!(
+        start.elapsed() > Duration::ZERO,
+        "the retries did not back off"
+    );
+    assert!(err.is_not_connected(), "{err:?}");
+}
+
+/// A resolve the remote refuses is retried once, at once, on a fresh session, as a fetch is, and
+/// then fails with the refusal and its trace.
+#[tokio::test(start_paused = true)]
+async fn a_refused_remote_resolve_is_retried_once() {
+    let (dir, store) = make_test_store().await;
+    let mutable = test_mutable_store(&dir, &store).await;
+    let partition = Partition::from([0xF4; 16]);
+    let context = Context::from([0xF4; 16]);
+    let key = hash::hash_slice(b"a key the remote refuses to resolve");
+    for (refusal, reports_refusal) in refusals() {
+        let source = refusal.trace().locations().to_vec();
+        let (session, resolutions) = failing_session(refusal);
+        let start = tokio::time::Instant::now();
+
+        let Err(err) = resolve_root(
+            store.clone(),
+            mutable.clone(),
+            partition,
+            key,
+            context,
+            0,
+            ReadOptions::default(),
+            Some(session),
+        )
+        .await
+        else {
+            panic!("the remote refuses the resolve");
+        };
+
+        assert_eq!(
+            resolutions.load(Ordering::Relaxed),
+            2,
+            "resolves, failing with {err:?}"
+        );
+        assert_eq!(start.elapsed(), Duration::ZERO, "the refusal backed off");
+        assert!(reports_refusal(&err), "{err:?}");
+        assert!(err.trace().locations().starts_with(&source), "{err:?}");
+    }
+}
+
+/// A resolve failing with `NotConnected` is retried five times on a fresh session, backing off
+/// before each retry, as a fetch is, and then fails with `NotConnected`.
+#[tokio::test(start_paused = true)]
+async fn a_not_connected_remote_resolve_is_retried_five_times_with_back_off() {
+    let (dir, store) = make_test_store().await;
+    let mutable = test_mutable_store(&dir, &store).await;
+    let key = hash::hash_slice(b"a key resolved on a session the server does not know");
+    let (session, resolutions) =
+        failing_session(ProtocolError::internal("the server knows no such session"));
+    let start = tokio::time::Instant::now();
+
+    let Err(err) = resolve_root(
+        store,
+        mutable,
+        Partition::from([0xF6; 16]),
+        key,
+        Context::from([0xF6; 16]),
+        0,
+        ReadOptions::default(),
+        Some(session),
+    )
+    .await
+    else {
+        panic!("the session never resolves");
+    };
+
+    assert_eq!(
+        resolutions.load(Ordering::Relaxed),
+        6,
+        "resolves, failing with {err:?}"
+    );
+    assert!(
+        start.elapsed() > Duration::ZERO,
+        "the retries did not back off"
+    );
+    assert!(err.is_not_connected(), "{err:?}");
 }
 
 /// One fetch, one decode, one hash: the content a remote fetch verified is the content handed

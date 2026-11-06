@@ -17,8 +17,7 @@ type: breaking
   answers with `Unauthenticated` or `PermissionDenied` fails with `NotAuthenticated` (16) or
   `NotAuthorized` (17), where it failed as an internal error. A push whose check for the fragments
   the server holds is refused this way fails with that code, and so do the mutable-store requests
-  of a C API storage handle that reaches only the remote. Fragment reads and writes through
-  `lore-storage` keep `NotConnected` (29).
+  of a C API storage handle that reaches only the remote.
 - `lore-revision`: `lore repository verify fragment` fails with `NotAuthenticated` (16) or
   `NotAuthorized` (17) when the server refuses the verification, where it failed as an internal
   error. Its fragment event reports the failure as before.
