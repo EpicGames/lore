@@ -216,8 +216,14 @@ yet.
 
 ### Tier 2 as alice
 
-Log in as in [As alice](#as-alice), then create both repositories, push to each, and protect `main`
-in `game`:
+```bash
+export LORE_AUTH_PATH=/tmp/lore-oidc-demo/alice
+lore auth login lore://localhost:41337
+```
+
+Open the URL the CLI prints, sign in as `alice@example.com` with password `alice`, and grant the
+access the page asks for, if it asks. Then create both repositories, push to each, and protect
+`main` in `game`:
 
 ```bash
 for repo in game:11111111111111111111111111111111 tools:22222222222222222222222222222222; do
@@ -234,8 +240,15 @@ lore branch protect main
 
 ### Tier 2 as bob
 
-Log in as in [As bob](#as-bob). In `game`, bob can't push to the protected `main`, but he can push
-to a branch of his own, and [obliterate](#try-obliterate) there:
+In a new terminal:
+
+```bash
+export LORE_AUTH_PATH=/tmp/lore-oidc-demo/bob
+lore auth login lore://localhost:41337
+```
+
+Sign in as `bob@example.com` with password `bob`. In `game`, bob can't push to the protected
+`main`, but he can push to a branch of his own, and [obliterate](#try-obliterate) there:
 
 ```bash
 cd /tmp/lore-oidc-demo
@@ -261,9 +274,27 @@ lore push
 
 ### Tier 2 as the CI client
 
-Log in as in [As the CI client](#as-the-ci-client). The CI client can push to the protected `main`
-in `game`, and can't reach `tools`: `lore clone lore://localhost:41337/tools` fails with
-`Not authorized to access repository`.
+In a new terminal, log in, clone `game`, and push to its protected `main`. On Dex, the client ID is
+`https://localhost/ci` instead of `lore-ci`:
+
+```bash
+export LORE_AUTH_PATH=/tmp/lore-oidc-demo/ci
+LORE_CLIENT_SECRET=lore-ci-secret lore auth login lore://localhost:41337 --client-id lore-ci
+cd /tmp/lore-oidc-demo
+lore clone lore://localhost:41337/game ci-game && cd ci-game
+echo ci > c.txt
+lore stage c.txt
+lore commit "CI revision"
+lore push
+```
+
+The push succeeds. The CI client has no grant on `tools`, so cloning it fails with
+`Not authorized to access repository`:
+
+```bash
+cd /tmp/lore-oidc-demo
+lore clone lore://localhost:41337/tools ci-tools
+```
 
 ### Change a grant
 
