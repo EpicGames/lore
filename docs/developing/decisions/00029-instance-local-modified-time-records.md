@@ -4,7 +4,7 @@ date: 2026-11-03
 deciders: Zack Neyland
 ---
 
-# ADR-00027: Keep modified-time records in the instance's dot directory
+# ADR-00029: Keep modified-time records in the instance's dot directory
 
 ## Context and Problem Statement
 

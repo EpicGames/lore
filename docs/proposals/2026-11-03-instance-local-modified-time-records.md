@@ -18,7 +18,7 @@ revision's content, so a scan can skip hashing a file whose time has not moved. 
 records out of the shared mutable store and into the instance's own Lore directory (`.lore/`). Records only
 one instance reads stop growing the store every instance on it loads, and a copy of the instance's
 directory carries records that already describe its files.
-[ADR-00027](../developing/decisions/00027-instance-local-modified-time-records.md) records the decision.
+[ADR-00029](../developing/decisions/00029-instance-local-modified-time-records.md) records the decision.
 
 ## Motivation
 
