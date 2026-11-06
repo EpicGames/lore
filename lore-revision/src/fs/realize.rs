@@ -2812,7 +2812,8 @@ async fn merge_file_in_view(
             .path()
             .to_absolute_path(repository.require_path()?)
             .forward::<SyncError>("placing the merged file below the root")?;
-        if has_theirs && operation.infer_is_diffable(change_to.path()).await? {
+        let mine_is_file = change_to.to.flags.contains(NodeFlags::File);
+        if has_theirs && mine_is_file && operation.infer_is_diffable(change_to.path()).await? {
             lore_trace!(
                 "Merge identified text file for merge: {}",
                 absolute_path.display()

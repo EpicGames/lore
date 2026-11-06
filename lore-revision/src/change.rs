@@ -435,12 +435,46 @@ pub async fn is_conflict(
 /// The subtree moves between repositories along with a mount replaced between a directory and a
 /// link, so a change the other side of a merge made below it does not stand on its own.
 pub fn is_link_replacement(change: &NodeChange) -> bool {
+    replaced_types(change).is_some_and(|(from_type, to_type)| {
+        from_type == LoreNodeType::Link || to_type == LoreNodeType::Link
+    })
+}
+
+/// The type of node a change puts where a file stood, or a file where a directory stood. `None`
+/// for any other change.
+pub fn file_directory_replacement(change: &NodeChange) -> Option<LoreNodeType> {
+    replaced_types(change)
+        .filter(|types| {
+            matches!(
+                types,
+                (LoreNodeType::File, LoreNodeType::Directory)
+                    | (LoreNodeType::Directory, LoreNodeType::File)
+            )
+        })
+        .map(|(_, to_type)| to_type)
+}
+
+/// Whether the two sides of a conflict put a file and a directory at one path, which no merge
+/// below that path resolves.
+pub fn file_directory_clash(source: &NodeChange, target: &NodeChange) -> bool {
+    source.to.mapping.node.is_valid_node_id()
+        && target.to.mapping.node.is_valid_node_id()
+        && matches!(
+            (source.to.flags.node_type(), target.to.flags.node_type()),
+            (LoreNodeType::File, LoreNodeType::Directory)
+                | (LoreNodeType::Directory, LoreNodeType::File)
+        )
+}
+
+/// The types of the node a change replaces and of the node it replaces it with, where the two
+/// differ.
+fn replaced_types(change: &NodeChange) -> Option<(LoreNodeType, LoreNodeType)> {
     if !change.from.mapping.node.is_valid_node_id() || !change.to.mapping.node.is_valid_node_id() {
-        return false;
+        return None;
     }
     let from_type = change.from.flags.node_type();
     let to_type = change.to.flags.node_type();
-    from_type != to_type && (from_type == LoreNodeType::Link || to_type == LoreNodeType::Link)
+    (from_type != to_type).then_some((from_type, to_type))
 }
 
 pub fn sort_by_path(changes: &mut [NodeChange]) {

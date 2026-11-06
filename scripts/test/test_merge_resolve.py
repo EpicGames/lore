@@ -58,13 +58,6 @@ def setup_merge_conflict(
     repo.branch_merge_start("incoming", no_commit=True, check=False, offline=True)
 
 
-def get_conflicted_paths(repo: Lore) -> set[str]:
-    """Return the set of file paths that are unresolved conflicts via JSON status."""
-    raw = repo.status(offline=True, json=True)
-    entries = parse_status_json(raw)
-    return {e["path"] for e in entries if e.get("flagConflictUnresolved") is True}
-
-
 def get_resolved_paths(repo: Lore) -> set[str]:
     """Return the set of file paths that are resolved conflicts via JSON status."""
     raw = repo.status(offline=True, json=True)
@@ -105,7 +98,7 @@ def test_merge_resolve_directory(new_lore_repo):
     setup_merge_conflict(repo, files)
 
     # All three files should be conflicted
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert "src/a.txt" in conflicted, (
         f"src/a.txt should be conflicted, got {conflicted}"
     )
@@ -136,7 +129,7 @@ def test_merge_resolve_directory(new_lore_repo):
     )
 
     # Verify via status: src/ files resolved, other/c.txt still conflicted
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert "src/a.txt" not in still_conflicted, "src/a.txt should be resolved"
     assert "src/b.txt" not in still_conflicted, "src/b.txt should be resolved"
     assert "other/c.txt" in still_conflicted, "other/c.txt should still be conflicted"
@@ -169,7 +162,7 @@ def test_merge_resolve_dot(new_lore_repo):
     }
     setup_merge_conflict(repo, files)
 
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert len(conflicted) == 3, f"Expected 3 conflicted files, got {conflicted}"
 
     # Write clean content to all files
@@ -190,7 +183,7 @@ def test_merge_resolve_dot(new_lore_repo):
         )
 
     # All conflicts should be resolved now
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert len(still_conflicted) == 0, (
         f"No files should remain conflicted, got {still_conflicted}"
     )
@@ -238,7 +231,7 @@ def test_merge_resolve_multiple_paths(new_lore_repo):
         f"b.txt should NOT be resolved, got {resolved_events}"
     )
 
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert "b.txt" in still_conflicted, "b.txt should still be conflicted"
     assert "a.txt" not in still_conflicted, "a.txt should be resolved"
     assert "c.txt" not in still_conflicted, "c.txt should be resolved"
@@ -267,14 +260,14 @@ def test_merge_resolve_mine_directory(new_lore_repo):
     }
     setup_merge_conflict(repo, files)
 
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert len(conflicted) == 3, f"Expected 3 conflicted files, got {conflicted}"
 
     # Resolve src/ with mine
     repo.branch_merge_resolve_mine("src", offline=True, json=True)
 
     # src/ files should be resolved, other/c.txt still conflicted
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert "other/c.txt" in still_conflicted, "other/c.txt should still be conflicted"
     assert "src/a.txt" not in still_conflicted, "src/a.txt should be resolved"
     assert "src/b.txt" not in still_conflicted, "src/b.txt should be resolved"
@@ -311,14 +304,14 @@ def test_merge_resolve_theirs_directory(new_lore_repo):
     }
     setup_merge_conflict(repo, files)
 
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert len(conflicted) == 3, f"Expected 3 conflicted files, got {conflicted}"
 
     # Resolve src/ with theirs
     repo.branch_merge_resolve_theirs("src", offline=True, json=True)
 
     # src/ files should be resolved, other/c.txt still conflicted
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert "other/c.txt" in still_conflicted, "other/c.txt should still be conflicted"
     assert "src/a.txt" not in still_conflicted, "src/a.txt should be resolved"
     assert "src/b.txt" not in still_conflicted, "src/b.txt should be resolved"
@@ -354,13 +347,13 @@ def test_merge_resolve_mine_dot(new_lore_repo):
     }
     setup_merge_conflict(repo, files)
 
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert len(conflicted) == 2, f"Expected 2 conflicted files, got {conflicted}"
 
     # Resolve all with mine using "."
     repo.branch_merge_resolve_mine(".", offline=True, json=True)
 
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert len(still_conflicted) == 0, (
         f"No files should remain conflicted, got {still_conflicted}"
     )
@@ -396,13 +389,13 @@ def test_merge_resolve_theirs_dot(new_lore_repo):
     }
     setup_merge_conflict(repo, files)
 
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert len(conflicted) == 2, f"Expected 2 conflicted files, got {conflicted}"
 
     # Resolve all with theirs using "."
     repo.branch_merge_resolve_theirs(".", offline=True, json=True)
 
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert len(still_conflicted) == 0, (
         f"No files should remain conflicted, got {still_conflicted}"
     )
@@ -442,7 +435,7 @@ def test_merge_resolve_mine_multiple_paths(new_lore_repo):
     # Resolve only a.txt and b.txt with mine
     repo.branch_merge_resolve_mine(["a.txt", "b.txt"], offline=True, json=True)
 
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert "c.txt" in still_conflicted, "c.txt should still be conflicted"
     assert "a.txt" not in still_conflicted, "a.txt should be resolved"
     assert "b.txt" not in still_conflicted, "b.txt should be resolved"
@@ -481,7 +474,7 @@ def test_merge_resolve_theirs_multiple_paths(new_lore_repo):
     # Resolve only a.txt and b.txt with theirs
     repo.branch_merge_resolve_theirs(["a.txt", "b.txt"], offline=True, json=True)
 
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert "c.txt" in still_conflicted, "c.txt should still be conflicted"
     assert "a.txt" not in still_conflicted, "a.txt should be resolved"
     assert "b.txt" not in still_conflicted, "b.txt should be resolved"
@@ -518,13 +511,13 @@ def test_merge_resolve_nested_directories(new_lore_repo):
     }
     setup_merge_conflict(repo, files)
 
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert len(conflicted) == 4, f"Expected 4 conflicted files, got {conflicted}"
 
     # Resolve only src/core/ with theirs (should get a.txt and util/b.txt)
     repo.branch_merge_resolve_theirs("src/core", offline=True, json=True)
 
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert "src/core/a.txt" not in still_conflicted, "src/core/a.txt should be resolved"
     assert "src/core/util/b.txt" not in still_conflicted, (
         "src/core/util/b.txt should be resolved"
@@ -565,13 +558,13 @@ def test_merge_resolve_mine_no_paths(new_lore_repo):
     }
     setup_merge_conflict(repo, files)
 
-    conflicted = get_conflicted_paths(repo)
+    conflicted = repo.unresolved_paths(offline=True)
     assert len(conflicted) == 2, f"Expected 2 conflicted files, got {conflicted}"
 
     # Resolve all with mine using no paths (pass repo root path which _fix_paths produces for None)
     repo.branch_merge_resolve_mine(None, offline=True, json=True)
 
-    still_conflicted = get_conflicted_paths(repo)
+    still_conflicted = repo.unresolved_paths(offline=True)
     assert len(still_conflicted) == 0, (
         f"No files should remain conflicted, got {still_conflicted}"
     )
@@ -690,16 +683,18 @@ def test_file_stage_merge_flags_a_merged_file_holding_markers(new_lore_repo):
         "Current changes", {"a.txt": STAGE_MERGE_CURRENT}, offline=True
     )
     repo.branch_merge_start("incoming", no_commit=True, check=False, offline=True)
-    assert get_conflicted_paths(repo) == {"a.txt"}, "only a.txt conflicts"
+    assert repo.unresolved_paths(offline=True) == {"a.txt"}, "only a.txt conflicts"
 
     with repo.open_file("b.txt", "w+") as f:
         f.writelines(["line1\n", "<<<<<<< ours\n", "mine\n", "=======\n"])
         f.writelines(["theirs\n", ">>>>>>> theirs\n", "line3\n"])
     repo.file_stage_merge(["b.txt"], offline=True)
-    assert "b.txt" in get_conflicted_paths(repo), "markers must flag b.txt in conflict"
+    assert "b.txt" in repo.unresolved_paths(offline=True), (
+        "markers must flag b.txt in conflict"
+    )
 
     repo.branch_merge_resolve(["b.txt"], offline=True, check=False)
-    assert "b.txt" in get_conflicted_paths(repo), (
+    assert "b.txt" in repo.unresolved_paths(offline=True), (
         "resolve must leave b.txt with markers"
     )
 
@@ -707,7 +702,7 @@ def test_file_stage_merge_flags_a_merged_file_holding_markers(new_lore_repo):
         with repo.open_file(path, "w+") as f:
             f.writelines(["line1\n", "line2 merged\n", "line3\n"])
     repo.branch_merge_resolve(["a.txt", "b.txt"], offline=True)
-    assert not get_conflicted_paths(repo), "no file holds markers any more"
+    assert not repo.unresolved_paths(offline=True), "no file holds markers any more"
 
     repo.commit("Merge incoming", offline=True)
 
@@ -725,7 +720,7 @@ def test_stage_merge_and_resolve_of_a_deleted_file_find_no_markers(new_lore_repo
     (Path(repo.path) / "a.txt").unlink()
 
     repo.branch_merge_resolve(["a.txt"], offline=True)
-    assert "a.txt" not in get_conflicted_paths(repo), "a.txt must be resolved"
+    assert "a.txt" not in repo.unresolved_paths(offline=True), "a.txt must be resolved"
 
     repo.file_stage_merge(["a.txt"], offline=True)
     assert "a.txt" in get_merged_paths(repo), "a.txt must be staged as merged"

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::future::Future;
-use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -84,7 +83,6 @@ use crate::state::LinkPin;
 use crate::state::Mark;
 use crate::state::NodeMapping;
 use crate::state::State;
-use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
 use crate::util::request_tracker::StoreRequestTracker;
@@ -2970,13 +2968,16 @@ pub async fn branch_merge_abort(
                 state::State::deserialize(r.link_context.clone(), r.link_reference.signature)
                     .await
                     .forward::<MergeError>("deserializing conflict link state")?;
-            let conflict_paths = collect_merge_conflict_files(
+            let conflict_paths = stage::collect_merge_paths(
                 r.link_context.clone(),
                 conflict_link_state,
                 r.link_node.child,
                 RelativePath::new(),
+                UNRESOLVED_CONFLICTS,
             )
-            .await?;
+            .await
+            .forward::<MergeError>("collecting the link's conflicted paths")?
+            .files;
 
             let mount_source = pre_merge_mount(&repository, &state_current, &r.link_path).await?;
 
@@ -3646,65 +3647,11 @@ pub async fn merge_unresolve(
     Ok(())
 }
 
-/// Recursively collect all file paths with unresolved merge conflicts under a node.
-/// If the node is a file with an unresolved merge conflict, returns it directly.
-/// If the node is a directory, walks all descendants and collects matching files.
-fn collect_merge_conflict_files(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_id: NodeID,
-    base_path: RelativePath,
-) -> Pin<Box<dyn Future<Output = Result<Vec<RelativePath>, MergeError>> + Send>> {
-    Box::pin(async move {
-        let block_index = NodeBlock::index(node_id);
-        let node_index = Node::index(node_id);
-        let block = state
-            .block(repository.clone(), block_index)
-            .await
-            .forward::<MergeError>("deserializing block")?;
-        let node = block.node(node_index);
-
-        if node.is_link() {
-            return Err(MergeError::internal(
-                "Conflict resolution inside linked repositories is not yet supported",
-            ));
-        }
-
-        if node.is_file() {
-            if node.is_staged_merge_conflict() && node.is_staged_merge_unresolved() {
-                return Ok(vec![base_path]);
-            }
-            return Ok(vec![]);
-        }
-
-        // Directory: recurse into children
-        let mut collected = Vec::new();
-        let mut children =
-            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
-                .await
-                .forward::<MergeError>("iterating block children")?;
-
-        while let Some((child_id, _child_node, child_name)) = children
-            .next()
-            .await
-            .forward::<MergeError>("getting next child")?
-        {
-            let child_path = base_path.push_into_buf(&child_name).freeze();
-            // Release the block read lock before recursing (see NodeNameLock docs).
-            drop(child_name);
-            let mut child_files = collect_merge_conflict_files(
-                repository.clone(),
-                state.clone(),
-                child_id,
-                child_path,
-            )
-            .await?;
-            collected.append(&mut child_files);
-        }
-
-        Ok(collected)
-    })
-}
+/// The conflicts a resolve or an abort still has to act on, a directory replaced by a file as one.
+const UNRESOLVED_CONFLICTS: stage::MergeWalk = stage::MergeWalk {
+    unresolved_only: true,
+    whole_directories: true,
+};
 
 pub async fn branch_merge_resolve(
     repository: Arc<RepositoryContext>,
@@ -3842,13 +3789,16 @@ async fn resolve_path_in_state(
     // Expanded paths are user-side (rooted at `user_relative`); inside a
     // link they need the mount prefix stripped before they can be resolved
     // against `state` (which is link-relative).
-    let expanded = collect_merge_conflict_files(
+    let expanded = stage::collect_merge_paths(
         context.clone(),
         state.clone(),
         node_link.node,
         user_relative,
+        UNRESOLVED_CONFLICTS,
     )
-    .await?;
+    .await
+    .forward::<MergeError>("collecting the conflicted paths below a directory")?
+    .files;
     for file_path in expanded {
         let state_relative = if mount.is_empty() {
             file_path.clone()

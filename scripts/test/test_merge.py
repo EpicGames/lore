@@ -8,7 +8,8 @@ import stat
 import string
 
 import pytest
-from error_types import CommitFailed
+from error_types import CommitFailed, LocalChanges
+from lore_parsers import parse_status_json
 
 from lore import Lore
 
@@ -1430,3 +1431,116 @@ def test_merge_deleted_files(new_lore_repo):
     assert "M directory/file.two (M)" in output, (
         f"Expected file not staged as modified merge: {output}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("replaced", ["file", "folder"])
+@pytest.mark.parametrize("current", ["file", "folder"])
+@pytest.mark.parametrize("outcome", ["mine", "theirs", "abort", "clean"])
+def test_merge_file_against_folder(new_lore_repo, replaced, current, outcome):
+    """The branch `file` holds the file `thing` and the branch `folder` the folder `thing/a.txt`.
+    One of them replaced what the base held there and the other edited it, which conflicts at
+    `thing` and resolves to either side or aborts, or edited another file, which merges cleanly."""
+    repo: Lore = new_lore_repo()
+    file, folder = {"thing": "file\n"}, {"thing/a.txt": "folder\n"}
+    base, replacement = (file, folder) if replaced == "file" else (folder, file)
+    replacer, editor = ("folder", "file") if replaced == "file" else ("file", "folder")
+    repo.write_commit_push("Base", {"root.txt": "root\n", **base})
+
+    repo.branch_create(replacer)
+    if replaced == "file":
+        repo.remove_file("thing")
+    else:
+        repo.rmtree("thing")
+    repo.write_files(replacement)
+    repo.stage("thing", scan=True)
+    repo.commit(f"Replace the {replaced}")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_create(editor)
+    edited = {
+        path: content.replace("\n", " edited\n") for path, content in base.items()
+    }
+    if outcome == "clean":
+        repo.write_commit_push("Edit another file", {"root.txt": "root edited\n"})
+    else:
+        repo.write_commit_push(f"Edit the {replaced}", edited)
+    holds = {replacer: replacement, editor: edited}
+
+    incoming = editor if current == replacer else replacer
+    repo.branch_switch(current)
+    repo.branch_merge_start(incoming, no_commit=True)
+
+    conflicted = repo.unresolved_paths()
+    if outcome == "clean":
+        assert not conflicted
+        expected = {"root.txt": "root edited\n", **replacement}
+    else:
+        assert conflicted == {"thing"}
+        kept = current if outcome in ("mine", "abort") else incoming
+        expected = {"root.txt": "root\n", **holds[kept]}
+
+    if outcome == "abort":
+        repo.branch_merge_abort()
+    else:
+        if outcome == "mine":
+            repo.branch_merge_resolve_mine("thing")
+        elif outcome == "theirs":
+            repo.branch_merge_resolve_theirs("thing")
+        repo.commit(f"Merge {incoming}")
+        repo.push()
+
+    assert repo.read_files() == expected
+    assert not parse_status_json(repo.status(scan=True, json=True))
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("current", ["file", "folder"])
+@pytest.mark.parametrize("outcome", ["mine", "theirs", "abort", "local_edit"])
+def test_merge_file_and_folder_both_added(new_lore_repo, current, outcome):
+    """The branch `file` adds the file `thing` and the branch `folder` the folder `thing/a.txt`,
+    which conflicts at `thing` and resolves to either side, after first choosing the other, or
+    aborts. Resolving to the other side is refused where the working tree holds a local edit at
+    `thing`."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"root.txt": "root\n"})
+    holds = {"file": {"thing": "file\n"}, "folder": {"thing/a.txt": "folder\n"}}
+    for branch, files in holds.items():
+        repo.branch_switch("main")
+        repo.branch_create(branch)
+        repo.write_commit_push(f"Add the {branch}", files)
+
+    incoming = "folder" if current == "file" else "file"
+    repo.branch_switch(current)
+    repo.branch_merge_start(incoming, no_commit=True)
+    assert repo.unresolved_paths() == {"thing"}
+
+    if outcome == "local_edit":
+        edit = (
+            {"thing": "local edit\n"} if current == "file" else {"thing/b.txt": "new\n"}
+        )
+        repo.write_files(edit)
+        with pytest.raises(LocalChanges):
+            repo.branch_merge_resolve_theirs("thing")
+        assert repo.unresolved_paths() == {"thing"}
+        kept = {**holds[current], **edit}
+        files = repo.read_files()
+        assert {path: files.get(path) for path in kept} == kept
+        return
+
+    if outcome == "abort":
+        repo.branch_merge_abort()
+    else:
+        resolve = {
+            "mine": repo.branch_merge_resolve_mine,
+            "theirs": repo.branch_merge_resolve_theirs,
+        }
+        resolve["theirs" if outcome == "mine" else "mine"]("thing")
+        resolve[outcome]("thing")
+        repo.commit(f"Merge {incoming}")
+        repo.push()
+
+    kept = current if outcome in ("mine", "abort") else incoming
+    assert repo.read_files() == {"root.txt": "root\n", **holds[kept]}
+    assert not parse_status_json(repo.status(scan=True, json=True))

@@ -425,6 +425,7 @@ pub async fn diff3_with_source_cap(
     // The subtree moves between repositories along with a mount either side replaced, so a change
     // the other side made below one cannot be applied on its own.
     let source_mounts = replaced_mount_paths(&source_changes);
+    let source_replacements = file_directory_replacements(&source_changes);
     let mut target_mounts: Vec<RelativePath> = Vec::new();
     let mut conflicting_mounts: Vec<RelativePath> = Vec::new();
 
@@ -462,6 +463,7 @@ pub async fn diff3_with_source_cap(
             conflicts: mut joined_conflicts,
             mut target_changes,
             target_moves,
+            target_replacements,
             source_consumed,
         } = Box::pin(join_target_walk(
             target_walk,
@@ -496,6 +498,16 @@ pub async fn diff3_with_source_cap(
             include_same,
         )
         .await?;
+        let target_replacements = sorted_replacements(target_replacements);
+        for path in conflicting_replacements(
+            [
+                (&source_replacements, &target_replacements, &target_changes),
+                (&target_replacements, &source_replacements, &joined_changes),
+            ],
+            &joined_conflicts,
+        ) {
+            push_unique_path(&mut conflicting_mounts, &path);
+        }
         joined_changes.append(&mut target_changes);
         (joined_changes, joined_conflicts)
     };
@@ -634,13 +646,13 @@ pub async fn diff3_with_source_cap(
         }
     }
     for mount in conflicting_mounts.iter() {
-        lore_debug!("Mount {mount} was replaced and changed below, conflict at the mount");
+        lore_debug!("{mount} was replaced on one side and changed on the other, conflict there");
         joined_changes.retain(|change| !mount.covers(change.path()));
         final_conflicts.retain(|(source_conflict, target_conflict)| {
             !mount.covers(source_conflict.path()) && !mount.covers(target_conflict.path())
         });
         final_conflicts.push(
-            mount_replacement_conflict(
+            replacement_conflict(
                 &repository,
                 &state_base,
                 &state_source,
@@ -703,7 +715,102 @@ fn replaced_mount_paths(changes: &[NodeChange]) -> Vec<RelativePath> {
     paths
 }
 
-async fn mount_replacement_conflict(
+/// The paths where one side of a 3-way diff replaced a file with a directory, or a directory with
+/// a file, and the other made a change there or below that cannot stand beside the replacement.
+///
+/// Each of `sides` holds one side's replacements, the other side's, each sorted by path, and the
+/// other side's changes the join left to apply. A replacement conflicts where a pair in
+/// `conflicts` stands at or below it, or where a change of the other side is left there. Where
+/// both sides put the same type of node there, the paths below it merge one by one. A pair in
+/// `conflicts` where one side added a file and the other a directory conflicts the same way,
+/// though neither replaced anything.
+#[lore_macro::test_pub]
+fn conflicting_replacements(
+    sides: [(&[Replacement], &[Replacement], &[NodeChange]); 2],
+    conflicts: &[(NodeChange, NodeChange)],
+) -> Vec<RelativePath> {
+    let mut paths = Vec::new();
+    for (source, target) in conflicts {
+        if change::file_directory_clash(source, target) {
+            push_unique_path(&mut paths, target.path());
+        }
+    }
+    if sides
+        .iter()
+        .all(|(replacements, _, _)| replacements.is_empty())
+    {
+        return paths;
+    }
+    let conflicted: Vec<&str> = sorted_paths(
+        conflicts
+            .iter()
+            .flat_map(|(source, target)| [source.path(), target.path()]),
+    );
+    for (replacements, others, other_changes) in sides {
+        if replacements.is_empty() {
+            continue;
+        }
+        let changed = sorted_paths(other_changes.iter().map(NodeChange::path));
+        for (path, to_type) in replacements {
+            if others
+                .binary_search_by(|(other, _)| other.as_str().cmp(path.as_str()))
+                .is_ok_and(|found| others[found].1 == *to_type)
+            {
+                continue;
+            }
+            if covers_any(&conflicted, path) || covers_any(&changed, path) {
+                push_unique_path(&mut paths, path);
+            }
+        }
+    }
+    paths
+}
+
+/// A path one side replaced a file with a directory or a directory with a file at, and the type of
+/// node it put there.
+type Replacement = (RelativePath, crate::interface::LoreNodeType);
+
+/// The replacements of a file with a directory and of a directory with a file among `changes`,
+/// sorted by path.
+fn file_directory_replacements(changes: &[NodeChange]) -> Vec<Replacement> {
+    sorted_replacements(
+        changes
+            .iter()
+            .filter_map(|change| {
+                change::file_directory_replacement(change)
+                    .map(|to_type| (change.path().clone(), to_type))
+            })
+            .collect(),
+    )
+}
+
+/// `replacements` sorted by path, each path once: a replacement is walked as a delete and an add at
+/// one path.
+fn sorted_replacements(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
+    replacements.sort_unstable_by(|(lhs, _), (rhs, _)| lhs.as_str().cmp(rhs.as_str()));
+    replacements.dedup_by(|(lhs, _), (rhs, _)| lhs == rhs);
+    replacements
+}
+
+fn sorted_paths<'a>(paths: impl Iterator<Item = &'a RelativePath>) -> Vec<&'a str> {
+    let mut sorted: Vec<&str> = paths.map(RelativePath::as_str).collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+/// Whether `sorted` holds `path` or a path below it.
+fn covers_any(sorted: &[&str], path: &RelativePath) -> bool {
+    if sorted.binary_search(&path.as_str()).is_ok() {
+        return true;
+    }
+    let prefix = format!("{path}/");
+    let first = sorted.partition_point(|candidate| *candidate < prefix.as_str());
+    sorted
+        .get(first)
+        .is_some_and(|candidate| candidate.starts_with(&prefix))
+}
+
+async fn replacement_conflict(
     repository: &Arc<RepositoryContext>,
     state_base: &Arc<State>,
     state_source: &Arc<State>,
@@ -796,6 +903,11 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
             }
             if change::is_link_replacement(&target_change) {
                 push_unique_path(target_mounts, target_change.path());
+            }
+            if let Some(to_type) = change::file_directory_replacement(&target_change) {
+                joined
+                    .target_replacements
+                    .push((target_change.path().clone(), to_type));
             }
             if let Some(mount) = source_mounts
                 .iter()
@@ -1007,6 +1119,9 @@ struct Joined {
     target_changes: Vec<NodeChange>,
     /// The target's changes no source change stands with, which leave their node at another path.
     target_moves: Vec<NodeChange>,
+    /// The target's replacements of a file with a directory and of a directory with a file, once
+    /// for each change that walks one.
+    target_replacements: Vec<Replacement>,
     /// Whether a target change stood with each source change.
     source_consumed: Vec<bool>,
 }
@@ -1019,6 +1134,7 @@ impl Joined {
             conflicts: Vec::new(),
             target_changes: Vec::new(),
             target_moves: Vec::new(),
+            target_replacements: Vec::new(),
             source_consumed: vec![false; source_count],
         }
     }

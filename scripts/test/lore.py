@@ -49,6 +49,7 @@ from lore_parsers import (
     parse_revision_list,
     parse_shared_store_info,
     parse_shared_store_list,
+    parse_status_json,
 )
 from service_util import name_service_executable
 
@@ -2819,7 +2820,7 @@ class Lore:
     def list_paths(self, prefix: Path | None = None) -> list[Path]:
         if prefix is None:
             prefix = Path()
-        if prefix == Path(".lore"):
+        if prefix == Path(self.dot_dir()):
             return []
         path = pathlib.Path(self.path)
         prefixed_path = path / prefix
@@ -2828,6 +2829,22 @@ class Lore:
             for child in prefixed_path.iterdir():
                 result.extend(self.list_paths(child.relative_to(path)))
         return result
+
+    def read_files(self) -> dict[str, str]:
+        """The text of every file the working tree holds, by path."""
+        return {
+            path.as_posix(): pathlib.Path(self.path, path).read_text()
+            for path in self.list_paths()
+            if self.file_exists(path)
+        }
+
+    def unresolved_paths(self, **kwargs: Unpack[GlobalOptions]) -> set[str]:
+        """The paths of the merge conflicts not yet resolved."""
+        return {
+            e["path"]
+            for e in parse_status_json(self.status(json=True, **kwargs))
+            if e.get("flagConflictUnresolved")
+        }
 
     @staticmethod
     def generate_random_name(base=""):

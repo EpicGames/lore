@@ -15,7 +15,7 @@ from error_types import (
     NotFound,
     ZeroRevisionError,
 )
-from lore_parsers import parse_branch_list_json, parse_jsonl
+from lore_parsers import parse_branch_list_json, parse_jsonl, parse_status_json
 
 from lore import Lore, verify_signatures
 
@@ -874,6 +874,56 @@ def test_switch_to_branch_deleting_dir_with_missing_tracked_file(new_lore_repo):
     assert not repo.path_exists("doomed_dir"), (
         "doomed_dir should be removed by switch to delete-dir"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("start, target", [("file", "folder"), ("folder", "file")])
+@pytest.mark.parametrize("command", ["switch", "sync"])
+@pytest.mark.parametrize("local_edit", [False, True])
+def test_switch_between_file_and_folder(
+    new_lore_repo, start, target, command, local_edit
+):
+    """Main holds the file `thing` at revision 1 and the branch `folder` the folder `thing/a.txt`
+    at revision 2. Switching branches or syncing revisions swaps one for the other both ways, and
+    refuses to where the file or folder it replaces holds a local edit."""
+    repo: Lore = new_lore_repo()
+    layouts = {
+        "file": {"root.txt": "root\n", "thing": "file\n"},
+        "folder": {"root.txt": "root\n", "thing/a.txt": "folder\n"},
+    }
+    repo.write_commit_push("Base", layouts["file"])
+
+    repo.branch_create("folder")
+    repo.remove_file("thing")
+    repo.write_files(layouts["folder"])
+    repo.stage("thing", scan=True)
+    repo.commit("Turn the file into a folder")
+    repo.push()
+
+    def go_to(layout: str):
+        if command == "switch":
+            repo.branch_switch("main" if layout == "file" else "folder")
+        else:
+            repo.sync("@1" if layout == "file" else "@2")
+
+    go_to(start)
+    assert repo.read_files() == layouts[start]
+
+    if local_edit:
+        edited = "thing" if start == "file" else "thing/a.txt"
+        repo.write_files({edited: "local edit\n"})
+        with pytest.raises(LocalChanges):
+            go_to(target)
+        assert repo.read_files() == {**layouts[start], edited: "local edit\n"}
+        return
+
+    go_to(target)
+    assert repo.read_files() == layouts[target]
+    assert not parse_status_json(repo.status(scan=True, json=True))
+
+    go_to(start)
+    assert repo.read_files() == layouts[start]
+    assert not parse_status_json(repo.status(scan=True, json=True))
 
 
 # =============================================================================

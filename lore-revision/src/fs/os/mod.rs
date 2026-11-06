@@ -141,12 +141,20 @@ impl InstanceOperation for OsOperation {
     }
 
     /// A path mid-deletion stats as `PermissionDenied` on Windows rather than
-    /// `NotFound`, so both report a non-existent path.
+    /// `NotFound`, and a path below a file as `NotADirectory`, so all of them report a
+    /// non-existent path.
     async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         let path = self.absolute(path)?;
         match lore_io::IoDriver::global().stat(path).await {
             Ok(stat) => Ok(FileInfo::from_stat(&stat)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(FileInfo::NotExist)
+            }
             Err(e)
                 if cfg!(target_family = "windows")
                     && e.kind() == std::io::ErrorKind::PermissionDenied =>

@@ -2265,6 +2265,20 @@ fn commit_child(
         reject_unresolved_conflict(child_node, relative_path.as_str())?;
     }
 
+    // A directory that held a conflict with a file keeps the copies the merge wrote beside it
+    // until the commit, as a file does.
+    if child_node.is_directory()
+        && child_node.is_staged_merge_conflict()
+        && !execution_context().globals().dry_run()
+    {
+        let operation = walk.operation.clone();
+        let path = relative_path.clone();
+        lore_spawn!(tasks, async move {
+            sync::unlink_merge_artifacts(&operation, &path).await;
+            Ok(())
+        });
+    }
+
     if child_node.is_staged_delete() {
         if child_node.is_directory() {
             lore_spawn!(
