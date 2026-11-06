@@ -1318,6 +1318,19 @@ impl LinkReference {
         self.branch.is_zero()
     }
 
+    /// The branch to store for this link to resolve to `branch` under a parent on
+    /// `parent_branch`.
+    ///
+    /// An auto-following link on its parent's branch stores zero, so it follows the parent onto
+    /// every branch made from it. Any other link stores `branch`.
+    pub fn branch_to_store(&self, branch: BranchId, parent_branch: BranchId) -> BranchId {
+        if branch == parent_branch && self.flags & LinkFlags::DisableAutoFollow == 0 {
+            BranchId::default()
+        } else {
+            branch
+        }
+    }
+
     pub fn repository(&self) -> RepositoryId {
         self.repository
     }
@@ -3505,6 +3518,19 @@ impl State {
             self.set_parent_other(Hash::default());
             self.set_metadata_hash(Hash::default());
         }
+    }
+
+    /// [Reparent](Self::reparent_onto) a staged state onto `current_revision`, the head of a new
+    /// branch, in place of `previous_revision`.
+    ///
+    /// A merge that [reconciles divergent history](Self::reconciles_divergent_history) takes the
+    /// branch latest it merged as its second parent, so the new branch's first-parent line reaches
+    /// its branch point.
+    pub fn reparent_replacing(&self, previous_revision: Hash, current_revision: Hash) {
+        if self.reconciles_divergent_history(previous_revision) {
+            self.set_parent_other(self.parent_self());
+        }
+        self.reparent_onto(current_revision);
     }
 
     pub fn is_merge(&self) -> bool {

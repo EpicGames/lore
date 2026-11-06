@@ -97,3 +97,33 @@ fn reparenting_a_staged_state_onto_its_own_signature_leaves_it_as_it_is() {
     assert_eq!(state.parent_other(), other_branch_latest());
     assert_eq!(state.metadata_hash(), metadata());
 }
+
+fn new_branch_head() -> Hash {
+    Hash::from_u64(8)
+}
+
+/// On a new branch, a merge of divergent history staged on the revision the branch replaces
+/// merges the remote latest into the branch: the new head first, so the branch's first-parent line
+/// reaches its branch point, and the remote latest second.
+#[test]
+fn reparenting_a_merge_of_divergent_history_onto_a_new_branch_merges_the_remote_latest_into_it() {
+    let state = staged_merge(remote_latest(), current());
+
+    state.reparent_replacing(current(), new_branch_head());
+
+    assert_eq!(state.parent_self(), new_branch_head());
+    assert_eq!(state.parent_other(), remote_latest());
+    assert!(state.is_merge());
+    assert_eq!(state.metadata_hash(), metadata());
+}
+
+/// A merge of another branch moves onto the new branch's head and keeps the branch it merged.
+#[test]
+fn reparenting_a_merge_of_another_branch_onto_a_new_branch_keeps_its_second_parent() {
+    let state = staged_merge(current(), other_branch_latest());
+
+    state.reparent_replacing(current(), new_branch_head());
+
+    assert_eq!(state.parent_self(), new_branch_head());
+    assert_eq!(state.parent_other(), other_branch_latest());
+}

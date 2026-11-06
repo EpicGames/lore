@@ -1447,7 +1447,7 @@ async fn commit_link_only(
             &level.state,
             level.repository.clone(),
             level.child_repository_id,
-            level.branch,
+            level.stored_branch,
             child_signature,
             level.link_node_id,
         )

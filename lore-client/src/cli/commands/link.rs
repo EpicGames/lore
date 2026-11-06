@@ -432,7 +432,10 @@ fn handle_link_update(globals: LoreGlobalArgs, args: &LinkUpdateArgs) -> u8 {
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::LinkChange(data) => {
                 if data.branch.is_zero() && data.revision.is_zero() {
-                    println!("Link is already up to date");
+                    println!(
+                        "{} is already up to date; not pinned",
+                        data.link_path.as_str()
+                    );
                 } else {
                     println!(
                         "{}Updated link and staged for commit{}",

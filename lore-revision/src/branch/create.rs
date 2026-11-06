@@ -101,12 +101,11 @@ pub async fn create(
     category: String,
     force: bool,
 ) -> Result<(), CreateError> {
-    let (state_current, state_staged, current_branch) =
-        State::deserialize_current_and_staged(repository.clone())
-            .await
-            .forward::<CreateError>("deserializing current and staged state")?;
+    let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
+        .await
+        .forward::<CreateError>("loading current anchor")?;
 
-    if state_current.revision().is_zero() {
+    if current_revision.is_zero() {
         return Err(CreateError::internal(
             "Unable to create a branch without a previous revision, commit something first",
         ));
@@ -125,12 +124,12 @@ pub async fn create(
         0,
         BranchPoint {
             branch: current_branch,
-            revision: state_current.revision(),
+            revision: current_revision,
         },
     );
 
     // Create the branch
-    match branch::create(
+    let created = match branch::create_at(
         repository.clone(),
         token,
         branch_id,
@@ -144,17 +143,18 @@ pub async fn create(
     )
     .await
     {
-        Ok(_) => (),
+        Ok(created) => Some(created),
         Err(err) if err.is_branch_already_exists() => {
             // A forced dry run reports the branch as recreated at the current revision, which
             // heads its stack: the delete below reaches the remote, which no dry run may change.
             if force && dry_run {
                 crate::event::LoreEvent::BranchCreate(branch::LoreBranchCreateEventData {
                     name: branch.as_str().into(),
-                    latest: state_current.revision(),
+                    latest: current_revision,
                     is_commit: 0,
                 })
                 .send();
+                None
             } else if force {
                 match branch::resolve(repository.clone(), branch.as_str()).await {
                     Ok(resolved) => {
@@ -168,7 +168,7 @@ pub async fn create(
                         }
 
                         // Retry the creation
-                        branch::create(
+                        let created = branch::create_at(
                             repository.clone(),
                             token,
                             branch_id,
@@ -182,6 +182,7 @@ pub async fn create(
                         )
                         .await
                         .forward::<CreateError>("retrying branch creation after delete")?;
+                        Some(created)
                     }
                     Err(err) => {
                         return Err(CreateError::BranchAlreadyExists(
@@ -206,7 +207,7 @@ pub async fn create(
             }
         }
         Err(err) => return Err(CreateError::internal_with_context(err, "creating branch")),
-    }
+    };
 
     layer_branch_create(
         repository.clone(),
@@ -217,8 +218,15 @@ pub async fn create(
     )
     .await?;
 
-    if let Some(state_staged) = state_staged {
-        crate::instance::store_staged_anchor(&repository, state_staged.revision())
+    // Linked branches can move the new branch past the current revision, and the working copy
+    // stands on the branch's head.
+    let (head, staged) = match created {
+        Some(created) if !created.head.is_zero() => (created.head, created.staged),
+        _ => (current_revision, None),
+    };
+
+    if let Some(staged) = staged {
+        crate::instance::store_staged_anchor(&repository, staged)
             .await
             .forward::<CreateError>("storing staged anchor")?;
     }
@@ -226,7 +234,7 @@ pub async fn create(
     crate::instance::store_current_anchor_branch(&repository, branch_id)
         .await
         .forward::<CreateError>("storing current anchor branch")?;
-    crate::instance::store_current_anchor(&repository, state_current.revision())
+    crate::instance::store_current_anchor(&repository, head)
         .await
         .forward::<CreateError>("storing current anchor")?;
 

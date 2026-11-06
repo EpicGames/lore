@@ -1512,8 +1512,12 @@ pub fn is_valid_name(name: &str) -> bool {
     true
 }
 
+/// [`create_at`], returning the branch it made.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments beside the future of
+/// [`create_at`]. An `async` block awaiting that future would hold it twice.
 #[allow(clippy::too_many_arguments)]
-pub async fn create(
+pub fn create(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     branch: BranchId,
@@ -1524,7 +1528,47 @@ pub async fn create(
     stack: Vec<BranchPoint>,
     dry_run: bool,
     create_linked: bool,
-) -> Result<Context, BranchError> {
+) -> impl Future<Output = Result<Context, BranchError>> {
+    futures::FutureExt::map(
+        create_at(
+            repository,
+            token,
+            branch,
+            name,
+            category,
+            creator,
+            created,
+            stack,
+            dry_run,
+            create_linked,
+        ),
+        |created| created.map(|created| created.branch),
+    )
+}
+
+/// A branch [`create_at`] made, and where it left the instance.
+pub struct CreatedBranch {
+    pub branch: BranchId,
+    /// The latest revision stored for the branch. Zero where an existing branch was restored.
+    pub head: Hash,
+    /// The staged state based on `head`, where linked branches repinned or rebased it.
+    pub staged: Option<Hash>,
+}
+
+/// [`create`], reporting the head it stored and the staged state rebased onto it.
+#[allow(clippy::too_many_arguments)]
+pub async fn create_at(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    branch: BranchId,
+    name: &str,
+    category: &str,
+    creator: &str,
+    created: u64,
+    stack: Vec<BranchPoint>,
+    dry_run: bool,
+    create_linked: bool,
+) -> Result<CreatedBranch, BranchError> {
     // Check if name is valid
     if !is_valid_name(name) {
         return Err(BranchError::internal("Invalid name"));
@@ -1609,7 +1653,11 @@ pub async fn create(
             metadata_store(repository.clone(), branch, existing_metadata).await?;
         }
         store_name_to_id(repository.clone(), branch, name).await?;
-        return Ok(branch);
+        return Ok(CreatedBranch {
+            branch,
+            head: Hash::default(),
+            staged: None,
+        });
     }
 
     let mut head = stack
@@ -1700,6 +1748,7 @@ pub async fn create(
     lore_drain_tasks!(tasks, BranchError::internal("Task failed"))?;
 
     let mut is_commit = false;
+    let mut staged = None;
 
     if !dry_run {
         lore_debug!("Creating branch {name} {branch} with stack {stack:?} at signature {head}");
@@ -1710,11 +1759,11 @@ pub async fn create(
                     .await
                     .forward::<BranchError>("Failed to deserialize current revision anchor")
             {
-                let state = state_staged.unwrap_or(state_current);
-                let serialized_latest = create_linked_branches(
+                let (serialized_latest, rebased_staged) = create_linked_branches(
                     repository.clone(),
                     token,
-                    state.clone(),
+                    state_current,
+                    state_staged,
                     branch,
                     current_branch,
                     head,
@@ -1725,6 +1774,7 @@ pub async fn create(
 
                 is_commit = serialized_latest != head;
                 head = serialized_latest;
+                staged = rebased_staged;
             }
 
             lore_debug!("Created linked branches, new latest {head}");
@@ -1767,33 +1817,85 @@ pub async fn create(
         .send();
     }
 
-    Ok(branch)
+    Ok(CreatedBranch {
+        branch,
+        head,
+        staged,
+    })
 }
 
+/// A link row the cascade repins, held by the staged state or the current one.
+#[derive(Clone, Copy)]
+struct CascadeMount {
+    link: state::LinkReference,
+    staged: bool,
+}
+
+/// The auto-following links `state_staged` and `state` hold, grouped by linked repository.
+///
+/// The staged state's rows come first, so a group's first row is the pin the next commit takes.
+/// A row of `state` that the staged state removes or remounts stays in its group, so the link is
+/// on the new branch once the change is unstaged.
+///
+/// Grouping keeps the cascade from racing itself: concurrent creates with the same branch ID
+/// resolve to one winner, and the loser is rejected with "branch has been advanced by another
+/// instance", failing the whole create.
+async fn cascade_mounts(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    state_staged: Option<&Arc<State>>,
+) -> Result<Vec<(RepositoryId, Vec<CascadeMount>)>, BranchError> {
+    let staged_links = match state_staged {
+        Some(state_staged) => state_staged
+            .link_list(repository.clone())
+            .await
+            .forward::<BranchError>("listing staged links")?,
+        None => Vec::new(),
+    };
+    let current_links = state
+        .link_list(repository.clone())
+        .await
+        .forward::<BranchError>("listing links")?;
+
+    let mounts = staged_links
+        .into_iter()
+        .map(|link| CascadeMount { link, staged: true })
+        .chain(current_links.into_iter().map(|link| CascadeMount {
+            link,
+            staged: false,
+        }))
+        .filter(|mount| mount.link.flags & link::LinkFlags::DisableAutoFollow == 0);
+    Ok(link::group_by_repository(mounts, |mount| {
+        mount.link.repository
+    }))
+}
+
+/// Creates `branch` in the linked repositories, and moves each link that names an explicit
+/// branch onto it.
+///
+/// The links of `state_staged` and `state` both drive the cascade, the staged ones first, so a
+/// linked branch starts at the pin the next commit takes. A row naming an explicit branch is
+/// repinned in the state holding it, at its own pin, with the zero branch to follow the new one.
+///
+/// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
+/// branch's latest, and `state_staged` is rebased onto it.
 #[allow(clippy::too_many_arguments)]
 async fn create_linked_branches(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     state: Arc<State>,
+    state_staged: Option<Arc<State>>,
     branch: BranchId,
     current_branch: BranchId,
     current_latest: Hash,
     name: String,
     category: String,
-) -> Result<Hash, BranchError> {
-    let link_list = state
-        .link_list(repository.clone())
-        .await
-        .forward::<BranchError>("Failed to list links")?;
+) -> Result<(Hash, Option<Hash>), BranchError> {
+    let link_groups = cascade_mounts(&repository, &state, state_staged.as_ref()).await?;
 
-    if link_list.is_empty() {
-        return Ok(current_latest);
+    if link_groups.is_empty() {
+        return Ok((current_latest, None));
     }
-
-    // Grouping keeps the cascade from racing itself: concurrent creates with the
-    // same branch ID resolve to one winner, and the loser is rejected with
-    // "branch has been advanced by another instance", failing the whole create.
-    let link_groups = link::auto_following_mounts(&link_list);
 
     let mut link_tasks = JoinSet::new();
 
@@ -1806,6 +1908,7 @@ async fn create_linked_branches(
 
             let repository = repository.clone();
             let state = state.clone();
+            let state_staged = state_staged.clone();
             let branch_id = branch;
             let branch_name = name.clone();
             let branch_category = category.clone();
@@ -1814,7 +1917,7 @@ async fn create_linked_branches(
                 // The first mount seeds the branch point; the others adopt what
                 // it resolved to, since they all address the same branch.
                 let leader = mounts[0];
-                let resolved_parent_branch = leader.resolve_branch(current_branch);
+                let resolved_parent_branch = leader.link.resolve_branch(current_branch);
 
                 let outcome = link::create_branch(
                     link.clone(),
@@ -1823,49 +1926,53 @@ async fn create_linked_branches(
                     branch_name,
                     branch_category,
                     resolved_parent_branch,
-                    leader.signature,
+                    leader.link.signature,
                 )
                 .await
                 .forward_with::<BranchError, _>(|| {
                     format!("Failed to create branch for link repository {link_id}")
                 })?;
 
-                // The create is shared, the reporting is not: every mount that
-                // follows this repository reports its own outcome, keyed on its
-                // path, because the repository ID cannot tell the mounts apart.
                 for mount in mounts.iter() {
-                    let link_path = state
-                        .node_path(repository.clone(), mount.local_node)
-                        .await
-                        .unwrap_or_default();
+                    let mount_state = match &state_staged {
+                        Some(state_staged) if mount.staged => state_staged,
+                        _ => &state,
+                    };
 
-                    link::report_branch_outcome(
-                        &link_path,
-                        link_id,
-                        branch_id,
-                        outcome.revision,
-                        outcome.reused,
-                    );
+                    // The create is shared, the reporting is not: every mount of the state that
+                    // seeded the branch reports its own outcome, keyed on its path, because the
+                    // repository ID cannot tell the mounts apart.
+                    if mount.staged == leader.staged {
+                        let link_path = mount_state
+                            .node_path(repository.clone(), mount.link.local_node)
+                            .await
+                            .unwrap_or_default();
 
-                    // When the link uses the implicit branch convention (zero),
-                    // skip update_link_pin_by_node — the branch is already
-                    // implicitly correct and the signature is unchanged (the new
-                    // linked branch points to the same revision). This avoids
-                    // dirtying the state and producing a bookkeeping revision.
-                    if !mount.branch.is_zero() {
-                        link::update_link_pin_by_node(
-                            &state,
-                            repository.clone(),
-                            mount.repository,
+                        link::report_branch_outcome(
+                            &link_path,
+                            link_id,
                             branch_id,
-                            mount.signature,
-                            mount.local_node,
+                            outcome.revision,
+                            outcome.reused,
+                        );
+                    }
+
+                    // A row that tracks its parent's branch already resolves to the new one, at
+                    // the same revision, so it is left alone.
+                    if !mount.link.branch.is_zero() {
+                        link::update_link_pin_by_node(
+                            mount_state,
+                            repository.clone(),
+                            mount.link.repository,
+                            BranchId::default(),
+                            mount.link.signature,
+                            mount.link.local_node,
                         )
                         .await
                         .forward_with::<BranchError, _>(|| {
                             format!(
                                 "Failed to update link reference for link repository {}",
-                                mount.repository
+                                mount.link.repository
                             )
                         })?;
                     }
@@ -1878,13 +1985,41 @@ async fn create_linked_branches(
 
     lore_drain_tasks!(link_tasks, BranchError::internal("Task failed"))?;
 
-    // If no link state was mutated (all links use implicit zero-branch
-    // convention), return the current latest unchanged — no bookkeeping
-    // revision needed.
-    if !state.is_dirty() {
-        return Ok(current_latest);
-    }
+    let head = if state.is_dirty() {
+        store_repin_revision(&repository, token, &state, branch, current_latest).await?
+    } else {
+        current_latest
+    };
 
+    let staged = match state_staged {
+        Some(state_staged) if head != current_latest => {
+            state_staged.reparent_replacing(current_latest, head);
+            Some(state_staged)
+        }
+        Some(state_staged) if state_staged.is_dirty() => Some(state_staged),
+        _ => None,
+    };
+    let staged = match staged {
+        Some(state_staged) => Some(
+            state_staged
+                .serialize(repository.clone(), token)
+                .await
+                .forward::<BranchError>("Failed to serialize staged state")?,
+        ),
+        None => None,
+    };
+
+    Ok((head, staged))
+}
+
+/// Writes the repins `state` holds as a revision on top of `current_latest`.
+async fn store_repin_revision(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: &Arc<State>,
+    branch: BranchId,
+    current_latest: Hash,
+) -> Result<Hash, BranchError> {
     let metadata_hash = state.metadata_hash();
 
     if metadata_hash.is_zero() {
@@ -1932,16 +2067,10 @@ async fn create_linked_branches(
     .await
     .forward::<BranchError>("Failed to weave history")?;
 
-    let signature = state
+    state
         .serialize(repository.clone(), token)
         .await
-        .forward::<BranchError>("Failed to serialize revision state")?;
-
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<BranchError>("Failed to serialize anchor")?;
-
-    Ok(signature)
+        .forward::<BranchError>("Failed to serialize revision state")
 }
 
 pub async fn delete(

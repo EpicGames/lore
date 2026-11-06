@@ -134,7 +134,8 @@ pub(crate) async fn update(
         .forward::<LinkError>("Failed to find link")?;
 
     let current_link_revision = link_reference.signature;
-    let resolved_branch = link_reference.resolve_branch(parent_branch);
+    let owner_branch = chain.owner_branch(parent_branch);
+    let resolved_branch = link_reference.resolve_branch(owner_branch);
 
     // If a pin is specified, attempt to resolve it
     let (link_revision, link_branch) = if let Some(pin) = pin {
@@ -199,7 +200,7 @@ pub(crate) async fn update(
         .link_update(
             inner_repository.clone(),
             link.id,
-            link_branch,
+            link_reference.branch_to_store(link_branch, owner_branch),
             link_revision,
             link_node.node,
         )

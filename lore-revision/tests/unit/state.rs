@@ -179,6 +179,34 @@ fn resolve_branch_returns_own_branch_when_non_zero() {
     assert_eq!(link_ref.resolve_branch(parent), own_branch);
 }
 
+/// An auto-following link resolving to its parent's branch stores zero, whatever it stored
+/// before. Another branch, or a link that does not follow, keeps the branch.
+#[test]
+fn branch_to_store_is_zero_only_for_an_auto_following_link_on_the_parent_branch() {
+    let parent = BranchId::from([1u8; 16]);
+    let other = BranchId::from([2u8; 16]);
+    let follows = LinkFlags::NoFlags.bits();
+    let pinned = LinkFlags::DisableAutoFollow.bits();
+    for (stored, flags, branch, expected) in [
+        (BranchId::default(), follows, parent, BranchId::default()),
+        (parent, follows, parent, BranchId::default()),
+        (other, follows, parent, BranchId::default()),
+        (BranchId::default(), follows, other, other),
+        (parent, pinned, parent, parent),
+    ] {
+        let link_ref = LinkReference {
+            branch: stored,
+            flags,
+            ..LinkReference::default()
+        };
+        assert_eq!(
+            link_ref.branch_to_store(branch, parent),
+            expected,
+            "stored {stored}, flags {flags}, resolving to {branch}"
+        );
+    }
+}
+
 /// A state with no serialized link list, so the registry lives only in the runtime copy and
 /// every read has to come from there.
 async fn null_repository() -> Arc<RepositoryContext> {

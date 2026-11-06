@@ -617,26 +617,35 @@ pub struct LinkTarget {
 pub fn auto_following_mounts(
     link_list: &[LinkReference],
 ) -> Vec<(RepositoryId, Vec<LinkReference>)> {
-    let mut groups: Vec<(RepositoryId, Vec<LinkReference>)> = Vec::new();
+    group_by_repository(
+        link_list.iter().copied().filter(|link_reference| {
+            let follows = link_reference.flags & LinkFlags::DisableAutoFollow == 0;
+            if !follows {
+                lore_debug!(
+                    "Auto follow disabled for link {}",
+                    link_reference.repository
+                );
+            }
+            follows
+        }),
+        |link_reference| link_reference.repository,
+    )
+}
 
-    for link_reference in link_list.iter() {
-        if link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
-            lore_debug!(
-                "Auto follow disabled for link {}",
-                link_reference.repository
-            );
-            continue;
-        }
-
-        match groups
-            .iter_mut()
-            .find(|(link_id, _mounts)| *link_id == link_reference.repository)
-        {
-            Some((_link_id, mounts)) => mounts.push(*link_reference),
-            None => groups.push((link_reference.repository, vec![*link_reference])),
+/// Groups `items` by the linked repository `repository` names for each, in the order the
+/// repositories first appear.
+pub fn group_by_repository<T>(
+    items: impl IntoIterator<Item = T>,
+    repository: impl Fn(&T) -> RepositoryId,
+) -> Vec<(RepositoryId, Vec<T>)> {
+    let mut groups: Vec<(RepositoryId, Vec<T>)> = Vec::new();
+    for item in items {
+        let id = repository(&item);
+        match groups.iter_mut().find(|(link_id, _items)| *link_id == id) {
+            Some((_link_id, group)) => group.push(item),
+            None => groups.push((id, vec![item])),
         }
     }
-
     groups
 }
 
@@ -1079,7 +1088,10 @@ pub struct LinkChainLevel {
     pub state: Arc<State>,
     pub link_node_id: NodeID,
     pub child_repository_id: RepositoryId,
+    /// The branch the link resolves to.
     pub branch: BranchId,
+    /// The branch the link row stores, per [`state::LinkReference::branch_to_store`].
+    pub stored_branch: BranchId,
     /// Child's committed pin; used as parent-self when reserializing.
     pub old_signature: Hash,
 }
@@ -1205,6 +1217,7 @@ pub async fn resolve_link_chain(
                 link_node_id: cur_node,
                 child_repository_id,
                 branch: resolved_branch,
+                stored_branch: link_reference.branch_to_store(resolved_branch, cur_branch),
                 old_signature,
             });
 
@@ -1233,6 +1246,14 @@ pub async fn resolve_link_chain(
 }
 
 impl ResolvedLinkChain {
+    /// The branch of the repository holding the innermost link, under a top level on
+    /// `parent_branch`.
+    pub fn owner_branch(&self, parent_branch: BranchId) -> BranchId {
+        self.levels
+            .last()
+            .map_or(parent_branch, |level| level.branch)
+    }
+
     /// The child (state, repository) mounted by level `index`: the next level's
     /// parent for an intermediate level, or `innermost`'s for the last level.
     /// Used by the inner -> outer folding passes.
@@ -1300,7 +1321,7 @@ pub async fn propagate_link_chain(
             &level.state,
             level.repository.clone(),
             level.child_repository_id,
-            level.branch,
+            level.stored_branch,
             new_signature,
             level.link_node_id,
             NodeFlags::Staged,
