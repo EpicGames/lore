@@ -35,7 +35,7 @@ Every provider has the same users:
 | --- | --- | --- |
 | `alice@example.com` | `alice` | `admin` |
 | `bob@example.com` | `bob` | `obliterate` |
-| CI client | secret `lore-ci-secret` | `push-protected`, on Dex in Tier 2 only |
+| CI client | secret `lore-ci-secret` | `push-protected` (not supported by Dex in Tier 1) |
 
 In Tier 1, every token holder gets `read`, and `write` through the server's default
 `implicit_actions`. The provider's roles or groups add the rest:
