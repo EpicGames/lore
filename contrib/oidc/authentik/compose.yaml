@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+name: lore-oidc-authentik
+
+x-authentik-env: &authentik-env
+  AUTHENTIK_POSTGRESQL__HOST: postgresql
+  AUTHENTIK_POSTGRESQL__NAME: authentik
+  AUTHENTIK_POSTGRESQL__USER: authentik
+  AUTHENTIK_POSTGRESQL__PASSWORD: authentik
+  # Development only. Changing it invalidates every session and token.
+  AUTHENTIK_SECRET_KEY: lore-oidc-example-not-a-secret-0123456789abcdef
+  AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+  AUTHENTIK_DISABLE_UPDATE_CHECK: "true"
+  AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+  # The akadmin account, for the admin interface at http://localhost:9000/if/admin/.
+  AUTHENTIK_BOOTSTRAP_PASSWORD: admin
+
+services:
+  postgresql:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: authentik
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 5s
+      retries: 20
+
+  server:
+    image: ghcr.io/goauthentik/server:2026.8.5
+    command: server
+    environment: *authentik-env
+    ports:
+      - "127.0.0.1:9000:9000"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/goauthentik/server:2026.8.5
+    command: worker
+    environment: *authentik-env
+    volumes:
+      - ./blueprint.yaml:/blueprints/custom/lore.yaml:ro
+    depends_on:
+      postgresql:
+        condition: service_healthy
+
+  # The token exchange service authentik-tier2.toml names. `docker compose --profile tier2 up -d`
+  # starts it.
+  exchange:
+    image: node:22-alpine
+    profiles: [tier2]
+    user: node
+    command: ["node", "/srv/exchange/server.js"]
+    environment:
+      # Inside the container; compose publishes the port on 127.0.0.1.
+      HOST: 0.0.0.0
+      LOGIN_ISSUERS: http://localhost:9000/application/o/lore-cli/,http://localhost:9000/application/o/lore-ci/
+      PROVIDER_URL: http://server:9000
+      GRANTS_FILE: /srv/grants.json
+    ports:
+      - "127.0.0.1:8190:8190"
+    volumes:
+      - ../exchange:/srv/exchange:ro
+      - ./grants.json:/srv/grants.json:ro

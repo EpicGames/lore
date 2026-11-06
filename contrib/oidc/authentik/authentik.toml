@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+[server.auth]
+# Each authentik application has its own issuer. Both sign with the same key, so
+# the server finds that key through the first issuer's discovery document.
+jwt_issuer = [
+    "http://localhost:9000/application/o/lore-cli/",
+    "http://localhost:9000/application/o/lore-ci/",
+]
+# Set by the `lore` scope mapping in blueprint.yaml. The client sends a token
+# only to a server whose host the token's `aud` names.
+jwt_audience = ["https://localhost"]
+permission_claim = "lore_actions"
+
+[server.auth.oidc]
+client_id = "lore-cli"
+# authentik adds the `lore` scope mapping's claims only when the client
+# requests the scope.
+scopes = ["openid", "profile", "lore"]
+# The same for the CI client's client credentials grant.
+client_credentials_scopes = ["lore"]
+
+[immutable_store.local]
+path = "/tmp/lore-oidc-demo/authentik-server"
+
+[mutable_store.local]
+path = "/tmp/lore-oidc-demo/authentik-server"
+
+[telemetry.logger]
+format = "text"

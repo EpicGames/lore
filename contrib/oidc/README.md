@@ -9,6 +9,7 @@ to the provider.
 | --- | --- |
 | [`keycloak/`](keycloak/README.md) | [Keycloak](https://www.keycloak.org) |
 | [`dex/`](dex/README.md) | [Dex](https://dexidp.io) |
+| [`authentik/`](authentik/README.md) | [authentik](https://goauthentik.io) |
 
 Each provider runs as Tier 1, where the server reads each caller's actions from a claim in the
 login token and applies them to every repository, and as Tier 2, where the client exchanges its
@@ -134,8 +135,8 @@ The server refuses both. `lore branch unprotect` needs `admin`, unless you creat
 
 ### As the CI client
 
-The CI client logs in with the client credentials grant, with no browser. On Keycloak its client
-ID is `lore-ci`. Dex can't give a client a role, so its CI client works in
+The CI client logs in with the client credentials grant, with no browser. On Keycloak and
+authentik its client ID is `lore-ci`. Dex can't give a client a role, so its CI client works in
 [Tier 2](#tier-2) only, under the client ID its [README](dex/README.md#the-ci-client) names.
 
 ```bash
@@ -178,8 +179,9 @@ it asks the server, so don't try this on content you want to keep.
 
 The server takes the caller's identity from the token's `identity` claim, and from `sub` when the
 token has none. The client records the same value as the creator and committer of each revision.
-Keycloak adds an `identity` claim with the user name, which users can't change there. The
-revisions above then name `alice`, and the CI client's user, `service-account-lore-ci`. Dex can't add the claim, so revisions there
+Keycloak and authentik add an `identity` claim with the user name, which users can't change
+there. The revisions above then name `alice`, and the CI client's
+user, such as `service-account-lore-ci` on Keycloak. Dex can't add the claim, so revisions there
 name its `sub`, which is stable too. The grants of [Tier 2](#tier-2) name users by the same
 identity.
 

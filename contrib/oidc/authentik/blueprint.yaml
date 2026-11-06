@@ -1,0 +1,157 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+version: 1
+metadata:
+  name: Lore OIDC example
+entries:
+  # The default brand, flows and scope mappings this blueprint refers to.
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Brand
+      required: true
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Provider authorization flow (implicit consent)
+      required: true
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: Default - Provider invalidation flow
+      required: true
+  - model: authentik_blueprints.metaapplyblueprint
+    attrs:
+      identifiers:
+        name: System - OAuth2 Provider - Scopes
+      required: true
+
+  # authentik answers the device login URL with 404 unless the brand names a device code flow,
+  # even when the URL carries the code. An empty one is enough: the provider's authorization
+  # flow signs the user in.
+  - model: authentik_flows.flow
+    id: device-code-flow
+    identifiers:
+      slug: lore-device-code
+    attrs:
+      name: Device code
+      title: Device code
+      designation: stage_configuration
+      authentication: none
+  - model: authentik_brands.brand
+    identifiers:
+      domain: authentik-default
+    attrs:
+      flow_device_code: !KeyOf device-code-flow
+
+  # The group names are Lore action names.
+  - model: authentik_core.group
+    id: group-admin
+    identifiers:
+      name: admin
+  - model: authentik_core.group
+    id: group-obliterate
+    identifiers:
+      name: obliterate
+  - model: authentik_core.group
+    id: group-push-protected
+    identifiers:
+      name: push-protected
+
+  - model: authentik_core.user
+    identifiers:
+      username: alice
+    attrs:
+      name: Alice Example
+      email: alice@example.com
+      password: alice
+      groups:
+        - !KeyOf group-admin
+  - model: authentik_core.user
+    identifiers:
+      username: bob
+    attrs:
+      name: Bob Example
+      email: bob@example.com
+      password: bob
+      groups:
+        - !KeyOf group-obliterate
+  # The user authentik issues lore-ci's client credentials tokens for. authentik creates it on
+  # the first such login under this name, or reuses it with its groups when it exists.
+  - model: authentik_core.user
+    identifiers:
+      username: ak-lore-ci-client_credentials
+    attrs:
+      name: Lore CI
+      email: lore-ci@example.com
+      type: service_account
+      groups:
+        - !KeyOf group-push-protected
+
+  - model: authentik_providers_oauth2.scopemapping
+    id: scope-lore
+    identifiers:
+      name: Lore
+    attrs:
+      scope_name: lore
+      description: Lore access
+      expression: |
+        lore_actions = {"owner", "admin", "migrate", "push-protected", "obliterate", "presign"}
+        return {
+            # The Lore client sends a token only to a server whose host `aud` names.
+            "aud": ["https://localhost"],
+            "identity": request.user.username,
+            "lore_actions": [
+                group.name for group in request.user.groups.all() if group.name in lore_actions
+            ],
+        }
+
+  - model: authentik_providers_oauth2.oauth2provider
+    id: provider-lore-cli
+    identifiers:
+      name: lore-cli
+    attrs:
+      client_type: public
+      client_id: lore-cli
+      redirect_uris: []
+      grant_types:
+        - urn:ietf:params:oauth:grant-type:device_code
+        - refresh_token
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
+      property_mappings:
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-openid]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-profile]]
+        - !Find [authentik_providers_oauth2.scopemapping, [managed, goauthentik.io/providers/oauth2/scope-offline_access]]
+        - !KeyOf scope-lore
+  - model: authentik_core.application
+    identifiers:
+      slug: lore-cli
+    attrs:
+      name: Lore CLI
+      provider: !KeyOf provider-lore-cli
+
+  - model: authentik_providers_oauth2.oauth2provider
+    id: provider-lore-ci
+    identifiers:
+      name: lore-ci
+    attrs:
+      client_type: confidential
+      client_id: lore-ci
+      redirect_uris: []
+      # Development only.
+      client_secret: lore-ci-secret
+      grant_types:
+        - client_credentials
+      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
+      signing_key: !Find [authentik_crypto.certificatekeypair, [name, authentik Self-signed Certificate]]
+      property_mappings:
+        - !KeyOf scope-lore
+  - model: authentik_core.application
+    identifiers:
+      slug: lore-ci
+    attrs:
+      name: Lore CI
+      provider: !KeyOf provider-lore-ci
