@@ -10,7 +10,9 @@ to the provider.
 | [`keycloak/`](keycloak/README.md) | [Keycloak](https://www.keycloak.org) |
 
 Each provider runs as Tier 1, where the server reads each caller's actions from a claim in the
-login token and applies them to every repository. See
+login token and applies them to every repository, and as Tier 2, where the client exchanges its
+login token for a token scoped to one repository. No provider here can issue those, so Tier 2 runs
+the token exchange service in [`exchange/`](exchange/README.md) beside the provider. See
 [Authentication](../../docs/reference/lore-server-config.md#authentication) in the server
 configuration reference for the settings.
 
@@ -18,7 +20,10 @@ configuration reference for the settings.
 > These setups are for local development only:
 >
 > - The users and the admin accounts have fixed passwords, and the CI client has a fixed secret.
-> - The providers serve plain HTTP, on `127.0.0.1` only.
+> - The providers and the exchange service serve plain HTTP, on `127.0.0.1` only.
+> - The exchange service generates its signing key at each start, so restarting it makes the
+>   tokens it issued fail until the clients exchange again.
+> - The Tier 2 token exchange service is an example, not meant for real deployments.
 
 ## Users
 
@@ -30,7 +35,7 @@ Every provider has the same users:
 | `bob@example.com` | `bob` | `obliterate` |
 | CI client | secret `lore-ci-secret` | `push-protected` |
 
-Every token holder gets `read`, and `write` through the server's default
+In Tier 1, every token holder gets `read`, and `write` through the server's default
 `implicit_actions`. The provider's roles or groups add the rest:
 
 - `admin`: alice can protect and unprotect branches.
@@ -45,8 +50,8 @@ Every token holder gets `read`, and `write` through the server's default
   `cargo build --release`, or install them as described in
   [Install the Lore CLI](../../docs/how-to/install-lore-cli.md) and
   [Deploy a local Lore server](../../docs/how-to/deploy-local-lore-server.md).
-- Free ports: `41337` (TCP and UDP) and `41339` for `loreserver`, and the provider's ports, which
-  its README lists.
+- Free ports: `41337` (TCP and UDP) and `41339` for `loreserver`, `8190` for the token exchange
+  service, and the provider's ports, which its README lists.
 
 ## Start a provider and the server
 
@@ -171,14 +176,105 @@ it asks the server, so don't try this on content you want to keep.
 The server takes the caller's identity from the token's `identity` claim, and from `sub` when the
 token has none. The client records the same value as the creator and committer of each revision.
 Keycloak adds an `identity` claim with the user name, which users can't change there. The
-revisions above then name `alice`, and the CI client's user, `service-account-lore-ci`.
+revisions above then name `alice`, and the CI client's user, `service-account-lore-ci`. The grants of [Tier 2](#tier-2) name users by the same
+identity.
+
+## Tier 2
+
+In Tier 2 the client logs in at the provider, then exchanges its login token (RFC 8693) for a token
+scoped to the one repository it's working on, at the token exchange service in
+[`exchange/`](exchange/README.md). The service decides who may do what on each repository, from
+`grants.json` in the provider's directory, in place of the provider's roles or groups. The grants
+name two repositories by fixed IDs, which `lore repository create --id` gives them:
+
+| User | `game`, ID `11111111111111111111111111111111` | `tools`, ID `22222222222222222222222222222222` |
+| --- | --- | --- |
+| alice | `write`, `admin` | `write`, `admin` |
+| bob | `write`, `obliterate` | `read` |
+| CI client | `write`, `push-protected` | none |
+
+Alice's grants are on `*`, every repository. A user with no grant on a repository can't reach it
+at all, and any grant on a repository lets the user read it.
+
+Start the provider with the exchange service beside it, and the server with the provider's Tier 2
+configuration, `<provider>-tier2.toml`. For Keycloak:
+
+```bash
+cd contrib/oidc/keycloak
+docker compose --profile tier2 up -d
+loreserver --config . --env keycloak-tier2
+```
+
+The server fetches the service's keys when it starts, and doesn't start if the service isn't up
+yet.
+
+### Tier 2 as alice
+
+Log in as in [As alice](#as-alice), then create both repositories, push to each, and protect `main`
+in `game`:
+
+```bash
+for repo in game:11111111111111111111111111111111 tools:22222222222222222222222222222222; do
+  mkdir /tmp/lore-oidc-demo/alice-${repo%%:*} && cd /tmp/lore-oidc-demo/alice-${repo%%:*}
+  lore repository create lore://localhost:41337/${repo%%:*} --id ${repo##*:}
+  echo one > a.txt
+  lore stage a.txt
+  lore commit "First revision"
+  lore push
+done
+cd /tmp/lore-oidc-demo/alice-game
+lore branch protect main
+```
+
+### Tier 2 as bob
+
+Log in as in [As bob](#as-bob). In `game`, bob can't push to the protected `main`, but he can push
+to a branch of his own, and [obliterate](#try-obliterate) there:
+
+```bash
+cd /tmp/lore-oidc-demo
+lore clone lore://localhost:41337/game bob-game && cd bob-game
+lore branch create bob-work
+echo bob > b.txt
+lore stage b.txt
+lore commit "Bob's revision"
+lore push
+```
+
+In `tools`, bob can clone, but the server refuses his push, even to a branch of his own:
+
+```bash
+cd /tmp/lore-oidc-demo
+lore clone lore://localhost:41337/tools bob-tools && cd bob-tools
+lore branch create bob-work
+echo bob > b.txt
+lore stage b.txt
+lore commit "Bob's revision"
+lore push
+```
+
+### Tier 2 as the CI client
+
+Log in as in [As the CI client](#as-the-ci-client). The CI client can push to the protected `main`
+in `game`, and can't reach `tools`: `lore clone lore://localhost:41337/tools` fails with
+`Not authorized to access repository`.
+
+### Change a grant
+
+The service reads `grants.json` on every exchange, but the client keeps an exchanged token until it
+expires, within five minutes, and exchanges again only then. A grant you add or remove therefore
+applies to a user within five minutes. Give bob `write` on `tools` under his identity, `bob`, and his push there succeeds once his current token for `tools` has expired:
+
+```json
+"22222222222222222222222222222222": ["write"]
+```
 
 ## Stop
 
 Stop `loreserver` with Ctrl+C, then in the provider's directory:
 
 ```bash
-docker compose down
+docker compose --profile tier2 down
 ```
 
 Remove `/tmp/lore-oidc-demo` to delete the server stores, the logins and the working trees.

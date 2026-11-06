@@ -17,3 +17,21 @@ services:
     volumes:
       - ./realm.json:/opt/keycloak/data/import/realm.json:ro
 
+  # The token exchange service keycloak-tier2.toml names. `docker compose --profile tier2 up -d`
+  # starts it.
+  exchange:
+    image: node:22-alpine
+    profiles: [tier2]
+    user: node
+    command: ["node", "/srv/exchange/server.js"]
+    environment:
+      # Inside the container; compose publishes the port on 127.0.0.1.
+      HOST: 0.0.0.0
+      LOGIN_ISSUERS: http://localhost:8180/realms/lore
+      PROVIDER_URL: http://keycloak:8080
+      GRANTS_FILE: /srv/grants.json
+    ports:
+      - "127.0.0.1:8190:8190"
+    volumes:
+      - ../exchange:/srv/exchange:ro
+      - ./grants.json:/srv/grants.json:ro
