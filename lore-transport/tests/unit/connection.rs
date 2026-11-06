@@ -973,3 +973,371 @@ fn resolved_user_fields() {
     assert_eq!(user.user_id, "uid-42");
     assert_eq!(user.user_name, "Bob");
 }
+
+/// The connection cache: the connections it hands to calls, and the connections it takes out.
+mod cache {
+    use std::sync::Weak;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::lore_spawn_net;
+    use lore_transport::auth::AuthEndpoint;
+    use lore_transport::traits::Admin;
+    use lore_transport::traits::Environment;
+    use lore_transport::traits::Lock;
+    use lore_transport::traits::Protocol;
+    use lore_transport::traits::Repository;
+    use lore_transport::traits::Revision;
+    use lore_transport::traits::Storage;
+
+    use super::*;
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
+
+    /// Runs `test` in an execution context, as a call runs.
+    async fn in_a_call(test: impl Future<Output = ()>) {
+        lore_base::runtime::LORE_CONTEXT
+            .scope(Arc::new(()), test)
+            .await;
+    }
+
+    /// A connection to `server`'s storage with a pool pinned for its partition, and nothing else
+    /// holding the pool.
+    async fn with_a_pinned_pool(server: &TestStorageServer) -> Arc<Connection> {
+        let connection = Connection::detached(server.connect(2).await);
+        connection
+            .session_pool(test_partition(), "first")
+            .await
+            .expect("a pinned pool");
+        connection
+    }
+
+    /// A call served a connection cached under its key, as an identity, adopts the credentials it
+    /// supplied, so the services the connection built present them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_served_a_cached_connection_adopts_its_credentials() {
+        in_a_call(async {
+            let remote = url::Url::parse("lore://cache-adopting.test.invalid")
+                .expect("a valid URL")
+                .to_string();
+            let cached = Connection::detached(Vec::new());
+            add_connection(&remote, "alice", true, AuthMode::Auto, cached.clone());
+
+            let served = connect(
+                &remote,
+                "alice",
+                RepositoryId::default(),
+                1,
+                "rotated identity token",
+                "rotated access token",
+                AuthMode::Auto,
+            )
+            .await
+            .expect("the cached connection");
+
+            assert!(Arc::ptr_eq(&served, &cached));
+            assert_eq!(
+                cached.credentials().tokens(),
+                (
+                    "rotated identity token".to_string(),
+                    "rotated access token".to_string()
+                )
+            );
+            remove_connection(cached);
+        })
+        .await;
+    }
+
+    /// A connection cached under a key a live connection is cached under leaves the live one in
+    /// place and is handed it, so the cache never takes out a connection calls are using.
+    #[test]
+    fn a_connection_cached_while_a_live_one_is_cached_under_its_key_is_not() {
+        let remote = "lore://cache-cached-twice.test.invalid";
+        let first = Connection::detached(Vec::new());
+        let cached = add_connection(remote, "", false, AuthMode::Auto, first.clone());
+        assert!(Arc::ptr_eq(&cached, &first));
+
+        let cached = add_connection(
+            remote,
+            "",
+            false,
+            AuthMode::Auto,
+            Connection::detached(Vec::new()),
+        );
+
+        assert!(
+            Arc::ptr_eq(&cached, &first),
+            "the second connection replaced the first"
+        );
+        let found = find_connection(remote, "", false, AuthMode::Auto);
+        assert!(found.is_some_and(|found| Arc::ptr_eq(&found, &first)));
+        remove_connection(first);
+    }
+
+    /// A stale connection taken out of the cache drops the pools it pins, so it is freed once no
+    /// call holds it, by each way one leaves the cache: replaced by a connection cached under its
+    /// key, dropped by a lookup that finds it stale, and marked failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_connection_taken_out_of_the_cache_drops_the_pools_it_pins() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let remote = "lore://cache-retired.test.invalid";
+            for way in ["replaced", "looked up", "marked failed"] {
+                let stale = with_a_pinned_pool(&server).await;
+                add_connection(remote, "", false, AuthMode::Auto, stale.clone());
+                match way {
+                    "replaced" => {
+                        stale.stale.store(true, Ordering::Relaxed);
+                        let replacement = Connection::detached(Vec::new());
+                        add_connection(remote, "", false, AuthMode::Auto, replacement.clone());
+                        remove_connection(replacement);
+                    }
+                    "looked up" => {
+                        stale.stale.store(true, Ordering::Relaxed);
+                        assert!(find_connection(remote, "", false, AuthMode::Auto).is_none());
+                    }
+                    _ => stale.mark_failed(),
+                }
+
+                assert!(find_connection(remote, "", false, AuthMode::Auto).is_none());
+                assert_eq!(
+                    Arc::strong_count(&stale),
+                    1,
+                    "a connection {way} is still held by the pool it pins"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A connection out of the cache pins no pool, so a call still holding it doesn't hold it back
+    /// again. One the transport marked stale while it is still cached pins its pools, so the calls
+    /// using it share a pool.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_out_of_the_cache_pins_no_pool() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let stale = Connection::detached(server.connect(2).await);
+            stale.stale.store(true, Ordering::Relaxed);
+            stale
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pool");
+            assert!(
+                Arc::strong_count(&stale) > 1,
+                "a stale connection still cached pinned no pool"
+            );
+
+            let retired = Connection::detached(server.connect(2).await);
+            remove_connection(retired.clone());
+            retired
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pool");
+            assert_eq!(
+                Arc::strong_count(&retired),
+                1,
+                "the pool it pinned holds the connection"
+            );
+            remove_connection(stale);
+        })
+        .await;
+    }
+
+    /// Retiring a connection drops its pins and leaves its pools valid, so a call holding one goes
+    /// on using its sessions.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pool_a_call_holds_serves_on_once_its_connection_is_retired() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let connection = Connection::detached(server.connect(2).await);
+            let pool = connection
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pinned pool");
+
+            remove_connection(connection.clone());
+
+            assert!(
+                pool.serves("first"),
+                "retiring the connection made the pool a call holds stale"
+            );
+        })
+        .await;
+    }
+
+    /// A subtask a connect spawns after the connect was cancelled is aborted as it is held, and so
+    /// releases the connection it holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subtask_held_after_its_connect_is_cancelled_is_aborted() {
+        in_a_call(async {
+            let cancelled: SubtaskAborts = Arc::new(parking_lot::Mutex::new(None));
+            let subtask = lore_spawn_net!(std::future::pending::<()>());
+
+            hold_subtask(&cancelled, subtask.abort_handle());
+
+            let ended = tokio::time::timeout(Duration::from_secs(10), subtask)
+                .await
+                .expect("the subtask ran on");
+            assert!(ended.is_err_and(|ended| ended.is_cancelled()));
+        })
+        .await;
+    }
+
+    /// A protocol whose environment lookups wait until `arrived` holds as many calls as it was made
+    /// for, so those calls all miss the cache and connect at once, and whose storage connects never
+    /// finish. It records each connection a storage connect was started for.
+    struct RacingProtocol {
+        arrived: Arc<tokio::sync::Barrier>,
+        connections: Arc<parking_lot::Mutex<Vec<Weak<Connection>>>>,
+    }
+
+    struct RacingEnvironment(Arc<tokio::sync::Barrier>);
+
+    #[async_trait::async_trait]
+    impl Environment for RacingEnvironment {
+        async fn get(&self) -> Result<EnvironmentConfig, ProtocolError> {
+            self.0.wait().await;
+            Ok(EnvironmentConfig::default())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Protocol for RacingProtocol {
+        async fn storage(
+            &self,
+            connection: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: Partition,
+            _: usize,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Storage>, ProtocolError> {
+            self.connections.lock().push(connection);
+            std::future::pending().await
+        }
+
+        async fn revision(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Revision>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn repository(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Repository>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn admin(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Admin>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn lock(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Lock>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn environment(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+        ) -> Result<Arc<dyn Environment>, ProtocolError> {
+            Ok(Arc::new(RacingEnvironment(self.arrived.clone())))
+        }
+    }
+
+    /// Calls that connect under one key at once share one connection, the first cached. The others
+    /// stop connecting and are freed. Whether two calls overlap after the lookup that would have
+    /// found the other's is up to the scheduler, so this runs rounds of many.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn calls_that_connect_at_once_share_one_connection() {
+        in_a_call(async {
+            const CALLS: usize = 16;
+            let connections: Arc<parking_lot::Mutex<Vec<Weak<Connection>>>> = Arc::default();
+            add(
+                "racing",
+                Arc::new(RacingProtocol {
+                    arrived: Arc::new(tokio::sync::Barrier::new(CALLS)),
+                    connections: connections.clone(),
+                }),
+            )
+            .expect("registering the racing scheme");
+
+            for round in 0..10 {
+                let remote = format!("racing://round-{round}.invalid:41337");
+                let mut calls = tokio::task::JoinSet::new();
+                for _ in 0..CALLS {
+                    let remote = remote.clone();
+                    lore_spawn_net!(calls, async move {
+                        connect(
+                            &remote,
+                            "",
+                            RepositoryId::default(),
+                            1,
+                            "",
+                            "",
+                            AuthMode::Auto,
+                        )
+                        .await
+                    });
+                }
+                let mut shared: Option<Arc<Connection>> = None;
+                while let Some(connected) = calls.join_next().await {
+                    let connection = connected.expect("the connect task").expect("connected");
+                    let first = shared.get_or_insert_with(|| connection.clone());
+                    assert!(
+                        Arc::ptr_eq(first, &connection),
+                        "calls connecting to {remote} at once were given different connections"
+                    );
+                }
+                let shared = shared.expect("a connection");
+                remove_connection(shared.clone());
+                shared
+                    .cancel_connect()
+                    .await
+                    .expect("cancelling the connect");
+                drop(shared);
+
+                wait_until(
+                    || {
+                        connections
+                            .lock()
+                            .iter()
+                            .all(|connection| connection.upgrade().is_none())
+                    },
+                    "a connection that lost the race was left connecting",
+                )
+                .await;
+            }
+        })
+        .await;
+    }
+}

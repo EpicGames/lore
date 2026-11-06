@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::Arc;
 use std::sync::Once;
 use std::sync::Weak;
@@ -172,6 +173,8 @@ pub(crate) fn credential_store() -> CredentialStore {
     lore_base::env::var(AUTH_PATH_VAR).unwrap_or_default()
 }
 
+/// The live connection cached for the key, or for the URL alone where the call has no identity
+/// yet. A stale connection cached under the key is taken out and [retired](retire).
 pub fn find_connection(
     remote_url: &str,
     identity: &str,
@@ -197,7 +200,9 @@ pub fn find_connection(
         if !connection.stale.load(Ordering::Relaxed) {
             return Some(connection.clone());
         }
-        map.remove(&key);
+        if let Some(stale) = map.remove(&key) {
+            retire(&stale);
+        }
     }
 
     if !may_match_on_url_alone(identity, from_supplied_credentials) {
@@ -222,13 +227,16 @@ pub fn find_connection(
         .map(|(_, c)| c.clone())
 }
 
+/// Caches `connection` and returns it, unless a live connection is cached under its key already,
+/// which is returned instead: two calls that connect at once share the first. A stale connection
+/// cached under the key is replaced and [retired](retire).
 pub fn add_connection(
     remote_url: &str,
     identity: &str,
     from_supplied_credentials: FromSuppliedCredentials,
     auth_mode: AuthMode,
     connection: Arc<Connection>,
-) {
+) -> Arc<Connection> {
     let key = (
         remote_url.to_string(),
         identity.to_string(),
@@ -237,20 +245,32 @@ pub fn add_connection(
         auth_mode,
     );
     let mut map = CONNECTION_MAP.lock();
-    if let Some(map) = map.as_mut() {
-        map.insert(key, connection);
-    } else {
-        let mut hashmap = HashMap::new();
-        hashmap.insert(key, connection);
-        map.replace(hashmap);
+    match map.get_or_insert_with(HashMap::new).entry(key) {
+        Entry::Occupied(cached) if !cached.get().stale.load(Ordering::Relaxed) => {
+            cached.get().clone()
+        }
+        Entry::Occupied(mut cached) => {
+            retire(&cached.insert(connection.clone()));
+            connection
+        }
+        Entry::Vacant(vacant) => vacant.insert(connection).clone(),
     }
 }
 
+/// Takes `connection` out of the cache and [retires](retire) it.
 pub fn remove_connection(connection: Arc<Connection>) {
-    let mut map = CONNECTION_MAP.lock();
-    if let Some(map) = map.as_mut() {
+    if let Some(map) = CONNECTION_MAP.lock().as_mut() {
         map.retain(|_, value| !Arc::ptr_eq(value, &connection));
     }
+    retire(&connection);
+}
+
+/// Frees a connection taken out of the cache once no call holds it, which closes its transport. The
+/// sessions of the pools it pins hold it, so this drops the pins and stops it pinning again. The
+/// pools stay valid for the calls that hold them.
+fn retire(connection: &Connection) {
+    connection.retired.store(true, Ordering::Relaxed);
+    connection.session_cache.clear();
 }
 
 /// Time allowed for the close frames to reach the peer before shutdown proceeds without
@@ -269,8 +289,11 @@ pub fn drop_connections() {
                     let _ = connection.1.cancel_connect().await;
                     // Drain in-flight streams and flush transport close frames to the peer
                     // before the runtime goes away. Without this, the server logs every
-                    // outstanding stream read as a transport error on client exit.
+                    // outstanding stream read as a transport error on client exit. Retired
+                    // after the close, so the session stops that dropping its pins sends find
+                    // no streams to hold the close back.
                     connection.1.close_transport().await;
+                    retire(&connection.1);
                 }
             },
             DROP_CONNECTIONS_WAIT,
@@ -387,14 +410,12 @@ pub async fn connect(
         from_supplied_credentials,
         auth_mode,
     ) {
-        // A match with credentials to adopt is a match on the full key -- see
-        // `may_match_on_url_alone` -- so this writes to the connection belonging
-        // to the identity the call acts as. The check restates that at the point
-        // of the write rather than relying on the lookup for it.
-        if !identity.is_empty() {
-            connection.credentials.update(identity_token, access_token);
-        }
-        return Ok(connection);
+        return Ok(shared_with_call(
+            connection,
+            &identity,
+            identity_token,
+            access_token,
+        ));
     }
 
     let identity_token = identity_token.to_string();
@@ -482,14 +503,12 @@ async fn connect_impl(
         from_supplied_credentials,
         auth_mode,
     ) {
-        // As above. An unauthenticated server leaves the identity unresolved even
-        // here, and that entry is shared with every other call that resolved none.
-        if !identity.is_empty() {
-            connection
-                .credentials
-                .update(&identity_token, &access_token);
-        }
-        return Ok(connection);
+        return Ok(shared_with_call(
+            connection,
+            &identity,
+            &identity_token,
+            &access_token,
+        ));
     }
 
     let credentials = Arc::new(SuppliedCredentials::new(&identity_token, &access_token));
@@ -504,8 +523,7 @@ async fn connect_impl(
         protocol.clone(),
     ));
 
-    let subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> =
-        Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let subtask_aborts: SubtaskAborts = Arc::new(parking_lot::Mutex::new(Some(Vec::new())));
 
     let connect_task = lore_spawn_net!({
         let environment_client = environment_client.clone();
@@ -629,7 +647,7 @@ async fn connect_impl(
                         }
                     }
                 });
-                subtask_aborts.lock().push(handle.abort_handle());
+                hold_subtask(&subtask_aborts, handle.abort_handle());
             }
 
             // Admin services are created lazily per-repository via Connection::admin().
@@ -663,7 +681,7 @@ async fn connect_impl(
                             Err(err) => connection.revision_ready.complete(Err(err)),
                         }
                     });
-                    subtask_aborts.lock().push(handle.abort_handle());
+                    hold_subtask(&subtask_aborts, handle.abort_handle());
                 }
 
                 {
@@ -694,7 +712,7 @@ async fn connect_impl(
                             Err(err) => connection.lock_ready.complete(Err(err)),
                         }
                     });
-                    subtask_aborts.lock().push(handle.abort_handle());
+                    hold_subtask(&subtask_aborts, handle.abort_handle());
                 }
             } else {
                 connection.revision_ready.complete(Ok(()));
@@ -730,7 +748,7 @@ async fn connect_impl(
                         Err(err) => connection.repository_ready.complete(Err(err)),
                     }
                 });
-                subtask_aborts.lock().push(handle.abort_handle());
+                hold_subtask(&subtask_aborts, handle.abort_handle());
             }
         }
     });
@@ -743,15 +761,49 @@ async fn connect_impl(
         });
     }
 
-    add_connection(
+    let cached = add_connection(
         remote_url.as_str(),
         identity.as_str(),
         from_supplied_credentials,
         auth_mode,
         connection.clone(),
     );
+    if !Arc::ptr_eq(&cached, &connection) {
+        // Another call cached a connection under this key since the lookup above. This call shares
+        // it, as it would had the lookup found it, and stops connecting its own before anything
+        // holds it. Nothing else locks the connector of a connection no call was handed, so this
+        // takes it without an await, which would hold this future's locals across it.
+        if let Ok(mut connector) = connection.connector.try_lock()
+            && let Some(connector) = connector.take()
+        {
+            drop(connection.abort_connector(connector));
+        }
+        return Ok(shared_with_call(
+            cached,
+            &identity,
+            &identity_token,
+            &access_token,
+        ));
+    }
 
     Ok(connection)
+}
+
+/// `connection`, cached for another call, adopting the credentials this call supplied when it acts
+/// as an identity, so the services the connection built present them. A lookup naming an identity
+/// matches on the full key (see [`may_match_on_url_alone`]), so the credentials reach the
+/// connection of the identity the call acts as. An unauthenticated server leaves the identity
+/// unresolved, and that entry is shared with every call that resolved none, so it adopts nothing.
+fn shared_with_call(
+    connection: Arc<Connection>,
+    identity: &str,
+    identity_token: &str,
+    access_token: &str,
+) -> Arc<Connection> {
+    if !identity.is_empty() {
+        connection.credentials.update(identity_token, access_token);
+    }
+    connection
 }
 
 /// The credentials a call supplied, shared by everything a connection builds.
@@ -901,7 +953,22 @@ struct Connector {
     setup_handle: JoinHandle<()>,
     /// Abort handles for every subtask the setup task has spawned. Pushed by
     /// the setup task as it spawns them; consumed by `cancel_connect`.
-    subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>>,
+    subtask_aborts: SubtaskAborts,
+}
+
+/// The abort handles of a connector's subtasks, `None` once the connector is cancelled.
+#[lore_macro::test_pub]
+type SubtaskAborts = Arc<parking_lot::Mutex<Option<Vec<tokio::task::AbortHandle>>>>;
+
+/// Holds `subtask` for a cancel to abort, or aborts it at once if the connector is cancelled: the
+/// setup task spawns its subtasks while a cancel may run, and one spawned after the cancel would
+/// otherwise run to its end.
+#[lore_macro::test_pub]
+fn hold_subtask(subtask_aborts: &SubtaskAborts, subtask: tokio::task::AbortHandle) {
+    match subtask_aborts.lock().as_mut() {
+        Some(held) => held.push(subtask),
+        None => subtask.abort(),
+    }
 }
 
 /// Connection over a protocol
@@ -945,6 +1012,8 @@ pub struct Connection {
     /// Permits for the gets callers run over this connection to cache fragments ahead of a read,
     /// made by the first caller to ask ([`Self::cache_get_permits`]); `None` for no cap.
     cache_gets: std::sync::OnceLock<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Set once the connection is out of the cache, after which it pins no session pool.
+    retired: std::sync::atomic::AtomicBool,
 }
 
 impl Drop for Connection {
@@ -998,6 +1067,7 @@ impl Connection {
             connector: tokio::sync::Mutex::new(None),
             stale: std::sync::atomic::AtomicBool::new(false),
             cache_gets: std::sync::OnceLock::new(),
+            retired: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1084,8 +1154,9 @@ impl Connection {
         &self.credentials
     }
 
-    /// Mark the connection failed and unregister it from the connection cache.
+    /// Mark the connection failed and unregister it from the connection cache, which retires it.
     /// Idempotent — additional callers find no entry and no-op.
+    #[lore_macro::test_pub]
     fn mark_failed(self: &Arc<Self>) {
         if !self.stale.swap(true, Ordering::Relaxed) {
             remove_connection(self.clone());
@@ -1130,6 +1201,7 @@ impl Connection {
         result
     }
 
+    #[lore_macro::test_pub]
     async fn cancel_connect(&self) -> Result<(), ProtocolError> {
         let Some(connector) = self.connector.lock().await.take() else {
             return Ok(());
@@ -1146,7 +1218,8 @@ impl Connection {
         self.stale.store(true, Ordering::Relaxed);
         lore_trace!("Connection to {} cancelled", self.remote_url);
         connector.setup_handle.abort();
-        for handle in std::mem::take(&mut *connector.subtask_aborts.lock()) {
+        let subtasks = connector.subtask_aborts.lock().take();
+        for handle in subtasks.unwrap_or_default() {
             handle.abort();
         }
         let cancelled = || ProtocolError::internal("connection cancelled");
@@ -1204,7 +1277,8 @@ impl Connection {
 
     /// The pool of sessions pinned here for `partition`, as long as it serves `correlation_id`.
     /// Otherwise the pool the connector has for `(partition, correlation_id)`, or a new one, is
-    /// pinned in its place, and the one it replaces stops its sessions once no call holds it.
+    /// pinned in its place, and the one it replaces stops its sessions once no call holds it. A
+    /// connection out of the cache pins none.
     ///
     /// A caller that needs one session per unit of work — a commit needs one per
     /// file — should hold the pool and [`pick`](SessionPool::pick) from it rather
@@ -1223,6 +1297,11 @@ impl Connection {
             .session_pool(partition, correlation_id, self.clone())
             .await?;
         self.session_cache.hold(partition, pool.clone());
+        // Retiring marks the connection before it drops the pins, so this drops a pool pinned
+        // while the connection was being retired, since a pin would hold it.
+        if self.retired.load(Ordering::Relaxed) {
+            self.session_cache.clear();
+        }
         Ok(pool)
     }
 

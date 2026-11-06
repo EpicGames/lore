@@ -146,6 +146,39 @@ async fn a_pooled_session_takes_turns_over_the_pool_the_context_holds() {
     );
 }
 
+/// A query of the remote reads through the pool the context holds. This context's connect has
+/// failed, so reaching the pool at all is proof the query did not look its session up through the
+/// connection.
+#[tokio::test]
+async fn a_remote_query_reads_through_the_pool_the_context_holds() {
+    let context = context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+    let resolutions = Arc::new(AtomicUsize::new(0));
+    context.set_session_pool(&Arc::new(lore_transport::SessionPool::new(
+        Arc::from("correlation"),
+        vec![counting_session(resolutions.clone())],
+    )));
+
+    let globals = LoreGlobalArgs {
+        correlation_id: "correlation".into(),
+        ..LoreGlobalArgs::default()
+    };
+    let _ = under_globals(globals, || {
+        lore_revision::repository::store::immutable_query(
+            context.clone(),
+            absent_address().to_string(),
+            false,
+            false,
+        )
+    })
+    .await;
+
+    assert_eq!(
+        resolutions.load(Ordering::Relaxed),
+        1,
+        "the query reached no session of the pool the context holds"
+    );
+}
+
 /// A context with no remote has nothing a session could resolve to, so the
 /// read and write paths take their local-only route rather than carrying one
 /// per fragment and failing it.

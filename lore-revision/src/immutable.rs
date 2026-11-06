@@ -212,7 +212,7 @@ pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc
 /// without a lookup on the connection, and the context decides whether the connection pins
 /// it as well.
 #[lore_macro::test_pub]
-async fn pooled_session(
+pub(crate) async fn pooled_session(
     repository: &Arc<RepositoryContext>,
     correlation_id: &str,
 ) -> Result<Arc<StorageSession>, ProtocolError> {

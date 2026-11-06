@@ -10,6 +10,7 @@ use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use lore_storage::read::heal_on_receipt;
 use lore_storage::read::verify_receipt;
 use lore_transport::Admin;
+use lore_transport::PartitionSessions;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 
@@ -35,12 +36,16 @@ use crate::store::StoreMatchResult;
 /// source: a payload it serves is checked against its address on receipt.
 pub struct RemoteImmutableStore {
     connections: protocol::RemoteConnections,
+    /// The session pool this store holds for each partition, which its ops under one correlation
+    /// id share.
+    pools: PartitionSessions,
 }
 
 impl RemoteImmutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
         RemoteImmutableStore {
             connections: protocol::RemoteConnections::new(remote_url, identity),
+            pools: PartitionSessions::default(),
         }
     }
 
@@ -52,16 +57,16 @@ impl RemoteImmutableStore {
     ) -> Self {
         RemoteImmutableStore {
             connections: protocol::RemoteConnections::with_connection(partition, connection),
+            pools: PartitionSessions::default(),
         }
     }
 
-    /// A session for ops on `partition`, from the pool pinned under the call's correlation id on
-    /// the connection held for the partition.
+    /// A session for ops on `partition`, as [`remote_session`] takes it.
     pub fn session(
         &self,
         partition: Partition,
     ) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + '_ {
-        remote_session(&self.connections, partition)
+        remote_session(&self.connections, &self.pools, partition)
     }
 
     /// The remote's admin service for `partition`.
@@ -94,16 +99,23 @@ impl RemoteImmutableStore {
     }
 }
 
-/// A session for ops on `partition`, from the pool pinned under the call's correlation id on the
-/// connection `connections` holds for the partition.
+/// A session for ops on `partition`, from the pool `pools` holds under the call's correlation id,
+/// started on the connection `connections` holds for the partition.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
-fn remote_session(
-    connections: &protocol::RemoteConnections,
+fn remote_session<'a>(
+    connections: &'a protocol::RemoteConnections,
+    pools: &'a PartitionSessions,
     partition: Partition,
-) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + '_ {
+) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + 'a {
     async move {
+        if let Some(pool) = pools.get_live(
+            partition,
+            execution_context().globals().correlation_id.as_str(),
+        ) {
+            return Ok(pool.pick());
+        }
         let connection = connections
             .connection(partition)
             .await
@@ -111,16 +123,17 @@ fn remote_session(
                 format!("connecting to remote store at {}", connections.remote_url())
             })?;
         let execution = execution_context();
-        connection
-            .session_pool(partition, execution.globals().correlation_id.as_str())
+        let pool = connection
+            .unpinned_session_pool(partition, execution.globals().correlation_id.as_str())
             .await
-            .map(|pool| pool.pick())
-            .forward_with(|| {
+            .forward_with::<StoreError, _>(|| {
                 format!(
                     "creating session to remote store at {}",
                     connections.remote_url()
                 )
-            })
+            })?;
+        pools.hold(partition, pool.clone());
+        Ok(pool.pick())
     }
 }
 
@@ -359,12 +372,16 @@ impl store::ImmutableStore for RemoteImmutableStore {
 
 pub struct RemoteMutableStore {
     connections: protocol::RemoteConnections,
+    /// The session pool this store holds for each partition, which its ops under one correlation
+    /// id share.
+    pools: PartitionSessions,
 }
 
 impl RemoteMutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
         RemoteMutableStore {
             connections: protocol::RemoteConnections::new(remote_url, identity),
+            pools: PartitionSessions::default(),
         }
     }
 
@@ -376,6 +393,7 @@ impl RemoteMutableStore {
     ) -> Self {
         RemoteMutableStore {
             connections: protocol::RemoteConnections::with_connection(partition, connection),
+            pools: PartitionSessions::default(),
         }
     }
 
@@ -384,7 +402,7 @@ impl RemoteMutableStore {
         &self,
         partition: Partition,
     ) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + '_ {
-        remote_session(&self.connections, partition)
+        remote_session(&self.connections, &self.pools, partition)
     }
 }
 

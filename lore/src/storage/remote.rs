@@ -61,11 +61,7 @@ impl RemoteEndpoint {
             .globals()
             .correlation_id
             .to_string();
-        if let Some(pool) = self
-            .pools
-            .get(partition, &correlation_id)
-            .filter(|pool| !pool.connection_is_stale())
-        {
+        if let Some(pool) = self.pools.get_live(partition, &correlation_id) {
             return Ok(Arc::new(StorageSession::pooled(pool)));
         }
         let connection = self.connection(partition).await?;

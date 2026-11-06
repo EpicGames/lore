@@ -603,6 +603,14 @@ impl PartitionSessions {
         self.pools.insert(partition, pool);
     }
 
+    /// The pool held for `partition`, if it [`serves`](SessionPool::serves) `correlation_id` over a
+    /// connection that is not stale. An owner that finds none holds the unpinned pool it starts in
+    /// its place, which serves it whether or not the connection pins pools.
+    pub fn get_live(&self, partition: Partition, correlation_id: &str) -> Option<Arc<SessionPool>> {
+        self.get(partition, correlation_id)
+            .filter(|pool| !pool.connection_is_stale())
+    }
+
     /// Drops every pool held.
     pub fn clear(&self) {
         self.pools.clear();

@@ -64,6 +64,31 @@ async fn a_payload_failing_its_check_is_served_as_healed() {
     assert_eq!((remote.gets(), remote.verifies()), (2, 1));
 }
 
+/// A store holds the session pool its reads share, so a command's reads over a connection out of
+/// the connection cache, which pins no pool, still share one: two reads start one session.
+#[tokio::test]
+async fn reads_over_a_connection_out_of_the_cache_share_the_pool_the_store_holds() {
+    let content = b"content read twice over a connection out of the cache";
+    let (source, address, _) = remote_copy(content, 0x73, 0).await;
+    let remote = serving_remote(&source, Serving::default());
+    let connection = Connection::detached(vec![remote.clone()]);
+    lore_transport::connection::remove_connection(connection.clone());
+    let store = Arc::new(RemoteImmutableStore::with_connection(source.id, connection));
+
+    under_execution_context(|| async {
+        for _ in 0..2 {
+            store
+                .clone()
+                .get(source.id, address)
+                .await
+                .expect("the payload is served");
+        }
+    })
+    .await;
+
+    assert_eq!(remote.starts(), 1, "each read started a pool of its own");
+}
+
 /// A payload still altered after a heal the remote reports as made is refused, after that one
 /// heal.
 #[tokio::test]

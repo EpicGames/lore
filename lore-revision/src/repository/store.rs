@@ -115,13 +115,12 @@ async fn immutable_query_address(
     }
 
     if !local
-        && let Ok(remote) = repository.remote().await
         && let Ok(remote_storage) = {
             let correlation_id = crate::lore::execution_context()
                 .globals()
                 .correlation_id
                 .to_string();
-            remote.session(repository.id, &correlation_id).await
+            crate::immutable::pooled_session(&repository, &correlation_id).await
         }
         && let Ok(result) = remote_storage
             .query(&[address])
