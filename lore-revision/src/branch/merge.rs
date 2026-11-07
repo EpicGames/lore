@@ -4506,7 +4506,10 @@ pub async fn merge_into(
         return Err(MergeError::internal("Cannot merge a branch with itself"));
     }
 
-    let branch_latest = if let Ok(remote) = repository.remote().await {
+    let branch_latest = if let Some(remote) = absent_unless_refused::<_, _, MergeError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? {
         branch::load_remote_latest(remote.clone(), repository.id, branch)
             .await
             .forward::<MergeError>("loading remote branch latest")?

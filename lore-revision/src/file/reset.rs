@@ -628,12 +628,14 @@ pub async fn reset(
         )
         .await
         .map_err(|err| {
-            ResetError::RevisionNotFound(
-                RevisionNotFound {
-                    revision: revision_spec,
-                }
-                .chain_err_from(err, "target revision not found"),
-            )
+            forward_refusal_or(err, "resolving the target revision", |err| {
+                ResetError::RevisionNotFound(
+                    RevisionNotFound {
+                        revision: revision_spec,
+                    }
+                    .chain_err_from(err, "target revision not found"),
+                )
+            })
         })?;
         state::State::deserialize(repository.clone(), resolved)
             .await
@@ -794,7 +796,7 @@ pub async fn reset_to_last_merged(
     let branch_name = branch.to_string();
     let branch = match branch::resolve(repository.clone(), branch.as_str()).await {
         Ok(resolved) => resolved,
-        Err(err) if err.is_not_authenticated() || err.is_not_authorized() => {
+        Err(err) if is_refusal(&err) => {
             return Err(err).forward_any("resolving branch for last-merged reset");
         }
         Err(err) => {
@@ -913,7 +915,9 @@ async fn reset_staged_links_under_paths(
         link::list_staged_node_paths(&state_current, &state_staged, repository.clone())
             .await
             .map_err(|err| {
-                ResetError::internal(format!("Failed to list staged link nodes: {err}"))
+                forward_refusal_or(err, "listing staged link nodes", |err| {
+                    ResetError::internal_with_context(err, "listing staged link nodes")
+                })
             })?;
     if staged_link_paths.is_empty() {
         return Ok(0);
@@ -1000,18 +1004,22 @@ async fn resolve_last_merged_target(
     relative_path: &RelativePath,
 ) -> Result<Arc<State>, ResetError> {
     let mut state_start = state_current;
-    let node_link = state_start
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .unwrap_or_default();
+    let node_link = absent_unless_refused::<_, _, ResetError>(
+        state_start
+            .find_node_link(repository.clone(), relative_path.as_str())
+            .await,
+        "finding the node",
+    )?
+    .unwrap_or_default();
     if !node_link.is_valid() {
         lore_debug!("Find state where node exist: {relative_path}");
         let revision = state_start.revision();
         if revision != branch_point {
             let parent = state_start.parent_self();
-            if let Ok(state) =
-                find_start_state(repository.clone(), parent, branch_point, relative_path).await
-            {
+            if let Some(state) = absent_unless_refused::<_, _, ResetError>(
+                find_start_state(repository.clone(), parent, branch_point, relative_path).await,
+                "finding the last revision holding the node",
+            )? {
                 state_start = state;
                 lore_debug!(
                     "Found revision where node exist: {relative_path} in {} -> {}",
@@ -1036,15 +1044,17 @@ async fn resolve_last_merged_target(
         let state_branch_point = state::State::deserialize(repository.clone(), branch_point)
             .await
             .forward::<ResetError>("Failed to deserialize revision state")?;
-        if let Ok(state_merge) = find_merge_state(
-            repository.clone(),
-            state_start,
-            state_branch_point.clone(),
-            branch_id,
-            relative_path,
-        )
-        .await
-        {
+        if let Some(state_merge) = absent_unless_refused::<_, _, ResetError>(
+            find_merge_state(
+                repository.clone(),
+                state_start,
+                state_branch_point.clone(),
+                branch_id,
+                relative_path,
+            )
+            .await,
+            "finding the last merge from the branch",
+        )? {
             lore_debug!(
                 "Found revision where node was merged from branch: {relative_path} in merge revision {} -> {}",
                 state_merge.revision(),
@@ -1155,10 +1165,13 @@ async fn find_start_state(
             .await
             .forward::<ResetError>("Failed to deserialize revision state")?;
 
-        let node_link = state_parent
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .unwrap_or_default();
+        let node_link = absent_unless_refused::<_, _, ResetError>(
+            state_parent
+                .find_node_link(repository.clone(), relative_path.as_str())
+                .await,
+            "finding the node",
+        )?
+        .unwrap_or_default();
         if node_link.is_valid() {
             return Ok(state_parent);
         }
@@ -1193,9 +1206,14 @@ async fn find_merge_state(
             state.parent_other()
         );
         if !state.parent_other().is_zero()
-            && let Ok(state_merged) =
-                state::State::deserialize(repository.clone(), state.parent_other()).await
-            && state_merged.branch(repository.clone()).await == branch
+            && let Some(state_merged) = absent_unless_refused::<_, _, ResetError>(
+                state::State::deserialize(repository.clone(), state.parent_other()).await,
+                "reading the merged-in parent",
+            )?
+            && absent_unless_refused::<_, _, ResetError>(
+                state_merged.recorded_branch(repository.clone()).await,
+                "reading the merged-in parent's branch",
+            )? == Some(branch)
         {
             return Ok(state);
         }
@@ -1203,7 +1221,11 @@ async fn find_merge_state(
         let node_link = state
             .find_node_link(repository.clone(), relative_path.as_str())
             .await
-            .map_err(|err| ResetError::internal_with_context(err, "Failed to find node"))?;
+            .map_err(|err| {
+                forward_refusal_or(err, "finding the node", |err| {
+                    ResetError::internal_with_context(err, "Failed to find node")
+                })
+            })?;
 
         let node_id = node_link.node;
 
@@ -1823,11 +1845,14 @@ async fn reset_walk_directory(
     let mut replaced = Vec::new();
 
     while let Some(child_node_id) = child_node_iter {
-        let Ok(child_node) = state_target.node(repository.clone(), child_node_id).await else {
-            failure = Some(ResetError::internal(
-                "Failed deserializing state node block",
-            ));
-            break;
+        let child_node = match state_target.node(repository.clone(), child_node_id).await {
+            Ok(child_node) => child_node,
+            Err(err) => {
+                failure = Some(forward_refusal_or(err, "reading a node block", |err| {
+                    ResetError::internal_with_context(err, "Failed deserializing state node block")
+                }));
+                break;
+            }
         };
 
         if let Err(err) = child_node

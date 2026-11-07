@@ -1538,9 +1538,7 @@ async fn resolve_branch_id_or_current(
 
     match branch::resolve(repository, branch).await {
         Ok(status) => Ok(status.id),
-        Err(err) if err.is_not_authenticated() || err.is_not_authorized() => {
-            Err(err).forward_any("resolving branch")
-        }
+        Err(err) if lore_base::error::is_refusal(&err) => Err(err).forward_any("resolving branch"),
         Err(_err) => Err(BranchMetadataError::from(
             lore_base::error::InvalidArguments {
                 reason: format!("branch '{branch}' not found"),

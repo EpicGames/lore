@@ -1219,32 +1219,41 @@ async fn commit_link_only(
         })?;
 
     // Resolve the link in both staged and current parent states
-    let resolved_staged = match link::resolve_link_at_path(
-        &state_parent_staged,
-        repository.clone(),
-        &link_path,
-    )
-    .await
-    {
-        Ok(resolved) => resolved,
-        Err(err) if err.is_not_a_link() => {
-            return Err(NotALink { path: link_path }.into());
-        }
-        Err(_) => {
-            return Err(LinkPathNotFound { path: link_path }.into());
-        }
-    };
+    let resolved_staged =
+        link::resolve_link_at_path(&state_parent_staged, repository.clone(), &link_path)
+            .await
+            .map_err(|err| {
+                forward_refusal_or(err, "resolving the staged link at path", |err| {
+                    if err.is_not_a_link() {
+                        CommitError::NotALink(
+                            NotALink {
+                                path: link_path.clone(),
+                            }
+                            .chain_err_from(err, "resolving the staged link at path"),
+                        )
+                    } else {
+                        CommitError::LinkPathNotFound(
+                            LinkPathNotFound {
+                                path: link_path.clone(),
+                            }
+                            .chain_err_from(err, "resolving the staged link at path"),
+                        )
+                    }
+                })
+            })?;
 
     let resolved_current =
         link::resolve_link_at_path(&state_parent_current, repository.clone(), &link_path)
             .await
             .map_err(|err| {
-                CommitError::LinkPathNotFound(
-                    LinkPathNotFound {
-                        path: link_path.clone(),
-                    }
-                    .chain_err_from(err, "resolving link at path"),
-                )
+                forward_refusal_or(err, "resolving link at path", |err| {
+                    CommitError::LinkPathNotFound(
+                        LinkPathNotFound {
+                            path: link_path.clone(),
+                        }
+                        .chain_err_from(err, "resolving link at path"),
+                    )
+                })
             })?;
 
     let link_staged_revision = resolved_staged.link_node.linked_node().revision;

@@ -13,6 +13,7 @@ use tokio::task::JoinSet;
 
 use super::RepositoryContext;
 use super::RepositoryError;
+use crate::errors::is_refusal;
 use crate::event;
 use crate::hash;
 use crate::interface::LoreArray;
@@ -740,7 +741,7 @@ async fn verify_fragment_remote(
                 },
             )
             .send();
-            if e.is_refusal() {
+            if is_refusal(&e) {
                 return Err(e.forward("verifying fragment on remote"));
             }
             Err(RepositoryError::internal(format!(

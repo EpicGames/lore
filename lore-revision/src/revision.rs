@@ -30,6 +30,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::RevisionNotFound;
 use crate::errors::absent_unless;
+use crate::errors::absent_unless_refused;
 use crate::event;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
@@ -2050,13 +2051,10 @@ async fn recorded_branch(
     repository: Arc<RepositoryContext>,
     revision: Hash,
 ) -> Result<BranchId, StateError> {
-    let state = State::deserialize(repository.clone(), revision).await?;
-    let metadata = Metadata::deserialize(repository, state.metadata_hash())
-        .await
-        .forward::<StateError>("deserializing revision metadata")?;
-    metadata
-        .get_branch()
-        .forward::<StateError>("reading the branch a revision records")
+    let read = State::deserialize(repository.clone(), revision)
+        .await?
+        .recorded_branch(repository);
+    read.await
 }
 
 /// The branch `revision` is taken on, given the branch a specifier named and the
@@ -2209,19 +2207,24 @@ fn branch_target(suffix: &str, original_input: &str) -> Result<BranchTarget, Sta
 }
 
 /// The latests a lookup on `branch` can anchor on, as `(remote, local)`.
+///
+/// A remote that is throttled or can't be reached answers no latest, which the local latest covers.
+/// A remote that refuses the caller fails the lookup.
 async fn branch_latests(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     should_search_remote: bool,
     should_search_local: bool,
 ) -> Result<(Option<Hash>, Option<Hash>), StateError> {
-    let remote_latest = if should_search_remote && let Ok(remote) = repository.remote().await {
-        // no propagation here: a throttled or unreachable remote is what the
-        // local latest below exists to cover, so it stays `None` rather than
-        // failing here.
-        branch::load_remote_latest(remote.clone(), repository.id, branch)
-            .await
-            .ok()
+    let remote_latest = if should_search_remote
+        && let Some(remote) = absent_unless_refused::<_, _, StateError>(
+            repository.remote().await,
+            "connecting to the remote",
+        )? {
+        absent_unless_refused::<_, _, StateError>(
+            branch::load_remote_latest(remote, repository.id, branch).await,
+            "loading remote branch latest",
+        )?
     } else {
         None
     };
@@ -2335,17 +2338,26 @@ async fn resolve_revision_number(
     let mut revision = Hash::default();
 
     if should_search_remote
-        && let Ok(connection) = repository.remote().await
-        && let Ok(revision_service) = connection.revision(repository.id).await
-        && let Ok(response) = revision_service
-            .revision_list(
-                RevisionListIdentifier {
-                    branch,
-                    number: revision_number,
-                }
-                .into(),
-            )
-            .await
+        && let Some(connection) = absent_unless_refused::<_, _, StateError>(
+            repository.remote().await,
+            "connecting to the remote",
+        )?
+        && let Some(revision_service) = absent_unless_refused::<_, _, StateError>(
+            connection.revision(repository.id).await,
+            "connecting to the remote revision service",
+        )?
+        && let Some(response) = absent_unless_refused::<_, _, StateError>(
+            revision_service
+                .revision_list(
+                    RevisionListIdentifier {
+                        branch,
+                        number: revision_number,
+                    }
+                    .into(),
+                )
+                .await,
+            "listing the remote revisions",
+        )?
     {
         // A page the remote serves from a cached segment holds the number at any
         // position, not first.

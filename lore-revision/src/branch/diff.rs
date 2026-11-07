@@ -7,6 +7,7 @@ use lore_error_set::prelude::*;
 
 use crate::branch;
 use crate::branch::BranchError;
+use crate::errors::absent_unless_refused;
 use crate::lore::execution_context;
 use crate::repository::RepositoryContext;
 use crate::state;
@@ -48,7 +49,10 @@ pub async fn diff(
         .unwrap_or_default();
 
     if !execution_context().globals().local()
-        && let Ok(remote) = repository.remote().await
+        && let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+            repository.remote().await,
+            "connecting to the remote",
+        )?
     {
         let source_task = {
             let remote = remote.clone();
@@ -56,11 +60,13 @@ pub async fn diff(
             let repository_id = repository.id;
             lore_spawn!(async move {
                 if !source_branch.local {
-                    source_branch.latest
+                    Ok(source_branch.latest)
                 } else {
-                    branch::load_remote_latest(remote, repository_id, source_branch.id)
-                        .await
-                        .unwrap_or_default()
+                    absent_unless_refused::<_, _, BranchError>(
+                        branch::load_remote_latest(remote, repository_id, source_branch.id).await,
+                        "loading source remote latest",
+                    )
+                    .map(Option::unwrap_or_default)
                 }
             })
         };
@@ -70,27 +76,31 @@ pub async fn diff(
             let repository_id = repository.id;
             lore_spawn!(async move {
                 if !target_branch.local {
-                    target_branch.latest
+                    Ok(target_branch.latest)
                 } else {
-                    branch::load_remote_latest(remote, repository_id, target_branch.id)
-                        .await
-                        .unwrap_or_default()
+                    absent_unless_refused::<_, _, BranchError>(
+                        branch::load_remote_latest(remote, repository_id, target_branch.id).await,
+                        "loading target remote latest",
+                    )
+                    .map(Option::unwrap_or_default)
                 }
             })
         };
         let (source_result, target_result) = tokio::join!(source_task, target_task);
-        let source_remote_latest = source_result.internal("loading source remote latest")?;
-        let target_remote_latest = target_result.internal("loading target remote latest")?;
+        let source_remote_latest = source_result.internal("loading source remote latest")??;
+        let target_remote_latest = target_result.internal("loading target remote latest")??;
 
         // If remote is > local, use remote
         if source_latest.is_zero() {
             source_latest = source_remote_latest;
-        } else if let Ok(local_revision) =
-            state::State::deserialize(repository.clone(), source_latest).await
-        {
-            if let Ok(remote_revision) =
-                state::State::deserialize(repository.clone(), source_remote_latest).await
-                && local_revision.revision_number() > 0
+        } else if let Some(local_revision) = absent_unless_refused::<_, _, BranchError>(
+            state::State::deserialize(repository.clone(), source_latest).await,
+            "reading the source latest state",
+        )? {
+            if let Some(remote_revision) = absent_unless_refused::<_, _, BranchError>(
+                state::State::deserialize(repository.clone(), source_remote_latest).await,
+                "reading the source remote latest state",
+            )? && local_revision.revision_number() > 0
                 && remote_revision.revision_number() > local_revision.revision_number()
             {
                 source_latest = source_remote_latest;
@@ -102,12 +112,14 @@ pub async fn diff(
         // If remote is > local, use remote
         if target_latest.is_zero() {
             target_latest = target_remote_latest;
-        } else if let Ok(local_revision) =
-            state::State::deserialize(repository.clone(), target_latest).await
-        {
-            if let Ok(remote_revision) =
-                state::State::deserialize(repository.clone(), target_remote_latest).await
-                && local_revision.revision_number() > 0
+        } else if let Some(local_revision) = absent_unless_refused::<_, _, BranchError>(
+            state::State::deserialize(repository.clone(), target_latest).await,
+            "reading the target latest state",
+        )? {
+            if let Some(remote_revision) = absent_unless_refused::<_, _, BranchError>(
+                state::State::deserialize(repository.clone(), target_remote_latest).await,
+                "reading the target remote latest state",
+            )? && local_revision.revision_number() > 0
                 && remote_revision.revision_number() > local_revision.revision_number()
             {
                 target_latest = target_remote_latest;

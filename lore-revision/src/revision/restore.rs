@@ -225,7 +225,10 @@ pub(crate) async fn restore(
         .await
         .forward::<RestoreError>("loading current anchor")?;
 
-    let remote_head = if let Ok(remote) = repository.remote().await {
+    let remote_head = if let Some(remote) = absent_unless_refused::<_, _, RestoreError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? {
         branch::load_remote(remote.clone(), repository.id, current_branch)
             .await
             .forward::<RestoreError>("loading remote head")?

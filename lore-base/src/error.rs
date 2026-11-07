@@ -53,9 +53,13 @@
 //! `PluginNotFound` sits with the other not-found codes, not with the other
 //! plugin codes.
 
+use std::convert::Infallible;
 use std::fmt;
 
+use lore_error_set::ErrorSet;
 use lore_error_set::FfiError;
+use lore_error_set::ForwardAny;
+use lore_error_set::Has;
 use thiserror::Error;
 
 /// Scopes `#[ffi_code(N)]` to this module.
@@ -141,6 +145,33 @@ pub struct NotAuthenticated;
 #[error("Not authorized to access repository")]
 #[ffi_code(17)]
 pub struct NotAuthorized;
+
+/// Whether `error` is a refusal of the caller: [`NotAuthenticated`] or [`NotAuthorized`].
+pub fn is_refusal<E: FfiError>(error: &E) -> bool {
+    matches!(
+        error.ffi_code(),
+        NotAuthenticated::FFI_CODE | NotAuthorized::FFI_CODE
+    )
+}
+
+/// `error` forwarded into `Target` when it is the remote's refusal of the caller, which keeps its
+/// variant there, and `otherwise(error)` when it is any other failure.
+#[track_caller]
+pub fn forward_refusal_or<Source, Target>(
+    error: Source,
+    context: &str,
+    otherwise: impl FnOnce(Source) -> Target,
+) -> Target
+where
+    Source: ErrorSet + FfiError,
+    Target: ErrorSet + Has<NotAuthenticated> + Has<NotAuthorized>,
+{
+    if !is_refusal(&error) {
+        return otherwise(error);
+    }
+    let Err(target) = Err::<Infallible, Source>(error).forward_any::<Target>(context);
+    target
+}
 
 #[derive(Debug, Clone, Error, FfiError)]
 #[error("No token stored")]

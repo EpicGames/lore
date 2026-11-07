@@ -1754,10 +1754,7 @@ pub(crate) async fn push_fragments(
             immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
                 .await
                 .map_err(|err| {
-                    if err.is_disconnected()
-                        || err.is_not_authenticated()
-                        || err.is_not_authorized()
-                    {
+                    if err.is_disconnected() || is_refusal(&err) {
                         err.forward("putting fragment to remote")
                     } else {
                         PushError::internal_with_context(err, "putting fragment to remote")

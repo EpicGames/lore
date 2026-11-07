@@ -174,9 +174,11 @@ pub async fn info(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            InfoError::from(RevisionNotFound {
-                revision: revision_spec,
+        .map_err(|err| {
+            forward_refusal_or(err, "resolving the revision", |_err| {
+                InfoError::from(RevisionNotFound {
+                    revision: revision_spec,
+                })
             })
         })?
     } else {
@@ -239,26 +241,32 @@ async fn info_path(
     local: bool,
     filtered: bool,
 ) -> Result<(), InfoError> {
-    if let Ok(node_link) = state_current
-        .find_node_link(repository.clone(), path.as_str())
-        .await
-    {
+    if let Some(node_link) = absent_unless_refused::<_, _, InfoError>(
+        state_current
+            .find_node_link(repository.clone(), path.as_str())
+            .await,
+        "finding the node",
+    )? {
         // TODO(vri): UCS-19229 - Links: Handle link nodes in file info lookup
         let node_path = state_current
             .node_path(repository.clone(), node_link.node)
             .await
-            .map_err(|_err| {
-                InfoError::from(FileNotFound {
-                    resource: path.to_string(),
+            .map_err(|err| {
+                forward_refusal_or(err, "reading the node path", |_err| {
+                    InfoError::from(FileNotFound {
+                        resource: path.to_string(),
+                    })
                 })
             })?;
 
         let node = state_current
             .node(repository.clone(), node_link.node)
             .await
-            .map_err(|_err| {
-                InfoError::from(FileNotFound {
-                    resource: path.to_string(),
+            .map_err(|err| {
+                forward_refusal_or(err, "reading the node", |_err| {
+                    InfoError::from(FileNotFound {
+                        resource: path.to_string(),
+                    })
                 })
             })?;
 
@@ -764,11 +772,17 @@ fn calculate_filtered_size_recurse(
             let repository = repository.clone();
             let state = state.clone();
             let relative_path = relative_path.clone();
-            let Ok(child_node) = state.node(repository.clone(), child).await else {
-                failure = Some(InfoError::internal(
-                    "Failed to calculate filtered size, encountered an invalid node",
-                ));
-                break;
+            let child_node = match state.node(repository.clone(), child).await {
+                Ok(child_node) => child_node,
+                Err(err) => {
+                    failure = Some(forward_refusal_or(err, "reading a node block", |err| {
+                        InfoError::internal_with_context(
+                            err,
+                            "Failed to calculate filtered size, encountered an invalid node",
+                        )
+                    }));
+                    break;
+                }
             };
             if let Err(err) = child_node
                 .walk_step(child, node_id, &mut cycle)

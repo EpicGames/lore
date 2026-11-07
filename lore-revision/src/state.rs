@@ -1506,6 +1506,23 @@ fn push_named_child(children: &mut Vec<StateNamedNode>, child: StateNamedNode) {
     children.push(child);
 }
 
+/// The failure a read of a revision's state data reports: a missing address or payload is
+/// [`NotFound`], and a slow-down and the remote's refusal of the caller keep their variants.
+fn state_data_read_failure(err: ImmutableError) -> StateError {
+    match err {
+        ImmutableError::AddressNotFound(traced) => {
+            StateError::NotFound(NotFound.chain_err(traced, "state data address not found"))
+        }
+        ImmutableError::PayloadNotFound(traced) => {
+            StateError::NotFound(NotFound.chain_err(traced, "state data payload not found"))
+        }
+        ImmutableError::SlowDown(traced) => StateError::SlowDown(traced),
+        ImmutableError::NotAuthenticated(traced) => StateError::NotAuthenticated(traced),
+        ImmutableError::NotAuthorized(traced) => StateError::NotAuthorized(traced),
+        err => StateError::internal_with_context(err, "Failed to read state data"),
+    }
+}
+
 /// Outcome of [`State::find_subnode_added_since`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddedSince {
@@ -1902,23 +1919,7 @@ impl State {
         let mut data =
             match Box::pin(StateData::read_from_immutable(repository, address, options)).await {
                 Ok(data) => data,
-                Err(ImmutableError::AddressNotFound(traced)) => {
-                    return Err(StateError::NotFound(
-                        NotFound.chain_err(traced, "state data address not found"),
-                    ));
-                }
-                Err(ImmutableError::PayloadNotFound(traced)) => {
-                    return Err(StateError::NotFound(
-                        NotFound.chain_err(traced, "state data payload not found"),
-                    ));
-                }
-                Err(ImmutableError::SlowDown(traced)) => return Err(StateError::SlowDown(traced)),
-                Err(err) => {
-                    return Err(StateError::internal_with_context(
-                        err,
-                        "Failed to read state data",
-                    ));
-                }
+                Err(err) => return Err(state_data_read_failure(err)),
             };
 
         if data.magic != STATE_MAGIC {
@@ -2661,12 +2662,37 @@ impl State {
         Ok(())
     }
 
-    pub async fn branch(&self, repository: Arc<RepositoryContext>) -> Context {
-        let metadata = self.metadata_hash();
-        let metadata = metadata::Metadata::deserialize(repository, metadata)
-            .await
-            .unwrap_or_default();
-        metadata.get_branch().unwrap_or_default()
+    /// The branch this state's metadata records, which is the branch it was committed on, or the
+    /// failure to read it, a refusal keeping its variant. [`Self::branch`] answers the zero branch
+    /// ID instead of a failure. Reads only the branch, without the strings
+    /// [`Self::revision_metadata`] allocates.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[inline]
+    pub fn recorded_branch(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> impl Future<Output = Result<Context, StateError>> + Send + use<> {
+        futures::FutureExt::map(
+            metadata::Metadata::deserialize(repository, self.metadata_hash()),
+            |metadata| -> Result<Context, StateError> {
+                metadata
+                    .forward::<StateError>("deserializing revision metadata")?
+                    .get_branch()
+                    .forward::<StateError>("reading the branch a revision records")
+            },
+        )
+    }
+
+    /// [`Self::recorded_branch`], or the zero branch ID where it cannot be read.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[inline]
+    pub fn branch(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> impl Future<Output = Context> + Send + use<> {
+        futures::FutureExt::map(self.recorded_branch(repository), Result::unwrap_or_default)
     }
 
     pub fn metadata_hash(&self) -> Hash {

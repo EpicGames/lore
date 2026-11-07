@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lore_base::types::Address;
 use lore_base::types::BranchPoint;
+use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_revision::change;
 use lore_revision::change::FileAction;
@@ -35,6 +37,34 @@ fn branch_point(branch: u8, revision_byte: u8) -> BranchPoint {
         branch: branch_id(branch),
         revision: revision(revision_byte),
     }
+}
+
+/// Names bytes that are not metadata, stored in `repository`'s local store, as the metadata of
+/// `branch`, so a read of the local copy fails.
+pub(crate) async fn store_unreadable_metadata(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) {
+    let bytes = Bytes::from_static(b"not branch metadata");
+    let hash = lore_storage::hash::hash_slice(&bytes);
+    repository
+        .immutable_store()
+        .put(
+            repository.id,
+            Address::zero_context_hash(hash),
+            Fragment {
+                flags: 0,
+                size_payload: bytes.len() as u32,
+                size_content: bytes.len() as u64,
+            },
+            Some(bytes),
+            false,
+        )
+        .await
+        .expect("storing bytes that are not metadata");
+    mutable_store_metadata(repository.clone(), branch, hash)
+        .await
+        .expect("storing the metadata hash");
 }
 
 /// A branch merging the branch it was created from: the shared branch is the
@@ -1185,13 +1215,17 @@ mod resolve_through_the_remote {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_revision::metadata::Metadata;
     use lore_revision::repository::RemoteState;
     use lore_revision::repository::RepositoryPaths;
     use lore_revision::test_util::context_with_state;
+    use lore_transport::Connection;
     use lore_transport::ProtocolError;
 
     use super::*;
     use crate::helper::in_memory;
+    use crate::immutable::serving::Serving;
+    use crate::immutable::serving::serving_remote;
     use crate::immutable::session_tests::under_globals;
     use crate::paged_remote::PagedRemote;
     use crate::paged_remote::client_and_writer;
@@ -1271,6 +1305,57 @@ mod resolve_through_the_remote {
                 ),
             }
         }
+    }
+
+    /// A context that cannot write, whose local copy of a branch's metadata is unreadable, reads the
+    /// remote's metadata and keeps it in its local store.
+    #[tokio::test]
+    async fn a_read_only_metadata_read_keeps_the_remote_metadata_locally() {
+        let branch = branch_id(7);
+        let source = context_with_state(RemoteState::Offline).await;
+        let mut served = Metadata::new();
+        served
+            .set_branch(branch)
+            .expect("the metadata holds the branch");
+        let hash = under_globals(globals(false), || served.serialize_local(source.clone()))
+            .await
+            .expect("the remote's metadata is stored");
+        let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        let writer = Arc::new(
+            RepositoryContext::new_with_state(
+                None,
+                immutable,
+                mutable,
+                source.id,
+                InstanceId::default(),
+                RemoteState::Connected(Connection::detached_revision(
+                    vec![serving_remote(&source, Serving::default())],
+                    Ok(()),
+                    source.id,
+                    Arc::new(PagedRemote::new(branch, Hash::default()).metadata(hash)),
+                )),
+                Arc::default(),
+                None,
+            )
+            .with_write_token(in_memory::token()),
+        );
+        store_unreadable_metadata(&writer, branch).await;
+        let repository = Arc::new(writer.without_command_locks());
+
+        let read = under_globals(globals(false), || {
+            lore_revision::branch::metadata(repository.clone(), branch)
+        })
+        .await
+        .expect("the remote's metadata is read");
+
+        assert_eq!(read.get_branch().ok(), Some(branch));
+        assert!(
+            lore_revision::immutable::is_stored_local(repository, Address::zero_context_hash(hash))
+                .await,
+            "the remote's metadata is kept locally"
+        );
     }
 
     /// An instance on in-memory stores, rooted at the directory returned with it, whose current

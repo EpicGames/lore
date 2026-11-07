@@ -704,10 +704,16 @@ pub async fn load_name_to_id(
         return Ok(id.to_context());
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(revision_service) = remote.revision(repository.id).await
-        && let Ok(response) = revision_service.branch_query(None, Some(name)).await
-        && !response.id.is_zero()
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(revision_service) = absent_unless_refused::<_, _, BranchError>(
+        remote.revision(repository.id).await,
+        "connecting to the remote revision service",
+    )? && let Some(response) = absent_unless_refused::<_, _, BranchError>(
+        revision_service.branch_query(None, Some(name)).await,
+        "querying the remote for the branch name",
+    )? && !response.id.is_zero()
     {
         let branch = response.id;
         let _ = store_name_to_id(repository.clone(), branch, name).await;
@@ -789,10 +795,10 @@ pub async fn load_latest(
         Ok(head) => Ok(head),
         Err(err) if err.is_branch_not_found() => {
             // In case no revision is yet pushed return a zero hash
-            if let Ok(_metadata) = metadata_hash(repository, branch).await {
-                Ok(Hash::default())
-            } else {
-                Err(err)
+            match metadata_hash(repository, branch).await {
+                Ok(_metadata) => Ok(Hash::default()),
+                Err(refused) if is_refusal(&refused) => Err(refused),
+                Err(_) => Err(err),
             }
         }
         Err(err) => Err(err),
@@ -842,25 +848,27 @@ pub async fn load_last_sync(
     }
 }
 
+/// The latest revision of `branch` on the remote. A failed branch query, other than a refusal, is
+/// reported as [`BranchNotFound`].
 pub async fn load_remote_latest(
     remote: Arc<Connection>,
     repository: RepositoryId,
     branch: BranchId,
 ) -> Result<Hash, BranchError> {
-    if let Ok(response) = remote
+    remote
         .revision(repository)
         .await
         .forward::<BranchError>("Failed to connect to remote revision service")?
         .branch_query(Some(branch), None)
         .await
-    {
-        Ok(response.latest)
-    } else {
-        // Silent error return, let caller determine if error
-        Err(BranchError::from(BranchNotFound {
-            branch: branch.to_string(),
-        }))
-    }
+        .map(|response| response.latest)
+        .map_err(|err| {
+            forward_refusal_or(err, "querying the remote branch", |_err| {
+                BranchError::from(BranchNotFound {
+                    branch: branch.to_string(),
+                })
+            })
+        })
 }
 
 #[derive(PartialEq)]
@@ -993,9 +1001,13 @@ pub async fn metadata_hash(
         return Ok(metadata);
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(status) = load_remote(remote, repository.id, branch).await
-        && !status.metadata.is_zero()
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(status) = absent_unless_refused::<_, _, BranchError>(
+        load_remote(remote, repository.id, branch).await,
+        "loading the remote branch",
+    )? && !status.metadata.is_zero()
     {
         return Ok(status.metadata);
     }
@@ -1135,7 +1147,7 @@ async fn resolve_remote(
 /// refusal of the credentials passes on; any other failure is `BranchNotFound`, as the branch is
 /// unknown without the remote.
 fn remote_lookup_failure(err: ProtocolError, branch: &str) -> BranchError {
-    if err.is_refusal() {
+    if is_refusal(&err) {
         return err.forward("connecting to remote for branch lookup");
     }
     BranchError::BranchNotFound(
@@ -1164,7 +1176,7 @@ fn queried_status(
         Err(ProtocolError::NotFound(_)) => Err(BranchError::from(BranchNotFound {
             branch: branch.to_string(),
         })),
-        Err(err) if err.is_refusal() => Err(err.forward("querying branch on remote")),
+        Err(err) if is_refusal(&err) => Err(err.forward("querying branch on remote")),
         Err(err) => Err(BranchError::internal_with_context(
             err,
             "Failed to get information from remote",
@@ -1186,7 +1198,10 @@ async fn resolve_default(
 ) -> Result<BranchStatus, BranchError> {
     let id = if let Ok(id) = Context::from_str(branch) {
         id
-    } else if let Ok(id) = branch::load_name_to_id(repository.clone(), branch).await {
+    } else if let Some(id) = absent_unless_refused::<_, _, BranchError>(
+        branch::load_name_to_id(repository.clone(), branch).await,
+        "looking up the branch name",
+    )? {
         id
     } else {
         let remote = repository
@@ -1202,7 +1217,10 @@ async fn resolve_default(
         return queried_status(response, branch);
     };
 
-    if let Ok(metadata) = metadata_hash(repository.clone(), id).await {
+    if let Some(metadata) = absent_unless_refused::<_, _, BranchError>(
+        metadata_hash(repository.clone(), id).await,
+        "loading the branch metadata hash",
+    )? {
         let latest = load_latest(repository.clone(), id)
             .await
             .unwrap_or_default();
@@ -1216,16 +1234,14 @@ async fn resolve_default(
         });
     }
 
-    match repository.remote().await {
-        Ok(remote) => match load_remote(remote, repository.id, id).await {
-            Ok(status) => return Ok(status),
-            Err(err) if err.is_not_authenticated() || err.is_not_authorized() => return Err(err),
-            Err(_) => {}
-        },
-        Err(err) if err.is_refusal() => {
-            return Err(err.forward("connecting to remote for branch lookup"));
-        }
-        Err(_) => {}
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(status) = absent_unless_refused::<_, _, BranchError>(
+        load_remote(remote, repository.id, id).await,
+        "loading the remote branch",
+    )? {
+        return Ok(status);
     }
 
     Ok(BranchStatus {
@@ -1243,19 +1259,26 @@ pub async fn load_metadata(
         .forward::<BranchError>("Failed to deserialize branch metadata")
 }
 
+/// The metadata of `branch`, read locally, or on the remote where the instance holds none it can
+/// read. Keeping the remote's metadata hash locally is best effort, so a context that cannot write
+/// still reads the remote's metadata. The remote's refusal of the caller is returned.
 pub async fn metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
 ) -> Result<Metadata, BranchError> {
     let local_metadata = metadata_local(repository.clone(), branch).await;
-    if local_metadata.is_ok() {
+    if local_metadata.as_ref().map_or_else(is_refusal, |_| true) {
         return local_metadata;
     }
 
-    if let Ok(remote) = repository.remote().await
-        && let Ok(status) = load_remote(remote, repository.id, branch).await
-    {
-        mutable_store(repository.clone(), METADATA, branch, status.metadata).await?;
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(status) = absent_unless_refused::<_, _, BranchError>(
+        load_remote(remote, repository.id, branch).await,
+        "loading the remote branch",
+    )? {
+        let _ = mutable_store(repository.clone(), METADATA, branch, status.metadata).await;
         return load_metadata(repository, status.metadata).await;
     }
 
@@ -1268,15 +1291,6 @@ pub async fn metadata_local(
 ) -> Result<Metadata, BranchError> {
     let hash = metadata_hash(repository.clone(), branch).await?;
     load_metadata(repository, hash).await
-}
-
-pub async fn metadata_remote(
-    remote: Arc<Connection>,
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-) -> Result<Metadata, BranchError> {
-    let status = load_remote(remote, repository.id, branch).await?;
-    load_metadata(repository, status.metadata).await
 }
 
 pub fn metadata_populate(
@@ -3105,6 +3119,27 @@ async fn try_auto_resolve_conflict(
     }
 }
 
+/// The stack of `branch` from its metadata, read locally or on the remote, and empty when it can't
+/// be read. The remote's refusal of the caller is returned rather than read as no stack. `side`
+/// names the branch in the log.
+async fn diff3_stack(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    side: &str,
+) -> Result<Vec<BranchPoint>, BranchError> {
+    let Some(branch_metadata) = absent_unless_refused::<_, _, BranchError>(
+        metadata(repository.clone(), branch).await,
+        "loading branch metadata",
+    )?
+    else {
+        lore_debug!("No local or remote {side} branch metadata available");
+        return Ok(Vec::new());
+    };
+    let stack = stack(&branch_metadata);
+    lore_debug!("Loaded metadata for {side} branch {branch}, found stack {stack:?}");
+    Ok(stack)
+}
+
 /// Resolve the common-ancestor base revision for a 3-way diff between two
 /// branches' tips. Performs the branch-stack walking, branch-point
 /// matching, and divergence detection that `diff3_collect` would otherwise
@@ -3145,57 +3180,8 @@ pub async fn resolve_diff3_base(
     );
 
     let common_ancestor = if source_branch != target_branch {
-        let source_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), source_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for source branch {source_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), source_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for source branch {source_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote source branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local source branch metadata available and have no remote");
-            vec![]
-        };
-
-        let target_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), target_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for target branch {target_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), target_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for target branch {target_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote target branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local target branch metadata available and have no remote");
-            vec![]
-        };
+        let source_stack = diff3_stack(&repository, source_branch, "source").await?;
+        let target_stack = diff3_stack(&repository, target_branch, "target").await?;
 
         let Some(common_ancestor) = find_common_ancestor_from_branch_points(
             repository.clone(),
@@ -3220,16 +3206,10 @@ pub async fn resolve_diff3_base(
 
         common_ancestor
     } else {
-        let branch_point = metadata(repository.clone(), source_branch)
-            .await
-            .map(|metadata| {
-                let stack = stack(&metadata);
-                lore_debug!(
-                    "Loaded local metadata for source branch {source_branch}, found stack {stack:?}"
-                );
-                stack.first().map(|parent| parent.revision)
-            })
-            .unwrap_or_default();
+        let branch_point = diff3_stack(&repository, source_branch, "source")
+            .await?
+            .first()
+            .map(|parent| parent.revision);
         let common_ancestor = Box::pin(find_common_revision_in_history_lines(
             repository.clone(),
             source_revision,

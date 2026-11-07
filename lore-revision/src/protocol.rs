@@ -16,6 +16,7 @@ use lore_transport::connection::RECONNECT_MAX_DELAY;
 use lore_transport::connection::RECONNECT_START_DELAY;
 use tokio::time::Instant;
 
+use crate::errors::is_refusal;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
 
@@ -236,7 +237,7 @@ impl RemoteConnections {
                             retry,
                         };
                     }
-                    Err(error) if error.is_refusal() => {
+                    Err(error) if is_refusal(error) => {
                         connections.remove(&repository);
                     }
                     Err(error) => {

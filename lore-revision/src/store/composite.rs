@@ -41,6 +41,7 @@ use crate::cluster::peer::PeerInfo;
 use crate::cluster::topology::Topology;
 use crate::errors::AddressNotFound;
 use crate::errors::SlowDown;
+use crate::errors::is_refusal;
 use crate::fragment::FragmentFlags;
 use crate::lore::Address;
 use crate::lore::Context;
@@ -918,6 +919,7 @@ impl CompositeStore {
                         break;
                     }
                 }
+                Err(error) if is_durable && is_refusal(&error) => return Err(error),
                 Err(error) => {
                     if is_durable && !error.is_slow_down() && !error.is_internal() {
                         break;

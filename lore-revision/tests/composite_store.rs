@@ -3845,6 +3845,43 @@ mod tests {
                     .await;
             }
 
+            /// A durable store that refuses the caller is not read as holding nothing: every
+            /// listener is handed the refusal.
+            #[tokio::test]
+            async fn durable_refusal_answers_every_listener_with_the_refusal() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let repository: Partition = random::<RepositoryId>();
+                        let address = random::<Address>();
+
+                        let durable = Arc::new(DelayStore::failing(
+                            StoreError::from(lore_base::error::NotAuthorized),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let error = handle
+                                .await
+                                .expect("task panicked")
+                                .expect_err("get_metadata reports the refusal");
+                            assert!(error.is_not_authorized(), "{error:?}");
+                        }
+
+                        assert_eq!(durable.get_metadata_count(), 1);
+                    })
+                    .await;
+            }
+
             /// The inflight slot is keyed by partition and address, so unrelated lookups running
             /// at the same time must not be served one another's answer.
             #[tokio::test]

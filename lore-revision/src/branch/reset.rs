@@ -150,7 +150,7 @@ pub async fn reset(
 
     let branch = match branch::resolve(repository.clone(), branch.as_str()).await {
         Ok(resolved) => resolved,
-        Err(err) if err.is_not_authenticated() || err.is_not_authorized() => {
+        Err(err) if is_refusal(&err) => {
             return Err(err).forward_any("resolving branch");
         }
         Err(err) => {

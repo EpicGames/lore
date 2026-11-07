@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_base::env::AUTH_PATH_VAR;
+use lore_base::error::is_refusal;
 use lore_base::lore_debug;
 use lore_base::lore_spawn_net;
 use lore_base::lore_spawn_net_nocontext;
@@ -461,7 +462,7 @@ fn check_advertised_endpoints(
 /// Only a refusal does. Everything else — a disconnect, backpressure, an internal fault — says the
 /// answer was not obtained rather than that it is no.
 fn refusal_is_final(err: &ProtocolError) -> bool {
-    err.is_refusal()
+    is_refusal(err)
 }
 
 /// `identity_token` and `access_token` are the credentials the caller supplied
@@ -1015,7 +1016,7 @@ impl ServiceReady {
         self.result
             .lock()
             .as_ref()
-            .is_some_and(|result| result.as_ref().is_err_and(ProtocolError::is_refusal))
+            .is_some_and(|result| result.as_ref().is_err_and(is_refusal))
     }
 
     async fn wait(&self) -> Result<(), ProtocolError> {
@@ -1185,15 +1186,7 @@ impl Connection {
         storage: Vec<Arc<dyn Storage>>,
         ready: Result<(), ProtocolError>,
     ) -> Arc<Self> {
-        let connection = Arc::new(Connection::unconnected(
-            Url::parse("lore://detached.invalid").expect("valid URL"),
-            AuthEndpoint::none(),
-            String::new(),
-            Arc::default(),
-            AuthMode::Auto,
-            EnvironmentConfig::default(),
-            Arc::new(LoreProtocol::default()),
-        ));
+        let connection = Self::detached_over(Arc::new(LoreProtocol::default()));
         if !storage.is_empty() {
             *connection.storage.write() = Some(Arc::new(StorageConnector::new(storage)));
         }
@@ -1201,11 +1194,41 @@ impl Connection {
         connection
     }
 
-    /// A [`detached`](Self::detached) connection reaching no storage, whose revision service
-    /// for `repository` is `revision`.
+    /// A [`detached`](Self::detached) connection reaching no storage, which opens its revision,
+    /// admin and lock services through `protocol`.
     #[cfg(feature = "test-util")]
-    pub fn detached_revision(repository: RepositoryId, revision: Arc<dyn Revision>) -> Arc<Self> {
-        let connection = Self::detached(Vec::new());
+    pub fn detached_protocol(protocol: Arc<dyn Protocol>) -> Arc<Self> {
+        let connection = Self::detached_over(protocol);
+        connection.storage_ready.complete(Ok(()));
+        connection.revision_ready.complete(Ok(()));
+        connection.lock_ready.complete(Ok(()));
+        connection
+    }
+
+    /// A connection to no remote over `protocol`, with every service pending.
+    #[cfg(feature = "test-util")]
+    fn detached_over(protocol: Arc<dyn Protocol>) -> Arc<Self> {
+        Arc::new(Connection::unconnected(
+            Url::parse("lore://detached.invalid").expect("valid URL"),
+            AuthEndpoint::none(),
+            String::new(),
+            Arc::default(),
+            AuthMode::Auto,
+            EnvironmentConfig::default(),
+            protocol,
+        ))
+    }
+
+    /// A [`detached`](Self::detached) connection over `storage`, whose storage connect answered
+    /// `ready` and whose revision service for `repository` is `revision`.
+    #[cfg(feature = "test-util")]
+    pub fn detached_revision(
+        storage: Vec<Arc<dyn Storage>>,
+        ready: Result<(), ProtocolError>,
+        repository: RepositoryId,
+        revision: Arc<dyn Revision>,
+    ) -> Arc<Self> {
+        let connection = Self::detached_ready(storage, ready);
         connection.revision.insert(repository, revision);
         connection.revision_ready.complete(Ok(()));
         connection

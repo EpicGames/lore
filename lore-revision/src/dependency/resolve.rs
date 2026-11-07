@@ -15,6 +15,7 @@ use super::LoreDependencyResolveItemEventData;
 use super::load_dependency_data;
 use crate::errors::FileNotFound;
 use crate::errors::InvalidArguments;
+use crate::errors::forward_refusal_or;
 use crate::event;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
@@ -222,12 +223,14 @@ pub async fn resolve_dependency_file_set(
             .find_node_link(repository.clone(), path)
             .await
             .map_err(|err| {
-                DependencyError::FileNotFound(
-                    FileNotFound {
-                        resource: (*path).to_string(),
-                    }
-                    .chain_err_from(err, "root path not found in state"),
-                )
+                forward_refusal_or(err, "finding the root path", |err| {
+                    DependencyError::FileNotFound(
+                        FileNotFound {
+                            resource: (*path).to_string(),
+                        }
+                        .chain_err_from(err, "root path not found in state"),
+                    )
+                })
             })?;
         if !node_link.is_valid() {
             return Err(FileNotFound {

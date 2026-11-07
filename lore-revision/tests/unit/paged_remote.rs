@@ -38,12 +38,14 @@ struct Page {
     older: Hash,
 }
 
-/// A remote holding one branch at `latest`, which answers a revision list with the page
-/// registered for its anchor and counts the revision lists it is asked for. An anchor with no
-/// page is not found. A remote with a `refusal` answers every branch query with it.
+/// A remote holding one branch at `latest`, with its metadata at `metadata`, which answers a
+/// revision list with the page registered for its anchor and counts the revision lists it is asked
+/// for. An anchor with no page is not found. A remote with a `refusal` answers every branch query
+/// with it.
 pub(crate) struct PagedRemote {
     branch: BranchId,
     latest: Hash,
+    metadata: Hash,
     pages: Vec<Page>,
     lists: AtomicUsize,
     refusal: Option<ProtocolError>,
@@ -54,10 +56,17 @@ impl PagedRemote {
         Self {
             branch,
             latest,
+            metadata: Hash::default(),
             pages: Vec::new(),
             lists: AtomicUsize::new(0),
             refusal: None,
         }
+    }
+
+    /// Hold the branch's metadata at `metadata`.
+    pub(crate) fn metadata(mut self, metadata: Hash) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     /// Answer every branch query with `refusal`.
@@ -101,7 +110,12 @@ pub(crate) async fn client_and_writer(
         mutable,
         repository_id,
         lore_revision::instance::InstanceId::default(),
-        RemoteState::Connected(Connection::detached_revision(repository_id, remote)),
+        RemoteState::Connected(Connection::detached_revision(
+            Vec::new(),
+            Ok(()),
+            repository_id,
+            remote,
+        )),
         Arc::default(),
         None,
     ));
@@ -210,7 +224,7 @@ impl Revision for PagedRemote {
         Ok(BranchQueryResponse {
             id: self.branch,
             latest: self.latest,
-            metadata: Hash::default(),
+            metadata: self.metadata,
             deleted: false,
         })
     }

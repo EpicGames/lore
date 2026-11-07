@@ -14,6 +14,7 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::errors::is_refusal;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
 use crate::lore::Address;
@@ -198,7 +199,7 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
 
     let remote = match repository.remote().await {
         Ok(remote) => remote,
-        Err(err) if err.is_refusal() => {
+        Err(err) if is_refusal(&err) => {
             return Err(err).forward_any("connecting to remote for notifications");
         }
         Err(_) => {

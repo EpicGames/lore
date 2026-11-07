@@ -1097,10 +1097,15 @@ pub async fn latest_revision(
         .await
         .unwrap_or_default();
 
-    let remote_latest = if let Ok(remote) = repository.remote().await {
-        branch::load_remote_latest(remote, repository.id, branch)
-            .await
-            .unwrap_or_default()
+    let remote_latest = if let Some(remote) = absent_unless_refused::<_, _, LayerError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? {
+        absent_unless_refused::<_, _, LayerError>(
+            branch::load_remote_latest(remote, repository.id, branch).await,
+            "loading remote branch latest",
+        )?
+        .unwrap_or_default()
     } else {
         local_latest
     };
@@ -1116,10 +1121,18 @@ pub async fn latest_revision(
         return Ok(local_latest);
     }
 
-    let Ok(local_state) = State::deserialize(repository.clone(), local_latest).await else {
+    let Some(local_state) = absent_unless_refused::<_, _, LayerError>(
+        State::deserialize(repository.clone(), local_latest).await,
+        "reading the local latest state",
+    )?
+    else {
         return Ok(remote_latest);
     };
-    let Ok(remote_state) = State::deserialize(repository.clone(), remote_latest).await else {
+    let Some(remote_state) = absent_unless_refused::<_, _, LayerError>(
+        State::deserialize(repository.clone(), remote_latest).await,
+        "reading the remote latest state",
+    )?
+    else {
         return Ok(local_latest);
     };
 

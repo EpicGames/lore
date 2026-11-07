@@ -70,6 +70,8 @@ pub(crate) use lore_base::error::SharedStoreNotFound;
 pub(crate) use lore_base::error::SlowDown;
 pub(crate) use lore_base::error::TokenNotFound;
 pub(crate) use lore_base::error::WriteRequired;
+pub(crate) use lore_base::error::forward_refusal_or;
+pub(crate) use lore_base::error::is_refusal;
 
 #[error_set]
 pub enum StateErrors {
@@ -152,4 +154,18 @@ where
         Err(err) if propagate(&err) => Err(err).forward_any::<Target>(context),
         Err(_) => Ok(None),
     }
+}
+
+/// [`absent_unless`] holding back a refusal of the caller. `Target` must declare both refusal
+/// variants, as [`forward_refusal_or`] requires, so a refusal cannot become `Internal`.
+#[track_caller]
+pub(crate) fn absent_unless_refused<T, Source, Target>(
+    result: Result<T, Source>,
+    context: &str,
+) -> Result<Option<T>, Target>
+where
+    Source: ErrorSet + FfiError,
+    Target: ErrorSet + Has<NotAuthenticated> + Has<NotAuthorized>,
+{
+    absent_unless(result, is_refusal, context)
 }

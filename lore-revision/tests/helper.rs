@@ -144,6 +144,25 @@ pub async fn test_repository_create(
     mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
     repository_id: lore_revision::lore::RepositoryId,
 ) -> TestRepository {
+    test_repository_create_with_remote(
+        immutable_store,
+        mutable_store,
+        repository_id,
+        Err(lore_transport::ProtocolError::from(
+            lore_base::error::NoRemote,
+        )),
+    )
+    .await
+}
+
+/// [`test_repository_create`] whose context answers `remote` as its remote connection.
+#[allow(dead_code)]
+pub async fn test_repository_create_with_remote(
+    immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    repository_id: lore_revision::lore::RepositoryId,
+    remote: Result<std::sync::Arc<lore_transport::Connection>, lore_transport::ProtocolError>,
+) -> TestRepository {
     let tempdir = generate_tempdir();
     let path = tempdir.to_path_buf();
     let default_branch_id = lore_base::types::Context::from(uuid::Uuid::now_v7());
@@ -166,7 +185,8 @@ pub async fn test_repository_create(
             default_repository_creation_args(immutable_store, mutable_store)
                 .with_path(&path)
                 .with_id(repository_id)
-                .with_instance_id(created.instance_id),
+                .with_instance_id(created.instance_id)
+                .with_remote(remote),
         )
         .with_write_token(write_token.share()),
     );

@@ -185,11 +185,20 @@ pub async fn create(
                         Some(created)
                     }
                     Err(err) => {
-                        return Err(CreateError::BranchAlreadyExists(
-                            BranchAlreadyExists {
-                                branch: branch.clone(),
-                            }
-                            .chain_err_from(err, "failed to resolve branch for force-recreate"),
+                        return Err(forward_refusal_or(
+                            err,
+                            "resolving branch for force-recreate",
+                            |err| {
+                                CreateError::BranchAlreadyExists(
+                                    BranchAlreadyExists {
+                                        branch: branch.clone(),
+                                    }
+                                    .chain_err_from(
+                                        err,
+                                        "failed to resolve branch for force-recreate",
+                                    ),
+                                )
+                            },
                         ));
                     }
                 }
@@ -206,6 +215,7 @@ pub async fn create(
                 return Err(CreateError::from(BranchAlreadyExists { branch }));
             }
         }
+        Err(err) if is_refusal(&err) => return Err(err).forward::<CreateError>("creating branch"),
         Err(err) => return Err(CreateError::internal_with_context(err, "creating branch")),
     };
 
@@ -304,6 +314,9 @@ async fn layer_branch_create(
                 return Err(CreateError::internal(
                     "Failed to create branch in layer, branch already exist",
                 ));
+            }
+            Err(err) if is_refusal(&err) => {
+                return Err(err).forward::<CreateError>("creating branch in layer");
             }
             Err(err) => {
                 return Err(CreateError::internal_with_context(

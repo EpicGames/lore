@@ -36,7 +36,7 @@ use super::session_tests::under_execution_context;
 /// holds for a notification; and the refusal of the credentials it answers every verify and
 /// mutable load with.
 #[derive(Default)]
-pub(super) struct Serving {
+pub(crate) struct Serving {
     pub(super) tampered: Option<Address>,
     pub(super) heals: bool,
     pub(super) heal_fails: bool,
@@ -51,7 +51,7 @@ pub(super) struct Serving {
 /// A remote serving what `source` stores as `serving` says, recording each address asked of it, the
 /// sessions started on it, numbered from 1, the verifies asked of it and the most gets it held at
 /// once.
-pub(super) struct ServingStorage {
+pub(crate) struct ServingStorage {
     source: Arc<RepositoryContext>,
     serving: Serving,
     asked: std::sync::Mutex<Vec<Address>>,
@@ -241,7 +241,7 @@ impl ServingStorage {
 }
 
 /// A remote serving what `source` stores as `serving` says.
-pub(super) fn serving_remote(
+pub(crate) fn serving_remote(
     source: &Arc<RepositoryContext>,
     serving: Serving,
 ) -> Arc<ServingStorage> {

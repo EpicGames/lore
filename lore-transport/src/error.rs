@@ -22,13 +22,6 @@ pub enum ProtocolError {
     Oversized,
 }
 
-impl ProtocolError {
-    /// Whether the remote refused the credentials presented, as unauthenticated or unauthorized.
-    pub fn is_refusal(&self) -> bool {
-        self.is_not_authorized() || self.is_not_authenticated()
-    }
-}
-
 impl From<tonic::Status> for ProtocolError {
     fn from(value: tonic::Status) -> Self {
         match value.code() {

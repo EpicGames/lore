@@ -1290,6 +1290,9 @@ pub(crate) async fn stage_single_node(
         Err(e) if e.is_node_not_found() => {
             // Fall through to create a new node
         }
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward::<StageError>("finding the subnode");
+        }
         Err(err) => {
             return Err(StageError::internal_with_context(
                 err,
@@ -3049,6 +3052,9 @@ pub(crate) async fn stage_node_from_metadata(
             }
         }
         Ok(None) => NodeLink::invalid(),
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward::<StageError>("finding the subnode");
+        }
         Err(err) => {
             return Err(StageError::internal_with_context(
                 err,
