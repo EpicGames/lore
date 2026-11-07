@@ -3,8 +3,9 @@
 import logging
 
 import pytest
+from error_types import LocalChanges, UnresolvedConflictError
+from lore_parsers import parse_status_json
 
-from error_types import LocalChanges
 from lore import Lore, verify_signatures
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,47 @@ def test_merge_conflict_keep_files(new_lore_repo):
     assert repo.file_exists(text_file + "~mine"), "Mine file does not exist"
     assert repo.file_exists(text_file + "~theirs"), "Theirs file does not exist"
     assert repo.file_exists(text_file + "~base"), "Base file does not exist"
+
+
+def unresolved_conflicts(repo: Lore) -> set[str]:
+    """The paths the status reports in an unresolved conflict."""
+    entries = parse_status_json(repo.status(json=True))
+    return {e["path"] for e in entries if e.get("flagConflictUnresolved") is True}
+
+
+def test_merge_conflict_deleted_here_survives_scan(new_lore_repo):
+    """A file deleted on this branch and changed on the incoming one is in conflict with no file on
+    disk, and is in neither the current revision nor the working tree. A scan must not take that
+    for an add the user reverted and drop it, which lets the merge commit without the incoming
+    change (EpicGames/lore#275)."""
+    repo: Lore = new_lore_repo()
+    path = "a.txt"
+    repo.write_commit_push("Add the file", {path: ["v1\n"]})
+
+    repo.branch_create("incoming")
+    repo.write_commit_push("Change the file", {path: ["v2\n"]})
+
+    repo.branch_switch("main")
+    repo.remove_file(path)
+    repo.stage(scan=True)
+    repo.commit("Delete the file")
+    repo.push()
+
+    repo.branch_merge("incoming")
+    assert unresolved_conflicts(repo) == {path}
+    assert not repo.file_exists(path)
+
+    repo.status(scan=True)
+    assert unresolved_conflicts(repo) == {path}, "the scan dropped the conflict"
+    with pytest.raises(UnresolvedConflictError):
+        repo.commit("Merge with the conflict unresolved")
+
+    # Keeping this side still keeps the deletion.
+    repo.branch_merge_resolve_mine(path)
+    repo.status(scan=True)
+    assert unresolved_conflicts(repo) == set()
+    repo.commit("Merge, keeping the deletion")
+    assert not repo.file_exists(path)
 
 
 @pytest.mark.smoke
