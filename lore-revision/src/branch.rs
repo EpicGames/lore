@@ -9,8 +9,6 @@ pub mod push;
 pub mod reset;
 
 use std::cmp::PartialEq;
-use std::collections::HashSet;
-use std::hash::BuildHasherDefault;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str;
@@ -24,7 +22,6 @@ use futures::StreamExt;
 use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_base::types::BranchPoint;
-use lore_base::types::PassThroughHasher;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::MatchedProtocolError;
@@ -34,6 +31,7 @@ use tokio::join;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
+use tokio::try_join;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use zerocopy::Immutable;
 
@@ -47,6 +45,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::find;
 use crate::hash;
+use crate::history;
 use crate::immutable;
 use crate::immutable::ReadFromImmutable;
 use crate::immutable::WriteToImmutable;
@@ -3539,7 +3538,8 @@ enum HistoryLineSearch {
 /// Only this direction can succeed: a revision's number is one past its parents',
 /// so a walk backwards never reaches a higher numbered revision. The walk stops
 /// once the line drops below `older_revision_number`, and after
-/// `MAX_DIVERGENT_HISTORY_LENGTH` revisions.
+/// `MAX_DIVERGENT_HISTORY_LENGTH` revisions. It fails where a batch of the line
+/// fails to load, as [`find::batch_load_history`] describes.
 ///
 /// The two ways of not finding it are worth telling apart.
 /// [`HistoryLineSearch::Diverged`] is a result: the line went past where the
@@ -3562,17 +3562,27 @@ async fn find_revision_in_history_line(
         return Ok(HistoryLineSearch::Reached);
     }
 
-    let mut line = load_history_line(repository.clone(), newer_revision).await;
+    let mut line = load_history_line(repository.clone(), newer_revision).await?;
     let mut scanned = 0;
 
     loop {
-        if line[scanned..].contains(&older_revision) {
+        if line[scanned..]
+            .iter()
+            .any(|&(_, revision)| revision == older_revision)
+        {
             lore_debug!(
                 "Revision {older_revision} -> {older_revision_number} is on the line from {newer_revision}"
             );
             return Ok(HistoryLineSearch::Reached);
         }
         scanned = line.len();
+
+        if history_reached_floor(&line, older_revision_number) {
+            lore_debug!(
+                "Line from {newer_revision} passed revision number {older_revision_number} without reaching {older_revision}"
+            );
+            return Ok(HistoryLineSearch::Diverged);
+        }
 
         if line.len() >= MAX_DIVERGENT_HISTORY_LENGTH {
             lore_warn!(
@@ -3581,16 +3591,9 @@ async fn find_revision_in_history_line(
             return Ok(HistoryLineSearch::Exhausted);
         }
 
-        if load_additional_history(repository.clone(), &mut line, older_revision_number).await {
-            if line[scanned..].contains(&older_revision) {
-                lore_debug!(
-                    "Revision {older_revision} -> {older_revision_number} is on the line from {newer_revision}"
-                );
-                return Ok(HistoryLineSearch::Reached);
-            }
-
+        if load_additional_history(repository.clone(), &mut line).await? {
             lore_debug!(
-                "Line from {newer_revision} passed revision number {older_revision_number} without reaching {older_revision}"
+                "Line from {newer_revision} ran out without reaching {older_revision} -> {older_revision_number}"
             );
             return Ok(HistoryLineSearch::Diverged);
         }
@@ -3603,9 +3606,13 @@ async fn find_revision_in_history_line(
 /// Self parents only, on both sides, so the revision found is where the two lines
 /// converge rather than the newest revision the two can reach through merges.
 ///
-/// Both lines are followed to the root revisions, each capped at
-/// `MAX_DIVERGENT_HISTORY_LENGTH`. `Ok(None)` means the cap was reached first, or
-/// that the lines genuinely share nothing.
+/// The lines meet as [`history::meet`] describes, each loaded a batch at a time
+/// and capped at `MAX_DIVERGENT_HISTORY_LENGTH`. A batch is loaded only for a
+/// line `meet` waits on, with every revision passed, which is the line whose
+/// oldest revision has the higher number, or both at equal numbers. `Ok(None)`
+/// means a line ended, or reached the cap, before the lines met. A line whose
+/// revision numbers do not decrease fails the search, as does a batch that fails
+/// to load, as [`find::batch_load_history`] describes.
 #[lore_macro::test_pub]
 async fn find_common_revision_in_history_lines(
     repository: Arc<RepositoryContext>,
@@ -3616,100 +3623,99 @@ async fn find_common_revision_in_history_lines(
 
     // Both lines are fetched at once. Each is a round trip when the history is not
     // cached, and neither depends on the other.
-    let (mut self_line, mut other_line) = join!(
+    let (mut self_line, mut other_line) = try_join!(
         load_history_line(repository.clone(), self_revision),
         load_history_line(repository.clone(), other_revision)
-    );
-
-    // Each line keeps a lookup of itself, extended as the line is, so a round
-    // tests the revisions it just loaded against everything the other side holds
-    // without rebuilding anything or rewalking a pair.
-    // Spelled out rather than aliased: a type alias naming a `HashSet` with a
-    // hasher is an item cbindgen parses, and it cannot represent a second type
-    // parameter on it.
-    let mut self_lookup: HashSet<Hash, BuildHasherDefault<PassThroughHasher>> =
-        self_line.iter().copied().collect();
-    let mut other_lookup: HashSet<Hash, BuildHasherDefault<PassThroughHasher>> =
-        other_line.iter().copied().collect();
+    )?;
 
     let mut self_ended = false;
     let mut other_ended = false;
     let mut self_loaded = 0;
     let mut other_loaded = 0;
+    let mut passed = (0, 0);
 
     loop {
-        // Scanning the line rather than the lookup is what makes this the newest
-        // shared revision: the line is in history order, a set is in neither.
-        if let Some(shared) = self_line[self_loaded..]
-            .iter()
-            .find(|revision| other_lookup.contains(*revision))
-            .copied()
-        {
-            return Ok(Some(shared));
-        }
-        if let Some(shared) = other_line[other_loaded..]
-            .iter()
-            .find(|revision| self_lookup.contains(*revision))
-            .copied()
-        {
-            return Ok(Some(shared));
+        for (line, loaded) in [(&self_line, self_loaded), (&other_line, other_loaded)] {
+            if let Some((number, revision)) =
+                history::out_of_order(|index| line.get(index).copied(), loaded)
+            {
+                return Err(BranchError::internal(format!(
+                    "the history line is out of order at revision {revision}, numbered {number}"
+                )));
+            }
         }
         self_loaded = self_line.len();
         other_loaded = other_line.len();
 
-        if self_ended && other_ended {
-            return Ok(None);
+        if let Some((shared, _)) = history::meet(
+            |index| self_line.get(index).copied(),
+            |index| other_line.get(index).copied(),
+            &mut passed,
+        ) {
+            return Ok(self_line.get(shared).map(|&(_, revision)| revision));
         }
 
-        let extend_self = self_line.len() < MAX_DIVERGENT_HISTORY_LENGTH && !self_ended;
-        let extend_other = other_line.len() < MAX_DIVERGENT_HISTORY_LENGTH && !other_ended;
-        if !extend_self && !extend_other {
+        let self_waits = passed.0 == self_line.len();
+        let other_waits = passed.1 == other_line.len();
+        if (self_waits && self_ended) || (other_waits && other_ended) {
+            return Ok(None);
+        }
+        if (self_waits && self_line.len() >= MAX_DIVERGENT_HISTORY_LENGTH)
+            || (other_waits && other_line.len() >= MAX_DIVERGENT_HISTORY_LENGTH)
+        {
             lore_warn!(
                 "Reached maximum history depth of {MAX_DIVERGENT_HISTORY_LENGTH} following {self_revision} and {other_revision} back to a shared revision"
             );
             return Ok(None);
         }
 
-        // Two round trips that need not wait on each other.
-        join!(
+        // Two round trips that need not wait on each other, where both lines wait.
+        try_join!(
             async {
-                if extend_self {
+                if self_waits {
                     self_ended =
-                        load_additional_history(repository.clone(), &mut self_line, 0).await;
-                    self_lookup.extend(self_line[self_loaded..].iter().copied());
+                        load_additional_history(repository.clone(), &mut self_line).await?;
                 }
+                Ok::<_, BranchError>(())
             },
             async {
-                if extend_other {
+                if other_waits {
                     other_ended =
-                        load_additional_history(repository.clone(), &mut other_line, 0).await;
-                    other_lookup.extend(other_line[other_loaded..].iter().copied());
+                        load_additional_history(repository.clone(), &mut other_line).await?;
                 }
+                Ok::<_, BranchError>(())
             }
-        );
+        )?;
     }
 }
 
-/// Load a line of revisions from `revision` backwards through self parents. Falls
-/// back to a local walk when the batch load comes back empty, so a repository
-/// with no reachable remote still contributes the line it has cached.
+/// Load a line of revisions from `revision` backwards through self parents, each
+/// with its revision number. Falls back to a local walk when the batch load comes
+/// back empty, so a repository with no reachable remote still contributes the line
+/// it has cached. Fails where the batch load does, as [`find::batch_load_history`]
+/// describes.
 #[lore_macro::test_pub]
-async fn load_history_line(repository: Arc<RepositoryContext>, revision: Hash) -> Vec<Hash> {
-    let mut history = find::batch_load_history(repository.clone(), revision).await;
+async fn load_history_line(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<Vec<(u64, Hash)>, BranchError> {
+    let mut history = find::batch_load_history(repository.clone(), revision)
+        .await
+        .forward::<BranchError>("loading the first batch of a history line")?;
     if !history.is_empty() {
         // The caller extends this a batch at a time up to the search depth, so
         // take the growth in one allocation rather than a copy per doubling.
         history.reserve(MAX_DIVERGENT_HISTORY_LENGTH.saturating_sub(history.len()));
-        return history;
+        return Ok(history);
     }
 
     lore_debug!("Found no revision from {revision}, walking locally");
 
     let mut history = Vec::new();
     let Ok(mut state_iter) = state::State::deserialize(repository.clone(), revision).await else {
-        return history;
+        return Ok(history);
     };
-    history.push(revision);
+    history.push((state_iter.revision_number(), revision));
 
     while history.len() < find::BATCH_COUNT && !state_iter.parent_self().is_zero() {
         let revision_next = state_iter.parent_self();
@@ -3717,66 +3723,53 @@ async fn load_history_line(repository: Arc<RepositoryContext>, revision: Hash) -
         else {
             break;
         };
-        history.push(revision_next);
+        history.push((state_next.revision_number(), revision_next));
         state_iter = state_next;
     }
 
-    history
+    Ok(history)
 }
 
-/// Whether a line has been followed to or past `floor_revision_number`, leaving
-/// nothing below it worth loading. A line that cannot be read any further counts
-/// as reached for the same reason.
+/// Whether the oldest revision of `history` is numbered at or below
+/// `floor_revision_number`. An empty line counts as reached.
 #[lore_macro::test_pub]
-async fn history_reached_floor(
-    repository: Arc<RepositoryContext>,
-    history: &[Hash],
-    floor_revision_number: u64,
-) -> bool {
-    let Some(oldest) = history.last() else {
-        return true;
-    };
-
-    let Ok(state) = State::deserialize(repository, *oldest).await else {
-        return true;
-    };
-
-    state.revision_number() <= floor_revision_number
+fn history_reached_floor(history: &[(u64, Hash)], floor_revision_number: u64) -> bool {
+    history
+        .last()
+        .is_none_or(|&(number, _)| number <= floor_revision_number)
 }
 
 /// Extend a line with the next batch of older revisions. Returns whether the line
-/// has nothing further worth loading, either because it reached the floor or
-/// because it ran out.
+/// ran out: nothing below its oldest revision could be loaded. Fails where the
+/// batch load does, as [`find::batch_load_history`] describes.
 #[lore_macro::test_pub]
 async fn load_additional_history(
     repository: Arc<RepositoryContext>,
-    history: &mut Vec<Hash>,
-    floor_revision_number: u64,
-) -> bool {
-    let Some(&last) = history.last() else {
-        return true;
+    history: &mut Vec<(u64, Hash)>,
+) -> Result<bool, BranchError> {
+    let Some(&(_, last)) = history.last() else {
+        return Ok(true);
     };
 
-    let additional = find::batch_load_history(repository.clone(), last).await;
+    let additional = find::batch_load_history(repository.clone(), last)
+        .await
+        .forward::<BranchError>("loading the next batch of a history line")?;
 
     // `batch_load_history` yields its start revision first, and that revision is
     // already the tail of `history`. Appending it again both duplicates work for
     // the caller's comparison and, once the line is exhausted, keeps reporting
     // progress that does not exist.
     let fresh = match additional.split_first() {
-        Some((first, rest)) if *first == last => rest,
+        Some((first, rest)) if first.1 == last => rest,
         _ => additional.as_slice(),
     };
 
     if fresh.is_empty() {
-        return true;
+        return Ok(true);
     }
 
-    // Appended before the floor is tested, since this batch still has to be
-    // compared - it can hold the revision being searched for.
     history.extend_from_slice(fresh);
-
-    history_reached_floor(repository, history, floor_revision_number).await
+    Ok(false)
 }
 
 struct WalkVisit {

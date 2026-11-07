@@ -541,3 +541,115 @@ mod upload {
         );
     }
 }
+
+/// The history a push collects by walking back from the peer's latest revision of the branch to
+/// where the local line leaves it.
+mod unpushed_history {
+    use std::time::Duration;
+
+    use lore_base::error::NotAuthorized;
+    use lore_base::types::BranchId;
+    use lore_revision::branch::BranchLatestStatus;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::state::State;
+
+    use super::*;
+    use crate::branch::with_execution;
+    use crate::branch::write_line;
+    use crate::paged_remote::Anchor;
+    use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::client_on;
+    use crate::paged_remote::client_stores;
+    use crate::paged_remote::remote_revision;
+
+    /// The error a push of a local line of two revisions meets collecting its history against
+    /// `peer`, whose latest revision of the branch is `peer_latest`, a revision only the peer
+    /// holds. The walk is bounded by a second, so that a walk that loops fails the test.
+    async fn unpushed_history_error(peer: PagedRemote, peer_latest: Hash) -> PushError {
+        let branch = BranchId::from([7; 16]);
+        let stores = client_stores().await;
+        let line = write_line(&stores.writer, Hash::default(), 1, 2).await;
+        let mut metadata = Metadata::new();
+        metadata
+            .set_string("name", "pushed")
+            .expect("naming the branch");
+        let metadata = metadata
+            .serialize(stores.writer.clone())
+            .await
+            .expect("writing the branch metadata");
+        lore_revision::branch::mutable_store_metadata(stores.writer.clone(), branch, metadata)
+            .await
+            .expect("storing the branch metadata");
+        lore_revision::branch::store_latest(
+            stores.writer.clone(),
+            branch,
+            Hash::default(),
+            line[1],
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .expect("storing the local latest");
+        let client = client_on(&stores, Arc::new(peer));
+        let remote = client.remote().await.expect("the client is connected");
+        let state = State::deserialize(client.clone(), line[1])
+            .await
+            .expect("reading the local latest");
+
+        let collected = collect_unpushed_history(
+            &client,
+            &remote,
+            &state,
+            branch,
+            line[1],
+            peer_latest,
+            branch,
+        );
+        match tokio::time::timeout(Duration::from_secs(1), collected)
+            .await
+            .expect("the walk ends within a second")
+        {
+            Ok(_) => panic!("the walk stops at the peer's latest"),
+            Err(error) => error,
+        }
+    }
+
+    /// A push whose walk back from the peer's latest revision stops fails with the walk's error,
+    /// which keeps its code: `RevisionNotFound` naming the peer's latest where the peer's page does
+    /// not move the line, and the peer's `NotAuthorized` where its list fails.
+    #[tokio::test]
+    async fn a_push_whose_walk_stops_fails_with_the_walks_error() {
+        Box::pin(with_execution(async {
+            let branch = BranchId::from([7; 16]);
+            let peer_latest = remote_revision(3, Hash::default(), Hash::from([0xA0; 32])).await;
+            let top = peer_latest.signature;
+
+            let stopped = unpushed_history_error(
+                PagedRemote::new(branch, top).holding([&peer_latest]).page(
+                    Anchor::Signature(top),
+                    vec![(3, top)],
+                    top,
+                ),
+                top,
+            )
+            .await;
+            let refused = unpushed_history_error(
+                PagedRemote::new(branch, top)
+                    .failing(Anchor::Signature(top), ProtocolError::from(NotAuthorized)),
+                top,
+            )
+            .await;
+
+            assert_eq!(
+                (
+                    stopped
+                        .as_revision_not_found()
+                        .map(|error| error.revision.clone()),
+                    refused.is_not_authorized(),
+                ),
+                (Some(top.to_string()), true),
+                "{stopped:?}; {refused:?}"
+            );
+        }))
+        .await;
+    }
+}

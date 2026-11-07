@@ -16,6 +16,7 @@ mod event;
 mod file;
 mod filter;
 mod filter_walk;
+mod find;
 mod fs;
 mod global;
 /// The fixtures the crate's process-isolated tests include, shared with these.
@@ -28,6 +29,7 @@ mod instance;
 mod instance_in_use_retry;
 mod instance_move_rollback;
 mod interface;
+mod layer;
 mod link;
 mod lock;
 mod merge;

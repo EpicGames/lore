@@ -24,6 +24,8 @@ mod push;
 use lore_revision::branch::*;
 use lore_revision::util::path::RelativePathBuf;
 
+use crate::paged_remote::above_unverified;
+
 fn branch_id(byte: u8) -> BranchId {
     BranchId::from([byte; 16])
 }
@@ -220,7 +222,7 @@ async fn with_execution<F: Future>(body: F) -> F::Output {
 
 /// A repository backed by in-memory stores and no remote, so every read has to
 /// come from the revisions the test wrote.
-async fn null_repository() -> Arc<RepositoryContext> {
+pub(crate) async fn null_repository() -> Arc<RepositoryContext> {
     let immutable_store = lore_storage::local::immutable_store::create(
         None::<&str>,
         lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -265,7 +267,7 @@ async fn write_revision(
 /// Write a revision on a branch of its own. Without a distinguishing metadata
 /// hash it would be addressed as, and so be, the revision the parent's own line
 /// holds at that number.
-async fn write_branch_revision(
+pub(crate) async fn write_branch_revision(
     repository: &Arc<RepositoryContext>,
     parent: Hash,
     revision_number: u64,
@@ -306,7 +308,7 @@ async fn write_merge_revision(
 
 /// Write a line of `count` revisions numbered from `first_revision_number`,
 /// returning them oldest first.
-async fn write_line(
+pub(crate) async fn write_line(
     repository: &Arc<RepositoryContext>,
     parent: Hash,
     first_revision_number: u64,
@@ -447,6 +449,128 @@ mod find_common_revision_in_history_lines {
             .expect("the search must not fail on readable lines");
 
             assert_eq!(met, Some(shared[2]));
+        }))
+        .await;
+    }
+
+    /// A line that reaches the newest shared revision a batch before the other still meets the
+    /// other there, not at an older shared revision both lines load in the later batch.
+    #[tokio::test]
+    async fn history_lines_meet_at_the_newest_shared_revision_a_batch_apart() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 120).await;
+            let one = write_line(&repository, shared[119], 1000, 5).await;
+            let other = write_line(&repository, shared[119], 2000, 100).await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one[4], other[99],
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(met, Some(shared[119]));
+        }))
+        .await;
+    }
+
+    /// Siblings at equal numbers are not shared, so both lines pass them and meet at
+    /// the shared revision below.
+    #[tokio::test]
+    async fn history_lines_pass_siblings_at_equal_numbers_to_the_shared_revision_below() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 3).await;
+            let one_sibling = write_branch_revision(&repository, shared[2], 4, 1).await;
+            let other_sibling = write_branch_revision(&repository, shared[2], 4, 2).await;
+            let one = write_line(&repository, one_sibling, 5, 2).await;
+            let other = write_line(&repository, other_sibling, 5, 1).await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one[1], other[0],
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(met, Some(shared[2]));
+        }))
+        .await;
+    }
+
+    /// A line whose revision numbers do not decrease does not follow self parents,
+    /// so the search fails rather than answering from it.
+    #[tokio::test]
+    async fn a_history_line_whose_numbers_do_not_decrease_fails_the_search() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let parent = write_revision(&repository, Hash::default(), 5).await;
+            let child = write_revision(&repository, parent, 3).await;
+            let other = write_line(&repository, Hash::default(), 1, 2).await;
+
+            let error = Box::pin(find_common_revision_in_history_lines(
+                repository, child, other[1],
+            ))
+            .await
+            .expect_err("the line from child rises in number to its parent");
+
+            assert!(error.is_internal(), "{error:?}");
+        }))
+        .await;
+    }
+
+    /// A batch is loaded only for the line whose oldest revision has the higher
+    /// number, so the store is read for the line below only once the lines need it:
+    /// three batches of `one`, and the first of `other`, which reaches the shared
+    /// revision before `one` does.
+    #[tokio::test]
+    async fn history_lines_load_the_line_below_only_once_it_is_needed() {
+        Box::pin(with_execution(async {
+            let (stores, counting) = crate::paged_remote::counted_client_stores().await;
+            let repository = stores.writer.clone();
+            let shared = write_line(&repository, Hash::default(), 1, 150).await;
+            let one = write_line(&repository, shared[149], 1000, 250).await;
+            let other = write_line(&repository, shared[149], 151, 1).await;
+            counting.take_reads();
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one[249], other[0],
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(met, Some(shared[149]));
+            assert_eq!(
+                counting.take_reads().payloads,
+                400,
+                "a state read for each revision of four batches of 100"
+            );
+        }))
+        .await;
+    }
+
+    /// A page that lists a revision on a line without its own state fails the search, whether
+    /// the state is missing, cut short, or another revision's, and whether the revision is the one
+    /// asked for or one below it.
+    #[tokio::test]
+    async fn history_lines_fail_where_a_page_lists_a_revision_without_its_own_state() {
+        Box::pin(with_execution(async {
+            for case in above_unverified(Hash::default()).await {
+                let unrelated = write_line(&case.writer, Hash::default(), 1, 2).await;
+
+                let met = Box::pin(find_common_revision_in_history_lines(
+                    case.client,
+                    case.local,
+                    unrelated[1],
+                ))
+                .await;
+
+                assert!(
+                    met.as_ref().is_err_and(|error| error.is_internal()),
+                    "{} state for {}: {met:?}",
+                    case.kind,
+                    case.position
+                );
+            }
         }))
         .await;
     }
@@ -944,6 +1068,27 @@ async fn history_line_that_cannot_be_read_diverges() {
     .await;
 }
 
+/// A page that lists a revision on the line without its own state fails the search for a
+/// revision on that line, whether the state is missing, cut short, or another revision's, and
+/// whether the revision is the one asked for or one below it.
+#[tokio::test]
+async fn history_line_search_fails_where_a_page_lists_a_revision_without_its_own_state() {
+    Box::pin(with_execution(async {
+        for case in above_unverified(Hash::default()).await {
+            let found =
+                find_revision_in_history_line(case.client, case.local, 4, revision(201), 1).await;
+
+            assert!(
+                found.as_ref().is_err_and(|error| error.is_internal()),
+                "{} state for {}: {found:?}",
+                case.kind,
+                case.position
+            );
+        }
+    }))
+    .await;
+}
+
 #[tokio::test]
 async fn history_line_of_an_unknown_revision_is_empty() {
     Box::pin(with_execution(async {
@@ -952,6 +1097,7 @@ async fn history_line_of_an_unknown_revision_is_empty() {
         assert!(
             load_history_line(repository, revision(200))
                 .await
+                .expect("an unknown revision is not a failure")
                 .is_empty(),
             "A revision that is not stored yields no line to search"
         );
@@ -959,27 +1105,65 @@ async fn history_line_of_an_unknown_revision_is_empty() {
     .await;
 }
 
+/// Whether a line reached its floor is read from the number its oldest revision
+/// carries. An unreadable oldest revision numbered above the floor is not at it;
+/// the next batch, which cannot read it either, ends the line.
 #[tokio::test]
-async fn reaching_the_floor_needs_a_readable_line_below_it() {
+async fn reaching_the_floor_is_read_from_the_oldest_revision_number() {
     Box::pin(with_execution(async {
         let repository = null_repository().await;
         let line = write_line(&repository, Hash::default(), 1, 3).await;
 
         assert!(
-            history_reached_floor(repository.clone(), &[], 0).await,
+            history_reached_floor(&[], 0),
             "An empty line has nothing left to load"
         );
         assert!(
-            history_reached_floor(repository.clone(), &[revision(200)], 0).await,
-            "A line that cannot be read any further has nothing left to load"
-        );
-        assert!(
-            history_reached_floor(repository.clone(), &line[..1], 1).await,
+            history_reached_floor(&[(1, line[0])], 1),
             "Revision number 1 is at a floor of 1"
         );
         assert!(
-            !history_reached_floor(repository, &line[2..], 1).await,
+            !history_reached_floor(&[(3, line[2])], 1),
             "Revision number 3 is above a floor of 1, so the line can still be followed"
+        );
+
+        let mut unreadable = vec![(3, revision(200))];
+        assert!(
+            !history_reached_floor(&unreadable, 1),
+            "An unreadable revision numbered above the floor is not at it"
+        );
+        assert!(
+            load_additional_history(repository, &mut unreadable)
+                .await
+                .expect("an unreadable revision is not a failure"),
+            "The next batch cannot read the revision either, so the line has nothing left to load"
+        );
+        assert_eq!(unreadable, vec![(3, revision(200))]);
+    }))
+    .await;
+}
+
+/// A line whose first batch passes the older revision's number without reaching
+/// it has diverged, which the search answers without loading another batch.
+#[tokio::test]
+async fn history_line_diverges_without_loading_past_the_older_revisions_number() {
+    Box::pin(with_execution(async {
+        let (stores, counting) = crate::paged_remote::counted_client_stores().await;
+        let repository = stores.writer.clone();
+        let shared = write_line(&repository, Hash::default(), 1, 2).await;
+        let newer = write_revision(&repository, shared[1], 13).await;
+        let older = write_revision(&repository, shared[1], 3).await;
+        counting.take_reads();
+
+        let found = find_revision_in_history_line(repository, newer, 13, older, 3)
+            .await
+            .expect("passing the older revision's number is not a failure");
+
+        assert_eq!(found, HistoryLineSearch::Diverged);
+        assert_eq!(
+            counting.take_reads().payloads,
+            3,
+            "one state read for each revision of the newer line's first batch"
         );
     }))
     .await;
@@ -993,21 +1177,25 @@ async fn extending_an_exhausted_line_reports_it_exhausted() {
     Box::pin(with_execution(async {
         let repository = null_repository().await;
         let line = write_line(&repository, Hash::default(), 1, 2).await;
-        let mut history = vec![line[1], line[0]];
+        let mut history = vec![(2, line[1]), (1, line[0])];
 
         assert!(
-            load_additional_history(repository.clone(), &mut history, 0).await,
+            load_additional_history(repository.clone(), &mut history)
+                .await
+                .expect("an exhausted line is not a failure"),
             "A line followed to its root revision has nothing further to load"
         );
         assert_eq!(
             history,
-            vec![line[1], line[0]],
+            vec![(2, line[1]), (1, line[0])],
             "An exhausted line must not grow"
         );
 
         let mut empty = Vec::new();
         assert!(
-            load_additional_history(repository, &mut empty, 0).await,
+            load_additional_history(repository, &mut empty)
+                .await
+                .expect("an empty line is not a failure"),
             "There is nothing to extend an empty line from"
         );
         assert!(empty.is_empty());

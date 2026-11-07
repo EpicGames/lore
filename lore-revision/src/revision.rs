@@ -2310,8 +2310,10 @@ async fn branch_latest(
 /// has no such revision.
 ///
 /// The remote answers from its revision list where it can, since that costs one
-/// request against a walk of every revision in between. Whichever latest the
-/// list did not answer from anchors that walk.
+/// request against a walk of every revision in between. The number the list
+/// labels an item with picks it, and the item's state, which its signature fixes,
+/// confirms it, as [`find::verified_number`] reads it. Where no item is picked or
+/// confirmed, whichever latest the list did not answer from anchors that walk.
 ///
 /// Numbering starts at one, so zero names no revision and is refused before any
 /// lookup rather than after walking the whole history to find nothing.
@@ -2365,6 +2367,7 @@ async fn resolve_revision_number(
             .items
             .iter()
             .find(|item| item.number == revision_number)
+            && find::verified_number(item) == Some(revision_number)
         {
             revision = item.signature;
             lore_debug!("response revision {}", revision);

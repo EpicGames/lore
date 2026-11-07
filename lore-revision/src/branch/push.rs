@@ -764,6 +764,7 @@ async fn load_branch_metadata(
 }
 
 /// The history a push of `branch` at `local_latest` reconciles against the peer's.
+#[lore_macro::test_pub]
 struct UnpushedHistory {
     /// The local revisions the peer is missing, newest first.
     local: Vec<Hash>,
@@ -784,6 +785,7 @@ struct UnpushedHistory {
 /// state of [`collect_fragments_and_push`].
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
 #[allow(clippy::manual_async_fn)]
 fn collect_unpushed_history(
     repository: &Arc<RepositoryContext>,

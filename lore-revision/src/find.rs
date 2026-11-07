@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 use lore_storage::options::ReadOptions;
 use serde::Serialize;
+use zerocopy::FromBytes;
 
 use crate::branch;
 use crate::errors::SlowDown;
@@ -104,7 +105,7 @@ where
             // Batch load a chunk of history
             // TODO(mjansson): Hide batch cache latency by issuing requests while iterating
             //                 previous batch of history, trying to stay ahead of the load curve
-            batch_load_history(repository.clone(), revision).await;
+            let _ = batch_load_history(repository.clone(), revision).await;
         }
 
         let state = State::deserialize(repository.clone(), revision)
@@ -255,10 +256,16 @@ pub async fn revision_by_number(
 
 pub const BATCH_COUNT: usize = 100;
 
+/// The line from `revision` back through self parents, newest first, each revision with its
+/// number: the revisions the local store holds, up to [`BATCH_COUNT`], then the remote's page from
+/// the first revision the store lacks, whole. Empty where the remote cannot list that page. The
+/// number of a listed revision is read from its state, as [`verified_number`] describes, and the
+/// page's states are cached as [`cache_page_states`] describes. Fails where the page lists a
+/// revision on the line without its own state.
 pub async fn batch_load_history(
     repository: Arc<RepositoryContext>,
     mut revision: Hash,
-) -> Vec<Hash> {
+) -> Result<Vec<(u64, Hash)>, FindError> {
     let mut history = Vec::with_capacity(BATCH_COUNT);
 
     while !revision.is_zero()
@@ -270,42 +277,49 @@ pub async fn batch_load_history(
         )
         .await
     {
-        history.push(revision);
+        history.push((state.revision_number, revision));
         revision = state.parent[0];
     }
 
     if revision.is_zero() || history.len() >= BATCH_COUNT {
-        return history;
+        return Ok(history);
     }
 
     let Ok(remote) = repository.remote().await else {
-        return vec![];
+        return Ok(vec![]);
     };
     let Ok(revision_protocol) = remote.revision(repository.id).await else {
-        return vec![];
+        return Ok(vec![]);
     };
 
     lore_debug!("Query remote for revision state history");
 
     let Ok(response) = revision_protocol.revision_list(revision.into()).await else {
-        return vec![];
+        return Ok(vec![]);
     };
 
     lore_debug!("Got {} revisions", response.items.len(),);
 
-    cache_revision_list_states(repository.clone(), &response.items).await;
-
     let line = response.items_from(revision);
-
+    for item in line {
+        let Some(number) = verified_number(item) else {
+            return Err(FindError::internal(format!(
+                "the remote listed revision {} without its own state",
+                item.signature
+            )));
+        };
+        history.push((number, item.signature));
+    }
     let metadata_addresses: Vec<Address> = line
         .iter()
         .map(|item| Address::zero_context_hash(item.metadata))
         .collect();
-    history.extend(line.iter().map(|item| item.signature));
+    let unverified = response.items.len() - line.len();
 
-    let _ = immutable::cache(repository, metadata_addresses, true).await;
+    let _ = immutable::cache(repository.clone(), metadata_addresses, true).await;
+    cache_page_states(repository, &response.items, unverified).await;
 
-    history
+    Ok(history)
 }
 
 /// Cache the per-item state blobs from a remote `revision_list` response into
@@ -314,29 +328,64 @@ pub async fn batch_load_history(
 /// `signature` lets the local cache absorb the response without a follow-up
 /// fetch and protects against a server returning bytes that do not match the
 /// signature it advertises.
-pub async fn cache_revision_list_states(
+pub fn cache_revision_list_states(
     repository: Arc<RepositoryContext>,
     items: &[lore_transport::RevisionItem],
-) {
-    let expected_len = std::mem::size_of::<StateData>();
-    for item in items {
-        if item.state.len() != expected_len {
-            continue;
+) -> impl Future<Output = ()> + '_ {
+    cache_page_states(repository, items, items.len())
+}
+
+/// Write the states a remote page's `items` carry to the local immutable store, so the revisions
+/// they describe are read without a remote fetch. Each of the first `unverified` items is written
+/// where its state is its revision's own, as [`holds_its_state`] checks, so bytes that don't hash
+/// to the item's signature are not stored. Each item after them is one the caller has checked the
+/// same way, as [`verified_number`] does, so it is written without hashing it again.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn cache_page_states(
+    repository: Arc<RepositoryContext>,
+    items: &[lore_transport::RevisionItem],
+    mut unverified: usize,
+) -> impl Future<Output = ()> + '_ {
+    async move {
+        for item in items {
+            if unverified > 0 {
+                unverified -= 1;
+                if !holds_its_state(item) {
+                    continue;
+                }
+            }
+            let _ = immutable::write(
+                repository.clone(),
+                Context::default(),
+                item.state.clone(),
+                immutable::write_options_from_repository(repository.clone())
+                    .with_revision_state()
+                    .with_local_cache_priority()
+                    .no_remote_write(),
+            )
+            .await;
         }
-        if Hash::hash_buffer(&item.state) != item.signature {
-            continue;
-        }
-        let _ = immutable::write(
-            repository.clone(),
-            Context::default(),
-            item.state.clone(),
-            immutable::write_options_from_repository(repository.clone())
-                .with_revision_state()
-                .with_local_cache_priority()
-                .no_remote_write(),
-        )
-        .await;
     }
+}
+
+/// Whether `item` carries its revision's state: the bytes its signature is the hash of.
+fn holds_its_state(item: &lore_transport::RevisionItem) -> bool {
+    item.state.len() == std::mem::size_of::<StateData>()
+        && Hash::hash_buffer(&item.state) == item.signature
+}
+
+/// The revision number in the state `item` carries, where that state is the revision's own, as
+/// [`holds_its_state`] checks. The number beside it in the item is the server's claim; the state's
+/// is the one its signature fixes.
+pub(crate) fn verified_number(item: &lore_transport::RevisionItem) -> Option<u64> {
+    if !holds_its_state(item) {
+        return None;
+    }
+    StateData::read_from_bytes(&item.state)
+        .ok()
+        .map(|state| state.revision_number)
 }
 
 /// Data for the event reporting a revision found by a search.

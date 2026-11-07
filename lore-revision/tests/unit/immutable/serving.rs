@@ -278,7 +278,7 @@ pub(super) async fn serving_session(
 
 /// `content` stored with its payload under `flags` in a repository of its own, standing in for the
 /// remote's copy, and its address and fragment.
-pub(super) async fn remote_copy(
+pub(crate) async fn remote_copy(
     content: &'static [u8],
     seed: u8,
     flags: u32,

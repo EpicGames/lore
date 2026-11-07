@@ -1143,6 +1143,10 @@ pub async fn latest_revision(
     }
 }
 
+/// The revision of `layer`, searched back from `latest`, whose `metadata` value matches that of a
+/// revision of `repository` at or below `state`, with that revision. Without `metadata`, `latest`
+/// and `state`'s revision. Fails where a batch of either history fails to load, as
+/// [`find::batch_load_history`] describes.
 #[allow(clippy::too_many_arguments)]
 pub async fn find_revision_match(
     repository: Arc<RepositoryContext>,
@@ -1171,18 +1175,25 @@ pub async fn find_revision_match(
     let mut source_revisions = vec![];
     if execution_context().globals().search_nearest() {
         lore_debug!("Batch load revisions for source history");
-        let revisions = find::batch_load_history(repository.clone(), state.revision()).await;
-        source_revisions = revisions.into_iter().map(|hash| (hash, None)).collect();
+        let revisions = find::batch_load_history(repository.clone(), state.revision())
+            .await
+            .forward::<LayerError>("loading a batch of the source history")?;
+        source_revisions = revisions
+            .into_iter()
+            .map(|(_, hash)| (hash, None))
+            .collect();
     }
     if source_revisions.is_empty() {
         source_revisions.push((state.revision(), None));
     }
 
     lore_debug!("Batch load revisions for target history from revision {latest}");
-    let target_revisions = find::batch_load_history(layer.clone(), latest).await;
+    let target_revisions = find::batch_load_history(layer.clone(), latest)
+        .await
+        .forward::<LayerError>("loading a batch of the layer's history")?;
     let mut target_revisions: Vec<(Hash, Option<Vec<u8>>)> = target_revisions
         .into_iter()
-        .map(|hash| (hash, None))
+        .map(|(_, hash)| (hash, None))
         .collect();
 
     let mut target_search_count = target_revisions.len();
@@ -1259,8 +1270,13 @@ pub async fn find_revision_match(
                 .last()
                 .map(|tuple| tuple.0)
                 .unwrap_or_default();
-            let revisions = find::batch_load_history(repository.clone(), last_revision).await;
-            let mut additional = revisions.into_iter().map(|hash| (hash, None)).collect();
+            let revisions = find::batch_load_history(repository.clone(), last_revision)
+                .await
+                .forward::<LayerError>("loading the next batch of the source history")?;
+            let mut additional = revisions
+                .into_iter()
+                .map(|(_, hash)| (hash, None))
+                .collect();
             source_revisions.append(&mut additional);
         }
 
@@ -1269,8 +1285,13 @@ pub async fn find_revision_match(
             .last()
             .map(|tuple| tuple.0)
             .unwrap_or_default();
-        let revisions = find::batch_load_history(layer.clone(), last_revision).await;
-        let mut additional: Vec<_> = revisions.into_iter().map(|hash| (hash, None)).collect();
+        let revisions = find::batch_load_history(layer.clone(), last_revision)
+            .await
+            .forward::<LayerError>("loading the next batch of the layer's history")?;
+        let mut additional: Vec<_> = revisions
+            .into_iter()
+            .map(|(_, hash)| (hash, None))
+            .collect();
         target_search_count += additional.len();
         if source_revisions.len() > 1 {
             target_revisions.append(&mut additional);
