@@ -270,10 +270,14 @@ fn a_rewrite_failing_its_rename_carries_the_new_lists_lines_back() {
     );
 }
 
-/// Appenders racing rewrites lose nothing and list nothing they did not append. The
-/// appenders append every path once, then the same paths again, paced, until the rewrites
-/// have seen every window: an append past a rewrite's read, one during the rewrite, and one
-/// under way on the list a rewrite replaces when its drain begins.
+/// Appenders racing rewrites lose nothing and list nothing they did not append. Each appender
+/// appends `APPENDS` new paths of its own unpaced, then goes on paced, one append in
+/// `NEW_EVERY` a new path and the rest repeating its first ones, until the rewrites have seen
+/// every window: an append past a rewrite's read, one during the rewrite, and one under way on
+/// the list a rewrite replaces when its drain begins. A new path past a read is one the read
+/// missed, so that window stays open however late the rewrites start, where with repeats alone
+/// only the first pass could show it; the repeats keep the list, which every rewrite reads
+/// whole, from growing with each append.
 #[test]
 fn an_append_racing_a_rewrite_is_kept() {
     use std::collections::BTreeSet;
@@ -286,6 +290,7 @@ fn an_append_racing_a_rewrite_is_kept() {
 
     const THREADS: usize = 4;
     const APPENDS: usize = 5000;
+    const NEW_EVERY: usize = 8;
     const MIN_REWRITES: usize = 50;
     // A bound on a hang, not a timing: the windows are seen long before on an idle machine.
     const DEADLINE: Duration = Duration::from_secs(30);
@@ -298,9 +303,16 @@ fn an_append_racing_a_rewrite_is_kept() {
         .map(|thread| {
             let (list, stop) = (list.clone(), stop.clone());
             std::thread::spawn(move || {
-                let mut index = 0;
+                // Appends made, and new paths among them: `t<thread>/p<index>` below `new`.
+                let (mut index, mut new) = (0, 0);
                 while index < APPENDS || !stop.load(Ordering::SeqCst) {
-                    list.append(&path(&format!("t{thread}/p{}", index % APPENDS)))
+                    let appended = if index < APPENDS || index % NEW_EVERY == 0 {
+                        new += 1;
+                        new - 1
+                    } else {
+                        index % APPENDS
+                    };
+                    list.append(&path(&format!("t{thread}/p{appended}")))
                         .expect("append");
                     index += 1;
                     if index >= APPENDS {
@@ -308,10 +320,12 @@ fn an_append_racing_a_rewrite_is_kept() {
                         std::thread::sleep(Duration::from_micros(100));
                     }
                 }
+                new
             })
         })
         .collect();
-    let deadline = Instant::now() + DEADLINE;
+    let started = Instant::now();
+    let deadline = started + DEADLINE;
     let mut rewrites = 0;
     // Appends past a rewrite's covered length that its read missed: only its carry keeps them.
     let mut carried = 0;
@@ -339,9 +353,17 @@ fn an_append_racing_a_rewrite_is_kept() {
         rewrites += 1;
     }
     stop.store(true, Ordering::SeqCst);
-    for thread in appenders {
-        thread.join().expect("an appender");
-    }
+    // Paths each appender appended: `t<thread>/p<index>` for every index below its count.
+    let appended: Vec<usize> = appenders
+        .into_iter()
+        .map(|thread| thread.join().expect("an appender"))
+        .collect();
+    eprintln!(
+        "{rewrites} rewrites in {:?}: {carried} appends carried, {overlapped} rewrites \
+         overlapped, {} drains waited",
+        started.elapsed(),
+        drained()
+    );
     assert!(
         carried > 0,
         "no append landed past a covered length after the read, in {rewrites} rewrites \
@@ -362,15 +384,17 @@ fn an_append_racing_a_rewrite_is_kept() {
         .iter()
         .map(|path| path.as_str().to_owned())
         .collect();
-    let missing: Vec<String> = (0..THREADS)
-        .flat_map(|thread| (0..APPENDS).map(move |index| format!("t{thread}/p{index}")))
-        .filter(|appended| !listed.contains(appended))
+    let missing: Vec<String> = appended
+        .iter()
+        .enumerate()
+        .flat_map(|(thread, &count)| (0..count).map(move |index| format!("t{thread}/p{index}")))
+        .filter(|path| !listed.contains(path))
         .collect();
     assert!(
         missing.is_empty(),
         "{} of {} appends lost across {rewrites} rewrites, first {:?}",
         missing.len(),
-        THREADS * APPENDS,
+        appended.iter().sum::<usize>(),
         missing.first()
     );
     let extra: Vec<&String> = listed
@@ -380,8 +404,8 @@ fn an_append_racing_a_rewrite_is_kept() {
                 .strip_prefix('t')
                 .and_then(|rest| rest.split_once("/p"))
                 .is_some_and(|(thread, index)| {
-                    thread.parse::<usize>().is_ok_and(|thread| thread < THREADS)
-                        && index.parse::<usize>().is_ok_and(|index| index < APPENDS)
+                    let count = thread.parse::<usize>().ok().and_then(|t| appended.get(t));
+                    count.is_some_and(|&count| index.parse::<usize>().is_ok_and(|i| i < count))
                 })
         })
         .collect();
