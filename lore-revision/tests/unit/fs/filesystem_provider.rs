@@ -119,10 +119,11 @@ impl TestFilesystemProvider {
         }
     }
 
-    /// A provider that holds its state in a `State`.
+    /// A provider that holds its state in a `State`, whose operations fail every write.
     pub fn holding_state() -> TestFilesystemProvider {
         Self {
             holds_state: true,
+            write_fails: true,
             ..Self::new()
         }
     }

@@ -49,6 +49,12 @@ pub async fn add(
     pin: Option<String>,
     disable_branching: bool,
 ) -> Result<(), LinkError> {
+    // A provider holding whole revisions serves no linked repository: its mount refuses a
+    // revision holding a link, and files written below the link would land in this State.
+    if repository.file_system().holds_state() {
+        return Err(crate::fs::hold::refused("add a link").into());
+    }
+
     // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
     // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
     // which form this is. A schemeless identifier names a repository on the same remote as

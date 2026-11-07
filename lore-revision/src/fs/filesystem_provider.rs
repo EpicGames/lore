@@ -16,6 +16,7 @@ use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
 use lore_base::error::InvalidPath;
 use lore_base::error::LocalModifications;
+use lore_base::error::NotSupported;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
@@ -23,6 +24,10 @@ use lore_error_set::prelude::*;
 
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+#[cfg(target_os = "linux")]
+use crate::fs::fuse::operation::FuseDirectoryListing;
+#[cfg(target_os = "linux")]
+use crate::fs::fuse::operation::FuseOperation;
 use crate::fs::os::OsDirectoryListing;
 use crate::fs::os::OsOperation;
 use crate::fs::swfs::filesystem::SwfsOperation;
@@ -42,6 +47,7 @@ use crate::state::LinkMountInfo;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
 use crate::state::RecordedModifiedTimes;
+use crate::state::SerializedBlocks;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -51,6 +57,7 @@ pub enum FsError {
     InvalidArguments,
     InvalidPath,
     LocalModifications,
+    NotSupported,
 }
 
 impl From<std::io::Error> for FsError {
@@ -64,8 +71,9 @@ impl From<std::io::Error> for FsError {
 /// The repository tracks files and directories. Anything else the file system holds — a device, a
 /// socket — answers as holding nothing, and a directory listing skips a link rather than
 /// describing what it points at. A path named on its own is stat'd through a link, so one naming
-/// a link answers for the target it resolves to. Supporting links means giving them a variant of
-/// their own rather than widening one of these.
+/// a link answers for the target it resolves to, except on a virtual clone, which answers one as
+/// holding nothing. Supporting links means giving them a variant of their own rather than widening
+/// one of these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileInfo {
     /// The path holds nothing, which a path the walk skipped also answers.
@@ -182,6 +190,8 @@ pub struct DirectoryEntry {
 /// the same reason [`InstanceOperationImpl`] does.
 pub enum StaticDispatchDirectoryListing {
     Os(OsDirectoryListing),
+    #[cfg(target_os = "linux")]
+    Fuse(FuseDirectoryListing),
 }
 
 /// Directory entries, resolved as the consumer asks for them.
@@ -201,6 +211,8 @@ impl DirectoryListing {
     pub async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
         match &mut self.dispatch {
             StaticDispatchDirectoryListing::Os(this) => this.next().await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchDirectoryListing::Fuse(this) => this.next().await,
         }
     }
 }
@@ -349,8 +361,22 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     /// working tree holds without reading it. Every operation it begins answers the same
     /// ([`InstanceOperationImpl::holds_state`]), so a provider handing out another provider's
     /// operations answers as that provider does.
+    ///
+    /// # Implementation notes
+    ///
+    /// - **FUSE**: true. Every change reaches the tree through the provider, which diffs the
+    ///   State it serves against the tree lore names by address.
     fn holds_state(&self) -> bool {
         false
+    }
+
+    /// The content of the file at `path` in the working tree, read without going through the
+    /// file system the provider serves it on, by a provider that holds its state
+    /// ([`Self::holds_state`]): the service never reads through its own mount. `None` where no
+    /// file stands there, and from a provider over files on a file system for every path, as a
+    /// caller reads those files directly.
+    async fn read_held_file(&self, _path: &RelativePath) -> Result<Option<Bytes>, FsError> {
+        Ok(None)
     }
 }
 
@@ -788,8 +814,8 @@ pub trait InstanceOperation: Send + Sync {
     /// # Implementation notes
     ///
     /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
-    /// - A provider that holds its state keeps what each file it served was stored as, which
-    ///   `committed` serves the file from without resolving its path again.
+    /// - **FUSE**: keeps it with what it recorded of the file as it served it, which `committed`
+    ///   serves the file from without resolving its path again.
     fn stored(&self, _path: &RelativePath, _address: Address, _size: u64, _mode: u16) {}
 
     /// Takes `committed`, the revision a commit of the instance's repository stored, made current
@@ -806,8 +832,8 @@ pub trait InstanceOperation: Send + Sync {
     /// # Implementation notes
     ///
     /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
-    /// - A provider that holds its state serves each file the commit read from `committed` rather
-    ///   than from the copy it kept.
+    /// - **FUSE**: each file the commit read and nothing wrote since is served from `committed`
+    ///   rather than from `write/`, which it leaves.
     fn committed(
         &self,
         _repository: Arc<RepositoryContext>,
@@ -823,6 +849,8 @@ pub trait InstanceOperation: Send + Sync {
 pub enum StaticDispatchInstanceOperation {
     Os(OsOperation),
     Swfs(SwfsOperation),
+    #[cfg(target_os = "linux")]
+    Fuse(FuseOperation),
     #[cfg(feature = "test-util")]
     Test(test_util::TestOperation),
 }
@@ -893,6 +921,11 @@ impl InstanceOperationImpl {
         self.modified_times.record(repository, path, mtime);
     }
 
+    /// Collects an entry keyed by the caller, stored and discarded with the recorded times.
+    pub fn record_modified_entry(&self, entry: (crate::lore::Hash, u64)) {
+        self.modified_times.push(entry);
+    }
+
     /// Takes the times collected so far. Times left behind are dropped with the operation,
     /// which is what an operation that does not know its resulting revision wants.
     pub fn take_modified_times(&self) -> RecordedModifiedTimes {
@@ -930,6 +963,8 @@ impl InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made),
             StaticDispatchInstanceOperation::Os(_this) => Ok(()),
             StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(_this) => Ok(()),
         }
     }
 
@@ -939,9 +974,115 @@ impl InstanceOperationImpl {
         self.holds_state
     }
 
+    /// Starts warming what `plan` names into the local store in the background, for a provider
+    /// that answers reads from a `State` snapshot; returns at once. Other providers hold every
+    /// file already and ignore it.
+    pub fn start_prefetch(&self, plan: crate::repository::prefetch::PrefetchPlan) {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.filesystem().start_prefetch(plan),
+            _ => drop(plan),
+        }
+    }
+
+    /// Hands the provider `path`, a directory the commit adds or moves, which the provider settles
+    /// once the revision is current. Other providers ignore it.
+    pub(crate) fn hand_directory(&self, path: &RelativePath) {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.hand_directory(path),
+            _ => {
+                let _ = path;
+            }
+        }
+    }
+
+    /// Keeps `blocks`, the committed State's blocks as its serialize wrote them, in memory until
+    /// the provider settles against that State. A provider that holds no `State` drops them.
+    pub(crate) fn keep_serialized_blocks(&self, blocks: SerializedBlocks) {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) if self.holds_state => {
+                this.keep_serialized_blocks(blocks);
+            }
+            _ => drop(blocks),
+        }
+    }
+
+    /// Drops what [`Self::keep_serialized_blocks`] kept: the commit settles nothing.
+    pub(crate) fn drop_serialized_blocks(&self) {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
+            this.drop_serialized_blocks();
+        }
+    }
+
+    /// Owes the provider's settle of the commit before its revision may become current: until
+    /// the settle completes with no error, a removal of a node the commit may have added records
+    /// its deletion ([`FuseOperation::owe_settle`]). Other providers owe nothing.
+    pub(crate) async fn owe_settle(&self) {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            this.owe_settle().await;
+        }
+    }
+
+    /// Ends what [`Self::owe_settle`] owes: the revision never became current.
+    pub(crate) fn release_settle_owed(&self) {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
+            this.release_settle_owed();
+        }
+    }
+
+    /// What the file at `path` holds, measured from `node`, the record a diff walk read of it,
+    /// where the operation answers from a `State`: the FUSE provider reads a local-content node's
+    /// host file and a tracked node's record, never resolving the path. Other operations read the
+    /// path.
+    pub async fn measure(&self, path: &RelativePath, node: &Node) -> Result<FileInfo, FsError> {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.measure(path, node).await,
+            _ => self.file_info(path).await,
+        }
+    }
+
+    /// Whether `path` names a symbolic link [`InstanceOperation::file_info`] answers as holding
+    /// nothing: a virtual clone versions none. Other operations' `file_info` follows a link, and
+    /// answer false.
+    pub async fn unversioned_symlink_at(&self, path: &RelativePath) -> Result<bool, FsError> {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.symlink_at(path).await,
+            _ => {
+                let _ = path;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Whether a write at `path` meets such a symbolic link, at the path or above it: the user's,
+    /// which a command must not write over or through.
+    pub async fn unversioned_symlink_at_or_above(
+        &self,
+        path: &RelativePath,
+    ) -> Result<bool, FsError> {
+        match &self.dispatch {
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.symlink_at_or_above(path).await,
+            _ => {
+                let _ = path;
+                Ok(false)
+            }
+        }
+    }
+
     /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
     /// keeps each nested repository in it, with the directories leading to one. An SWFS mount
-    /// deletes nothing on disk, so there the two are the same.
+    /// deletes nothing on disk, so there the two are the same, and a virtual clone deletes as
+    /// `remove_recursive` does: its provider tracks no nested repository.
     pub async fn remove_recursive_keeping_repositories(
         &self,
         path: &RelativePath,
@@ -957,6 +1098,8 @@ impl InstanceOperationImpl {
                 this.remove_recursive_keeping_repositories(path).await
             }
             StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove_recursive(path).await,
         }
     }
 
@@ -965,13 +1108,28 @@ impl InstanceOperationImpl {
     /// stands at, its local changes refused, kept or overwritten as `options` asks
     /// ([`crate::fs::hold`]). Outside a dry run the hold counts as a change. An operation that
     /// holds no `State` refuses, changing nothing.
-    #[allow(clippy::unused_async)]
     pub async fn hold_state(
         &self,
         repository: Arc<RepositoryContext>,
         target: Arc<State>,
         options: HoldOptions,
     ) -> Result<(), FsError> {
+        #[cfg(target_os = "linux")]
+        if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
+            && self.holds_state
+        {
+            if !options.dry_run {
+                self.record_change();
+            }
+            return crate::fs::fuse::swap::hold_mounted(
+                this.filesystem(),
+                self,
+                repository,
+                target,
+                options,
+            )
+            .await;
+        }
         #[cfg(feature = "test-util")]
         if let StaticDispatchInstanceOperation::Test(this) = &self.dispatch
             && self.holds_state
@@ -1004,6 +1162,10 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Swfs(this) => {
                 this.changes_from_filesystem_to_state(diff)
             }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.changes_from_filesystem_to_state(diff)
+            }
         }
     }
 
@@ -1013,6 +1175,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.file_info(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.file_info(path).await,
         }
     }
 
@@ -1022,6 +1186,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.untracked_file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.untracked_file_info(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.untracked_file_info(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.untracked_file_info(path).await,
         }
     }
 
@@ -1031,6 +1197,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.holds_name_exactly(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.holds_name_exactly(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.holds_name_exactly(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.holds_name_exactly(path).await,
         }
     }
 
@@ -1044,6 +1212,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.names_folding_to(path, name).await,
             StaticDispatchInstanceOperation::Os(this) => this.names_folding_to(path, name).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.names_folding_to(path, name).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.names_folding_to(path, name).await,
         }
     }
 
@@ -1053,6 +1223,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.read_directory(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.read_directory(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.read_directory(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.read_directory(path).await,
         }
     }
 
@@ -1065,6 +1237,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.content_source(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.content_source(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.content_source(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.content_source(path).await,
         }
     }
 
@@ -1087,6 +1261,11 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.file_holds_content(repository, path, previous, previous_size, established)
                     .await
             }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.file_holds_content(repository, path, previous, previous_size, established)
+                    .await
+            }
         }
     }
 
@@ -1104,6 +1283,10 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Swfs(this) => {
                 this.make_executable(path, executable).await
             }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.make_executable(path, executable).await
+            }
         }
     }
 
@@ -1117,6 +1300,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.create_dir_all(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.create_dir_all(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.create_dir_all(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.create_dir_all(path).await,
         }
     }
 
@@ -1130,6 +1315,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.write_file(path, contents).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.write_file(path, contents).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.write_file(path, contents).await,
         }
     }
 
@@ -1143,6 +1330,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.rename(from, to).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.rename(from, to).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.rename(from, to).await,
         }
     }
 
@@ -1156,6 +1345,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove(path).await,
         }
     }
 
@@ -1169,6 +1360,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove_empty_directory(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove_empty_directory(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove_empty_directory(path).await,
         }
     }
 
@@ -1182,6 +1375,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove_recursive(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.remove_recursive(path).await,
         }
     }
 
@@ -1202,6 +1397,10 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.write_node(repository, node, path).await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
+                this.write_node(repository, node, path).await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
                 this.write_node(repository, node, path).await
             }
         }
@@ -1228,6 +1427,11 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.set_file_to_immutable_store_contents(repository, address, path)
                     .await
             }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.set_file_to_immutable_store_contents(repository, address, path)
+                    .await
+            }
         }
     }
 
@@ -1249,6 +1453,10 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Swfs(this) => {
                 this.copy_file(source_path, destination_path).await
             }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
+                this.copy_file(source_path, destination_path).await
+            }
         }
     }
 
@@ -1258,6 +1466,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_diffable(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.infer_is_diffable(path).await,
         }
     }
 
@@ -1267,6 +1477,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_conflicted(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_conflicted(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_conflicted(path).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.infer_is_conflicted(path).await,
         }
     }
 
@@ -1279,6 +1491,8 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(this) => this.stored(path, address, size, mode),
             StaticDispatchInstanceOperation::Os(this) => this.stored(path, address, size, mode),
             StaticDispatchInstanceOperation::Swfs(this) => this.stored(path, address, size, mode),
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.stored(path, address, size, mode),
         }
     }
 
@@ -1300,6 +1514,10 @@ impl InstanceOperation for InstanceOperationImpl {
                 this.committed(repository, committed).await
             }
             StaticDispatchInstanceOperation::Swfs(this) => {
+                this.committed(repository, committed).await
+            }
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => {
                 this.committed(repository, committed).await
             }
         }

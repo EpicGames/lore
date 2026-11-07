@@ -2265,6 +2265,7 @@ fn verify_changes_against_filesystem<'a>(
                 async move {
                     let mut change = change;
                     let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
+                    let realizes_every_change = true;
                     let no_force_hash_check = false;
                     crate::fs::realize::verify_filesystem(
                         &mut change,
@@ -2272,6 +2273,7 @@ fn verify_changes_against_filesystem<'a>(
                         operation,
                         crate::state::NodeMapping::root(repository, state_current),
                         no_forward_changes,
+                        realizes_every_change,
                         no_force_hash_check,
                         stats,
                         FilterMode::Full,

@@ -123,6 +123,8 @@ async fn a_served_deleted_directory_emits_no_child_twice_or_at_a_name_it_left() 
             let walk = Walk::started(true).await;
             let (repository, from, d) = (&walk.repository, &walk.from, walk.directory);
             let children = &walk.children;
+            let state = from.clone();
+            let moves = state.walk_moves();
 
             let reattached = from
                 .served()
@@ -177,6 +179,11 @@ async fn a_served_deleted_directory_emits_no_child_twice_or_at_a_name_it_left() 
                 walk.finished().await,
                 ["d", "d/a3", "d/a4", "d/a5", "d/a6", "d/e", "d/e/a0"],
                 "each child once at its collected name, none renamed, detached or moved since"
+            );
+            assert_eq!(
+                state.walk_moves(),
+                moves + 3,
+                "the renamed, the detached and the moved child are counted as left out"
             );
         })
         .await;

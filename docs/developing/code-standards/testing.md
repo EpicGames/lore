@@ -478,6 +478,27 @@ own, so runs side by side share neither. A call doesn't carry
 it as the harness starts its shared service: with a directory of its own for
 both paths and `LORE_AUTH_STORE=fallback`.
 
+### Running every test over virtual clones
+
+`LORE_TEST_VFS` names a VFS that every repository a test creates or clones
+through the harness takes where the test names none, so the suite runs over
+virtual clones. The service mounts a virtual clone, so the run needs one:
+
+```bash
+LORE_TEST_SHARED_SERVICE=1 LORE_TEST_VFS=fuse uv run pytest scripts/test/ -m smoke -n 4
+```
+
+A bare, untracked or dry-run clone stays as the test asks, since a virtual
+clone has no such form. A virtual clone stays mounted past the test that made
+it, so the harness detaches every Lore mount below a test's directories before
+removing them.
+
+A test that cannot run over a virtual clone keeps the VFS it names, or none,
+with `@pytest.mark.own_vfs("<why>")`. The reason names what the test does that a
+virtual clone does not: it links or layers a repository, deletes or moves an
+instance's directory, or asserts what a plain status reports of an ordinary
+working tree, where a status on a virtual clone always scans.
+
 ### Per-test timeout
 
 Every test is bounded at ten minutes (`timeout` in `pyproject.toml`), and the

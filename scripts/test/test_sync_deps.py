@@ -7,6 +7,10 @@ import pytest
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "syncs a dependency set, which a virtual clone holds whole"
+)
+
 logger = logging.getLogger(__name__)
 
 

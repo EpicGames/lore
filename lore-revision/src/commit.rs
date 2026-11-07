@@ -1544,7 +1544,9 @@ async fn build_commit_metadata(
 ///
 /// `reconciling` is the operation the commit read its files through, `None` for a link's own
 /// commit, which makes no revision of the instance current. Outside a dry run, where its provider
-/// holds its state, it is handed `state_staged` as stored once the revision is current
+/// holds its state, it owes the provider's settle from before the revision may become current
+/// ([`InstanceOperationImpl::owe_settle`]), released at once where the branch's latest was not
+/// stored, and is handed `state_staged` as stored once the revision is current
 /// ([`hand_over_committed`]), before it is reused as the staged anchor.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_commit(
@@ -1560,13 +1562,28 @@ async fn finalize_commit(
     let dry_run = execution_context().globals().dry_run();
 
     if !dry_run {
-        store_branch_latest_and_make_current(
+        if let Some(operation) = reconciling {
+            operation.owe_settle().await;
+        }
+        // The halves of `store_branch_latest_and_make_current`, apart: only a failure of the
+        // first leaves nothing current, so no settle owed.
+        if let Err(error) = branch::store_latest(
             repository.clone(),
+            branch,
             branch_previous,
             signature,
-            branch,
+            BranchLatestStatus::Divergent,
         )
-        .await?;
+        .await
+        {
+            if let Some(operation) = reconciling {
+                operation.release_settle_owed();
+            }
+            return Err(error).forward::<CommitError>("Failed to store current branch latest");
+        }
+        crate::instance::store_current_anchor(&repository, signature)
+            .await
+            .forward::<CommitError>("Failed to serialize current revision anchor")?;
         if let Some(operation) = reconciling
             && operation.holds_state()
             && let Err(error) = hand_over_committed(&repository, operation, state_staged).await
@@ -1622,16 +1639,20 @@ async fn finalize_commit(
 
 /// Hands `committed` to `operation`, whose provider holds its state, once the stores are flushed
 /// ([`InstanceOperation::committed`]). The provider may then drop the copies it kept of the files
-/// the commit read, which only a revision on disk replaces after a crash.
+/// the commit read, which only a revision on disk replaces after a crash. A failed flush drops the
+/// blocks kept for the settle ([`InstanceOperationImpl::keep_serialized_blocks`]).
 async fn hand_over_committed(
     repository: &Arc<RepositoryContext>,
     operation: &InstanceOperationImpl,
     committed: &Arc<State>,
 ) -> Result<(), CommitError> {
-    repository
+    if let Err(error) = repository
         .flush(execution_context().globals().sync_data())
         .await
-        .forward_any::<CommitError>("flushing the commit")?;
+    {
+        operation.drop_serialized_blocks();
+        return Err(error).forward_any::<CommitError>("flushing the commit");
+    }
     operation
         .committed(repository.clone(), committed.clone())
         .await
@@ -1724,8 +1745,10 @@ async fn commit_staged_revision(
         // For each file in repository, create fragments if they don't already
         // exist. Also rehash directories affected by change and generate new
         // root hash.
+        // A clone: the block's own reference serves the serialize below, so no second slot holds
+        // one across the walk's await.
         commit_files_and_rehash(
-            operation,
+            operation.clone(),
             repository.clone(),
             token.share(),
             state_staged.clone(),
@@ -1791,9 +1814,11 @@ async fn commit_staged_revision(
             .await
             .forward::<CommitError>("Failed to free the detached slots")?;
 
-        // Serialize the new current state
+        // Serialize the new current state, its fresh blocks kept for the provider's settle
         let signature = state_staged
-            .serialize(repository.clone(), &token)
+            .serialize_keeping(repository.clone(), &token, |written| {
+                operation.keep_serialized_blocks(written);
+            })
             .await
             .forward::<CommitError>("Failed to serialize revision state")?;
 
@@ -1857,7 +1882,9 @@ pub async fn store_branch_latest_and_make_current(
 /// `operation` is the caller's, covering the whole working tree the files are read from, links
 /// and layers included: their paths are the parent's and so is their filesystem. A file the
 /// state holds as a resolved merge conflict has the copies that merge left beside it removed,
-/// so the operation is one finalized as having changed the filesystem.
+/// so the operation is one finalized as having changed the filesystem. Where its provider holds
+/// its state, it is handed each directory the walk adds or moves
+/// ([`InstanceOperationImpl::hand_directory`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_files_and_rehash(
     operation: Arc<InstanceOperationImpl>,
@@ -1901,6 +1928,7 @@ pub(crate) async fn commit_files_and_rehash(
     let discover_stats = stats.clone();
     let producer = {
         let walk = Arc::new(CommitWalk {
+            hands_directories: operation.holds_state(),
             operation: operation.clone(),
             repository: repository.clone(),
             token: token.share(),
@@ -2055,6 +2083,9 @@ fn reject_unresolved_conflict(node: &Node, path: &str) -> Result<(), CommitError
 /// What every directory of a commit walk reads and writes.
 #[lore_macro::test_pub]
 struct CommitWalk {
+    /// Whether each directory the walk adds or moves goes to `operation`
+    /// ([`InstanceOperationImpl::hand_directory`]): a link's walk keeps its own.
+    hands_directories: bool,
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
@@ -2146,7 +2177,8 @@ struct CommitFrame {
 
 impl CommitFrame {
     /// Enters the staged directory `node_id` at `relative_path`, adding the directory to the delta
-    /// when it is staged itself.
+    /// when it is staged itself, and handing it to the walk's operation when it is staged added
+    /// or moved.
     async fn enter(
         walk: &CommitWalk,
         relative_path: RelativePath,
@@ -2168,6 +2200,9 @@ impl CommitFrame {
             );
             if node.is_staged() {
                 delta_add(walk.delta.clone(), node_id, node.flags);
+                if walk.hands_directories && (node.is_staged_add() || node.is_staged_move()) {
+                    walk.operation.hand_directory(&relative_path);
+                }
             }
         }
         let children = StateNodeChildrenWithNameIterator::new(
@@ -2659,22 +2694,29 @@ fn commit_file(
                 .forward_with::<CommitError, _>(|| {
                     format!("naming the content of {relative_path}")
                 })?;
-            let (address, size_content) = immutable::write_from_file_with_tracker(
-                repository.clone(),
-                &source,
-                node.address.context,
-                immutable::write_options_from_repository(repository.clone()),
-                Some(tracker),
-            )
-            .await
-            .forward_with::<CommitError, _>(|| {
-                format!(
-                    "Failed writing file {} to immutable store",
-                    relative_path.as_str()
-                )
-            })?;
-
-            stats.file_read(size_content);
+            // Content a virtual filesystem serves from the immutable store is stored already,
+            // under the address it names, so it is taken as it is rather than read back.
+            let (address, size_content) =
+                if let Some(stored) = immutable::virtual_immutable(&source) {
+                    stored
+                } else {
+                    let written = immutable::write_from_file_with_tracker(
+                        repository.clone(),
+                        &source,
+                        node.address.context,
+                        immutable::write_options_from_repository(repository.clone()),
+                        Some(tracker),
+                    )
+                    .await
+                    .forward_with::<CommitError, _>(|| {
+                        format!(
+                            "Failed writing file {} to immutable store",
+                            relative_path.as_str()
+                        )
+                    })?;
+                    stats.file_read(written.1);
+                    written
+                };
             let mode = info.mode(node.mode);
             operation.stored(&relative_path, address, size_content, mode);
 
@@ -2943,6 +2985,7 @@ async fn commit_link(
 
             let producer = {
                 let walk = Arc::new(CommitWalk {
+                    hands_directories: false,
                     operation: operation.clone(),
                     repository: repository.clone(),
                     token: token.share(),

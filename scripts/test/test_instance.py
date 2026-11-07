@@ -337,6 +337,7 @@ class TestInstanceMove:
             str(target) not in listed and str(target).replace("\\", "/") not in listed
         )
 
+    @pytest.mark.own_vfs("checks the .lore an ordinary instance carries into the moved directory")
     def test_instance_move_succeeds_for_regular_instance(
         self, new_lore_repo, scratch_dir
     ):
@@ -395,6 +396,7 @@ class TestInstanceMove:
             and original_path.replace("\\", "/") not in listed
         ), f"Instance should no longer be registered at the source. Output: {listed}"
 
+    @pytest.mark.own_vfs("checks the .lore an ordinary instance carries into the moved directory")
     def test_instance_move_resolves_a_relative_target_against_the_working_directory(
         self, new_lore_repo, scratch_dir
     ):

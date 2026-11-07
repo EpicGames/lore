@@ -4,6 +4,7 @@
 
 use core::str;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use lore_error_set::prelude::*;
 
@@ -12,6 +13,7 @@ use crate::errors::InvalidArguments;
 use crate::errors::InvalidNodeHierarchy;
 use crate::errors::NodeNotFound;
 use crate::errors::SlowDown;
+use crate::lore_warn;
 use crate::node::ChainPatch;
 use crate::node::Node;
 use crate::node::NodeBlock;
@@ -223,7 +225,7 @@ impl<'a> BlockLocks<'a> {
     }
 
     /// Adds `weight` to `directory`'s chain change count and appends the patch to its log, if it
-    /// has one; a directory with no log costs the empty slot search.
+    /// has one ([`Self::log_patch`]); a directory with no log costs the empty slot search.
     pub(in crate::state) fn note(
         &mut self,
         directory: NodeID,
@@ -239,12 +241,44 @@ impl<'a> BlockLocks<'a> {
         if weight != 0 {
             held.writer.note_chain_changes(index, weight);
         }
-        if let Some(log) = held.writer.chain_log_mut(index) {
+        if held.writer.chain_log_mut(index).is_some() {
+            self.log_patch(directory, kind, name_hash, node_id);
+        }
+    }
+
+    /// Appends the patch to `directory`'s log, which a listing watches, with a weak reference to
+    /// `node_id`'s block, which every primitive holds locked too. Without that block no patch can
+    /// be written, so the log leaves every earlier reader stale. Out of line, so a directory
+    /// without a log, the only kind outside a VFS provider's State, carries none of it.
+    #[inline(never)]
+    fn log_patch(&mut self, directory: NodeID, kind: PatchKind, name_hash: u64, node_id: NodeID) {
+        let index = Node::index(directory);
+        let block = self.entry(node_id).map(|held| Arc::downgrade(held.block));
+        let Some(log) = self
+            .entry(directory)
+            .and_then(|held| held.writer.chain_log_mut(index))
+        else {
+            return;
+        };
+        if let Some(block) = block {
             log.append(ChainPatch {
                 name_hash,
+                block,
                 node: node_id,
                 kind,
             });
+        } else {
+            log.skip(kind);
+            // Not an assert: release builds keep debug assertions and abort, and the skip is a
+            // correct fallback.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                lore_warn!(
+                    "Directory {directory}: a chain change was logged without the block of child \
+                     {node_id}; its listings rebuild"
+                );
+            }
         }
     }
 

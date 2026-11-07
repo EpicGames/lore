@@ -94,6 +94,21 @@ pub struct FilterLine {
     literal: bool,
 }
 
+impl FilterInstance {
+    /// Whether both hold the same authored rules in the same order, and so answer every path
+    /// the same way. The indexes are derived from the lines, so comparing lines is enough.
+    pub fn same_rules(&self, other: &FilterInstance) -> bool {
+        self.lines.len() == other.lines.len()
+            && self.lines.iter().zip(&other.lines).all(|(a, b)| {
+                a.glob == b.glob
+                    && a.negated == b.negated
+                    && a.directory == b.directory
+                    && a.filename == b.filename
+                    && a.literal == b.literal
+            })
+    }
+}
+
 #[error_set]
 pub enum FilterError {
     InvalidArguments,
@@ -121,10 +136,41 @@ impl FilterState {
     };
 
     /// Whether the path this state describes is excluded.
-    #[cfg(feature = "test-util")]
-    #[lore_macro::test_pub]
-    fn excluded(&self) -> bool {
+    pub fn excluded(&self) -> bool {
         self.excluded
+    }
+
+    /// A state carrying only whether the path is excluded, decided at no
+    /// particular line (as `ROOT` is).
+    ///
+    /// For a caller that persisted just the excluded bit and needs a
+    /// `FilterState` back to hand a walk. Resuming a walk from an excluded
+    /// result takes every line from the top, where the original decision took
+    /// only those from the line that decided it, so a re-inclusion authored
+    /// before that line, which lost there, re-includes below it. A caller that
+    /// can keep the line resumes with [`decided`](Self::decided).
+    pub fn excluded_from(excluded: bool) -> Self {
+        Self {
+            excluded,
+            decided_at: 0,
+        }
+    }
+
+    /// A state carrying whether the path is excluded and the line that decided
+    /// it, as [`decided_at`](Self::decided_at) answered, for a caller that
+    /// persisted both: a walk resumed from it reaches the verdicts the original
+    /// walk would have.
+    pub fn decided(excluded: bool, decided_at: u32) -> Self {
+        Self {
+            excluded,
+            decided_at,
+        }
+    }
+
+    /// The line that decided the verdict, which floors the lines a walk below
+    /// an excluded path takes.
+    pub fn decided_at(&self) -> u32 {
+        self.decided_at
     }
 }
 
@@ -230,7 +276,15 @@ pub fn load(
     ignore_path: impl AsRef<Path>,
     view_path: impl AsRef<Path>,
 ) -> Result<Filter, FilterError> {
-    let mut ignore = load_filter(ignore_path)?;
+    with_ignore(load_filter(ignore_path)?, view_path)
+}
+
+/// The filter of `ignore`, the rules of a repository's ignore file, with the exclusions every
+/// repository holds and the view at `view_path`.
+fn with_ignore(
+    mut ignore: FilterInstance,
+    view_path: impl AsRef<Path>,
+) -> Result<Filter, FilterError> {
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
     for suffix in MERGE_ARTIFACT_SUFFIXES {
@@ -259,7 +313,29 @@ pub fn load_with_instance_ignore(
     instance_ignore_path: impl AsRef<Path>,
     view_path: impl AsRef<Path>,
 ) -> Result<Filter, FilterError> {
-    let mut filter = load(ignore_path, view_path)?;
+    with_instance_ignore(load(ignore_path, view_path)?, instance_ignore_path)
+}
+
+/// [`load_with_instance_ignore`] with the repository's ignore file read already: `ignore` holds
+/// its bytes and the path they came from, for the error message, and `None` where it has none.
+pub fn load_with_instance_ignore_from(
+    ignore: Option<(&[u8], &Path)>,
+    instance_ignore_path: impl AsRef<Path>,
+    view_path: impl AsRef<Path>,
+) -> Result<Filter, FilterError> {
+    let rules = match ignore {
+        Some((bytes, path)) => parse_filter(bytes, path)?,
+        None => FilterInstance::default(),
+    };
+    with_instance_ignore(with_ignore(rules, view_path)?, instance_ignore_path)
+}
+
+/// `filter` with the exclusions in the instance's own ignore file at `instance_ignore_path` after
+/// its own, as [`load_with_instance_ignore`] reads them.
+fn with_instance_ignore(
+    mut filter: Filter,
+    instance_ignore_path: impl AsRef<Path>,
+) -> Result<Filter, FilterError> {
     let path = instance_ignore_path.as_ref();
     let Ok(bytes) = std::fs::read(path) else {
         return Ok(filter);
@@ -1732,7 +1808,7 @@ impl FilterMode {
 /// and still hold content a later rule re-includes, and then the answer depends
 /// on which question was asked.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
+pub(crate) enum Scope {
     /// The path itself. Says nothing about what sits below it.
     Node,
     /// The path and everything below it, which is what a walk has to know
@@ -1923,7 +1999,7 @@ impl Filter {
     /// is one index lookup rather than a second pass over the lines.
     ///
     /// A file has no subtree, so it is answered the same at either scope.
-    fn child_exclude_reason(
+    pub(crate) fn child_exclude_reason(
         &self,
         parent: FilterStates,
         path: &impl FilterPath,
@@ -2274,7 +2350,7 @@ impl Filter {
 
     /// Reports the path that was asked about, not the ancestor that matched: it
     /// is what the caller named, and the ancestor is only available lowercased.
-    fn emit(path: &impl FilterPath, reason: Option<FilterReason>) -> bool {
+    pub(crate) fn emit(path: &impl FilterPath, reason: Option<FilterReason>) -> bool {
         match reason {
             Some(reason) => {
                 LoreEvent::FilterExclude(LoreFilterExcludeEventData {

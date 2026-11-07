@@ -12,7 +12,8 @@ use crate::repository::DOT_LORE;
 pub enum ExternalDirError {}
 
 const EXTERNAL: &str = "external";
-const WRITE: &str = "write";
+/// The directory in an instance's external directory holding what its mount wrote.
+pub const WRITE_DIR: &str = "write";
 
 pub fn external_dir_for_instance(instance_id: InstanceId) -> Result<PathBuf, ExternalDirError> {
     let global =
@@ -24,10 +25,6 @@ pub fn external_dir_for_instance(instance_id: InstanceId) -> Result<PathBuf, Ext
 
 pub fn external_lore_dir(instance_id: InstanceId) -> Result<PathBuf, ExternalDirError> {
     Ok(external_dir_for_instance(instance_id)?.join(DOT_LORE))
-}
-
-pub fn external_write_dir(instance_id: InstanceId) -> Result<PathBuf, ExternalDirError> {
-    Ok(external_dir_for_instance(instance_id)?.join(WRITE))
 }
 
 pub fn check_for_external_lore_dir(

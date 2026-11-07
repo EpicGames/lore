@@ -11,6 +11,10 @@ from test_utils import has_staged_anchor, status_by_path
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_reset(new_lore_repo):

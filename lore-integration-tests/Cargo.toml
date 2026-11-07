@@ -74,6 +74,10 @@ lore-transport = { workspace = true, features = ["test-util"] }
 rcgen = { workspace = true }
 serde = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = { workspace = true }
+lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
+
 [features]
 integration_tests = ["lore-server/integration_tests"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]

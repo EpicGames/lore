@@ -10,6 +10,7 @@ members = [
     "lore-credential",
     "lore-error-set",
     "lore-error-set-macro",
+    "lore-fuse",
     "lore-hashicorp",
     "lore-integration-tests",
     "lore-io",
@@ -136,6 +137,7 @@ config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
 crossbeam-epoch = "0.9.21"
 crossbeam-queue = "0.3.14"
+crossbeam-utils = "0.8.23"
 dashmap = "6.1.0"
 diffy = "0.5.2"
 directories = "6.0.0"

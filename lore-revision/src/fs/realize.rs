@@ -360,6 +360,7 @@ pub fn verify_filesystem_for_changes(
                         operation,
                         current,
                         forward_changes,
+                        false,
                         force_hash_check,
                         stats,
                         filter_mode,
@@ -793,8 +794,9 @@ async fn remove_directory_of_case_variants<C: Borrow<NodeChange>>(
 /// and settling on it what realizing it has to know, and answers whether it still has work to do.
 ///
 /// A caller that realizes every change it verified, which a merge does to build the staged state
-/// out of them, takes the change as this leaves it and disregards the answer. One that realizes
-/// only what the working copy still needs, which a sync does, drops the rest.
+/// out of them, takes the change as this leaves it and disregards the answer, and says so in
+/// `realizes_every_change`. One that realizes only what the working copy still needs, which a
+/// sync does, drops the rest.
 ///
 /// A file found to hold the incoming content has its time recorded where it is older than the
 /// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads
@@ -809,6 +811,7 @@ pub async fn verify_filesystem(
     operation: Arc<InstanceOperationImpl>,
     current: NodeMapping,
     forward_changes: bool,
+    realizes_every_change: bool,
     force_full_check: bool,
     stats: Arc<SyncVerifyStats>,
     filter_mode: FilterMode,
@@ -835,6 +838,18 @@ pub async fn verify_filesystem(
     }
 
     if !modifications.info.exists() {
+        if operation
+            .unversioned_symlink_at_or_above(&repository_path)
+            .await?
+        {
+            // A caller realizing every change would write over it whatever this answers.
+            if forward_changes && !realizes_every_change {
+                lore_info!("Keeping the symbolic link at {}", change.path());
+                return Ok(false);
+            }
+            lore_error!("A symbolic link stands at or above {}", change.path());
+            return Err(LocalModifications.into());
+        }
         return match change.action {
             change::FileAction::Add => {
                 // Nothing exist in file system, safe to add

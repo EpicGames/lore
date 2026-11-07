@@ -18,7 +18,7 @@ pub fn variant_type_size(input: TokenStream) -> TokenStream {
     variant::get_variant_type_sizes(&ast)
 }
 
-#[proc_macro_derive(LoreArgs, attributes(handler))]
+#[proc_macro_derive(LoreArgs, attributes(handler, requires_service))]
 pub fn lore_args(input: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(input as DeriveInput);
 

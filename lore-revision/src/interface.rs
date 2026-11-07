@@ -1008,7 +1008,7 @@ fn execution_initialize() {
     });
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ExecutionMode {
     Client,
     Server,
@@ -1103,6 +1103,40 @@ impl ExecutionContext {
             environment: Some(environment),
             ..self
         }
+    }
+
+    /// This context for a holder that serves past the call that made it, a mounted filesystem,
+    /// for a caller with `environment`: these globals and this mode, and a dispatcher that sends
+    /// nowhere, as no call awaits what the holder logs.
+    #[cfg(target_os = "linux")]
+    #[lore_macro::test_pub]
+    pub(crate) fn serving(&self, environment: CallEnvironment) -> Self {
+        let mut dispatcher = EventDispatcher::new(None);
+        dispatcher
+            .correlation_id
+            .clone_from(&self.dispatcher.correlation_id);
+        let user_id = self
+            .user_id
+            .try_lock()
+            .map(|id| id.clone())
+            .unwrap_or_default();
+        Self {
+            globals: self.globals.clone(),
+            dispatcher,
+            log_level: self.log_level,
+            user_id: Mutex::new(user_id),
+            mode: self.mode,
+            caller_state: self.caller_state.clone(),
+            environment: Some(environment),
+            ..Default::default()
+        }
+    }
+
+    /// The environment of the process that relayed this call, `None` for a call made in this
+    /// process.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn environment(&self) -> Option<&CallEnvironment> {
+        self.environment.as_ref()
     }
 
     pub fn globals(&self) -> &LoreGlobalArgs {

@@ -17,6 +17,10 @@ from thin_client import (
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_add_diff_reports_link_only(new_lore_repo):

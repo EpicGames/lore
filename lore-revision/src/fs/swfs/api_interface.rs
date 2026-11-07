@@ -464,6 +464,7 @@ mod swfs_impl {
             SwfsInterfaceError::internal("Looking up SWFS interface without SWFS being enabled"),
         )?;
         mount_manager
+            .swfs()
             .get_interface_from_swfs_handle(handle)
             .ok_or(SwfsInterfaceError::internal(
                 "Missing SWFS interface for handle",

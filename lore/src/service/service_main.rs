@@ -262,7 +262,7 @@ async fn close_swfs_mounts(service_state: &ServiceStateImpl) {
     let Some(manager) = MountManagerState::mount_manager() else {
         return;
     };
-    if let Err(error) = manager.close_all().await {
+    if let Err(error) = manager.swfs().close_all().await {
         service_state.push_log(LoreLogLevel::Error, error.to_string());
     }
 }

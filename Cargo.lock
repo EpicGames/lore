@@ -2600,6 +2600,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-fuse"
+version = "0.13.1-nightly"
+dependencies = [
+ "dashmap",
+ "libc",
+ "lore-base",
+ "lore-fuse",
+ "lore-macro",
+ "parking_lot",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "zerocopy",
+]
+
+[[package]]
 name = "lore-hashicorp"
 version = "0.13.1-nightly"
 dependencies = [
@@ -2630,9 +2646,11 @@ dependencies = [
  "axum",
  "bytes",
  "ctor",
+ "libc",
  "lore",
  "lore-aws",
  "lore-base",
+ "lore-fuse",
  "lore-hashicorp",
  "lore-proto",
  "lore-revision",
@@ -2724,7 +2742,9 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "crossbeam-epoch",
  "crossbeam-queue",
+ "crossbeam-utils",
  "ctor",
  "dashmap",
  "diffy",
@@ -2741,6 +2761,7 @@ dependencies = [
  "lore-base",
  "lore-credential",
  "lore-error-set",
+ "lore-fuse",
  "lore-io",
  "lore-macro",
  "lore-proto",

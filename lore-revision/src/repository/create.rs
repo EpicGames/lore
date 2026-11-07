@@ -12,6 +12,7 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::StoreConfig;
 use super::VfsConfig;
+use super::VfsType;
 use super::get_dot_lore_path;
 use super::load_repository_config_from_dot_dir;
 use crate::branch;
@@ -215,7 +216,7 @@ pub(crate) async fn create_with_metadata(
     }
 
     repository::refuse_nesting_in_swfs_mount(path)?;
-    if options.vfs_options.vfs_type.is_swfs() {
+    if options.vfs_options.vfs_type == VfsType::Swfs {
         repository::refuse_swfs_nested_in_repository(path)?;
         repository::refuse_swfs_past_mount_limit()?;
     }
@@ -223,7 +224,7 @@ pub(crate) async fn create_with_metadata(
     if existing_dot_dir.exists() {
         let existing_repository_is_swfs =
             load_repository_config_from_dot_dir(existing_dot_dir.as_path())
-                .is_ok_and(|config| config.is_swfs());
+                .is_ok_and(|config| config.vfs_type() == VfsType::Swfs);
         if call.force() && !existing_repository_is_swfs {
             if call.dry_run() {
                 dry_run_created(id_or_new(&options), name, path);

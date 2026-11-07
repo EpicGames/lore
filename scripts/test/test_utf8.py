@@ -15,13 +15,16 @@ TRUNCATED_UTF8 = b"hello \xe4\xb8"
 
 
 def run_lore_raw(repo: Lore, urc_args: list, check: bool = True):
-    """Call repo with raw byte arguments, bypassing text=True."""
+    """Call repo with raw byte arguments, bypassing text=True, in the environment the
+    test set up for it."""
     cmd = [
         repo.lore_executable_path.encode(),
         b"--repository",
         repo.path.encode(),
     ] + [a.encode() if isinstance(a, str) else a for a in urc_args]
-    return subprocess.run(cmd, capture_output=True, check=check)
+    return subprocess.run(
+        cmd, capture_output=True, check=check, env=repo.sandboxed_env()
+    )
 
 
 @pytest.mark.smoke

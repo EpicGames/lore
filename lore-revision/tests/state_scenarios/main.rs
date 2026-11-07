@@ -16,6 +16,8 @@
 
 mod calls;
 mod catalogue;
+#[cfg(target_os = "linux")]
+mod fuse;
 #[allow(
     dead_code,
     unused_imports,

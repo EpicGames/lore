@@ -201,7 +201,7 @@ pub async fn served_mark_dir(tree: &Tree, dir: NodeID) -> bool {
     .await
 }
 
-/// A served create of file `name` in `dir`, as a VFS provider makes one: the node
+/// A served create of file `name` in `dir`, as the provider's `attach_local` makes one: the node
 /// added and holding local content. The node where it attached; `None` where the name is held or
 /// the directory is gone, which the provider answers with an error.
 pub async fn served_create(tree: &Tree, dir: NodeID, name: &str) -> Option<NodeID> {
@@ -253,11 +253,11 @@ fn attach_answered(
     }
 }
 
-/// A served create of file `name` in `dir` after a listing reader's build of `dir`, as the VFS
-/// provider's CREATE makes one: it looks the name up in the directory's listing, and attaches
-/// checked against the directory's log since the lookup where it found the name absent
-/// (`AttachCheck::Absent`). Where the lookup found the name held, the CREATE answers it exists
-/// with no attach; this attaches by walking the
+/// A served create of file `name` in `dir` after a listing reader's build of `dir`, as FUSE's
+/// `create_node` makes one: its `resolve_to_attach` looks the name up in the directory's listing
+/// (`Listing::lookup_to_attach`), and `attach_local` attaches checked against the directory's log
+/// since the lookup where it found the name absent (`AttachCheck::Absent`). Where the lookup found
+/// the name held, `create_node` answers it exists with no attach; this attaches by walking the
 /// chain, which a holder gone since lets through. The node where it attached; `None` where the
 /// name is held or the directory is gone.
 pub async fn listing_create(tree: &Tree, dir: NodeID, name: &str) -> Option<NodeID> {
@@ -295,10 +295,10 @@ pub async fn listing_create_waiting(
     .await
 }
 
-/// A served rename of `node` to `name` in `dir` after a listing reader's build of `dir`, as the VFS
-/// provider's RENAME makes one onto a name it looked up in the directory's listing: checked against
-/// the directory's log since the lookup where it found the name absent (`ReattachCheck::Absent`).
-/// Where the lookup found the name held, the provider replaces its holder; this
+/// A served rename of `node` to `name` in `dir` after a listing reader's build of `dir`, as FUSE's
+/// `rename_in_state` makes one onto a name its `resolve_to_attach` looked up in the directory's
+/// listing: checked against the directory's log since the lookup where it found the name absent
+/// (`ReattachCheck::Absent`). Where the lookup found the name held, FUSE replaces its holder; this
 /// moves by walking the chain, refused where the name is still held. Whether it moved, as
 /// [`served_rename`] answers.
 pub async fn listing_rename(tree: &Tree, node: NodeID, dir: NodeID, name: &str) -> bool {
@@ -363,7 +363,7 @@ async fn listing_absence(
     Ok(absent)
 }
 
-/// A listing reader's build of directory `dir`, as a VFS provider's listing makes one:
+/// A listing reader's build of directory `dir`, as the provider's `Listing::build_with` makes one:
 /// the directory's log marked before the walk, so a patch landing during it is found after, then
 /// the reader's point there and `marked`, a window of its call; the children's name tables loaded;
 /// the children walked by name, one staged for deletion left out, the walk noted; the blocks of the
@@ -410,7 +410,7 @@ async fn listing_built(
 }
 
 /// The absence of `name_hash` from `dir` a listing reader's lookup to attach finds after `built`,
-/// as the VFS provider's listing reads it: none where the build left a child out,
+/// as the provider's `Listing::lookup_to_attach` reads it: none where the build left a child out,
 /// or where an entry listed under the hash still holds its node, read under its block's read lock
 /// alone; then, under the directory block's read lock, none where the log was respelled since the
 /// build, no longer covers it, or holds an attach of the hash since; `GONE` where the directory is
@@ -492,7 +492,7 @@ async fn named_walk(
     Ok((walk, left_out || skipped != 0))
 }
 
-/// A VFS provider diff's checked attach of file `name` in `dir`, as it settles an add where
+/// The provider diff's checked attach of file `name` in `dir`, as its `settle_add` makes one where
 /// its tree does not list `dir`: the file attached dirty-added where no live child holds the name;
 /// where one does, a delete staged for it taken back and the holder marked modified unless it is
 /// an add; then `dir` marked. `None` where the directory is gone.
@@ -571,7 +571,7 @@ async fn checked_attach(
     Ok(Some(attached))
 }
 
-/// A served rename of `node` to `name` in `dir`, as the VFS provider's RENAME makes one onto a
+/// A served rename of `node` to `name` in `dir`, as FUSE's `rename_in_state` makes one onto a
 /// free name (`ServedNodes::node_reattach_local`): a directory moves to another place only while
 /// it holds local content, and a file or a respell moves as any reattach does. Whether it moved;
 /// a directory refused, a held name, and a node or directory a concurrent removal took are no
@@ -667,7 +667,7 @@ pub async fn hold_local(tree: &Tree, node: NodeID) {
 }
 
 /// A served rename of `node` to `name` in `dir` over `holder`, the node holding the name, as
-/// the VFS provider's RENAME makes one onto a held name, under the local rule
+/// FUSE's `rename_in_state` makes one onto a held name, under the local rule
 /// [`served_rename`] states; whether it moved. A directory refused and a node or directory a
 /// concurrent removal took are no error.
 pub async fn served_rename_replacing(
@@ -704,7 +704,7 @@ pub async fn served_rename_replacing(
     .await
 }
 
-/// A served removal of `node`, as a VFS provider's UNLINK makes one; whether it detached.
+/// A served removal of `node`, as FUSE's `detach_node` makes one; whether it detached.
 pub async fn served_detach(tree: &Tree, node: NodeID) -> bool {
     call(&tree.state, (&super::SERVED_DETACH, Some(node)), async {
         match tree
@@ -733,12 +733,12 @@ pub struct Rmdir {
     pub rechecked: usize,
 }
 
-/// A served RMDIR of directory `dir`, as a VFS provider's RMDIR makes one: on each attempt the
-/// directory's block read, its record with its chain's count, its children walked by name, a child
-/// staged for deletion passed over, and the directory detached only while its chain holds what the
-/// walk read ([`Detach::IfUnchanged`]); a chain that moved during the walk is checked again before
-/// the detach, as the VFS provider checks it before it touches the host. A directory holding a
-/// child, or one a concurrent removal took, is not detached.
+/// A served RMDIR of directory `dir`, as FUSE's makes one: on each attempt the directory's block
+/// read, its record with its chain's count, its children walked by name, a child staged for
+/// deletion passed over, and the directory detached only while its chain holds what the walk read
+/// ([`Detach::IfUnchanged`]); a chain that moved during the walk is checked again before the
+/// detach, as FUSE checks it before it touches the host. A directory holding a child, or one a
+/// concurrent removal took, is not detached.
 pub async fn served_rmdir(tree: &Tree, dir: NodeID) -> Rmdir {
     call(&tree.state, (&super::SERVED_RMDIR, Some(dir)), async {
         let mut ended = Rmdir::default();
@@ -749,12 +749,12 @@ pub async fn served_rmdir(tree: &Tree, dir: NodeID) -> Rmdir {
 }
 
 thread_local! {
-    /// The attempts a served RMDIR makes before it answers its retries spent: the VFS provider's
-    /// 64, lowered by a scenario that reaches the answer ([`set_rmdir_attempts_for_tests`]).
+    /// The attempts a served RMDIR makes before it answers its retries spent: FUSE's 64, lowered
+    /// by a scenario that reaches the answer ([`set_rmdir_attempts_for_tests`]).
     static RMDIR_ATTEMPTS: std::cell::Cell<u32> = const { std::cell::Cell::new(64) };
 }
 
-/// Sets the attempts a served RMDIR on this thread makes, as the VFS provider's are 64.
+/// Sets the attempts a served RMDIR on this thread makes, as FUSE's are 64.
 pub fn set_rmdir_attempts_for_tests(attempts: u32) {
     RMDIR_ATTEMPTS.with(|set| set.set(attempts));
 }
@@ -820,11 +820,11 @@ async fn rmdir(tree: &Tree, dir: NodeID, ended: &mut Rmdir) -> Outcome {
             Err(error) => return failed(&error),
         }
     }
-    // As the VFS provider's RMDIR answers `EAGAIN` once its retries are spent.
+    // As FUSE's RMDIR answers `EAGAIN` once its retries are spent.
     Outcome::SelfReported(SelfReported::RetriesSpent)
 }
 
-/// A swap's copy of file `name` into `dir`, as a swap copies a file: a build of the
+/// A swap's copy of file `name` into `dir`, as its `copy_subtree` copies a file: a build of the
 /// file alone, published, clean, needing only a live directory. Whether it attached; a name held
 /// or a directory gone is no error.
 pub async fn swap_attach(tree: &Tree, dir: NodeID, name: &str) -> bool {
@@ -870,8 +870,8 @@ fn published(publish: Result<AttachOutcome, StateError>) -> (Option<NodeID>, Out
     }
 }
 
-/// A swap's copy of directory `name` holding files `children` into `dir`, as a swap copies a
-/// directory ([`lore_revision::state::SwapNodes::node_attach_tree`]): built clean out of every
+/// A swap's copy of directory `name` holding files `children` into `dir`, as its `copy_subtree`
+/// makes one ([`lore_revision::state::SwapNodes::node_attach_tree`]): built clean out of every
 /// chain, then published whole, needing only a live directory. The copy where it attached;
 /// `None` where the name is held or the directory is gone.
 pub async fn swap_copy_tree(
@@ -952,10 +952,10 @@ pub async fn find(tree: &Tree, dir: NodeID, name: &str) -> Option<NodeID> {
     .await
 }
 
-/// A find of `name` in directory `dir` through the blocks in memory alone, as the VFS provider's
-/// worker resolves a name it must not read the store for (`find_subnode_resident`): the node found;
-/// `None` where no child carries it, or, self-reported, where a block it needed was not in memory.
-/// It has no scheduling point, so it runs whole between other tasks' steps.
+/// A find of `name` in directory `dir` through the blocks in memory alone, as FUSE's worker resolves
+/// a name it must not read the store for (`find_subnode_resident`): the node found; `None` where no
+/// child carries it, or, self-reported, where a block it needed was not in memory. It has no
+/// scheduling point, so it runs whole between other tasks' steps.
 pub async fn find_resident(tree: &Tree, dir: NodeID, name: &str) -> Option<NodeID> {
     call(&tree.state, (&super::FIND_RESIDENT, Some(dir)), async {
         let name = hash_string(name);
@@ -969,7 +969,7 @@ pub async fn find_resident(tree: &Tree, dir: NodeID, name: &str) -> Option<NodeI
 }
 
 /// The children of directory `dir` as a children iterator begun from the directory yields them,
-/// as the scan and a VFS provider diff walk one, the walk noted: the nodes, in order; `None` where
+/// as the scan and the provider diff walk one, the walk noted: the nodes, in order; `None` where
 /// it failed or slowed down.
 pub async fn children(tree: &Tree, dir: NodeID) -> Option<Vec<NodeID>> {
     call(&tree.state, (&super::CHILDREN, Some(dir)), async {
@@ -1586,7 +1586,7 @@ fn answered(found: Result<Option<NodeID>, Outcome>) -> (Option<NodeID>, Outcome)
     }
 }
 
-/// A served copy-up of file `node` in directory `dir`, as the VFS provider's copy-up makes one
+/// A served copy-up of file `node` in directory `dir`, as FUSE's `mark_local_file` makes one
 /// ([`lore_revision::state::ServedNodes::node_copy_up`]): the file rewritten dirty with local
 /// content; whether it did. A file or directory a concurrent removal took is no error.
 pub async fn served_copy_up(tree: &Tree, node: NodeID, dir: NodeID) -> bool {
@@ -2019,13 +2019,14 @@ pub async fn scan_add(tree: &Tree, dir: NodeID, name: &str) {
     .await;
 }
 
-/// A VFS provider diff's add of `name` in `dir`, a directory its walk listed without the name: the
-/// node published dirty-added without a name check, a file where `is_file`, then `dir` marked.
-/// `os_diff`'s add (`FileDiffContext::add_new_node`) makes the same writes, and also a settled
-/// mark under a staging intent and `dir`'s mark where the add failed, which this leaves out.
-/// Nothing else writes the diff's State, and its settles run one at a time; the explorations beside
-/// clears and detaches run it beside more than production does. The node where it was added;
-/// `None` where `dir` is gone or the add failed.
+/// The provider diff's add of `name` in `dir`, a directory its walk listed without the name, as
+/// its `settle_add` makes one (state/diff.rs): the node published dirty-added without a name
+/// check, a file where `is_file`, then `dir` marked. `os_diff`'s add
+/// (`FileDiffContext::add_new_node`) makes the same writes, and also a settled mark under a
+/// staging intent and `dir`'s mark where the add failed, which this leaves out. Nothing else
+/// writes the diff's State, and its settles run one at a time; the explorations beside clears and
+/// detaches run it beside more than production does. The node where it was added; `None` where
+/// `dir` is gone or the add failed.
 pub async fn diff_add(tree: &Tree, dir: NodeID, name: &str, is_file: bool) -> Option<NodeID> {
     let flags = if is_file {
         NodeFlags::File | NodeFlags::DirtyAdd
@@ -2192,7 +2193,7 @@ async fn added_in(
     }
 }
 
-/// `ensure_scan_dir_chain` (`os_diff.rs`), as a VFS provider diff runs it before the checked attach
+/// `ensure_scan_dir_chain` (`os_diff.rs`), as the provider diff runs it before the checked attach
 /// of a name whose parent its walk did not list, a path-filtered scan before it walks a directory
 /// the State lacks, and status for the directories its untracked paths share, a level of them at
 /// once (`create_shared_untracked_ancestors`): each directory of `names` below `start` found, or,
@@ -2216,10 +2217,10 @@ pub async fn scan_chain(tree: &Tree, start: NodeID, names: &str) -> Option<NodeI
     .await
 }
 
-/// A VFS provider diff's settle of an add whose parent its walk did not list: the directories to
-/// the parent found or added ([`scan_chain`]), then the checked attach of file `name` in it
-/// ([`checked_create`]), two calls, as the settle makes them in turn. `None` where the chain
-/// stopped short or the parent is gone.
+/// The provider diff's settle of an add whose parent its walk did not list (state/diff.rs,
+/// `settle_add`): the directories to the parent found or added ([`scan_chain`]), then the checked
+/// attach of file `name` in it ([`checked_create`]), two calls, as the settle makes them in turn.
+/// `None` where the chain stopped short or the parent is gone.
 pub async fn chain_checked_create(
     tree: &Tree,
     start: NodeID,
@@ -2600,8 +2601,8 @@ async fn discarded(tree: &Tree, node: NodeID) -> Outcome {
     }
 }
 
-/// The pre-serving respelling of `node` to `name` where it stands (the VFS provider's
-/// respell): its stored name read and compared, then, where it differs, the rename and the
+/// The pre-serving respelling of `node` to `name` where it stands (fs/fuse/filesystem.rs,
+/// `respell`): its stored name read and compared, then, where it differs, the rename and the
 /// node's own mark, `Dirty`, `Keep`, unforced, with its ancestors (`respelled`). Its callers change
 /// only the name's case; a scenario's rename may change its hash, which no caller does, where the
 /// scenario says why.
@@ -2663,8 +2664,8 @@ async fn respelled(tree: &Tree, kind: &'static Kind, (node, name): (NodeID, &str
     .await;
 }
 
-/// `os_diff`'s undelete of `node` (`staged_entry`): its staged flags cleared, the node alone,
-/// leaving out the settled mark that follows it there.
+/// The provider diff's undelete of `node`, as `os_diff`'s (`staged_entry`): its staged flags
+/// cleared, the node alone, leaving out the settled mark that follows it there.
 pub async fn staged_clear(tree: &Tree, node: NodeID) {
     call(&tree.state, (&super::STAGED_CLEAR, Some(node)), async {
         leaving(Leaves::Unstaged);

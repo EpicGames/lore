@@ -74,7 +74,7 @@ fn an_action_records_matching_dirty_and_staged_flags() {
 }
 
 use lore_base::runtime::LORE_CONTEXT;
-use lore_revision::state::test_util::push_distinct;
+use lore_revision::state::push_distinct;
 use lore_revision::state::*;
 
 use crate::fs::filesystem_provider::setup_test_execution;

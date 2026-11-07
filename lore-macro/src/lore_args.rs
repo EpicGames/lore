@@ -21,11 +21,31 @@ pub fn get_lore_args_impl(input: &DeriveInput) -> TokenStream {
         .parse_args()
         .unwrap_or_else(|err| panic!("LoreArgs handler attribute failed to parse: {err}"));
 
+    // Opts a struct with a `vfs: LoreVfsType` field into overriding `requires_service`, for the
+    // clone and create arguments: the only two calls that need the service before an instance
+    // exists to say so, where their VFS resolves to FUSE, which only the service mounts.
+    // `command_requires_service_given` in `lore` matches the same two commands. Every other
+    // `#[derive(LoreArgs)]` struct keeps the trait's default (`false`).
+    let requires_service =
+        if input.attrs.iter().any(|attr| {
+            attr.path().segments.iter().next_back().unwrap().ident == "requires_service"
+        }) {
+            quote! {
+                fn requires_service(&self) -> bool {
+                    self.vfs.to_config().vfs_type == ::lore_revision::repository::VfsType::Fuse
+                }
+            }
+        } else {
+            quote! {}
+        };
+
     quote! {
         impl crate::args::LoreArgs for #name {
             fn to_command(self) -> crate::remote::command::LoreCommand {
                 self.into()
             }
+
+            #requires_service
         }
 
         #validate_text

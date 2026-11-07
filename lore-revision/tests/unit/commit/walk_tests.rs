@@ -175,6 +175,7 @@ impl WalkFixture {
     async fn walk(&self) -> (Result<(), CommitError>, Vec<(NodeID, String)>) {
         let (file_tx, mut file_rx) = mpsc::channel(16);
         let walk = Arc::new(CommitWalk {
+            hands_directories: false,
             operation: FilesystemProvider::begin_operation(&OsFilesystem::new(&self.root))
                 .await
                 .expect("Opening an operation"),

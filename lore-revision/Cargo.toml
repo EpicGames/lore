@@ -16,7 +16,9 @@ bitcode = { workspace = true }
 blake3 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
+crossbeam-epoch = { workspace = true }
 crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
 dashmap = { workspace = true }
 diffy = { workspace = true }
 fastcdc = { workspace = true }
@@ -68,6 +70,13 @@ zerocopy = { workspace = true }
 # staleness reads its error constants from the latter, so both are named here.
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+lore-fuse = { path = "../lore-fuse" }
+
+# `MockTransport`, for provider tests that need the dispatcher's reply path.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
+
 [[example]]
 name = "state_bench"
 path = "examples/state_bench/main.rs"
@@ -104,10 +113,15 @@ seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
 test-util = []
+# A build the instruction gate counts (`state-bench`, and lore's `revision-tree-bench`): the
+# test-only lock counters (`state::lock_counting`, `node::read_contention`) count nothing, so the
+# count measures the paths that ship. Examples build with the dev-dependencies, which turn on
+# test-util.
+bench = []
 # The node operation bench, run by hand: `cargo run --release -p lore-revision --example
 # state_bench --features state-bench`. Naming the feature keeps `cargo test` and builds of all
 # targets from building it.
-state-bench = []
+state-bench = ["bench"]
 # The node operations' scheduling points (`state::node::hooks`), which the stress harness drives:
 # enabled by `state-stress` alone, so no other build or test run carries them. Benchmarks never
 # build with it.

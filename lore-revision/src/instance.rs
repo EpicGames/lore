@@ -6,6 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use lore_base::error::MountsBusy;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use lore_storage::store_types::KeyType;
@@ -45,6 +46,7 @@ use crate::lore_warn;
 use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryContextCreationArgs;
+use crate::repository::VfsType;
 
 pub const INSTANCE_METADATA: &str = "instance-metadata";
 pub const ANCHOR_CURRENT: &str = "anchor-current";
@@ -112,6 +114,14 @@ impl InstanceId {
 
     pub fn text_encoding(&self) -> String {
         hex::encode(self.data())
+    }
+
+    /// Parse the hex form produced by [`Self::text_encoding`], as found in a FUSE mount's
+    /// `lore:<instance-id-hex>` source string. Returns `None` for malformed or wrong-length input.
+    pub fn from_hex(text: &str) -> Option<Self> {
+        let bytes = hex::decode(text).ok()?;
+        let data: [u8; 16] = bytes.try_into().ok()?;
+        Some(Self { data })
     }
 }
 
@@ -747,6 +757,7 @@ pub enum InstanceError {
     NotAuthenticated,
     NotAuthorized,
     NotSupported,
+    MountsBusy,
 }
 
 impl EventError for InstanceError {
@@ -838,19 +849,33 @@ fn names_unreachable_volume(_error: &io::Error) -> bool {
 /// cannot be removed by hand, so its external `.lore` in the global data
 /// directory is evidence it still exists, and outweighs a missing path or
 /// checkout.
+///
+/// A FUSE instance's path is an empty mount point while it is not mounted, as
+/// when the service is stopped, or mid-move, so its external `.lore`
+/// outweighs a missing checkout too. A missing path still makes it stale: a
+/// start removes the external directory of an instance whose mount point was
+/// deleted.
+///
+/// An external `.lore` whose config is there but cannot be read or parsed is
+/// no evidence the instance is gone, whichever VFS it was, so it keeps the
+/// registration too.
 pub async fn instance_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
     let staleness = path_staleness(path, instance_id).await;
-    // SWFS instances will seem stale, so if the result would be stale AND there is an external
-    // config AND that config is an SWFS instance, then override the result.
-    if matches!(
+    if !matches!(
         staleness,
         InstanceStaleness::PathMissing | InstanceStaleness::CheckoutMissing
-    ) && let Ok(external) = crate::global::external_dir::external_lore_dir(instance_id)
-        && external_dot_lore_names_swfs(&external).await
-    {
-        InstanceStaleness::Active
-    } else {
-        staleness
+    ) {
+        return staleness;
+    }
+    let Ok(external) = crate::global::external_dir::external_lore_dir(instance_id) else {
+        return staleness;
+    };
+    match external_vfs(&external).await {
+        None | Some(VfsType::Swfs) => InstanceStaleness::Active,
+        Some(VfsType::Fuse) if staleness == InstanceStaleness::CheckoutMissing => {
+            InstanceStaleness::Active
+        }
+        Some(_) => staleness,
     }
 }
 
@@ -889,17 +914,16 @@ async fn path_staleness(path: &str, instance_id: InstanceId) -> InstanceStalenes
     }
 }
 
-/// Whether the external `.lore` directory at `dot_lore` holds the config of an
-/// SWFS-backed instance. An absent config names none; one that is present but
-/// cannot be read or parsed is not evidence against an SWFS instance, so it
-/// counts as one.
-#[lore_macro::test_pub]
-async fn external_dot_lore_names_swfs(dot_lore: &Path) -> bool {
+/// The VFS the config in the external `.lore` directory at `dot_lore` names: [`VfsType::None`]
+/// where it names none or there is no config, and nothing where a config is there but cannot be
+/// read or parsed.
+async fn external_vfs(dot_lore: &Path) -> Option<VfsType> {
     crate::util::config::load::<crate::repository::RepositoryConfig>(
         dot_lore.join(crate::repository::CONFIG),
     )
     .await
-    .map_or(true, |config| config.is_swfs())
+    .ok()
+    .map(|config| config.vfs_type())
 }
 
 /// The branch (ID and name) and revision an instance has checked out, read
@@ -986,7 +1010,7 @@ pub struct LoreRepositoryInstanceDeleteBeginEventData {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreRepositoryInstanceDeletePhase {
-    /// Unmounting the SWFS instance
+    /// Unmounting the instance, an SWFS instance or a virtual clone
     Unmounting = 0,
     /// Removing instance keys from mutable store
     Deregistering = 1,
@@ -1141,19 +1165,20 @@ async fn uses_shared_store(repository: &Arc<RepositoryContext>) -> Result<bool, 
         .is_some())
 }
 
-/// Whether the instance at `path` can be acted on, given whether it `is_swfs`, whether a
-/// mount manager is `in_service`, and the instance the mount manager has `mounted` at `path`.
+/// Whether the instance at `path` can be acted on, given whether it `is_mounted` by the service,
+/// whether a mount manager is `in_service`, and the instance the mount manager has `mounted` at
+/// `path`.
 ///
-/// An instance counts as SWFS when an external directory exists for the instance id in its
-/// `.lore/instance` file, but a directory can name any id. Acting on that id alone would let a
-/// checkout that names another instance move or delete that instance's files, while the mount at
-/// `path` stayed with the instance it belongs to. A mount of `instance_id` itself at `path` is
-/// what ties the path to the id, so an SWFS instance needs one, and any other instance must not
-/// be on a mount at all.
+/// An instance counts as mounted, by SWFS or FUSE, when an external directory exists for the
+/// instance id in its `.lore/instance` file, but a directory can name any id. Acting on that id
+/// alone would let a checkout that names another instance move or delete that instance's files,
+/// while the mount at `path` stayed with the instance it belongs to. A mount of `instance_id`
+/// itself at `path` is what ties the path to the id, so a mounted instance needs one, and any
+/// other instance must not be on a mount at all.
 #[lore_macro::test_pub]
 fn check_mount(
     instance_id: InstanceId,
-    is_swfs: bool,
+    is_mounted: bool,
     in_service: bool,
     mounted: Option<InstanceId>,
     path: &str,
@@ -1164,46 +1189,47 @@ fn check_mount(
             "{path} is the mount of instance {mounted}, but its instance file names instance \
              {instance_id}, so it cannot be told which to {action}"
         ))),
-        Some(_) if !is_swfs => Err(InstanceError::internal(format!(
+        Some(_) if !is_mounted => Err(InstanceError::internal(format!(
             "{path} is the mount of instance {instance_id}, which has no external directory, so \
              it cannot be told how to {action} it"
         ))),
         Some(_) => Ok(()),
-        None if !is_swfs => Ok(()),
+        None if !is_mounted => Ok(()),
         None if !in_service => Err(InstanceError::internal(format!(
-            "Instance {instance_id} is an SWFS instance, which only the service can {action}"
+            "Instance {instance_id} is a VFS instance, which only the service can {action}"
         ))),
         None => Err(InstanceError::internal(format!(
-            "Instance {instance_id} is not mounted at {path}, so it is not the SWFS instance \
+            "Instance {instance_id} is not mounted at {path}, so it is not the VFS instance \
              that directory's instance id names"
         ))),
     }
 }
 
-/// The mount manager, if `path` is the mount of `instance_id`, after checking as
-/// [`check_mount`] does that the instance at `path` can be acted on.
+/// The VFS serving the instance at `path`, after checking as [`check_mount`] does that it can be
+/// acted on: the VFS of the service's mount of `instance_id` at `path`, which the check requires
+/// of an instance with an external directory, or [`VfsType::None`] for one in a directory of its
+/// own.
 fn require_own_mount(
     instance_id: InstanceId,
-    is_swfs: bool,
     path: &str,
     action: &str,
-) -> Result<Option<Arc<crate::fs::mount_manager::MountManager>>, InstanceError> {
+) -> Result<VfsType, InstanceError> {
     let mount_manager = MountManagerState::mount_manager();
     let mounted = match &mount_manager {
         Some(mount_manager) => mount_manager
-            .mounted_instance(Path::new(path))
+            .mounted(Path::new(path))
             .forward_any::<InstanceError>("failed to look up the mount")?,
         None => None,
     };
     check_mount(
         instance_id,
-        is_swfs,
+        matches!(check_for_external_lore_dir(instance_id), Ok(Some(_))),
         mount_manager.is_some(),
-        mounted,
+        mounted.map(|(mounted, _)| mounted),
         path,
         action,
     )?;
-    Ok(mount_manager.filter(|_| mounted.is_some()))
+    Ok(mounted.map_or(VfsType::None, |(_, vfs)| vfs))
 }
 
 /// Fail where Windows would refuse to rename or delete `instance_path` because a process has it
@@ -1334,17 +1360,25 @@ async fn remove_instance_directory(path: &Path) -> io::Result<()> {
     .await
 }
 
-/// Remove the registration of the instance at `path`: open it as a repository, as a command run
-/// from there would, and remove its keys from the registry.
-async fn deregister_instance_at(path: &Path, instance_id: InstanceId) -> Result<(), InstanceError> {
+/// Open the instance at `path` as a repository, as a command run from there would, to remove its
+/// registration with [`deregister_instance`].
+async fn open_instance_at(path: &Path) -> Result<Arc<RepositoryContext>, InstanceError> {
     let token = crate::repository::RepositoryWriteToken::acquire(path).await;
-    let repository = crate::repository::load_and_connect_with_token(
+    crate::repository::load_and_connect_with_token(
         path,
         crate::repository::RepositoryAccess::ReadWrite,
         Some(token),
     )
     .await
-    .forward_any::<InstanceError>("failed to open the instance")?;
+    .forward_any::<InstanceError>("failed to open the instance")
+}
+
+/// Remove the registration of `instance_id` from `repository`, the instance opened by
+/// [`open_instance_at`], and close it again.
+async fn deregister_instance(
+    repository: Arc<RepositoryContext>,
+    instance_id: InstanceId,
+) -> Result<(), InstanceError> {
     if !remove_instance_keys(&repository, instance_id).await {
         return Err(WriteRequired.into());
     }
@@ -1354,13 +1388,15 @@ async fn deregister_instance_at(path: &Path, instance_id: InstanceId) -> Result<
         .forward_any::<InstanceError>("failed to flush the instance removal")
 }
 
-/// Delete the current instance: remove its registration, unmount it (if SWFS and in service), and
-/// delete its directories.
+/// Delete the current instance: remove its registration, unmount it (an SWFS or FUSE instance, in
+/// the service), and delete its directories.
 ///
-/// The registration goes first, and the repository is closed again before anything is deleted, as
-/// Windows cannot delete files that are open. Nothing is destroyed if the instance cannot be
-/// opened to deregister it. A delete that then fails leaves files behind, and says where, for the
-/// user to remove.
+/// A FUSE instance is unmounted before anything changes, with a plain unmount a busy mount
+/// refuses, so a mount in use leaves the instance as it was. Otherwise the registration goes
+/// first. Either way the repository is closed again before anything is deleted, as Windows cannot
+/// delete files that are open. Nothing is destroyed if the instance cannot be opened to
+/// deregister it. A delete that then fails leaves files behind, and says where, for the user to
+/// remove.
 ///
 /// In a dry run (the global `dry_run` flag), checks everything a delete would need and emits
 /// events describing what would be deleted, without performing any changes.
@@ -1371,32 +1407,44 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
     let dry_run = crate::lore::execution_context().globals().dry_run();
     let instance_id = repository.instance_id;
     let path = repository.path_for_display().to_string();
-    // Detect SWFS by checking for external lore directory
-    let is_swfs = check_for_external_lore_dir(instance_id).is_ok_and(|opt| opt.is_some());
+    // Everything that can fail on a bad configuration is checked before anything is changed, and
+    // by a dry run too.
+    let vfs = require_own_mount(instance_id, &path, "delete")?;
 
     // Emit begin event
     LoreEvent::RepositoryInstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData {
         instance_id,
         path: LoreString::from_str(&path),
-        is_swfs: if is_swfs { 1 } else { 0 },
+        is_swfs: u8::from(vfs == VfsType::Swfs),
         dry_run: if dry_run { 1 } else { 0 },
     })
     .send();
 
-    // Everything that can fail on a bad configuration is checked before anything is changed, and
-    // by a dry run too.
-    require_own_mount(instance_id, is_swfs, &path, "delete")?;
     require_working_directory_outside(&path, "delete")?;
     let shared_store = uses_shared_store(&repository).await?;
 
+    // A FUSE instance is unmounted first, as a busy mount refuses it and so leaves the instance
+    // whole; an SWFS one after it is deregistered.
+    let phases: &[LoreRepositoryInstanceDeletePhase] = match vfs {
+        VfsType::None => &[
+            LoreRepositoryInstanceDeletePhase::Deregistering,
+            LoreRepositoryInstanceDeletePhase::DeletingFiles,
+        ],
+        VfsType::Swfs => &[
+            LoreRepositoryInstanceDeletePhase::Deregistering,
+            LoreRepositoryInstanceDeletePhase::Unmounting,
+            LoreRepositoryInstanceDeletePhase::DeletingFiles,
+        ],
+        VfsType::Fuse => &[
+            LoreRepositoryInstanceDeletePhase::Unmounting,
+            LoreRepositoryInstanceDeletePhase::Deregistering,
+            LoreRepositoryInstanceDeletePhase::DeletingFiles,
+        ],
+    };
+
     if dry_run {
         // Dry run: report what would happen
-        let unmounting = is_swfs.then_some(LoreRepositoryInstanceDeletePhase::Unmounting);
-        for phase in [LoreRepositoryInstanceDeletePhase::Deregistering]
-            .into_iter()
-            .chain(unmounting)
-            .chain([LoreRepositoryInstanceDeletePhase::DeletingFiles])
-        {
+        for &phase in phases {
             LoreEvent::RepositoryInstanceDeleteProgress(
                 LoreRepositoryInstanceDeleteProgressEventData { phase },
             )
@@ -1409,50 +1457,61 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
         return Ok(());
     }
 
-    LoreEvent::RepositoryInstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
-        phase: LoreRepositoryInstanceDeletePhase::Deregistering,
-    })
-    .send();
-    // A registry inside the instance directory goes with it.
-    if shared_store {
-        deregister_instance_at(Path::new(&path), instance_id).await?;
+    // Only the mount leads a command at `path` to the instance's external `.lore`, so a FUSE
+    // instance is opened before it is unmounted. That opens nothing through the mount, which the
+    // unmount would then find busy.
+    let mut opened = None;
+    if shared_store && vfs == VfsType::Fuse {
+        opened = Some(open_instance_at(Path::new(&path)).await?);
     }
-
-    if is_swfs {
+    // The opened instance holds the write token until it is deregistered; one with nothing to
+    // deregister holds it alone. No command writes to the instance while it is unmounted, and
+    // once it is, none can open it at its path.
+    let _token = if !shared_store && vfs == VfsType::Fuse {
+        Some(crate::repository::RepositoryWriteToken::acquire(Path::new(&path)).await)
+    } else {
+        None
+    };
+    for &phase in phases {
         LoreEvent::RepositoryInstanceDeleteProgress(
-            LoreRepositoryInstanceDeleteProgressEventData {
-                phase: LoreRepositoryInstanceDeletePhase::Unmounting,
-            },
+            LoreRepositoryInstanceDeleteProgressEventData { phase },
         )
         .send();
-        if let Some(mm) = MountManagerState::mount_manager() {
-            let _ = mm.remove_mount(Path::new(&path));
+        match phase {
+            LoreRepositoryInstanceDeletePhase::Deregistering => {
+                // A registry inside the instance directory goes with it.
+                if shared_store {
+                    let repository = match opened.take() {
+                        Some(repository) => repository,
+                        None => open_instance_at(Path::new(&path)).await?,
+                    };
+                    let deregistered = deregister_instance(repository, instance_id).await;
+                    if vfs == VfsType::Fuse {
+                        // Unmounted by now, and still registered, so a start mounts it again.
+                        deregistered.forward_with::<InstanceError, _>(|| {
+                            format!(
+                                "deregistering the unmounted instance, which the service mounts \
+                                 at {path} again when it restarts"
+                            )
+                        })?;
+                    } else {
+                        deregistered?;
+                    }
+                }
+            }
+            LoreRepositoryInstanceDeletePhase::Unmounting => {
+                if vfs == VfsType::Fuse {
+                    unmount_fuse_instance(&path).await?;
+                } else if let Some(mm) = MountManagerState::mount_manager() {
+                    mm.swfs()
+                        .remove_mount(Path::new(&path))
+                        .forward::<InstanceError>("unmounting the instance")?;
+                }
+            }
+            LoreRepositoryInstanceDeletePhase::DeletingFiles => {
+                delete_instance_files(vfs, instance_id, &path).await?;
+            }
         }
-    }
-
-    LoreEvent::RepositoryInstanceDeleteProgress(LoreRepositoryInstanceDeleteProgressEventData {
-        phase: LoreRepositoryInstanceDeletePhase::DeletingFiles,
-    })
-    .send();
-    if is_swfs {
-        let external = external_dir_for_instance(instance_id)
-            .forward_any::<InstanceError>("failed to find the external directory")?;
-        remove_instance_directory(&external).await.map_err(|e| {
-            InstanceError::internal(format!(
-                "Failed to delete external directory {}: {e}. The instance is already \
-                 deregistered and unmounted; delete that directory manually",
-                external.display()
-            ))
-        })?;
-    } else {
-        remove_instance_directory(Path::new(&path))
-            .await
-            .map_err(|e| {
-                InstanceError::internal(format!(
-                    "Failed to delete repository directory {path}: {e}. Delete the directory \
-                     manually"
-                ))
-            })?;
     }
 
     LoreEvent::RepositoryInstanceDeleteComplete(LoreRepositoryInstanceDeleteCompleteEventData {
@@ -1461,6 +1520,69 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
     .send();
     lore_debug!("Deleted instance {instance_id} at {path}");
     Ok(())
+}
+
+/// Remove what an instance deleted from its registration leaves on disk: its directory, or for a
+/// mounted instance its external directory and, for FUSE, the mount point the unmount emptied.
+async fn delete_instance_files(
+    vfs: VfsType,
+    instance_id: InstanceId,
+    path: &str,
+) -> Result<(), InstanceError> {
+    if !vfs.is_virtual() {
+        return remove_instance_directory(Path::new(path))
+            .await
+            .map_err(|e| {
+                InstanceError::internal(format!(
+                    "Failed to delete repository directory {path}: {e}. Delete the directory \
+                     manually"
+                ))
+            });
+    }
+    let external = external_dir_for_instance(instance_id)
+        .forward_any::<InstanceError>("failed to find the external directory")?;
+    remove_instance_directory(&external).await.map_err(|e| {
+        InstanceError::internal(format!(
+            "Failed to delete external directory {}: {e}. The instance is already \
+             deregistered and unmounted; delete that directory manually",
+            external.display()
+        ))
+    })?;
+    // Not removed recursively: it is empty once unmounted, and a mount still standing there
+    // would take whatever it serves with it.
+    if vfs == VfsType::Fuse
+        && let Err(e) = lore_io::IoDriver::global().remove_dir(path).await
+        && !is_absent(&e)
+    {
+        return Err(InstanceError::internal(format!(
+            "Failed to remove the mount point {path}: {e}. The instance is already deleted; \
+             remove that directory manually"
+        )));
+    }
+    Ok(())
+}
+
+/// Unmount the FUSE instance at `path`, a plain unmount that a busy mount refuses.
+#[cfg(target_os = "linux")]
+async fn unmount_fuse_instance(path: &str) -> Result<(), InstanceError> {
+    let Some(mm) = MountManagerState::mount_manager() else {
+        return Err(InstanceError::internal(format!(
+            "The instance at {path} is a VFS instance, which only the service can unmount"
+        )));
+    };
+    // The mount manager's error says why, `MountsBusy` naming the busy path.
+    mm.fuse()
+        .unmount(Path::new(path), false)
+        .await
+        .forward_with::<InstanceError, _>(|| format!("unmounting the instance at {path}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+async fn unmount_fuse_instance(path: &str) -> Result<(), InstanceError> {
+    Err(InstanceError::internal(format!(
+        "The instance at {path} is a virtual clone, which only Linux serves"
+    )))
 }
 
 /// Record where the instance at `path` now is: open it as a repository, as a command run from
@@ -1475,20 +1597,21 @@ async fn register_instance_at(path: &Path) -> Result<(), InstanceError> {
     .await
     .forward_any::<InstanceError>("failed to open the instance")?;
     update_path(repository.clone()).await?;
+    // Synced, since a move then removes the mount point the old registration names.
     repository
-        .flush(false)
+        .flush(true)
         .await
         .forward_any::<InstanceError>("failed to flush the instance registration")
 }
 
-/// Move an instance's directory, or its mount for an SWFS instance in a service.
+/// Move an instance's directory, or its mount for an SWFS or FUSE instance in a service.
 async fn move_instance(
-    is_swfs: bool,
+    vfs: VfsType,
     instance_id: InstanceId,
     from: &str,
     to: &str,
 ) -> Result<(), InstanceError> {
-    if !is_swfs {
+    if !vfs.is_virtual() {
         let action = format!("move {from} to {to}");
         let retryable = |error: &io::Error| rename_is_retryable(error, Path::new(to));
         return retry_while_in_use(&action, retryable, || {
@@ -1504,19 +1627,69 @@ async fn move_instance(
     }
     let Some(mm) = MountManagerState::mount_manager() else {
         return Err(InstanceError::internal(format!(
-            "Instance {instance_id} is an SWFS instance, which only the service can move"
+            "Instance {instance_id} is a VFS instance, which only the service can move"
         )));
     };
-    mm.remount(Path::new(from), Path::new(to))
+    if vfs == VfsType::Fuse {
+        return move_fuse_mount(&mm, instance_id, from, to).await;
+    }
+    mm.swfs()
+        .remount(Path::new(from), Path::new(to))
         .await
         .map_err(|e| InstanceError::internal(format!("Failed to remount instance at {to}: {e}")))
 }
 
-/// Move the current instance to a new path: move its directory (or its mount for an SWFS
+/// Move the FUSE mount of `instance_id` from `from` to `to`, holding the instance's write token
+/// at `from` throughout, so no command writing to the instance there, such as a commit or a sync,
+/// runs while it is unmounted and mounted again, and no other move or delete of it does.
+#[cfg(target_os = "linux")]
+async fn move_fuse_mount(
+    mm: &crate::fs::mount_manager::MountManager,
+    instance_id: InstanceId,
+    from: &str,
+    to: &str,
+) -> Result<(), InstanceError> {
+    let _token = crate::repository::RepositoryWriteToken::acquire(Path::new(from)).await;
+    mm.fuse()
+        .move_mount(instance_id, Path::new(from), Path::new(to))
+        .await
+        .forward_with::<InstanceError, _>(|| format!("moving the mount to {to}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+async fn move_fuse_mount(
+    _mm: &crate::fs::mount_manager::MountManager,
+    _instance_id: InstanceId,
+    from: &str,
+    _to: &str,
+) -> Result<(), InstanceError> {
+    Err(InstanceError::internal(format!(
+        "The instance at {from} is a virtual clone, which only Linux serves"
+    )))
+}
+
+/// Remove the mount point a FUSE move left at `path` once the instance's registration no longer
+/// names it. Until then it stays, so a service starting meanwhile finds the instance's registered
+/// path and mounts it there. One left behind is only an empty directory, so a failure is reported
+/// and the move stands.
+async fn remove_left_mount_point(vfs: VfsType, path: &str) {
+    if vfs != VfsType::Fuse {
+        return;
+    }
+    if let Err(error) = lore_io::IoDriver::global().remove_dir(path).await
+        && !is_absent(&error)
+    {
+        lore_warn!("Unable to remove {path}, the mount point the instance moved from: {error}");
+    }
+}
+
+/// Move the current instance to a new path: move its directory (or its mount for an SWFS or FUSE
 /// instance in a service), and then record the new path.
 ///
 /// The registration is written last so a move that fails leaves the instance registered where it
-/// is, and a registration that cannot be written undoes the move.
+/// is, and a registration that cannot be written undoes the move. A FUSE instance's old mount
+/// point goes only after that, as a service that starts mounts the instance at its registered path.
 ///
 /// In a dry run (the global `dry_run` flag), checks everything a move would need and reports it
 /// without moving or registering anything.
@@ -1544,8 +1717,6 @@ async fn instance_move_with(
     let dry_run = crate::lore::execution_context().globals().dry_run();
     let instance_id = repository.instance_id;
     let source_path = repository.path_for_display().to_string();
-    // Detect SWFS by checking for external lore directory
-    let is_swfs = check_for_external_lore_dir(instance_id).is_ok_and(|opt| opt.is_some());
     let target = Path::new(target_path);
 
     // Validate target path
@@ -1567,13 +1738,14 @@ async fn instance_move_with(
         )));
     }
 
-    if let Some(mm) = require_own_mount(instance_id, is_swfs, &source_path, "move")? {
-        // check target isn't already an instance mount
-        if mm.is_mounted(target).unwrap_or(false) {
-            return Err(InstanceError::internal(format!(
-                "Target path is already an instance mount: {target_path}"
-            )));
-        }
+    let vfs = require_own_mount(instance_id, &source_path, "move")?;
+    if vfs.is_virtual()
+        && let Some(mm) = MountManagerState::mount_manager()
+        && mm.is_mounted(target).unwrap_or(false)
+    {
+        return Err(InstanceError::internal(format!(
+            "Target path is already an instance mount: {target_path}"
+        )));
     }
     require_working_directory_outside(&source_path, "move")?;
     // The new path is recorded through the instance's config and, if it has one, its shared
@@ -1597,20 +1769,27 @@ async fn instance_move_with(
         return Ok(());
     }
 
-    move_instance(is_swfs, instance_id, &source_path, target_path).await?;
+    move_instance(vfs, instance_id, &source_path, target_path).await?;
 
     if let Err(error) = register(target).await {
         // A failed write can still have left part of the new record behind, so moving the
         // instance back is not enough: its registration has to name the source again.
         let mut message = format!("Failed to record the new path {target_path}: {error}");
-        match move_instance(is_swfs, instance_id, target_path, &source_path).await {
-            Ok(()) => {
-                if let Err(restore_error) = register(Path::new(&source_path)).await {
+        match move_instance(vfs, instance_id, target_path, &source_path).await {
+            Ok(()) => match register(Path::new(&source_path)).await {
+                Ok(()) => remove_left_mount_point(vfs, target_path).await,
+                Err(restore_error) => {
                     message.push_str(&format!(
                         ". The instance is back at {source_path}, but its registration could not \
                          be restored: {restore_error}. Run `lore repository update-path` in it"
                     ));
                 }
+            },
+            Err(undo_error) if vfs == VfsType::Fuse => {
+                message.push_str(&format!(
+                    ". Moving the instance back to {source_path} also failed: {undo_error}. \
+                     Restarting the service mounts it at the path its registration names"
+                ));
             }
             Err(undo_error) => {
                 message.push_str(&format!(
@@ -1622,6 +1801,7 @@ async fn instance_move_with(
         lore_warn!("{message}");
         return Err(InstanceError::internal(message));
     }
+    remove_left_mount_point(vfs, &source_path).await;
 
     LoreEvent::RepositoryInstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData {
         instance_id,

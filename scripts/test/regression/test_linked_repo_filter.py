@@ -13,6 +13,7 @@ def _write_view_filter(scratch_dir, *lines: str) -> str:
     return view_filter
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.regression
 def test_view_filter_when_adding_linked_repo(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo()

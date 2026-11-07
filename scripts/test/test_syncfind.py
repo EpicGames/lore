@@ -219,6 +219,7 @@ def test_sync_branch_at_branch_point(new_lore_repo):
     assert "On branch feature" in repo.status(), "Failed to switch at the branch point"
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_clone_and_pin_branch_at_branch_point(new_lore_repo):
     """A clone and a link pin take the branch a revision specifier names.

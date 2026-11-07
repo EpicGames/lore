@@ -1,0 +1,2 @@
+# The bench scripts source their helpers from beside themselves.
+source-path=SCRIPTDIR

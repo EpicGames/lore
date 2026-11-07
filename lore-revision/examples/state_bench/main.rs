@@ -272,6 +272,11 @@ fn sizes() -> ! {
         "SIZE NodeBlock={}",
         size_of::<lore_revision::node::NodeBlock>()
     );
+    #[cfg(target_os = "linux")]
+    println!(
+        "SIZE InodeEntry={}",
+        size_of::<lore_revision::fs::fuse::inode::InodeEntry>()
+    );
     std::process::exit(0);
 }
 

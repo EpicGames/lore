@@ -289,10 +289,22 @@ pub mod tests {
     pub const TEST_PROTOCOL: &str = "test/0.2";
     pub const TEST_PROTOCOL_V4: &str = "lore-storage/0.4";
 
+    /// Requests each stream of a [`TestHandlerFactory::new`] server handles at once.
+    pub const TEST_PROCESS_LIMIT: usize = 100;
+
     impl TestHandlerFactory {
         pub fn new(
             immutable_store: Arc<dyn ImmutableStore>,
             mutable_store: Arc<dyn MutableStore>,
+        ) -> Self {
+            Self::with_process_limit(immutable_store, mutable_store, TEST_PROCESS_LIMIT)
+        }
+
+        /// [`Self::new`], handling `process_limit` requests on each stream at once.
+        pub fn with_process_limit(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+            process_limit: usize,
         ) -> Self {
             let contexts: ObservedContexts = Arc::default();
             let mut service_store = ServiceStore::default();
@@ -315,7 +327,7 @@ pub mod tests {
                             Arc::new(storage_protocol),
                             context,
                             AdmissionLimits {
-                                process_limit: 100,
+                                process_limit,
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,
@@ -344,7 +356,7 @@ pub mod tests {
                             Arc::new(v4_service),
                             context,
                             AdmissionLimits {
-                                process_limit: 100,
+                                process_limit,
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,
@@ -369,7 +381,7 @@ pub mod tests {
                             Arc::new(service),
                             context,
                             AdmissionLimits {
-                                process_limit: 100,
+                                process_limit,
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,

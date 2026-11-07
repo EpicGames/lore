@@ -362,6 +362,7 @@ def test_sync_view_carries_a_revision_move_as_well(new_lore_repo, scratch_dir):
     assert_status_clean(instance, "the instance is coherent with revision and view")
 
 
+@pytest.mark.own_vfs("marks a file dirty without changing it, which a status on a virtual clone measures as unchanged")
 @pytest.mark.smoke
 @pytest.mark.parametrize("force", [False, True])
 def test_sync_view_drops_dirty_flags_for_paths_leaving_the_view(
@@ -552,6 +553,7 @@ def layer_revision(instance: Lore) -> str:
     return layers[0]["revision"]
 
 
+@pytest.mark.own_vfs("layers a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_sync_view_carries_a_layer_mount_out_of_view_and_back(
     new_lore_repo, scratch_dir
@@ -591,6 +593,7 @@ def test_sync_view_carries_a_layer_mount_out_of_view_and_back(
     assert layer_revision(instance) == pinned, "the layer's pin is still where it was"
 
 
+@pytest.mark.own_vfs("layers a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_sync_view_moves_the_view_below_a_layer_mount(new_lore_repo, scratch_dir):
     """A view moving below the mount is applied inside it, leaving the rest of the
@@ -670,6 +673,7 @@ def repository_with_link(new_lore_repo) -> Lore:
     return repo
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_sync_view_moves_the_view_below_a_link_mount(new_lore_repo, scratch_dir):
     """A view moving below a link mount is applied inside it, leaving the rest of
@@ -705,6 +709,7 @@ def test_sync_view_moves_the_view_below_a_link_mount(new_lore_repo, scratch_dir)
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_sync_view_carries_a_link_mount_out_of_view_and_back(
     new_lore_repo, scratch_dir
@@ -738,6 +743,7 @@ def test_sync_view_carries_a_link_mount_out_of_view_and_back(
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_sync_view_removes_a_link_mount_a_reaching_view_empties(
     new_lore_repo, scratch_dir
@@ -751,7 +757,9 @@ def test_sync_view_removes_a_link_mount_a_reaching_view_empties(
 
     sync_view(instance, reaching)
 
-    assert not instance.path_exists(LINK_MOUNT), "the emptied mount directory is removed"
+    assert not instance.path_exists(LINK_MOUNT), (
+        "the emptied mount directory is removed"
+    )
     assert_status_clean(instance, "a mount the narrowing emptied is not a delete")
     assert not repo.clone(view=reaching).path_exists(LINK_MOUNT), (
         "a clone under the view holds no mount directory either"

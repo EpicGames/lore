@@ -25,6 +25,10 @@ from test_utils import unstaged_entries
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 # ---------------------------------------------------------------------------
 # Links crossing branches: the link registry travels with the merge.
 #

@@ -10,6 +10,17 @@ use crate::remote::command::LoreCommand;
 
 pub trait LoreArgs {
     fn to_command(self) -> LoreCommand;
+
+    /// Whether this call's own arguments require the Lore service, whatever instance it names:
+    /// `true` for a clone or a create whose `vfs` resolves to FUSE, a mount only the service
+    /// makes. `false` for every other call, whose instance decides instead (see
+    /// `instance_requires_service_given` in `call_delegation`).
+    ///
+    /// Read without building a command, so the caller that only wants this answer never
+    /// pays for one.
+    fn requires_service(&self) -> bool {
+        false
+    }
 }
 
 // Separate from `LoreArgs`, which is public, so that running a handler stays internal to this crate.

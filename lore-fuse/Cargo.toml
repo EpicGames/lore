@@ -1,0 +1,28 @@
+[package]
+name = "lore-fuse"
+edition = "2024"
+version.workspace = true
+publish = false
+
+[lib]
+name = "lore_fuse"
+test = false
+
+[dependencies]
+libc = { workspace = true }
+zerocopy = { workspace = true }
+tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
+tokio-util = { workspace = true }
+lore-base = { workspace = true }
+lore-macro = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+lore-base = { workspace = true, features = ["test-util"] }
+lore-fuse = { path = ".", features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+test-util = []

@@ -16,8 +16,10 @@ takes whatever a per-test cleanup could not.
 
 import logging
 import os
+import re
 import shutil
 import stat
+import subprocess
 from pathlib import Path
 from time import sleep
 
@@ -60,14 +62,81 @@ def _retry_without_readonly(func, path, exc):
     func(path)
 
 
+def _lore_mount_table() -> list[tuple[str, str]]:
+    """The Lore FUSE mounts in the mount table, as (mount point, source) pairs. The
+    source names the instance, `lore:<instance id>`. None where there is no mount
+    table to read."""
+    try:
+        with open("/proc/self/mountinfo") as mountinfo:
+            lines = mountinfo.readlines()
+    except OSError:
+        return []
+    mounts = []
+    for line in lines:
+        fields, _, rest = line.partition(" - ")
+        parts = fields.split()
+        filesystem = rest.split()
+        if len(parts) <= 4 or len(filesystem) < 2 or filesystem[0] != "fuse.lore":
+            continue
+        # The table escapes a space, tab, newline or backslash as an octal triple.
+        target = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), parts[4])
+        mounts.append((target, filesystem[1]))
+    return mounts
+
+
+def lore_mount_instance(path) -> str | None:
+    """The instance id, in hex, of the Lore FUSE mount at `path`, or None where
+    nothing is mounted there."""
+    target = os.path.realpath(path)
+    for mount, source in _lore_mount_table():
+        if mount == target and source.startswith("lore:"):
+            return source.removeprefix("lore:")
+    return None
+
+
+def _lore_mounts_below(path: Path) -> list[str]:
+    """The Lore FUSE mounts at or below `path`, deepest first."""
+    root = os.path.realpath(path)
+    mounts = [
+        target
+        for target, _ in _lore_mount_table()
+        if target == root or target.startswith(root + os.sep)
+    ]
+    return sorted(mounts, key=len, reverse=True)
+
+
+def detach_lore_mounts(path) -> None:
+    """Detach, lazily, every Lore FUSE mount at or below `path`. A virtual clone
+    stays mounted by the service past the test that made it, and a mount point
+    cannot be removed while mounted; `LORE_TEST_VFS` makes every repository one."""
+    fusermount = shutil.which("fusermount3")
+    if fusermount is None:
+        return
+    for target in _lore_mounts_below(Path(path)):
+        result = subprocess.run(
+            [fusermount, "-u", "-z", target],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "Could not detach the Lore mount at %s: %s",
+                target,
+                result.stderr.strip(),
+            )
+
+
 def remove_tree(path, *, label: str = "test data") -> bool:
-    """Remove `path` and everything under it, returning whether it is gone.
+    """Remove `path` and everything under it, returning whether it is gone. A
+    Lore mount below it is detached first.
 
     Never raises: a cleanup failure is reported as a warning and a `False`
     return, because losing a directory to a stuck handle is a disk-space
     problem and failing the test that created it would be a correctness one.
     """
     path = Path(path)
+    detach_lore_mounts(path)
     attempts = len(_RETRY_DELAYS_SECONDS) + 1
     for attempt in range(attempts):
         try:

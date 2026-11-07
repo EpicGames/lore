@@ -53,6 +53,11 @@ LORE_TEST_SERVICE_SOCKET_VAR = "LORE_TEST_SERVICE_SOCKET"
 # and stop it when the run ends.
 LORE_TEST_SHARED_SERVICE_VAR = "LORE_TEST_SHARED_SERVICE"
 
+# Names the VFS, such as `fuse`, of every repository a test creates or clones where
+# the test names none. A virtual clone is mounted by the service, so a run setting
+# it takes one too. See `docs/developing/code-standards/testing.md`.
+LORE_TEST_VFS_VAR = "LORE_TEST_VFS"
+
 # Lines the client prints about the service. They are matched rather than
 # parsed, so they are kept here next to each other: each one pairs with a string
 # in the Rust sources and has to be changed with it.

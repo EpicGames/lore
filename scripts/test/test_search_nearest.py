@@ -10,6 +10,7 @@ from lore import Lore
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.own_vfs("layers repositories, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_search_nearest_layer_metadata(new_lore_repo):
     """--search-nearest searches through source revision history to find

@@ -169,6 +169,7 @@ def test_merge_out_of_view_directory_not_materialized(new_lore_repo, scratch_dir
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_merge_out_of_view_link_not_materialized(new_lore_repo, scratch_dir):
     """A merge that adds a link outside the local view filter must not clone the
@@ -348,6 +349,7 @@ def _registered_links(repo: Lore) -> dict[str, str]:
     }
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_merge_grafts_a_link_added_in_an_out_of_view_subtree(
     new_lore_repo, scratch_dir
@@ -369,6 +371,7 @@ def test_merge_grafts_a_link_added_in_an_out_of_view_subtree(
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_merge_grafts_a_link_removed_in_an_out_of_view_subtree(
     new_lore_repo, scratch_dir
@@ -389,6 +392,7 @@ def test_merge_grafts_a_link_removed_in_an_out_of_view_subtree(
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_merge_grafts_a_link_moved_in_an_out_of_view_subtree(
     new_lore_repo, scratch_dir
@@ -411,6 +415,7 @@ def test_merge_grafts_a_link_moved_in_an_out_of_view_subtree(
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_merge_grafts_links_inside_an_out_of_view_subtree(new_lore_repo, scratch_dir):
     """Links the other branch remounted, added or re-pinned out of view land as it has them.

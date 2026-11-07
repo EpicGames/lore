@@ -25,6 +25,7 @@ def generate_branch_id() -> str:
     return uuid.uuid4().hex
 
 
+@pytest.mark.own_vfs("switches branches with --reset, which a virtual clone refuses")
 @pytest.mark.smoke
 def test_branch(new_lore_repo):
     repo: Lore = new_lore_repo()

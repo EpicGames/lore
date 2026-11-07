@@ -269,6 +269,7 @@ def test_filescan_delete_detected_dirty_and_persists(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_filescan_no_scan_ignores_unmarked_edits(new_lore_repo):
     """`status` WITHOUT --scan performs no filesystem walk: an on-disk
@@ -440,6 +441,7 @@ def test_dirs_delete_tree_scan(new_lore_repo):
     assert_absent(scanned, "keep.txt", msg="unrelated committed file is untouched")
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_dirs_dirty_parent_collects_mixed_children(new_lore_repo):
     """`file dirty <dir>` collects every changed descendant: a modified file
@@ -502,6 +504,7 @@ def test_dirs_dirty_parent_collects_mixed_children(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_dirs_dirty_changes_two_levels_below_marked_parent(new_lore_repo):
     """Marking the TOP directory dirty surfaces changes that live two and
@@ -973,6 +976,7 @@ def test_dirtyapi_nonexistent_path_ignored(new_lore_repo):
     assert_absent(entries, "ghost/none.txt", msg="nonexistent path must be ignored")
 
 
+@pytest.mark.own_vfs("reads a plain status that sees no unmarked untracked file, where a status on a virtual clone always scans, its provider's diff being exact")
 @pytest.mark.smoke
 def test_dirtyapi_ignored_path_skipped(new_lore_repo):
     """A dirty mark on a file under an ignored directory is skipped; status
@@ -998,6 +1002,7 @@ def test_dirtyapi_ignored_path_skipped(new_lore_repo):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stage_default_only_stages_dirty_marked(new_lore_repo):
     """Default `stage` (no --scan) does NO filesystem walk: it stages only
@@ -1130,6 +1135,7 @@ def test_stage_explicit_file_without_dirty(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stage_explicit_dir_default_only_dirty_leaves(new_lore_repo):
     """An explicit directory `stage <dir>` WITHOUT --scan stages only the
@@ -1176,6 +1182,7 @@ def test_stage_dir_scan_full_walk(new_lore_repo):
     assert_entry(entries, "src/b.txt", action="keep", dirty=True, staged=True)
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stage_path_scoped_scan(new_lore_repo):
     """`stage --scan` scoped to a path arg stages only files under that path;
@@ -1258,6 +1265,7 @@ def test_reset_modify_clears_and_restores(new_lore_repo):
     assert not has_staged_anchor(repo), "anchor must be gone once the tree is clean"
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_reset_add_untracks(new_lore_repo):
     """Plain `reset` of a dirty-add keeps the file on disk (only --purge removes
@@ -1337,6 +1345,7 @@ def test_reset_delete_restores(new_lore_repo):
     assert_file_set(scanned, [], msg="--scan must agree the tree is clean")
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_reset_directory_mixed_children(new_lore_repo):
     """Resetting a directory restores its tracked dirtied children (a modify and
@@ -1439,6 +1448,7 @@ def test_reset_nested_path(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_reset_purge_removes_untracked(new_lore_repo):
     """reset --purge removes an untracked file (never even dirtied) from disk."""
@@ -1581,6 +1591,7 @@ def test_commit_dirty_only_modify_survives(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_commit_dirty_only_add_excluded_from_tree(new_lore_repo):
     """A staged add in a new dir lands in the sealed tree; a dirty-only add in
@@ -4135,6 +4146,7 @@ def _stage_one(repo: Lore, path: str) -> None:
     repo.stage(path, offline=True)
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stress_all_classes_then_commit(new_lore_repo):
     """One repo state holding all change classes at once: a staged add, a
@@ -4261,6 +4273,7 @@ def test_stress_all_classes_then_commit(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stress_all_classes_then_reset_all(new_lore_repo):
     """The same all-classes state, dropped wholesale by status(reset=True):
@@ -4462,6 +4475,7 @@ def test_stress_pathscoped_status_mixed(new_lore_repo):
     assert_absent(entries, "other/keep.txt", msg="untouched file must not appear")
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stress_long_chain(new_lore_repo):
     """A long lifecycle chain validating the full reported set at each step:
@@ -4544,6 +4558,7 @@ def _chain_exists(repo: Lore, path: str) -> bool:
     return os.path.exists(repo._fix_path(path))
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_chain_modify_scan_switch_reset_status(new_lore_repo):
     """CENTERPIECE chain: commit base -> branch_create(other) -> switch(main)
@@ -5196,6 +5211,7 @@ def test_chain_modify_stage_unstage_scan_switch_reset(new_lore_repo):
     assert not has_staged_anchor(repo), "anchor released once clean"
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_chain_add_scan_switch_reset_keeps_untracked(new_lore_repo):
     """Chain (add -> scan -> switch -> reset): add new.txt -> scan (add/dirty,
@@ -6813,6 +6829,7 @@ def test_reset_refuses_staged_delete_nested(new_lore_repo):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_reset_dirty_add_nested_keeps_file(new_lore_repo):
     """Resetting a dirty add several directories deep keeps the untracked file
@@ -7114,6 +7131,7 @@ def test_commit_dirty_only_modify_nested_survives(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("drops the staged anchor and dumps it, where a status on a virtual clone always scans, its provider's diff being exact and marks what the working tree holds again")
 @pytest.mark.smoke
 def test_commit_dirty_only_add_nested_survives(new_lore_repo):
     """Committing a staged change leaves a dirty-only add in a brand-new nested
@@ -9405,6 +9423,7 @@ def test_emptydir_dirty_mark_then_stage(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_emptydir_reset_dirty_add_keeps_dir(new_lore_repo):
     """`reset` (without --purge) of a scan-detected empty-directory add discards
@@ -9471,6 +9490,7 @@ def test_emptydir_committed_reset_purge_removes_untracked_child(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_root_reset_purge_against_empty_revision(new_lore_repo):
     """`reset . --purge` against a revision holding an empty root clears the

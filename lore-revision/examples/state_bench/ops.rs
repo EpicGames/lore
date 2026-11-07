@@ -331,7 +331,7 @@ pub async fn served_rmdir(state: &State, repo: &Repo, dir: NodeID) -> bool {
     true
 }
 
-/// A removal as the served provider makes one: the node detached under the
+/// A removal as the served provider's `detach_node` makes one: the node detached under the
 /// served chain rule where `when` allows, then its detached record read for its flags.
 async fn served_detach(state: &State, repo: &Repo, node: NodeID, when: Detach<'_>) -> Node {
     assert!(
@@ -375,7 +375,7 @@ pub async fn served_rename_over(
     )
 }
 
-/// An UNLINK as the served provider makes one: the node removed as `served_detach` removes it.
+/// An UNLINK as the served provider makes one: the node removed as `detach_node` removes it.
 #[inline(never)]
 pub async fn served_unlink(state: &State, repo: &Repo, node: NodeID) {
     served_detach(state, repo, node, Detach::Always).await;
@@ -416,7 +416,7 @@ pub async fn mark_moved(state: &State, repo: &Repo, node: NodeID) {
         .expect("a mark succeeds");
 }
 
-/// A new local directory a mount adds under `parent`, as the VFS provider adds one.
+/// A new local directory a mount adds under `parent`, as `add_local_node` adds one.
 #[inline(never)]
 pub async fn mount_add_dir(state: &State, repo: &Repo, parent: NodeID, name: &str) -> NodeID {
     let node_id = state
@@ -438,8 +438,8 @@ pub async fn mount_add_dir(state: &State, repo: &Repo, parent: NodeID, name: &st
     node_id
 }
 
-/// A local file a mount adds under `parent`, which holds no node of its name, as the VFS provider
-/// adds a new one.
+/// A local file a mount adds under `parent`, which holds no node of its name, as
+/// `add_local_node` adds a new one.
 #[inline(never)]
 pub async fn mount_add(state: &State, repo: &Repo, parent: NodeID, (name, name_hash): (&str, u64)) {
     let node = Node {

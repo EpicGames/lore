@@ -122,6 +122,7 @@ def test_obliterate(new_lore_repo, scratch_dir):
 @pytest.mark.parametrize(
     "by_path,superseded", [(False, False), (True, False), (False, True)]
 )
+@pytest.mark.own_vfs("expects a clone or sync to fail on obliterated content, which a virtual clone reads only when a file is read")
 def test_obliterate_warns_before_reporting_deletion_and_still_removes_content(
     new_lore_repo, by_path, superseded
 ):
@@ -167,6 +168,7 @@ def test_obliterate_warns_before_reporting_deletion_and_still_removes_content(
             repo.clone()
 
 
+@pytest.mark.own_vfs("expects a clone or sync to fail on obliterated content, which a virtual clone reads only when a file is read")
 @pytest.mark.smoke
 def test_clone_and_sync_materialize_available_files_after_obliteration(
     new_lore_repo, scratch_dir

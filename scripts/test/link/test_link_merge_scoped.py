@@ -11,6 +11,10 @@ from link_helpers import (
     setup_link_merge_conflict,
 )
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_merge_specific(new_lore_repo):

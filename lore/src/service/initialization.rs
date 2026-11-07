@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use lore_base::error::InvalidPath;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_error_set::ForwardStrict;
+use lore_error_set::ForwardAny;
 use lore_error_set::error_set;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::fs::mount_manager_state::MountManagerState;
@@ -17,6 +17,7 @@ use crate::call::setup_execution;
 use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::remote::service_process::mark_running_as_service;
 
 #[error_set]
 pub enum ServiceInitializationError {
@@ -47,6 +48,7 @@ pub async fn initialize_service(
     globals: LoreGlobalArgs,
     service_state: Arc<ServiceStateImpl>,
 ) -> Result<(), ServiceInitializationError> {
+    mark_running_as_service();
     lore_revision::store::immutable::set_background_flush_delay(SERVICE_STORE_FLUSH_SECONDS);
     service_state.initialize();
 
@@ -56,7 +58,9 @@ pub async fn initialize_service(
         .scope(execution, async move {
             let result = MountManagerState::initialize()
                 .await
-                .forward::<ServiceInitializationError>("Failed initializing SWFS repositories");
+                .forward_any::<ServiceInitializationError>(
+                    "Failed initializing mounted repositories",
+                );
             let detail = LoreErrorDetail::from_result(result);
 
             execution_context().dispatcher.complete(detail).await

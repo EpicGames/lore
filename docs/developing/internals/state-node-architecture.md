@@ -1,6 +1,6 @@
 # State node architecture
 
-A `State` is one revision tree held in memory: a committed revision a command reads, the staged tree that staging or a C API handle edits, or the working tree a virtual file system (VFS) provider serves. This page describes, at the level of its architecture, how that tree is stored, how it changes while many tasks read and write it at once, and how it stays both correct and fast while they do. The storage is the node block in `lore-revision/src/state/block.rs` (re-exported as `lore_revision::node`), and the code that loads, registers and saves blocks is in `lore-revision/src/state.rs`. The node operations in `lore-revision/src/state/node/` are the code that changes nodes, their chains and their flags; outside them, only saving and loading a State (with committing, where it resets the root record before saving), and clearing the flags left above a removed node, write node blocks. The C API's revision-tree verbs, staging, committing and the other commands change trees through them, as a VFS provider serving a State would.
+A `State` is one revision tree held in memory: a committed revision a command reads, the staged tree that staging or a C API handle edits, or the working tree a virtual file system (VFS) provider serves. This page describes, at the level of its architecture, how that tree is stored, how it changes while many tasks read and write it at once, and how it stays both correct and fast while they do. The storage is the node block in `lore-revision/src/state/block.rs` (re-exported as `lore_revision::node`), and the code that loads, registers and saves blocks is in `lore-revision/src/state.rs`. The node operations in `lore-revision/src/state/node/` are the code that changes nodes, their chains and their flags; outside them, only saving and loading a State (with committing, where it resets the root record before saving), and clearing the flags left above a removed node, write node blocks. The VFS provider for Linux, the C API's revision-tree verbs, staging, committing and the other commands all change trees through them.
 
 ## Overview
 
@@ -96,7 +96,7 @@ Other callers don't need that guarantee at every moment. A command, staging or a
 
 Saving a State is no tier: it runs no node operation, and no writer runs beside it.
 
-No VFS provider in this repository serves a State. The served and swap tiers are there for one, and `state_bench` and the stress suite drive them as a provider would.
+The VFS provider for Linux serves a State through the served and swap tiers, and `state_bench` and the stress suite drive them as it does. It doesn't sweep that State yet, so a slot a request left detached stays until the next mount rebuilds the State.
 
 Freeing a slot that another task still holds would hand that task a different node, so the caller's claim on the State decides when slots may be freed. Under a shared claim, many calls run at once and no published slot is ever freed, so every node ID in flight stays valid. Only under an exclusive claim, as when committing or once a command's parallel walks have finished, are published slots freed. A served State holds no exclusive claim, so nothing frees its published slots but sweeping where the provider has paused its requests.
 
@@ -176,7 +176,7 @@ Some guarantees would cost every caller for the sake of a few, so the contract l
 - **Count wraparound:** A count is 32 bits and moving a node out adds 2^16, so 65,536 moves out of one directory bring its count back where it started. A lookup whose walk spans that many sees no change in the count, and could answer that a name is absent while a node moved behind its walk holds it.
 - **Linked and layer States:** Staging and committing sweep the State they work on, not the linked and layer States they save beside it, so a slot a call left detached or in flight there stays until that State is swept.
 - **Sweeping a served State:** The provider sweeps only where it has paused its requests, is neither settling directories nor switching revisions and holds no copy it hasn't published, and its `retained` test keeps every node the kernel still references. The State checks neither. Until the provider sweeps, a served State's name tables keep the name of every node it detached.
-- **Committing through a VFS provider:** If committing through a provider stops once the new revision may be current but before its directories are settled, removing or renaming an added file or directory records a deletion for the rest of the mount. This applies once a provider serves a State.
+- **Committing through a VFS provider:** If committing through a provider stops once the new revision may be current but before its directories are settled, removing or renaming an added file or directory records a deletion for the rest of the mount.
 - **Saving:** A writer running while the State is saved isn't lost, though the saved revision is then no snapshot of one moment. Nothing saves a State beside writers today; if anything did, taking a slot while the State saves could leave a block threaded onto the unused-block chain twice, closing a cycle, and closing that gap would cost every slot allocation a check.
 - **The C API:** The C API's move verb flags its destination before moving, so no clearing may run beside it, and none does. A call of the move verb dropped after moving its node leaves the moved subtree without its staged-move flags, so its files commit with no record of moving in their history. Closing a handle doesn't wait for a dropped call's aborted tasks, which only read the store and change the closed tree's in-memory State.
 
@@ -199,7 +199,7 @@ The release profile keeps debug assertions, so checks wanted only under test sit
 
 ### Measurement
 
-A change can cost instructions without failing any test, so the node operations are measured as well as tested. Two benchmarks drive them the way their callers do: `state_bench` in `lore-revision/examples/` for the served, swap, discard and `Unserved` workloads, and `revision_tree_bench` in `lore/examples/` for the C API's verbs. Both refuse to build with `state-hooks`. Under `perf stat` they count instructions across each workload's operations alone, and a change to the module is compared workload by workload against a baseline revision. `state_bench --sizes` reports the sizes of the main records, and tests assert size budgets for the futures of block lookups.
+A change can cost instructions without failing any test, so the node operations are measured as well as tested. Two benchmarks drive them the way their callers do: `state_bench` in `lore-revision/examples/` for the served, swap, discard and `Unserved` workloads, and `revision_tree_bench` in `lore/examples/` for the C API's verbs. Both refuse to build with `state-hooks`. Under `perf stat` they count instructions across each workload's operations alone, and a change to the module is compared workload by workload against a baseline revision. `state_bench --sizes` reports the sizes of the main records, tests assert size budgets for the futures of block lookups, and `lore-revision/tests/fuse_allocations.rs` holds the per-request allocation budgets of the VFS provider for Linux.
 
 ### Trade-offs
 
@@ -209,7 +209,7 @@ Each of these buys speed or simplicity on the common path at a cost elsewhere:
 - **The served rule's climb:** The first served change below a chain of clean directories flags every clean level above it, one pair lock per level.
 - **Detached slots until sweeping:** A detached record keeps its slot and its name until sweeping frees it, so a served State holds them until its provider sweeps, and staging and committing pay a scan of each flagged block in memory.
 - **Freed slots in full blocks:** A full block that frees a slot stays off the unused-block chain until the State next saves.
-- **Logs with a horizon:** A chain log holds a bounded window of changes (`CHAIN_LOG_MAX`), and a listing older than the window rebuilds itself. A log keeps the largest window it grew to while its block is in memory, at most 16 KiB for each directory a listing watched, even once no listing watches it or its slot is freed.
+- **Logs with a horizon:** A chain log holds a bounded window of changes (`CHAIN_LOG_MAX`), and a listing older than the window rebuilds itself. A log keeps the largest window it grew to while its block is in memory, at most 24 KiB for each directory a listing watched, even once no listing watches it or its slot is freed.
 
 ## How correctness is checked
 
@@ -235,6 +235,7 @@ A race shows only in rare interleavings, and a broken tree raises no error, so c
 - `lore-revision/src/state/node/discard.rs`, `pending.rs` and `slots.rs` — freeing, the pending queue and slot allocation.
 - `lore-revision/src/state/node/sweep.rs` — sweeping detached slots, unserved and served.
 - `lore-revision/src/state/node/hooks.rs` and `hooks/log.rs` — scheduling points and the log.
+- `lore-revision/src/fs/fuse/listing.rs` — the VFS listing that replays chain logs and shows names absent, in the provider for Linux.
 - `lore-revision/examples/state_stress/` — the stress harness: the deterministic and chaos schedulers, the log's collector, the model, the invariants and the mixes of operations.
 - `lore-revision/tests/state_scenarios/` — the deterministic scenarios, which share the stress harness, and `lore/tests/state_scenarios/` those that run the C API's verbs.
 - `scripts/state-stress/` — the stress suite's driver and its README.

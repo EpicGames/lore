@@ -20,6 +20,10 @@ from lore_parsers import (
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 from test_utils import revision_metadata_keys, status_by_path
 
+pytestmark = pytest.mark.own_vfs(
+    "layers repositories, which a virtual clone does not hold"
+)
+
 
 logger = logging.getLogger(__name__)
 

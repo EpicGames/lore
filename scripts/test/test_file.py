@@ -1169,6 +1169,7 @@ def test_file_audit_summary_reads_each_revision_s_author(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_file_audit_follows_a_path_into_a_linked_repository(new_lore_repo):
     """A path resolving into a linked repository carries that repository's node
@@ -1225,6 +1226,7 @@ def test_file_audit_follows_a_path_into_a_linked_repository(new_lore_repo):
     ], f"a linked revision's attribution is not read here: {rows}"
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_file_audit_offline_reports_a_link_it_cannot_reach(new_lore_repo):
     """A linked repository out of reach is reported against the link, for the

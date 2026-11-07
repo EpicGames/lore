@@ -5,6 +5,10 @@ from error_types import NotALinkError
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_info_reports_link_details(new_lore_repo):

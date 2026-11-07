@@ -16,6 +16,8 @@ from test_shared_store import per_url_store_path
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs("makes its SWFS clones from ordinary repositories")
+
 # The most SWFS instances a service mounts, `MountManager::MOUNT_LIMIT`.
 SWFS_MOUNT_LIMIT = 8
 

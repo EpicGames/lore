@@ -4444,59 +4444,76 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// A status over a provider that holds its state, whose diff is exact, scans without `--scan`,
-    /// persists what it marks, and emits the summary of its scan.
+    /// Runs a status, scanning as `scan` asks, over a repository whose provider holds its state,
+    /// after a file is added there. Answers the adds the summary of the scan counted, if the status
+    /// emitted one, and how many adds named as the file it persisted marks for.
+    async fn status_over_an_exact_diff(scan: bool) -> (Option<u64>, usize) {
+        let (repository, tempdir) = committed_repository("", &[]).await;
+        test_file_write(tempdir.path().join("added.txt").as_path(), b"added");
+        let (exact, _) = test_holding_context(&repository);
+        let adds = Arc::new(std::sync::Mutex::new(None));
+        let captured = adds.clone();
+        let execution = Arc::new(
+            lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                lore_revision::interface::LoreGlobalArgs::default(),
+                lore_revision::relay::EventDispatcher::new(Some(Box::new(move |event| {
+                    if let lore_revision::event::LoreEvent::RepositoryStatusSummary(data) = event {
+                        *captured.lock().expect("summary") = Some(data.adds);
+                    }
+                }))),
+                "test-user".to_string(),
+            ),
+        );
+
+        LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                lore_revision::repository::status::status_boxed(
+                    exact.clone(),
+                    None,
+                    lore_revision::repository::status::StatusOptions {
+                        scan,
+                        ..scan_status_options()
+                    },
+                ),
+            )
+            .await
+            .expect("Status failed");
+        execution.dispatcher.drain().await;
+        let summary = *adds.lock().expect("summary");
+
+        let (_, staged, _) = State::deserialize_current_and_staged(exact.clone())
+            .await
+            .expect("Deserialize failed");
+        let staged = staged.expect("The status persisted no marks");
+        let marked = children_named(&exact, &staged, ROOT_NODE, "added.txt")
+            .await
+            .len();
+        (summary, marked)
+    }
+
+    /// A status over a provider that holds its state, whose diff is exact, scans without `--scan`
+    /// and persists what it marks. Unasked, it reports as a plain status does, with no summary of
+    /// the scan; asked for `--scan`, it emits one.
     #[tokio::test]
-    async fn a_status_over_an_exact_diff_persists_its_marks_and_emits_its_summary() {
+    async fn a_status_over_an_exact_diff_persists_its_marks_and_summarises_its_scan_when_asked() {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
-                let (repository, tempdir) = committed_repository("", &[]).await;
-                test_file_write(tempdir.path().join("added.txt").as_path(), b"added");
-                let (exact, _) = test_holding_context(&repository);
-                let adds = Arc::new(std::sync::Mutex::new(None));
-                let captured = adds.clone();
-                let execution = Arc::new(
-                    lore_revision::interface::ExecutionContext::new_client_with_user_id(
-                        lore_revision::interface::LoreGlobalArgs::default(),
-                        lore_revision::relay::EventDispatcher::new(Some(Box::new(move |event| {
-                            if let lore_revision::event::LoreEvent::RepositoryStatusSummary(data) =
-                                event
-                            {
-                                *captured.lock().expect("summary") = Some(data.adds);
-                            }
-                        }))),
-                        "test-user".to_string(),
-                    ),
-                );
-
-                LORE_CONTEXT
-                    .scope(
-                        execution.clone(),
-                        lore_revision::repository::status::status_boxed(
-                            exact.clone(),
-                            None,
-                            lore_revision::repository::status::StatusOptions {
-                                scan: false,
-                                ..scan_status_options()
-                            },
-                        ),
-                    )
-                    .await
-                    .expect("Status failed");
-                execution.dispatcher.drain().await;
+                let (summary, marked) = status_over_an_exact_diff(false).await;
                 assert_eq!(
-                    *adds.lock().expect("summary"),
-                    Some(1),
-                    "The status emitted no summary of its scan"
+                    summary, None,
+                    "A plain status emitted a summary of its scan"
                 );
+                assert_eq!(marked, 1, "A plain status marked no add");
 
-                let (_, staged, _) = State::deserialize_current_and_staged(exact.clone())
-                    .await
-                    .expect("Deserialize failed");
-                let staged = staged.expect("The status persisted no marks");
-                let added = children_named(&exact, &staged, ROOT_NODE, "added.txt").await;
-                assert_eq!(added.len(), 1, "The status marked no add");
+                let (summary, marked) = status_over_an_exact_diff(true).await;
+                assert_eq!(
+                    summary,
+                    Some(1),
+                    "A status asked to scan emitted no summary of its scan"
+                );
+                assert_eq!(marked, 1, "A status asked to scan marked no add");
             }))
             .await
             .expect("Test task failed");

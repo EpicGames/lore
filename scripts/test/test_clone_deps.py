@@ -8,6 +8,10 @@ from lore_parsers import parse_jsonl
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "clones a dependency set, which a virtual clone holds whole"
+)
+
 logger = logging.getLogger(__name__)
 
 

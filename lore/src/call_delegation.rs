@@ -18,8 +18,12 @@ use lore_revision::interface::LoreGlobalArgs;
 use crate::args::LoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
+use crate::remote::call::ServiceCallError;
 use crate::remote::call::service_call;
+use crate::remote::call::service_call_over;
 use crate::remote::command::LoreCommand;
+use crate::remote::service_process::connect_to_running_service;
+use crate::remote::service_process::running_as_service;
 use crate::remote::service_process::service_in_use;
 use crate::remote::service_process::service_in_use_blocking;
 
@@ -209,8 +213,126 @@ pub(crate) async fn reject_call(
     .await
 }
 
-/// Runs `command` to completion, in the Lore service when one is in use and in this process
-/// otherwise. Blocks on the runtime, so it is called from outside it.
+/// Whether `globals` names a FUSE-backed instance that must reach the
+/// service rather than run in this process.
+///
+/// A FUSE instance's working tree is served through a mount the service
+/// maintains; running its command here instead would read and write the
+/// repository outside that mount, alongside whatever the service is doing
+/// through it. The check is unconditional -- unlike [`service_in_use`], which
+/// is a process-wide setting -- because it follows from the instance's own
+/// config, not from a choice this process makes for every call.
+///
+/// Always `false` inside the service process itself: it is the one process
+/// every FUSE instance's calls are forced to, so forcing them here as well
+/// would relay a call the service is already running back to itself.
+#[lore_macro::test_pub]
+fn instance_requires_service_given(globals: &LoreGlobalArgs, running_as_service: bool) -> bool {
+    if running_as_service {
+        return false;
+    }
+    let repository_path = globals.repository_path();
+    if repository_path.is_empty() {
+        return false;
+    }
+    let path = lore_revision::util::path::make_absolute_from(
+        repository_path,
+        globals.working_directory().map(std::path::Path::new),
+    )
+    .unwrap_or_else(|_| std::path::PathBuf::from(repository_path));
+    lore_revision::repository::load_repository_config(&path)
+        .is_ok_and(|config| config.vfs_type() == lore_revision::repository::VfsType::Fuse)
+}
+
+/// Whether `args` must run in the Lore service rather than here, decided without building a
+/// command: either `args` require it themselves (see [`LoreArgs::requires_service`], overridden
+/// by the clone and create arguments) or [`instance_requires_service_given`] holds.
+///
+/// [`command_requires_service_given`] answers the same question once a command already
+/// exists, by reading this same predicate off the args a `LoreCommand` variant carries,
+/// rather than re-deriving it -- the FUSE-vfs check lives once, on [`LoreArgs`].
+fn args_require_service<ArgsType: LoreArgs>(
+    globals: &LoreGlobalArgs,
+    args: &ArgsType,
+    running_as_service: bool,
+) -> bool {
+    if running_as_service {
+        return false;
+    }
+    args.requires_service() || instance_requires_service_given(globals, false)
+}
+
+/// Whether `command` must run in the Lore service rather than here: either `command` is a
+/// clone or a create whose `vfs` resolves to FUSE, which would otherwise be refused rather
+/// than set up as a mount outside the service that must serve it, or
+/// [`instance_requires_service_given`] holds.
+#[lore_macro::test_pub]
+fn command_requires_service(globals: &LoreGlobalArgs, command: &LoreCommand) -> bool {
+    command_requires_service_given(globals, command, running_as_service())
+}
+
+/// The decision behind [`command_requires_service`], with "is this the
+/// service process" taken as a parameter for the reason
+/// [`instance_requires_service_given`] gives.
+#[lore_macro::test_pub]
+fn command_requires_service_given(
+    globals: &LoreGlobalArgs,
+    command: &LoreCommand,
+    running_as_service: bool,
+) -> bool {
+    if running_as_service {
+        return false;
+    }
+    // The commands whose arguments opt into `LoreArgs::requires_service`.
+    let args_require = match command {
+        LoreCommand::RepositoryClone(args) => args.requires_service(),
+        LoreCommand::RepositoryCreate(args) => args.requires_service(),
+        _ => false,
+    };
+    args_require || instance_requires_service_given(globals, false)
+}
+
+/// Runs a call on the service without ever starting one, for an instance,
+/// clone, or create only the service may act through.
+///
+/// Reports [`lore_base::error::ServiceUnavailable`], with a hint on how to
+/// start one, rather than spawning a service to answer a call this process
+/// has no business running locally.
+async fn service_call_without_spawn(
+    globals: LoreGlobalArgs,
+    command: LoreCommand,
+    callback: LoreEventCallback,
+) -> i32 {
+    if let Ok(Some(connection)) = connect_to_running_service().await {
+        return service_call_over(connection, globals, command, callback).await;
+    }
+    let reason = match &command {
+        LoreCommand::RepositoryClone(_) => "A FUSE clone is mounted by the Lore service, and \
+             none is running. Run `lore service start`."
+            .to_string(),
+        LoreCommand::RepositoryCreate(_) => "A FUSE instance is created and mounted by the \
+             Lore service, and none is running. Run `lore service start`."
+            .to_string(),
+        _ => "This instance is served through a FUSE mount only the Lore service may use, and \
+              none is running. Run `lore service start`."
+            .to_string(),
+    };
+    crate::call::no_repository_call(
+        globals,
+        callback,
+        (),
+        "fuse_forced_relay",
+        |()| async move {
+            Err::<(), ServiceCallError>(ServiceCallError::from(
+                lore_base::error::ServiceUnavailable { reason },
+            ))
+        },
+    )
+    .await
+}
+
+/// Runs `command` to completion, in the Lore service when the command requires one or one is in
+/// use, and in this process otherwise. Blocks on the runtime, so it is called from outside it.
 ///
 /// Checks for the service before choosing what to run, so the calling thread's stack holds the
 /// relay's future or this command's, never a future sized for every command.
@@ -219,11 +341,25 @@ pub fn run_command(
     command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
-    if service_in_use_blocking() {
+    if command_requires_service(&globals, &command) {
+        run_on_running_service(globals, command, callback)
+    } else if service_in_use_blocking() {
         run_relayed(globals, command, callback)
     } else {
         command.run_local(globals, callback)
     }
+}
+
+/// Relays `command` to a Lore service already running and blocks until it finishes, for an
+/// instance, clone, or create only the service may act through. Not inlined, for the reason
+/// [`run_relayed`] gives.
+#[inline(never)]
+fn run_on_running_service(
+    globals: LoreGlobalArgs,
+    command: LoreCommand,
+    callback: LoreEventCallback,
+) -> i32 {
+    block_on_command(pin!(service_call_without_spawn(globals, command, callback)))
 }
 
 /// Relays `command` to the Lore service and blocks until it finishes. Not inlined, so the relay's
@@ -251,15 +387,20 @@ pub(crate) fn block_on_command(running: Pin<&mut dyn Future<Output = i32>>) -> i
     crate::runtime().block_on(running)
 }
 
-/// Runs `command` in the Lore service when one is in use and in this process otherwise.
+/// Runs `command` in the Lore service when the command requires one or one is in use, and in this
+/// process otherwise.
 ///
 /// Pins each future it awaits, for the reason `LoreCommand::invoke_local` gives.
+#[lore_macro::test_pub]
 pub(crate) async fn dispatch_command(
     globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
-    if service_in_use().await {
+    if command_requires_service(&globals, &command) {
+        let relay = pin!(service_call_without_spawn(globals, command, callback));
+        relay.await
+    } else if service_in_use().await {
         let relay = pin!(service_call(globals, command, callback));
         relay.await
     } else {
@@ -278,6 +419,7 @@ pub(crate) fn invoke_locally(
     command.invoke_local(globals, callback)
 }
 
+#[lore_macro::test_pub]
 pub(crate) async fn dispatch_call<
     ArgsType: LoreArgs,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
@@ -288,6 +430,9 @@ pub(crate) async fn dispatch_call<
     callback: LoreEventCallback,
     handler: Handler,
 ) -> i32 {
+    if args_require_service(&globals, &args, running_as_service()) {
+        return service_call_without_spawn(globals, args.to_command(), callback).await;
+    }
     if service_in_use().await {
         service_call(globals, args.to_command(), callback).await
     } else {

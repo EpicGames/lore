@@ -74,3 +74,39 @@ async fn a_task_a_relayed_call_spawns_reads_its_environment() {
 
     assert_eq!(auth.as_deref(), Some("/caller/auth"));
 }
+
+/// The context a mount is built under, the service's for a relayed caller, reads the caller's
+/// environment, so the mount finds the credentials its caller finds, under the service's globals.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_serving_context_reads_its_callers_environment_under_the_services_globals() {
+    let globals = lore_revision::interface::LoreGlobalArgs {
+        correlation_id: "service".to_string().into(),
+        ..Default::default()
+    };
+    let service = ExecutionContext::new_client(globals, EventDispatcher::new(None));
+    let serving: Arc<dyn Any + Send + Sync> = Arc::new(service.serving(CallEnvironment {
+        values: [None, Some("/caller/auth".to_string())],
+    }));
+
+    let (global, auth, correlation_id) = LORE_CONTEXT
+        .scope(serving, async {
+            lore_base::lore_spawn!(async {
+                (
+                    lore_base::env::var(GLOBAL_PATH_VAR),
+                    lore_base::env::var(AUTH_PATH_VAR),
+                    lore_revision::runtime::execution_context()
+                        .globals()
+                        .correlation_id
+                        .to_string(),
+                )
+            })
+            .await
+            .expect("the task must finish")
+        })
+        .await;
+
+    assert_eq!(auth.as_deref(), Some("/caller/auth"));
+    assert_eq!(global, None, "the caller left the global path unset");
+    assert_eq!(correlation_id, "service");
+}

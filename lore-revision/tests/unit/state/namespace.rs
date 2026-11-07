@@ -43,7 +43,7 @@ async fn add(
 }
 
 /// Every live child of `parent_id`, by name, in walk order -- via the same
-/// name-carrying iterator a VFS provider's listing uses, so a name missing here is
+/// name-carrying iterator `Listing::build` uses, so a name missing here is
 /// also missing from a directory listing.
 async fn child_names(
     state: Arc<State>,

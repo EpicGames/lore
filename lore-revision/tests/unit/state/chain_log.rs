@@ -378,6 +378,95 @@ fn logged(block: &NodeBlock, directory: NodeID, from: u32) -> Vec<(PatchKind, u6
         .collect()
 }
 
+/// `directory`'s patches from sequence `from` to the log's head, oldest first, each with its
+/// node and the block its weak reference names, where that block is still in memory.
+fn logged_blocks(
+    block: &NodeBlock,
+    directory: NodeID,
+    from: u32,
+) -> Vec<(NodeID, Option<Arc<NodeBlock>>)> {
+    let reader = block.read();
+    let log = reader
+        .chain_log(Node::index(directory))
+        .expect("the directory has a chain log");
+    (from..log.seq())
+        .map(|sequence| {
+            let patch = log
+                .patch(sequence)
+                .unwrap_or_else(|| panic!("patch {sequence} is not in the log's window"));
+            (patch.node, patch.block.upgrade())
+        })
+        .collect()
+}
+
+/// Each patch names the block that holds its node, which a VFS listing reads an attached node's
+/// record from with no State lock: here for children in another block than their directory, an
+/// add, a move in and a move in over a holder, and each detach.
+#[tokio::test]
+async fn a_patch_names_the_block_holding_its_node() {
+    with_state(|repository, state| async move {
+        let dir = add_node(&repository, &state, ROOT_NODE, "dir", NodeFlags::NoFlags).await;
+        let other = add_node(&repository, &state, ROOT_NODE, "other", NodeFlags::NoFlags).await;
+        // Fills the directory's block, so every node below lands in another.
+        for index in 0..BLOCK_NODE_COUNT {
+            add_node(
+                &repository,
+                &state,
+                other,
+                &format!("f{index}"),
+                NodeFlags::File,
+            )
+            .await;
+        }
+        let holder = add_node(&repository, &state, dir, "held.txt", NodeFlags::File).await;
+        let mover = add_node(&repository, &state, other, "m.txt", NodeFlags::File).await;
+        let replacer = add_node(&repository, &state, other, "r.txt", NodeFlags::File).await;
+        let (block, mark) = listed(&repository, &state, dir).await;
+
+        let added = add_node(&repository, &state, dir, "added.txt", NodeFlags::File).await;
+        state
+            .node_move_staged(
+                repository.clone(),
+                mover,
+                dir,
+                ("moved.txt", hash_string("moved.txt")),
+                &state.moves_permit().await.expect("the moves permit"),
+                false,
+            )
+            .await
+            .expect("Failed to move the child in");
+        state
+            .node_reattach_replacing(repository.clone(), replacer, dir, "held.txt", holder)
+            .await
+            .expect("Failed to move over the holder");
+
+        let patches = logged_blocks(&block, dir, mark.seq);
+        assert_eq!(
+            patches.iter().map(|(node, _)| *node).collect::<Vec<_>>(),
+            [added, mover, holder, replacer],
+            "the add, the move in, the holder's detach and the replacer's attach"
+        );
+        for (node, named) in &patches {
+            assert_ne!(
+                NodeBlock::index(*node),
+                NodeBlock::index(dir),
+                "node {node} lies in another block than its directory"
+            );
+            let holding = state
+                .block(repository.clone(), NodeBlock::index(*node))
+                .await
+                .expect("Failed to load the node's block");
+            assert!(
+                named
+                    .as_ref()
+                    .is_some_and(|named| Arc::ptr_eq(named, &holding)),
+                "node {node}'s patch names the block holding it"
+            );
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_create_appends_an_attach_patch_under_the_directory_log() {
     with_state(|repository, state| async move {

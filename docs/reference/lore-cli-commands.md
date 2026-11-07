@@ -370,8 +370,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
+virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -404,7 +404,7 @@ writes no files and reads them from the remote when a command needs them.
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
 * `--use-shared-store` — Use the shared store rather than create a local immutable store
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
@@ -2164,8 +2164,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
+virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2198,7 +2198,7 @@ writes no files and reads them from the remote when a command needs them.
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
 * `--use-shared-store` — Use the shared store rather than create a local immutable store
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)

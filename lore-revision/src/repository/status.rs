@@ -500,11 +500,27 @@ async fn file_size_from_node_change_path(
     Ok(info.size())
 }
 
-/// Reports every change a path's scan finds, answering with how many arrived and the first
+/// How a scan reports the changes it finds: what it counts them into, and whether a deleted
+/// directory stands for everything below it.
+#[lore_macro::test_pub]
+#[derive(Clone)]
+pub(crate) struct ScanReport {
+    /// The counts the reported changes fold into.
+    summary: Arc<StatusSummaryStats>,
+    /// Whether a deleted directory is reported as one entry, as a plain status reports the marks
+    /// a scan left, rather than with every entry below it, as `--scan` reports them.
+    whole_deleted_directories: bool,
+}
+
+/// Reports every change a path's scan finds, answering with how many were reported and the first
 /// failure among them.
 ///
 /// Reads to the end rather than stopping at a failure: the walk marks dirty as it goes, and its
 /// marks are what a status run leaves behind whether or not every change could be reported.
+///
+/// Where `report` asks for whole deleted directories, a delete below a directory reported
+/// deleted is left out. The walk reports a directory before what it finds below it, so the
+/// directories reported deleted are all that is held, never the changes.
 ///
 /// Each change is taken by a `let`-`else` rather than a `while let`, whose scrutinee would stay
 /// reserved beside the change while it is reported.
@@ -512,17 +528,31 @@ async fn file_size_from_node_change_path(
 async fn report_scan_changes(
     operation: &InstanceOperationImpl,
     repository: &Arc<RepositoryContext>,
-    summary: &StatusSummaryStats,
+    report: &ScanReport,
     changes: &mut state::ChangeStream<state::FilesystemDiffStats>,
 ) -> (usize, Option<StatusError>) {
     let mut reported = 0;
     let mut failure = None;
+    let mut deleted_directories: Vec<RelativePath> = Vec::new();
     loop {
         let Some(change) = changes.next().await else {
             break;
         };
+        if report.whole_deleted_directories && change.action == FileAction::Delete {
+            let path = change.path();
+            if deleted_directories
+                .iter()
+                .any(|directory| path.below(directory).is_some_and(|rest| !rest.is_empty()))
+            {
+                continue;
+            }
+            if change.from.flags.is_directory() && !change.to.mapping.node.is_valid_node_id() {
+                deleted_directories.push(path.clone());
+            }
+        }
         reported += 1;
-        if let Err(err) = report_scan_change(operation, repository, summary, &change).await {
+        if let Err(err) = report_scan_change(operation, repository, &report.summary, &change).await
+        {
             failure.get_or_insert(err);
         }
     }
@@ -1331,14 +1361,14 @@ pub(crate) async fn scan_paths(
     state_current: &Arc<state::State>,
     state_staged: &Arc<state::State>,
     layer_mounts: &Arc<Vec<state::LayerMountInfo>>,
-    summary: Option<&Arc<StatusSummaryStats>>,
+    report: Option<&ScanReport>,
 ) -> Result<bool, StatusError> {
     let targets = resolve_scan_targets(
         &operation,
         repository,
         state_staged,
         paths,
-        summary.is_some(),
+        report.is_some(),
     )
     .await?;
     create_shared_untracked_ancestors(repository, state_staged, &targets).await?;
@@ -1356,7 +1386,7 @@ pub(crate) async fn scan_paths(
                 state_staged.clone(),
                 target.path,
                 layer_mounts.clone(),
-                summary.cloned(),
+                report.cloned(),
                 discards.clone(),
             )
         );
@@ -1566,7 +1596,7 @@ async fn create_shared_untracked_ancestors(
 }
 
 /// Reconciles `path` against the filesystem, or the whole repository for `None`, reporting the
-/// changes it finds into `summary` where given and holding what it finds stale on `discards`.
+/// changes it finds as `report` asks where given and holding what it finds stale on `discards`.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn, clippy::too_many_arguments)]
@@ -1577,7 +1607,7 @@ fn scan_path(
     state_staged: Arc<state::State>,
     path: Option<RelativePath>,
     layer_mounts: Arc<Vec<state::LayerMountInfo>>,
-    summary: Option<Arc<StatusSummaryStats>>,
+    report: Option<ScanReport>,
     discards: Arc<state::WalkDiscards>,
 ) -> impl Future<Output = Result<(), StatusError>> + Send {
     async move {
@@ -1611,9 +1641,9 @@ fn scan_path(
         .await
         .forward::<StatusError>("computing diff against filesystem")?;
 
-        let (reported, failure) = match summary.as_ref() {
-            Some(summary) => {
-                report_scan_changes(&operation, &repository, summary, &mut changes).await
+        let (reported, failure) = match report.as_ref() {
+            Some(report) => {
+                report_scan_changes(&operation, &repository, report, &mut changes).await
             }
             None => (0, None),
         };
@@ -1622,8 +1652,8 @@ fn scan_path(
             .finish()
             .await
             .forward::<StatusError>("computing diff against filesystem")?;
-        if let Some(summary) = summary {
-            summary.append_diff(&diff_stats);
+        if let Some(report) = report {
+            report.summary.append_diff(&diff_stats);
         }
 
         lore_debug!(
@@ -1649,18 +1679,24 @@ struct TreeDiffPlan {
     check_dirty: bool,
     /// Whether the working tree is scanned for changes neither state holds.
     scan: bool,
+    /// Whether the scan was asked for, so it reports as `--scan` does: every entry below a
+    /// deleted directory, and a summary. A scan run unasked reports as a plain status does.
+    scan_asked: bool,
 }
 
 impl TreeDiffPlan {
     /// The plan `options` ask for over a repository that holds a staged state where `has_staged`
     /// says so. A provider that holds its state in a `State`, whose diff is exact, is scanned
-    /// whether or not the scan was asked for, and its dirty flags need no check.
+    /// whether or not the scan was asked for, and its dirty flags need no check. Unasked, its
+    /// scan reports what a plain status reports on any other working tree: a deleted directory as
+    /// one entry, and no summary.
     #[lore_macro::test_pub]
     fn for_status(options: &StatusOptions, has_staged: bool, holds_state: bool) -> Self {
         TreeDiffPlan {
             compare_staged: options.staged && has_staged,
             check_dirty: options.check_dirty && !holds_state,
             scan: options.scan || holds_state,
+            scan_asked: options.scan,
         }
     }
 
@@ -1724,6 +1760,10 @@ async fn report_tree_diffs(
                 "Calculating deltas against filesystem for {} paths",
                 paths.len()
             );
+            let report = ScanReport {
+                summary: summary.clone(),
+                whole_deleted_directories: !plan.scan_asked,
+            };
             scan_paths(
                 operation,
                 repository,
@@ -1731,7 +1771,7 @@ async fn report_tree_diffs(
                 state_current,
                 state_staged,
                 layer_mounts,
-                Some(summary),
+                Some(&report),
             )
             .await?;
             Ok(cleared_links)
@@ -2068,8 +2108,9 @@ pub(crate) async fn status(
 
     // Emit the aggregate dirty-node summary for reconciling status runs. For
     // a scan these are the changes detected against the filesystem; for
-    // --check-dirty they are the nodes that stayed dirty after verification.
-    if plan.scan || check_dirty {
+    // --check-dirty they are the nodes that stayed dirty after verification. A scan run unasked
+    // reports as a plain status does, with no summary.
+    if plan.scan_asked || check_dirty {
         let data = summary.event_data();
         lore_debug!(
             "Status summary: {} added, {} modified, {} deleted, {} moved, {} copied, {} hash checks, {} mtime matches",

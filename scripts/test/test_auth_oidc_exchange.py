@@ -216,6 +216,10 @@ def test_a_push_after_the_login_expires_refreshes_before_the_exchange(
 
 
 @pytest.mark.smoke
+@pytest.mark.own_vfs(
+    "withdraws the grant after the repository is created, where a virtual clone's mount "
+    "exchanged its token for the partition when it connected"
+)
 def test_a_partition_the_provider_will_not_grant_is_not_reached(
     exchange_env, make_repo
 ):

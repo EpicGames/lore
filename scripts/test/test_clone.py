@@ -171,6 +171,7 @@ def test_clone_direct_file_write(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("re-clones over the files an ordinary clone leaves on disk")
 @pytest.mark.smoke
 def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo):
     """A clone into a directory that already holds identical files retains them rather than
@@ -205,6 +206,7 @@ def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo)
     )
 
 
+@pytest.mark.own_vfs("re-clones over the files an ordinary clone leaves on disk")
 @pytest.mark.smoke
 def test_reclone_over_files_stamped_ahead_records_no_time(new_lore_repo):
     """A clone that retains files whose times are not older than the filesystem clock it read

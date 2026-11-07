@@ -7,6 +7,10 @@ from test_utils import unstaged_entries, working_tree_files
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 _OVERLAP_LINK_FILES = {
     "sub/outer.txt": "outer content\n",
     "sub/test/inner.txt": "inner content\n",

@@ -243,6 +243,7 @@ def _commit(repo: Lore, files: list[str], directories: tuple[str, ...] = ()) -> 
     repo.push()
 
 
+@pytest.mark.own_vfs("layers a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_view_with_a_wildcard_reinclusion_creates_no_excluded_directory(
     new_lore_repo, scratch_dir

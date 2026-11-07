@@ -29,11 +29,11 @@ use std::task::ready;
 use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
 use lore_revision::node::Node;
-use lore_revision::node::NodeExtFlags;
 use lore_revision::node::NodeID;
 use lore_revision::state::AddedSince;
 use lore_revision::state::Content;
 use lore_revision::state::State;
+use lore_revision::state::diff;
 use lore_revision::state::node::hooks;
 use lore_revision::state::node::hooks::StateHooks;
 use lore_revision::state::node::hooks::log::Effect;
@@ -196,11 +196,11 @@ impl Filter {
         keep: |_| true,
     };
 
-    /// Every child a working tree versions, a symbolic link a VFS provider keeps as local content
-    /// not, as a diff against a working tree a provider serves keeps them.
+    /// Every child a working tree versions, a symbolic link not, as the diff against a working
+    /// tree keeps them.
     pub const VERSIONED: Self = Self {
         deleted: true,
-        keep: |record| !record.ext_flags().contains(NodeExtFlags::Symlink),
+        keep: diff::versioned_on_a_working_tree,
     };
 
     /// Whether a child with `record` is kept.

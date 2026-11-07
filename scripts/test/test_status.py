@@ -603,6 +603,7 @@ def test_status_count(new_lore_repo, scratch_dir):
     )
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_status_count_link(new_lore_repo, scratch_dir):
     """`status --count` counts a link mount as a directory, descends only into
@@ -734,6 +735,7 @@ def test_status_count_paths(new_lore_repo):
     ) == {"directories": 0, "files": 1}
 
 
+@pytest.mark.own_vfs("layers a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_status_count_layer(new_lore_repo):
     """`status --count` includes layer content (a standalone state tree mounted
@@ -804,6 +806,7 @@ def test_status_count_layer(new_lore_repo):
     }
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_status_count_link_and_layers(new_lore_repo):
     """`status --count` sums the parent tree, an in-tree link, and multiple
@@ -877,6 +880,7 @@ def test_status_count_link_and_layers(new_lore_repo):
     ) == {"directories": 4, "files": 6}
 
 
+@pytest.mark.own_vfs("marks unchanged files dirty and reads them back from a plain status, where a status on a virtual clone always scans, its provider's diff being exact")
 @pytest.mark.smoke
 def test_status_check_dirty(new_lore_repo):
     """`status --check-dirty` clears dirty flags that no longer reflect a real

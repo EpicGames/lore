@@ -57,6 +57,7 @@ use crate::fs::filesystem_provider::with_operation;
 use crate::fs::mount_manager_state::MountManagerState;
 use crate::fs::os::OsFilesystem;
 use crate::global::GlobalConfig;
+use crate::global::external_dir::external_dir_for_instance;
 use crate::hash;
 use crate::instance::InstanceId;
 use crate::interface::LoreBranchLocation;
@@ -194,7 +195,7 @@ pub struct RepositoryConfig {
 
 impl RepositoryConfig {
     pub fn validate(&self) -> Result<(), RepositoryError> {
-        if self.is_swfs()
+        if self.vfs_type() == VfsType::Swfs
             && !matches!(
                 self.shared_store_to_use.as_ref(),
                 Some(SharedStoreToUseConfig {
@@ -210,10 +211,21 @@ impl RepositoryConfig {
         Ok(())
     }
 
-    pub fn is_swfs(&self) -> bool {
+    /// The VFS serving the instance's working tree. A config without a `[vfs]` section names
+    /// none, which is what [`VfsType::None`] says, not a fallback.
+    pub fn vfs_type(&self) -> VfsType {
         self.vfs
             .as_ref()
-            .is_some_and(|vfs_config| vfs_config.vfs_type.is_swfs())
+            .map_or(VfsType::None, |vfs_config| vfs_config.vfs_type)
+    }
+
+    /// The time a virtual clone's files show where no swap has recorded one: the config's, or now
+    /// where the config holds none.
+    pub fn vfs_base_time(&self) -> u64 {
+        self.vfs
+            .as_ref()
+            .and_then(|vfs_config| vfs_config.base_time)
+            .unwrap_or_else(util::time::timestamp)
     }
 }
 
@@ -266,16 +278,29 @@ impl StoreConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsType {
     #[default]
     None,
     Swfs,
+    Fuse,
+}
+
+impl std::fmt::Display for VfsType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VfsType::None => "none",
+            VfsType::Swfs => "swfs",
+            VfsType::Fuse => "fuse",
+        })
+    }
 }
 
 impl VfsType {
-    pub fn is_swfs(&self) -> bool {
-        matches!(self, VfsType::Swfs)
+    /// Whether the working tree is a mount the service makes, SWFS or FUSE, whose `.lore`
+    /// directory lives outside it, rather than a plain directory.
+    pub fn is_virtual(self) -> bool {
+        matches!(self, VfsType::Swfs | VfsType::Fuse)
     }
 }
 
@@ -285,6 +310,8 @@ pub enum VfsConfigError {}
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct VfsConfig {
     pub vfs_type: VfsType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_time: Option<u64>,
 }
 
 /// Decides whether the automatic incremental background GC (evictor + compactor) is
@@ -687,9 +714,13 @@ impl RemoteState {
     }
 }
 
-fn remote_arc(state: RemoteState) -> Arc<tokio::sync::RwLock<RemoteState>> {
+fn remote_arc(state: RemoteState) -> SharedRemote {
     Arc::new(tokio::sync::RwLock::new(state))
 }
+
+/// A context's remote, which contexts made from it share: the connection, its pending connect,
+/// or why there is none.
+pub(crate) type SharedRemote = Arc<tokio::sync::RwLock<RemoteState>>;
 
 pub struct RepositoryContextCreationArgs {
     pub paths: Option<RepositoryPaths>,
@@ -907,6 +938,90 @@ impl RepositoryContext {
         self
     }
 
+    /// Attach store claims this context shares with other contexts, released once the last of
+    /// them drops: a mounted filesystem shares its claims with every context it serves through,
+    /// so work done through any of them keeps the claims until it ends. `None` attaches nothing.
+    #[must_use]
+    pub(crate) fn with_shared_store_hold(
+        mut self,
+        stores: Option<Arc<lore_storage::local::store_lock::StoreHold>>,
+    ) -> Self {
+        self.own_stores = stores;
+        self
+    }
+
+    /// A remote for a holder that serves past the command that built this context, a mounted
+    /// filesystem: its connect started now, in this call's execution context, from the instance's
+    /// configuration, whatever the command was told about going offline, since content the holder
+    /// serves later may be stored on the remote alone. None where the configuration names no
+    /// remote or cannot be read.
+    pub(crate) fn serving_remote(&self) -> SharedRemote {
+        let config = self
+            .paths
+            .as_ref()
+            .and_then(|paths| load_config(paths.dot_path.join(CONFIG)).ok());
+        let correlation_id = crate::runtime::try_execution_context()
+            .map(|context| context.globals().correlation_id.to_string())
+            .unwrap_or_default();
+        remote_arc(match config {
+            Some(config) => {
+                match connect_remote(self.id, correlation_id, &config, config.identity.clone()) {
+                    Ok(future) => RemoteState::Pending(future),
+                    Err(error) => RemoteState::from_result(Err(error)),
+                }
+            }
+            None => RemoteState::Offline,
+        })
+    }
+
+    /// Gives `remote`, a holder's shared remote ([`Self::serving_remote`]), this context's
+    /// connection, or its connect under way, where `remote` failed or never connected: a holder
+    /// whose own connect failed, as a remount before the network is up does, reaches the remote
+    /// again through the next command that does. Takes no lock another holds.
+    pub(crate) fn repair_shared_remote(&self, remote: &SharedRemote) {
+        if Arc::ptr_eq(&self.remote, remote) {
+            return;
+        }
+        let Ok(mut shared) = remote.try_write() else {
+            return;
+        };
+        if !matches!(*shared, RemoteState::Failed(_) | RemoteState::Offline) {
+            return;
+        }
+        let Ok(own) = self.remote.try_read() else {
+            return;
+        };
+        match &*own {
+            RemoteState::Connected(connection) => {
+                *shared = RemoteState::Connected(connection.clone());
+            }
+            RemoteState::Pending(connect) => *shared = RemoteState::Pending(connect.clone()),
+            RemoteState::Offline | RemoteState::Failed(_) => {}
+        }
+    }
+
+    /// This context over `remote`, which the contexts of one holder share
+    /// ([`Self::serving_remote`]).
+    #[must_use]
+    pub(crate) fn with_shared_remote(&self, remote: &SharedRemote) -> Self {
+        RepositoryContext {
+            remote: remote.clone(),
+            ..self.inherited()
+        }
+    }
+
+    /// Claims this context's stores as [`claim_stores`] does, for a holder that uses them outside
+    /// any command: a mounted filesystem.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] if either store's claim cannot be taken.
+    pub(crate) async fn hold_stores(
+        &self,
+    ) -> Result<lore_storage::local::store_lock::StoreHold, RepositoryError> {
+        claim_stores(&self.immutable_store, &self.mutable_store).await
+    }
+
     /// Attach a [`RepositoryWriteToken`] to this context. The token carries
     /// the per-path write-mutex guard, so the caller must have already
     /// obtained it via [`RepositoryWriteToken::acquire`] (fresh mint +
@@ -987,6 +1102,11 @@ impl RepositoryContext {
 
     pub fn immutable_store(&self) -> Arc<dyn ImmutableStore> {
         self.immutable_store.clone()
+    }
+
+    /// The immutable store, borrowed, for a caller that needs no ownership of it.
+    pub fn immutable_store_ref(&self) -> &Arc<dyn ImmutableStore> {
+        &self.immutable_store
     }
 
     /// Read-only view of the mutable store. Always available; bound to the
@@ -1110,6 +1230,43 @@ impl RepositoryContext {
             file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new(),
             ..self.inherited()
         }
+    }
+
+    /// A context over this context's stores for the instance mounted at `root` whose `.lore` is
+    /// `dot_path`, as the service serves it when remounting: the instance's view, a remote
+    /// connected on first use, and no write token. Reads nothing inside `root`.
+    pub(crate) fn mounted_instance_context(
+        &self,
+        root: &Path,
+        dot_path: &Path,
+        instance_id: InstanceId,
+        config: &RepositoryConfig,
+    ) -> Result<Self, RepositoryError> {
+        let id = read_id_from_file(dot_path.join(ID)).internal("Repository not found")?;
+        let filter = Arc::new(
+            filter::load_view(dot_path.join(VIEW_FILTER))
+                .forward::<RepositoryError>("Failed to load repository view")?,
+        );
+        let context = execution_context();
+        let remote = match connect(id, context.globals(), config, config.identity.clone()) {
+            Ok(future) => RemoteState::Pending(future),
+            Err(error) => RemoteState::from_result(Err(error)),
+        };
+        let mounted = Self::new_with_state(
+            Some(RepositoryPaths::new(
+                root.to_path_buf(),
+                dot_path.to_path_buf(),
+            )),
+            self.immutable_store.clone(),
+            self.mutable_store.clone(),
+            id,
+            instance_id,
+            remote,
+            filter,
+            None,
+        );
+        mounted.set_disable_cache(cache_disabled(context.globals(), config));
+        Ok(mounted)
     }
 
     /// Rebuild this context with a different filter view and remote connection,
@@ -1530,16 +1687,16 @@ pub const MINE_SUFFIX: &str = "~mine";
 pub const MERGE_ARTIFACT_SUFFIXES: [&str; 3] = [MINE_SUFFIX, THEIRS_SUFFIX, BASE_SUFFIX];
 
 /// Refuses another SWFS instance once the service mounts as many as SWFS supports
-/// ([`MountManager::MOUNT_LIMIT`](crate::fs::mount_manager::MountManager::MOUNT_LIMIT)).
+/// ([`SwfsMountManager::MOUNT_LIMIT`](crate::fs::swfs::mount_manager::SwfsMountManager::MOUNT_LIMIT)).
 ///
 /// An early check, so a create or clone that would be refused fails before any of the instance is
 /// made rather than after the setup work. It claims nothing: two instances can both pass it, and
-/// [`MountManager::create_mount`](crate::fs::mount_manager::MountManager::create_mount) checks
-/// again under a lock as it mounts, which is what keeps the count within the limit. Outside a
-/// service there is no mount to count, and creating the instance is refused there anyway.
+/// [`SwfsMountManager::create_mount`](crate::fs::swfs::mount_manager::SwfsMountManager::create_mount)
+/// checks again under a lock as it mounts, which is what keeps the count within the limit. Outside
+/// a service there is no mount to count, and creating the instance is refused there anyway.
 pub(crate) fn refuse_swfs_past_mount_limit() -> Result<(), NotSupported> {
     match MountManagerState::mount_manager() {
-        Some(manager) => manager.refuse_past_mount_limit(),
+        Some(manager) => manager.swfs().refuse_past_mount_limit(),
         None => Ok(()),
     }
 }
@@ -1555,7 +1712,7 @@ pub(crate) fn refuse_nesting_in_swfs_mount(
     path: &std::path::Path,
 ) -> Result<(), crate::errors::InvalidArguments> {
     if let Some(mount) =
-        MountManagerState::mount_manager().and_then(|manager| manager.mount_containing(path))
+        MountManagerState::mount_manager().and_then(|manager| manager.swfs().mount_containing(path))
     {
         return Err(crate::errors::InvalidArguments {
             reason: format!(
@@ -1605,6 +1762,10 @@ pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath>
             }
         }
     };
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(dot_lore)) = crate::fs::fuse::discover::discover_external_dot_lore(path) {
+        return Ok(dot_lore);
+    }
     let legacy = path.join(DOT_URC);
     Ok(if legacy.is_dir() {
         legacy
@@ -2361,7 +2522,22 @@ fn connect(
     if globals.offline() {
         return Err(ProtocolError::from(NoRemote));
     }
+    connect_remote(
+        repository,
+        globals.correlation_id.to_string(),
+        config,
+        identity,
+    )
+}
 
+/// [`connect`] whatever the command was told about going offline, for a holder that serves past
+/// the command that built it.
+fn connect_remote(
+    repository: RepositoryId,
+    correlation_id: String,
+    config: &RepositoryConfig,
+    identity: Option<String>,
+) -> Result<RemoteFuture, ProtocolError> {
     let remote_url = config.remote_url.clone();
     remote_url.as_ref().inspect(|url| {
         lore_debug!("Using repository config remote: {url}",);
@@ -2373,7 +2549,6 @@ fn connect(
     let remote_url = remote_url.as_deref().unwrap_or_default().to_string();
     let identity = identity.as_deref().unwrap_or_default().to_string();
 
-    let correlation_id = globals.correlation_id.to_string();
     Ok(protocol::shared_connect(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
@@ -2608,7 +2783,13 @@ pub async fn load_and_connect_with_token(
         let _ = save_config(config_path.as_path(), &persisted).await;
     }
 
-    let filter = load_filter(path)?;
+    // A FUSE working tree is the service's own mount, which the service never reads through: its
+    // ignore file is read from the provider serving it, once the mount is found below.
+    let filter = if config.vfs_type() == VfsType::Fuse {
+        None
+    } else {
+        Some(load_filter(path)?)
+    };
 
     // Resolve the remote eagerly only when we need it for the mutable store upgrade.
     // Otherwise keep it pending so local-only commands never block on the connect.
@@ -2751,18 +2932,27 @@ pub async fn load_and_connect_with_token(
         instance_id
     };
 
-    // Load the mounted filesystem if this is a SWFS-backed instance
-    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> = if config.is_swfs() {
-        let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
-            "Loading a SWFS repository without using the service",
-        ))?;
-        Some(
-            mount_manager
-                .get_mount_filesystem_provider(path)
-                .forward::<RepositoryError>("Unable to find mount for SWFS repository")?,
-        )
-    } else {
-        None
+    // Load the mounted filesystem if this is a virtually-backed instance (SWFS or FUSE)
+    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> =
+        if config.vfs_type().is_virtual() {
+            let mount_manager = MountManagerState::mount_manager().ok_or_else(|| {
+                RepositoryError::internal(format!(
+                    "Loading a {} repository without using the service; run `lore service start`",
+                    config.vfs_type()
+                ))
+            })?;
+            Some(
+                mount_manager
+                    .filesystem_provider(path)
+                    .forward_any::<RepositoryError>("Unable to find mount for repository")?,
+            )
+        } else {
+            None
+        };
+
+    let filter = match filter {
+        Some(filter) => filter,
+        None => load_held_filter(filesystem.as_deref(), &dot_path).await?,
     };
 
     // Keep the remote pending so local-only commands finish without waiting on the
@@ -2795,7 +2985,7 @@ pub async fn load_and_connect_with_token(
     // Commit command will look at the global flag and set this explicitly
     repository.set_disable_upload(true);
 
-    repository.set_disable_cache(!(global.cache() || config.is_swfs()));
+    repository.set_disable_cache(cache_disabled(global, &config));
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
     repository.set_prefetch_tree(
@@ -2953,32 +3143,70 @@ pub fn is_valid_name(name: &str) -> bool {
             .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
 }
 
+/// Whether a context for an instance with `config` leaves fetched content out of the local
+/// store: unless the command asks to cache, only virtual instances keep it, since their
+/// files are read back through the store rather than from disk.
+fn cache_disabled(global: &LoreGlobalArgs, config: &RepositoryConfig) -> bool {
+    !(global.cache() || config.vfs_type().is_virtual())
+}
+
 pub async fn create_local(
     path: &Path,
     token: &RepositoryWriteToken,
     repository: RepositoryId,
     default_branch: BranchId,
     default_branch_name: String,
-    config: RepositoryConfig,
+    mut config: RepositoryConfig,
     no_tracking: bool,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
     require_text_root(path)?;
     let instance_id = InstanceId::generate();
+    #[cfg(target_os = "linux")]
+    let mount_point_preexisted = path.exists();
+
+    // A FUSE mount serves the instance's stores, so it is mounted once they hold the instance.
+    let fuse_mount_manager = if config.vfs_type() == VfsType::Fuse {
+        if !cfg!(target_os = "linux") {
+            return Err(RepositoryError::internal(
+                "FUSE instances are only supported on Linux",
+            ));
+        }
+        if let Some(vfs) = config.vfs.as_mut()
+            && vfs.base_time.is_none()
+        {
+            vfs.base_time = Some(util::time::timestamp());
+        }
+        Some(
+            MountManagerState::mount_manager().ok_or(RepositoryError::internal(
+                "Attempting to create a virtual-filesystem instance outside the service",
+            ))?,
+        )
+    } else {
+        None
+    };
 
     let dotpath;
     let filesystem_provider: Option<Arc<dyn FilesystemProvider + 'static>>;
-    if config.is_swfs() {
+    if fuse_mount_manager.is_some() {
+        dotpath = external_dir_for_instance(instance_id)
+            .forward::<RepositoryError>("Unable to get external directory")?
+            .join(DOT_LORE);
+        filesystem_provider = None;
+    } else if config.vfs_type().is_virtual() {
         let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
-            "Attempting to create an SWFS instance outside the service",
+            "Attempting to create a virtual-filesystem instance outside the service",
         ))?;
         dotpath = mount_manager
+            .swfs()
             .create_mount(path, &config, repository, instance_id)
             .await
-            .forward::<RepositoryError>("Failed to create mount for SWFS instance")?;
+            .forward_any::<RepositoryError>("Failed to create mount for instance")?;
         filesystem_provider = Some(
             mount_manager
-                .get_mount_filesystem_provider(path)
-                .forward::<RepositoryError>("Failed to get filesystem provider for fresh mount")?,
+                .filesystem_provider(path)
+                .forward_any::<RepositoryError>(
+                    "Failed to get filesystem provider for fresh mount",
+                )?,
         );
     } else {
         dotpath = path.join(DOT_LORE);
@@ -3078,7 +3306,7 @@ pub async fn create_local(
     // Register instance in the mutable store
     crate::instance::register_instance(&repository, instance_id, &path.display().to_string())
         .await
-        .forward::<RepositoryError>("Failed to create local store")?;
+        .forward_any::<RepositoryError>("Failed to create local store")?;
 
     // Generate default branch. When using a shared global mutable store, the
     // branch may already exist from another instance — skip creation in that case.
@@ -3118,6 +3346,46 @@ pub async fn create_local(
         .is_some_and(|context| context.globals().sync_data());
     repository.flush(sync_data).await?;
 
+    #[cfg(target_os = "linux")]
+    if let Some(mount_manager) = fuse_mount_manager {
+        // The mount serves reads through this context until its first swap.
+        repository.set_disable_cache(cache_disabled(execution_context().globals(), &config));
+        if let Err(error) = mount_manager
+            .fuse()
+            .create_mount(repository.clone(), path, &config, instance_id)
+            .await
+        {
+            // The caller gets no instance id to undo, so the instance is undone here.
+            if let Err(abandon) = mount_manager
+                .fuse()
+                .abandon_clone(path, instance_id, !mount_point_preexisted)
+                .await
+            {
+                lore_warn!(
+                    "Failed to undo the FUSE instance at {}: {abandon}",
+                    path.display()
+                );
+            }
+            return Err(error)
+                .forward_any::<RepositoryError>("Failed to create mount for instance");
+        }
+        let provider = mount_manager
+            .filesystem_provider(path)
+            .forward_any::<RepositoryError>("Failed to get filesystem provider for fresh mount")?;
+        return Ok(Arc::new(
+            RepositoryContext::new(RepositoryContextCreationArgs {
+                paths: repository.paths.clone(),
+                immutable_store: repository.immutable_store.clone(),
+                mutable_store: repository.mutable_store.clone(),
+                id: repository.id,
+                instance_id,
+                remote: Err(ProtocolError::from(NoRemote)),
+                filter: Arc::default(),
+                filesystem_provider: Some(provider),
+            })
+            .with_write_token(token.share()),
+        ));
+    }
     Ok(repository)
 }
 
@@ -3141,6 +3409,42 @@ pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryEr
     let dot_path = get_dot_lore_path(root_path)?;
     let filter = filter::load_with_instance_ignore(
         &ignore_path,
+        dot_path.join(INSTANCE_IGNORE),
+        dot_path.join(VIEW_FILTER),
+    )
+    .forward::<RepositoryError>("Failed to load repository filter")?;
+    Ok(Arc::new(filter))
+}
+
+/// The filter of a virtual clone whose working tree `provider` serves: its ignore file read from
+/// the provider, since the service never reads through its own mount, then the instance's own
+/// ignore rules and its view from `dot_path`, as [`load_filter`] loads an ordinary clone's. An
+/// ignore file the provider holds and cannot read fails the load, as one that cannot be understood
+/// does: without its rules a walk would take in everything it keeps out. Its content is made
+/// local whenever the provider takes a revision, so a command run offline reads it.
+async fn load_held_filter(
+    provider: Option<&dyn FilesystemProvider>,
+    dot_path: &Path,
+) -> Result<Arc<filter::Filter>, RepositoryError> {
+    let mut ignore = None;
+    if let Some(provider) = provider {
+        for name in [DOT_LOREIGNORE, DOT_URCIGNORE] {
+            if let Some(bytes) = provider
+                .read_held_file(&RelativePath::new_from_clean_parts(name, ""))
+                .await
+                .forward_any_with::<RepositoryError, _>(|| {
+                    format!("Failed to read the virtual clone's {name}")
+                })?
+            {
+                ignore = Some((bytes, name));
+                break;
+            }
+        }
+    }
+    let filter = filter::load_with_instance_ignore_from(
+        ignore
+            .as_ref()
+            .map(|(bytes, name)| (bytes.as_ref(), Path::new(*name))),
         dot_path.join(INSTANCE_IGNORE),
         dot_path.join(VIEW_FILTER),
     )

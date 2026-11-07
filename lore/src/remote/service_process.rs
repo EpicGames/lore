@@ -9,6 +9,8 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_base::error::ServiceUnavailable;
@@ -256,6 +258,27 @@ impl ServiceSettings {
     fn decide_use_service(&self) -> bool {
         relaying_is_asked_for(std::env::var_os(USE_SERVICE_VAR), self.relaying_on)
     }
+}
+
+/// Whether this process is the service, set once by [`initialize_service`] before it starts
+/// handling connections.
+///
+/// A FUSE instance's commands, and a clone or create whose `vfs` resolves to FUSE, are always
+/// forced to relay to the service (see `command_requires_service` in `call_delegation`), but the
+/// service handling a relayed command re-enters the same dispatch path — without this flag it
+/// would relay to itself forever. Not the same thing as [`service_runs_in_this_process`], which
+/// answers true only later, once the service has bound its socket ([`register_service_process`]).
+///
+/// [`initialize_service`]: crate::service::initialization::initialize_service
+static IN_SERVICE_PROCESS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn mark_running_as_service() {
+    IN_SERVICE_PROCESS.store(true, Ordering::Release);
+}
+
+#[lore_macro::test_pub]
+pub(crate) fn running_as_service() -> bool {
+    IN_SERVICE_PROCESS.load(Ordering::Acquire)
 }
 
 /// Whether this call is carried out by the service rather than here.

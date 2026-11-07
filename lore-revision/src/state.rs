@@ -37,8 +37,10 @@ use bitflags::bitflags;
 use bytes::Bytes;
 pub use diff::DiffWalkStats;
 pub use diff::GraftOracle;
+pub(crate) use diff::diff_states_into;
 use futures::future::Either;
 use lore_base::error::InvalidPath;
+use lore_base::lore_drain_tasks;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 pub use node::ServedNodes;
@@ -324,6 +326,44 @@ pub(crate) const CHAIN_CHANGE_ATTEMPTS: u32 = 256;
 /// ([`ChainMark::reattached`]). The count wraps at 2^32, so a reader misses a reattach only if
 /// 2^16 of them pass between its two reads.
 pub const REATTACH_CHANGES: u32 = 1 << 16;
+
+/// Per-thread counts of reads of a State's runtime lock, while enabled, so a test can show a
+/// path takes none. Built only for tests: a build without `test-util`, or a bench build
+/// (`bench`), counts nothing and pays nothing.
+#[cfg(feature = "test-util")]
+pub mod lock_counting {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    static COUNTING: AtomicBool = AtomicBool::new(false);
+
+    thread_local! {
+        static THREAD: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Enables or disables counting process-wide. Disabled by default.
+    pub fn set_runtime_read_counting(enabled: bool) {
+        COUNTING.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Runtime reads counted on the calling thread.
+    pub fn thread_runtime_read_count() -> u64 {
+        THREAD.with(Cell::get)
+    }
+
+    #[cfg(not(feature = "bench"))]
+    #[inline]
+    pub(crate) fn enabled() -> bool {
+        COUNTING.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(feature = "bench"))]
+    #[inline]
+    pub(crate) fn record() {
+        THREAD.with(|count| count.set(count.get() + 1));
+    }
+}
 
 /// Counts of the chain nodes a find by name ([`State::find_subnode`],
 /// [`State::find_subnode_resident`]) steps through, while enabled, per thread and process-wide,
@@ -799,11 +839,16 @@ pub struct StateNodeChildrenWithNameIterator {
     current_iblock: usize,
     walk: ChainWalk,
     /// Live children the walk passed over because their block could not give back their name.
-    #[cfg(feature = "test-util")]
     skipped_invalid: u32,
 }
 
 impl StateNodeChildrenWithNameIterator {
+    /// Live children the walk passed over because their block could not give back their name.
+    #[lore_macro::test_pub]
+    pub(crate) fn skipped_invalid(&self) -> u32 {
+        self.skipped_invalid
+    }
+
     /// Create a new iterator starting from the first child of the given parent node.
     /// Loads blocks with nametable for name lookup via `next()`.
     pub async fn new(
@@ -819,7 +864,6 @@ impl StateNodeChildrenWithNameIterator {
                 current_block: None,
                 current_iblock: 0,
                 walk: ChainWalk::empty(parent_node_id),
-                #[cfg(feature = "test-util")]
                 skipped_invalid: 0,
             });
         }
@@ -843,7 +887,6 @@ impl StateNodeChildrenWithNameIterator {
             current_block: block,
             current_iblock: iblock,
             walk,
-            #[cfg(feature = "test-util")]
             skipped_invalid: 0,
         })
     }
@@ -897,10 +940,7 @@ impl StateNodeChildrenWithNameIterator {
             match name {
                 Ok(name) => return Ok(Some((node_id, node, name))),
                 Err(err) => {
-                    #[cfg(feature = "test-util")]
-                    {
-                        self.skipped_invalid += 1;
-                    }
+                    self.skipped_invalid += 1;
                     lore_warn!("Skipping node {node_id} with invalid name: {err}");
                 }
             }
@@ -984,7 +1024,25 @@ pub struct StateNodeChildrenIterator {
     walk: ChainWalk,
 }
 
+/// Pushes `block` onto `blocks` unless it holds it already; answers whether it pushed. A
+/// sibling chain may leave a block and come back to it, and the one just seen is the likeliest
+/// match.
+#[lore_macro::test_pub]
+fn push_distinct(blocks: &mut Vec<Arc<NodeBlock>>, block: &Arc<NodeBlock>) -> bool {
+    if blocks.iter().rev().any(|seen| Arc::ptr_eq(seen, block)) {
+        return false;
+    }
+    blocks.push(block.clone());
+    true
+}
+
 impl StateNodeChildrenIterator {
+    /// The node block holding the child [`Self::next`] returned last.
+    #[lore_macro::test_pub]
+    pub(crate) fn block(&self) -> Option<&Arc<NodeBlock>> {
+        self.current_block.as_ref()
+    }
+
     /// Create a new iterator starting from the first child of the given parent node.
     /// Loads blocks without nametable — use when only node data is needed.
     pub async fn new(
@@ -1134,6 +1192,12 @@ impl StateNodeChildrenIterator {
 /// residency whatever they do.
 const BLOCK_LOADING_PERMITS: usize = 256;
 
+/// The blocks a serialize wrote ([`State::serialize_keeping`]), held in memory while this lives.
+pub struct SerializedBlocks {
+    _nodes: Vec<(Arc<NodeBlock>, usize)>,
+    _metadata: Vec<(Arc<NodeFileMetadataBlock>, usize)>,
+}
+
 /// Marks a State dirty when dropped: a save clears the State's flag as it writes its data, and
 /// releases the blocks it wrote only after, so a save that fails or is dropped between leaves
 /// them registered, which the next save writes only with the State dirty. Disarmed once the
@@ -1210,6 +1274,9 @@ pub struct State {
     /// proof records it when taken, and answers stale once it moved, as a freed slot may have
     /// been taken again since (C15).
     reclaims: AtomicU32,
+    /// How many children a hierarchy walk left out as moved since it collected them
+    /// ([`Self::walk_moves`])
+    walk_moves: AtomicU64,
     /// Block deserialization semaphore
     block_deserialize: tokio::sync::Semaphore,
     /// File metadata block deserialization semaphore
@@ -1693,7 +1760,8 @@ impl State {
         guard
     }
 
-    /// The runtime lock's read guard.
+    /// The runtime lock's read guard, counted under `test-util` while `lock_counting` is
+    /// enabled.
     #[inline]
     fn runtime_read(&self) -> parking_lot::RwLockReadGuard<'_, StateRuntime> {
         #[cfg(feature = "state-hooks")]
@@ -1701,6 +1769,10 @@ impl State {
             crate::state::node::hooks::Resource::Runtime(self.hooks.ordinal()),
             false,
         );
+        #[cfg(all(feature = "test-util", not(feature = "bench")))]
+        if lock_counting::enabled() {
+            lock_counting::record();
+        }
         self.runtime.read()
     }
 
@@ -1818,6 +1890,7 @@ impl State {
                 clears_rechecked: _,
                 clears_found_gone: _,
                 reclaims: _,
+                walk_moves: _,
                 deserialize: _,
                 block_deserialize: _,
                 metadata_deserialize: _,
@@ -1850,6 +1923,7 @@ impl State {
             (&raw mut (*fields).clears_rechecked).write(AtomicU64::new(0));
             (&raw mut (*fields).clears_found_gone).write(AtomicU64::new(0));
             (&raw mut (*fields).reclaims).write(AtomicU32::new(0));
+            (&raw mut (*fields).walk_moves).write(AtomicU64::new(0));
             (&raw mut (*fields).deserialize).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).block_deserialize).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).metadata_deserialize).write(tokio::sync::Semaphore::new(1));
@@ -1960,6 +2034,21 @@ impl State {
     /// before [`StateFormat::LowerCaseHash`] does, loads every block in a task of its own, and
     /// each task holds the state.
     ///
+    /// Not an `async fn`: it answers [`Self::serialize_keeping`]'s future itself, which keeps
+    /// nothing, so no second copy of the arguments sits beside it.
+    pub fn serialize<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        token: &'a RepositoryWriteToken,
+    ) -> impl Future<Output = Result<Hash, StateError>> + Send + 'a {
+        self.serialize_keeping(repository, token, drop::<SerializedBlocks>)
+    }
+
+    /// [`Self::serialize`], handing `keep` the blocks it wrote once written: a block the State
+    /// made, which only its registration held until the write released it, stays in memory while
+    /// `keep` holds it, so a reader of the revision just written finds it there rather than
+    /// loading it back from the store. A State that is not dirty writes and hands nothing.
+    ///
     /// No writer runs beside a save, nor another save of this State (the Serialize tier is
     /// exclusive): each block records one save's edit sequence. A writer that does run beside one
     /// is not lost: what it changed goes into the next save, which then holds everything the
@@ -1967,10 +2056,11 @@ impl State {
     /// parent block imaged after a publish can name a child whose block was imaged before it, and
     /// a block threaded onto the unused chain behind a fresh head this save does not write is
     /// reached in the next save alone.
-    pub async fn serialize(
+    pub async fn serialize_keeping(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
         _token: &RepositoryWriteToken,
+        keep: impl FnOnce(SerializedBlocks) + Send,
     ) -> Result<Hash, StateError> {
         debug_assert!(
             self.runtime_read().fresh_blocks_from.is_none(),
@@ -2139,6 +2229,10 @@ impl State {
             repository.id
         );
 
+        keep(SerializedBlocks {
+            _nodes: block_dirty,
+            _metadata: block_file_metadata_dirty,
+        });
         Ok(address.hash)
     }
 
@@ -2780,6 +2874,19 @@ impl State {
         Box::pin(self.block_deserialize(repository, block_index)).await
     }
 
+    /// The heap bytes the chain logs of this State's blocks in memory hold
+    /// ([`NodeBlock::chain_log_bytes`]). Reads each block once its runtime lock is released.
+    #[doc(hidden)]
+    pub fn chain_log_bytes(&self) -> usize {
+        let resident: Vec<Arc<NodeBlock>> = self
+            .runtime_read()
+            .block
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        resident.iter().map(|block| block.chain_log_bytes()).sum()
+    }
+
     /// Node block `block_index` where it is in memory, reading nothing.
     pub fn resident_block(&self, block_index: usize) -> Option<Arc<NodeBlock>> {
         let lock = self.runtime_read();
@@ -3013,6 +3120,45 @@ impl State {
         lore_trace!("Deserialized state node block {block_index}");
 
         Ok(block)
+    }
+
+    /// Loads every node block holding a child of `parent`, with its name table, and returns the
+    /// blocks so they stay resident while the caller walks the children.
+    ///
+    /// The children form a sibling chain across blocks, so a block is known only once the block
+    /// before it is loaded: the blocks load in turn, and each name table loads while the walk
+    /// goes on.
+    #[lore_macro::test_pub]
+    pub(crate) async fn load_children_with_nametables(
+        self: &Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+    ) -> Result<Vec<Arc<NodeBlock>>, StateError> {
+        let mut children =
+            StateNodeChildrenIterator::new(self.clone(), repository.clone(), parent).await?;
+        let mut blocks: Vec<Arc<NodeBlock>> = Vec::new();
+        let mut nametables: JoinSet<Result<(), StateError>> = JoinSet::new();
+        while children.next().await?.is_some() {
+            let Some(block) = children.block() else {
+                continue;
+            };
+            if !push_distinct(&mut blocks, block) {
+                continue;
+            }
+            if !block.is_nametable_deserialized() {
+                let block = block.clone();
+                let repository = repository.clone();
+                lore_spawn!(
+                    nametables,
+                    crate::subtask!(async move { block.deserialize_nametable(repository).await })
+                );
+            }
+        }
+        lore_drain_tasks!(
+            nametables,
+            StateError::internal("Failed to load a node name table")
+        )?;
+        Ok(blocks)
     }
 
     pub async fn block_with_nametable(
@@ -6710,16 +6856,8 @@ fn emit_change(
     )
 }
 
-/// `states` is the filter's verdict for `path`, which the hierarchy walk below
-/// steps its children from rather than folding each whole path.
-///
-/// Only a directory added or deleted as a whole is walked: a caller emitting a
-/// modification walks the directory itself. The walk is boxed, one allocation per
-/// such directory: inline, it would make this future and every future above it
-/// larger.
-///
-/// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+/// [`add_change_where`] walking every child of a directory added or deleted as a whole.
+#[allow(clippy::too_many_arguments)]
 fn add_change(
     from: NodeChangeState,
     to: NodeChangeState,
@@ -6728,6 +6866,40 @@ fn add_change(
     changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
+) -> impl Future<Output = Result<(), StateError>> + Send + '_ {
+    add_change_where(
+        from,
+        to,
+        action,
+        measured,
+        changes,
+        filter_mode,
+        states,
+        false,
+    )
+}
+
+/// `states` is the filter's verdict for `path`, which the hierarchy walk below
+/// steps its children from rather than folding each whole path, and `versioned_only`
+/// whether the walk takes only the children a working tree versions
+/// ([`diff::versioned_on_a_working_tree`]), as it does in a filesystem State.
+///
+/// Only a directory added or deleted as a whole is walked: a caller emitting a
+/// modification walks the directory itself. The walk is boxed, one allocation per
+/// such directory: inline, it would make this future and every future above it
+/// larger.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn add_change_where(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    action: change::FileAction,
+    measured: change::Flags,
+    changes: &ChangeSender,
+    filter_mode: FilterMode,
+    states: FilterStates,
+    versioned_only: bool,
 ) -> impl Future<Output = Result<(), StateError>> + Send + '_ {
     async move {
         // Avoid adding repository root node in case it was to/from an empty repository
@@ -6788,6 +6960,7 @@ fn add_change(
             changes,
             filter_mode,
             states,
+            versioned_only,
         ))
         .await
     }
@@ -7184,6 +7357,16 @@ pub struct FilesystemDiffStats {
     pub file_hash: AtomicU64,
     /// Files a recorded modified time answered for, sparing them a hash check.
     pub file_mtime_match: AtomicU64,
+    /// Adds the tree no longer holds, discarded from the tree diffed against it.
+    pub discarded: AtomicU64,
+    /// Where the provider diff met its filesystem State changed since it listed a directory, as
+    /// the walk's `DiffWalkStats::moved_under_walk` counts it. For tests.
+    #[doc(hidden)]
+    pub moved_under_walk: AtomicU64,
+    /// Of those, the finds made for a delete since the directory's chain changed, as
+    /// `DiffWalkStats::finds_after_change` counts them. For tests.
+    #[doc(hidden)]
+    pub finds_after_change: AtomicU64,
 }
 
 impl FilesystemDiffStats {
@@ -7202,6 +7385,16 @@ impl FilesystemDiffStats {
             .fetch_add(stats.file_hash.load(Ordering::Relaxed), Ordering::Relaxed);
         self.file_mtime_match.fetch_add(
             stats.file_mtime_match.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.discarded
+            .fetch_add(stats.discarded.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.moved_under_walk.fetch_add(
+            stats.moved_under_walk.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.finds_after_change.fetch_add(
+            stats.finds_after_change.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -8503,21 +8696,25 @@ pub fn file_modified_time_entry(
 
 pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &impl WalkPath) -> u64 {
     let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
-    let mtime = if let Ok(value) = repository
+    let mtime = stored_modified_time(&repository, key).await;
+    lore_trace!("Load mtime {mtime} for {path}");
+    mtime
+}
+
+/// The modification time stored under `key` in `repository`'s mutable store, 0 for none.
+pub(crate) async fn stored_modified_time(repository: &RepositoryContext, key: Hash) -> u64 {
+    match repository
         .read_mutable_store()
         .load(repository.root_id(), key, KeyType::Untyped)
         .await
     {
-        u64::from_ne_bytes(
+        Ok(value) => u64::from_ne_bytes(
             value.data()[..size_of::<u64>()]
                 .try_into()
                 .unwrap_or_default(),
-        )
-    } else {
-        0
-    };
-    lore_trace!("Load mtime {mtime} for {path}");
-    mtime
+        ),
+        Err(_) => 0,
+    }
 }
 
 /// Records that `path` held the current revision's content at `mtime`.
@@ -9973,12 +10170,14 @@ struct CollectedChildren {
 }
 
 impl HierarchyLevel {
-    /// The level walking the children of `node`, in the tree `side` names.
+    /// The level walking the children of `node`, in the tree `side` names; on a served State, only
+    /// those a working tree versions where `versioned_only`.
     async fn open(
         side: &NodeChangeState,
         node: NodeID,
         appended: bool,
         states: FilterStates,
+        versioned_only: bool,
     ) -> Result<Self, StateError> {
         let NodeMapping {
             repository, state, ..
@@ -9986,9 +10185,19 @@ impl HierarchyLevel {
         let children = if state.is_served() {
             // Boxed: only a served State collects, and the collection would otherwise set the
             // size of every walk's future.
-            let collected =
+            let collected = if versioned_only {
+                Box::pin(state.collect_children_unsorted_where(
+                    repository.clone(),
+                    node,
+                    true,
+                    false,
+                    diff::versioned_on_a_working_tree,
+                ))
+                .await?
+            } else {
                 Box::pin(state.collect_children_unsorted(repository.clone(), node, true, false))
-                    .await?;
+                    .await?
+            };
             LevelChildren::Collected(CollectedChildren {
                 node,
                 children: collected.children.into_iter(),
@@ -10054,6 +10263,10 @@ impl CollectedChildren {
                 .1
                 .node_and_name_ref(Node::index(child));
             if node.is_discarded() || node.parent != self.node || node.name_hash != name_hash {
+                side.mapping
+                    .state
+                    .walk_moves
+                    .fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             match name {
@@ -10070,7 +10283,8 @@ impl CollectedChildren {
 /// warning, where that node cannot be read; an add enumerates `to`, and fails where it cannot be
 /// read. Neither descends a file or a link: a link's children are another repository's, and its
 /// mount path stands for them. `states` is the filter's verdict for the directory, which each child
-/// steps from.
+/// steps from, and the walk takes only the children a working tree versions where
+/// `versioned_only`.
 ///
 /// Descent is an explicit stack of [`HierarchyLevel`] rather than a box per node, so the walk runs
 /// at a fixed call depth. A child directory is handed to a task of its own while
@@ -10100,6 +10314,7 @@ fn add_change_hierarchy(
     changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
+    versioned_only: bool,
 ) -> impl Future<Output = Result<(), StateError>> + Send + '_ {
     let sides = match action {
         FileAction::Delete => delete_hierarchy_side(from, &to).map(|side| (side, to)),
@@ -10136,6 +10351,7 @@ fn add_change_hierarchy(
             changes,
             filter_mode,
             states,
+            versioned_only,
             &mut tasks,
         )
         .await;
@@ -10172,10 +10388,20 @@ fn spawned_hierarchy(
     changes: ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
+    versioned_only: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send>> {
     Box::pin(async move {
-        let result = add_change_hierarchy(from, to, action, &changes, filter_mode, states).await;
+        let result = add_change_hierarchy(
+            from,
+            to,
+            action,
+            &changes,
+            filter_mode,
+            states,
+            versioned_only,
+        )
+        .await;
         drop(permit);
         result
     })
@@ -10190,13 +10416,15 @@ async fn walk_hierarchy(
     changes: &ChangeSender,
     filter_mode: FilterMode,
     states: FilterStates,
+    versioned_only: bool,
     tasks: &mut JoinSet<Result<(), StateError>>,
 ) -> Result<(), StateError> {
     let mut path = side
         .mapping
         .path
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
-    let mut levels = vec![HierarchyLevel::open(side, side.mapping.node, false, states).await?];
+    let mut levels =
+        vec![HierarchyLevel::open(side, side.mapping.node, false, states, versioned_only).await?];
     while let Some(level) = levels.last_mut() {
         let Some((child_id, child_node, child_name)) = level.next_child(side).await? else {
             if levels.pop().is_some_and(|done| done.appended) {
@@ -10204,6 +10432,12 @@ async fn walk_hierarchy(
             }
             continue;
         };
+        // On every level: a streamed one meets each child here first, and a served one collected
+        // only what a working tree versions but reads each child again here, which may have
+        // become a symbolic link since.
+        if versioned_only && !diff::versioned_on_a_working_tree(&child_node) {
+            continue;
+        }
         let appended = !child_name.is_empty();
         path.push(child_name);
         let filter = &side.mapping.repository.filter;
@@ -10268,6 +10502,7 @@ async fn walk_hierarchy(
                         changes,
                         filter_mode,
                         child_states,
+                        versioned_only,
                         permit
                     ))
                 );
@@ -10275,7 +10510,10 @@ async fn walk_hierarchy(
                     path.pop();
                 }
             } else {
-                levels.push(HierarchyLevel::open(side, child_id, appended, child_states).await?);
+                levels.push(
+                    HierarchyLevel::open(side, child_id, appended, child_states, versioned_only)
+                        .await?,
+                );
                 path.reserve(1 + RelativePath::COMPONENT_ROOM);
             }
         } else if appended {
@@ -10321,76 +10559,9 @@ fn delete_hierarchy_side(from: NodeChangeState, to: &NodeChangeState) -> Option<
 /// tests.
 #[cfg(feature = "test-util")]
 pub mod test_util {
-    use lore_base::lore_drain_tasks;
-
     use super::*;
 
-    /// Pushes `block` onto `blocks` unless it holds it already; answers whether it pushed. A
-    /// sibling chain may leave a block and come back to it, and the one just seen is the likeliest
-    /// match.
-    pub fn push_distinct(blocks: &mut Vec<Arc<NodeBlock>>, block: &Arc<NodeBlock>) -> bool {
-        if blocks.iter().rev().any(|seen| Arc::ptr_eq(seen, block)) {
-            return false;
-        }
-        blocks.push(block.clone());
-        true
-    }
-
-    impl StateNodeChildrenIterator {
-        /// The node block holding the child [`Self::next`] returned last.
-        pub fn block(&self) -> Option<&Arc<NodeBlock>> {
-            self.current_block.as_ref()
-        }
-    }
-
-    impl StateNodeChildrenWithNameIterator {
-        /// Live children the walk passed over because their block could not give back their name.
-        pub fn skipped_invalid(&self) -> u32 {
-            self.skipped_invalid
-        }
-    }
-
     impl State {
-        /// Loads every node block holding a child of `parent`, with its name table, and returns the
-        /// blocks so they stay resident while the caller walks the children.
-        ///
-        /// The children form a sibling chain across blocks, so a block is known only once the block
-        /// before it is loaded: the blocks load in turn, and each name table loads while the walk
-        /// goes on.
-        pub async fn load_children_with_nametables(
-            self: &Arc<Self>,
-            repository: Arc<RepositoryContext>,
-            parent: NodeID,
-        ) -> Result<Vec<Arc<NodeBlock>>, StateError> {
-            let mut children =
-                StateNodeChildrenIterator::new(self.clone(), repository.clone(), parent).await?;
-            let mut blocks: Vec<Arc<NodeBlock>> = Vec::new();
-            let mut nametables: JoinSet<Result<(), StateError>> = JoinSet::new();
-            while children.next().await?.is_some() {
-                let Some(block) = children.block() else {
-                    continue;
-                };
-                if !push_distinct(&mut blocks, block) {
-                    continue;
-                }
-                if !block.is_nametable_deserialized() {
-                    let block = block.clone();
-                    let repository = repository.clone();
-                    lore_spawn!(
-                        nametables,
-                        crate::subtask!(
-                            async move { block.deserialize_nametable(repository).await }
-                        )
-                    );
-                }
-            }
-            lore_drain_tasks!(
-                nametables,
-                StateError::internal("Failed to load a node name table")
-            )?;
-            Ok(blocks)
-        }
-
         /// Drops the State's own hold on the blocks it keeps in memory for reuse: its block cache
         /// and the file metadata blocks kept for checks and attaches. A block nothing else holds
         /// leaves memory, to be loaded again when next asked for. Dirty blocks stay registered for
@@ -10452,6 +10623,12 @@ pub mod test_util {
         /// detached, which they answer as success, over this state's life. For tests.
         pub fn clears_found_gone(&self) -> u64 {
             self.clears_found_gone.load(Ordering::Relaxed)
+        }
+
+        /// How many children the walk of a directory added or deleted as a whole found moved
+        /// since it collected them, over this state's life. For tests.
+        pub fn walk_moves(&self) -> u64 {
+            self.walk_moves.load(Ordering::Relaxed)
         }
 
         /// Whether node block `index` is recorded changed ([`Self::block_modified`]), so the next

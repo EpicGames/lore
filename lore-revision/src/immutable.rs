@@ -634,6 +634,9 @@ pub fn write_from_file_with_tracker(
 /// Whether a file still holds content already stored is [`file_matches`], which measures against
 /// the fragmentation that content was stored under.
 ///
+/// Content a virtual filesystem serves from the store is stored under the address it names, so
+/// that address's hash answers without reading it.
+///
 /// Returns [`lore_storage::hash_file`]'s future with its error forwarded, without a future of its
 /// own.
 #[inline]
@@ -641,8 +644,49 @@ pub fn hash_file(
     repository: Arc<RepositoryContext>,
     source: &lore_storage::ContentSource<'_>,
 ) -> impl Future<Output = Result<Hash, ImmutableError>> {
-    lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
-        .map(|hashed| hashed.forward::<ImmutableError>("hashing file"))
+    match virtual_immutable(source) {
+        Some((address, _)) => futures::future::Either::Left(std::future::ready(Ok(address.hash))),
+        None => futures::future::Either::Right(
+            lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
+                .map(|hashed| hashed.forward::<ImmutableError>("hashing file")),
+        ),
+    }
+}
+
+/// The whole content `source` holds, which the caller budgets for holding resident.
+///
+/// `lore_storage` reads no virtual content, so content a virtual filesystem serves from the store
+/// is read from `repository`'s immutable store, and fetched from the remote where it is not local.
+pub async fn read_source(
+    repository: &Arc<RepositoryContext>,
+    source: &lore_storage::ContentSource<'_>,
+) -> Result<Bytes, ImmutableError> {
+    match virtual_immutable(source) {
+        Some((address, _)) => {
+            read(
+                repository.clone(),
+                address,
+                None,
+                read_options_from_repository(repository),
+            )
+            .await
+        }
+        None => source
+            .read_all()
+            .await
+            .forward::<ImmutableError>("reading file"),
+    }
+}
+
+/// The address and size of content a virtual filesystem serves from the immutable store, and
+/// `None` for any other source.
+pub fn virtual_immutable(source: &lore_storage::ContentSource<'_>) -> Option<(Address, u64)> {
+    match source {
+        lore_storage::ContentSource::Virtual(
+            lore_storage::content::VirtualContent::Immutable { address, size },
+        ) => Some((*address, *size)),
+        _ => None,
+    }
 }
 
 /// Whether `source` still holds the content `previous` addresses, fetching fragment metadata

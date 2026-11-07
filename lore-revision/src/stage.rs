@@ -770,6 +770,15 @@ pub(crate) async fn stage_filesystem_path(
             return Ok(NodeLink::invalid());
         }
         lore_debug!("Path {} does not exist in repository", full_relative_path);
+        if operation
+            .unversioned_symlink_at(&full_relative_path)
+            .await
+            .forward::<StageError>("Failed to read the path")?
+        {
+            lore_trace!("Path is a symbolic link, which is not versioned: {full_relative_path}");
+            crate::path::emit_path_ignore(full_relative_path.as_str()).await;
+            return Ok(NodeLink::default());
+        }
         if !force {
             return Err(StageError::internal(format!(
                 "Invalid path {full_relative_path}"
@@ -2841,6 +2850,21 @@ impl StagedChild {
     }
 }
 
+/// Renames `from` to `to` on the filesystem, which differ only in case. A refusal the stage error
+/// declares, such as a read-only instance, stays that error.
+async fn unify_case(
+    operation: &InstanceOperationImpl,
+    from: &RelativePath,
+    to: &RelativePath,
+) -> Result<(), StageError> {
+    operation
+        .rename(from, to)
+        .await
+        .forward_any_with::<StageError, _>(|| {
+            format!("Unable to rename file system path {from} to {to}")
+        })
+}
+
 /// Whether `directory` holds both the spelling the tree carries and the one the file system
 /// showed, which a case-sensitive file system can hold side by side as separate entries.
 ///
@@ -3217,11 +3241,7 @@ pub(crate) async fn stage_node_from_metadata(
                 name = node_name;
                 let to_path = relative_path.join(&name);
 
-                operation.rename(&from_path, &to_path).await.map_err(|e| {
-                    StageError::internal(format!(
-                        "Unable to rename file system path {from_path} to {to_path}: {e}"
-                    ))
-                })?;
+                unify_case(operation, &from_path, &to_path).await?;
             }
             StageCaseChange::Rename => {
                 // Stage a rename operation, updating the repository to match the file system
@@ -3236,11 +3256,7 @@ pub(crate) async fn stage_node_from_metadata(
                     lore_debug!(
                         "Case rename: old path {old_path} still exists alongside {new_path}, unifying file system"
                     );
-                    operation.rename(&old_path, &new_path).await.map_err(|e| {
-                        StageError::internal(format!(
-                            "Unable to rename file system path {old_path} to {new_path}: {e}"
-                        ))
-                    })?;
+                    unify_case(operation, &old_path, &new_path).await?;
                 }
 
                 from_path = Some(relative_path.join(&node_name).to_string());

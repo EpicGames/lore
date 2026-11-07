@@ -26,7 +26,8 @@
 //! - **Swap** ([`State::swap`]): a swap's apply and settle on a served State. Its changes from the
 //!   target publish only clean copies, which the tier checks, detach only with `IfClean`, `IfEmpty`
 //!   or `At`, which its caller keeps to, and never reattach, so they need only a parent not flagged
-//!   `Discarded`.
+//!   `Discarded`. A swap also gives a clean file the target's content in place through the
+//!   unserved [`State::node_rewrite`] with `Rewrite::IfClean`, which changes no chain and no flag.
 //! - **Unserved**: the methods on [`State`], for the C API's verbs, staging, committing, the scan,
 //!   the other commands, and the writers that build a State before it is served, which run as one
 //!   task with no other reference to the State. Under a shared claim (the C API's add, modify, move
@@ -38,9 +39,9 @@
 //!
 //! Saving a State is no tier: it runs no node operation, and no writer runs beside it (C14).
 //!
-//! No VFS provider in this repository serves a State. The served and swap tiers, and the clauses
-//! below that name a provider's inode table, host layer, settles or mount, apply to a provider
-//! that does; the stress suite drives them as a provider would.
+//! The VFS provider for Linux (`crate::fs::fuse`) serves a State through the served and swap
+//! tiers. It does not sweep that State yet (C15), so a slot a request left detached or in flight
+//! stays until the next mount rebuilds the State.
 //!
 //! # Terms
 //!
@@ -266,9 +267,9 @@
 //!   linked and layer States they save beside it, so a slot one of those calls left detached or in
 //!   flight there stays until a sweep of that State.
 //! - **Chain logs.** A log keeps its largest ring while its block is in memory, at most
-//!   [`crate::node::CHAIN_LOG_MAX`] patches of 16 bytes for each directory a listing watched, even
-//!   once no listing watches it or its slot is freed: a block of watched directories may hold 8 MiB
-//!   of logs.
+//!   [`crate::node::CHAIN_LOG_MAX`] patches of 24 bytes for each directory a listing watched, even
+//!   once no listing watches it or its slot is freed: a block of watched directories may hold 12
+//!   MiB of logs.
 //! - **Detached names.** A detached record keeps its name (C3) until a sweep frees it (C15), so a
 //!   served State's name tables keep the name of every node it detached until the provider's next
 //!   sweep that finds it released.

@@ -33,6 +33,7 @@ def find_status_entry(entries: list[dict], path: str) -> dict | None:
     return None
 
 
+@pytest.mark.own_vfs("re-clones over the files an ordinary clone leaves on disk")
 @pytest.mark.smoke
 def test_sync(new_lore_repo):
     repo: Lore = new_lore_repo()
@@ -738,6 +739,7 @@ def test_sync_aborted_by_local_change_writes_nothing(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
 @pytest.mark.smoke
 def test_sync_records_modified_times_for_what_it_realizes(new_lore_repo):
     """A sync establishes what every file it touches holds: the ones it writes by writing
@@ -801,7 +803,9 @@ def test_sync_prefetches_the_tree_only_when_the_instance_asks(new_lore_repo):
     output = clone.sync(level="debug")
     assert "Prefetched" not in output, output
 
-    with open(os.path.join(clone.dot_path(), "config.toml"), "a", encoding="utf-8") as config:
+    with open(
+        os.path.join(clone.dot_path(), "config.toml"), "a", encoding="utf-8"
+    ) as config:
         config.write("\n[sync]\nprefetch_tree = true\n")
     repo.write_commit_push("Third", {"root.txt": b"third"})
     output = clone.sync(level="debug")
@@ -865,6 +869,7 @@ def test_dry_run_sync_records_no_modified_times(new_lore_repo):
 @pytest.mark.skipif(
     sys.platform == "win32", reason="file permissions do not deny reads on Windows"
 )
+@pytest.mark.own_vfs("denies reads through file permissions, where a virtual clone refuses a local file it cannot compare as a local change")
 def test_sync_reports_a_file_it_cannot_read(new_lore_repo):
     """A file the sync cannot read compares as unmodified, so the incoming change is applied
     and the write is what fails. The failure must name the file rather than report local
@@ -1453,6 +1458,7 @@ def test_sync_merge_of_divergent_history_leaves_the_branch_ahead_of_the_remote(
     assert status["isRemoteAhead"] == 0
 
 
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
 @pytest.mark.smoke
 def test_sync_records_the_time_of_a_file_holding_the_incoming_content_only_before_its_clock(
     new_lore_repo,

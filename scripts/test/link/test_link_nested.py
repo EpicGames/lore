@@ -6,6 +6,10 @@ import pytest
 from link_helpers import build_nested_link_repos_at
 from test_utils import unstaged_entries, working_tree_files
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_scan_keeps_a_nested_mount_missing_from_the_working_tree(new_lore_repo):

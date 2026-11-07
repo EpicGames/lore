@@ -31,6 +31,7 @@ from service_util import (
     LORE_SERVICE_SOCKET_VAR,
     LORE_TEST_SERVICE_SOCKET_VAR,
     LORE_TEST_SHARED_SERVICE_VAR,
+    LORE_TEST_VFS_VAR,
     remove_service_claim,
     service_supported,
     stop_lore_service,
@@ -496,16 +497,40 @@ def _relays_to_the_shared_service(request, monkeypatch):
     Each call carries the test's global and auth paths, which the service reads
     in place of its own.
     """
-    socket_name = os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
-    if (
-        socket_name
-        and "lore_service_runner" not in request.fixturenames
-        and request.node.get_closest_marker("runs_in_process") is None
-    ):
+    if _relayed_to_the_shared_service(request):
         monkeypatch.setenv("LORE_USE_SERVICE", "1")
-        monkeypatch.setenv(LORE_SERVICE_SOCKET_VAR, socket_name)
+        monkeypatch.setenv(
+            LORE_SERVICE_SOCKET_VAR, os.environ[LORE_TEST_SERVICE_SOCKET_VAR]
+        )
         # Blank rather than unset, so `name_service_executable` leaves it so.
         monkeypatch.setenv("LORE_SERVICE_EXECUTABLE", " ")
+
+
+def _relayed_to_the_shared_service(request) -> bool:
+    """Whether the shared service carries out the test's commands."""
+    return bool(
+        os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
+        and "lore_service_runner" not in request.fixturenames
+        and request.node.get_closest_marker("runs_in_process") is None
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forces_the_vfs_only_where_the_shared_service_serves(request, monkeypatch):
+    """Keeps `LORE_TEST_VFS` in force only for a test whose commands the shared
+    service carries out, as only a service mounts a virtual clone, and that does
+    not choose its repositories' VFS itself.
+
+    A test that manages a service of its own stops and starts it, which takes
+    its virtual clones with it, and a test marked `runs_in_process` reaches no
+    service. A test marked `own_vfs` asserts on what the VFS it names, or the
+    lack of one, does.
+    """
+    if os.environ.get(LORE_TEST_VFS_VAR) and (
+        not _relayed_to_the_shared_service(request)
+        or request.node.get_closest_marker("own_vfs") is not None
+    ):
+        monkeypatch.delenv(LORE_TEST_VFS_VAR)
 
 
 @pytest.fixture(scope="function")
@@ -940,6 +965,11 @@ def pytest_configure(config):
         "markers",
         "runs_in_process(reason): keep the test's commands in their own process when "
         "LORE_TEST_SERVICE_SOCKET relays the rest of the run to a service",
+    )
+    config.addinivalue_line(
+        "markers",
+        "own_vfs(reason): keep the VFS the test names, or none, when LORE_TEST_VFS "
+        "names one for every repository of the run",
     )
     config.addinivalue_line(
         "markers",

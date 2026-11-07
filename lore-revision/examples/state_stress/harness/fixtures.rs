@@ -512,6 +512,12 @@ impl Tree {
             .expect("the committed State loads");
     }
 
+    /// This tree as a provider serves it: `state`, a State of the same revision loaded afresh,
+    /// in place of its own, so its nodes keep their IDs.
+    pub fn serving(self, state: Arc<State>) -> Self {
+        Self { state, ..self }
+    }
+
     /// The node made for `path` (without a trailing `/`).
     pub fn id(&self, path: &str) -> NodeID {
         let path = path.trim_end_matches('/');

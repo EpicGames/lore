@@ -45,7 +45,7 @@ default = []
 oodle = ["lore-revision/oodle"]
 test-util = []
 # The `revision_tree_bench` example, built only on demand.
-revision-tree-bench = ["test-util", "lore-base/test-util"]
+revision-tree-bench = ["test-util", "lore-base/test-util", "lore-revision/bench"]
 # The C API's scenarios of the State's node operations (`tests/state_scenarios`), which drive
 # lore-revision's scheduling points and so run only by hand.
 state-stress = ["lore-revision/state-stress"]

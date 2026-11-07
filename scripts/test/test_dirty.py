@@ -325,6 +325,7 @@ def test_dirty_move_scan_without_prior_status(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("marks a copy the working tree does not hold and reads it from a plain status, where a status on a virtual clone always scans, its provider's diff being exact")
 @pytest.mark.smoke
 def test_dirty_copy(new_lore_repo):
     """Mark a file as dirty-copied and verify status."""
@@ -944,6 +945,7 @@ def test_stage_scan_stages_without_dirty(new_lore_repo):
     assert entry["flagStaged"] is True
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_stage_default_only_stages_dirty(new_lore_repo):
     """stage (default) only stages dirty-marked files, ignores unmarked changes."""
@@ -1262,6 +1264,7 @@ def test_dirty_ignored_path_skipped(new_lore_repo):
     assert entry is None, "file under ignored path should be skipped"
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_commit_excludes_dirty_only_node(new_lore_repo):
     """Dirty-only nodes must not change the committed revision.
@@ -1496,6 +1499,7 @@ def test_sync_with_stale_dirty_flag(new_lore_repo):
         assert f.read() == "v2 longer content\n"
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_status_reset_clears_tracked_state(new_lore_repo):
     """--reset drops the existing tracked state before computing status.
@@ -2459,6 +2463,7 @@ def remove_view_filter(repo: Lore) -> None:
         os.remove(view_path)
 
 
+@pytest.mark.own_vfs("reads the marks a dirty walk leaves through --check-dirty, which a status on a virtual clone replaces with a scan")
 @pytest.mark.smoke
 def test_dirty_delete_respects_view_filter(new_lore_repo):
     """A dirty-delete of a directory must not mark view-filtered descendants.
@@ -2954,6 +2959,7 @@ def test_dirty_add_repeated_is_idempotent(new_lore_repo):
     check("second dirty, --check-dirty", check_dirty=True)
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_scan_answers_from_recorded_mtime_after_commit(new_lore_repo):
     """A commit reads and hashes every file it commits, and records the modified time it
@@ -2983,6 +2989,7 @@ def test_scan_answers_from_recorded_mtime_after_commit(new_lore_repo):
     assert summary["modifies"] == 0, summary
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_scan_hashes_a_same_size_edit(new_lore_repo):
     """An edit that keeps the file's size cannot be settled by the size comparison, so the
@@ -3019,6 +3026,7 @@ def test_scan_hashes_a_same_size_edit(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("tests what a scan of an ordinary working tree finds and forgets, where a virtual clone tracks every write itself")
 @pytest.mark.smoke
 def test_scan_records_mtime_after_hash_check(new_lore_repo):
     """A file restored to its committed content has a new modified time, so the recorded
@@ -3106,8 +3114,10 @@ def test_switch_drops_the_dirty_markers_of_what_it_restores(new_lore_repo):
 
 
 def _dirty_entries(repo: Lore) -> list[tuple[str, str, str]]:
-    return [
+    """The dirty entries a plain status reports, sorted: status streams its entries in no set
+    order."""
+    return sorted(
         (to_posix(entry["path"]), entry.get("type"), entry.get("action"))
         for entry in get_status_files(repo)
         if entry.get("flagDirty")
-    ]
+    )

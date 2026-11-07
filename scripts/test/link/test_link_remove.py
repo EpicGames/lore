@@ -8,6 +8,10 @@ from link_helpers import DEFAULT_PARENT_FILE, make_parent_with_link
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_remove_keeps_uncommitted_local_edit(new_lore_repo):

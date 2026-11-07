@@ -1,416 +1,269 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+//! The service's mounts. Each VFS has a manager of its own, which alone mounts, moves and
+//! unmounts its instances: [`SwfsMountManager`] for SWFS and, on Linux, `FuseMountManager` for
+//! FUSE. This one holds both, finds every registered instance once as the service starts and hands
+//! each to its manager, and answers what is mounted at a path, whichever VFS mounted it.
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use lore_base::error::InvalidPath;
-use lore_base::error::NotSupported;
+use lore_base::error::MountsBusy;
 use lore_error_set::ForwardStrict;
 use lore_error_set::error_set;
 
+use crate::fs::filesystem_provider::FilesystemProvider;
+#[cfg(target_os = "linux")]
+use crate::fs::fuse::mount::FuseFilesystemProvider;
+#[cfg(target_os = "linux")]
+use crate::fs::fuse::mount_manager::FuseMountManager;
+#[cfg(target_os = "linux")]
+use crate::fs::fuse::mount_manager::remove_deleted_instance;
 use crate::fs::swfs::api_interface::SwfsInterface;
-use crate::fs::swfs::api_interface::WrappedHandle;
-use crate::fs::swfs::api_interface::swfs_api::SWFSHandle;
 use crate::fs::swfs::filesystem::SwfsFilesystem;
-use crate::fs::swfs::mount_resources::MountResources;
+use crate::fs::swfs::mount_manager::SwfsMountManager;
 use crate::fs::swfs::paths::MountPath;
 use crate::global::external_dir::check_for_external_lore_dir;
-use crate::global::external_dir::external_dir_for_instance;
 use crate::instance::InstanceId;
+#[cfg(target_os = "linux")]
+use crate::instance::InstanceMetadata;
 use crate::instance::list_instances;
-use crate::lore::RepositoryId;
 use crate::lore_warn;
-use crate::repository::DOT_LORE;
+#[cfg(target_os = "linux")]
 use crate::repository::RepositoryConfig;
+#[cfg(target_os = "linux")]
+use crate::repository::RepositoryContext;
+use crate::repository::VfsType;
 use crate::repository::load_repository_config_from_dot_dir;
 use crate::shared_store::registry::SharedStoreRegistry;
 use crate::shared_store::registry::SharedStoreRegistryEntry;
 use crate::util::config::SaveableConfig;
 
-pub struct Mount {
-    instance_id: InstanceId,
-    mount: Arc<SwfsInterface>,
-}
-
 #[error_set]
 pub enum MountManagerError {
     InvalidPath,
+    MountsBusy,
 }
 
+/// A FUSE instance found at startup, mounted once the manager exists.
+#[lore_macro::test_pub]
+#[cfg(target_os = "linux")]
+pub(crate) struct PendingFuseMount {
+    pub(crate) repository: Arc<RepositoryContext>,
+    pub(crate) instance: InstanceMetadata,
+    pub(crate) dot_lore: PathBuf,
+    pub(crate) config: RepositoryConfig,
+}
+
+#[lore_macro::test_pub]
+#[cfg(not(target_os = "linux"))]
+struct PendingFuseMount;
+
+/// The mounts a start made of its registered SWFS instances, not yet ready, by path.
+type FoundSwfsMounts = Vec<(MountPath, InstanceId, Arc<SwfsInterface>)>;
+
 pub struct MountManager {
-    mounted_paths: DashMap<MountPath, Mount>,
-    swfs_id_lookup: DashMap<WrappedHandle, Arc<SwfsInterface>>,
-    /// Held across the check against [`Self::MOUNT_LIMIT`] and the mount that follows it, so two
-    /// instances created at once cannot both take the last place.
-    creating: tokio::sync::Mutex<()>,
+    swfs: SwfsMountManager,
+    #[cfg(target_os = "linux")]
+    fuse: FuseMountManager,
 }
 
 impl MountManager {
-    /// The most SWFS instances a service mounts. The SWFS driver attaches about eight mounts, and
-    /// the library parks the process that asks for one more, so the client hangs or loses its
-    /// connection with no way back. The driver's limit is machine-wide, which this count of the
-    /// service's own mounts does not see.
-    pub(crate) const MOUNT_LIMIT: usize = 8;
-
-    /// Refuses another SWFS instance once this service mounts [`Self::MOUNT_LIMIT`] of them.
-    pub fn refuse_past_mount_limit(&self) -> Result<(), NotSupported> {
-        if self.mount_count() < Self::MOUNT_LIMIT {
-            return Ok(());
-        }
-        Err(NotSupported {
-            operation: format!(
-                "mounting another SWFS instance: this service already mounts {}, the most SWFS \
-                 supports at once",
-                self.mount_count()
-            ),
-        })
-    }
-
-    /// Mounts every SWFS instance of the stores in `entries`. A store that cannot be opened or
-    /// listed, and an instance whose config cannot be read, are logged and skipped rather than
-    /// stopping the rest.
+    /// Mounts the SWFS instances of every store in `entries` and finds its FUSE instances, which
+    /// are mounted once the manager exists. A store that cannot be opened or listed, and an
+    /// instance whose external directory or config cannot be read, are logged and skipped rather
+    /// than stopping the rest.
     #[lore_macro::test_pub]
     async fn mounts_of_entries(
         entries: &[SharedStoreRegistryEntry],
-    ) -> Result<DashMap<MountPath, Mount>, MountManagerError> {
-        let mounted_paths = DashMap::new();
+    ) -> Result<(FoundSwfsMounts, Vec<PendingFuseMount>), MountManagerError> {
+        let mut swfs = Vec::new();
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut pending_fuse = Vec::new();
         for entry in entries {
-            let Ok(entry_repository) =
-                entry
-                    .create_null_repository_context()
-                    .await
-                    .inspect_err(|error| {
-                        lore_warn!("Unable to open shared store at {}: {error}", entry.path());
-                    })
-            else {
-                continue;
+            let entry_repository = match entry.create_null_repository_context().await {
+                Ok(repository) => repository,
+                Err(error) => {
+                    lore_warn!("Unable to open shared store at {}: {error}", entry.path());
+                    continue;
+                }
             };
-            let Ok(instances) = list_instances(&entry_repository)
-                .await
-                .inspect_err(|error| {
+            let instances = match list_instances(&entry_repository).await {
+                Ok(instances) => instances,
+                Err(error) => {
                     lore_warn!(
                         "Unable to list instances of shared store at {}: {error}",
                         entry.path()
                     );
-                })
-            else {
-                continue;
+                    continue;
+                }
             };
             for instance in &instances {
-                let Some(dot_lore) =
-                    check_for_external_lore_dir(instance.instance_id)
-                        .forward::<MountManagerError>("Unable to find external .lore directory")?
-                else {
-                    continue;
-                };
-                let Ok(config) =
-                    load_repository_config_from_dot_dir(&dot_lore).inspect_err(|error| {
+                let dot_lore = match check_for_external_lore_dir(instance.instance_id) {
+                    Ok(Some(dot_lore)) => dot_lore,
+                    Ok(None) => continue,
+                    Err(error) => {
                         lore_warn!(
-                            "Unable to load the repository config of instance {} at {}: {error}",
-                            instance.instance_id,
+                            "Unable to find the external .lore directory of instance at {}: {error}",
                             instance.path
                         );
-                    })
-                else {
-                    continue;
+                        continue;
+                    }
                 };
-                if config.is_swfs() {
-                    let mount_path = MountPath::new(Path::new(&instance.path))
-                        .forward::<MountManagerError>("Failed to make mount path")?;
-                    let mount = SwfsInterface::mount(
-                        MountResources::premount_instance(instance.instance_id, mount_path.clone())
-                            .await
-                            .forward::<MountManagerError>("Failed gathering premount resources")?,
-                    )
-                    .forward::<MountManagerError>("Failed to mount")?;
-
-                    mounted_paths.insert(
-                        mount_path,
-                        Mount {
-                            instance_id: instance.instance_id,
-                            mount,
-                        },
-                    );
+                let config = match load_repository_config_from_dot_dir(&dot_lore) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        lore_warn!(
+                            "Unable to load the repository config of instance at {}: {error}",
+                            instance.path
+                        );
+                        continue;
+                    }
+                };
+                match config.vfs_type() {
+                    #[cfg(target_os = "linux")]
+                    VfsType::Fuse => {
+                        if remove_deleted_instance(instance).await {
+                            continue;
+                        }
+                        pending_fuse.push(PendingFuseMount {
+                            repository: entry_repository.clone(),
+                            instance: InstanceMetadata {
+                                instance_id: instance.instance_id,
+                                path: instance.path.clone(),
+                                created: instance.created,
+                            },
+                            dot_lore,
+                            config,
+                        });
+                    }
+                    VfsType::Swfs => {
+                        let mount_path =
+                            MountPath::new(Path::new(&instance.path))
+                                .forward::<MountManagerError>("Failed to make mount path")?;
+                        let mount = SwfsMountManager::mount_registered(
+                            instance.instance_id,
+                            mount_path.clone(),
+                        )
+                        .await?;
+                        swfs.push((mount_path, instance.instance_id, mount));
+                    }
+                    VfsType::None => {}
+                    // Only Linux serves FUSE instances.
+                    #[cfg(not(target_os = "linux"))]
+                    VfsType::Fuse => {}
                 }
             }
         }
-        Ok(mounted_paths)
+        Ok((swfs, pending_fuse))
     }
 
     pub async fn initialize() -> Result<Arc<Self>, MountManagerError> {
         let registry = SharedStoreRegistry::load()
             .await
             .forward::<MountManagerError>("Unable to load shared store registry")?;
-        let mounted_paths = Self::mounts_of_entries(registry.entries()).await?;
-        let lookup = DashMap::new();
-        for mount in mounted_paths.iter() {
-            mount
-                .mount
-                .wait_for_ready()
-                .await
-                .forward::<MountManagerError>("Failed waiting for mount to be ready")?;
-            lookup.insert(mount.mount.lookup_key(), mount.mount.clone());
-        }
-        Ok(Arc::new(MountManager {
-            mounted_paths,
-            swfs_id_lookup: lookup,
-            creating: tokio::sync::Mutex::new(()),
-        }))
+        let (swfs, pending_fuse) = Self::mounts_of_entries(registry.entries()).await?;
+        let manager = Arc::new(MountManager {
+            swfs: SwfsMountManager::with_mounts(swfs).await?,
+            #[cfg(target_os = "linux")]
+            fuse: FuseMountManager::new(lore_base::runtime::try_lore_context()),
+        });
+        #[cfg(target_os = "linux")]
+        manager.fuse.remount_instances(pending_fuse).await;
+        #[cfg(not(target_os = "linux"))]
+        let _ = pending_fuse;
+        Ok(manager)
+    }
+
+    /// The SWFS mounts.
+    pub fn swfs(&self) -> &SwfsMountManager {
+        &self.swfs
+    }
+
+    /// The FUSE mounts.
+    #[cfg(target_os = "linux")]
+    pub fn fuse(&self) -> &FuseMountManager {
+        &self.fuse
     }
 
     pub fn check_for_external_lore_dir(
         &self,
         repository_path: &Path,
     ) -> Result<Option<PathBuf>, MountManagerError> {
-        let mount_path = MountPath::new(repository_path)
-            .forward::<MountManagerError>("Failed to make mount path")?;
-        if let Some(mount) = self.mounted_paths.get(&mount_path) {
-            check_for_external_lore_dir(mount.instance_id).forward::<MountManagerError>(
-                "Unable to find external lore directory for expected instance ID",
-            )
-        } else {
-            Ok(None)
+        match self.mounted(repository_path)? {
+            Some((instance_id, _)) => check_for_external_lore_dir(instance_id)
+                .forward::<MountManagerError>(
+                    "Unable to find external lore directory for expected instance ID",
+                ),
+            None => Ok(None),
         }
     }
 
-    pub fn get_mount_filesystem_provider(
+    pub fn filesystem_provider(
         &self,
         repository_path: &Path,
-    ) -> Result<Arc<SwfsFilesystem>, MountManagerError> {
+    ) -> Result<Arc<dyn FilesystemProvider>, MountManagerError> {
         let mount_path = MountPath::new(repository_path)
             .forward::<MountManagerError>("Failed to make mount path")?;
-        let mount = self
-            .mounted_paths
-            .get(&mount_path)
-            .ok_or_else(|| InvalidPath {
+        #[cfg(target_os = "linux")]
+        if let Some(mount) = self.fuse.mounted_at(&mount_path) {
+            return Ok(Arc::new(FuseFilesystemProvider::new(mount)));
+        }
+        match self.swfs.interface_at(&mount_path) {
+            Some(interface) => Ok(Arc::new(SwfsFilesystem::new(
+                mount_path.as_ref(),
+                interface,
+            ))),
+            None => Err(InvalidPath {
                 path: mount_path.as_ref().display().to_string(),
-            })?;
-        Ok(Arc::new(SwfsFilesystem::new(
-            mount_path.as_ref(),
-            mount.mount.clone(),
-        )))
-    }
-
-    pub async fn create_mount(
-        &self,
-        repository_path: &Path,
-        repository_config: &RepositoryConfig,
-        repository_id: RepositoryId,
-        instance_id: InstanceId,
-    ) -> Result<PathBuf, MountManagerError> {
-        let mount_path = MountPath::new(repository_path)
-            .forward::<MountManagerError>("Failed to make mount path")?;
-        let _creating = self.creating.lock().await;
-        if self.mounted_paths.contains_key(&mount_path) {
-            return Err(MountManagerError::internal(format!(
-                "Mount already exists for path {}",
-                repository_path.display()
-            )));
+            }
+            .into()),
         }
-        // Create and clone refuse an instance past the limit before making any of it; this
-        // catches one that raced another to the last place.
-        self.refuse_past_mount_limit()
-            .map_err(|refused| MountManagerError::internal(refused.to_string()))?;
-        let dot_lore = external_dir_for_instance(instance_id)
-            .forward::<MountManagerError>("Unable to get external directory")?
-            .join(DOT_LORE);
-        let mount = SwfsInterface::mount(
-            MountResources::premount_instance_with_config(
-                repository_id,
-                instance_id,
-                mount_path.clone(),
-                repository_config,
-            )
-            .await
-            .forward::<MountManagerError>("Failed gathering premount resources")?,
-        )
-        .forward::<MountManagerError>("Failed to mount")?;
-        self.attach(mount_path, instance_id, mount).await?;
-        Ok(dot_lore)
-    }
-
-    pub fn get_interface_from_swfs_handle(&self, handle: SWFSHandle) -> Option<Arc<SwfsInterface>> {
-        self.swfs_id_lookup
-            .get(&WrappedHandle::new(handle))
-            .map(|entry| entry.value().clone())
-    }
-
-    /// Returns the number of currently mounted SWFS paths.
-    pub fn mount_count(&self) -> usize {
-        self.mounted_paths.len()
-    }
-
-    /// The mount `path` lies inside, below its root, if any.
-    ///
-    /// Compared as text, case folded and with separators made alike, rather than canonicalized:
-    /// canonicalizing a path inside a mount is what fails.
-    pub fn mount_containing(&self, path: &Path) -> Option<PathBuf> {
-        let normalize = |path: &Path| {
-            let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
-            text.strip_prefix(r"\\?\")
-                .map_or(text.clone(), str::to_owned)
-                .trim_end_matches('\\')
-                .to_owned()
-        };
-        let target = normalize(path);
-        self.mounted_paths.iter().find_map(|entry| {
-            let root = normalize(entry.key().as_ref());
-            target
-                .strip_prefix(&root)
-                .is_some_and(|rest| rest.starts_with('\\'))
-                .then(|| entry.key().as_ref().to_path_buf())
-        })
     }
 
     /// Check if a path is currently mounted.
     pub fn is_mounted(&self, path: &Path) -> Result<bool, MountManagerError> {
-        let mount_path =
-            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
-        Ok(self.mounted_paths.contains_key(&mount_path))
+        Ok(self.mounted(path)?.is_some())
     }
 
-    /// The instance mounted at `path`, if any.
-    pub fn mounted_instance(&self, path: &Path) -> Result<Option<InstanceId>, MountManagerError> {
+    /// The instance mounted at `path` and the VFS mounting it, if any.
+    pub fn mounted(&self, path: &Path) -> Result<Option<(InstanceId, VfsType)>, MountManagerError> {
         let mount_path =
             MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
+        #[cfg(target_os = "linux")]
+        if let Some(instance_id) = self.fuse.instance_at(&mount_path) {
+            return Ok(Some((instance_id, VfsType::Fuse)));
+        }
         Ok(self
-            .mounted_paths
-            .get(&mount_path)
-            .map(|mount| mount.instance_id))
+            .swfs
+            .instance_at(&mount_path)
+            .map(|instance_id| (instance_id, VfsType::Swfs)))
     }
 
-    /// Remove a mount, triggering cleanup/swfsClose when Arc drops.
-    /// Returns the `instance_id` if a mount existed at the path.
-    pub fn remove_mount(&self, path: &Path) -> Result<Option<InstanceId>, MountManagerError> {
-        let mount_path =
-            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
-        if let Some((_, mount)) = self.mounted_paths.remove(&mount_path) {
-            self.swfs_id_lookup.remove(&mount.mount.lookup_key());
-            // Closed explicitly: other holders of the interface would keep the path mounted.
-            mount.mount.close();
-            Ok(Some(mount.instance_id))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Mount `instance_id` at `mount_path`, record it, and wait for SWFS to be ready.
-    async fn mount_instance(
-        &self,
-        instance_id: InstanceId,
-        mount_path: MountPath,
-    ) -> Result<(), MountManagerError> {
-        let mount = SwfsInterface::mount(
-            MountResources::premount_instance(instance_id, mount_path.clone())
-                .await
-                .forward::<MountManagerError>("Failed gathering premount resources")?,
-        )
-        .forward::<MountManagerError>("Failed to mount")?;
-        self.attach(mount_path, instance_id, mount).await
-    }
-
-    /// Record a fresh `mount` of `instance_id` at `mount_path` and wait for SWFS to be ready. If
-    /// SWFS does not become ready the mount is closed and no longer recorded.
-    async fn attach(
-        &self,
-        mount_path: MountPath,
-        instance_id: InstanceId,
-        mount: Arc<SwfsInterface>,
-    ) -> Result<(), MountManagerError> {
-        let handle = mount.lookup_key();
-        // Recorded before SWFS is ready, as it can call back as soon as it is mounted.
-        self.swfs_id_lookup.insert(handle.clone(), mount.clone());
-        let displaced = self.mounted_paths.insert(
-            mount_path.clone(),
-            Mount {
-                instance_id,
-                mount: mount.clone(),
-            },
+    /// Every mount, by path, with the instance it serves and the VFS mounting it.
+    pub fn mounts(&self) -> Vec<(PathBuf, InstanceId, VfsType)> {
+        let swfs = self.swfs.mounts().into_iter();
+        let mounts = swfs.map(|(path, instance_id)| (path, instance_id, VfsType::Swfs));
+        #[cfg(target_os = "linux")]
+        let mounts = mounts.chain(
+            self.fuse
+                .mounts()
+                .into_iter()
+                .map(|(path, instance_id)| (path, instance_id, VfsType::Fuse)),
         );
-        if displaced.is_some() {
-            return Err(MountManagerError::internal(format!(
-                "Mount double created for path {}",
-                mount_path.as_ref().display()
-            )));
-        }
-        if let Err(error) = mount.wait_for_ready().await {
-            self.mounted_paths.remove(&mount_path);
-            self.swfs_id_lookup.remove(&handle);
-            mount.close();
-            return Err(MountManagerError::internal(format!(
-                "Failed waiting for mount to be ready: {error}"
-            )));
-        }
-        Ok(())
+        mounts.collect()
     }
+}
 
-    /// Move a mount from one path to another by unmounting it from `from_path` and mounting the
-    /// same instance at `to_path`. SWFS is given the mount path when a mount is created, so it
-    /// cannot be pointed at a new one in place.
-    ///
-    /// If the target cannot be mounted, the instance is mounted at `from_path` again.
-    pub async fn remount(&self, from_path: &Path, to_path: &Path) -> Result<(), MountManagerError> {
-        let from_mount_path = MountPath::new(from_path)
-            .forward::<MountManagerError>("Failed to make from mount path")?;
-        let to_mount_path =
-            MountPath::new(to_path).forward::<MountManagerError>("Failed to make to mount path")?;
-
-        // The mount is closed, not just dropped: callers still hold references to the interface,
-        // and the source path stays mounted until it is closed.
-        let Some(instance_id) = self.remove_mount(from_path)? else {
-            return Err(MountManagerError::internal(format!(
-                "Mount not found at path {}",
-                from_path.display()
-            )));
-        };
-
-        let Err(error) = self.mount_instance(instance_id, to_mount_path).await else {
-            return Ok(());
-        };
-        self.mount_instance(instance_id, from_mount_path)
-            .await
-            .map_err(|restore_error| {
-                MountManagerError::internal(format!(
-                    "Failed to mount at {}: {error}; restoring the mount at {} also failed: {restore_error}",
-                    to_path.display(),
-                    from_path.display()
-                ))
-            })?;
-        Err(error)
-    }
-
-    /// Unmounts the mounts the service has to release before it stops, as the service does when
-    /// it stops, detaching a busy one lazily with `force`. SWFS mounts are the only mounts, and are
-    /// closed by [`close_all`](Self::close_all) once the service has stopped taking commands rather
-    /// than here, where a command arriving after this could still use one, so this unmounts
-    /// nothing.
-    #[allow(clippy::unused_async)]
-    pub async fn unmount_all(&self, _force: bool) -> Result<(), MountManagerError> {
-        Ok(())
-    }
-
-    /// Closes every SWFS mount, for the service to call as it exits, however it was stopped.
-    ///
-    /// The mount manager is a static, which is never dropped, so a mount not closed here outlives
-    /// the process only in the driver, which does not tear down a mount whose client went away
-    /// without closing it. On a blocking thread, because closing a mount waits for its uses in
-    /// progress (see [`SwfsInterface::close`]) and then on SWFS, which allows a client still
-    /// writing through the mount 10 seconds.
-    pub async fn close_all(&self) -> Result<(), MountManagerError> {
-        let mounts: Vec<Arc<SwfsInterface>> = self
-            .mounted_paths
-            .iter()
-            .map(|mount| Arc::clone(&mount.mount))
-            .collect();
-        lore_base::lore_spawn_blocking!(move || {
-            for mount in mounts {
-                mount.close();
-            }
+#[cfg(feature = "test-util")]
+impl MountManager {
+    pub fn for_test() -> Arc<Self> {
+        Arc::new(MountManager {
+            swfs: SwfsMountManager::new(),
+            #[cfg(target_os = "linux")]
+            fuse: FuseMountManager::new(None),
         })
-        .await
-        .map_err(|error| MountManagerError::internal(format!("Closing SWFS mounts: {error}")))
     }
 }

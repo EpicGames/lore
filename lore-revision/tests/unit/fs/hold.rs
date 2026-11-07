@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::event::LoreEvent;
@@ -15,12 +16,14 @@ use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::FsError;
 use lore_revision::fs::filesystem_provider::HoldOptions;
 use lore_revision::fs::hold;
+use lore_revision::fs::hold::HoldHost;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
 use lore_revision::node::NodeExtFlags;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::RepositoryContext;
@@ -30,6 +33,7 @@ use lore_revision::state;
 use lore_revision::state::Ext;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
+use lore_revision::util::path::RelativePath;
 use parking_lot::Mutex;
 
 use crate::fs::filesystem_provider::test_store_create;
@@ -183,15 +187,76 @@ async fn add_locally(repository: &Arc<RepositoryContext>, held: &State, name: &s
         .expect("add the local node");
 }
 
-/// What [`hold::check`] answers for `changes` against `held` under `options`.
+/// A host whose local files hold the content of the address each path maps to, and no content
+/// any node addresses at a path it does not name. A check changes nothing through it.
+#[derive(Default)]
+struct Contents(BTreeMap<String, Address>);
+
+impl HoldHost for Contents {
+    fn remove_tree(&self, path: &RelativePath) {
+        unreachable!("a check removes no tree, here {path}");
+    }
+
+    fn remove_file(&self, path: &RelativePath) {
+        unreachable!("a check removes no file, here {path}");
+    }
+
+    async fn overwrite_local(
+        &self,
+        path: &RelativePath,
+        _node: NodeID,
+        _place: (NodeID, u64),
+        _wanted: &Node,
+    ) -> Result<bool, FsError> {
+        unreachable!("a check overwrites no file, here {path}");
+    }
+
+    async fn holds_content(
+        &self,
+        path: &RelativePath,
+        address: Address,
+        _size: u64,
+        _established: &lore_storage::ContentHashes,
+    ) -> Result<bool, FsError> {
+        Ok(self.0.get(path.as_str()) == Some(&address))
+    }
+}
+
+/// What [`hold::check`] answers for `changes` against `held` under `options`, with no local file
+/// holding the content of a node.
 async fn check(
     repository: &Arc<RepositoryContext>,
     held: &Arc<State>,
     changes: &[NodeChange],
     options: HoldOptions,
-) -> Result<(), FsError> {
+) -> Result<hold::Matching, FsError> {
+    check_over(&Contents::default(), repository, held, changes, options).await
+}
+
+/// [`check`] with `host` answering what the local files hold.
+async fn check_over(
+    host: &Contents,
+    repository: &Arc<RepositoryContext>,
+    held: &Arc<State>,
+    changes: &[NodeChange],
+    options: HoldOptions,
+) -> Result<hold::Matching, FsError> {
     let mut paths = hold::Resolver::new((repository, held));
-    hold::check(&mut paths, changes, options).await
+    hold::check((host, &mut paths), changes, options).await
+}
+
+/// The address of the node at `path` in `state`.
+async fn address_of(repository: &Arc<RepositoryContext>, state: &State, path: &str) -> Address {
+    let node = state
+        .find_node_link(repository.clone(), path)
+        .await
+        .expect("the path's node")
+        .node;
+    state
+        .node(repository.clone(), node)
+        .await
+        .expect("the node")
+        .address
 }
 
 fn paths_of(changes: &[NodeChange]) -> Vec<(FileAction, String)> {
@@ -212,7 +277,8 @@ async fn a_held_state_at_the_target_takes_no_changes() {
             &BTreeMap::new(),
         )
         .await
-        .expect("the changes");
+        .expect("the changes")
+        .0;
         assert!(changes.is_empty(), "{:?}", paths_of(&changes));
     })
     .await;
@@ -233,7 +299,8 @@ async fn the_changes_are_the_diff_from_the_held_revision() {
             &BTreeMap::new(),
         )
         .await
-        .expect("the changes");
+        .expect("the changes")
+        .0;
         assert_eq!(paths_of(&changes), paths_of(&r.diff(&r.second).await));
         assert!(!changes.is_empty());
     })
@@ -251,7 +318,8 @@ async fn an_unsettled_path_is_re_placed() {
             let unsettled = BTreeMap::from([("a.txt".to_string(), adds_back)]);
             let changes = hold::changes((&repository, &held), (&repository, &r.second), &unsettled)
                 .await
-                .expect("the changes");
+                .expect("the changes")
+                .0;
             assert_eq!(paths_of(&changes), vec![(action, "a.txt".to_string())]);
         }
     })
@@ -336,7 +404,8 @@ async fn a_move_out_of_the_view_stays_in_view() {
             &BTreeMap::new(),
         )
         .await
-        .expect("the changes");
+        .expect("the changes")
+        .0;
         let is_the_move = |change: &NodeChange| {
             change
                 .move_source()
@@ -380,6 +449,76 @@ async fn a_local_edit_the_target_changes_refuses_the_hold() {
     .await;
 }
 
+/// A local edit of a file holding what the target brings there, or what it replaces, loses
+/// nothing to the hold, so the check passes and answers the file as matching; one holding
+/// neither refuses the hold.
+#[tokio::test]
+async fn a_local_edit_holding_either_side_of_the_change_passes_the_check() {
+    with_revisions(async |r: Revisions| {
+        let repository = r.repository();
+        let held = r.held(&r.first).await;
+        mark_locally(&repository, &held, "a.txt", NodeFlags::DirtyModify).await;
+        let changes = r.diff(&r.second).await;
+        for state in [&r.first, &r.second] {
+            let address = address_of(&repository, state, "a.txt").await;
+            let host = Contents(BTreeMap::from([("a.txt".to_string(), address)]));
+            let matching = check_over(&host, &repository, &held, &changes, HoldOptions::default())
+                .await
+                .expect("the edit holds a side of the change");
+            let size = state
+                .node(
+                    repository.clone(),
+                    state
+                        .find_node_link(repository.clone(), "a.txt")
+                        .await
+                        .expect("a.txt")
+                        .node,
+                )
+                .await
+                .expect("a.txt's node")
+                .size;
+            assert_eq!(
+                matching,
+                hold::Matching::from([("a.txt".to_string(), (address, size))])
+            );
+        }
+        let elsewhere = address_of(&repository, &r.first, "untouched.txt").await;
+        let host = Contents(BTreeMap::from([("a.txt".to_string(), elsewhere)]));
+        let refused = check_over(&host, &repository, &held, &changes, HoldOptions::default()).await;
+        assert!(
+            matches!(refused, Err(FsError::LocalModifications(_))),
+            "{refused:?}"
+        );
+    })
+    .await;
+}
+
+/// A file added locally where the target adds one is refused even holding the target's content:
+/// a hold keeps a local addition, as an ordinary clone does, so it is never compared.
+#[tokio::test]
+async fn a_local_addition_holding_what_the_target_adds_refuses_the_hold() {
+    with_revisions(async |r: Revisions| {
+        let repository = r.repository();
+        let held = r.held(&r.first).await;
+        add_locally(&repository, &held, "new.txt", true).await;
+        let address = address_of(&repository, &r.second, "new.txt").await;
+        let host = Contents(BTreeMap::from([("new.txt".to_string(), address)]));
+        let refused = check_over(
+            &host,
+            &repository,
+            &held,
+            &r.diff(&r.second).await,
+            HoldOptions::default(),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(FsError::LocalModifications(_))),
+            "{refused:?}"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn a_local_edit_the_target_leaves_passes_the_check() {
     with_revisions(async |r: Revisions| {
@@ -414,6 +553,34 @@ async fn a_local_edit_in_a_directory_the_target_deletes_refuses_the_hold() {
         assert!(
             matches!(refused, Err(FsError::LocalModifications(_))),
             "{refused:?}"
+        );
+    })
+    .await;
+}
+
+/// A local edit in a directory the target deletes holding what the revision holds there, as a
+/// file renamed only in case does, loses nothing to the deletion: the check passes and answers
+/// the file as matching, so the apply removes it with its directory, as an ordinary clone does.
+#[tokio::test]
+async fn a_local_edit_in_a_directory_the_target_deletes_holding_the_revision_passes_the_check() {
+    with_revisions(async |r: Revisions| {
+        let repository = r.repository();
+        let held = r.held(&r.first).await;
+        mark_locally(&repository, &held, "dir/b.txt", NodeFlags::DirtyModify).await;
+        let address = address_of(&repository, &r.first, "dir/b.txt").await;
+        let host = Contents(BTreeMap::from([("dir/b.txt".to_string(), address)]));
+        let matching = check_over(
+            &host,
+            &repository,
+            &held,
+            &r.diff(&r.second).await,
+            HoldOptions::default(),
+        )
+        .await
+        .expect("the edit holds what the revision holds");
+        assert_eq!(
+            matching,
+            hold::Matching::from([("dir/b.txt".to_string(), (address, 1))])
         );
     })
     .await;
@@ -656,7 +823,8 @@ async fn a_local_edit_in_a_directory_the_target_moves_refuses_the_hold() {
             &BTreeMap::new(),
         )
         .await
-        .expect("the changes");
+        .expect("the changes")
+        .0;
         assert!(
             changes.iter().any(|change| change
                 .move_source()
@@ -702,9 +870,13 @@ async fn the_check_reads_a_directory_once_however_many_of_its_paths_it_checks() 
         );
         let reads = async |changes: &[NodeChange]| {
             let mut paths = hold::Resolver::new((&repository, &held));
-            hold::check(&mut paths, changes, HoldOptions::default())
-                .await
-                .expect("nothing local is changed");
+            hold::check(
+                (&Contents::default(), &mut paths),
+                changes,
+                HoldOptions::default(),
+            )
+            .await
+            .expect("nothing local is changed");
             paths.reads()
         };
         assert_eq!(
@@ -716,27 +888,32 @@ async fn the_check_reads_a_directory_once_however_many_of_its_paths_it_checks() 
     .await;
 }
 
-/// The report sends an event for each change, carrying the target's size, and the totals.
+/// The report sends the totals once discovered, with no work done, then an event for each change,
+/// carrying the target's size, then the totals with the work done.
 #[tokio::test]
-async fn the_report_sends_each_change_and_the_totals() {
+async fn the_report_sends_the_totals_then_each_change_then_the_work_done() {
     with_revisions(async |r: Revisions| {
         let changes = r.diff(&r.second).await;
         let files = Arc::new(Mutex::new(Vec::new()));
-        let totals = Arc::new(Mutex::new(None));
+        let progress = Arc::new(Mutex::new(Vec::new()));
         let execution = Arc::new(ExecutionContext::new_client_with_user_id(
             LoreGlobalArgs::default(),
             EventDispatcher::new(Some(Box::new({
-                let (files, totals) = (files.clone(), totals.clone());
+                let (files, progress) = (files.clone(), progress.clone());
                 move |event: &LoreEvent| match event {
                     LoreEvent::RevisionSyncFile(file) => {
                         files.lock().push((file.path.to_string(), file.size));
                     }
-                    LoreEvent::RevisionSyncProgress(progress) => {
-                        *totals.lock() = Some((
-                            progress.file_update,
-                            progress.bytes_update,
-                            progress.file_delete,
-                            progress.discovery_complete,
+                    LoreEvent::RevisionSyncProgress(sent) => {
+                        progress.lock().push((
+                            files.lock().len(),
+                            (sent.file_update, sent.bytes_update, sent.file_delete),
+                            (
+                                sent.file_update_total,
+                                sent.bytes_update_total,
+                                sent.file_delete_total,
+                            ),
+                            sent.discovery_complete,
                         ));
                     }
                     _ => {}
@@ -758,7 +935,14 @@ async fn the_report_sends_each_change_and_the_totals() {
             .iter()
             .filter(|change| change.action == FileAction::Delete)
             .count();
-        assert_eq!(*totals.lock(), Some((2, 13, deleted, 1)));
+        let totals = (2, 13, deleted);
+        assert_eq!(
+            *progress.lock(),
+            [
+                (0, (0, 0, 0), totals, 1),
+                (changes.len(), totals, totals, 1),
+            ]
+        );
     })
     .await;
 }

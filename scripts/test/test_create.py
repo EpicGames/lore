@@ -59,6 +59,7 @@ class TestCreate:
             "Lore repo does not exist after second initialization attempt"
         )
 
+    @pytest.mark.own_vfs("re-creates the repository in place with a plain command, which makes an ordinary instance over the virtual clone's mount")
     def test_initialize_twice_forced(self, new_lore_repo):
         """
         Attempting to initialize a repo repository a second time with a new name using the force flag should succeed.

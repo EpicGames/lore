@@ -16,6 +16,7 @@ from lore import Lore
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.own_vfs("reads a plain status that sees no unmarked local edit, where a status on a virtual clone always scans, its provider's diff being exact")
 @pytest.mark.smoke
 def test_merge(new_lore_repo):
     repo: Lore = new_lore_repo()

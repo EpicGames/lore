@@ -218,7 +218,7 @@ typedef enum lore_file_audit_outcome_t {
 
 // Phase of an instance delete operation.
 typedef enum lore_repository_instance_delete_phase_t {
-  // Unmounting the SWFS instance
+  // Unmounting the instance, an SWFS instance or a virtual clone
   LORE_REPOSITORY_INSTANCE_DELETE_PHASE_UNMOUNTING = 0,
   // Removing instance keys from mutable store
   LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DEREGISTERING = 1,
@@ -250,6 +250,8 @@ typedef enum lore_vfs_type_t {
   LORE_VFS_TYPE_DEFAULT = 1,
   // Use SWFS as a VFS
   LORE_VFS_TYPE_SWFS = 2,
+  // Use a Linux FUSE mount served by the Lore service as a VFS
+  LORE_VFS_TYPE_FUSE = 3,
 } lore_vfs_type_t;
 
 // Whether a repository being created or cloned should be backed by a shared store.
@@ -4982,7 +4984,9 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t layer;
   // (Optional) Layer metadata key to link revisions with
   struct lore_string_t layer_metadata;
-  // (Optional) File containing list of files to prefetch
+  // (Optional) Access recording whose paths a virtual clone warms in the background: one
+  // repository-relative path per line, a directory ending with `/`, `/` for the root. A
+  // relative file path resolves against the caller's working directory.
   struct lore_string_t prefetch;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
   // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
@@ -9680,8 +9684,8 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 // A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
 // prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
 // its files caches every file metadata block of the cloned revision, which staging and committing
-// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-// and reads them from the remote when a call needs them.
+// write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes
+// no files and reads them from the remote when a call needs them.
 //
 // # Events
 //

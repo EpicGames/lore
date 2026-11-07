@@ -3,6 +3,7 @@
 mod aws_store_test;
 mod common;
 mod dynamodb_test;
+mod fuse_remote_test;
 mod hashicorp;
 mod locks_test;
 mod presign_test;

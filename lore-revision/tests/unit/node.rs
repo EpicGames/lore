@@ -224,6 +224,7 @@ fn log_across_the_wrap(appends: u32) -> std::sync::Arc<NodeBlock> {
         for node in 0..appends {
             log.append(ChainPatch {
                 name_hash: u64::from(node),
+                block: std::sync::Weak::new(),
                 node,
                 kind: PatchKind::Attached,
             });
@@ -274,6 +275,7 @@ fn fill(block: &NodeBlock, count: usize) {
         let sequence = log.seq();
         log.append(ChainPatch {
             name_hash: u64::from(sequence),
+            block: std::sync::Weak::new(),
             node: sequence,
             kind: if sequence.is_multiple_of(3) {
                 PatchKind::Detached
@@ -313,6 +315,25 @@ fn assert_every_patch_at_its_sequence(block: &NodeBlock, when: &str) {
     }
 }
 
+/// A change logged without its node's block takes a sequence and leaves the log covering no
+/// earlier position, so every listing built before it finds the log stale; a detach is counted.
+#[test]
+fn a_skip_takes_a_sequence_and_uncovers_every_earlier_position() {
+    let block = NodeBlock::new_zeroed();
+    block.watch_chain(0, None);
+    fill(&block, 3);
+    let mut writer = block.write_for_tests();
+    let log = writer.chain_log_mut(0).expect("an installed log");
+    let (seq, detaches) = (log.seq(), log.detaches());
+    assert!(log.covers(seq - 1), "the last patch is in the window");
+    log.skip(PatchKind::Detached);
+    assert_eq!(log.seq(), seq + 1, "the skip takes a sequence");
+    assert_eq!(log.detaches(), detaches + 1, "a skipped detach is counted");
+    assert!(log.holds_no_patch(), "the window is empty");
+    assert!(log.covers(seq + 1), "a reader at the head is covered");
+    assert!(!log.covers(seq), "a reader before the skip is not");
+}
+
 /// A watch of a full ring grows it fourfold, keeping each patch at its sequence and the
 /// counts, until it holds [`CHAIN_LOG_MAX`], where it stays.
 #[test]
@@ -324,7 +345,7 @@ fn a_full_log_grows_fourfold_at_each_watch_up_to_1024() {
         assert_eq!(held, capacity, "before the watch at {capacity}");
         assert_eq!(
             block.chain_log_bytes(),
-            16 + 32 + 16 * capacity,
+            16 + 32 + 24 * capacity,
             "the slot, the header and the ring at {capacity}"
         );
         fill(&block, capacity + 3);

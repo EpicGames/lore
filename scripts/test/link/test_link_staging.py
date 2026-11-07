@@ -22,6 +22,10 @@ from test_utils import (
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_staging(new_lore_repo):

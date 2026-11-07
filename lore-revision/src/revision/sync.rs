@@ -908,7 +908,7 @@ pub(crate) async fn sync(
 
     let state_synced = state_target.clone();
     with_operation::<_, SyncError, _>(repository_current.file_system(), async |operation| {
-        Box::pin(realize_state(
+        let realized = Box::pin(realize_state(
             repository_current.clone(),
             repository.clone(),
             operation.clone(),
@@ -916,12 +916,15 @@ pub(crate) async fn sync(
             state_target,
             options.clone(),
         ))
-        .await?;
+        .await;
 
-        // Make sure caching has finished
+        // The caching task and the fetches it starts hold the repository, so the sync waits for
+        // it whether or not the state was realized. Aborting it would end the task but not its
+        // fetches, which a dropped join set aborts without waiting for.
         if let Some(task) = cache_task {
             let _ = task.await;
         }
+        realized?;
 
         // Safe to handle error when cache task has finished
         let modified_times = operation.take_modified_times();

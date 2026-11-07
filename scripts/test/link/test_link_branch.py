@@ -17,6 +17,10 @@ from lore_parsers import parse_jsonl, parse_status_json
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_branching_and_pinning(new_lore_repo):

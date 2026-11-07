@@ -1106,9 +1106,12 @@ pub enum PatchKind {
 }
 
 /// One change to a directory's child chain: `node`, under `name_hash`, attached or detached.
+/// `block` is the node's block, weak so a patch pins nothing and forms no cycle: a VFS listing
+/// reads an attached node's record from it with no State lock.
 #[derive(Clone, Debug)]
 pub struct ChainPatch {
     pub name_hash: u64,
+    pub block: std::sync::Weak<NodeBlock>,
     pub node: NodeID,
     pub kind: PatchKind,
 }
@@ -1134,7 +1137,7 @@ struct ChainLogSlot {
     log: Box<ChainLog>,
 }
 
-const _: () = assert!(std::mem::size_of::<Option<ChainPatch>>() == 16);
+const _: () = assert!(std::mem::size_of::<Option<ChainPatch>>() == 24);
 const _: () = assert!(std::mem::size_of::<ChainLog>() == 32);
 const _: () = assert!(std::mem::size_of::<ChainLogSlot>() == 16);
 
@@ -1203,6 +1206,17 @@ impl ChainLog {
         if self.seq.wrapping_sub(self.floor) as usize > len {
             self.floor = self.floor.wrapping_add(1);
         }
+    }
+
+    /// Takes sequence `seq` for a change it holds no patch for and moves the floor to the head,
+    /// so every earlier position is outside the window and its readers answer stale.
+    #[lore_macro::test_pub]
+    pub(crate) fn skip(&mut self, kind: PatchKind) {
+        if kind == PatchKind::Detached {
+            self.detaches = self.detaches.wrapping_add(1);
+        }
+        self.seq = self.seq.wrapping_add(1);
+        self.floor = self.seq;
     }
 
     /// Counts a rename in place that kept the name hash, which no patch tells from no change.
@@ -1311,6 +1325,40 @@ impl NodeBlockRuntimeData {
         self.chain_logs
             .binary_search_by_key(&(node_index as u16), |slot| slot.index)
             .ok()
+    }
+}
+
+/// A process-wide count of block reads that found a writer holding or taking the block, while
+/// enabled, so a test can show whether readers wait on writers. Built only for tests: a build
+/// without `test-util`, or a bench build (`bench`), counts nothing and pays nothing.
+#[cfg(feature = "test-util")]
+pub mod read_contention {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    static COUNTING: AtomicBool = AtomicBool::new(false);
+    static CONTENDED: AtomicU64 = AtomicU64::new(0);
+
+    /// Enables or disables counting process-wide. Disabled by default.
+    pub fn set_contended_read_counting(enabled: bool) {
+        COUNTING.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Contended block reads counted on every thread.
+    pub fn contended_reads() -> u64 {
+        CONTENDED.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(feature = "bench"))]
+    #[inline]
+    pub(crate) fn enabled() -> bool {
+        COUNTING.load(Ordering::Relaxed)
+    }
+
+    #[cfg(not(feature = "bench"))]
+    pub(crate) fn record() {
+        CONTENDED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1584,6 +1632,9 @@ pub struct NodeBlock {
     /// dropped under the block's write lock; in memory only, so a reload drops every bit, which
     /// reads as a change and keeps the directory dirty.
     clear_pending: [AtomicU64; BLOCK_NODE_COUNT / 64],
+    /// How many cached directory listings hold this block, in the high half, and the bytes the
+    /// first of them charged, in the low half; in memory only.
+    listing_pins: AtomicU64,
     /// Whether the State holds this block registered for its next save
     /// ([`Self::claim_registration`]): set by the registration that pushes it, cleared by the
     /// save's release under the block's read lock where the block reads clean (C14).
@@ -2198,6 +2249,7 @@ impl NodeBlock {
                 name_deserialized: _,
                 chain_changes: _,
                 clear_pending: _,
+                listing_pins: _,
                 registered: _,
                 #[cfg(feature = "state-hooks")]
                     hooks: _,
@@ -2246,6 +2298,75 @@ impl NodeBlock {
             self.registered.store(false, Ordering::Release);
         }
         dirty
+    }
+
+    /// Counts one more cached listing holding this block; for the first, the bytes it charges,
+    /// [`Self::memory_bytes`] as the block stands now, which the last unpin gives back.
+    pub fn pin_for_listing(&self) -> Option<usize> {
+        let mut charge = None;
+        let mut pins = self.listing_pins.load(Ordering::Acquire);
+        loop {
+            let next = if pins >> 32 == 0 {
+                let bytes = *charge
+                    .get_or_insert_with(|| self.memory_bytes().min(u32::MAX as usize) as u64);
+                (1 << 32) | bytes
+            } else {
+                pins + (1 << 32)
+            };
+            match self.listing_pins.compare_exchange_weak(
+                pins,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return (pins >> 32 == 0).then_some((next & u64::from(u32::MAX)) as usize),
+                Err(actual) => pins = actual,
+            }
+        }
+    }
+
+    /// Counts one cached listing fewer holding this block; for the last, the bytes the first
+    /// charged.
+    pub fn unpin_for_listing(&self) -> Option<usize> {
+        let mut pins = self.listing_pins.load(Ordering::Acquire);
+        loop {
+            debug_assert!(pins >> 32 != 0, "an unpin without a pin");
+            let last = pins >> 32 == 1;
+            let next = if last { 0 } else { pins - (1 << 32) };
+            match self.listing_pins.compare_exchange_weak(
+                pins,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return last.then_some((pins & u64::from(u32::MAX)) as usize),
+                Err(actual) => pins = actual,
+            }
+        }
+    }
+
+    /// The heap bytes this block's chain logs hold: a slot each in the slot array, each log's
+    /// header and its ring of patches.
+    pub fn chain_log_bytes(&self) -> usize {
+        #[cfg(feature = "state-hooks")]
+        let _order = self.lock_order();
+        let runtime = self.read_data();
+        runtime
+            .chain_logs
+            .iter()
+            .map(|slot| {
+                std::mem::size_of::<ChainLogSlot>()
+                    + std::mem::size_of::<ChainLog>()
+                    + slot.log.capacity() * std::mem::size_of::<Option<ChainPatch>>()
+            })
+            .sum()
+    }
+
+    /// The bytes this block holds in memory: its nodes and its name table.
+    pub fn memory_bytes(&self) -> usize {
+        #[cfg(feature = "state-hooks")]
+        let _order = self.lock_order();
+        std::mem::size_of::<NodeBlockData>() + self.read_data().name.capacity()
     }
 
     /// Drop the bits a store written before [`NODE_BLOCK_RUNTIME_FLAGS`] existed
@@ -2333,13 +2454,18 @@ impl NodeBlock {
         }
     }
 
-    /// The block's read guard. Under `state-hooks`, always tried first, so a lock found held is
-    /// told to the scheduler before the task blocks on it, and touched once taken.
+    /// The block's read guard, counted under `test-util` where it found a writer while
+    /// `read_contention` is enabled. Under `state-hooks`, always tried first, so a lock found
+    /// held is told to the scheduler before the task blocks on it, and touched once taken.
     #[inline]
     fn read_guard(&self) -> RwLockReadGuard<'_, NodeBlockRuntimeData> {
         #[cfg(feature = "state-hooks")]
         {
             let guard = self.data.try_read().unwrap_or_else(|| {
+                #[cfg(all(feature = "test-util", not(feature = "bench")))]
+                if read_contention::enabled() {
+                    read_contention::record();
+                }
                 let contention = self.hooks.contended(crate::state::node::hooks::Mode::Read);
                 let guard = self.data.read();
                 self.hooks.taken(contention);
@@ -2349,7 +2475,16 @@ impl NodeBlock {
             guard
         }
         #[cfg(not(feature = "state-hooks"))]
-        self.data.read()
+        {
+            #[cfg(all(feature = "test-util", not(feature = "bench")))]
+            if read_contention::enabled() {
+                if let Some(guard) = self.data.try_read() {
+                    return guard;
+                }
+                read_contention::record();
+            }
+            self.data.read()
+        }
     }
 
     /// The block's write guard; under `state-hooks`, tried first and touched once taken, as
@@ -4076,30 +4211,6 @@ mod test_util {
         /// The block's write access, for tests that write node blocks directly.
         pub fn write_for_tests(&self) -> NodeBlockWriter<'_> {
             self.write()
-        }
-
-        /// The heap bytes this block's chain logs hold: a slot each in the slot array, each log's
-        /// header and its ring of patches.
-        pub fn chain_log_bytes(&self) -> usize {
-            #[cfg(feature = "state-hooks")]
-            let _order = self.lock_order();
-            let runtime = self.read_data();
-            runtime
-                .chain_logs
-                .iter()
-                .map(|slot| {
-                    std::mem::size_of::<ChainLogSlot>()
-                        + std::mem::size_of::<ChainLog>()
-                        + slot.log.capacity() * std::mem::size_of::<Option<ChainPatch>>()
-                })
-                .sum()
-        }
-
-        /// The bytes this block holds in memory: its nodes and its name table.
-        pub fn memory_bytes(&self) -> usize {
-            #[cfg(feature = "state-hooks")]
-            let _order = self.lock_order();
-            std::mem::size_of::<NodeBlockData>() + self.read_data().name.capacity()
         }
 
         /// The name of the node at `node_index`, copied out, as the read path checks it.

@@ -15,7 +15,6 @@ use lore_revision::event::LoreServiceStatusEventData;
 use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreGlobalArgs;
-use lore_revision::lore::execution_context;
 use lore_revision::lore_info;
 use lore_revision::lore_warn;
 use lore_revision::service_state::ServiceStateImpl;
@@ -145,9 +144,12 @@ async fn stop_local(
             // service is asked to exit. `force` is read from the execution context: read from
             // `globals` before they move, it would keep a second copy of them in the future of
             // `stop_local`.
+            // SWFS mounts are closed as the service exits, once it takes no more commands.
+            #[cfg(target_os = "linux")]
             if let Some(manager) = MountManagerState::mount_manager() {
                 manager
-                    .unmount_all(execution_context().globals().force())
+                    .fuse()
+                    .unmount_all(lore_revision::lore::execution_context().globals().force())
                     .await
                     .forward_any::<ServiceStopError>("Unmounting before the service stops")?;
             }
@@ -468,7 +470,8 @@ fn emit_status_from_service() {
         .unwrap_or_default();
 
     // Get mount count from MountManagerState.
-    let swfs_mount_count = MountManagerState::mount_manager().map_or(0, |m| m.mount_count() as u32);
+    let swfs_mount_count =
+        MountManagerState::mount_manager().map_or(0, |m| m.swfs().mount_count() as u32);
 
     // Emit ServiceStatus event.
     LoreEvent::ServiceStatus(LoreServiceStatusEventData {

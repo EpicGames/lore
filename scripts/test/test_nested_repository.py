@@ -18,6 +18,10 @@ from error_types import NestedRepositoryError
 from lore import Lore
 from lore_parsers import parse_status_json
 
+pytestmark = pytest.mark.own_vfs(
+    "nests a repository in the working tree, which a virtual clone serves as its own"
+)
+
 logger = logging.getLogger(__name__)
 
 

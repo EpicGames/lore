@@ -5,6 +5,10 @@ from link_helpers import make_parent_with_link, make_repo
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 def _remote_branches(repo: Lore) -> list[str]:
     return sorted(repo.run(["branch", "list"], remote=True, no_pager=True).splitlines())

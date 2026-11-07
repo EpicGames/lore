@@ -1237,11 +1237,11 @@ async fn diff_read_file(
     let state = match side {
         DiffSide::Revision(state) => state,
         DiffSide::Working(operation) => {
-            let content = operation
+            let source = operation
                 .content_source(relative_path)
                 .await
-                .forward::<DiffError>("naming the content of the file to diff")?
-                .read_all()
+                .forward::<DiffError>("naming the content of the file to diff")?;
+            let content = immutable::read_source(&repository, &source)
                 .await
                 .forward_any::<DiffError>("Failed reading file for diff")?;
             return Ok(make_diff_content(&content));
@@ -1324,11 +1324,11 @@ pub(crate) async fn read_working_content(
             return Ok(None);
         }
 
-        let content = operation
+        let source = operation
             .content_source(relative_path)
             .await
-            .forward::<DiffError>("naming the content of the working tree file")?
-            .read_all()
+            .forward::<DiffError>("naming the content of the working tree file")?;
+        let content = immutable::read_source(&repository, &source)
             .await
             .forward_any::<DiffError>("Failed reading file from the working tree")?;
 

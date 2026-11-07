@@ -1631,6 +1631,39 @@ mod tests {
         })
         .await;
     }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_provider_marks_every_state_it_serves() {
+        with_state(|repository, state| async move {
+            assert!(
+                !state.is_served(),
+                "no State is served before a provider takes it"
+            );
+            let fs = lore_revision::fs::fuse::filesystem::FuseFilesystem::new(
+                repository.clone(),
+                state.clone(),
+                lore_revision::fs::fuse::attr::AttrContext {
+                    uid: 1000,
+                    gid: 1000,
+                    blksize: 1 << 17,
+                    base_time: 1_700_000_000_000,
+                },
+            )
+            .await
+            .expect("provider construction");
+            assert!(fs.state().is_served(), "the State the provider serves");
+            assert!(
+                state.is_served(),
+                "the zero revision is served as the caller's own State"
+            );
+
+            let next = State::new();
+            fs.publish(next.clone(), repository.clone(), None, None);
+            assert!(next.is_served(), "a published State is served");
+        })
+        .await;
+    }
 }
 
 mod single_file_compare_result_tests {

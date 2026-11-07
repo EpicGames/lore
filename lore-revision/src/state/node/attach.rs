@@ -55,10 +55,11 @@ pub enum AttachOutcome {
 }
 
 /// A name no child of a directory held when the directory's chain log stood at `at`, read from
-/// `block`, the directory's block, as a provider's listing looks a name up. An attach or a
-/// reattach handed one checks the patches from `at` on under its write locks in place of finding
-/// the name by walking the chain. It records the State's reclaim count: once a sweep freed a slot,
-/// a patch since `at` may name a node freed and taken again, so the proof speaks of nothing (C15).
+/// `block`, the directory's block, as the VFS provider's listing looks a name up
+/// (`fs::fuse::listing::Listing::lookup_to_attach`). An attach or a reattach handed one
+/// checks the patches from `at` on under its write locks in place of finding the name by walking
+/// the chain. It records the State's reclaim count: once a sweep freed a slot, a patch since `at`
+/// may name a node freed and taken again, so the proof speaks of nothing (C15).
 #[derive(Clone)]
 pub struct Absent {
     at: u32,
@@ -69,6 +70,26 @@ pub struct Absent {
 }
 
 impl Absent {
+    /// The caller has shown that no child of `dir` held `name_hash` with the log of `block`,
+    /// `dir`'s block in `state`, at `at`, as `state` stands now: the VFS provider's listing, or a
+    /// test or the stress suite standing in for one.
+    #[lore_macro::test_pub]
+    pub(crate) fn new(
+        state: &State,
+        at: u32,
+        block: Arc<NodeBlock>,
+        dir: NodeID,
+        name_hash: u64,
+    ) -> Self {
+        Self {
+            at,
+            block,
+            dir,
+            name_hash,
+            reclaims: state.reclaims(),
+        }
+    }
+
     /// The log position the absence holds at.
     #[cfg(any(feature = "test-util", feature = "state-hooks"))]
     pub fn at(&self) -> u32 {
@@ -1401,33 +1422,5 @@ fn refused_parent(flags: u16) -> StateError {
             reason: "the parent is staged for deletion, so a child added under it would go with it"
                 .into(),
         })
-    }
-}
-
-/// The accessors, wrappers and constructors a `test-util` build adds to this module's types, for
-/// tests.
-#[cfg(feature = "test-util")]
-mod test_util {
-    use super::*;
-
-    impl Absent {
-        /// The caller has shown that no child of `dir` held `name_hash` with the log of `block`,
-        /// `dir`'s block in `state`, at `at`, as `state` stands now. Only tests and the stress
-        /// suite make one, standing in for a provider's listing.
-        pub fn new(
-            state: &State,
-            at: u32,
-            block: Arc<NodeBlock>,
-            dir: NodeID,
-            name_hash: u64,
-        ) -> Self {
-            Self {
-                at,
-                block,
-                dir,
-                name_hash,
-                reclaims: state.reclaims(),
-            }
-        }
     }
 }

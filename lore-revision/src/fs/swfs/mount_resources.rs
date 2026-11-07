@@ -40,6 +40,7 @@ use crate::repository::RemoteState;
 use crate::repository::RepositoryConfig;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryPaths;
+use crate::repository::VfsType;
 use crate::repository::claim_opened_stores;
 use crate::repository::create_client_immutable_store;
 use crate::repository::create_client_mutable_store;
@@ -170,7 +171,7 @@ impl MountResources {
         mount_path: MountPath,
         config: &RepositoryConfig,
     ) -> Result<MountResources, SwfsMountError> {
-        if !config.is_swfs() {
+        if config.vfs_type() != VfsType::Swfs {
             return Err(SwfsMountError::internal(
                 "Attempting to mount a non-SWFS instance",
             ));

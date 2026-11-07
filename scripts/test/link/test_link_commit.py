@@ -13,6 +13,10 @@ from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 
 from lore import Lore
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_unchanged_commit(new_lore_repo):

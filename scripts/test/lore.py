@@ -19,6 +19,7 @@ from pathlib import Path
 from time import sleep
 from typing import TypedDict, Unpack, overload
 
+from cleanup_util import lore_mount_instance
 from error_types import (
     ServerConnectionError,
     UnknownLoreError,
@@ -51,9 +52,15 @@ from lore_parsers import (
     parse_shared_store_list,
     parse_status_json,
 )
-from service_util import name_service_executable
+from service_util import LORE_TEST_VFS_VAR, name_service_executable
 
 logger = logging.getLogger(__name__)
+
+
+def run_vfs(vfs: str | None) -> str | None:
+    """`vfs`, or the VFS `LORE_TEST_VFS` names for the run where the test names
+    none."""
+    return vfs or os.environ.get(LORE_TEST_VFS_VAR) or None
 
 
 def lore_test_env(global_dir: str) -> dict[str, str]:
@@ -252,7 +259,15 @@ class Lore:
         return ".lore"
 
     def dot_path(self) -> str:
-        """Return the full path to the repository metadata directory."""
+        """Return the full path to the repository metadata directory.
+
+        A virtual clone keeps it outside its mount, in the external directory the
+        global data directory holds for its instance, which is where Lore finds it
+        through the mount table."""
+        instance = lore_mount_instance(self.path)
+        if instance is not None:
+            global_dir = self.sandboxed_env()["LORE_GLOBAL_PATH"]
+            return os.path.join(global_dir, "data", "external", instance, ".lore")
         return os.path.join(self.path, self.dot_dir())
 
     def ignore_file(self) -> str:
@@ -464,6 +479,7 @@ class Lore:
         shared_store_path: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
+        vfs = run_vfs(vfs)
         output = self.run(
             ["repository", "create", remote_path if remote_path else self.remote_path]
             + (["--description", description] if description else [])
@@ -2125,6 +2141,9 @@ class Lore:
         no_tracking: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
+        # A bare, untracked or dry-run clone has no virtual form, so it stays as asked.
+        if not (bare or no_tracking or kwargs.get("dry_run")):
+            vfs = run_vfs(vfs)
         new_repo_name = name if name else self.generate_random_name()
         if path is None:
             parent = Path(self.path).parent
@@ -2799,9 +2818,17 @@ class Lore:
     def clear_local_files(self):
         """
         Remove all local repository files for this repository
+
+        A virtual clone's files and `.lore` are the service's, so its instance is
+        deleted, which unmounts it, before the mount point goes. The delete runs
+        from outside the mount, which a working directory inside would hold busy.
         """
         import shutil
 
+        if lore_mount_instance(self.path) is not None:
+            self.repository_instance_delete(
+                cwd=os.path.dirname(os.path.realpath(self.path))
+            )
         shutil.rmtree(self.path, ignore_errors=True)
 
     def make_dirs(self, path):

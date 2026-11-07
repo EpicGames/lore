@@ -121,6 +121,8 @@ pub enum VfsType {
     /// content in the shared store made for its remote, so it needs a reachable remote: it cannot
     /// be created offline, or for a repository with no remote.
     Swfs,
+    /// A writable virtual clone: a Linux FUSE mount served by the Lore service.
+    Fuse,
 }
 
 impl VfsType {
@@ -129,6 +131,7 @@ impl VfsType {
             VfsType::None => LoreVfsType::None,
             VfsType::Default => LoreVfsType::Default,
             VfsType::Swfs => LoreVfsType::Swfs,
+            VfsType::Fuse => LoreVfsType::Fuse,
         }
     }
 }
@@ -203,7 +206,7 @@ pub struct RepositoryCloneArgs {
     #[clap(long, value_name = "key")]
     layer_metadata: Option<String>,
 
-    /// File containing list of files to prefetch
+    /// Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
     #[clap(long, value_name = "file")]
     prefetch: Option<String>,
 
@@ -368,8 +371,8 @@ pub enum RepositoryCommands {
     /// A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the
     /// clone for working offline instead. With it, as with `--cache`, a clone that writes its files
     /// caches every file metadata block of the cloned revision, which staging and committing write
-    /// to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-    /// and reads them from the remote when a command needs them.
+    /// to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes no
+    /// files and reads them from the remote when a command needs them.
     Clone(RepositoryCloneArgs),
 
     /// Delete a repository
@@ -416,7 +419,7 @@ pub enum RepositoryInstanceCommands {
     /// paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains
     /// in the global data directory, even when it is not mounted.
     Prune,
-    /// Delete the current instance: unmount (if SWFS), deregister from mutable store, and delete associated directories
+    /// Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and delete associated directories
     Delete,
     /// Move the current instance to a new path
     Move(RepositoryInstanceMoveArgs),

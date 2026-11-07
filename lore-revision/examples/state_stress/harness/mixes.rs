@@ -87,12 +87,12 @@ pub enum Must {
 /// What one task does.
 #[derive(Clone, Copy, Debug)]
 pub enum Op {
-    /// A VFS provider diff's checked create in a directory: attached dirty-added, then the
+    /// The provider diff's checked create in a directory: attached dirty-added, then the
     /// directory marked.
     Create(&'static str),
     /// A checked create, then its removal.
     CreateRemove(&'static str),
-    /// A VFS provider diff's add into a directory its walk listed: added dirty-added without a name
+    /// The provider diff's add into a directory its walk listed: added dirty-added without a name
     /// check, as each task's name is its own, then the directory marked.
     DiffAdd(&'static str),
     /// `lore dirty`'s add of a file below a directory of the task's own it adds first, each marked,
@@ -1175,7 +1175,7 @@ pub async fn exclusive_tree(spread: bool, repository: Arc<RepositoryContext>) ->
     tree
 }
 
-/// The exclusive claim's mix: checked creates, creates removed, a VFS provider diff's and `lore
+/// The exclusive claim's mix: checked creates, creates removed, the provider diff's and `lore
 /// dirty`'s adds, scans' chains, adds of files and directories discarded, renames, marks, clears,
 /// dirty rewrites, in-place and owned changes, owned clears, repins to each revision, listings
 /// through the link and collections of `q`'s dirty paths following it; a staged clear and a

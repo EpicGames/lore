@@ -70,13 +70,23 @@ fn options(scan: bool, check_dirty: bool) -> StatusOptions {
 }
 
 /// A provider whose diff is exact is scanned without `--scan`, with no dirty flag to check, and
-/// any other provider is scanned only when asked.
+/// any other provider is scanned only when asked. Unasked, the scan reports as a plain status
+/// does.
 #[test]
 fn an_exact_provider_diff_plans_a_scan_without_the_flag() {
     let exact = TreeDiffPlan::for_status(&options(false, true), true, true);
     assert!(exact.scan, "an exact diff is scanned unasked");
+    assert!(
+        !exact.scan_asked,
+        "an unasked scan reports as a plain status"
+    );
     assert!(!exact.check_dirty, "an exact diff leaves no flag to check");
     assert!(exact.compare_staged);
+    let asked = TreeDiffPlan::for_status(&options(true, false), true, true);
+    assert!(
+        asked.scan && asked.scan_asked,
+        "an asked scan reports as `--scan`"
+    );
 
     let unasked = TreeDiffPlan::for_status(&options(false, true), true, false);
     assert!(
@@ -92,6 +102,7 @@ async fn a_staged_comparison_alone_reads_no_working_tree() {
         compare_staged: true,
         check_dirty: false,
         scan: false,
+        scan_asked: false,
     })
     .await;
 
@@ -108,6 +119,7 @@ async fn a_dirty_check_without_a_staged_comparison_reads_no_working_tree() {
         compare_staged: false,
         check_dirty: true,
         scan: false,
+        scan_asked: false,
     })
     .await;
 
@@ -123,6 +135,7 @@ async fn a_dirty_check_opens_one_operation() {
         compare_staged: true,
         check_dirty: true,
         scan: false,
+        scan_asked: false,
     })
     .await;
 
@@ -136,6 +149,7 @@ async fn a_scan_opens_one_operation() {
         compare_staged: false,
         check_dirty: false,
         scan: true,
+        scan_asked: true,
     })
     .await;
 
@@ -151,6 +165,7 @@ async fn a_dirty_check_and_a_scan_share_one_operation() {
         compare_staged: true,
         check_dirty: true,
         scan: true,
+        scan_asked: true,
     })
     .await;
 
@@ -189,10 +204,14 @@ async fn a_scanned_change_is_held_once_while_it_is_reported() {
                 to: side,
             };
             let summary = StatusSummaryStats::default();
+            let scan_report = ScanReport {
+                summary: Arc::new(StatusSummaryStats::default()),
+                whole_deleted_directories: true,
+            };
             let mut changes = state::ChangeStream::nothing();
 
             let report = report_scan_change(&operation, &repository, &summary, &change);
-            let reports = report_scan_changes(&operation, &repository, &summary, &mut changes);
+            let reports = report_scan_changes(&operation, &repository, &scan_report, &mut changes);
 
             assert!(
                 size_of_val(&reports) < size_of_val(&report) + 2 * size_of::<NodeChange>(),
@@ -256,6 +275,7 @@ async fn a_failed_scan_still_discards_what_the_other_scans_found_stale() {
                     compare_staged: false,
                     check_dirty: false,
                     scan: true,
+                    scan_asked: true,
                 },
             )
             .await;

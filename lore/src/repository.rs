@@ -63,6 +63,8 @@ pub enum LoreVfsType {
     Default = 1,
     /// Use SWFS as a VFS
     Swfs = 2,
+    /// Use a Linux FUSE mount served by the Lore service as a VFS
+    Fuse = 3,
 }
 
 impl LoreVfsType {
@@ -70,8 +72,24 @@ impl LoreVfsType {
         VfsConfig {
             vfs_type: match self {
                 LoreVfsType::None => VfsType::None,
-                LoreVfsType::Swfs | LoreVfsType::Default => VfsType::Swfs,
+                LoreVfsType::Swfs => VfsType::Swfs,
+                LoreVfsType::Fuse => VfsType::Fuse,
+                LoreVfsType::Default => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        VfsType::Fuse
+                    }
+                    #[cfg(target_family = "windows")]
+                    {
+                        VfsType::Swfs
+                    }
+                    #[cfg(not(any(target_os = "linux", target_family = "windows")))]
+                    {
+                        VfsType::None
+                    }
+                }
             },
+            base_time: None,
         }
     }
 }
@@ -80,6 +98,7 @@ impl LoreVfsType {
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(clone_local)]
+#[requires_service]
 pub struct LoreRepositoryCloneArgs {
     /// URL to the repository
     pub repository_url: LoreString,
@@ -97,7 +116,9 @@ pub struct LoreRepositoryCloneArgs {
     pub layer: LoreString,
     /// (Optional) Layer metadata key to link revisions with
     pub layer_metadata: LoreString,
-    /// (Optional) File containing list of files to prefetch
+    /// (Optional) Access recording whose paths a virtual clone warms in the background: one
+    /// repository-relative path per line, a directory ending with `/`, `/` for the root. A
+    /// relative file path resolves against the caller's working directory.
     pub prefetch: LoreString,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
     /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
@@ -121,8 +142,8 @@ pub struct LoreRepositoryCloneArgs {
 /// A clone needs the remote, so the offline flag does not keep it from connecting: it prepares the
 /// clone for working offline instead. With it, as with the cache flag, a clone that writes its
 /// files caches every file metadata block of the cloned revision, which staging and committing
-/// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-/// and reads them from the remote when a command needs them.
+/// write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes
+/// no files and reads them from the remote when a command needs them.
 ///
 /// # Events
 ///
@@ -221,7 +242,16 @@ async fn clone_impl(
     } else {
         None
     };
-    let prefetch = args.prefetch.clone().into();
+    let prefetch = if args.prefetch.length > 0 {
+        Some(
+            util::path::make_absolute(args.prefetch.as_str())
+                .forward_with::<CloneError, _>(|| format!("Invalid path: {}", args.prefetch))?
+                .display()
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     let global_config = GlobalConfig::load()
         .await
@@ -252,6 +282,7 @@ async fn clone_impl(
         ignore_existing,
         direct_file_write,
         prefetch,
+        tree_prefetch: None,
         shared_store_options,
         vfs_options,
         no_tracking,
@@ -439,6 +470,7 @@ async fn dump_impl(
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(create_local)]
+#[requires_service]
 pub struct LoreRepositoryCreateArgs {
     /// URL to the repository. Treated as the repository name instead when the call is
     /// offline or local, where an empty value names it after the directory it is

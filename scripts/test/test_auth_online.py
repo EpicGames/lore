@@ -445,6 +445,7 @@ def test_repository_create_and_delete_manage_the_auth_resource(auth_env, make_ac
     assert deletions[0]["bearer"] == owner.login_token
 
 
+@pytest.mark.own_vfs("counts the token exchanges a push makes, where a virtual clone's mount exchanged its token when it connected")
 @pytest.mark.smoke
 def test_remote_write_uses_token_exchange_and_online_permission_checks(
     auth_env, make_actor
@@ -1051,6 +1052,7 @@ def test_cross_partition_copy_requires_a_source_grant(auth_env):
 LINKER_API_KEY = "linker-api-key"
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor):
     """A revision tree walk follows a link into another partition only when
