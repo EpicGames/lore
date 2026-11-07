@@ -33,6 +33,12 @@ use tracing::debug;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::http::log_http_error;
+use crate::http::range::RangeRequest;
+use crate::http::range::advertise_ranges;
+use crate::http::range::content_range;
+use crate::http::range::range_request;
+use crate::http::range::set_content_range;
+use crate::http::range::unsatisfied_range;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -149,19 +155,53 @@ pub async fn handler(
 
             let options = immutable::read_options_from_repository(&repository);
 
+            let (fragment, _) = immutable::load_raw(
+                repository.clone(),
+                parsed_address,
+                options.with_decompress(),
+            )
+            .await
+            .map_err(GetContentError::ReadStream)?;
+            let total = fragment.size_content;
+            let range = match range_request(&headers, total) {
+                RangeRequest::Unsatisfiable => {
+                    let mut out = HeaderMap::new();
+                    advertise_ranges(&mut out);
+                    set_content_range(
+                        &mut out,
+                        unsatisfied_range(total).map_err(GetContentError::HeaderGeneration)?,
+                    );
+                    return Ok((StatusCode::RANGE_NOT_SATISFIABLE, out, Body::empty()));
+                }
+                RangeRequest::Partial(range) => Some(range),
+                RangeRequest::Full => None,
+            };
+            let read_range = range.as_ref().map(|r| r.start as usize..r.end as usize);
+
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
             let content_length =
-                immutable::read_stream(repository, parsed_address, None, options, tx)
+                immutable::read_stream(repository, parsed_address, read_range, options, tx)
                     .await
                     .map_err(GetContentError::ReadStream)?;
 
             let stream = ReceiverStream::new(rx);
 
-            let headers = create_stream_response_headers(query, content_length)
+            let mut headers = create_stream_response_headers(query, content_length)
                 .map_err(GetContentError::HeaderGeneration)?;
+            advertise_ranges(&mut headers);
+            let status = match &range {
+                Some(range) => {
+                    set_content_range(
+                        &mut headers,
+                        content_range(range, total).map_err(GetContentError::HeaderGeneration)?,
+                    );
+                    StatusCode::PARTIAL_CONTENT
+                }
+                None => StatusCode::OK,
+            };
 
-            Ok((StatusCode::OK, headers, Body::from_stream(stream)))
+            Ok((status, headers, Body::from_stream(stream)))
         })
         .await
 }
