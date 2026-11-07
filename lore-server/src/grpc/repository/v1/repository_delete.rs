@@ -79,16 +79,12 @@ pub async fn handler(
             }
             registry.remove(authorization, id).await?;
 
-            repository::store_name_to_id(
-                repository.clone(),
-                metadata.name.as_str(),
-                RepositoryId::default(),
-            )
-            .await
-            .filter_slow_down()?
-            .warn_map_err(|err| {
-                Status::internal(format!("Failed to delete repository name mapping: {err}"))
-            })?;
+            repository::release_name(repository.clone(), metadata.name.as_str(), repository.id)
+                .await
+                .filter_slow_down()?
+                .warn_map_err(|err| {
+                    Status::internal(format!("Failed to delete repository name mapping: {err}"))
+                })?;
 
             repository::metadata_store_hash(repository.clone(), Hash::default())
                 .await
