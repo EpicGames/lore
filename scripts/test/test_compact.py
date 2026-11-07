@@ -480,6 +480,11 @@ class _DeduplicatedStore:
         self.assert_files_whole()
         return killed
 
+    def time_step(self, repo: Lore, step: str, seconds: float) -> None:
+        """Take `seconds` as the last run of `step` in `repo` that finished, the window
+        `killed_step` kills its next run within."""
+        self._windows[(repo.path, step)] = max(seconds, 0.1)
+
     def killed_step(self, repo: Lore, step: str, args: list[str]) -> bool:
         """As `killed`, within 1.5 times the last run of `step` in `repo` that finished."""
         key = (repo.path, step)
@@ -560,7 +565,8 @@ def test_killed_repository_gc_loses_no_local_content(new_lore_repo):
     in durability and in holding a payload, as `_DeduplicatedStore` describes. Each round
     collects after the first pushes, and kills collections after the second, which orphans
     payloads beside local-only ones, so compaction rewrites packfiles holding local-only
-    content when the kill lands."""
+    content when the kill lands. Each collection is killed within 1.5 times the last one that
+    finished, as a collection that finds the work done ends much sooner than one that does it."""
     _seed_random()
     store = _DeduplicatedStore(new_lore_repo)
     kills = 0
@@ -572,7 +578,7 @@ def test_killed_repository_gc_loses_no_local_content(new_lore_repo):
             repo.push(max_connections=16, no_gc=True)
         start = time.monotonic()
         out = gc_repo.repository_gc(json=True)
-        full_pass = time.monotonic() - start
+        store.time_step(gc_repo, "gc", time.monotonic() - start)
         assert parse_jsonl(out, "compactionBegin"), "the full pass compacts"
         store.fetch(round_index)
         store.write_local(round_index)
@@ -584,11 +590,10 @@ def test_killed_repository_gc_loses_no_local_content(new_lore_repo):
         _commit(store.pushing, f"Pending {round_index}", no_gc=True)
 
         for _ in range(4):
-            kills += store.killed(
-                gc_repo, ["repository", "gc"], max(full_pass, 0.5) * 1.5
-            )
+            kills += store.killed_step(gc_repo, "gc", ["repository", "gc"])
         store.assert_intact()
 
+    logger.info("%d of 80 passes were killed", kills)
     assert kills >= 16, f"only {kills} of 80 passes were killed"
     store.local.repository_gc()
     store.assert_intact()
