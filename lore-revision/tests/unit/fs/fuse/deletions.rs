@@ -424,6 +424,8 @@ fn an_append_racing_a_rewrite_is_kept() {
     );
 }
 
+/// A rewrite finishes while appends never pause: its drain waits only for the appends that
+/// began on the list it replaces, not for a moment with none under way.
 #[test]
 fn a_rewrite_finishes_while_appends_never_pause() {
     use std::collections::BTreeSet;
@@ -436,7 +438,9 @@ fn a_rewrite_finishes_while_appends_never_pause() {
 
     const THREADS: usize = 8;
     const DISTINCT: usize = 5000;
-    const BOUND: Duration = Duration::from_secs(2);
+    // A bound on a hang, not a timing: the rewrite finishes in milliseconds on an idle machine,
+    // and takes longer only on one this test shares with others, where it must not fail.
+    const DEADLINE: Duration = Duration::from_secs(30);
 
     let dir = TempDir::new("lore-fuse-deletions-steady-");
     let list = Arc::new(DeletionList::open(&dir.path().join(DELETION_LIST)).expect("open"));
@@ -475,16 +479,16 @@ fn a_rewrite_finishes_while_appends_never_pause() {
             let _ = finished.send(begun.elapsed());
         })
     };
-    let elapsed = took.recv_timeout(BOUND);
+    let elapsed = took.recv_timeout(DEADLINE);
     stop.store(true, Ordering::Relaxed);
     for thread in appenders {
         thread.join().expect("an appender");
     }
     rewriter.join().expect("the rewrite");
-    assert!(
-        elapsed.is_ok(),
-        "a rewrite under appends that never pause finishes within {BOUND:?}"
-    );
+    let elapsed = elapsed.unwrap_or_else(|_| {
+        panic!("a rewrite under appends that never pause finishes within {DEADLINE:?}")
+    });
+    eprintln!("a rewrite under {THREADS} appenders that never pause: {elapsed:?}");
 
     let listed: BTreeSet<String> = list
         .read()
