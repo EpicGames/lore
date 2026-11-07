@@ -1337,6 +1337,79 @@ async fn resolve_remote_latest(
     }
 }
 
+/// Whether a branch has revisions the remote latest does not, and whether the remote latest has
+/// revisions the branch does not, answered as `(local_ahead, remote_ahead)` for `local_state`, the
+/// branch's local latest, and `remote_state`, a different remote latest.
+///
+/// `local_diverged` is whether the branch holds revisions not on the remote history, and
+/// `last_sync` is the remote latest the branch was last recorded as synced to. A diverged branch
+/// numbered past the remote latest is behind it unless the remote latest is on its first-parent
+/// history, where a merge of divergent history holds the remote latest it merged. A `last_sync`
+/// equal to the remote latest says it is. Any other `last_sync` is checked against that history
+/// ([`on_first_parent_history`]), since it is stored apart from the branch latest and a process
+/// killed between the two writes leaves a committed merge with the sync point before it.
+#[lore_macro::test_pub]
+async fn compare_with_remote(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    local_state: &State,
+    remote_state: &State,
+    local_diverged: bool,
+    last_sync: Hash,
+) -> (bool, bool) {
+    let local_n = local_state.revision_number();
+    let remote_n = remote_state.revision_number();
+    if !local_diverged {
+        (false, remote_n > local_n)
+    } else if local_n > remote_n {
+        let remote_ahead = last_sync != remote_state.revision()
+            && !on_first_parent_history(repository, branch, local_state, remote_state).await;
+        (true, remote_ahead)
+    } else {
+        // Numbered at or past the branch latest, the remote latest is not on its history.
+        (true, true)
+    }
+}
+
+/// Whether `revision_state` is on the history of `latest_state`, walked along first parents.
+///
+/// The walk stops at the first revision numbered at or below `revision_state`, so it reads at most
+/// one revision for each revision number between the two. A revision that cannot be read ends it,
+/// answering `false`.
+async fn on_first_parent_history(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    latest_state: &State,
+    revision_state: &State,
+) -> bool {
+    let revision = revision_state.revision();
+    let revision_number = revision_state.revision_number();
+    find::find_revision(
+        repository.clone(),
+        branch,
+        latest_state.revision(),
+        false,
+        None,
+        |state, _metadata| {
+            if state.revision() == revision {
+                find::FindMatchResult::Match
+            } else if state.revision_number() <= revision_number {
+                find::FindMatchResult::Abort
+            } else {
+                find::FindMatchResult::Continue
+            }
+        },
+    )
+    .await
+    .inspect_err(|err| {
+        lore_debug!(
+            "Revision {revision} not found on the first-parent history of {}: {err}",
+            latest_state.revision()
+        );
+    })
+    .is_ok()
+}
+
 /// Reconciles every requested path against the filesystem within `operation`, marking
 /// dirty as it goes. Given a `summary`, it emits a status event per change the caller did not
 /// stage, counted into `summary`, and reports a path neither the tree nor the working tree holds
@@ -1939,9 +2012,6 @@ pub(crate) async fn status(
         Hash::default()
     };
 
-    let mut local_ahead = false;
-    let mut remote_ahead = false;
-
     let last_sync = branch::load_last_sync(repository.clone(), branch.id)
         .await
         .unwrap_or_default();
@@ -1954,30 +2024,21 @@ pub(crate) async fn status(
         .await
         .unwrap_or(true);
 
-    if local_latest != remote_latest.unwrap_or_default()
+    let (local_ahead, remote_ahead) = if local_latest != remote_latest.unwrap_or_default()
         && let Some(remote_state) = remote_state.clone()
     {
-        let local_n = local_state.revision_number();
-        let remote_n = remote_state.revision_number();
-        if !local_diverged {
-            remote_ahead = remote_n > local_n;
-        } else if remote_n > local_n {
-            // Local has unpushed work AND remote moved beyond it.
-            local_ahead = true;
-            remote_ahead = true;
-        } else if local_n > remote_n {
-            local_ahead = true;
-            // Refine with last_sync: if remote has moved beyond the last
-            // recorded sync point, it has revisions we don't have.
-            if last_sync != remote_latest.unwrap_or_default() {
-                remote_ahead = true;
-            }
-        } else {
-            // Same revision number, different hashes — divergent.
-            local_ahead = true;
-            remote_ahead = true;
-        }
-    }
+        compare_with_remote(
+            &repository,
+            branch.id,
+            &local_state,
+            &remote_state,
+            local_diverged,
+            last_sync,
+        )
+        .await
+    } else {
+        (false, false)
+    };
     {
         let status = match (remote_ahead, local_ahead) {
             (true, true) => "divergent",

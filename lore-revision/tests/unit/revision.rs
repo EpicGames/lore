@@ -23,6 +23,7 @@ mod diff;
 mod instance;
 mod last_merged;
 mod merge_moves;
+mod remote_comparison;
 mod resolve;
 mod sync;
 mod sync_hold;
