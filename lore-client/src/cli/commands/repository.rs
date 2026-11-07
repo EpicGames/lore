@@ -1900,7 +1900,7 @@ fn handle_repository_instance_delete(globals: LoreGlobalArgs) -> u8 {
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::Complete(_) => {}
             LoreEvent::RepositoryInstanceDeleteBegin(data) => {
-                let mode = if data.dry_run != 0 { " (dry run)" } else { "" };
+                let mode = if dry_run { " (dry run)" } else { "" };
                 println!(
                     "Deleting instance {} at {}{}",
                     data.instance_id, data.path, mode

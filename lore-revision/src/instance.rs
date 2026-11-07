@@ -1002,8 +1002,6 @@ pub struct LoreRepositoryInstanceDeleteBeginEventData {
     pub path: LoreString,
     /// Whether this is a SWFS-backed instance
     pub is_swfs: u8,
-    /// Whether this is a dry-run (preview only)
-    pub dry_run: u8,
 }
 
 /// Phase of an instance delete operation.
@@ -1419,7 +1417,6 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
         instance_id,
         path: LoreString::from_str(&path),
         is_swfs: u8::from(vfs == VfsType::Swfs),
-        dry_run: if dry_run { 1 } else { 0 },
     })
     .send();
 

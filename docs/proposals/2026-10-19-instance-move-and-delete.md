@@ -220,16 +220,22 @@ Doing it right needs at least:
 ### Dry run
 
 Under the global `--dry-run` flag, each command runs its validation, emits its events, and stops. A move emits
-`RepositoryInstanceMoveBegin` and `RepositoryInstanceMoveComplete`. A delete emits `RepositoryInstanceDeleteBegin` with its dry-run field set, the
+`RepositoryInstanceMoveBegin` and `RepositoryInstanceMoveComplete`. A delete emits `RepositoryInstanceDeleteBegin`, the
 progress events for the steps it would take, and `RepositoryInstanceDeleteComplete`. The CLI labels the output as a dry run. A dry
 run of a delete checks that the sibling name for the rename aside is free, and renames nothing.
 
 ## Compatibility
 
 - **Wire format** — The service and client exchange commands and events over local IPC, encoded with bitcode, and this
-  proposal adds the move and delete commands and the instance events to that
-  encoding. [ADR-00025](../developing/decisions/00025-service-version-compatibility.md) already documents how breaking
-  changes to the C API like this are handled for client-service IPC.
+  proposal adds the move and delete commands and the instance events to that encoding. Removing the dry-run field from
+  `RepositoryInstanceDeleteBegin` changes how that event encodes. Bitcode identifies fields by position
+  ([ADR-00022](../developing/decisions/00022-service-ipc-bitcode.md)) and the message protocol version stays 2, so
+  builds from either side of the change connect, but neither can decode the other's begin event. A delete relayed from
+  an old client to a new service, or from a new client to an old one, fails at that event with an internal "decoding
+  message" error. The service doesn't stop a command whose client has gone, so a real delete still runs to the end in
+  the service. Other commands and events are unaffected. The handshake that
+  [ADR-00025](../developing/decisions/00025-service-version-compatibility.md) proposes would refuse such a pair up
+  front. Until it lands, a client and the service must come from the same build.
 - **Client/server protocols** — N/A for the remote protocol: no new RPCs. Recording or removing a registration opens the
   instance as a repository, which makes the same connection to the remote that other commands make.
 - **On-disk format** — N/A: the commands write the same registration records and anchor keys that `update-path` and
@@ -247,6 +253,12 @@ run of a delete checks that the sibling name for the rename aside is free, and r
   target is reported as `InvalidArguments` (3), where a target that existed or was already mounted was reported as an
   internal error (-1, exit status 255). That is a breaking change for a script or C API caller that tests a refused
   move for 255 or -1.
+- **The delete begin event** — `lore_repository_instance_delete_begin_event_data_t` drops its `dry_run` field, and the
+  event's JSON drops `dryRun`. An event doesn't repeat its call's arguments: a caller reads the `dry_run` it set in
+  `lore_global_args_t`. This breaks a caller that reads the field. The struct keeps its size and its other fields keep
+  their offsets, as `dry_run` sat in what is now trailing padding, so a caller built against the old header and loaded
+  with a new library doesn't crash but reads an unspecified byte as `dry_run`. The CLI still labels a dry run, from its
+  own `--dry-run`.
 - **The `<name>.deleting-<instance ID>` name** — A new directory name beside the instance while a delete runs, visible to
   a parent instance's status, to file watchers and to backup tools. Scripts that clean up after a failed delete can
   rely on the name.
@@ -289,11 +301,18 @@ run of a delete checks that the sibling name for the rename aside is free, and r
 
 ## Migration Plan
 
-The refusal code is the one breaking change (see [Compatibility](#compatibility)). A script or C API caller that tests
-a refused move for exit status 255 or `-1` tests for `InvalidArguments` (3) instead. One that tests only for a
-non-zero result needs no change, and one that accepts both codes works with releases before and after this change.
-Nothing else needs migrating: the commands write the same registration records, and keep their arguments, events and
-phases.
+Two changes break callers: the refusal code for a move, and dropping `dry_run` from the delete begin event (see
+[Compatibility](#compatibility)). Nothing stored changes: the commands write the same registration records.
+
+- A script or C API caller that tests a refused move for exit status 255 or `-1` tests for `InvalidArguments` (3)
+  instead. One that tests only for a non-zero result needs no change, and one that accepts both codes works with
+  releases before and after this change.
+- A C API caller that reads the field reads `dry_run` from its `lore_global_args_t` instead, and rebuilds against the
+  new `lore.h`. A consumer of the JSON stops reading `dryRun`.
+- Upgrade the client and the service together, then restart a running service with `lore service stop`, so that no
+  client relays to a service from another build. A tool that embeds the library and relays to a shared service needs
+  that service's build.
+- Rolling back is the same in reverse: downgrade both and restart the service.
 
 Rolling back to an earlier release brings back the earlier codes: `-1` for a target that exists or is already mounted,
 and a failure at the rename for a target inside the instance. A target whose parents don't exist fails again rather

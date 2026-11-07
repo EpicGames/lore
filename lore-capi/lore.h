@@ -3427,8 +3427,6 @@ typedef struct lore_repository_instance_delete_begin_event_data_t {
   struct lore_string_t path;
   // Whether this is a SWFS-backed instance
   uint8_t is_swfs;
-  // Whether this is a dry-run (preview only)
-  uint8_t dry_run;
 } lore_repository_instance_delete_begin_event_data_t;
 
 // Event data for progress during an instance delete operation.

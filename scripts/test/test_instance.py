@@ -87,6 +87,7 @@ class TestInstanceDelete:
         assert "Deleting instance" in output or "delete" in output.lower(), (
             f"Dry-run should report delete action. Output: {output}"
         )
+        assert "(dry run)" in output, f"Dry-run should be labelled. Output: {output}"
 
         # The repository directory should still exist
         assert os.path.isdir(repo.path), (
