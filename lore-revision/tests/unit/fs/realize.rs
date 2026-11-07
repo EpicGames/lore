@@ -1331,6 +1331,7 @@ async fn a_deleted_link_keeps_a_directory_under_a_case_variant_of_its_mount() {
 }
 
 /// Adds a file holding `content` at [`VARIANT`] to `state`, beside the one at [`TRACKED`].
+#[cfg(target_os = "linux")]
 async fn track_variant(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,

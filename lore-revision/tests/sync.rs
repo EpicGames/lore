@@ -674,14 +674,18 @@ mod tests {
 
     /// The file a revision moves out of [`PLUGIN`] as it deletes the directory, the spelling the
     /// working tree holds it under, and the directory it moves to.
+    #[cfg(target_os = "linux")]
     const RULES: &str = "Rules.cs";
+    #[cfg(target_os = "linux")]
     const RULES_VARIANT: &str = "rules.cs";
+    #[cfg(target_os = "linux")]
     const SHARED: &str = "Shared";
 
     /// Commits `instance` holding `content` as [`RULES`] in [`PLUGIN`] and then a revision moving
     /// it into [`SHARED`] as `carried` and deleting [`PLUGIN`], answering the second. The working
     /// tree is left on the first revision, holding `variant` as [`RULES_VARIANT`] in place of the
     /// file.
+    #[cfg(target_os = "linux")]
     async fn a_move_out_of_a_deleted_directory(
         instance: &TestRepository,
         content: &[u8],

@@ -25,6 +25,7 @@ fn migrated_terminal_arms_have_no_send_error_call() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_family = "windows"))]
 #[test]
 fn lore_vfs_type_default_maps_to_fuse_on_linux_and_swfs_on_windows() {
     let config = lore::repository::LoreVfsType::Default.to_config();

@@ -961,6 +961,7 @@ impl RepositoryContext {
     /// Attach store claims this context shares with other contexts, released once the last of
     /// them drops: a mounted filesystem shares its claims with every context it serves through,
     /// so work done through any of them keeps the claims until it ends. `None` attaches nothing.
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub(crate) fn with_shared_store_hold(
         mut self,
@@ -975,6 +976,7 @@ impl RepositoryContext {
     /// configuration, whatever the command was told about going offline, since content the holder
     /// serves later may be stored on the remote alone. None where the configuration names no
     /// remote or cannot be read.
+    #[cfg(target_os = "linux")]
     pub(crate) fn serving_remote(&self) -> SharedRemote {
         let config = self
             .paths
@@ -998,6 +1000,7 @@ impl RepositoryContext {
     /// connection, or its connect under way, where `remote` failed or never connected: a holder
     /// whose own connect failed, as a remount before the network is up does, reaches the remote
     /// again through the next command that does. Takes no lock another holds.
+    #[cfg(target_os = "linux")]
     pub(crate) fn repair_shared_remote(&self, remote: &SharedRemote) {
         if Arc::ptr_eq(&self.remote, remote) {
             return;
@@ -1022,6 +1025,7 @@ impl RepositoryContext {
 
     /// This context over `remote`, which the contexts of one holder share
     /// ([`Self::serving_remote`]).
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub(crate) fn with_shared_remote(&self, remote: &SharedRemote) -> Self {
         RepositoryContext {
@@ -1036,6 +1040,7 @@ impl RepositoryContext {
     /// # Errors
     ///
     /// [`RepositoryError`] if either store's claim cannot be taken.
+    #[cfg(target_os = "linux")]
     pub(crate) async fn hold_stores(
         &self,
     ) -> Result<lore_storage::local::store_lock::StoreHold, RepositoryError> {
@@ -1255,6 +1260,7 @@ impl RepositoryContext {
     /// A context over this context's stores for the instance mounted at `root` whose `.lore` is
     /// `dot_path`, as the service serves it when remounting: the instance's view, a remote
     /// connected on first use, and no write token. Reads nothing inside `root`.
+    #[cfg(target_os = "linux")]
     pub(crate) fn mounted_instance_context(
         &self,
         root: &Path,

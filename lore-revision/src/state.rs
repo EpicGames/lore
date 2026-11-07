@@ -37,6 +37,7 @@ use bitflags::bitflags;
 use bytes::Bytes;
 pub use diff::DiffWalkStats;
 pub use diff::GraftOracle;
+#[cfg(target_os = "linux")]
 pub(crate) use diff::diff_states_into;
 use futures::future::Either;
 use lore_base::error::InvalidPath;

@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::change;
+#[cfg(target_os = "linux")]
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
@@ -23,8 +24,11 @@ use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::query_depth;
+#[cfg(target_os = "linux")]
 use crate::fs::filesystem_provider::FileInfo;
+#[cfg(target_os = "linux")]
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
+#[cfg(target_os = "linux")]
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::interface::LoreNodeType;
 use crate::lore::Address;
@@ -33,6 +37,7 @@ use crate::lore_debug;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
 use crate::lore_warn;
+#[cfg(target_os = "linux")]
 use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
@@ -40,32 +45,47 @@ use crate::node::NodeExtFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
+#[cfg(target_os = "linux")]
 use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
+#[cfg(target_os = "linux")]
 use crate::state::AttachOutcome;
 use crate::state::ChangeSender;
+#[cfg(target_os = "linux")]
 use crate::state::ChangeStream;
+#[cfg(target_os = "linux")]
 use crate::state::Clear;
+#[cfg(target_os = "linux")]
 use crate::state::Ext;
+#[cfg(target_os = "linux")]
 use crate::state::FilesystemDiffStats;
+#[cfg(target_os = "linux")]
 use crate::state::Mark;
+#[cfg(target_os = "linux")]
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
+#[cfg(target_os = "linux")]
 use crate::state::SettledAction;
 use crate::state::State;
 use crate::state::StateChildrenNodes;
 use crate::state::StateError;
 use crate::state::StateNamedNode;
+#[cfg(target_os = "linux")]
 use crate::state::WalkDiscards;
 use crate::state::add_change;
 use crate::state::add_change_where;
+#[cfg(target_os = "linux")]
 use crate::state::apply_pending_discards;
 use crate::state::compute_change_flags;
 use crate::state::emit_change;
+#[cfg(target_os = "linux")]
 use crate::state::file_matches_node;
+#[cfg(target_os = "linux")]
 use crate::state::mark_settled;
 use crate::state::named_node_sort;
+#[cfg(target_os = "linux")]
 use crate::state::node_change_state;
+#[cfg(target_os = "linux")]
 use crate::state::os_diff::ensure_scan_dir_chain;
 use crate::state::stream::emit;
 use crate::util::path::RelativePath;
@@ -2066,6 +2086,7 @@ where
 /// The walk runs behind a stream of its own and the changes are settled one at a time as they
 /// arrive, so one task makes every mark, and the walk has listed a directory of `from` before
 /// any mark adds to it.
+#[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn diff_states_into(
     operation: Arc<InstanceOperationImpl>,
@@ -2139,6 +2160,7 @@ pub(crate) async fn diff_states_into(
 /// Whether the root of a provider diff at `path` is a directory `from` holds where the filesystem
 /// State `to` holds nothing. The walk compares the children of its root, so it would report only
 /// what the directory held.
+#[cfg(target_os = "linux")]
 fn is_removed_directory(from: &NodeChangeState, to: &NodeChangeState, path: &RelativePath) -> bool {
     !path.is_empty()
         && from.mapping.node.is_valid_node_id()
@@ -2151,6 +2173,7 @@ fn is_removed_directory(from: &NodeChangeState, to: &NodeChangeState, path: &Rel
 /// working tree reports a missing path, through the hierarchy a delete of a whole directory walks.
 /// The root is put to the filter first, past the ignore rules only where lore's tree tracks it,
 /// so an add never committed that the rules now cover is left out, as the walk leaves it.
+#[cfg(target_os = "linux")]
 async fn removed_directory_changes(
     from: NodeChangeState,
     to: NodeChangeState,
@@ -2180,6 +2203,7 @@ async fn removed_directory_changes(
 }
 
 /// What a provider diff has settled so far, and what it settles once the walk has ended.
+#[cfg(target_os = "linux")]
 struct Settling {
     operation: Arc<InstanceOperationImpl>,
     from: NodeMapping,
@@ -2203,12 +2227,14 @@ struct Settling {
 }
 
 /// Whether `path` lies below one of `directories`.
+#[cfg(target_os = "linux")]
 fn below_any(directories: &[RelativePath], path: &RelativePath) -> bool {
     directories
         .iter()
         .any(|directory| path.below(directory).is_some_and(|rest| !rest.is_empty()))
 }
 
+#[cfg(target_os = "linux")]
 impl Settling {
     /// Settles one change the walk found, answering with the change to report, if any.
     async fn settle(&mut self, change: NodeChange) -> Result<Option<NodeChange>, StateError> {

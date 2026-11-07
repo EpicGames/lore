@@ -1236,6 +1236,7 @@ pub async fn clone(
 /// Undoes a FUSE clone's mount after a failure past a successful `create_local`. A no-op off
 /// Linux and when `is_fuse` is false; best-effort otherwise, logged and never allowed to shadow
 /// the original failure it is cleaning up after.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
 async fn abandon_failed_fuse_clone(
     path: &Path,
     is_fuse: bool,

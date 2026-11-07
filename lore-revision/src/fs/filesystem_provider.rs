@@ -1010,6 +1010,7 @@ impl InstanceOperationImpl {
     }
 
     /// Drops what [`Self::keep_serialized_blocks`] kept: the commit settles nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
     pub(crate) fn drop_serialized_blocks(&self) {
         #[cfg(target_os = "linux")]
         if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
@@ -1020,6 +1021,7 @@ impl InstanceOperationImpl {
     /// Owes the provider's settle of the commit before its revision may become current: until
     /// the settle completes with no error, a removal of a node the commit may have added records
     /// its deletion ([`FuseOperation::owe_settle`]). Other providers owe nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
     pub(crate) async fn owe_settle(&self) {
         #[cfg(target_os = "linux")]
         if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch
@@ -1030,6 +1032,7 @@ impl InstanceOperationImpl {
     }
 
     /// Ends what [`Self::owe_settle`] owes: the revision never became current.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_self))]
     pub(crate) fn release_settle_owed(&self) {
         #[cfg(target_os = "linux")]
         if let StaticDispatchInstanceOperation::Fuse(this) = &self.dispatch {
@@ -1041,6 +1044,7 @@ impl InstanceOperationImpl {
     /// where the operation answers from a `State`: the FUSE provider reads a local-content node's
     /// host file and a tracked node's record, never resolving the path. Other operations read the
     /// path.
+    #[cfg(target_os = "linux")]
     pub async fn measure(&self, path: &RelativePath, node: &Node) -> Result<FileInfo, FsError> {
         match &self.dispatch {
             #[cfg(target_os = "linux")]
@@ -1052,6 +1056,7 @@ impl InstanceOperationImpl {
     /// Whether `path` names a symbolic link [`InstanceOperation::file_info`] answers as holding
     /// nothing: a virtual clone versions none. Other operations' `file_info` follows a link, and
     /// answer false.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
     pub async fn unversioned_symlink_at(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
             #[cfg(target_os = "linux")]
@@ -1065,6 +1070,7 @@ impl InstanceOperationImpl {
 
     /// Whether a write at `path` meets such a symbolic link, at the path or above it: the user's,
     /// which a command must not write over or through.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
     pub async fn unversioned_symlink_at_or_above(
         &self,
         path: &RelativePath,
@@ -1108,6 +1114,7 @@ impl InstanceOperationImpl {
     /// stands at, its local changes refused, kept or overwritten as `options` asks
     /// ([`crate::fs::hold`]). Outside a dry run the hold counts as a change. An operation that
     /// holds no `State` refuses, changing nothing.
+    #[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
     pub async fn hold_state(
         &self,
         repository: Arc<RepositoryContext>,
