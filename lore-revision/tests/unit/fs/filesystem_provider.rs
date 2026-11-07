@@ -54,6 +54,7 @@ pub struct TestFilesystemProvider {
     pub failing_scans: Arc<Mutex<Vec<String>>>,
     /// Paths whose scan finds the named node stale.
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
+    begin_fails: bool,
     finalize_fails: bool,
     committed_fails: bool,
     write_fails: bool,
@@ -68,6 +69,14 @@ pub struct TestFilesystemProvider {
 impl TestFilesystemProvider {
     pub fn new() -> TestFilesystemProvider {
         Self::default()
+    }
+
+    /// A provider that fails to begin an operation, as one whose filesystem will not freeze.
+    pub fn failing_begin() -> TestFilesystemProvider {
+        Self {
+            begin_fails: true,
+            ..Self::new()
+        }
     }
 
     /// A provider whose operations record the finalize and then report it failed.
@@ -205,6 +214,9 @@ pub fn test_repository_over(
 impl FilesystemProvider for TestFilesystemProvider {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         self.begin_count.fetch_add(1, Ordering::AcqRel);
+        if self.begin_fails {
+            return Err(FsError::internal("the test provider fails to begin"));
+        }
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Test(TestOperation {
                 file_info_count: self.file_info_count.clone(),

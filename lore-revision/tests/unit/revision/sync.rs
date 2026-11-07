@@ -140,6 +140,112 @@ fn a_filesystem_error_keeps_its_kind_through_a_sync() {
     assert!(matches!(missing, SyncError::FileNotFound(_)), "{missing:?}");
 }
 
+/// A realize that fails answers its own error only once the task run beside it has ended, so
+/// the repository that task holds is released by the time the sync answers.
+#[tokio::test]
+async fn a_failed_realize_waits_for_the_task_beside_it() {
+    use lore_base::error::LocalModifications;
+    use lore_base::lore_spawn;
+    use lore_revision::fs::filesystem_provider::FsError;
+
+    let repository = Arc::new(());
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let held = repository.clone();
+    let beside = lore_spawn!(async move {
+        let _ = released.await;
+        drop(held);
+    });
+
+    let mut realizing = std::pin::pin!(realize_joining(beside, async {
+        Err(SyncError::from(FsError::from(LocalModifications)))
+    }));
+    assert!(
+        futures::poll!(realizing.as_mut()).is_pending(),
+        "the failed realize answered while the task beside it still ran"
+    );
+
+    release
+        .send(())
+        .expect("the task beside the realize is waiting");
+    let realized = realizing.await;
+    assert!(
+        matches!(realized, Err(SyncError::LocalModifications(_))),
+        "{realized:?}"
+    );
+    assert_eq!(
+        1,
+        Arc::strong_count(&repository),
+        "the task beside the realize still holds the repository"
+    );
+}
+
+/// A sync whose filesystem operation fails to begin starts no cache task, so nothing is left
+/// holding the repository once the sync answers. The test runtime runs one thread, so a task
+/// spawned and never awaited would still hold it at the check.
+#[tokio::test]
+async fn a_sync_that_cannot_begin_its_operation_leaves_the_repository_unheld() {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::RepositoryContext;
+
+    use crate::fs::filesystem_provider::test_store_create;
+    use crate::helper::RepositoryContextCreationArgsExt;
+    use crate::helper::default_repository_creation_args;
+    use crate::helper::test_commit_tree;
+    use crate::helper::test_file_write;
+    use crate::helper::test_repository_create;
+
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let instance = test_repository_create(
+                immutable.clone(),
+                mutable.clone(),
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
+            test_file_write(&instance.path.join("first.txt"), b"first");
+            let first = test_commit_tree(&instance, "First").await.revision();
+            test_file_write(&instance.path.join("second.txt"), b"second");
+            test_commit_tree(&instance, "Second").await;
+
+            let filesystem = Arc::new(TestFilesystemProvider::failing_begin());
+            let repository = Arc::new(
+                RepositoryContext::new(
+                    default_repository_creation_args(immutable, mutable)
+                        .with_path(&instance.path)
+                        .with_id(instance.repository.id)
+                        .with_instance_id(instance.repository.instance_id)
+                        .with_filesystem_provider(filesystem.clone()),
+                )
+                .with_write_token(instance.write_token.share()),
+            );
+
+            let synced = sync_boxed(
+                repository.clone(),
+                &instance.write_token,
+                SyncOptions {
+                    revision: Some(first.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            assert!(synced.is_err(), "{synced:?}");
+            assert_eq!(
+                1,
+                filesystem.begins(),
+                "the sync never reached its operation"
+            );
+            assert_eq!(
+                1,
+                Arc::strong_count(&repository),
+                "a task the sync started still holds the repository"
+            );
+        })
+        .await;
+}
+
 /// The walk a sync runs between the remote's latest revision of the branch and the local one.
 mod branch_point {
     use std::time::Duration;
