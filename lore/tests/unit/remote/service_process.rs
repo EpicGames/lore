@@ -43,6 +43,69 @@ fn a_config_value_of_only_space_is_treated_as_unset() {
     );
 }
 
+/// What [`executable_to_start`] picks with no executable named: this program's own only for a
+/// start that allows it, in a program that runs the service, and the naming failure otherwise.
+#[test]
+fn with_none_named_only_a_start_that_allows_it_uses_a_program_that_serves() {
+    let own = PathBuf::from("/opt/lore/bin/lore");
+    for (start, serves, starts_own) in [
+        (ServiceStart::NamedOrThisProgram, true, true),
+        (ServiceStart::NamedOrThisProgram, false, false),
+        (ServiceStart::Named, true, false),
+        (ServiceStart::Named, false, false),
+    ] {
+        let none_named = resolve_service_executable(None, None);
+        let picked = executable_to_start(none_named, start, serves, || Ok(own.clone()));
+
+        if starts_own {
+            let picked = picked.unwrap_or_else(|error| panic!("{start:?} starts its own: {error}"));
+            assert_eq!(picked, own);
+        } else {
+            let error = picked.expect_err("no executable to start");
+            assert!(
+                error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
+                "{start:?}, serving {serves}: the naming failure, got {error}"
+            );
+        }
+    }
+}
+
+/// A named executable is the one started, whatever program asks, and this program's own is not
+/// looked up then.
+#[test]
+fn a_named_executable_is_started_in_place_of_this_program() {
+    let named = PathBuf::from("/opt/lore/1.9/bin/lore");
+    for start in [ServiceStart::Named, ServiceStart::NamedOrThisProgram] {
+        let picked = executable_to_start(Ok(named.clone()), start, true, || {
+            panic!("this program's executable is not looked up when one is named")
+        });
+
+        assert_eq!(picked.expect("the named executable"), named);
+    }
+}
+
+/// A program that serves but cannot find its own executable fails as a start does that has none,
+/// naming where one can be set.
+#[test]
+fn a_program_that_cannot_find_its_own_executable_reports_it_as_unavailable() {
+    let picked = executable_to_start(
+        resolve_service_executable(None, None),
+        ServiceStart::NamedOrThisProgram,
+        true,
+        || Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+    );
+
+    let error = picked.expect_err("no executable to start");
+    assert!(
+        error.is_service_unavailable()
+            && error
+                .to_string()
+                .contains("finding this program's executable failed")
+            && error.to_string().contains(SERVICE_EXECUTABLE_SETTING),
+        "the failure and where to name one instead: {error}"
+    );
+}
+
 #[test]
 fn an_environment_value_that_reads_as_off_turns_relaying_off() {
     // The obvious way to disable something must not enable it.

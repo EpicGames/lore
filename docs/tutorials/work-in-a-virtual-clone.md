@@ -2,7 +2,7 @@
 
 In this tutorial you'll clone a repository as a virtual clone, a mount that the Lore service serves straight from the shared store, and run the everyday edit loop in it: edit files, check status, commit, push, sync, switch branches, reset an edit and merge a branch. When you're finished, your virtual clone will hold the same files as an ordinary working tree of the same repository, and you'll know how to get it back after the service stops or a clone fails.
 
-A virtual clone writes no files when you clone it. Every read of tracked content is answered from the store, which fetches what it doesn't hold on first read, and only the files you create or change are written to disk, outside the mount. Every command you run in a virtual clone is carried out by the Lore service that serves its mount, so the service has to be running.
+A virtual clone writes no files when you clone it. Every read of tracked content is answered from the store, which fetches what it doesn't hold on first read, and only the files you create or change are written to disk, outside the mount. Every command you run in a virtual clone is carried out by the Lore service that serves its mount, and a clone that finds no service running starts it.
 
 ## Prerequisites
 
@@ -14,7 +14,7 @@ A virtual clone writes no files when you clone it. Every read of tracked content
 
 1. **Start the Lore service.**
 
-   Name the build that serves your commands, then start it. The [background service tutorial](run-commands-through-the-service.md) explains both commands.
+   Name the build that serves your commands, then start it. The [background service tutorial](run-commands-through-the-service.md) explains both commands. This step is optional: the clone in the next step starts the service when none is running, from the `lore` you run.
 
    ```bash
    lore service set-executable "$(command -v lore)"
@@ -30,11 +30,11 @@ A virtual clone writes no files when you clone it. Every read of tracked content
 
 2. **Clone the repository as a virtual clone.**
 
-   `--vfs fuse` makes the clone a virtual one. It always goes to the running service, whether or not you've turned on running commands through the service.
+   `--vfs fuse` makes the clone a virtual one, over the shared store from the quickstart. It always goes to the service, whether or not you've turned on running commands through the service.
 
    ```bash
    cd ~
-   lore clone lore://127.0.0.1:41337/my-project my-project-fuse --vfs fuse --use-shared-store
+   lore clone lore://127.0.0.1:41337/my-project my-project-fuse --vfs fuse
    ```
 
    ```text
@@ -275,10 +275,18 @@ Both trees holding the same files, with the virtual clone at revision 7 in sync 
 ### `Lore service unavailable`, exit code 32, when you clone
 
 ```text
-[Error] Lore service unavailable: A FUSE clone is mounted by the Lore service, and none is running. Run `lore service start`.
+[Error] Lore service unavailable: A FUSE clone is mounted by the Lore service, and no service could be reached or started: starting /opt/lore/bin/lore failed: No such file or directory (os error 2)
 ```
 
-No service is running, so nothing was created. Run `lore service start` and clone again.
+No service was running, and none could be started from the executable named for it, with `lore service set-executable` or in `LORE_SERVICE_EXECUTABLE`, so nothing was created. Name one that exists, or clear the setting with `lore service set-executable ""` and unset `LORE_SERVICE_EXECUTABLE` to have the clone start the service from the `lore` you run, then clone again.
+
+### `Repository not found`, exit code 89, in a virtual clone
+
+```text
+[Error] Repository not found: /home/you/my-project-fuse
+```
+
+No service is running, so the clone isn't mounted and its directory is empty, for example after `lore service stop` or a restart. Run `lore service start`: it mounts every virtual clone it finds again, with your uncommitted changes in place.
 
 ### A clone fails partway
 

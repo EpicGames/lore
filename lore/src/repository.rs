@@ -121,7 +121,9 @@ pub struct LoreRepositoryCloneArgs {
     /// relative file path resolves against the caller's working directory.
     pub prefetch: LoreString,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
-    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+    /// is a virtual one, which always uses a shared store and refuses
+    /// `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
     pub use_shared_store: LoreSharedStoreMode,
     /// [Optional] Path to use for the shared store, an empty string means to use the default
     pub shared_store_path: LoreString,
@@ -256,13 +258,14 @@ async fn clone_impl(
     let global_config = GlobalConfig::load()
         .await
         .forward::<CloneError>("Couldn't load global config")?;
+    let vfs_options = args.vfs.to_config();
     let shared_store_options = SharedStoreToUseConfig::from_api_args(
         &global_config,
-        args.use_shared_store,
+        args.use_shared_store.for_vfs(vfs_options.vfs_type)?,
         &args.shared_store_path,
     )
     .forward_with::<CloneError, _>(|| format!("Invalid path: {}", args.shared_store_path))?;
-    let vfs_options = Some(args.vfs.to_config());
+    let vfs_options = Some(vfs_options);
 
     let root_files: Vec<String> = args
         .root_files
@@ -483,7 +486,9 @@ pub struct LoreRepositoryCreateArgs {
     /// Which VFS to use, if any
     pub vfs: LoreVfsType,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
-    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+    /// is a virtual one, which always uses a shared store and refuses
+    /// `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
     pub use_shared_store: LoreSharedStoreMode,
     /// [Optional] Path to use for the shared store, an empty string means to use the default
     pub shared_store_path: LoreString,
@@ -552,6 +557,7 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         .await
         .forward::<CreateError>("loading global config")?;
 
+    let vfs_options = args.vfs.to_config();
     let options = CreateOptions {
         id: if !id.is_zero() { Some(id) } else { None },
         description: if !args.description.is_empty() {
@@ -561,11 +567,11 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         },
         shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
-            args.use_shared_store,
+            args.use_shared_store.for_vfs(vfs_options.vfs_type)?,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
-        vfs_options: args.vfs.to_config(),
+        vfs_options,
     };
 
     lore_revision::repository::create::create_boxed(repository_url, repository_path, options).await
@@ -616,6 +622,7 @@ async fn create_with_metadata_impl(
         .await
         .forward::<CreateError>("loading global config")?;
 
+    let vfs_options = args.vfs.to_config();
     let options = CreateOptions {
         id: if !id.is_zero() { Some(id) } else { None },
         description: if !args.description.is_empty() {
@@ -625,11 +632,11 @@ async fn create_with_metadata_impl(
         },
         shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
-            args.use_shared_store,
+            args.use_shared_store.for_vfs(vfs_options.vfs_type)?,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
-        vfs_options: args.vfs.to_config(),
+        vfs_options,
     };
     let metadata = Some(CreateMetadata {
         creator: metadata.creator.to_string(),

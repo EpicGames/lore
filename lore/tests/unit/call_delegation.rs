@@ -13,6 +13,7 @@ use lore::call_delegation::*;
 use lore::interface::LoreEventCallback;
 use lore::interface::LoreString;
 use lore::remote::command::LoreCommand;
+use lore::remote::service_process::SERVICE_EXECUTABLE_SETTING;
 use lore::remote::service_process::running_as_service;
 use lore_base::error::InvalidArguments;
 use lore_base::error::NotFound;
@@ -535,11 +536,12 @@ fn a_default_vfs_clone_resolves_to_fuse_and_requires_the_service() {
     );
 }
 
-/// A FUSE instance with no running service fails with `ServiceUnavailable`
-/// and a message that tells the user how to fix it, rather than silently
-/// running the call locally against a mount the service isn't maintaining.
+/// A FUSE instance with no running service, in a program that names no executable to start
+/// one from and does not run the service itself, fails with `ServiceUnavailable`, on Linux
+/// naming where to set one, rather than silently running the call locally against a mount the
+/// service isn't maintaining.
 #[tokio::test]
-async fn fuse_instance_without_running_service_reports_service_unavailable_with_start_hint() {
+async fn fuse_instance_without_a_service_to_reach_or_start_reports_where_to_name_one() {
     let _socket = SERVICE_SOCKET_TESTS.lock().await;
     let root = repository_with_config("fuse-unavailable", "[vfs]\nvfs_type = \"Fuse\"\n");
     let globals = globals_for(&root);
@@ -590,8 +592,12 @@ async fn fuse_instance_without_running_service_reports_service_unavailable_with_
     assert_eq!(*sink.status.lock().unwrap(), Some(expected_code));
     let message = sink.message.lock().unwrap().clone().unwrap_or_default();
     assert!(
-        message.contains("lore service start"),
-        "the message must hint at starting the service, got: {message}"
+        message.contains("This instance is served through a FUSE mount"),
+        "the message must say why the call needs the service, got: {message}"
+    );
+    assert!(
+        !cfg!(target_os = "linux") || message.contains(SERVICE_EXECUTABLE_SETTING),
+        "on Linux, where a service would be started, it must say where to name one, got: {message}"
     );
 }
 
@@ -657,7 +663,8 @@ async fn dispatched_without_a_service<ArgsType: LoreArgs>(
 }
 
 /// A FUSE clone and a FUSE create through the arguments entry point, with no service
-/// running, never run here: each is refused with `ServiceUnavailable` and its own reason.
+/// running and none this program can start, never run here: each is refused with
+/// `ServiceUnavailable` and its own reason.
 #[tokio::test]
 async fn fuse_clone_and_create_arguments_without_a_running_service_report_their_reasons() {
     let _socket = SERVICE_SOCKET_TESTS.lock().await;
@@ -687,8 +694,9 @@ async fn fuse_clone_and_create_arguments_without_a_running_service_report_their_
     }
 }
 
-/// A FUSE clone through the command entry point, with no service running, is refused with
-/// `ServiceUnavailable` and the clone's reason rather than run here.
+/// A FUSE clone through the command entry point, with no service running and none this
+/// program can start, is refused with `ServiceUnavailable` and the clone's reason rather than
+/// run here.
 #[tokio::test]
 async fn a_fuse_clone_command_without_a_running_service_reports_the_clone_reason() {
     let _socket = SERVICE_SOCKET_TESTS.lock().await;

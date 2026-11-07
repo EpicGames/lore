@@ -399,6 +399,80 @@ def test_start_reports_a_reachable_service_whether_or_not_it_started_one(
 
 
 @pytest.mark.smoke
+def test_start_with_no_executable_named_serves_from_the_client_that_ran_it(
+    new_lore_repo, stops_background_services
+):
+    """`service start` asks for a service outright, so with no executable named
+    the `lore` that ran it starts one from itself, as the configuration reference
+    describes. Relaying a command still needs one named, which
+    `test_relaying_without_an_executable_or_running_service_fails` holds."""
+    repo: Lore = new_lore_repo()
+    env = repo.sandboxed_env()
+    # Left unnamed on purpose, so the name `sandboxed_env` supplies is dropped.
+    env.pop("LORE_SERVICE_EXECUTABLE", None)
+
+    def service(command: str) -> str:
+        ran = subprocess.run(
+            [repo.lore_executable_path, "service", command],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=repo.path,
+        )
+        output = ran.stdout + ran.stderr
+        assert ran.returncode == 0, f"service {command} must succeed: {output}"
+        return output
+
+    started = service("start")
+    assert LORE_SERVICE_RUNNING_MESSAGE in started, started
+
+    status = service("status")
+    reported = next(
+        (
+            line.split("Executable:", 1)[1].strip()
+            for line in status.splitlines()
+            if "Executable:" in line
+        ),
+        None,
+    )
+    assert reported is not None, f"status must report an executable: {status}"
+    assert _same_file_path(reported, repo.lore_executable_path), (
+        f"the service must be the client that started it: reported {reported!r}, "
+        f"expected {repo.lore_executable_path!r}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    platform.system() == "Linux", reason="Linux serves FUSE, so a FUSE clone starts a service"
+)
+def test_a_fuse_clone_off_linux_starts_no_service(
+    new_lore_repo, stops_background_services, lore_service_runner
+):
+    """Off Linux, which serves no FUSE clone, a FUSE clone fails without starting a
+    service to refuse it."""
+    repo: Lore = new_lore_repo()
+    clone_path = str(Path(repo.path).parent / Lore.generate_random_name("fuse-clone"))
+
+    command = subprocess.run(
+        [
+            *(repo.lore_executable_path, "--repository", repo.path),
+            *("repository", "clone", repo.remote_path, clone_path),
+            *("--vfs", "fuse", "--use-shared-store"),
+        ],
+        capture_output=True,
+        text=True,
+        env=repo.sandboxed_env(),
+        cwd=repo.path,
+    )
+
+    assert command.returncode != 0, command.stdout + command.stderr
+    assert LORE_NO_SERVICE_MESSAGE in stop_lore_service(
+        repo.lore_executable_path, lore_service_runner.global_dir_name
+    ), "the clone must not have started a service"
+
+
+@pytest.mark.smoke
 def test_stop_ends_the_service_and_reports_when_there_is_none(
     new_lore_repo, stops_background_services
 ):

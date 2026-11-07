@@ -15,6 +15,8 @@ from lore import Lore
 from error_types import LoreException
 from service_util import LORE_SERVICE_ENVIRONMENT
 
+INVALID_ARGUMENTS = 3
+
 logger = logging.getLogger(__name__)
 
 
@@ -298,6 +300,7 @@ class TestInstanceMove:
         assert "already exists" in str(exc_info.value).lower(), (
             f"Error should mention target exists. Got: {exc_info.value}"
         )
+        assert exc_info.value.returncode == INVALID_ARGUMENTS, exc_info.value
 
         # Nothing was changed: the instance is still at the source, and registered there.
         assert os.path.isdir(repo.dot_path())
@@ -310,31 +313,33 @@ class TestInstanceMove:
             str(target) not in listed and str(target).replace("\\", "/") not in listed
         )
 
-    def test_instance_move_fails_if_parent_missing(self, new_lore_repo, scratch_dir):
-        """Moving to a path with non-existent parent should fail."""
+    def test_instance_move_creates_a_missing_parent(self, new_lore_repo, scratch_dir):
+        """A move creates the directories above its target that don't exist, and a
+        dry run creates none of them.
+
+        Runs from outside the repository, as Windows cannot rename a directory that
+        is a running process's working directory."""
         repo: Lore = new_lore_repo()
+        with repo.open_file("test.txt", "w") as f:
+            f.write("test content\n")
+        repo.stage(scan=True, offline=True)
+        repo.commit("Test commit", offline=True)
+        original_path = repo.path
+        missing = scratch_dir("missing_parent")
+        target = missing / "subdir" / "repo"
+        outside = str(missing.parent)
 
-        # Target path with non-existent parent
-        target = scratch_dir("nonexistent_parent", unique=False) / "subdir" / "repo"
+        repo.repository_instance_move(str(target), dry_run=True, cwd=outside)
+        assert not os.path.exists(missing), "a dry run creates nothing"
 
-        # Move should fail because parent doesn't exist
-        with pytest.raises(LoreException) as exc_info:
-            repo.repository_instance_move(str(target))
+        repo.repository_instance_move(str(target), cwd=outside)
 
-        assert (
-            "parent" in str(exc_info.value).lower()
-            or "does not exist" in str(exc_info.value).lower()
-        ), f"Error should mention parent issue. Got: {exc_info.value}"
-
-        # Nothing was changed: the instance is still at the source, and registered there.
-        assert os.path.isdir(repo.dot_path())
-        assert not os.path.exists(target.parent)
-        listed = repo.repository_instance_list()
-        assert repo.path in listed or repo.path.replace("\\", "/") in listed, (
-            f"Instance should still be registered at the source. Output: {listed}"
-        )
-        assert (
-            str(target) not in listed and str(target).replace("\\", "/") not in listed
+        assert not os.path.exists(original_path), "the instance left the source"
+        with open(target / "test.txt") as f:
+            assert f.read() == "test content\n", "the instance is at the target"
+        listed = repo.repository_instance_list(path=str(target), cwd=outside)
+        assert str(target) in listed or str(target).replace("\\", "/") in listed, (
+            f"Instance should be registered at the target. Output: {listed}"
         )
 
     @pytest.mark.own_vfs("checks the .lore an ordinary instance carries into the moved directory")
@@ -524,6 +529,7 @@ class TestInstanceMove:
         assert "already exists" in str(exc_info.value).lower(), (
             f"Error should mention target exists. Got: {exc_info.value}"
         )
+        assert exc_info.value.returncode == INVALID_ARGUMENTS, exc_info.value
 
     @pytest.mark.skipif(
         sys.platform != "win32", reason="Only Windows blocks on a working directory"

@@ -3,11 +3,19 @@ type: feature
 ---
 
 - `lore-client`: `lore clone --vfs fuse` makes a virtual clone on Linux: the Lore service mounts the repository with
-  FUSE and serves its files from the store, fetching them on first read, so the clone writes no files. A command that
-  makes one runs through the service, which mounts its virtual clones again when it starts. `--vfs default` picks
-  FUSE on Linux, SWFS on Windows and no virtual filesystem elsewhere, where it picked SWFS on every platform
+  FUSE and serves its files from the shared store for its remote, fetching them on first read, so the clone writes no
+  files. A command that
+  makes one, or works in one, runs through the service, which mounts its virtual clones again when it starts. With no
+  service running, a command that makes one starts the service, as does a command in one whose service ended without
+  taking its mount down: from the executable `lore service set-executable` names, or with none named, from the `lore`
+  that ran the command. A command in a virtual clone whose service is still starting, or listens on another socket,
+  starts none, and says which socket it looked on. `--vfs default` picks FUSE on Linux, SWFS on Windows and no virtual filesystem
+  elsewhere, where it picked SWFS on every platform
 - `lore`: `LORE_VFS_TYPE_FUSE` asks `lore_repository_clone` for a virtual clone on Linux, and
   `LORE_VFS_TYPE_DEFAULT` picks FUSE on Linux, SWFS on Windows and none elsewhere
+- `lore`: `lore::serve_from_this_executable()` tells the library that the program's own executable runs the service
+  with `service run`, so starting the service, and a command that makes a virtual clone, start one from it when no
+  executable is named
 - `lore-revision`: Virtual clones run the edit loop as an ordinary clone does, the ignore file included, apart from a
   file added with `lore file dirty` that the ignore file names: it stays marked, where an ordinary clone's scan drops
   it. A virtual clone resolves names in the case they are spelled, as an ordinary Linux clone does, so a rename

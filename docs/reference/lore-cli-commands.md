@@ -347,7 +347,7 @@ Create a repository in the given directory
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -361,7 +361,7 @@ Create a repository in the given directory
       store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
       no remote
 
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
 ## `lore repository clone`
@@ -388,7 +388,7 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -405,7 +405,7 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
 * `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
@@ -2182,7 +2182,7 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -2199,7 +2199,7 @@ virtual clone writes no files and reads them from the remote when a command need
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
 * `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)

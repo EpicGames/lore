@@ -27,19 +27,19 @@ the service's. Other paths are from the repository root.
 | Kernel FUSE protocol 7.39 or later (Linux 6.8 ships 7.39), offering every required INIT flag | `src/init.rs:90`, `src/abi/mod.rs:61` |
 | Read-write access to `/dev/fuse` | `src/transport/device.rs:169` |
 | `fusermount3` on `PATH`. Root falls back to `mount(2)` when it is missing or fails. | `src/mount.rs:130` |
-| A running service. A FUSE instance is only created inside the service process. | `lore-revision/src/repository.rs:3180-3182` |
+| The service. A FUSE instance is only created inside the service process, and a command that needs one starts one when none is running. | `lore-revision/src/repository.rs:3180-3182` |
 
 ## Trying it
 
 ```sh
 cargo build --release -p lore-client          # builds the `lore` binary
 export PATH=$PWD/target/release:$PATH
-export LORE_SERVICE_EXECUTABLE=$PWD/target/release/lore   # needed to start a service
+export LORE_SERVICE_EXECUTABLE=$PWD/target/release/lore   # this build serves, over [service] executable
 export LORE_SERVICE_SOCKET=lore-fuse-try       # a service of its own, apart from any other
-lore service start                             # this build, on this socket
 
-# Clone into a FUSE mount. The clone runs in the service. --view and --prefetch are optional.
-lore clone <url> ~/work/tree --vfs fuse --use-shared-store \
+# Clone into a FUSE mount. The clone runs in the service, and with none running on this socket
+# starts one. --view and --prefetch are optional.
+lore clone <url> ~/work/tree --vfs fuse \
     --view <view filter file> --prefetch <recording>
 
 ls -l ~/work/tree; cat ~/work/tree/README.md    # read through the mount
@@ -58,24 +58,34 @@ lore service start                             # remounts every FUSE instance
 
 - `--vfs fuse` selects `VfsType::Fuse`. `--vfs default` also means FUSE on Linux
   (`LoreVfsType::to_config`, `lore/src/repository.rs:77-81`); the flag's default is `none`.
-- A FUSE clone, and every command run against an existing FUSE instance, goes to the running
-  service whatever `LORE_USE_SERVICE` says (`command_requires_service`,
-  `lore/src/call_delegation.rs:269`). With no service running it fails with `ServiceUnavailable`
-  (exit code 32) and a hint to run `lore service start`; the clone starts no service and creates
-  nothing (`lore/src/call_delegation.rs:299-330`).
+- A FUSE clone, and every command run against an existing FUSE instance, goes to the service
+  whatever `LORE_USE_SERVICE` says (`command_requires_service`, `lore/src/call_delegation.rs:303`).
+  With no service running it starts one: from the named service executable, or with none named,
+  from the `lore` client that ran it, which calls `lore::serve_from_this_executable()`
+  (`executable_to_start`, `lore/src/remote/service_process.rs:201`). A program that links the
+  library and names none fails with `ServiceUnavailable` (exit code 32) and creates nothing
+  (`forced_service_call`, `lore/src/call_delegation.rs:336`). `lore service start` starts one the
+  same way. A command in an instance whose mount answers while nothing listens on its socket
+  starts none: the service serving the mount is still starting, or listens on another socket. The
+  error names both causes and the socket it looked on.
+- An instance is found as FUSE through its mount (`discover_external_dot_lore`), so a command at
+  the path of a clone no service has mounted, after `lore service stop` or a reboot, does not see
+  the instance and starts no service. `lore service start` mounts it again.
 - `LORE_USE_SERVICE` relays any other command; `0`, `false`, `no` and `off` read as off
-  (`reads_as_off`, `lore/src/remote/service_process.rs:177`).
+  (`reads_as_off`, `lore/src/remote/service_process.rs:239`).
   `lore service set-use-automatically true` makes relaying the default.
-- Only starting a service needs a named service executable: `LORE_SERVICE_EXECUTABLE`, or
-  `lore service set-executable <path>` (`[service] executable` in the global config;
-  `resolve_service_executable`, `lore/src/remote/service_process.rs:120`). Relaying to a running
-  service needs none.
+- A relayed command starts a service only from a named service executable:
+  `LORE_SERVICE_EXECUTABLE`, or `lore service set-executable <path>` (`[service] executable` in the
+  global config; `resolve_service_executable`, `lore/src/remote/service_process.rs:120`). Relaying
+  to a running service needs none.
 - `LORE_SERVICE_SOCKET` names the service socket; processes sharing a value share a service
   (`lore/src/remote.rs:26`). `.cargo/config.toml` sets `LORE_USE_SERVICE=0` and
   `LORE_SERVICE_SOCKET=lore_service-cargo` for anything `cargo` runs. Override both when trying
   the mount through `cargo run`.
-- `--use-shared-store` matters for restarts: the service remounts only instances it finds through
-  the shared store registry (`mounts_of_entries`, `fs/mount_manager.rs:79`).
+- A FUSE clone always uses the shared store for its remote, as if `--use-shared-store` were given,
+  and refuses `LORE_SHARED_STORE_MODE_DISABLED` (`LoreSharedStoreMode::for_vfs`,
+  `lore-revision/src/repository.rs:403`): the service remounts only instances it finds through the
+  shared store registry (`mounts_of_entries`, `fs/mount_manager.rs:79`).
 - The instance's `.lore` directory lives outside the mount, at
   `<global data>/external/<instance id>/.lore` (`lore-revision/src/global/external_dir.rs:18`).
   Commands inside the mount find it through `/proc/self/mountinfo`, never by statting the mount
@@ -89,7 +99,7 @@ of every block (see "Prefetch"). To record a prefetch file:
 ```sh
 lore service stop
 LORE_FUSE_RECORD_DIR=~/recordings lore service start   # every mount this service constructs records
-lore clone <url> ~/work/rec --vfs fuse --use-shared-store --view <view filter file>
+lore clone <url> ~/work/rec --vfs fuse --view <view filter file>
 (cd ~/work/rec && <build>)                              # the workload to record
 lore service stop                                       # the recording is ~/recordings/<instance id>-<unix seconds>.txt
 lore service start                                      # without the variable: recording off

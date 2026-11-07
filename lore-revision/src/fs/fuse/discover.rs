@@ -109,3 +109,13 @@ pub fn discover_external_dot_lore(path: &Path) -> Result<Option<PathBuf>, Extern
         None => Ok(None),
     }
 }
+
+/// The mount point of the innermost `fuse.lore` mount at or above `path` when that mount answers,
+/// so a service serves it. `None` where there is no such mount, or where the innermost one is
+/// stale, left by a service that ended without unmounting it. Probes the mount point alone, with
+/// a `statfs` its server answers, so a caller on a runtime runs it on a blocking thread.
+pub fn answering_lore_mount(path: &Path) -> Option<PathBuf> {
+    let mountinfo = std::fs::read_to_string(MOUNTINFO_PATH).ok()?;
+    let (mount_point, _) = lore_mount_for_path(&mountinfo, path)?;
+    (!lore_fuse::mount::is_stale_mount(&mount_point)).then_some(mount_point)
+}

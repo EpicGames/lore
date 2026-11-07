@@ -218,6 +218,9 @@ def test_double_create(new_lore_repo, scratch_dir):
         repo.shared_store_create(repo.remote, str(store_path))
 
 
+@pytest.mark.own_vfs(
+    "checks the store in the .lore of a repository without a shared store, which a virtual clone always uses"
+)
 @pytest.mark.smoke
 def test_create_repo(new_lore_repo):
     # Create the default shared store
@@ -529,6 +532,9 @@ def test_set_and_get_automatic_shared_store(new_lore_repo):
     assert info.is_automatic is False, "is_automatic should be false after disabling"
 
 
+@pytest.mark.own_vfs(
+    "checks the default store automatic use picks, where the run gives a virtual clone a store of its own"
+)
 @pytest.mark.smoke
 def test_automatic_shared_store(new_lore_repo, create_repo):
     """With automatic usage enabled and no shared store yet, creating or cloning

@@ -135,22 +135,21 @@ fn resolve_service_executable(
     )))
 }
 
-/// The executable to start the service with, reading the one set in the config.
+/// The executable named to start the service with, and whether the global config could be read.
 ///
 /// A config that cannot be read leaves the executable unknown rather than failing
 /// the call. Most callers have none set, so a config Lore cannot read is reported
 /// and stepped over.
-pub async fn service_executable() -> Result<PathBuf, ServiceProcessError> {
-    let config = match GlobalConfig::load().await {
-        Ok(config) => Some(config),
+pub async fn service_executable() -> (Result<PathBuf, ServiceProcessError>, bool) {
+    match GlobalConfig::load().await {
+        Ok(config) => (service_executable_in(Some(&config)), true),
         Err(error) => {
             lore_warn!(
                 "Could not read {SERVICE_EXECUTABLE_SETTING} from the global config: {error}"
             );
-            None
+            (service_executable_in(None), false)
         }
-    };
-    service_executable_in(config.as_ref())
+    }
 }
 
 /// The executable to start the service with, from the environment variable or `config`, which is
@@ -162,6 +161,62 @@ pub(crate) fn service_executable_in(
         std::env::var_os(SERVICE_EXECUTABLE_VAR),
         config.and_then(GlobalConfig::service_executable),
     )
+}
+
+/// Whether this program's own executable runs the service when started with
+/// [`SERVICE_RUN_ARGUMENTS`]. Set once through [`serve_from_this_executable`].
+static SERVES_FROM_THIS_EXECUTABLE: AtomicBool = AtomicBool::new(false);
+
+/// Records that this program's own executable runs the service when started with
+/// `service run`.
+///
+/// A start asked for outright, and a command only the service may carry out, such as one
+/// that makes a virtual clone, then start a service from this executable when none is
+/// running and none is named. A program whose executable does not run the service that
+/// way must not call this: it would be started in place of a service.
+pub fn serve_from_this_executable() {
+    SERVES_FROM_THIS_EXECUTABLE.store(true, Ordering::Release);
+}
+
+/// The executables a caller may start a service from when none is running.
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceStart {
+    /// The one named in `LORE_SERVICE_EXECUTABLE` or `[service] executable`. Relaying, once
+    /// turned on, is on for every program on the machine that links the library, so without a
+    /// name the build serving the machine would be whichever relayed first.
+    Named,
+    /// The named one, else this program's own where it runs the service
+    /// ([`serve_from_this_executable`]). For a start asked for outright, and for a command
+    /// only the service may carry out, which has no other place to run.
+    NamedOrThisProgram,
+}
+
+/// The executable a `start` may start a service from: `named`, else, where none is named,
+/// this program's own, from `this_executable`, where `start` allows it and `may_serve` holds.
+/// `may_serve` is false for a program that doesn't run the service, and where the global config
+/// couldn't be read, as it may name one. Fails as `named` does otherwise, and says so as well
+/// when this program's own cannot be found.
+#[lore_macro::test_pub]
+fn executable_to_start(
+    named: Result<PathBuf, ServiceProcessError>,
+    start: ServiceStart,
+    may_serve: bool,
+    this_executable: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, ServiceProcessError> {
+    let none_named = match named {
+        Err(ServiceProcessError::ServiceUnavailable(unavailable))
+            if start == ServiceStart::NamedOrThisProgram && may_serve =>
+        {
+            unavailable.into_inner().reason
+        }
+        named => return named,
+    };
+    this_executable().map_err(|error| {
+        unavailable(format!(
+            "finding this program's executable failed: {error}, and {none_named}"
+        ))
+    })
 }
 
 /// Environment variable that turns relaying on or off, overriding the setting
@@ -253,7 +308,7 @@ impl ServiceSettings {
     /// Whether calls are relayed to the service, which is when relaying is asked for.
     ///
     /// An executable is not required here: a service already running can be used
-    /// without one. Only starting a service when none is running requires an
+    /// without one. Only starting a service when none is running requires a named
     /// executable, and that check happens in [`connect_or_spawn_service`].
     fn decide_use_service(&self) -> bool {
         relaying_is_asked_for(std::env::var_os(USE_SERVICE_VAR), self.relaying_on)
@@ -512,21 +567,30 @@ pub(crate) async fn connect_to_running_service() -> Result<Option<UdsStream>, Se
     connect_attempt().await
 }
 
-/// Connects to the service, starting one when none is running.
+/// Connects to the service, starting one when none is running from an executable
+/// `start` allows.
 ///
 /// Several callers reach this at once with no service running, and each starts
 /// one. Only the first to claim the socket keeps running, and the rest exit once
 /// it answers, so what is waited for afterwards is *a* service answering rather
 /// than the one this caller started: the callers whose service lost the claim
 /// become clients of the one that won it.
-pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProcessError> {
+pub(crate) async fn connect_or_spawn_service(
+    start: ServiceStart,
+) -> Result<UdsStream, ServiceProcessError> {
     if let Some(connection) = connect_to_running_service().await? {
         return Ok(connection);
     }
 
     collect_exited_services();
 
-    let executable = service_executable().await?;
+    let (named, config_read) = service_executable().await;
+    let executable = executable_to_start(
+        named,
+        start,
+        config_read && SERVES_FROM_THIS_EXECUTABLE.load(Ordering::Acquire),
+        std::env::current_exe,
+    )?;
     let mut service = lore_base::lore_spawn_blocking!(move || spawn_service(executable))
         .await
         .internal("joining the service start task")??;

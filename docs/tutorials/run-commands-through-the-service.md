@@ -12,7 +12,7 @@ The service and both settings are per user: the config is your user-level `confi
 
 ## Step 1 — Name the build that serves your commands
 
-Lore never guesses which executable to start as the service, so you name it once. Use the absolute path of the `lore` you want serving your commands.
+A command that the setting sends to the service starts one only from an executable you name, so the build serving your machine is one you chose. Name it once, with the absolute path of the `lore` you want serving your commands.
 
 <!-- tabs:start -->
 
@@ -50,7 +50,7 @@ lore service set-use-automatically true
 Lore commands will be carried out by the service
 ```
 
-Both settings are needed. With the setting on and no executable named, Lore tells you so and keeps running commands in the process you ran.
+Both settings are needed. With the setting on and no executable named, commands go to a service that's already running and fail with exit code 32 when none is, and Lore warns you of that when you turn the setting on.
 
 ## Step 3 — Run a command
 
@@ -167,16 +167,13 @@ use_automatically = true
 
 ## Troubleshooting
 
-### Commands still run in the process that ran them
-
-Lore prints a warning naming what is missing:
+### A warning that no service executable is set
 
 ```text
-[Warn] No service executable is named, so commands will keep running in the process
-that runs them.
+[Warn] No service executable is set. Commands will use a service that is already running, but will fail if none is running. To let commands start a service when needed, set an executable with `lore service set-executable <path>`, or under [service] executable in the global config.
 ```
 
-Relaying needs the setting *and* an executable. Run `lore service set-executable <path>` to complete the pair. Clearing the executable with `lore service set-executable ""` is the other way back to a pair that does not relay.
+You turned the service on without naming an executable. Commands go to a service that's already running, and fail with exit code 32 when none is. Run `lore service set-executable <path>` so that they start one when needed.
 
 ### `Lore service unavailable`, exit code 32
 

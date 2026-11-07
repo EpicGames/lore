@@ -484,6 +484,11 @@ def lore_service_socket():
     remove_service_claim(socket_name)
 
 
+# The executable a test relayed to the shared service names for starting one: a
+# path that does not exist, so the failure to start it says what happened.
+SHARED_SERVICE_GONE = "/the-shared-lore-service-of-this-run-stopped"
+
+
 @pytest.fixture(autouse=True)
 def _relays_to_the_shared_service(request, monkeypatch):
     """Carries out every command of the test in the service named by
@@ -492,18 +497,19 @@ def _relays_to_the_shared_service(request, monkeypatch):
 
     A test that manages a service of its own, through `lore_service_runner`,
     keeps it and this run's socket, and a test marked `runs_in_process` keeps
-    its commands in their own process. No executable is named, so a command that
-    finds the shared service gone fails rather than starting one of its own.
-    Each call carries the test's global and auth paths, which the service reads
-    in place of its own.
+    its commands in their own process. The executable named for starting a
+    service does not exist, so a command that finds the shared service gone
+    fails rather than starting one of its own. Naming none would not do: a
+    command in a virtual clone, and `lore service start`, then start one from
+    the `lore` that ran them. Each call carries the test's global and auth
+    paths, which the service reads in place of its own.
     """
     if _relayed_to_the_shared_service(request):
         monkeypatch.setenv("LORE_USE_SERVICE", "1")
         monkeypatch.setenv(
             LORE_SERVICE_SOCKET_VAR, os.environ[LORE_TEST_SERVICE_SOCKET_VAR]
         )
-        # Blank rather than unset, so `name_service_executable` leaves it so.
-        monkeypatch.setenv("LORE_SERVICE_EXECUTABLE", " ")
+        monkeypatch.setenv("LORE_SERVICE_EXECUTABLE", SHARED_SERVICE_GONE)
 
 
 def _relayed_to_the_shared_service(request) -> bool:

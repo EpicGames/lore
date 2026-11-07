@@ -22,6 +22,9 @@ use crate::remote::call::ServiceCallError;
 use crate::remote::call::service_call;
 use crate::remote::call::service_call_over;
 use crate::remote::command::LoreCommand;
+use crate::remote::service_process::ServiceProcessError;
+use crate::remote::service_process::ServiceStart;
+use crate::remote::service_process::connect_or_spawn_service;
 use crate::remote::service_process::connect_to_running_service;
 use crate::remote::service_process::running_as_service;
 use crate::remote::service_process::service_in_use;
@@ -231,17 +234,47 @@ fn instance_requires_service_given(globals: &LoreGlobalArgs, running_as_service:
     if running_as_service {
         return false;
     }
+    instance_path(globals).is_some_and(|path| {
+        lore_revision::repository::load_repository_config(&path)
+            .is_ok_and(|config| config.vfs_type() == lore_revision::repository::VfsType::Fuse)
+    })
+}
+
+/// The absolute path of the instance `globals` names, if they name one.
+fn instance_path(globals: &LoreGlobalArgs) -> Option<std::path::PathBuf> {
     let repository_path = globals.repository_path();
     if repository_path.is_empty() {
-        return false;
+        return None;
     }
-    let path = lore_revision::util::path::make_absolute_from(
-        repository_path,
-        globals.working_directory().map(std::path::Path::new),
+    Some(
+        lore_revision::util::path::make_absolute_from(
+            repository_path,
+            globals.working_directory().map(std::path::Path::new),
+        )
+        .unwrap_or_else(|_| std::path::PathBuf::from(repository_path)),
     )
-    .unwrap_or_else(|_| std::path::PathBuf::from(repository_path));
-    lore_revision::repository::load_repository_config(&path)
-        .is_ok_and(|config| config.vfs_type() == lore_revision::repository::VfsType::Fuse)
+}
+
+/// Whether a forced call that reaches no service starts one: only on Linux, the one platform that
+/// serves FUSE, and not for a call in an instance whose mount answers, which a service that is
+/// still starting or listens on another socket serves. The mount is probed on a blocking thread,
+/// as its server answers the probe.
+#[cfg(target_os = "linux")]
+async fn starts_a_service(globals: &LoreGlobalArgs, makes_instance: bool) -> bool {
+    let Some(path) = instance_path(globals).filter(|_| !makes_instance) else {
+        return true;
+    };
+    lore_base::lore_spawn_blocking!(move || {
+        lore_revision::fs::fuse::discover::answering_lore_mount(&path).is_none()
+    })
+    .await
+    .unwrap_or(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+async fn starts_a_service(_globals: &LoreGlobalArgs, _makes_instance: bool) -> bool {
+    false
 }
 
 /// Whether `args` must run in the Lore service rather than here, decided without building a
@@ -292,30 +325,80 @@ fn command_requires_service_given(
     args_require || instance_requires_service_given(globals, false)
 }
 
-/// Runs a call on the service without ever starting one, for an instance,
-/// clone, or create only the service may act through.
+/// Runs a call on the service for an instance, clone, or create only the service may act
+/// through, starting one when none is running and [`starts_a_service`] holds: from the executable
+/// named for it, or else from this program's own where it runs the service
+/// ([`ServiceStart::NamedOrThisProgram`]).
 ///
-/// Reports [`lore_base::error::ServiceUnavailable`], with a hint on how to
-/// start one, rather than spawning a service to answer a call this process
-/// has no business running locally.
-async fn service_call_without_spawn(
+/// Never runs the call here. Where no service can be reached or started, it reports
+/// [`lore_base::error::ServiceUnavailable`], saying why the call needs one and why none could be
+/// had.
+async fn forced_service_call(
     globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
-    if let Ok(Some(connection)) = connect_to_running_service().await {
-        return service_call_over(connection, globals, command, callback).await;
+    let unreached = match connect_to_running_service().await {
+        Ok(Some(connection)) => {
+            return service_call_over(connection, globals, command, callback).await;
+        }
+        Ok(None) => None,
+        Err(error) => Some(error),
+    };
+    Box::pin(unanswered_forced_service_call(
+        globals, command, callback, unreached,
+    ))
+    .await
+}
+
+/// [`forced_service_call`] where no service answered its connect, failing with `unreached` or,
+/// where that is `None`, finding none running. Starts one where [`starts_a_service`] holds and
+/// runs the call on it, or else reports why none could be had.
+///
+/// Boxed by its caller: it holds a second [`service_call_over`], and runs only where a service is
+/// missing, so the future of every forced call stays the size of the call over a running service.
+async fn unanswered_forced_service_call(
+    globals: LoreGlobalArgs,
+    command: LoreCommand,
+    callback: LoreEventCallback,
+    mut unreached: Option<ServiceProcessError>,
+) -> i32 {
+    let makes_instance = matches!(
+        command,
+        LoreCommand::RepositoryClone(_) | LoreCommand::RepositoryCreate(_)
+    );
+    if unreached.is_none() && starts_a_service(&globals, makes_instance).await {
+        match connect_or_spawn_service(ServiceStart::NamedOrThisProgram).await {
+            Ok(connection) => {
+                return service_call_over(connection, globals, command, callback).await;
+            }
+            Err(error) => unreached = Some(error),
+        }
     }
-    let reason = match &command {
-        LoreCommand::RepositoryClone(_) => "A FUSE clone is mounted by the Lore service, and \
-             none is running. Run `lore service start`."
-            .to_string(),
-        LoreCommand::RepositoryCreate(_) => "A FUSE instance is created and mounted by the \
-             Lore service, and none is running. Run `lore service start`."
-            .to_string(),
-        _ => "This instance is served through a FUSE mount only the Lore service may use, and \
-              none is running. Run `lore service start`."
-            .to_string(),
+    let needs = match &command {
+        LoreCommand::RepositoryClone(_) => "A FUSE clone is mounted by the Lore service",
+        LoreCommand::RepositoryCreate(_) => {
+            "A FUSE instance is created and mounted by the Lore service"
+        }
+        _ => "This instance is served through a FUSE mount only the Lore service may use",
+    };
+    let reason = match unreached {
+        None if makes_instance || !cfg!(target_os = "linux") => {
+            format!("{needs}, and no service is running")
+        }
+        None => format!(
+            "{needs}, and the service serving its mount doesn't listen on this command's socket, \
+             {}: it is still starting, or it listens on another socket. Run the command again \
+             once it has started, or with the `LORE_SERVICE_SOCKET` it listens on",
+            crate::remote::service_socket_name()
+        ),
+        Some(ServiceProcessError::ServiceUnavailable(unavailable)) => format!(
+            "{needs}, and no service could be reached or started: {}",
+            unavailable.into_inner().reason
+        ),
+        Some(error @ ServiceProcessError::Internal(_)) => {
+            format!("{needs}, and no service could be reached or started: {error}")
+        }
     };
     crate::call::no_repository_call(
         globals,
@@ -342,7 +425,7 @@ pub fn run_command(
     callback: LoreEventCallback,
 ) -> i32 {
     if command_requires_service(&globals, &command) {
-        run_on_running_service(globals, command, callback)
+        run_forced(globals, command, callback)
     } else if service_in_use_blocking() {
         run_relayed(globals, command, callback)
     } else {
@@ -350,16 +433,12 @@ pub fn run_command(
     }
 }
 
-/// Relays `command` to a Lore service already running and blocks until it finishes, for an
-/// instance, clone, or create only the service may act through. Not inlined, for the reason
-/// [`run_relayed`] gives.
+/// Relays `command` to the Lore service and blocks until it finishes, for an instance, clone, or
+/// create only the service may act through, as [`forced_service_call`] does. Not inlined, for the
+/// reason [`run_relayed`] gives.
 #[inline(never)]
-fn run_on_running_service(
-    globals: LoreGlobalArgs,
-    command: LoreCommand,
-    callback: LoreEventCallback,
-) -> i32 {
-    block_on_command(pin!(service_call_without_spawn(globals, command, callback)))
+fn run_forced(globals: LoreGlobalArgs, command: LoreCommand, callback: LoreEventCallback) -> i32 {
+    block_on_command(pin!(forced_service_call(globals, command, callback)))
 }
 
 /// Relays `command` to the Lore service and blocks until it finishes. Not inlined, so the relay's
@@ -398,7 +477,7 @@ pub(crate) async fn dispatch_command(
     callback: LoreEventCallback,
 ) -> i32 {
     if command_requires_service(&globals, &command) {
-        let relay = pin!(service_call_without_spawn(globals, command, callback));
+        let relay = pin!(forced_service_call(globals, command, callback));
         relay.await
     } else if service_in_use().await {
         let relay = pin!(service_call(globals, command, callback));
@@ -431,7 +510,7 @@ pub(crate) async fn dispatch_call<
     handler: Handler,
 ) -> i32 {
     if args_require_service(&globals, &args, running_as_service()) {
-        return service_call_without_spawn(globals, args.to_command(), callback).await;
+        return forced_service_call(globals, args.to_command(), callback).await;
     }
     if service_in_use().await {
         service_call(globals, args.to_command(), callback).await

@@ -26,6 +26,7 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreString;
 use crate::remote::call::service_call_over;
 use crate::remote::service_process::ServiceProcessError;
+use crate::remote::service_process::ServiceStart;
 use crate::remote::service_process::collect_exited_services;
 use crate::remote::service_process::connect_or_spawn_service;
 use crate::remote::service_process::connect_to_running_service;
@@ -44,9 +45,10 @@ pub struct LoreServiceStartArgs {}
 
 /// Start the Lore service process, unless one is already running.
 ///
-/// Connects to the running service, and starts one when nothing is listening.
-/// Succeeds once a service is reachable, whether it was already running or was
-/// started here.
+/// Connects to the running service, and starts one when nothing is listening: from the
+/// executable named in `LORE_SERVICE_EXECUTABLE` or `[service] executable`, else from this
+/// program's own where it runs the service ([`crate::serve_from_this_executable`]). Succeeds
+/// once a service is reachable, whether it was already running or was started here.
 ///
 /// # Events
 ///
@@ -86,9 +88,11 @@ fn start_local(
         // The connection is proof that a service is reachable and nothing more.
         // A start asks for one to be running, not for anything to be sent to it,
         // so it is closed again here.
-        connect_or_spawn_service().await.map(|_connection| {
-            lore_info!("Lore service is running");
-        })
+        connect_or_spawn_service(ServiceStart::NamedOrThisProgram)
+            .await
+            .map(|_connection| {
+                lore_info!("Lore service is running");
+            })
     })
 }
 

@@ -823,6 +823,34 @@ mod tests {
         );
     }
 
+    /// With no executable named, a program that has not said its own executable runs the
+    /// service starts none, and the failure names where one can be set.
+    #[test]
+    #[serial]
+    fn a_start_with_none_named_starts_nothing_in_a_program_that_does_not_serve() {
+        let _settings = machine_settings("service-api-none-named-");
+        // Safety: as above.
+        unsafe { std::env::remove_var(EXECUTABLE_VAR) };
+
+        let (messages, callback) = capturing();
+        let status = lore::runtime().block_on(start(callback));
+        let reported = messages
+            .lock()
+            .expect("the collector lock is not poisoned")
+            .join("\n");
+
+        assert_eq!(
+            status,
+            unavailable_code(),
+            "with none named, nothing is started: {reported}"
+        );
+        assert!(
+            reported.contains("[service] executable"),
+            "the failure must name where one can be set: {reported}"
+        );
+        assert!(!socket_is_accepting(), "no service answers on the socket");
+    }
+
     /// A status with no service running succeeds with running=false, rather than
     /// failing with a connection error. This is the expected behavior when the
     /// service is not started.

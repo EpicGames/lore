@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-"""FUSE instances served by the background service: clone, read, sync, the refusal
-outside the service, a service stop that meets a busy mount, a forced stop after a
+"""FUSE instances served by the background service: clone, read, sync, a clone
+that starts the service, a service stop that meets a busy mount, a forced stop after a
 replacement service remounted, two service starts racing one that is mounting, the
 relayed staged-link and latest-list listings, an interactive commit through the mount,
 and a diff after a sync."""
@@ -20,6 +20,7 @@ from time import monotonic, sleep
 import pytest
 from error_types import MountsBusyError, RevisionNotFound
 from service_util import (
+    LORE_NO_SERVICE_MESSAGE,
     LORE_SERVICE_CLAIM_REFUSED_MESSAGE,
     LORE_SERVICE_ENVIRONMENT,
     LORE_SERVICE_SOCKET_VAR,
@@ -134,51 +135,202 @@ def test_clone_vfs_fuse_lists_and_reads(new_lore_repo, fuse_mounts):
     assert cat(os.path.join(fuse.path, "added.txt")) == added
 
 
+def store_holding(repo: Lore, instance: Lore) -> str | None:
+    """The path of the shared store whose registry lists `instance`, read through
+    `repo`, an ordinary clone, or `None` where none lists it."""
+    wanted = os.path.realpath(instance.path)
+    for store, entry in repo.shared_store_list(include_instances=True).entries.items():
+        if any(os.path.realpath(path) == wanted for _, path in entry.instances or []):
+            return store
+    return None
+
+
 @pytest.mark.smoke
-def test_fuse_clone_fails_when_no_service_is_running(
-    new_lore_repo, stops_background_services
+def test_fuse_clone_uses_a_shared_store_unasked(
+    new_lore_repo, fuse_mounts, scratch_dir
 ):
-    """A FUSE clone always relays to the service, even with no service running
-    to spawn one for it: it is refused outright, with a hint on how to start
-    one, rather than mounted locally.
+    """A FUSE clone uses a shared store with no `--use-shared-store`, so the service
+    finds it when it starts, and takes `--shared-store-path` without the flag."""
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    repo.write_commit_push("initial", {"readme.txt": b"hello\n"})
+
+    clone = repo.clone(vfs="fuse")
+    fuse_mounts.append(clone.path)
+    assert is_mounted(clone.path), "the FUSE clone is mounted"
+    assert store_holding(repo, clone) is not None, "a shared store lists the clone"
+
+    base = os.path.realpath(scratch_dir("fuse-clone-store", create=True))
+    placed = repo.clone(vfs="fuse", shared_store_path=base)
+    fuse_mounts.append(placed.path)
+    assert is_mounted(placed.path), "the FUSE clone is mounted"
+    store = store_holding(repo, placed)
+    assert store is not None and os.path.realpath(store).startswith(base + os.sep), (
+        f"the store under {base} lists the clone, not {store}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("named", [True, False], ids=["named", "none-named"])
+def test_fuse_clone_starts_the_service_when_none_is_running(
+    new_lore_repo, stops_background_services, named
+):
+    """A FUSE clone always goes to the service, and with none running it starts
+    one, which mounts the clone: from the executable named for the service, or
+    with none named, from the `lore` that ran the clone, which runs the service
+    as well.
+
+    Runs the CLI directly rather than through `Lore.clone()`, to run it with no
+    executable named."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("initial", {"file.txt": b"content"})
+
+    clone_path = str(Path(repo.path).parent / Lore.generate_random_name("fuse-clone"))
+    env = repo.sandboxed_env()
+    if not named:
+        # `sandboxed_env` names the build under test, which the other case uses.
+        env.pop("LORE_SERVICE_EXECUTABLE", None)
+
+    def lore(*args: str) -> str:
+        ran = subprocess.run(
+            [repo.lore_executable_path, *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=repo.path,
+        )
+        output = ran.stdout + ran.stderr
+        assert ran.returncode == 0, f"lore {' '.join(args)} must succeed: {output}"
+        return output
+
+    try:
+        lore(
+            *("--repository", repo.path, "repository", "clone"),
+            *(repo.remote_path, clone_path, "--vfs", "fuse", "--use-shared-store"),
+        )
+        assert is_mounted(clone_path), "the service the clone started mounts it"
+        assert cat(os.path.join(clone_path, "file.txt")) == b"content"
+
+        status = lore("service", "status")
+        assert os.path.realpath(repo.lore_executable_path) in status, (
+            f"the service must be the build under test: {status}"
+        )
+    finally:
+        # Nothing else here holds the mount, so a stop takes it down. Forced and
+        # detached anyway, so a failure above leaves no mount behind.
+        subprocess.run(
+            [repo.lore_executable_path, "service", "stop", "--force"],
+            capture_output=True,
+            check=False,
+            env=env,
+            cwd="/",
+        )
+        if is_mounted(clone_path):
+            subprocess.run(
+                ["fusermount3", "-u", "-z", clone_path],
+                capture_output=True,
+                check=False,
+            )
+
+
+@pytest.mark.smoke
+def test_fuse_clone_with_a_missing_named_executable_fails(
+    new_lore_repo, stops_background_services, global_dir_name
+):
+    """A named executable is the one a FUSE clone starts the service from, even
+    when it is missing and the `lore` that ran the clone could serve: the clone
+    fails with ServiceUnavailable naming it, and creates nothing.
 
     Runs the CLI directly rather than through `Lore.clone()`, which raises a
     typed exception from the command's output and does not expose the raw
     return code."""
     repo: Lore = new_lore_repo()
     repo.write_commit_push("initial", {"file.txt": b"content"})
-
     clone_path = str(Path(repo.path).parent / Lore.generate_random_name("fuse-clone"))
+    missing = str(Path(global_dir_name) / "no-such-lore")
 
     command = subprocess.run(
         [
-            repo.lore_executable_path,
-            "--repository",
-            repo.path,
-            "repository",
-            "clone",
-            repo.remote_path,
-            clone_path,
-            "--vfs",
-            "fuse",
-            "--use-shared-store",
+            *(repo.lore_executable_path, "--repository", repo.path),
+            *("repository", "clone", repo.remote_path, clone_path),
+            *("--vfs", "fuse", "--use-shared-store"),
         ],
         capture_output=True,
         text=True,
-        env=repo.sandboxed_env(),
+        env=repo.sandboxed_env(LORE_SERVICE_EXECUTABLE=missing),
         cwd=repo.path,
     )
     output = command.stdout + command.stderr
 
-    assert command.returncode == SERVICE_UNAVAILABLE, (
-        f"a FUSE clone with no service running must fail with ServiceUnavailable: {output}"
+    assert command.returncode == SERVICE_UNAVAILABLE, output
+    assert f"starting {missing} failed" in output, output
+    assert not Path(clone_path).exists(), "a clone that reached no service creates nothing"
+
+
+@pytest.mark.smoke
+def test_a_command_in_a_clone_served_on_another_socket_starts_no_service(
+    new_lore_repo, fuse_mounts
+):
+    """A command in a virtual clone whose service listens on another socket than
+    the command's starts no service, which would not hold the clone's mount, and
+    names the socket it looked on."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("initial", {"readme.txt": b"served elsewhere\n"})
+    fuse = fuse_clone(repo, fuse_mounts)
+    other = repo.sandboxed_env(
+        **{LORE_SERVICE_SOCKET_VAR: Lore.generate_random_name("lore_service-other")}
     )
-    assert "lore service start" in output, (
-        f"the refusal must hint how to start the service: {output}"
+
+    try:
+        status = subprocess.run(
+            [repo.lore_executable_path, "status"],
+            capture_output=True,
+            text=True,
+            env=other,
+            cwd=fuse.path,
+            timeout=60,
+        )
+        output = status.stdout + status.stderr
+
+        assert status.returncode == SERVICE_UNAVAILABLE, output
+        assert other[LORE_SERVICE_SOCKET_VAR] in output, output
+        assert listing(fuse.path) == ["readme.txt"], "the clone is still served"
+    finally:
+        stop = subprocess.run(
+            [repo.lore_executable_path, "service", "stop", "--force"],
+            capture_output=True,
+            text=True,
+            env=other,
+            cwd="/",
+        )
+    assert LORE_NO_SERVICE_MESSAGE in stop.stdout + stop.stderr, (
+        "no service was started on the command's socket"
     )
-    assert not Path(clone_path).exists(), (
-        "a FUSE clone refused before it runs must not create the destination"
+
+
+@pytest.mark.smoke
+def test_a_command_in_a_clone_whose_service_died_starts_one(
+    new_lore_repo, background_lore_service, fuse_mounts
+):
+    """A command in a virtual clone whose service died without taking its mount
+    down starts a service, which detaches the dead mount and mounts the clone
+    again."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("initial", {"readme.txt": b"served again\n"})
+    fuse = fuse_clone(repo, fuse_mounts)
+    background_lore_service.kill()
+    background_lore_service.wait()
+
+    status = subprocess.run(
+        [repo.lore_executable_path, "--repository", fuse.path, "status"],
+        capture_output=True,
+        text=True,
+        env=repo.sandboxed_env(),
+        cwd=str(Path(fuse.path).parent),
+        timeout=60,
     )
+
+    assert status.returncode == 0, status.stdout + status.stderr
+    assert listing(fuse.path) == ["readme.txt"], "the clone is mounted again"
 
 
 @pytest.mark.smoke

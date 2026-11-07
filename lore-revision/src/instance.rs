@@ -19,6 +19,7 @@ use crate::anchor::AnchorError;
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
 use crate::errors::FileNotFound;
+use crate::errors::InvalidArguments;
 use crate::errors::InvalidPath;
 use crate::errors::LinkNotFound;
 use crate::errors::Maintenance;
@@ -746,6 +747,7 @@ pub enum InstanceError {
     NotFound,
     FileNotFound,
     Oversized,
+    InvalidArguments,
     InvalidPath,
     AddressNotFound,
     PayloadNotFound,
@@ -764,6 +766,7 @@ impl EventError for InstanceError {
     fn translated(&self) -> LoreError {
         match self {
             InstanceError::Disconnected(_) => LoreError::Connection,
+            InstanceError::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }
@@ -1684,12 +1687,110 @@ async fn remove_left_mount_point(vfs: VfsType, path: &str) {
     }
 }
 
-/// Move the current instance to a new path: move its directory (or its mount for an SWFS or FUSE
-/// instance in a service), and then record the new path.
+/// A move refused for its target, before anything changes.
+fn refused_target(reason: String) -> InstanceError {
+    InvalidArguments { reason }.into()
+}
+
+/// The directories above `target` that don't exist, nearest first, and the nearest one that does,
+/// `None` where none does. An ancestor that exists in any form, a symbolic link or a file
+/// included, ends the walk, and one that can't be checked fails it. A path below a file doesn't
+/// exist, so the walk goes on to the file.
+fn missing_parents(target: &Path) -> Result<(Vec<PathBuf>, Option<&Path>), InstanceError> {
+    let mut missing = Vec::new();
+    for directory in target.ancestors().skip(1) {
+        if directory.as_os_str().is_empty() {
+            return Ok((missing, Some(directory)));
+        }
+        match directory.symlink_metadata() {
+            Ok(_) => return Ok((missing, Some(directory))),
+            Err(error) if is_absent(&error) || error.kind() == io::ErrorKind::NotADirectory => {
+                missing.push(directory.to_path_buf());
+            }
+            Err(error) => {
+                return Err(InstanceError::internal(format!(
+                    "Unable to check {}, above the target path {}: {error}",
+                    directory.display(),
+                    target.display()
+                )));
+            }
+        }
+    }
+    Ok((missing, None))
+}
+
+/// Whether `existing`, the nearest directory above a move's target that exists, leads into the
+/// instance at `source` through a symbolic link, which the cleaned paths that
+/// [`is_path_inside_repository`](crate::util::path::is_path_inside_repository) compares can't
+/// show. Only the directory above the instance is resolved, as a move renames the instance's own
+/// entry rather than what that entry may link to.
+fn leads_into_instance(existing: &Path, source: &Path) -> Result<bool, InstanceError> {
+    let resolve = |path: &Path| {
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        path.canonicalize().map_err(|error| {
+            InstanceError::internal(format!("Unable to resolve {}: {error}", path.display()))
+        })
+    };
+    let instance = match (source.parent(), source.file_name()) {
+        (Some(parent), Some(name)) => resolve(parent)?.join(name),
+        _ => resolve(source)?,
+    };
+    Ok(resolve(existing)?.starts_with(instance))
+}
+
+/// Create `missing`, the directories above `target_path` that [`missing_parents`] found, so the
+/// instance can move there. A failure removes what it created.
+async fn create_parents(missing: &[PathBuf], target_path: &str) -> Result<(), InstanceError> {
+    let Some(nearest) = missing.first() else {
+        return Ok(());
+    };
+    if let Err(error) = lore_io::IoDriver::global().create_dir_all(nearest).await {
+        remove_created_parents(missing).await;
+        return Err(InstanceError::internal(format!(
+            "Failed to create {}, the directory to move the instance into at {target_path}: \
+             {error}",
+            nearest.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Remove the directories [`create_parents`] made for a move that did not stand, nearest first,
+/// stopping at one that can't be removed, such as one something else has written into since. One
+/// left behind is reported, and the outcome of the move stands.
+async fn remove_created_parents(created: &[PathBuf]) {
+    for directory in created {
+        match lore_io::IoDriver::global().remove_dir(directory).await {
+            Ok(()) => {}
+            Err(error) if is_absent(&error) => {}
+            Err(error) => {
+                lore_warn!(
+                    "Unable to remove {}, which the move created: {error}",
+                    directory.display()
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// Move the current instance to a new path: create the directories above it that do not exist,
+/// move its directory (or its mount for an SWFS or FUSE instance in a service), and then record the
+/// new path.
 ///
 /// The registration is written last so a move that fails leaves the instance registered where it
-/// is, and a registration that cannot be written undoes the move. A FUSE instance's old mount
-/// point goes only after that, as a service that starts mounts the instance at its registered path.
+/// is, and a registration that cannot be written undoes the move. A move that does not stand
+/// removes the directories it created. A FUSE instance's old mount point goes only after that, as
+/// a service that starts mounts the instance at its registered path.
+///
+/// The target is cleaned first, so a target that leaves the instance through `..` names the
+/// directory it reaches. A target that exists (a symbolic link that leads nowhere included), is
+/// inside the instance (through a symbolic link too), is below a file, has no existing directory
+/// above it, or is an instance mount is refused with [`InstanceError::InvalidArguments`].
 ///
 /// In a dry run (the global `dry_run` flag), checks everything a move would need and reports it
 /// without moving or registering anything.
@@ -1717,25 +1818,42 @@ async fn instance_move_with(
     let dry_run = crate::lore::execution_context().globals().dry_run();
     let instance_id = repository.instance_id;
     let source_path = repository.path_for_display().to_string();
+    let target_path = &crate::util::path::clean(target_path.to_owned());
     let target = Path::new(target_path);
 
-    // Validate target path
-    if target.exists() {
-        return Err(InstanceError::internal(format!(
+    // Validate target path. A symbolic link there exists even where it leads nowhere, and a
+    // rename would replace it.
+    if target.symlink_metadata().is_ok() {
+        return Err(refused_target(format!(
             "Target path already exists: {target_path}"
         )));
     }
 
-    if let Some(parent) = target.parent() {
-        if !parent.exists() || !parent.is_dir() {
-            return Err(InstanceError::internal(format!(
-                "Target path parent does not exist: {target_path}"
+    if crate::util::path::is_path_inside_repository(Path::new(&source_path), target_path) {
+        return Err(refused_target(format!(
+            "Target path is inside the instance: {target_path}"
+        )));
+    }
+    let (missing, existing) = missing_parents(target)?;
+    match existing {
+        None => {
+            return Err(refused_target(format!(
+                "None of the directories above the target path exist: {target_path}"
             )));
         }
-    } else {
-        return Err(InstanceError::internal(format!(
-            "Target path parent does not exist: {target_path}"
-        )));
+        Some(existing) if !existing.as_os_str().is_empty() && !existing.is_dir() => {
+            return Err(refused_target(format!(
+                "Target path is below {}, which is not a directory: {target_path}",
+                existing.display()
+            )));
+        }
+        Some(existing) if leads_into_instance(existing, Path::new(&source_path))? => {
+            return Err(refused_target(format!(
+                "Target path is inside the instance, which {} leads into: {target_path}",
+                existing.display()
+            )));
+        }
+        Some(_) => {}
     }
 
     let vfs = require_own_mount(instance_id, &source_path, "move")?;
@@ -1743,7 +1861,7 @@ async fn instance_move_with(
         && let Some(mm) = MountManagerState::mount_manager()
         && mm.is_mounted(target).unwrap_or(false)
     {
-        return Err(InstanceError::internal(format!(
+        return Err(refused_target(format!(
             "Target path is already an instance mount: {target_path}"
         )));
     }
@@ -1769,22 +1887,30 @@ async fn instance_move_with(
         return Ok(());
     }
 
-    move_instance(vfs, instance_id, &source_path, target_path).await?;
+    create_parents(&missing, target_path).await?;
+    if let Err(error) = move_instance(vfs, instance_id, &source_path, target_path).await {
+        remove_created_parents(&missing).await;
+        return Err(error);
+    }
 
     if let Err(error) = register(target).await {
         // A failed write can still have left part of the new record behind, so moving the
         // instance back is not enough: its registration has to name the source again.
         let mut message = format!("Failed to record the new path {target_path}: {error}");
         match move_instance(vfs, instance_id, target_path, &source_path).await {
-            Ok(()) => match register(Path::new(&source_path)).await {
-                Ok(()) => remove_left_mount_point(vfs, target_path).await,
-                Err(restore_error) => {
-                    message.push_str(&format!(
-                        ". The instance is back at {source_path}, but its registration could not \
-                         be restored: {restore_error}. Run `lore repository update-path` in it"
-                    ));
+            Ok(()) => {
+                match register(Path::new(&source_path)).await {
+                    Ok(()) => remove_left_mount_point(vfs, target_path).await,
+                    Err(restore_error) => {
+                        message.push_str(&format!(
+                            ". The instance is back at {source_path}, but its registration could \
+                             not be restored: {restore_error}. Run `lore repository update-path` \
+                             in it"
+                        ));
+                    }
                 }
-            },
+                remove_created_parents(&missing).await;
+            }
             Err(undo_error) if vfs == VfsType::Fuse => {
                 message.push_str(&format!(
                     ". Moving the instance back to {source_path} also failed: {undo_error}. \

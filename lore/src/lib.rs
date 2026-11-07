@@ -117,6 +117,20 @@ pub fn will_use_service() -> bool {
     remote::service_process::service_in_use_blocking()
 }
 
+/// Records that this program's own executable runs the Lore service when started with
+/// `service run`. Where no executable is named and no service is running, starting the service
+/// and a command only the service may carry out, such as one that makes a virtual clone, then
+/// start one from this executable.
+///
+/// A program whose executable does not run the service that way must not call this: a command
+/// would start that program in place of a service. Without this call, a service is started only
+/// from the executable named in `LORE_SERVICE_EXECUTABLE` or the global config's
+/// `[service] executable`. Relaying a command to the service starts one only from that named
+/// executable, whether or not this is called.
+pub fn serve_from_this_executable() {
+    remote::service_process::serve_from_this_executable();
+}
+
 /// Sizes this process's thread pools for relaying its calls to the service, when
 /// that is what it will do. A no-op otherwise, and a no-op once a runtime exists.
 ///

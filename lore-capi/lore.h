@@ -4989,7 +4989,9 @@ typedef struct lore_repository_clone_args_t {
   // relative file path resolves against the caller's working directory.
   struct lore_string_t prefetch;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
-  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+  // is a virtual one, which always uses a shared store and refuses
+  // `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
   enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
@@ -5034,7 +5036,9 @@ typedef struct lore_repository_create_args_t {
   // Which VFS to use, if any
   enum lore_vfs_type_t vfs;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
-  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting, except where `vfs`
+  // is a virtual one, which always uses a shared store and refuses
+  // `LORE_SHARED_STORE_MODE_DISABLED` with `InvalidArguments`.
   enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;

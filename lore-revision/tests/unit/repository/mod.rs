@@ -60,3 +60,70 @@ fn repository_config_names_its_vfs_type() {
         "a config without a [vfs] section names no VFS"
     );
 }
+
+/// A virtual VFS always uses a shared store: one that inherits the machine's setting gets one,
+/// and one that disables it is refused. Without a VFS the mode is kept as given.
+#[test]
+fn a_virtual_vfs_always_uses_a_shared_store() {
+    use lore_revision::repository::LoreSharedStoreMode;
+
+    for vfs in [VfsType::Fuse, VfsType::Swfs] {
+        for mode in [LoreSharedStoreMode::Inherit, LoreSharedStoreMode::Enabled] {
+            assert_eq!(
+                mode.for_vfs(vfs).expect("a shared store is allowed"),
+                LoreSharedStoreMode::Enabled,
+                "{mode:?} with {vfs}"
+            );
+        }
+        let refusal = LoreSharedStoreMode::Disabled
+            .for_vfs(vfs)
+            .expect_err("a virtual clone without a shared store is refused");
+        assert!(
+            refusal.reason.contains("always uses a shared store"),
+            "{}",
+            refusal.reason
+        );
+    }
+    for mode in [
+        LoreSharedStoreMode::Inherit,
+        LoreSharedStoreMode::Enabled,
+        LoreSharedStoreMode::Disabled,
+    ] {
+        assert_eq!(
+            mode.for_vfs(VfsType::None).expect("no VFS keeps the mode"),
+            mode
+        );
+    }
+}
+
+/// A config with a virtual VFS and no shared store fails to validate, as the instance could not
+/// be found or served.
+#[test]
+fn a_virtual_vfs_without_a_shared_store_fails_to_validate() {
+    use lore_revision::repository::SharedStoreToUseConfig;
+
+    for vfs_type in [VfsType::Fuse, VfsType::Swfs] {
+        let vfs = Some(VfsConfig {
+            vfs_type,
+            base_time: None,
+        });
+        let without = RepositoryConfig {
+            vfs: vfs.clone(),
+            ..Default::default()
+        };
+        assert!(
+            without.validate().is_err(),
+            "{vfs_type} without a shared store"
+        );
+        let with = RepositoryConfig {
+            vfs,
+            shared_store_to_use: Some(SharedStoreToUseConfig {
+                use_shared_store: Some(true),
+                shared_store_path: None,
+            }),
+            ..Default::default()
+        };
+        assert!(with.validate().is_ok(), "{vfs_type} with a shared store");
+    }
+    assert!(RepositoryConfig::default().validate().is_ok());
+}

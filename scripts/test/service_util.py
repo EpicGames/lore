@@ -25,11 +25,12 @@ def name_service_executable(
 ) -> dict[str, str]:
     """Names the executable under test as the service.
 
-    `service start` needs an executable to spawn, and commands relaying to a
-    service need an executable to start one when none is running. Setting it
-    here rather than in each test ensures no test can leave it out, and that
-    the service serving a test is always the build being tested rather than
-    whichever Lore is installed on the machine running the suite.
+    Commands relaying to a service need an executable to start one when none is
+    running, and `service start` and a virtual clone's commands start the named
+    one in place of the `lore` that ran them. Setting it here rather than in
+    each test ensures no test can leave it out, and that the service serving a
+    test is always the build being tested rather than whichever Lore is
+    installed on the machine running the suite.
 
     A test that names one itself keeps it.
     """

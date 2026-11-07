@@ -469,6 +469,20 @@ class Lore:
     def repository_list(self, url: str | None = None, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "list"] + ([url] if url else []), **kwargs)
 
+    def _own_shared_store(
+        self, asked_vfs: str | None, vfs: str | None, repo_path: str
+    ) -> str | None:
+        """A shared store of its own, beside `repo_path`, for a repository that
+        `LORE_TEST_VFS` makes virtual where the test asked for no shared store, or
+        `None` for any other. A virtual clone always uses a shared store, and one
+        of its own keeps the repository apart from the test's others, as the store
+        in its own `.lore` did: a branch it commits to doesn't advance in theirs."""
+        if asked_vfs or vfs in (None, "none"):
+            return None
+        store = f"{repo_path}.store"
+        self.created_paths.append(store)
+        return store
+
     def repository_create(
         self,
         remote_path: str | None = None,
@@ -479,7 +493,10 @@ class Lore:
         shared_store_path: str | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
+        asked_vfs = vfs
         vfs = run_vfs(vfs)
+        if not (use_shared_store or shared_store_path):
+            shared_store_path = self._own_shared_store(asked_vfs, vfs, self.path)
         output = self.run(
             ["repository", "create", remote_path if remote_path else self.remote_path]
             + (["--description", description] if description else [])
@@ -2141,6 +2158,7 @@ class Lore:
         no_tracking: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
+        asked_vfs = vfs
         # A bare, untracked or dry-run clone has no virtual form, so it stays as asked.
         if not (bare or no_tracking or kwargs.get("dry_run")):
             vfs = run_vfs(vfs)
@@ -2153,6 +2171,10 @@ class Lore:
         # Recorded before the directory exists, so a clone that fails partway
         # through still has its half-written tree removed with the test.
         self.created_paths.append(str(new_repo_path))
+        if not (use_shared_store or shared_store_path):
+            shared_store_path = self._own_shared_store(
+                asked_vfs, vfs, str(new_repo_path)
+            )
         if not kwargs.get("dry_run") and vfs != "swfs":
             new_repo_path.mkdir(exist_ok=True)
         root_file_args = []

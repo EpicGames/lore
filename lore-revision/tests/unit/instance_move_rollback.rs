@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! What `instance move` does when recording the new path fails after the directory has moved.
+//! What `instance move` does when recording the new path fails after the directory has moved, and
+//! with the directories it creates above its target.
 //!
 //! The step that records a path is injected, so each failure is forced rather than waited for.
 #![allow(clippy::disallowed_methods)]
@@ -43,7 +44,7 @@ fn execution_in(global: &Path) -> Arc<ExecutionContext> {
 /// A regular instance at `source`, and a `target` beside it that does not exist.
 struct Instance {
     _global: TempDir,
-    _parent: TempDir,
+    parent: TempDir,
     source: PathBuf,
     target: PathBuf,
     repository: Arc<RepositoryContext>,
@@ -74,7 +75,7 @@ impl Instance {
 
         Self {
             _global: global,
-            _parent: parent,
+            parent,
             source,
             target,
             repository: Arc::new(RepositoryContext::new(args)),
@@ -83,6 +84,10 @@ impl Instance {
 
     fn global(&self) -> &Path {
         self._global.path()
+    }
+
+    fn parent(&self) -> &Path {
+        self.parent.path()
     }
 
     fn target_str(&self) -> String {
@@ -214,5 +219,268 @@ async fn an_instance_that_cannot_be_moved_back_is_reported_where_it_is() {
         paths(&calls),
         std::slice::from_ref(&instance.target),
         "the source registration is not restored while the instance is elsewhere"
+    );
+}
+
+/// A target whose directories do not exist yet, two levels below the instance's parent.
+fn deep_target(instance: &Instance) -> PathBuf {
+    instance.parent().join("new").join("deeper").join("target")
+}
+
+/// A move into directories that do not exist creates them, and the instance moves there.
+#[tokio::test]
+async fn a_move_creates_the_directories_above_its_target() {
+    let instance = Instance::new().await;
+    let target = deep_target(&instance);
+
+    let result = LORE_CONTEXT
+        .scope(execution_in(instance.global()), async {
+            instance_move_with(
+                instance.repository.clone(),
+                &target.display().to_string(),
+                async |_path: &Path| Ok(()),
+            )
+            .await
+        })
+        .await;
+
+    result.expect("the move succeeds");
+    assert!(
+        target.join(DOT_LORE).exists(),
+        "the instance is at the target"
+    );
+    assert!(!instance.source.exists(), "and no longer at the source");
+}
+
+/// A move whose registration fails moves the instance back, and removes the directories it
+/// created for the target.
+#[tokio::test]
+async fn a_move_that_is_undone_removes_the_directories_it_created() {
+    let instance = Instance::new().await;
+    let target = deep_target(&instance);
+
+    let result = LORE_CONTEXT
+        .scope(execution_in(instance.global()), async {
+            instance_move_with(
+                instance.repository.clone(),
+                &target.display().to_string(),
+                async |path: &Path| {
+                    if path == target {
+                        Err(InstanceError::internal("the registry is unavailable"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .await
+        })
+        .await;
+
+    let message = result.expect_err("the move fails").to_string();
+    assert!(
+        message.contains("Failed to record the new path"),
+        "{message}"
+    );
+    assert!(
+        instance.source.join(DOT_LORE).exists(),
+        "back at the source"
+    );
+    assert!(
+        !instance.parent().join("new").exists(),
+        "the directories the move created are gone"
+    );
+}
+
+/// A move whose rename fails removes the directories it created for the target.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_move_that_fails_removes_the_directories_it_created() {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Safety: `geteuid` takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: root renames out of a directory it cannot write to");
+        return;
+    }
+    let instance = Instance::new().await;
+    let elsewhere = TempDir::new("lore-move-rollback-elsewhere-");
+    let target = elsewhere.path().join("new").join("target");
+    // A directory that cannot be written to refuses to give up the instance's directory.
+    let source_parent = instance.parent();
+    std::fs::set_permissions(source_parent, Permissions::from_mode(0o555))
+        .expect("make the source's parent read-only");
+
+    let result = LORE_CONTEXT
+        .scope(execution_in(instance.global()), async {
+            instance_move_with(
+                instance.repository.clone(),
+                &target.display().to_string(),
+                async |_path: &Path| Ok(()),
+            )
+            .await
+        })
+        .await;
+    std::fs::set_permissions(source_parent, Permissions::from_mode(0o755))
+        .expect("make the source's parent writable again");
+
+    let message = result.expect_err("the rename fails").to_string();
+    assert!(message.contains("Failed to move directory"), "{message}");
+    assert!(
+        instance.source.join(DOT_LORE).exists(),
+        "still at the source"
+    );
+    assert!(
+        !elsewhere.path().join("new").exists(),
+        "the directory the move created is gone"
+    );
+}
+
+/// The message a move to `target` is refused with as invalid arguments, before it registers
+/// anything, the instance left at its source.
+async fn refused_move(instance: &Instance, target: &Path) -> String {
+    let calls = Mutex::new(Vec::new());
+    let result = LORE_CONTEXT
+        .scope(execution_in(instance.global()), async {
+            instance_move_with(
+                instance.repository.clone(),
+                &target.display().to_string(),
+                async |path: &Path| {
+                    calls.lock().expect("calls").push(path.to_path_buf());
+                    Ok(())
+                },
+            )
+            .await
+        })
+        .await;
+    assert!(paths(&calls).is_empty(), "nothing is registered");
+    assert!(
+        instance.source.join(DOT_LORE).exists(),
+        "still at the source"
+    );
+    let error = result.expect_err("the move is refused");
+    assert!(
+        matches!(error, InstanceError::InvalidArguments(_)),
+        "{error}"
+    );
+    error.to_string()
+}
+
+/// A target below a file is refused before anything is created.
+#[tokio::test]
+async fn a_target_below_a_file_is_refused() {
+    let instance = Instance::new().await;
+    let file = instance.parent().join("file");
+    std::fs::write(&file, b"").expect("a file where a directory would go");
+
+    let message = refused_move(&instance, &file.join("new").join("target")).await;
+
+    assert!(message.contains("which is not a directory"), "{message}");
+}
+
+/// A target inside the instance is refused before anything is created in its working tree.
+#[tokio::test]
+async fn a_target_inside_the_instance_is_refused() {
+    let instance = Instance::new().await;
+
+    let message = refused_move(&instance, &instance.source.join("new").join("target")).await;
+
+    assert!(message.contains("inside the instance"), "{message}");
+    assert!(
+        !instance.source.join("new").exists(),
+        "nothing is created in the working tree"
+    );
+}
+
+/// A target below a symbolic link that leads into the instance is refused before anything is
+/// created in its working tree, as the rename into its own subtree would fail.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_target_through_a_link_into_the_instance_is_refused() {
+    let instance = Instance::new().await;
+    let elsewhere = TempDir::new("lore-move-rollback-elsewhere-");
+    let link = elsewhere.path().join("link");
+    std::os::unix::fs::symlink(&instance.source, &link).expect("link to the instance");
+
+    let message = refused_move(&instance, &link.join("new").join("target")).await;
+
+    assert!(message.contains("inside the instance"), "{message}");
+    assert!(
+        !instance.source.join("new").exists(),
+        "nothing is created in the working tree"
+    );
+}
+
+/// A symbolic link at the target that leads nowhere exists all the same: the move is refused, and
+/// the link stays rather than being replaced by the instance.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dangling_link_at_the_target_is_refused() {
+    let instance = Instance::new().await;
+    std::os::unix::fs::symlink(instance.parent().join("nowhere"), &instance.target)
+        .expect("a link that leads nowhere");
+
+    let message = refused_move(&instance, &instance.target).await;
+
+    assert!(message.contains("already exists"), "{message}");
+    assert!(
+        instance
+            .target
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink()),
+        "the link is still there"
+    );
+}
+
+/// A target below a symbolic link to the directory holding the instance is outside it, and the
+/// instance moves there.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_target_through_a_link_beside_the_instance_moves_it() {
+    let instance = Instance::new().await;
+    let elsewhere = TempDir::new("lore-move-rollback-elsewhere-");
+    let link = elsewhere.path().join("link");
+    std::os::unix::fs::symlink(instance.parent(), &link).expect("link to the instance's parent");
+
+    let result = LORE_CONTEXT
+        .scope(execution_in(instance.global()), async {
+            instance_move_with(
+                instance.repository.clone(),
+                &link.join("beside").display().to_string(),
+                async |_path: &Path| Ok(()),
+            )
+            .await
+        })
+        .await;
+
+    result.expect("the move succeeds");
+    assert!(
+        instance.parent().join("beside").join(DOT_LORE).exists(),
+        "the instance is beside its old path"
+    );
+}
+
+/// A target that leaves the instance through `..` names the directory it reaches, and the
+/// instance moves there.
+#[tokio::test]
+async fn a_target_through_dot_dot_moves_beside_the_instance() {
+    let instance = Instance::new().await;
+    let target = instance.source.join("..").join("beside");
+
+    let result = LORE_CONTEXT
+        .scope(execution_in(instance.global()), async {
+            instance_move_with(
+                instance.repository.clone(),
+                &target.display().to_string(),
+                async |_path: &Path| Ok(()),
+            )
+            .await
+        })
+        .await;
+
+    result.expect("the move succeeds");
+    assert!(
+        instance.parent().join("beside").join(DOT_LORE).exists(),
+        "the instance is beside its old path"
     );
 }

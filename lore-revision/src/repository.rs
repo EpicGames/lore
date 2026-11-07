@@ -195,7 +195,8 @@ pub struct RepositoryConfig {
 
 impl RepositoryConfig {
     pub fn validate(&self) -> Result<(), RepositoryError> {
-        if self.vfs_type() == VfsType::Swfs
+        let vfs = self.vfs_type();
+        if vfs.is_virtual()
             && !matches!(
                 self.shared_store_to_use.as_ref(),
                 Some(SharedStoreToUseConfig {
@@ -204,9 +205,9 @@ impl RepositoryConfig {
                 })
             )
         {
-            return Err(RepositoryError::internal(
-                "Using SWFS without using a shared store",
-            ));
+            return Err(RepositoryError::internal(format!(
+                "Using the {vfs} VFS without a shared store"
+            )));
         }
         Ok(())
     }
@@ -393,6 +394,25 @@ pub enum LoreSharedStoreMode {
 }
 
 lore_base::carries_no_text!(LoreSharedStoreMode);
+
+impl LoreSharedStoreMode {
+    /// The mode a repository whose working tree `vfs` serves is made with. A virtual one always
+    /// uses a shared store: an SWFS instance keeps its content there, and the service finds the
+    /// FUSE instances it mounts through the shared stores when it starts. So
+    /// [`Inherit`](Self::Inherit) enables one for it, and [`Disabled`](Self::Disabled) is refused.
+    pub fn for_vfs(self, vfs: VfsType) -> Result<Self, InvalidArguments> {
+        match self {
+            _ if !vfs.is_virtual() => Ok(self),
+            Self::Disabled => Err(InvalidArguments {
+                reason: format!(
+                    "An instance with the {vfs} VFS always uses a shared store, so it can't be \
+                     made with the shared store disabled"
+                ),
+            }),
+            Self::Inherit | Self::Enabled => Ok(Self::Enabled),
+        }
+    }
+}
 
 impl SharedStoreToUseConfig {
     pub fn from_api_args(

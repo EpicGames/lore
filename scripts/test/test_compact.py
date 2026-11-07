@@ -632,6 +632,9 @@ def _store_files(repo: Lore) -> dict[str, bytes]:
     }
 
 
+@pytest.mark.own_vfs(
+    "reads the store in the repository's own .lore, where a virtual clone uses a shared store"
+)
 @pytest.mark.smoke
 def test_repository_gc_dry_run_collects_nothing(new_lore_repo):
     """`repository gc --dry-run` leaves a store that is over its caps as it was, where

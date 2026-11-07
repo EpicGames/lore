@@ -95,6 +95,10 @@ pub fn client_main() -> ExitCode {
         lore::size_threads_for_connections(globals.max_connections);
     }
 
+    // This executable runs the service with `service run`, so a command only the service may
+    // carry out, such as one in a virtual clone, can start one from it.
+    lore::serve_from_this_executable();
+
     let result = handle_lore_commands(cli_command, globals);
 
     lore::shutdown();

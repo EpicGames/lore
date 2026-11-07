@@ -6,7 +6,7 @@ authors:
   - Zack Neyland
 status: Accepted
 created: 2026-10-19
-updated: 2026-11-03
+updated: 2026-11-07
 discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1113
 ---
 
@@ -128,15 +128,23 @@ A step that is still refused when the attempts are spent fails with the same err
 
 1. **Resolve the target.** The dispatch layer resolves a relative `TARGET_PATH` against the working directory the call
    carries, which for a call relayed to the service is the caller's, falling back to the service's own only when the
-   call names none. Every later step uses the absolute result.
+   call names none. The command cleans the result, so a `..` names the directory it reaches, and every later step uses
+   that cleaned absolute path.
 2. **Validate**, in dry-run and real mode alike:
-    - The target does not exist and its parent does.
+    - The target doesn't exist, where a symbolic link that leads nowhere counts as existing, and isn't inside the
+      instance. The nearest of the directories above it that exists is a directory that doesn't lead into the instance
+      through a symbolic link. A directory above it that can't be checked or resolved fails the move.
     - On Windows, the caller's working directory is not inside the instance. Windows refuses to rename a directory that
       is any process's working directory, so the command fails with an explanation.
     - The instance's config loads, and the shared store it names, if any, resolves.
     - For an SWFS instance, the service is running, holds the instance mounted at its current path, and does not already
       hold a mount at the target.
-3. **Move.** A regular instance's directory is renamed, retrying while its files are in use (see
+
+   A target that fails the first check, or that the service already holds a mount at, is refused with
+   `InvalidArguments`.
+3. **Create the parents.** Once every check has passed, the command creates the directories above the target that
+   don't exist. A dry run creates none.
+4. **Move.** A regular instance's directory is renamed, retrying while its files are in use (see
    [Retrying while files are in use](#retrying-while-files-are-in-use)). An SWFS instance is remounted: the service
    closes the interface at the old path, then mounts a fresh interface at the new path, and mounts the old path again if
    the new mount fails. Closing is explicit and idempotent, because other holders of the interface would otherwise keep
@@ -145,13 +153,15 @@ A step that is still refused when the attempts are spent fails with the same err
    return, however long they take, and only then releases the native handle, so nothing uses the handle after it is
    closed. Admitting a call costs one atomic increment and never blocks, because every SWFS callback and freeze or thaw
    passes through it. Only the rare close waits.
-4. **Record the new path.** The command opens the instance at its new location as a repository and runs the same update
+5. **Record the new path.** The command opens the instance at its new location as a repository and runs the same update
    as `lore repository update-path`. It registers the instance at the new path and retires any registration another
    instance left there.
-5. **Roll back on failure.** If recording fails, the command moves the instance back and registers the old path again. A
-   failure at either step is reported with an instruction to run `lore repository update-path`.
+6. **Roll back on failure.** If recording fails, the command moves the instance back, registers the old path again, and
+   removes the directories it created. A failure at either step is reported with an instruction to run
+   `lore repository update-path`.
 
-The registration is written last, so a move that fails at step 3 leaves the instance registered where it still is.
+The registration is written last, so a move that fails at step 4 leaves the instance registered where it still is, and
+removes the directories step 3 created.
 
 ### Delete
 
@@ -232,7 +242,11 @@ run of a delete checks that the sibling name for the rename aside is free, and r
   way leaves what remains under `<name>.deleting-<instance ID>` rather than at the instance's path, and the error names
   that directory. The rename happens within the `DeletingFiles` phase, so the phases and events are unchanged. This is
   not a breaking change: no call that succeeded before fails, and a caller that waits for the command still finds the
-  files gone when it returns.
+  files gone when it returns. A move to a target whose parents don't exist creates them, where it failed before, and
+  a move to a target inside the instance is refused before anything changes, where it failed at the rename. A refused
+  target is reported as `InvalidArguments` (3), where a target that existed or was already mounted was reported as an
+  internal error (-1, exit status 255). That is a breaking change for a script or C API caller that tests a refused
+  move for 255 or -1.
 - **The `<name>.deleting-<instance ID>` name** — A new directory name beside the instance while a delete runs, visible to
   a parent instance's status, to file watchers and to backup tools. Scripts that clean up after a failed delete can
   rely on the name.
@@ -263,6 +277,8 @@ run of a delete checks that the sibling name for the rename aside is free, and r
 - **Durability and crash consistency** — A move and a delete are sequences of steps, not one atomic operation, and each
   registry write is flushed before the next step starts. A crash between a move's rename and its registration leaves the
   registry naming the old path, which `lore repository update-path` or `instance prune` repairs. A crash between a
+  move creating the target's parents and its rename leaves those directories empty. A move whose rollback can't move
+  the instance back keeps the directories it created, as the instance is in them. A crash between a
   delete's deregistration and its file deletion leaves files that nothing lists, at the instance's path or under
   `<name>.deleting-<instance ID>` beside it, which the user deletes by hand. A move
   writes the registration last, so a failure before the rename leaves it correct. A delete removes it first, so no
@@ -273,7 +289,16 @@ run of a delete checks that the sibling name for the rename aside is free, and r
 
 ## Migration Plan
 
-N/A — no breaking changes, no migration required.
+The refusal code is the one breaking change (see [Compatibility](#compatibility)). A script or C API caller that tests
+a refused move for exit status 255 or `-1` tests for `InvalidArguments` (3) instead. One that tests only for a
+non-zero result needs no change, and one that accepts both codes works with releases before and after this change.
+Nothing else needs migrating: the commands write the same registration records, and keep their arguments, events and
+phases.
+
+Rolling back to an earlier release brings back the earlier codes: `-1` for a target that exists or is already mounted,
+and a failure at the rename for a target inside the instance. A target whose parents don't exist fails again rather
+than creating them. Nothing the newer release wrote needs undoing, as the directories a move created are plain
+directories.
 
 ## Security Considerations
 
@@ -405,6 +430,15 @@ The behaviour before this amendment.
 
 *Rejected because:* the path stays occupied for the whole removal, minutes for a large instance, and the removal
 competes with interactive programs for the disk throughout.
+
+### Require the target's parent to exist
+
+The behaviour before the amendment that creates the target's parents: the move refused a target whose parent didn't
+exist.
+
+*Rejected because:* moving an instance into a new directory took a `mkdir` first, for a step the command can take and
+undo itself. The command creates the directories only once every check has passed, so a refused move or a dry run
+creates nothing.
 
 ### Return before the files are deleted
 

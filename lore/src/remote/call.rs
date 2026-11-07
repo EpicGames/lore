@@ -18,6 +18,7 @@ use crate::remote::message::blocking_read_message;
 use crate::remote::message::write_message;
 use crate::remote::network::UdsStream;
 use crate::remote::network::uds_supported;
+use crate::remote::service_process::ServiceStart;
 use crate::remote::service_process::connect_or_spawn_service;
 
 #[error_set]
@@ -115,7 +116,7 @@ pub async fn service_call_impl(
 
     let connection = match connection {
         Some(connection) => connection,
-        None => connect_or_spawn_service()
+        None => connect_or_spawn_service(ServiceStart::Named)
             .await
             .forward::<ServiceCallError>("reaching a Lore service")?,
     };
