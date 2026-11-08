@@ -10,6 +10,7 @@ use axum::extract::Query;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
+use axum::http::Method;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_DISPOSITION;
 use axum::http::header::CONTENT_ENCODING;
@@ -34,6 +35,11 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::http::log_http_error;
 use crate::http::presign_token::PresignTokenError;
 use crate::http::presign_token::verify;
+use crate::http::range::Selection;
+use crate::http::range::range_headers;
+use crate::http::range::read_range;
+use crate::http::range::requested_range;
+use crate::http::range::select;
 use crate::http::security_headers::apply_security_headers;
 use crate::http::server::ServerState;
 use crate::util::setup_execution;
@@ -94,6 +100,10 @@ pub struct RedeemQuery {
     pub token: String,
 }
 
+/// Serves the content a presigned token names, or the byte range its `Range` header asks for.
+///
+/// Answers `GET` only: the router sends every other method to `reject_non_get`, so it reads
+/// `Range` as a `GET` request's.
 pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
@@ -143,6 +153,7 @@ pub async fn handler(
         .and_then(|v| v.to_str().map(str::to_string).ok())
         .unwrap_or_default();
 
+    let range = requested_range(&Method::GET, &headers);
     let execution = setup_execution(module_path!(), correlation_id, "<presigned>".to_string());
     LORE_CONTEXT
         .scope(execution, async move {
@@ -154,14 +165,38 @@ pub async fn handler(
 
             let options = read_options_from_repository(&repository);
 
-            let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
-
-            let content_length =
-                immutable::read_stream(repository, parsed_address, None, options, tx)
+            let (fragment, buffer) =
+                immutable::load_root(repository.clone(), parsed_address, options)
                     .await
                     .map_err(RedeemError::ReadStream)?;
+            let total = fragment.size_content;
+            let selection = select(range, total);
+            if selection == Selection::Unsatisfiable {
+                let mut response_headers = HeaderMap::new();
+                let status = range_headers(&selection, total, &mut response_headers)
+                    .map_err(RedeemError::HeaderGeneration)?;
+                apply_security_headers(&mut response_headers);
+                return Ok((status, response_headers, Body::empty()));
+            }
+
+            let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
+
+            let content_length = immutable::stream_root(
+                repository,
+                parsed_address,
+                fragment,
+                buffer,
+                read_range(&selection),
+                options,
+                tx,
+            )
+            .await
+            .map_err(RedeemError::ReadStream)?;
 
             let mut response_headers = HeaderMap::new();
+            let status = range_headers(&selection, total, &mut response_headers)
+                .map_err(RedeemError::HeaderGeneration)?;
+            apply_security_headers(&mut response_headers);
             response_headers.insert(CONTENT_TYPE, content_type);
             if let Some(ce) = content_encoding {
                 response_headers.insert(
@@ -189,10 +224,8 @@ pub async fn handler(
                     .map_err(RedeemError::HeaderGeneration)?,
             );
 
-            apply_security_headers(&mut response_headers);
-
             let stream = ReceiverStream::new(rx);
-            Ok((StatusCode::OK, response_headers, Body::from_stream(stream)))
+            Ok((status, response_headers, Body::from_stream(stream)))
         })
         .await
 }

@@ -1,20 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
-
 use axum::http::StatusCode;
-use axum_test::TestServer;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_server::auth::jwt::TokenVerification;
-use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::security_headers::ContentTypePolicy;
-use lore_server::http::server::LoreHttpServerSettings;
-use lore_server::http::server::ServerHealth;
-use lore_server::http::server::ServerState;
-use lore_server::http::server::create_router;
 use rand::random;
 use serde_json::json;
 
+use crate::http::test_utils::MISSING_ADDRESS;
+use crate::http::test_utils::build_test_server;
 use crate::http::test_utils::content_type_policy;
 use crate::http::test_utils::presign_config_with_policy;
 use crate::store::test_support::test_store_create;
@@ -36,23 +29,18 @@ async fn mint_with_policy(
         .scope(execution, async move {
             let repository = random::<lore_revision::lore::RepositoryId>();
             let repo_hex = format!("{repository}");
-            let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
+            let address = MISSING_ADDRESS;
 
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let state = ServerState {
+            let server = build_test_server(
                 immutable_store,
                 mutable_store,
-                token_verification: TokenVerification::Ignore,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: Some(presign_config_with_policy(policy)),
-            };
-            let settings = LoreHttpServerSettings::test_default();
-            let server =
-                TestServer::new(create_router(state, test_health, &settings)).unwrap();
+                Some(presign_config_with_policy(policy)),
+            );
 
             server
-                .post(&format!("/v1/repository/{repo_hex}/content/{address}/presign"))
+                .post(&format!(
+                    "/v1/repository/{repo_hex}/content/{address}/presign"
+                ))
                 .json(&body)
                 .await
         })

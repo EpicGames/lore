@@ -735,7 +735,8 @@ fn check_max_content_size(
 /// content larger than `options.max_content_size` allows.
 ///
 /// Returns the load's future mapped through the check, without a future of its own.
-fn load_root(
+#[inline]
+pub fn load_root(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
@@ -1312,21 +1313,11 @@ pub fn read_into_buffer(
 }
 
 /// Read content into a streaming channel, returning the fragment describing the whole content
-/// and the content range that will arrive on the channel.
+/// and the content range that will arrive on the channel: [`load_root`], then [`stream_root`].
 ///
-/// The returned range is the caller's, clamped to what exists, so a caller can emit a header
-/// and account for what it receives before the first chunk lands. Chunks arrive in content
-/// order and the caller positions them at `range.start` and upwards; the range is `0..0` when
-/// nothing was asked for, and nothing is sent.
-///
-/// Ranged reads of a fragmented payload fetch only the leaves the range touches, so the work
-/// is proportional to the range rather than to the content.
-///
-/// The range returns before the leaves flow, so a failure part-way through the tree arrives on
-/// the channel as an `Err`: it is the only route by which the caller learns its content is short.
-///
-/// Not an `async fn`, which would hold a second copy of its arguments.
-#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+/// Returns the two futures chained, without a future of its own.
+#[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn read_stream(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -1336,20 +1327,66 @@ pub fn read_stream(
     sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
     remote_session: Option<Arc<StorageSession>>,
 ) -> impl Future<Output = Result<(Fragment, Range<u64>), StorageError>> {
-    async move {
-        let (fragment, buffer) = load_root(
+    futures::TryFutureExt::and_then(
+        load_root(
             store.clone(),
             partition,
             address,
             options,
             remote_session.clone(),
-        )
-        .await?;
+        ),
+        move |(fragment, buffer)| {
+            futures::TryFutureExt::map_ok(
+                stream_root(
+                    store,
+                    partition,
+                    address,
+                    fragment,
+                    buffer,
+                    range,
+                    options,
+                    sender,
+                    remote_session,
+                ),
+                move |streamed| (fragment, streamed),
+            )
+        },
+    )
+}
 
+/// Stream the `range` of the content under `address` into `sender`, from its root fragment
+/// `fragment` and the expanded payload `buffer` that [`load_root`] loaded, returning the content
+/// range that will arrive on the channel.
+///
+/// The returned range is the caller's, clamped to what exists, so a caller can emit a header
+/// and account for what it receives before the first chunk lands. Chunks arrive in content
+/// order and the caller positions them at `range.start` and upwards; when the returned range is
+/// empty, nothing is sent.
+///
+/// Ranged reads of a fragmented payload fetch only the leaves the range touches, so the work
+/// is proportional to the range rather than to the content.
+///
+/// The range returns before the leaves flow, so a failure part-way through the tree arrives on
+/// the channel as an `Err`: it is the only route by which the caller learns its content is short.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+pub fn stream_root(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
+    remote_session: Option<Arc<StorageSession>>,
+) -> impl Future<Output = Result<Range<u64>, StorageError>> {
+    async move {
         let range = resolve_content_range(range, fragment.size_content);
         let streamed = range.start as u64..range.end as u64;
         if range.is_empty() {
-            return Ok((fragment, streamed));
+            return Ok(streamed);
         }
 
         if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
@@ -1374,18 +1411,20 @@ pub fn read_stream(
                 .await;
 
                 if let Err(err) = result {
-                    lore_base::lore_warn!("error while defragmenting during read_stream: {0}", err);
+                    lore_base::lore_warn!("error while defragmenting during stream_root: {0}", err);
                     let _ = report.send(Err(err)).await;
                 }
             });
 
-            Ok((fragment, streamed))
+            Ok(streamed)
         } else {
-            sender
-                .send(Ok(cut_content(&buffer, range)?))
+            let content = cut_content(&buffer, range)?;
+            let permit = sender
+                .reserve()
                 .await
-                .map_err(|_err| StorageError::internal("read stream closed"))?;
-            Ok((fragment, streamed))
+                .map_err(|_closed| StorageError::internal("read stream closed"))?;
+            permit.send(Ok(content));
+            Ok(streamed)
         }
     }
 }

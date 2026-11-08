@@ -136,6 +136,7 @@ pub use read::REMOTE_FETCH_INFLIGHT;
 pub use read::check_payload_sizes;
 pub use read::expand_payload;
 pub use read::load_fragment;
+pub use read::load_root;
 pub use read::read;
 pub use read::read_into;
 pub use read::read_into_buffer;
@@ -148,6 +149,7 @@ pub use read::read_resolved_stream;
 pub use read::read_stream;
 pub use read::remote_fetch_bytes;
 pub use read::remote_fetch_inflight;
+pub use read::stream_root;
 pub use read::write_all_to_file;
 // Re-export store types
 pub use store_types::KeyType;

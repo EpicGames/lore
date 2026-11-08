@@ -9,6 +9,7 @@ use axum::extract::Query;
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
+use axum::http::Method;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_DISPOSITION;
 use axum::http::header::CONTENT_ENCODING;
@@ -33,6 +34,11 @@ use tracing::debug;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::http::log_http_error;
+use crate::http::range::Selection;
+use crate::http::range::range_headers;
+use crate::http::range::read_range;
+use crate::http::range::requested_range;
+use crate::http::range::select;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -111,7 +117,12 @@ fn create_stream_response_headers(
     Ok(headers)
 }
 
+/// Serves the content `address` names, or the byte range its `Range` header asks for.
+///
+/// Answers `HEAD` with the headers of a `GET` without `Range`, taken from the content's root
+/// fragment, without streaming the content.
 pub async fn handler(
+    method: Method,
     State(state): State<Arc<ServerState>>,
     Query(query): Query<GetRepositoryContentQuery>,
     Path((repository_id, address)): Path<(String, String)>,
@@ -138,6 +149,8 @@ pub async fn handler(
         .and_then(|header_value| header_value.to_str().map(str::to_string).ok())
         .unwrap_or_default();
 
+    let range = requested_range(&method, &headers);
+    let head = method == Method::HEAD;
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     LORE_CONTEXT
         .scope(execution, async move {
@@ -149,19 +162,43 @@ pub async fn handler(
 
             let options = immutable::read_options_from_repository(&repository);
 
-            let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
-
-            let content_length =
-                immutable::read_stream(repository, parsed_address, None, options, tx)
+            let (fragment, buffer) =
+                immutable::load_root(repository.clone(), parsed_address, options)
                     .await
                     .map_err(GetContentError::ReadStream)?;
+            let total = fragment.size_content;
+            let selection = select(range, total);
+            if selection == Selection::Unsatisfiable {
+                let mut response_headers = HeaderMap::new();
+                let status = range_headers(&selection, total, &mut response_headers)
+                    .map_err(GetContentError::HeaderGeneration)?;
+                return Ok((status, response_headers, Body::empty()));
+            }
 
-            let stream = ReceiverStream::new(rx);
+            let (content_length, body) = if head {
+                (total, Body::empty())
+            } else {
+                let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
+                let content_length = immutable::stream_root(
+                    repository,
+                    parsed_address,
+                    fragment,
+                    buffer,
+                    read_range(&selection),
+                    options,
+                    tx,
+                )
+                .await
+                .map_err(GetContentError::ReadStream)?;
+                (content_length, Body::from_stream(ReceiverStream::new(rx)))
+            };
 
-            let headers = create_stream_response_headers(query, content_length)
+            let mut response_headers = create_stream_response_headers(query, content_length)
+                .map_err(GetContentError::HeaderGeneration)?;
+            let status = range_headers(&selection, total, &mut response_headers)
                 .map_err(GetContentError::HeaderGeneration)?;
 
-            Ok((StatusCode::OK, headers, Body::from_stream(stream)))
+            Ok((status, response_headers, body))
         })
         .await
 }

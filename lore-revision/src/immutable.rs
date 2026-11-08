@@ -324,17 +324,45 @@ pub fn load_raw(
 // Read path -- delegates to lore-storage with session
 // ---------------------------------------------------------------------------
 
-/// Stream the given data range to `sender`, returning the number of bytes that will arrive.
+/// Load the root fragment of the content `address` names, and its expanded payload, as
+/// [`lore_storage::load_root`] loads it.
 ///
-/// `None` streams the whole content, so the count is `size_content` as it always was. A range
-/// is clamped to the content and only the fragments it touches are fetched.
-///
-/// Returns [`lore_storage::read_stream`]'s future mapped to the count, holding `repository` until it
-/// completes, without a future of its own.
+/// Returns that future with its error forwarded, holding `repository` until it completes, without
+/// a future of its own.
 #[inline]
-pub fn read_stream(
+pub fn load_root(
     repository: Arc<RepositoryContext>,
     address: Address,
+    options: ReadOptions,
+) -> impl Future<Output = Result<(Fragment, Bytes), ImmutableError>> {
+    let session = resolve_session(&repository);
+    lore_storage::load_root(
+        repository.immutable_store(),
+        repository.id,
+        address,
+        options,
+        session,
+    )
+    .map(move |loaded| {
+        drop(repository);
+        loaded.forward::<ImmutableError>("loading root fragment")
+    })
+}
+
+/// Stream the given data range to `sender`, from the root fragment `fragment` and expanded payload
+/// `buffer` that [`load_root`] loaded for `address`, returning the number of bytes that will arrive.
+///
+/// `None` streams the whole content. A range is clamped to the content and only the fragments it
+/// touches are fetched.
+///
+/// Returns [`lore_storage::stream_root`]'s future mapped to the count, holding `repository` until it
+/// completes, without a future of its own.
+#[inline]
+pub fn stream_root(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
     range: Option<Range<usize>>,
     options: ReadOptions,
     sender: Sender<Result<Bytes, lore_storage::StorageError>>,
@@ -342,14 +370,15 @@ pub fn read_stream(
     let store = repository.immutable_store();
     let partition = repository.id;
     let session = resolve_session(&repository);
-    lore_storage::read_stream(store, partition, address, range, options, sender, session).map(
-        move |streamed| {
-            drop(repository);
-            streamed
-                .map(|(_fragment, streamed)| streamed.end - streamed.start)
-                .forward::<ImmutableError>("reading immutable data")
-        },
+    lore_storage::stream_root(
+        store, partition, address, fragment, buffer, range, options, sender, session,
     )
+    .map(move |streamed| {
+        drop(repository);
+        streamed
+            .map(|streamed| streamed.end - streamed.start)
+            .forward::<ImmutableError>("streaming immutable data")
+    })
 }
 
 /// Read the given data range from a fragment which can be a large data set

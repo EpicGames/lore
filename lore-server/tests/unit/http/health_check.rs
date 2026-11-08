@@ -11,11 +11,12 @@ use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::server::LoreHttpServerSettings;
 use lore_server::http::server::ServerHealth;
-use lore_server::http::server::ServerState;
 use lore_server::http::server::create_router;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::http::test_utils::build_test_server;
+use crate::http::test_utils::test_state;
 use crate::store::test_support::test_store_create;
 
 #[tokio::test]
@@ -23,19 +24,7 @@ async fn test_server_is_up_and_listening() {
     let (immutable_store, mutable_store, _execution) =
         test_store_create().await.expect("Failed to create stores");
 
-    // Create the server and test the request
-    let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-    let test_shared_state = ServerState {
-        immutable_store,
-        mutable_store,
-        token_verification: TokenVerification::Ignore,
-        repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-        max_file_size: 100,
-        presign_config: None,
-    };
-    let settings = LoreHttpServerSettings::test_default();
-    let app = create_router(test_shared_state, test_health, &settings);
-    let test_server = TestServer::new(app).unwrap();
+    let test_server = build_test_server(immutable_store, mutable_store, None);
 
     let response = test_server.get("/health_check").await;
 
@@ -54,19 +43,15 @@ async fn test_unavailable_store_server_is_not_healthy() {
         interval_timeout: None,
         store_health_check: true,
     };
-    let test_shared_state = ServerState {
-        immutable_store,
-        mutable_store,
-        token_verification: TokenVerification::Ignore,
-        repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-        max_file_size: 100,
-        presign_config: None,
-    };
     let settings = LoreHttpServerSettings {
         store_health_check: true,
         ..Default::default()
     };
-    let app = create_router(test_shared_state, test_health, &settings);
+    let app = create_router(
+        test_state(immutable_store, mutable_store, None),
+        test_health,
+        &settings,
+    );
     let test_server = TestServer::new(app).unwrap();
 
     let response = test_server.get("/health_check").await;

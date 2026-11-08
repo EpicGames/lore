@@ -6,25 +6,42 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use axum::Extension;
+use axum::body::to_bytes;
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::HeaderName;
 use axum::http::HeaderValue;
+use axum::http::Method;
 use axum::http::StatusCode;
-use axum_test::TestServer;
+use axum::http::Uri;
+use axum::http::header::ACCEPT_RANGES;
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::CONTENT_RANGE;
+use axum::http::header::RANGE;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use bytes::Bytes;
 use jsonwebtoken::EncodingKey;
 use jsonwebtoken::Header;
 use jsonwebtoken::encode;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_revision::fragment;
 use lore_server::auth::jwt::AuthorizationToken;
-use lore_server::auth::jwt::TokenVerification;
-use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-use lore_server::http::server::LoreHttpServerSettings;
-use lore_server::http::server::ServerHealth;
+use lore_server::http::repositories::repository::contents::content::get_repository_content::handler;
 use lore_server::http::server::ServerState;
-use lore_server::http::server::create_router;
 use rand::random;
 
+use crate::http::test_utils::MISSING_ADDRESS;
+use crate::http::test_utils::RANGED_CONTENT_SIZE;
+use crate::http::test_utils::build_test_server;
+use crate::http::test_utils::put_compressed_content;
+use crate::http::test_utils::test_state;
+use crate::http::test_utils::write_fragmented_content;
 use crate::store::test_support::test_store_create;
 
 #[tokio::test]
@@ -33,20 +50,7 @@ async fn test_server_is_up_and_listening() {
         test_store_create().await.expect("Failed to create stores");
     LORE_CONTEXT
         .scope(execution.clone(), async move {
-            // Create the server and test the request
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let test_shared_state = ServerState {
-                immutable_store,
-                mutable_store,
-                token_verification: TokenVerification::Ignore,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: None,
-            };
-
-            let settings = LoreHttpServerSettings::test_default();
-            let app = create_router(test_shared_state, test_health, &settings);
-            let test_server = TestServer::new(app).unwrap();
+            let test_server = build_test_server(immutable_store, mutable_store, None);
 
             let response = test_server.get("/does-not-exist").expect_failure().await;
 
@@ -61,20 +65,7 @@ async fn test_address_in_wrong_format() {
         test_store_create().await.expect("Failed to create stores");
     LORE_CONTEXT
         .scope(execution.clone(), async move {
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let test_shared_state = ServerState {
-                immutable_store,
-                mutable_store,
-                token_verification: TokenVerification::Ignore,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: None,
-            };
-            let settings = LoreHttpServerSettings::test_default();
-            let app = create_router(test_shared_state, test_health, &settings);
-            let test_server = TestServer::new(app).unwrap();
-
-            // Create the server and test the request
+            let test_server = build_test_server(immutable_store, mutable_store, None);
             let non_existing_address = "/v1/repository/fffff/content/fffff-ff"; // Wrong lengths
             let response = test_server.get(non_existing_address).expect_failure().await;
 
@@ -89,26 +80,21 @@ async fn test_address_not_found() {
         test_store_create().await.expect("Failed to create stores");
     LORE_CONTEXT
         .scope(execution.clone(), async move {
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let test_shared_state = ServerState {
-                immutable_store,
-                mutable_store,
-                token_verification: TokenVerification::Ignore,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: None,
-            };
-            let settings = LoreHttpServerSettings::test_default();
-            let app = create_router(test_shared_state, test_health, &settings);
-            let test_server = TestServer::new(app).unwrap();
+            let test_server = build_test_server(immutable_store, mutable_store, None);
 
-            // Create the server and test the request
-            let non_existing_address = "/v1/repository/ffffffffffffffffffffffffffffffff/content/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
-            let response = test_server.get(non_existing_address).expect_failure().await;
+            let response = test_server
+                .get(&format!(
+                    "/v1/repository/ffffffffffffffffffffffffffffffff/content/{MISSING_ADDRESS}"
+                ))
+                .add_header(RANGE, "bytes=99999999-")
+                .expect_failure()
+                .await;
 
             assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
             assert_eq!(response.text(), "address not found");
-        }).await;
+            assert!(response.headers().get(CONTENT_RANGE).is_none());
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -133,19 +119,7 @@ async fn test_address_returned_correctly() {
                 .await
                 .expect("Failed to put data in immutable store");
 
-            // Create the server and test the request
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let test_shared_state = ServerState {
-                immutable_store,
-                mutable_store,
-                token_verification: TokenVerification::Ignore,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: None,
-            };
-            let settings = LoreHttpServerSettings::test_default();
-            let app = create_router(test_shared_state, test_health, &settings);
-            let test_server = TestServer::new(app).unwrap();
+            let test_server = build_test_server(immutable_store, mutable_store, None);
             let valid_url = format!("/v1/repository/{repository}/content/{address}");
 
             let response = test_server.get(valid_url.as_str()).await;
@@ -177,19 +151,7 @@ async fn test_address_returned_correctly_with_headers() {
                 .await
                 .expect("Failed to put data in immutable store");
 
-            // Create the server and test the request
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let test_shared_state = ServerState {
-                immutable_store,
-                mutable_store,
-                token_verification: TokenVerification::Ignore,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: None,
-            };
-            let settings = LoreHttpServerSettings::test_default();
-            let app = create_router(test_shared_state, test_health, &settings);
-            let test_server = TestServer::new(app).unwrap();
+            let test_server = build_test_server(immutable_store, mutable_store, None);
             let valid_url = format!("/v1/repository/{repository}/content/{address}");
 
             let response = test_server
@@ -238,19 +200,7 @@ async fn test_address_works_with_jwt_verifier_and_good_token() {
                 .await
                 .expect("Failed to put data in immutable store");
 
-            // Create the server and test the request
-            let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-            let test_shared_state = ServerState {
-                immutable_store,
-                mutable_store,
-                token_verification: TokenVerification::Ignore,
-                repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-                max_file_size: 100,
-                presign_config: None,
-            };
-            let settings = LoreHttpServerSettings::test_default();
-            let app = create_router(test_shared_state, test_health, &settings);
-            let test_server = TestServer::new(app).unwrap();
+            let test_server = build_test_server(immutable_store, mutable_store, None);
             let valid_url = format!("/v1/repository/{repository}/content/{address}");
 
             // Create a valid token, with a kid (which is what's checked for now, so it breaks if/when we check further)
@@ -293,6 +243,165 @@ async fn test_address_works_with_jwt_verifier_and_good_token() {
                 .await;
 
             assert_eq!(response.status_code(), StatusCode::OK);
+        })
+        .await;
+}
+
+/// Writes fragmented content, then requests it with `method`, sending `range`
+/// as its `Range` header.
+async fn request_range(method: Method, range: &str) -> (axum_test::TestResponse, Bytes) {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let range = range.to_string();
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<Context>();
+            let (address, content) = write_fragmented_content(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository.into(),
+            )
+            .await;
+            let test_server = build_test_server(immutable_store, mutable_store, None);
+
+            let response = test_server
+                .method(
+                    method,
+                    &format!("/v1/repository/{repository}/content/{address}"),
+                )
+                .add_header(RANGE, range)
+                .await;
+            (response, content)
+        })
+        .await
+}
+
+#[tokio::test]
+async fn test_range_returns_partial_content() {
+    let (response, content) = request_range(Method::GET, "bytes=5000-13999").await;
+
+    assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.headers().get(CONTENT_RANGE).unwrap(),
+        &format!("bytes 5000-13999/{RANGED_CONTENT_SIZE}")
+    );
+    assert_eq!(response.headers().get(CONTENT_LENGTH).unwrap(), "9000");
+    assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+    assert_eq!(response.as_bytes(), &content[5000..14000]);
+}
+
+#[tokio::test]
+async fn test_range_past_the_end_is_not_satisfiable() {
+    let (response, _) = request_range(Method::GET, "bytes=2000000-2000010").await;
+
+    assert_eq!(response.status_code(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+    assert_eq!(
+        response.headers().get(CONTENT_RANGE).unwrap(),
+        &format!("bytes */{RANGED_CONTENT_SIZE}")
+    );
+}
+
+#[tokio::test]
+async fn test_several_ranges_return_whole_content() {
+    let (response, content) = request_range(Method::GET, "bytes=0-9,100-109").await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+    assert!(response.headers().get(CONTENT_RANGE).is_none());
+    assert_eq!(response.as_bytes(), &content[..]);
+}
+
+#[tokio::test]
+async fn test_head_with_range_is_not_partial_content() {
+    let (response, _) = request_range(Method::HEAD, "bytes=0-9").await;
+
+    assert_eq!(response.status_code(), StatusCode::OK);
+    assert!(response.headers().get(CONTENT_RANGE).is_none());
+    assert_eq!(response.headers().get(ACCEPT_RANGES).unwrap(), "bytes");
+    assert_eq!(
+        response.headers().get(CONTENT_LENGTH).unwrap(),
+        &RANGED_CONTENT_SIZE.to_string()
+    );
+    assert!(response.as_bytes().is_empty());
+}
+
+/// Calls the handler directly with `method` and `headers`, for content `address` in `repository`.
+/// It runs on the test's runtime, and its response keeps the body a router strips for `HEAD`.
+async fn call_handler(
+    state: Arc<ServerState>,
+    method: Method,
+    repository: Context,
+    address: Address,
+    headers: HeaderMap,
+) -> Response {
+    handler(
+        method,
+        State(state),
+        Query::try_from_uri(&Uri::from_static("/")).unwrap(),
+        Path((repository.to_string(), address.to_string())),
+        Extension(None),
+        headers,
+    )
+    .await
+    .into_response()
+}
+
+#[tokio::test]
+async fn test_head_streams_no_content() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<Context>();
+            let (address, _) = write_fragmented_content(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository.into(),
+            )
+            .await;
+            let state = Arc::new(test_state(immutable_store, mutable_store, None));
+
+            for (method, streamed) in [(Method::HEAD, 0), (Method::GET, RANGED_CONTENT_SIZE)] {
+                let response = call_handler(
+                    state.clone(),
+                    method.clone(),
+                    repository,
+                    address,
+                    HeaderMap::new(),
+                )
+                .await;
+
+                assert_eq!(response.status(), StatusCode::OK, "{method}");
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                assert_eq!(body.len(), streamed, "{method}");
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_a_request_decodes_the_root_once() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = random::<Context>();
+            let address = put_compressed_content(immutable_store.clone(), repository.into()).await;
+            let state = Arc::new(test_state(immutable_store, mutable_store, None));
+
+            for range in [None, Some("bytes=0-9")] {
+                let mut headers = HeaderMap::new();
+                if let Some(range) = range {
+                    headers.insert(RANGE, HeaderValue::from_static(range));
+                }
+                lore_storage::test_util::reset_counts();
+                let response =
+                    call_handler(state.clone(), Method::GET, repository, address, headers).await;
+
+                assert!(response.status().is_success(), "{range:?}");
+                assert_eq!(lore_storage::test_util::counts().1, 1, "{range:?}");
+            }
         })
         .await;
 }

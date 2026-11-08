@@ -1105,11 +1105,11 @@ mod tests {
     }
 
     /// Writes a payload using small fixed-size chunks to force a 2-level
-    /// fragment tree, then reads it back via `read_stream` (which uses the
-    /// streaming defragment pipeline in ordered mode) and verifies the
-    /// reassembled content matches.
+    /// fragment tree, then reads it back via `load_root` and `stream_root`
+    /// (which uses the streaming defragment pipeline in ordered mode) and
+    /// verifies the reassembled content matches.
     #[tokio::test]
-    async fn read_stream_multilevel_fragmented() {
+    async fn stream_root_multilevel_fragmented() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
 
@@ -1143,10 +1143,20 @@ mod tests {
                 let (tx, mut rx) =
                     tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(64);
                 let options = immutable::read_options_from_repository(&repository);
-                let content_length =
-                    immutable::read_stream(repository.clone(), address, None, options, tx)
-                        .await
-                        .expect("read_stream failed");
+                let (fragment, buffer) = immutable::load_root(repository.clone(), address, options)
+                    .await
+                    .expect("load_root failed");
+                let content_length = immutable::stream_root(
+                    repository.clone(),
+                    address,
+                    fragment,
+                    buffer,
+                    None,
+                    options,
+                    tx,
+                )
+                .await
+                .expect("stream_root failed");
 
                 assert_eq!(content_length, payload_size as u64);
 
