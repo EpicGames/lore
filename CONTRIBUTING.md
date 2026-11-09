@@ -85,7 +85,7 @@ For anything beyond a trivial fix, **open a GitHub Issue before writing code:**
 
 Wait for a maintainer to weigh in before investing significant effort.
 
-For large or cross-cutting changes, check whether a [Lore Enhancement Proposal](#lore-enhancement-proposals) is required before any code is written.
+For large or cross-cutting changes, check early whether a [Lore Enhancement Proposal](#lore-enhancement-proposals) is required. The implementation can't be merged until the LEP is accepted.
 
 ## Development workflow
 
@@ -161,13 +161,13 @@ Keep PRs focused. One logical change per PR.
 
 Expect at least one round of feedback before a PR is merged.
 
-A PR requires **two approvals** from Maintainers to merge.
+A PR requires **one approval** from a Maintainer to merge.
 
 Address each piece of feedback, then re-request review. Maintainer decisions are final. If feedback isn't clear, ask.
 
 ## Lore Enhancement Proposals
 
-An LEP is required before implementing any change that affects:
+An accepted LEP is required before merging any change that affects:
 
 - The Lore wire protocol or on-disk format
 - Public APIs (`lore` CLI commands, `lore-capi`, language bindings)
@@ -176,7 +176,7 @@ An LEP is required before implementing any change that affects:
 
 For everything else, an Issue and PR are sufficient.
 
-LEPs live in [`docs/proposals/`](docs/proposals/). Copy [`docs/proposals/lep-template.md`](docs/proposals/lep-template.md) to a new file named `YYYY-MM-DD-your-feature.md`, fill it out, and open a pull request. The LEP must be accepted before implementation begins. See the [LEP README](docs/proposals/README.md) for the full lifecycle and writing guidelines.
+LEPs live in [`docs/proposals/`](docs/proposals/). Copy [`docs/proposals/lep-template.md`](docs/proposals/lep-template.md) to a new file named `YYYY-MM-DD-your-feature.md`, fill it out, and open a pull request. The LEP must be accepted before its implementation is merged. Implementation work may start while the LEP is under discussion. See the [LEP README](docs/proposals/README.md) for the full lifecycle and writing guidelines.
 
 ## Documentation
 

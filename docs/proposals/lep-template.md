@@ -3,10 +3,10 @@ lep: YYYY-MM-DD-kebab-name
 title: Short, descriptive title
 authors:
   - Author 1
-status: Draft  # Draft → Accepted or Rejected. Set on merge of the discussion CR.
+status: Draft  # Draft → Accepted or Rejected. Set when the proposal is merged.
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
-discussion: <link to the review venue>
+# discussion: <link to a public discussion of this proposal> (optional; public links only)
 # replaces: LEP id this proposal supersedes
 # superseded-by: LEP id that has replaced this proposal
 ---

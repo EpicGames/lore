@@ -18,7 +18,7 @@ The folder picks the doc type. The doc type sets the structure.
 | "Why did the project choose X?" (contributor) | `docs/developing/decisions/` | ADR |
 | "How do I write code that conforms to Lore conventions?" (contributor) | `docs/developing/code-standards/` | Code-Standard |
 
-If you are unsure which folder applies, open a draft change request (CR) with your best guess; maintainers will redirect.
+If you are unsure which folder applies, open a draft pull request with your best guess; maintainers will redirect.
 
 Depth: [`canon/doc-types.md`](canon/doc-types.md) defines all seven types, their required sections, and a worked example for "I added a feature — what do I write?"
 
@@ -76,7 +76,7 @@ Depth: [`tools/README.md`](tools/README.md) for install instructions, full rule 
 
 ## 5. Submit
 
-Open a CR. In the description, name the folder you targeted, link any related Lore feature or PR, and call out anything you are unsure about — the right doc type, where to put a section, what to cut.
+Open a pull request. In the description, name the folder you targeted, link any related Lore feature or PR, and call out anything you are unsure about — the right doc type, where to put a section, what to cut.
 
 ## What maintainers handle
 

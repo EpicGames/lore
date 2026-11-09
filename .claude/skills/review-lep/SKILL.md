@@ -46,7 +46,8 @@ Deterministic. For each item, mark **PASS** or **FAIL**. Note the line number wh
 
 **Frontmatter:**
 
-- All required fields present: `lep`, `title`, `authors`, `status`, `created`, `updated`, `discussion`.
+- All required fields present: `lep`, `title`, `authors`, `status`, `created`, `updated`.
+- If `discussion` is set, it is a public link (for example a public pull request or issue). A link to an internal review, ticket, chat thread or wiki is a FAIL.
 - `status` is one of `Draft`, `Accepted`, `Rejected`.
 - `lep` value matches the filename (without `.md`).
 - `created` and `updated` are valid `YYYY-MM-DD` dates.

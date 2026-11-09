@@ -4,9 +4,7 @@ site_name: Lore Developer Documentation
 site_url: https://epicgames.github.io/lore/
 # Source repository: renders the header repo link and the per-page View-source
 # button (content.action.view derives a blob/main/docs/ link from edit_uri).
-# The "Edit this page" button is intentionally omitted — contributions go
-# through Lore change requests, not direct GitHub edits to main. edit_uri
-# assumes the default branch is `main`.
+# edit_uri assumes the default branch is `main`.
 repo_url: https://github.com/EpicGames/lore
 repo_name: EpicGames/lore
 edit_uri: edit/main/docs/

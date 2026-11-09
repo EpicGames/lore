@@ -17,4 +17,4 @@ Closes #
 - [ ] A change to async code reports its future sizes against the base, and its allocation counts when it adds or removes a box, in its commit message ([async-futures.md](https://github.com/EpicGames/lore/blob/main/docs/developing/code-standards/async-futures.md#10-measurement-and-tests))
 - [ ] A change to shipped behavior adds a note to [`docs/release-notes/`](https://github.com/EpicGames/lore/blob/main/docs/release-notes/README.md)
 - [ ] Docs under `docs/` updated where behavior changed
-- [ ] If this change is large or cross-cutting, an [LEP](https://github.com/EpicGames/lore/blob/main/docs/proposals/README.md) has been filed first
+- [ ] If this change is large or cross-cutting, its [LEP](https://github.com/EpicGames/lore/blob/main/docs/proposals/README.md) has been accepted

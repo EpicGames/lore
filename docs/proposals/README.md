@@ -1,7 +1,7 @@
 # Lore Enhancement Proposals
 
-This directory holds **Lore Enhancement Proposals (LEPs)** — public-facing,
-pre-implementation proposals for changes to the Lore wire protocol, on-disk
+This directory holds **Lore Enhancement Proposals (LEPs)** — public-facing
+proposals for changes to the Lore wire protocol, on-disk
 format, public APIs (CLI, capi, JS bindings), and cross-cutting features. LEPs are where the design is debated; ADRs in
 [`../developing/decisions/`](../developing/decisions/README.md) record narrow architecture
 decisions after they are made.
@@ -11,10 +11,10 @@ decisions after they are made.
 LEPs use a three-state lifecycle:
 
 - **Draft** — being authored or under review.
-- **Accepted** — approved; implementation may proceed.
+- **Accepted** — approved; its implementation may be merged.
 - **Rejected** — evaluated and not pursued. Rejected LEPs stay in-tree as historical record.
 
-An accepted LEP changes through an amendment: a review that edits the LEP in place, with the same discussion period as a new LEP. The LEP stays `Accepted`, and the amendment sets `updated` to the date it merges. To reverse an accepted decision rather than refine it, write a new LEP that sets `replaces`.
+An accepted LEP changes through an amendment: a review that edits the LEP in place, discussed in public like a new LEP. The LEP stays `Accepted`, and the amendment sets `updated` to the date it merges. To reverse an accepted decision rather than refine it, write a new LEP that sets `replaces`.
 
 Filenames follow the `YYYY-MM-DD-kebab-name.md` convention.
 
@@ -28,6 +28,7 @@ These apply across every section.
 
 - **Active voice.** Write "this proposal rejects approach X", not "approach X was rejected"; "Lore writes the new version", not "the new version is written by Lore". Past-participle adjectives ("the upgraded client", "the proposed design") are fine.
 - **Public citations.** LEPs are public. Support every factual claim either with a public link (RFC, code path in the Lore tree, a public ADR, an upstream project doc) or by capturing the relevant detail inline. Internal-only resources (internal code reviews, JIRA tickets, Slack threads, internal wikis) can't be shared externally and shouldn't be included in the LEP — they don't substitute for support in the body.
+- **Discussion link.** The `discussion` frontmatter field is optional. When set, it links to a public discussion of the proposal, such as a public pull request or issue. Leave it out rather than link an internal review or thread.
 - **Ground every claim.** If you can't back something up with research, prior discussion, or the proposal itself, leave it out rather than filling space.
 - **One decision per proposal.** Propose one change that can be accepted on its own. When parts of a proposal have their own goals, risks, and compatibility surface, write a proposal for each, so that accepting one doesn't decide the others. A change to an accepted proposal is an amendment to it, as [Lifecycle](#lifecycle) describes.
 - **Lore terms.** Use the terms the [glossary](../glossary.md) defines, in the sense it defines them. Don't give a defined term a second meaning.

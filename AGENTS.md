@@ -37,7 +37,8 @@ Four classes are different. A **larger architectural change**, anything touching
 in this repo, in public:
 
 - **LEPs** — `docs/proposals/YYYY-MM-DD-<slug>.md`. Required per `GOVERNANCE.md`;
-  minimum two-week discussion, and **accepted before implementation begins**.
+  discussed in public, and **accepted before the implementation is merged**;
+  implementation work may start while the LEP is under discussion.
 - **ADRs** — `docs/developing/decisions/<NNNNN>-<slug>.md`, for rulings below the
   LEP bar.
 
@@ -45,12 +46,7 @@ If you are about to write code in one of those four classes, the proposal comes
 first — not afterwards to describe what was built. The LEP bar is in `GOVERNANCE.md`
 and `CONTRIBUTING.md`.
 
-## Governance sign-off is a GitHub gate
+## Binding rules
 
-The issue → PR → two-Maintainer-approval flow in `GOVERNANCE.md` and
-`CONTRIBUTING.md` governs public contributions arriving through GitHub. It is not a
-per-revision gate on work in Lore — a Lore branch is reviewed through its change
-request.
-
-Binding either way: an accepted LEP before implementation for the four classes
-above, the Code of Conduct, and the security policy.
+The Code of Conduct and the security policy bind every change. A change in one of the
+four classes above also needs an accepted LEP before it merges.
