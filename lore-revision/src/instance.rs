@@ -205,18 +205,18 @@ async fn store_normalized_registration(
     let mut metadata = Metadata::new();
     metadata
         .set_string(INSTANCE_ID, hex::encode(instance_id.data()).as_str())
-        .forward_any::<InstanceRegistryError>("failed to set instance ID in metadata")?;
+        .forward::<InstanceRegistryError>("failed to set instance ID in metadata")?;
     metadata
         .set_string(PATH, normalized_path)
-        .forward_any::<InstanceRegistryError>("failed to set path in metadata")?;
+        .forward::<InstanceRegistryError>("failed to set path in metadata")?;
     metadata
         .set_u64(CREATED, crate::util::time::timestamp())
-        .forward_any::<InstanceRegistryError>("failed to set created in metadata")?;
+        .forward::<InstanceRegistryError>("failed to set created in metadata")?;
 
     let metadata_hash = metadata
         .serialize_local(repository.clone())
         .await
-        .forward_any::<InstanceRegistryError>("failed to serialize instance metadata")?;
+        .forward::<InstanceRegistryError>("failed to serialize instance metadata")?;
 
     let (key, key_type) = instance_key(repository.salt(), instance_id);
     let handle = repository.try_write_mutable_store().ok_or(WriteRequired)?;
@@ -396,7 +396,7 @@ pub async fn load_instance_metadata(
 ) -> Result<InstanceMetadata, InstanceRegistryError> {
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
-        .forward_any::<InstanceRegistryError>("failed to deserialize instance metadata")?;
+        .forward::<InstanceRegistryError>("failed to deserialize instance metadata")?;
 
     // Missing or corrupt fields are non-fatal — instance metadata is advisory
     // (used for branch checkout warnings and stale instance detection), not
@@ -743,10 +743,8 @@ pub async fn delete_staged_anchor(repository: &Arc<RepositoryContext>) -> Result
     store_staged_anchor(repository, Hash::default()).await
 }
 
-/// Errors from reading and writing instance registrations in the mutable store.
-///
-/// [`InstanceError`] declares every variant of this set, and adds the errors that unmounting an
-/// instance raises.
+/// Errors from writing and reading an instance registration: its metadata in the immutable store
+/// and the key that names it in the mutable store.
 #[error_set]
 pub enum InstanceRegistryError {
     WriteRequired,

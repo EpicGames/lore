@@ -3422,7 +3422,7 @@ pub async fn create_local(
     // Register instance in the mutable store
     crate::instance::register_instance(&repository, instance_id, &path.display().to_string())
         .await
-        .forward::<RepositoryError>("Failed to create local store")?;
+        .forward::<RepositoryError>("registering the new instance")?;
 
     // Generate default branch. When using a shared global mutable store, the
     // branch may already exist from another instance — skip creation in that case.
