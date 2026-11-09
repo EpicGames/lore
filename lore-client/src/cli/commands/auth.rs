@@ -38,6 +38,8 @@ use crate::println;
 use crate::styling::CommonStyles;
 use crate::util;
 
+const LOGIN_REMOTE_REQUIRED: &str = "No remote URL supplied. Run `lore auth login <remote-url>` or run from a Lore repository with a configured remote.";
+
 #[derive(Args)]
 pub struct AuthArgs {
     #[command(subcommand)]
@@ -112,8 +114,58 @@ pub enum AuthCommands {
     Clear,
 }
 
+fn configured_remote_url(repository_path: &str) -> Option<String> {
+    lore_revision::repository::load_repository_config(repository_path)
+        .ok()
+        .and_then(|config| config.remote_url)
+        .filter(|remote_url| !remote_url.is_empty())
+}
+
+fn login_with_token_can_use_explicit_auth_url(args: &AuthLoginArgs) -> bool {
+    args.token_type.is_some()
+        && args.token.is_some()
+        && args
+            .auth_url
+            .as_deref()
+            .is_some_and(|auth_url| !auth_url.is_empty())
+}
+
+fn resolve_login_remote_url(
+    globals: &LoreGlobalArgs,
+    args: &AuthLoginArgs,
+) -> Result<LoreString, &'static str> {
+    if let Some(remote_url) = args
+        .remote_url
+        .as_deref()
+        .filter(|remote_url| !remote_url.is_empty())
+    {
+        return Ok(LoreString::from(remote_url));
+    }
+
+    if let Some(remote_url) = configured_remote_url(globals.repository_path.as_str()) {
+        return Ok(LoreString::from(remote_url.as_str()));
+    }
+
+    if login_with_token_can_use_explicit_auth_url(args) {
+        return Ok(LoreString::default());
+    }
+
+    Err(LOGIN_REMOTE_REQUIRED)
+}
+
 pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8 {
-    let remote_url = LoreString::from(&args.remote_url);
+    if args.token_type.is_some() ^ args.token.is_some() {
+        crate::eprintln!("Both --token-type and --token are required for non-interactive login");
+        return 1;
+    }
+
+    let remote_url = match resolve_login_remote_url(&globals, args) {
+        Ok(remote_url) => remote_url,
+        Err(message) => {
+            crate::eprintln!("{message}");
+            return 1;
+        }
+    };
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -148,9 +200,6 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
             auth_url: args.auth_url.as_deref().into(),
         };
         runtime().block_on(auth::login_with_token(globals, args, callback)) as u8
-    } else if args.token_type.is_some() || args.token.is_some() {
-        crate::eprintln!("Both --token-type and --token are required for non-interactive login");
-        1
     } else {
         let args = LoreAuthLoginInteractiveArgs {
             remote_url,
@@ -499,5 +548,76 @@ pub fn resolve_user_ids(
     match Arc::try_unwrap(auth_data) {
         Ok(auth_data) => auth_data.into_inner(),
         Err(_) => HashMap::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn globals_without_repo() -> LoreGlobalArgs {
+        let repository_path = std::env::temp_dir().join(format!(
+            "lore-auth-login-missing-repo-{}",
+            std::process::id()
+        ));
+
+        LoreGlobalArgs {
+            repository_path: repository_path.display().to_string().into(),
+            ..Default::default()
+        }
+    }
+
+    fn login_args(
+        remote_url: Option<&str>,
+        token_type: Option<&str>,
+        token: Option<&str>,
+        auth_url: Option<&str>,
+    ) -> AuthLoginArgs {
+        AuthLoginArgs {
+            token_type: token_type.map(str::to_owned),
+            token: token.map(str::to_owned),
+            auth_url: auth_url.map(str::to_owned),
+            remote_url: remote_url.map(str::to_owned),
+            no_browser: false,
+        }
+    }
+
+    #[test]
+    fn interactive_login_without_remote_errors() {
+        let globals = globals_without_repo();
+        let args = login_args(None, None, None, None);
+
+        assert_eq!(
+            resolve_login_remote_url(&globals, &args).unwrap_err(),
+            LOGIN_REMOTE_REQUIRED
+        );
+    }
+
+    #[test]
+    fn token_login_with_auth_url_allows_missing_remote() {
+        let globals = globals_without_repo();
+        let args = login_args(
+            None,
+            Some("api-key"),
+            Some("token-value"),
+            Some("ucs-auth://auth.example.com"),
+        );
+
+        assert!(
+            resolve_login_remote_url(&globals, &args)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn login_uses_remote_argument_when_present() {
+        let globals = globals_without_repo();
+        let args = login_args(Some("lore.example.com"), None, None, None);
+
+        assert_eq!(
+            resolve_login_remote_url(&globals, &args).unwrap().as_str(),
+            "lore.example.com"
+        );
     }
 }

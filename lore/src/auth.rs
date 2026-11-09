@@ -8,6 +8,7 @@ use lore_credential::UserInfo;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::auth;
+use lore_revision::auth::login::InteractiveLoginError;
 use lore_revision::auth::login::LoginError;
 use lore_revision::auth::userinfo::LoreAuthIdentityEventData;
 use lore_revision::auth::userinfo::LoreAuthUserInfoEventData;
@@ -28,6 +29,8 @@ use crate::call::repository_call_read;
 use crate::call::setup_execution;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreString;
+
+const LOGIN_REMOTE_REQUIRED: &str = "No remote URL supplied. Run `lore auth login <remote-url>` or run from a Lore repository with a configured remote.";
 
 #[error_set]
 pub enum AuthStoreError {
@@ -206,21 +209,22 @@ async fn login_with_token_local(
 
     let auth_url: Option<String> = args.auth_url.into();
 
-    LORE_CONTEXT
+    let result = LORE_CONTEXT
         .scope(execution, async move {
-            let result = async move {
-                login_with_token_impl(
-                    remote_url.as_str(),
-                    args.token.as_str(),
-                    args.token_type.as_str(),
-                    auth_url.as_deref(),
-                )
-                .await
+            if remote_url.is_empty() && auth_url.as_deref().unwrap_or_default().is_empty() {
+                return Err(LoginError::internal(LOGIN_REMOTE_REQUIRED));
             }
-            .await;
-            execution_context().dispatcher.complete_result(result).await
+
+            login_with_token_impl(
+                remote_url.as_str(),
+                args.token.as_str(),
+                args.token_type.as_str(),
+                auth_url.as_deref(),
+            )
+            .await
         })
-        .await
+        .await;
+    execution_context().dispatcher.complete_result(result).await
 }
 
 async fn login_with_token_impl(
@@ -291,21 +295,22 @@ async fn login_interactive_local(
 
     let execution = setup_execution(globals, callback);
 
-    LORE_CONTEXT
+    let result = LORE_CONTEXT
         .scope(execution, async move {
-            let result = async move {
-                match auth::login::interactive(remote_url.as_str(), args.no_browser != 0).await {
-                    Ok(user_info) => {
-                        send_user_info(user_info);
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                }
+            if remote_url.is_empty() {
+                return Err(InteractiveLoginError::internal(LOGIN_REMOTE_REQUIRED));
             }
-            .await;
-            execution_context().dispatcher.complete_result(result).await
+
+            match auth::login::interactive(remote_url.as_str(), args.no_browser != 0).await {
+                Ok(user_info) => {
+                    send_user_info(user_info);
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            }
         })
-        .await
+        .await;
+    execution_context().dispatcher.complete_result(result).await
 }
 
 /// Arguments for listing all stored authentication identities across endpoints.
