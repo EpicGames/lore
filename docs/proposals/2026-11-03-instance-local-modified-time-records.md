@@ -5,7 +5,7 @@ authors:
   - Zack Neyland
 status: Draft
 created: 2026-11-03
-updated: 2026-11-03
+updated: 2026-11-05
 discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1110
 ---
 
@@ -68,13 +68,27 @@ directory carries records that already describe its files.
   describe the copy's files, as long as the copy keeps modification times. A lookup that falls back to the
   store copies the record it finds into `.lore/`, so records an older client wrote reach a copy too once a
   scan has read them. (Goal 2.)
-- **The store is a fallback that does not go stale.** A lookup that finds no record in `.lore/` reads the
+- **A new instance never touches the store's records.** An upgraded client that creates an instance, by
+  `lore repository create` or `lore clone`, clears `.lore/records/` and marks it with an empty
+  `.lore/records/no-store` file. No client has written store records under a new instance ID, so a marked
+  instance's lookups never read the store and its new times zero nothing there. A copy of `.lore/`
+  carries the mark, and so would an instance made by the
+  [copy-on-write instance clone](2026-10-31-copy-on-write-instance-clone.md), whose instance ID is new.
+  (Goals 1 and 3.)
+- **For an older instance, the store is a fallback that does not go stale.** An instance without the mark,
+  created by an older client, may hold store records. Its lookups that find no record in `.lore/` read the
   record an older client wrote in the store. Copying such a record into `.lore/` leaves it in the store,
   since it still describes the path's content. When an upgraded client records a new time for a path, or
   clears it, it also zeroes that path's store record if one exists. A store record therefore either still
   describes the path's content or answers nothing, for this client and for an older one after a downgrade.
   The cost is a store lookup for each time recorded or cleared, and one store write per path whose content
-  changes while an older client's record of it remains; a new instance makes no such writes. (Goal 3.)
+  changes while an older client's record of it remains. (Goal 3.)
+- **The records are sorted arrays.** The records are split into 256 shards by the first byte of the key.
+  Each shard is an array of 24-byte records sorted by key, and its file is a header followed by the same
+  bytes, so loading a shard is one read and writing it back is one gathered write from its memory. A
+  lookup is a binary search. A new time for a key the shard holds is changed in place; new keys are
+  collected and merged into the array in one pass. A removed record is marked with time 0 and left out
+  when the shard is written back.
 - **Records are advisory.** A record that is missing or cannot be read costs one hash, never a wrong
   answer, as today.
 
@@ -82,12 +96,13 @@ directory carries records that already describe its files.
 
 - **Wire format** — N/A: no message or fragment changes.
 - **Client/server protocols** — N/A: the server and the client-to-service IPC are unchanged.
-- **On-disk format** — New directory `.lore/records/`. Its files start with a magic number and a format
-  version. A client that does not recognize the version treats the records as absent, hashes, and replaces
-  them when it next writes the records back. An
-  older client ignores the directory and reads only the store. After a downgrade it hashes the files whose
-  records moved to `.lore/` and finds the rest in the store as before. It does not misread a file, since an
-  upgraded client zeroes every store record it makes stale, apart from the crash case under Durability.
+- **On-disk format** — New directory `.lore/records/`: 256 shard files, which start with a magic number
+  and a format version, and the `no-store` mark. A client that does not recognize the version treats the
+  records as absent, hashes, and replaces them when it next writes the records back. An older client
+  ignores the directory and reads only the store. After a downgrade it hashes the files whose records
+  moved to `.lore/` and finds the rest in the store as before. It does not misread a file, since an
+  upgraded client zeroes every store record it makes stale, apart from the crash case under Durability
+  and the downgrade under Risks.
 - **`.lore/` contents** — Backup and copy tools see the new directory, about 24 bytes per file of the
   working tree. Copying it with the working tree, keeping modification times, is what lets a copy skip
   hashing.
@@ -97,21 +112,29 @@ directory carries records that already describe its files.
 
 - **Concurrency** — Commands still take the store locks, and the repository lock inside them, as
   ADR-00024 orders. A new instance's records add nothing to the buckets they load and rewrite under the
-  store lock. The entries older clients wrote, zeroed or not, stay in those buckets.
-- **Memory** — The records grow with the number of files, as they do today: 24 bytes per record in
-  `.lore/records/`, against 84 bytes per record in the store: 26 MB for the 1,096,884 records of the working tree
-  measured here, which the store would hold as about 92 MB. A command
-  loads only the parts of the records the paths it visits reach.
+  store lock, and it loads no bucket to look for records of its own. The entries older clients wrote,
+  zeroed or not, stay in those buckets. Each shard has its own async read-write lock, which is never held
+  by a task waiting for anything but that shard's file; lookups in one shard run side by side.
+- **Memory** — The records grow with the number of files, as they do today: 24 bytes per record, in memory
+  and in `.lore/records/`, against 84 bytes per record in the store: 26 MB for the 1,096,884 records of the
+  working tree measured here, which the store would hold as about 92 MB. A command loads only the shards
+  the paths it visits reach. New keys wait to be merged in a list of their own, which a shard merges once
+  it holds more than an eighth of the shard's records or 256 entries, whichever is larger, and at the
+  latest when the shard is written back.
 - **Statelessness** — The loaded records belong to the instance's repository lock, which the process
   caches and shares between commands that hold it at once (`REPOSITORY_LOCK_CACHE` in
   `lore-revision/src/repository.rs`). In the Lore service they therefore live while any command in the
-  instance runs, and Lore writes them back when the last holder releases the lock.
+  instance runs. Lore writes the changed shards back, side by side and alongside the store flushes, in
+  the flush that follows each command with write access, and keeps the repository lock until those
+  writes have landed. A read-only command's changes, the times it adopts from the store and the shards
+  it could not read, are written by the flush of a later command with write access that shares the
+  lock, and otherwise are dropped with the lock; the next command reads them again.
 - **Determinism** — Preserved: records change only which files a scan hashes, never its result.
-- **Durability** — A crash before Lore writes the records back loses the records written since the lock was
-  taken. A lost record costs a hash. The `.lore/` records and the store's zeroing are written separately, so
-  a crash between them can leave an older client's store record for content the path no longer holds; it
-  answers only if the file's time is set back to the recorded one, and an upgraded client never reads it
-  once the path has a record of its own.
+- **Durability** — A crash before Lore writes the records back loses the records changed since the last
+  command's flush. A lost record costs a hash. For an instance an older client created, the `.lore/`
+  records and the store's zeroing are written separately, so a crash between them can leave an older
+  client's store record for content the path no longer holds; it answers only if the file's time is set
+  back to the recorded one, and an upgraded client never reads it once the path has a record of its own.
 
 ## Migration Plan
 
@@ -142,6 +165,12 @@ they do today: deleting an instance removes only its registration and anchor key
   feature reads them across instances.
 
 **Risks**
+
+- **Risk:** an older client runs on an instance an upgraded client created, after a downgrade, and writes
+  store records under its instance ID, which the upgraded client neither reads nor zeroes once upgraded
+  again — *mitigation:* the upgraded client never trusts those records. Only a second downgrade reads
+  them. Such a record answers wrongly only for a path whose file keeps the recorded time while the content
+  the current revision holds for it changes under the upgraded client, as when it clears a record.
 
 - **Risk:** a copy that does not keep modification times inherits records that never match —
   *mitigation:* a record that does not match costs a hash, so the copy scans as a fresh instance does today.
@@ -191,5 +220,3 @@ and a partition the records do not need.
 
 - Should deleting or pruning an instance also remove its records from the store, which no client does
   today?
-- Can a client skip the store lookup for each time it records in an instance that has never held store
-  records, given that a downgrade can add them back?

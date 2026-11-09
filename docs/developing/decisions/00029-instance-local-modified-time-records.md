@@ -37,9 +37,12 @@ Chosen option: "Keep modified-time records in a record file of their own in the 
 keeps the store from growing with every file of every instance, it travels with a copy of the directory at
 no extra cost, and its entry is 24 bytes against the store's 84.
 
-Records live in `.lore/records/`, keyed by the path. A lookup that misses there falls back to the store
-record an older client wrote, and an upgraded client zeroes a path's store record when it records a new time
-for the path or clears it, so the fallback does not answer with a stale time. SWFS instances, whose mount
+Records live in `.lore/records/`, keyed by the path, as 256 shards of 24-byte records sorted by key, each
+shard's file holding the same bytes as its memory. An instance an upgraded client creates is marked as
+holding no store records, and never reads or zeroes the store's. For an instance an older client created, a
+lookup that misses falls back to the store record an older client wrote, and an upgraded client zeroes a
+path's store record when it records a new time for the path or clears it, so the fallback does not answer
+with a stale time. SWFS instances, whose mount
 presents the recorded times, and in-memory instances keep their records in the store. Anchors and
 registrations stay in the mutable store as ADR-00014 decided. The
 [instance-local modified-time records](../../proposals/2026-11-03-instance-local-modified-time-records.md)
@@ -48,10 +51,12 @@ LEP gives the design.
 ### Consequences
 
 - Good, because a copy of an instance starts with records that describe its files.
-- Good, because a new instance adds no records to the shared store. Records older clients wrote stay
-  there, zeroed once their paths change, at 84 bytes each, as zeroed keys do today.
+- Good, because a new instance adds no records to the shared store and loads none of its buckets to look
+  for any. Records older clients wrote stay there, zeroed once their paths change, at 84 bytes each, as
+  zeroed keys do today.
 - Bad, because Lore does not write the records atomically with the store flush, which ADR-00014 relies on
   for anchors. A lost record costs a hash, never a wrong answer.
 - Bad, because a client from before this change reads only the store; after a downgrade it hashes the
-  files whose records moved.
+  files whose records moved, and the records it then writes for a new instance are never read or zeroed
+  by an upgraded client.
 - Neutral, because restoring committed modification times on sync stays possible.
