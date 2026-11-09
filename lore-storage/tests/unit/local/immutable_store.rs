@@ -361,7 +361,7 @@ async fn a_flush_waits_for_a_bucket_write_another_flush_claimed() {
     let delayed = lore_base::lore_spawn!(ImmutableStoreGroup::flush_delayed(
         Arc::downgrade(&store),
         group_index,
-        0
+        Duration::ZERO
     ));
     pause.reached.notified().await;
     let flushing = dyn_store.clone();
@@ -919,7 +919,8 @@ async fn a_delayed_flush_rolls_a_pending_commit_forward_before_it_writes_a_bucke
         let blocked = format_bucket_path(&dir.path().join("immutable"), group_index, bucket);
         super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
 
-        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+            .await;
 
         let group = &store.group[group_index];
         assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
@@ -1039,7 +1040,7 @@ async fn a_group_directory_that_cannot_be_read_fails_the_open() {
 async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
     let weak = Arc::downgrade(store);
     for group_index in 0..GROUP_COUNT {
-        ImmutableStoreGroup::flush_delayed(weak.clone(), group_index, 0).await;
+        ImmutableStoreGroup::flush_delayed(weak.clone(), group_index, Duration::ZERO).await;
     }
 }
 
@@ -3470,7 +3471,7 @@ async fn a_delayed_flush_with_nothing_to_write_claims_nothing() {
 
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
-    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO).await;
 
     assert_eq!(
         std::fs::read(&epoch).ok(),
@@ -3502,7 +3503,7 @@ async fn a_delayed_flush_writes_no_level_marker_for_a_group_with_nothing_flagged
         .join(lore_storage::local::fan_out::MARKER_FILENAME);
     let before = std::fs::read(&epoch).ok();
 
-    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), 0, 0).await;
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), 0, Duration::ZERO).await;
 
     assert_eq!(
         std::fs::read(&epoch).ok(),
@@ -3548,7 +3549,7 @@ async fn a_delayed_flush_releases_the_flock_a_span_left_to_it() {
     let flush = lore_base::lore_spawn!(ImmutableStoreGroup::flush_delayed(
         Arc::downgrade(&store),
         group_index,
-        0
+        Duration::ZERO
     ));
     pause.reached.notified().await;
     drop(span);
@@ -4859,7 +4860,7 @@ async fn a_delayed_flush_writes_stamps_without_announcing_them() {
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
     store.find(partition, address, Lookup::Read).await.unwrap();
-    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO).await;
 
     let root = store.path.clone().expect("a disk-backed store has a path");
     let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
@@ -8531,7 +8532,8 @@ async fn no_bucket_file_is_written_while_a_fan_out_is_uncommitted() {
             "the group fanned out without committing"
         );
 
-        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+            .await;
 
         assert_eq!(std::fs::read(&bucket_path).unwrap(), committed);
         assert!(!format_bucket_path(&dir.join("immutable"), group_index, 1).exists());
@@ -9757,4 +9759,569 @@ async fn the_first_flush_writes_a_bucket_emptied_since_its_file_was_written() {
         .await
         .expect_err("an evicted entry is not loaded back");
     assert!(matches!(err, StoreError::AddressNotFound(_)));
+}
+
+mod evict {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    use super::*;
+    use crate::store_fixture::payload_in_groups;
+
+    /// Settings for a store that uses the full bucket layout, flushes in the background, and has no
+    /// eviction protection.
+    pub(super) fn background_settings(defer_eviction_flush: bool) -> ImmutableStoreSettings {
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            flush_background: true,
+            defer_eviction_flush,
+            initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
+            ..quiet_settings()
+        }
+    }
+
+    /// Stores `payload` with durability set by `durable` and returns its group and bucket.
+    async fn put_one(
+        store: &Arc<LocalImmutableStore>,
+        payload: &[u8],
+        durable: bool,
+    ) -> (usize, usize) {
+        let address = put_payload(
+            store,
+            Partition::from([0x44u8; 16]),
+            Context::default(),
+            payload,
+            durable,
+        )
+        .await;
+        let group_index = address.hash.data()[0] as usize;
+        let bucket_count = store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed);
+        (
+            group_index,
+            lore_storage::local::fan_out::bucket_index_for(&address.hash, bucket_count),
+        )
+    }
+
+    /// Opens a store with `settings` and writes all `payloads` to disk, using each payload's
+    /// durability flag. No group has a pending delayed flush. Returns each payload's group and
+    /// bucket.
+    pub(super) async fn store_with_written(
+        dir: &lore_base::test_util::TempDir,
+        settings: ImmutableStoreSettings,
+        payloads: &[(Vec<u8>, bool)],
+    ) -> (Arc<LocalImmutableStore>, Vec<(usize, usize)>) {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings)
+            .await
+            .unwrap();
+        let mut written = vec![];
+        for (payload, durable) in payloads {
+            written.push(put_one(&store, payload, *durable).await);
+        }
+        store.clone().flush(true).await.unwrap();
+        for group in store.group.iter() {
+            group.flush.lock().await.abort_all();
+            group.scheduled.store(false, atomic::Ordering::Relaxed);
+        }
+        (store, written)
+    }
+
+    /// One payload in each of two groups, neither durable.
+    pub(super) fn two_groups() -> Vec<(Vec<u8>, bool)> {
+        let [(_, first), (_, second)] = payloads_in_two_groups(1);
+        vec![(first[0].clone(), false), (second[0].clone(), false)]
+    }
+
+    pub(super) async fn entries_on_disk(
+        store: &LocalImmutableStore,
+        group_index: usize,
+        bucket_index: usize,
+    ) -> usize {
+        let root = store.path.clone().expect("a disk-backed store has a path");
+        ImmutableStoreBucket::deserialize_files(format_bucket_path(
+            &root,
+            group_index,
+            bucket_index,
+        ))
+        .await
+        .unwrap()
+        .entry
+        .len()
+    }
+
+    /// Polls until the bucket's file holds no entry, failing after `within`.
+    async fn wait_until_written(
+        store: &LocalImmutableStore,
+        (group_index, bucket_index): (usize, usize),
+        within: Duration,
+    ) {
+        tokio::time::timeout(within, async {
+            while entries_on_disk(store, group_index, bucket_index).await != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("group {group_index}'s eviction is written within {within:?}"));
+    }
+
+    /// **A store that defers its eviction flush relies on each affected group's delayed flush
+    /// to write the evicted buckets**, keeping the flock until the flush has written every
+    /// bucket.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_each_evicted_group_and_keeps_the_flock_until_written() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for &(group_index, bucket_index) in &written {
+            assert!(
+                store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "group {group_index} has a delayed flush due"
+            );
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                1,
+                "the pass left group {group_index} unwritten"
+            );
+        }
+        assert!(lock.is_held(), "the unwritten buckets keep the flock");
+
+        for &(group_index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+                .await;
+        }
+
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the delayed flush wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(
+            !lock.is_held(),
+            "the delayed flushes let the store go once nothing was flagged"
+        );
+    }
+
+    /// **Every eviction pass schedules each group with unwritten changes, including a pass that
+    /// evicts nothing**, so a group whose delayed flush ended without writing it is tried again.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_a_group_left_flagged_at_a_pass_that_evicts_nothing() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_again_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let (left, _) = written[0];
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+        // A failed delayed flush leaves this state: woken, with the bucket still flagged for
+        // writing.
+        store.group[left]
+            .scheduled
+            .store(false, atomic::Ordering::Relaxed);
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 0, "the second pass finds nothing left to evict");
+        assert!(
+            store.group[left].scheduled.load(atomic::Ordering::Relaxed),
+            "the group the first pass left flagged has a delayed flush due again"
+        );
+    }
+
+    /// **An evicting pass schedules a group holding only access stamps, and a pass that evicts
+    /// nothing leaves it alone**, since stamps never hold the flock.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_a_group_holding_only_stamps_after_an_evicting_pass() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_stamps_");
+        let settings = ImmutableStoreSettings {
+            protect_local_fragment: true,
+            ..background_settings(true)
+        };
+        let [(_, kept), (_, evictable)] = payloads_in_two_groups(1);
+        let payloads = [(kept[0].clone(), false), (evictable[0].clone(), true)];
+        let (store, written) = store_with_written(&dir, settings, &payloads).await;
+        let (stamped, stamped_bucket) = written[0];
+        store.group[stamped].soft_dirty[stamped_bucket].store(true, atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            store.clone().evict(1, false, None).await.unwrap(),
+            1,
+            "the pass evicts only the durable fragment"
+        );
+        assert!(
+            store.group[stamped]
+                .scheduled
+                .load(atomic::Ordering::Relaxed),
+            "the stamped group has a delayed flush due after an evicting pass"
+        );
+
+        store.group[stamped]
+            .scheduled
+            .store(false, atomic::Ordering::Relaxed);
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 0);
+        assert!(
+            !store.group[stamped]
+                .scheduled
+                .load(atomic::Ordering::Relaxed),
+            "a pass that evicts nothing schedules no flush for stamps alone"
+        );
+    }
+
+    /// **When a fan-out awaits its commit and no bucket is flagged, a pass that evicts nothing
+    /// takes no claim**: claiming to write would tell every other process the store changed, and
+    /// nothing holds the flock for the commit.
+    #[tokio::test]
+    async fn a_deferring_store_leaves_a_pending_commit_alone_at_a_pass_that_evicts_nothing() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_no_claim_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let group = &store.group[written[0].0];
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+        for &(index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), index, Duration::ZERO).await;
+        }
+        assert!(!lock.is_held(), "the delayed flushes let the store go");
+        let epoch = dir.to_path_buf().join("immutable").join("epoch");
+        let before = std::fs::read(&epoch).ok();
+        let full = group.bucket_count.load(atomic::Ordering::Relaxed);
+        group
+            .committed_level
+            .store(full / 2, atomic::Ordering::Relaxed);
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 0);
+
+        assert_eq!(
+            std::fs::read(&epoch).ok(),
+            before,
+            "the pass told no other process the store changed"
+        );
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            full / 2,
+            "the commit waits for a pass that evicts"
+        );
+        assert!(!lock.is_held(), "the store stays free");
+    }
+
+    /// **A pass that ends after garbage collection was asked to stop schedules no delayed
+    /// flush**, which would claim the store after background work was to end.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_nothing_once_asked_to_stop() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_stop_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let (group_index, bucket_index) = written[0];
+        store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        store.stop_requests.fetch_add(1, atomic::Ordering::Relaxed);
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 0);
+
+        assert!(
+            !store.group[group_index]
+                .scheduled
+                .load(atomic::Ordering::Relaxed),
+            "no delayed flush is due"
+        );
+        store.stop_requests.fetch_sub(1, atomic::Ordering::Relaxed);
+    }
+
+    /// **When asked to sync, a store with deferred eviction flushes writes the evicted buckets at
+    /// the end of the pass**, since the delayed flush writes without syncing.
+    #[tokio::test]
+    async fn a_deferring_store_writes_as_the_pass_ends_when_asked_to_sync() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_sync_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let evicted = store.clone().evict(1, true, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the pass wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the pass wrote what it evicted and let go");
+    }
+
+    /// **A store with deferral enabled but background flushing disabled writes each pass's
+    /// evictions when the pass ends**, because its changes to durable entries wait for an explicit
+    /// flush rather than a delayed one.
+    #[tokio::test]
+    async fn a_store_deferring_without_background_flushing_writes_as_the_pass_ends() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_no_bg_");
+        let settings = ImmutableStoreSettings {
+            flush_background: false,
+            ..background_settings(true)
+        };
+        let (store, written) = store_with_written(&dir, settings, &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the pass wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the pass wrote what it evicted and let go");
+    }
+
+    /// **An in-memory store does not defer**, having no disk to write to and so no delayed flush
+    /// that would clear a group's due flag.
+    #[tokio::test]
+    async fn an_in_memory_store_schedules_no_delayed_flush() {
+        let store = LocalImmutableStore::new(None, background_settings(true))
+            .await
+            .unwrap();
+        let mut groups = vec![];
+        for (payload, durable) in two_groups() {
+            groups.push(put_one(&store, &payload, durable).await.0);
+        }
+        for &group_index in &groups {
+            store.group[group_index]
+                .scheduled
+                .store(false, atomic::Ordering::Relaxed);
+        }
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        for group_index in groups {
+            assert!(
+                !store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "group {group_index} has no delayed flush due"
+            );
+        }
+    }
+
+    /// **A store with deferred eviction flushes writes evicted buckets in a lower-numbered group
+    /// well before those in a higher-numbered group.** The groups' delayed flushes are spread
+    /// across one flush delay. With a delay of 16 seconds, a group below 32 is due within two
+    /// seconds of the pass, and a group numbered 224 or higher is due after more than fourteen.
+    #[tokio::test]
+    async fn a_deferring_store_spreads_the_groups_writes_across_the_flush_delay() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_spread_");
+        let settings = ImmutableStoreSettings {
+            flush_delay_seconds: 16,
+            ..background_settings(true)
+        };
+        let payloads = [
+            (payload_in_groups(0..32), false),
+            (payload_in_groups(224..GROUP_COUNT), false),
+        ];
+        let (store, written) = store_with_written(&dir, settings, &payloads).await;
+        let (low, high) = (written[0], written[1]);
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for (group_index, _) in [low, high] {
+            assert!(
+                store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "the pass scheduled group {group_index}'s delayed flush"
+            );
+        }
+        wait_until_written(&store, low, Duration::from_secs(10)).await;
+        assert_eq!(
+            entries_on_disk(&store, high.0, high.1).await,
+            1,
+            "the high group's delayed flush is not yet due"
+        );
+    }
+
+    /// **A store with background flushing enabled and eviction flushing not deferred writes
+    /// each bucket from which it evicted entries at the end of the eviction pass**, then
+    /// releases the store.
+    #[tokio::test]
+    async fn a_background_flushing_store_that_does_not_defer_writes_as_the_pass_ends() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_no_defer_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(false), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the pass wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the pass wrote what it evicted and let go");
+    }
+}
+
+mod flush_delayed {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    use super::evict::background_settings;
+    use super::evict::entries_on_disk;
+    use super::evict::store_with_written;
+    use super::evict::two_groups;
+    use super::*;
+
+    /// **When a store defers eviction writes, the delayed flush completes a fan-out waiting for its
+    /// commit** by writing the whole group, then releases the store.
+    #[tokio::test]
+    async fn a_deferring_stores_delayed_flush_commits_a_pending_fan_out() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_commit_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let (group_index, bucket_index) = written[0];
+        let group = &store.group[group_index];
+        let full = group.bucket_count.load(atomic::Ordering::Relaxed);
+        group
+            .committed_level
+            .store(full / 2, atomic::Ordering::Relaxed);
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+        assert!(
+            group.scheduled.load(atomic::Ordering::Relaxed),
+            "the group has a delayed flush due"
+        );
+        for &(index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), index, Duration::ZERO).await;
+        }
+
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            full,
+            "the delayed flush committed the group's layout"
+        );
+        assert_eq!(
+            entries_on_disk(&store, group_index, bucket_index).await,
+            0,
+            "and wrote the eviction"
+        );
+        assert!(!lock.is_held(), "and let the store go");
+    }
+
+    /// **A store with deferred eviction writes leaves a group below the full layout to its delayed
+    /// flush**, like any other group, and that flush writes the eviction.
+    #[tokio::test]
+    async fn a_deferring_store_writes_a_group_below_the_full_layout_in_its_delayed_flush() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_level_");
+        let settings = ImmutableStoreSettings {
+            initial_fan_out_level: 1,
+            ..background_settings(true)
+        };
+        let (store, written) = store_with_written(&dir, settings, &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        for &(group_index, bucket_index) in &written {
+            assert!(
+                store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "group {group_index} has a delayed flush due"
+            );
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                1,
+                "the pass left group {group_index} unwritten"
+            );
+        }
+        for &(group_index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+                .await;
+        }
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the delayed flush wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the delayed flushes let the store go");
+    }
+
+    /// **A deferring store's delayed flush fans out a group whose bucket holds more entries than
+    /// the fan-out threshold**, as only a flush of the whole group does.
+    #[tokio::test]
+    async fn a_deferring_stores_delayed_flush_fans_out_a_group_past_its_threshold() {
+        let dir = lore_base::test_util::TempDir::new("is_delayed_fan_out_");
+        let store = LocalImmutableStore::new(
+            Some(dir.to_path_buf()),
+            ImmutableStoreSettings {
+                initial_fan_out_level: 1,
+                fan_out_threshold: 2,
+                ..background_settings(true)
+            },
+        )
+        .await
+        .unwrap();
+        let (group_index, payloads) = payloads_in_one_group(3);
+        for payload in &payloads {
+            put_payload(
+                &store,
+                Partition::from([0x44u8; 16]),
+                Context::default(),
+                payload,
+                false,
+            )
+            .await;
+        }
+        let group = &store.group[group_index];
+        group.flush.lock().await.abort_all();
+        group.scheduled.store(false, atomic::Ordering::Relaxed);
+        assert_eq!(group.bucket_count.load(atomic::Ordering::Relaxed), 1);
+
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+            .await;
+
+        let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
+        assert!(bucket_count > 1, "the delayed flush fanned the group out");
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            bucket_count,
+            "and committed its new layout"
+        );
+    }
+}
+
+mod eviction_flush_delay {
+    use super::*;
+
+    /// Group wait times increase in equal steps. The first group waits for a fraction of the
+    /// flush delay, and the last waits for the full delay.
+    #[test]
+    fn spreads_groups_in_equal_steps_up_to_the_flush_delay() {
+        let flush_delay = Duration::from_secs(10);
+        let step = flush_delay / GROUP_COUNT as u32;
+
+        for group_index in 0..GROUP_COUNT {
+            assert_eq!(
+                LocalImmutableStore::eviction_flush_delay(flush_delay, group_index),
+                step * (group_index as u32 + 1),
+                "group {group_index} waits its own number of steps"
+            );
+        }
+        assert_eq!(
+            LocalImmutableStore::eviction_flush_delay(flush_delay, GROUP_COUNT - 1),
+            flush_delay,
+            "the last group waits the whole delay"
+        );
+    }
 }

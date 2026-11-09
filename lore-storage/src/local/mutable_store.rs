@@ -2361,7 +2361,7 @@ async fn maybe_fan_out_mutable_group(
     authoritative: bool,
 ) -> Result<(), LocalMutableStoreError> {
     let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-    if n >= crate::local::fan_out::FAN_OUT_LEVEL_MAX {
+    if !crate::local::fan_out::can_fan_out(n) {
         return Ok(());
     }
     // Scan dirty buckets briefly under read locks to find max entry count.

@@ -21,6 +21,21 @@ use lore_storage::local::immutable_store::ImmutableStoreEntry;
 use lore_storage::local::immutable_store::LocalImmutableStore;
 use lore_storage::local::store_lock::Intent;
 
+/// A payload of `size` bytes, at least 4, that `seed` makes distinct.
+fn seeded_payload(seed: u32, size: usize) -> Vec<u8> {
+    let mut payload = vec![0u8; size];
+    payload[..4].copy_from_slice(&seed.to_le_bytes());
+    payload
+}
+
+/// A payload of 4 KiB whose hash falls in a group within `groups`.
+pub(crate) fn payload_in_groups(groups: std::ops::Range<usize>) -> Vec<u8> {
+    (0u32..)
+        .map(|seed| seeded_payload(seed, 4096))
+        .find(|payload| groups.contains(&(hash::hash_slice(payload).data()[0] as usize)))
+        .expect("some seed lands in the range")
+}
+
 /// `count` payloads of 4 KiB whose hashes all fall in one group, and that group's index.
 pub(crate) fn payloads_in_one_group(count: usize) -> (usize, Vec<Vec<u8>>) {
     payloads_of_size_in_one_group(count, 4096)
@@ -29,11 +44,7 @@ pub(crate) fn payloads_in_one_group(count: usize) -> (usize, Vec<Vec<u8>>) {
 /// `count` payloads of `size` bytes, at least 4, whose hashes all fall in one group, and that
 /// group's index.
 pub(crate) fn payloads_of_size_in_one_group(count: usize, size: usize) -> (usize, Vec<Vec<u8>>) {
-    let payload = |seed: u32| {
-        let mut payload = vec![0u8; size];
-        payload[..4].copy_from_slice(&seed.to_le_bytes());
-        payload
-    };
+    let payload = |seed: u32| seeded_payload(seed, size);
     let mut seeds_by_group: HashMap<usize, Vec<u32>> = HashMap::new();
     for seed in 0u32.. {
         let group_index = hash::hash_slice(&payload(seed)).data()[0] as usize;
@@ -52,11 +63,7 @@ pub(crate) fn payloads_of_size_in_one_group(count: usize, size: usize) -> (usize
 /// `count` payloads of 4 KiB in each of two groups, the first two groups to hold `count`, with
 /// each group's index.
 pub(crate) fn payloads_in_two_groups(count: usize) -> [(usize, Vec<Vec<u8>>); 2] {
-    let payload = |seed: u32| {
-        let mut payload = vec![0u8; 4096];
-        payload[..4].copy_from_slice(&seed.to_le_bytes());
-        payload
-    };
+    let payload = |seed: u32| seeded_payload(seed, 4096);
     let mut seeds_by_group: HashMap<usize, Vec<u32>> = HashMap::new();
     let mut full = vec![];
     for seed in 0u32.. {

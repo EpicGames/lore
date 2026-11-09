@@ -438,10 +438,11 @@ pub struct ImmutableStoreGroup {
     pub pending_level: std::sync::atomic::AtomicUsize,
     /// Forces the bucket-file writes for this group to be serial.
     ///
-    /// `flush_all` holds it for a whole group flush so that the fan-out check, the
-    /// `committed_level` read that selects the commit path, and the writes are one
-    /// atomic unit. Every other writer (the delayed flush, the evictor, the
-    /// compactor, the packfile upgrade) takes it only around its own bucket write.
+    /// `flush_all` holds it for the whole group flush, making the fan-out check, the
+    /// `committed_level` read that selects the commit path, and the writes one atomic unit. A
+    /// delayed flush that writes the whole group does the same. Otherwise, writers (the delayed
+    /// flush, the evictor, the compactor, the packfile upgrade) take it only around their own
+    /// bucket writes.
     ///
     /// Without it, an overlapping flush can observe a half-finished level transition
     /// and take the regular path while a two-phase commit is still pending. The
@@ -451,7 +452,7 @@ pub struct ImmutableStoreGroup {
     /// Locking the rename alone would not help: the snapshot it publishes is taken
     /// before the rename, so the two paths must not interleave at all.
     ///
-    /// Scope is deliberately narrow outside `flush_all` because
+    /// Scope is deliberately narrow outside the whole-group flushes because
     /// `compact_group_packfiles` calls `evict_group_sized`, and a `tokio::sync::Mutex`
     /// is not reentrant - a per-function guard would self-deadlock.
     pub flush_lock: Arc<Mutex<()>>,
@@ -736,6 +737,14 @@ pub struct ImmutableStoreSettings {
     pub flush_background: bool,
     /// Flush delay in seconds
     pub flush_delay_seconds: u64,
+    /// Defers writing buckets changed by a capacity eviction pass to each group's delayed flush.
+    /// Flushes are spread across one flush delay. This requires `flush_background` and applies
+    /// only to passes that do not sync; compaction's size-driven eviction still writes as it goes.
+    /// With this setting, every delayed flush with changes writes the whole group if it is below
+    /// the full bucket layout, fanning it out where needed. Unwritten buckets hold the store's
+    /// flock until they are written, so this suits a process that holds its store for its entire
+    /// lifetime. The default is `false`.
+    pub defer_eviction_flush: bool,
     /// Eviction target capacity as a percentage of the max capacity (0-100)
     pub target_capacity_percentage: usize,
     /// Compaction target size as a percentage of the max size (0-100)
@@ -767,6 +776,7 @@ impl Default for ImmutableStoreSettings {
             isolate_partitions: false,
             flush_background: false,
             flush_delay_seconds: DEFAULT_FLUSH_DELAY_SECONDS,
+            defer_eviction_flush: false,
             target_capacity_percentage: 70,
             target_size_percentage: 70,
             compaction_parallel_groups: 8,
@@ -1610,8 +1620,22 @@ impl ImmutableStoreGroup {
         !self.fan_out_uncommitted() && !(0..self.dirty.len()).any(|bucket| self.needs_flush(bucket))
     }
 
-    /// Writes out the group's flagged buckets after `delay` seconds, each after rolling forward a
-    /// fan-out commit the group left pending and committing a level marker it has yet to write.
+    /// Whether a delayed flush must write the whole group when the store defers eviction writes.
+    /// The group may still need to fan out, or its fan-out may be awaiting commit, blocking all
+    /// single-bucket writes. Both cases require a whole-group flush. Read under the flush lock so
+    /// the result stays valid.
+    fn needs_whole_group_flush(&self) -> bool {
+        crate::local::fan_out::can_fan_out(self.bucket_count.load(atomic::Ordering::Relaxed))
+            || self.fan_out_uncommitted()
+    }
+
+    /// Writes out the group's flagged buckets after `delay`. Before writing each bucket, rolls
+    /// forward a fan-out commit the group left pending and commits a level marker the group has
+    /// yet to write.
+    ///
+    /// On a store that defers its eviction writes, a group with changes is written in full when it
+    /// may still need to fan out or its fan-out awaits commit. Writing the whole group can change
+    /// its layout on disk.
     ///
     /// **Claimed before anything is written, with a guard of its own, and only as far as the
     /// work needs**: to write for changes, to read for access stamps alone. This wakes long
@@ -1622,8 +1646,15 @@ impl ImmutableStoreGroup {
     /// whether or not a span covers it, and its drop releases the flock once the pass has left
     /// nothing flagged.
     #[lore_macro::test_pub]
-    async fn flush_delayed(weak_ref: Weak<LocalImmutableStore>, group_index: usize, delay: u64) {
-        tokio::time::sleep(Duration::from_secs(delay)).await;
+    async fn flush_delayed(
+        weak_ref: Weak<LocalImmutableStore>,
+        group_index: usize,
+        delay: Duration,
+    ) {
+        // Even a zero sleep waits for the timer's next millisecond tick.
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         #[cfg(feature = "test-util")]
         let _task = crate::test_util::store_task(crate::test_util::StoreTask::DelayedFlush);
         if let Some(store) = weak_ref.upgrade()
@@ -1652,6 +1683,29 @@ impl ImmutableStoreGroup {
                 return;
             };
             let _claim = claim;
+
+            // A store that defers eviction writes leaves all of them to this flush. Fanning out
+            // requires a claim to write; access stamps alone use the single-bucket writes below,
+            // which never fan out the group. The check runs first without the flush lock to keep
+            // the lock off the common path, then again under it. If a commit fails between the
+            // two checks, its buckets wait for the next eviction pass.
+            if intent == Intent::Write
+                && store.defers_eviction_flush()
+                && group.needs_whole_group_flush()
+            {
+                let flush_guard =
+                    crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
+                if group.needs_whole_group_flush() {
+                    let _in_flight = crate::local::fan_out::write_share(&group.writes);
+                    if let Err(err) =
+                        flush_locked_group(group.clone(), group_index, path.clone(), false).await
+                    {
+                        lore_base::lore_warn!("Failed to flush group {group_index}: {err}");
+                    }
+                    return;
+                }
+                drop(flush_guard);
+            }
 
             for bucket_index in 0..group.bucket.len() {
                 // Atomic pre-check avoids acquiring the bucket RwLock for clean buckets.
@@ -3580,6 +3634,16 @@ impl LocalImmutableStore {
         {
             return;
         }
+        self.schedule_flush(
+            group_index,
+            Duration::from_secs(self.settings.flush_delay_seconds),
+        )
+        .await;
+    }
+
+    /// Starts the group's delayed flush after `delay` unless a flush is already due. The bucket's
+    /// flag must be set before this call. See [`ImmutableStoreGroup::scheduled`].
+    async fn schedule_flush(self: &Arc<Self>, group_index: usize, delay: Duration) {
         let group = &self.group[group_index];
         if group.scheduled.swap(true, atomic::Ordering::Relaxed) {
             return;
@@ -3588,12 +3652,53 @@ impl LocalImmutableStore {
         let _ = flush.try_join_next();
         lore_base::lore_spawn!(
             flush,
-            ImmutableStoreGroup::flush_delayed(
-                Arc::downgrade(self),
-                group_index,
-                self.settings.flush_delay_seconds,
-            )
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(self), group_index, delay)
         );
+    }
+
+    /// The delay between an eviction pass and the group's flush of the buckets it evicted from.
+    /// Delays increase by an equal step per group up to `flush_delay`. When a pass evicts from
+    /// every group, this spreads out the bucket writes queued on the I/O pool, one group at a
+    /// time.
+    #[lore_macro::test_pub]
+    fn eviction_flush_delay(flush_delay: Duration, group_index: usize) -> Duration {
+        flush_delay / GROUP_COUNT as u32 * (group_index as u32 + 1)
+    }
+
+    /// Starts delayed flushes for groups with pending writes, spreading them across one flush
+    /// delay. Changes always require a write; access stamps require one only after a pass that
+    /// `evicted`.
+    ///
+    /// Run at every eviction pass, even if it evicted nothing, to retry groups left flagged by a
+    /// failed delayed flush. Scheduling takes no claim. Each delayed flush claims the store for
+    /// itself and releases the flock once nothing is flagged. Until then, unwritten buckets hold
+    /// the flock.
+    async fn schedule_eviction_flushes(self: &Arc<Self>, evicted: bool) {
+        let flush_delay = Duration::from_secs(self.settings.flush_delay_seconds);
+        for (group_index, group) in self.group.iter().enumerate() {
+            if group.scheduled.load(atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let worth_writing = match group.pending_flush() {
+                PendingFlush::Changes => true,
+                // A fan-out awaiting commit blocks single-bucket writes. Access stamps use only
+                // single-bucket writes, so they must wait for a change that triggers a whole-group
+                // write.
+                PendingFlush::Stamps => evicted && !group.fan_out_uncommitted(),
+                PendingFlush::Nothing => false,
+            };
+            if worth_writing {
+                self.schedule_flush(
+                    group_index,
+                    Self::eviction_flush_delay(flush_delay, group_index),
+                )
+                .await;
+            }
+        }
+    }
+
+    fn defers_eviction_flush(&self) -> bool {
+        self.settings.defer_eviction_flush && self.settings.flush_background && self.path.is_some()
     }
 
     pub async fn load(
@@ -3935,10 +4040,10 @@ impl LocalImmutableStore {
     /// `max_capacity`, and returns how many, with the write claim the pass took at its first
     /// eviction, if it took one.
     ///
-    /// The claim is handed back rather than dropped, for the caller to hold until it has
-    /// written what the pass evicted. Without it, that flush runs on whatever span another use
-    /// of the store holds at the time, and that span can end, and its flock go, while the
-    /// flush still runs.
+    /// The caller receives the claim and holds it while writing the buckets the pass evicted
+    /// from, or until it delegates those writes to flushes that acquire their own claims. Without
+    /// this claim, the caller's write uses a span held by another operation on the store. That
+    /// span can end and release its flock while the write is still running.
     pub async fn evict_oldest(
         &self,
         max_capacity: usize,
@@ -5702,16 +5807,22 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 Ok(count)
             }
         );
-        // **What a pass evicts, the pass writes, under its own claim.** Eviction empties
-        // buckets in memory and nothing else is scheduled to write them, so left dirty they
-        // would keep the flock for as long as this process kept the store — for a timer
-        // running in the background of a process that has finished with the store,
-        // indefinitely. The write runs on the claim the eviction took rather than through
-        // `flush`, whose claim a span of whatever use of the store is under way would cover,
-        // and that span can end while the write runs.
-        if let Ok(count) = &evicted.result
-            && *count > 0
-        {
+        // **A pass that defers eviction writes schedules a delayed flush for every changed bucket,
+        // including buckets that an earlier delayed flush failed to write. Any other pass writes
+        // its eviction changes before it ends. Every write holds a claim until it finishes,
+        // independent of other uses of the store.** A changed bucket holds the flock until it is
+        // written. Eviction runs on a background timer. Without a scheduled write, a changed bucket
+        // could hold the flock indefinitely if the process keeps the store but no longer uses it.
+        let evicted_any = evicted.result.as_ref().is_ok_and(|count| *count > 0);
+        // Deferral is safe only when nothing waits on the write. Delayed flushes do not perform the
+        // sync a caller may request. A pass ending after a stop request writes its own evictions so
+        // delayed flushes do not claim the store after background work is asked to stop.
+        if self.defers_eviction_flush() && !sync_data && !self.gc_stop_requested() {
+            self.schedule_eviction_flushes(evicted_any).await;
+        } else if evicted_any {
+            // The write uses the eviction's claim because it lasts until the write finishes. It
+            // can't rely on the span of another use of the store: that span may end while the write
+            // is still running.
             let _ = self.clone().flush_all(self.path.clone(), sync_data).await;
         }
         drop(writing);
@@ -6858,7 +6969,7 @@ async fn maybe_fan_out_immutable_group(
     group_index: usize,
 ) -> Result<(), LocalImmutableStoreError> {
     let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-    if n >= crate::local::fan_out::FAN_OUT_LEVEL_MAX {
+    if !crate::local::fan_out::can_fan_out(n) {
         return Ok(());
     }
     let mut b_max = 0usize;

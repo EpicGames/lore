@@ -485,7 +485,7 @@ async fn flush_waits_for_a_claimed_bucket_write(dir: PathBuf) -> Outcome {
         delayed = Some(lore_base::lore_spawn!(ImmutableStoreGroup::flush_delayed(
             weak,
             GROUP as usize,
-            0
+            Duration::ZERO
         )));
     })
     .await;
@@ -1360,7 +1360,8 @@ async fn durable_flush_syncs_what_a_delayed_flush_wrote(dir: PathBuf) -> Outcome
     let key = keys(&config, 0..255, 64..4096, 1, &mut HashSet::new())[0];
     let store = open(&dir, &config).await;
     put(&store, &config, key, 0).await;
-    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), GROUP as usize, 0).await;
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), GROUP as usize, Duration::ZERO)
+        .await;
     flush(&store, true).await;
     let packstore = store.packstore(GROUP as usize);
     let mut unsynced = vec![];

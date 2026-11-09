@@ -499,7 +499,7 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | Field | Default | Applies to | Description |
 | --- | --- | --- | --- |
 | `path` | derived `<temp>/lore-server` | both | Filesystem location for the store. When empty, the server derives a path under the system temporary directory at startup (ephemeral — see [Zero-config defaults](#zero-config-defaults)). |
-| `flush_delay_seconds` | `10` | both | Seconds between background flushes to disk. |
+| `flush_delay_seconds` | `10` | both | Seconds between background flushes to disk. In the immutable store, index writes pending after a capacity eviction pass are also spread across this interval, group by group, except in maintenance mode, where they are written as the pass ends. If the server stops before a group's writes reach disk, the entries evicted from that group are back when it restarts. |
 | `max_capacity` | none | immutable | Maximum number of entries before eviction. |
 | `max_size` | none | immutable | Maximum total store size in bytes before background compaction reclaims space. Compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced. |
 | `eviction_delay` | none | immutable | Interval in milliseconds between eviction passes. Defaults to 10 s when unset. |

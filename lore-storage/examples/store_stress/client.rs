@@ -169,7 +169,7 @@ impl Stores {
         let immutable = Arc::downgrade(&self.immutable);
         for (index, group) in self.immutable.group.iter().enumerate() {
             if group.scheduled.load(Ordering::Relaxed) {
-                ImmutableStoreGroup::flush_delayed(immutable.clone(), index, 0).await;
+                ImmutableStoreGroup::flush_delayed(immutable.clone(), index, Duration::ZERO).await;
                 swept[0] += 1;
             }
         }

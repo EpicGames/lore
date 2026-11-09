@@ -25,6 +25,7 @@ use std::process::ChildStdout;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
 use lore_base::test_util::TempDir;
@@ -510,7 +511,7 @@ impl StoreClient {
         let immutable = Arc::downgrade(&stores.immutable);
         for (index, group) in stores.immutable.group.iter().enumerate() {
             if group.scheduled.load(Ordering::Relaxed) {
-                ImmutableStoreGroup::flush_delayed(immutable.clone(), index, 0).await;
+                ImmutableStoreGroup::flush_delayed(immutable.clone(), index, Duration::ZERO).await;
                 swept[0] += 1;
             }
         }

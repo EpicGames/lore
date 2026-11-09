@@ -1334,6 +1334,11 @@ fn generate_ephemeral_certificate(endpoint: &str) -> Result<crate::tls::Certific
     })
 }
 
+/// Whether the server runs in maintenance mode, serving no store.
+fn maintenance_mode() -> bool {
+    std::env::var("LORE_SERVER_MAINTENANCE").is_ok_and(|v| v == "1")
+}
+
 async fn create_local_store(
     settings: &LocalImmutableStoreSettings,
     flush_background: bool,
@@ -1362,6 +1367,7 @@ async fn create_local_store(
             isolate_partitions: true, /* Server mode, one process holds content for every tenant */
             flush_background,
             flush_delay_seconds: settings.flush_delay_seconds as u64,
+            defer_eviction_flush: !maintenance_mode(), /* Server mode, no other process uses the server's stores, so unwritten buckets holding a store's flock block nobody; in maintenance mode the stores are left free for the maintenance */
             target_capacity_percentage: settings.target_capacity_percentage.unwrap_or(default_settings.target_capacity_percentage),
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),
@@ -2078,7 +2084,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let connection_close_timeout =
         Duration::from_secs(settings.server.connection_close_timeout_seconds as u64);
 
-    let is_maintenance = if std::env::var("LORE_SERVER_MAINTENANCE").is_ok_and(|v| v == "1") {
+    let is_maintenance = if maintenance_mode() {
         info!(
             "Server is running in maintenance mode - only environment and health endpoints will be served"
         );

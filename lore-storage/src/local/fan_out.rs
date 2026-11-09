@@ -30,6 +30,11 @@ pub const LEVEL_LADDER: [usize; 5] = [1, 32, 64, 128, 256];
 /// existing `BUCKET_COUNT` in the local store implementations. Server-mode stores start here.
 pub const FAN_OUT_LEVEL_MAX: usize = 256;
 
+/// Whether a group of `bucket_count` buckets can still fan out.
+pub fn can_fan_out(bucket_count: usize) -> bool {
+    bucket_count < FAN_OUT_LEVEL_MAX
+}
+
 /// Default per-bucket entry threshold that triggers fan-out at the next serialize. Used by
 /// `MutableStoreSettings::default()` and `ImmutableStoreSettings::default()`.
 pub const FAN_OUT_THRESHOLD_DEFAULT: usize = 1000;
