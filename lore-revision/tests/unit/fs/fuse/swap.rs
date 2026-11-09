@@ -11,8 +11,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -84,13 +82,6 @@ fn attr_context() -> AttrContext {
 
 fn path(value: &str) -> RelativePath {
     RelativePath::new_from_initial_path(value).expect("relative path")
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_millis() as u64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +211,13 @@ impl Swapping {
     async fn stored_time(&self, name: &str) -> u64 {
         state::file_modified_time(self.repository(), &path(name)).await
     }
+
+    /// The time a swap of this read-only mount started now would record
+    /// ([`state::time_before_next_write`] in the dot directory).
+    async fn time_before_next_write(&self) -> u64 {
+        let repository = self.repository();
+        state::time_before_next_write(repository.dot_dir_path().ok()).await
+    }
 }
 
 async fn swapping(files: &[(&str, &[u8])], work: impl AsyncFnOnce(Swapping)) {
@@ -271,9 +269,9 @@ async fn swap_records_modified_time_for_each_added_or_modified_file() {
             // Read after this commit, which can record the time the first one left out for a
             // file written in its clock tick, so that only the swap can change it.
             let keep_before = s.stored_time("keep.txt").await;
-            let before = now_millis();
+            let before = s.time_before_next_write().await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
-            let after = now_millis();
+            let after = s.time_before_next_write().await;
 
             s.operation
                 .take_modified_times()
@@ -576,10 +574,11 @@ async fn swap_records_modified_time_for_directories_whose_entry_set_changed() {
                 ])
                 .await;
 
-            let before = now_millis();
+            let same_before = s.stored_time("same").await;
+            let before = s.time_before_next_write().await;
             let sink = Arc::new(RecordingSink::default());
             s.swap_to(&second, sink.clone()).await;
-            let after = now_millis();
+            let after = s.time_before_next_write().await;
 
             for (ino, name) in [(dir, "dir"), (other, "other")] {
                 let seconds = s.getattr(ino).await.mtime;
@@ -603,9 +602,9 @@ async fn swap_records_modified_time_for_directories_whose_entry_set_changed() {
                     "{name}: {recorded} not in {before}..={after}"
                 );
             }
-            let same_recorded = s.stored_time("same").await;
-            assert!(
-                !(before..=after).contains(&same_recorded),
+            assert_eq!(
+                s.stored_time("same").await,
+                same_before,
                 "a directory whose entries did not change keeps its time"
             );
         },
@@ -823,9 +822,9 @@ async fn file_info_and_read_directory_agree_for_a_file_changed_by_a_sync() {
         &[("dir/a.txt", b"one"), ("dir/keep.txt", b"keep")],
         async |s: Swapping| {
             let second = s.commit(&[("dir/a.txt", Some(b"two"))]).await;
-            let before = now_millis();
+            let before = s.time_before_next_write().await;
             s.swap_to(&second, Arc::new(RecordingSink::default())).await;
-            let after = now_millis();
+            let after = s.time_before_next_write().await;
 
             let changed = s
                 .operation
@@ -1283,7 +1282,7 @@ async fn a_sync_out_of_view_then_a_wider_view_serves_the_revision() {
             let second = s
                 .commit(&[("hidden/a.txt", Some(b"changed")), ("hidden/b.txt", None)])
                 .await;
-            let before = now_millis();
+            let before = s.time_before_next_write().await;
             swap(
                 &s.fs,
                 &s.operation,
@@ -1293,7 +1292,7 @@ async fn a_sync_out_of_view_then_a_wider_view_serves_the_revision() {
             )
             .await
             .expect("swap under the view");
-            let after = now_millis();
+            let after = s.time_before_next_write().await;
             assert_eq!(s.lookup(ROOT_INO, "hidden").await, Err(Errno::ENOENT));
 
             swap(

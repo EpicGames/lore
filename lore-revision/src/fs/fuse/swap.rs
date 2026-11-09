@@ -10,8 +10,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use lore_base::types::Address;
 use lore_error_set::prelude::*;
@@ -359,13 +357,6 @@ fn writes_file(change: &NodeChange) -> bool {
         && (change.action != FileAction::Keep || change.from.differs_from(&change.to))
 }
 
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// What [`swap`] and [`swap_mounted`] do to local changes: keep each, as a sync forwarding local
 /// changes does.
 const KEEP_LOCAL: HoldOptions = HoldOptions {
@@ -481,7 +472,16 @@ async fn swap_through(
             .forward_any::<FsError>("reporting what holding the target changes");
     }
 
-    let now = now_millis();
+    // The time is recorded for content served from the store. A copy-up later stamps the
+    // content's host file in the staging directory and moves it under `write/`, so the time is
+    // probed there: an edit of the same size compares as unchanged where the host file's stamp
+    // matches it. A read-only mount writes no host file, so its time is probed in the dot
+    // directory.
+    let probe_dir = match fs.local_files() {
+        Some(local) => Some(local.staging_dir()),
+        None => repository.dot_dir_path().ok(),
+    };
+    let now = crate::state::time_before_next_write(probe_dir).await;
     let mut directories: Vec<RelativePath> = Vec::new();
     for change in applied.iter().filter(|change| changes_entry_set(change)) {
         directories.push(change.path().parent_path());

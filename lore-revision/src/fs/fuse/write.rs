@@ -672,6 +672,11 @@ impl LocalFiles {
         &self.root_path
     }
 
+    /// The staging directory beside `write/`, on `write/`'s file system.
+    pub fn staging_dir(&self) -> &Path {
+        &self.staging
+    }
+
     /// The cached host file of inode `ino`.
     pub fn file(&self, ino: u64) -> Option<Arc<File>> {
         self.files.get(&ino).map(|cached| cached.file.clone())

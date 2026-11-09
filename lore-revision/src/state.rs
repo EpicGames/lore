@@ -8946,10 +8946,32 @@ pub(crate) async fn read_clock_floor(repository: &RepositoryContext) -> u64 {
 /// `None` when the working copy cannot be stamped, which leaves a caller no way to tell a
 /// settled time from one a further write can still share.
 pub async fn filesystem_stamp_now(repository: &RepositoryContext) -> Option<u64> {
-    let path = modified_time_probe_path(repository)?;
-    let stamp = stamp_probe(&path).await;
-    let _ = lore_io::IoDriver::global().remove_file(&path).await;
+    stamp_and_remove_probe(&modified_time_probe_path(repository)?).await
+}
+
+/// [`stamp_probe`], then removes the probe at `path`.
+async fn stamp_and_remove_probe(path: &std::path::Path) -> Option<u64> {
+    let stamp = stamp_probe(path).await;
+    let _ = lore_io::IoDriver::global().remove_file(path).await;
     stamp
+}
+
+/// A time older than the modified time of any file written from now on to the filesystem that
+/// holds `dir`: one millisecond before the stamp a probe written in `dir` gets. The probe is
+/// removed once read.
+///
+/// The process clock where `dir` is `None` or cannot be stamped. A file written within the
+/// filesystem's clock tick can then carry the time returned.
+#[lore_macro::test_pub]
+pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64 {
+    let stamp = match dir {
+        Some(dir) => stamp_and_remove_probe(&dir.join(MODIFIED_TIME_PROBE)).await,
+        None => None,
+    };
+    match stamp {
+        Some(stamp) => stamp.saturating_sub(1),
+        None => crate::util::fs::modified_millis(None),
+    }
 }
 
 /// Waits until the working copy's filesystem stamps later than `mtime_max`.
