@@ -170,7 +170,7 @@ pub async fn register_instance(
     repository: &Arc<RepositoryContext>,
     instance_id: InstanceId,
     path: &str,
-) -> Result<(), InstanceError> {
+) -> Result<(), InstanceRegistryError> {
     let normalized_path = crate::util::path::clean(path.to_owned());
     store_normalized_registration(repository, instance_id, &normalized_path).await?;
     retire_instances_at_path(repository, instance_id, &normalized_path).await;
@@ -188,7 +188,7 @@ pub async fn store_instance_registration(
     repository: &Arc<RepositoryContext>,
     instance_id: InstanceId,
     path: &str,
-) -> Result<(), InstanceError> {
+) -> Result<(), InstanceRegistryError> {
     let normalized_path = crate::util::path::clean(path.to_owned());
     store_normalized_registration(repository, instance_id, &normalized_path).await
 }
@@ -199,29 +199,29 @@ async fn store_normalized_registration(
     repository: &Arc<RepositoryContext>,
     instance_id: InstanceId,
     normalized_path: &str,
-) -> Result<(), InstanceError> {
+) -> Result<(), InstanceRegistryError> {
     let mut metadata = Metadata::new();
     metadata
         .set_string(INSTANCE_ID, hex::encode(instance_id.data()).as_str())
-        .forward_any::<InstanceError>("failed to set instance ID in metadata")?;
+        .forward_any::<InstanceRegistryError>("failed to set instance ID in metadata")?;
     metadata
         .set_string(PATH, normalized_path)
-        .forward_any::<InstanceError>("failed to set path in metadata")?;
+        .forward_any::<InstanceRegistryError>("failed to set path in metadata")?;
     metadata
         .set_u64(CREATED, crate::util::time::timestamp())
-        .forward_any::<InstanceError>("failed to set created in metadata")?;
+        .forward_any::<InstanceRegistryError>("failed to set created in metadata")?;
 
     let metadata_hash = metadata
         .serialize_local(repository.clone())
         .await
-        .forward_any::<InstanceError>("failed to serialize instance metadata")?;
+        .forward_any::<InstanceRegistryError>("failed to serialize instance metadata")?;
 
     let (key, key_type) = instance_key(repository.salt(), instance_id);
     let handle = repository.try_write_mutable_store().ok_or(WriteRequired)?;
     handle
         .store(repository.id, key, metadata_hash, key_type)
         .await
-        .forward::<InstanceError>("failed to store instance registration")?;
+        .forward::<InstanceRegistryError>("failed to store instance registration")?;
 
     lore_debug!("Registered instance {instance_id} with metadata hash {metadata_hash}");
     Ok(())
@@ -339,7 +339,9 @@ async fn reconcile_instances(
     policy: RetirePolicy,
     report: StaleReport,
 ) -> Result<(Vec<InstanceMetadata>, Vec<StaleInstance>), InstanceError> {
-    let instances = list_instances(repository).await?;
+    let instances = list_instances(repository)
+        .await
+        .forward::<InstanceError>("listing registered instances")?;
     let mut live = Vec::with_capacity(instances.len());
     let mut stale = Vec::new();
     let mut retired_any = false;
@@ -389,10 +391,10 @@ async fn reconcile_instances(
 pub async fn load_instance_metadata(
     repository: &Arc<RepositoryContext>,
     metadata_hash: Hash,
-) -> Result<InstanceMetadata, InstanceError> {
+) -> Result<InstanceMetadata, InstanceRegistryError> {
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
-        .forward_any::<InstanceError>("failed to deserialize instance metadata")?;
+        .forward_any::<InstanceRegistryError>("failed to deserialize instance metadata")?;
 
     // Missing or corrupt fields are non-fatal — instance metadata is advisory
     // (used for branch checkout warnings and stale instance detection), not
@@ -490,14 +492,14 @@ pub async fn recover_instance_id(
 /// Returns a list of `InstanceMetadata` for each registered instance.
 pub async fn list_instances(
     repository: &Arc<RepositoryContext>,
-) -> Result<Vec<InstanceMetadata>, InstanceError> {
+) -> Result<Vec<InstanceMetadata>, InstanceRegistryError> {
     use futures::StreamExt;
 
     let mut stream = repository
         .read_mutable_store()
         .list(repository.id, KeyType::Instance)
         .await
-        .forward::<InstanceError>("failed to list instances")?;
+        .forward::<InstanceRegistryError>("failed to list instances")?;
 
     let mut instances = Vec::new();
     while let Some((_key, metadata_hash)) = stream.next().await {
@@ -737,6 +739,32 @@ pub async fn store_staged_anchor(
 /// Delete the staged anchor (write zero hash).
 pub async fn delete_staged_anchor(repository: &Arc<RepositoryContext>) -> Result<(), AnchorError> {
     store_staged_anchor(repository, Hash::default()).await
+}
+
+/// Errors from reading and writing instance registrations in the mutable store.
+///
+/// [`InstanceError`] declares every variant of this set, and adds the errors that unmounting an
+/// instance raises.
+#[error_set]
+pub enum InstanceRegistryError {
+    WriteRequired,
+    NodeNotFound,
+    LinkNotFound,
+    NotFound,
+    FileNotFound,
+    Oversized,
+    InvalidArguments,
+    InvalidPath,
+    AddressNotFound,
+    PayloadNotFound,
+    Disconnected,
+    SlowDown,
+    Maintenance,
+    NotConnected,
+    NoRemote,
+    NotAuthenticated,
+    NotAuthorized,
+    NotSupported,
 }
 
 #[error_set]
@@ -1144,7 +1172,9 @@ pub async fn instance_prune(repository: Arc<RepositoryContext>) -> Result<u32, I
 /// retiring any registration another instance left at that path.
 pub async fn update_path(repository: Arc<RepositoryContext>) -> Result<(), InstanceError> {
     let current_path = repository.path_for_display().to_string();
-    register_instance(&repository, repository.instance_id, &current_path).await?;
+    register_instance(&repository, repository.instance_id, &current_path)
+        .await
+        .forward::<InstanceError>("registering the instance at its current path")?;
     lore_debug!("Updated instance path to {current_path}");
     Ok(())
 }

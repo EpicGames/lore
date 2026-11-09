@@ -216,7 +216,7 @@ async fn list_local(
                 let repository = entry.create_null_repository_context().await?;
                 list_instances(&repository)
                     .await
-                    .forward_any::<RepositoryError>("Listing instances from repository")?
+                    .forward::<RepositoryError>("Listing instances from repository")?
                     .into_iter()
                     .map(|metadata| (metadata.instance_id, metadata.path.into()))
                     .unzip()
