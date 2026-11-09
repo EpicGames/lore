@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::num::NonZeroU8;
+use std::num::NonZeroU64;
 use std::num::NonZeroUsize;
 
 use config::Config;
@@ -891,7 +892,11 @@ pub struct ReplicatedStoreSettings {
     pub remote_url: String,
     pub certs: Option<CertificateSettings>,
     pub regenerate_retry: RetrySettings,
-    pub periodic_client_refresh_secs: u64,
+    /// The number of clients, each with its own connection to the remote. Every limit and
+    /// transport setting below applies to each client separately.
+    #[serde(default = "default_replicated_store_num_clients")]
+    pub num_clients: NonZeroUsize,
+    pub periodic_client_refresh_secs: NonZeroU64,
     #[serde(default = "default_quic_client_monitor_interval_secs")]
     pub client_metrics_interval_seconds: u64,
     /// how many inflight messages are allowed before we self-throttle
@@ -904,6 +909,10 @@ pub struct ReplicatedStoreSettings {
     /// refreshed.
     #[serde(default = "default_peer_initial_cwnd_bytes")]
     pub initial_cwnd_bytes: InitialCwndBytes,
+}
+
+fn default_replicated_store_num_clients() -> NonZeroUsize {
+    NonZeroUsize::new(2).expect("2 is not zero")
 }
 
 #[derive(Copy, Clone, Default, Debug, Deserialize, PartialEq)]

@@ -85,6 +85,10 @@ mode = "replicated"
 # The full server's `[server.quic_internal]` listener, which serves the
 # replication store protocol.
 remote_url = "lore://127.0.0.1:41340"
+# Connections to the full server. Requests go to whichever has the fewest of
+# their kind in flight, so one stalled connection doesn't hold up the rest.
+# `client_message_limit` applies to each connection. Defaults to 2.
+# num_clients = 2
 periodic_client_refresh_secs = 300
 client_message_limit = 100
 # Window each connection starts sending with. Defaults to 1 MiB.

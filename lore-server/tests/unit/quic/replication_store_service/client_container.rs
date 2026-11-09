@@ -613,3 +613,137 @@ mod regenerate_client {
         assert_eq!(*served.lock().unwrap(), vec![0, 1, 1, 2]);
     }
 }
+
+mod report_connection_failed {
+    use super::*;
+
+    async fn make_container() -> (
+        ClientContainer<MockClient>,
+        mpsc::Sender<Result<MockClient, ProtocolError>>,
+    ) {
+        let (tx, rx) = mpsc::channel(2);
+        tx.send(Ok(MockClient::new())).await.expect("send client");
+        let factory = Arc::new(CapturingFactory {
+            rx: rx.into(),
+            captured_cwnd: Arc::default(),
+        });
+        let container = ClientContainer::new(factory, make_config())
+            .await
+            .expect("factory create");
+        (container, tx)
+    }
+
+    #[tokio::test]
+    async fn a_failure_on_the_current_client_marks_the_container_unhealthy() {
+        let (container, _tx) = make_container().await;
+
+        assert!(container.report_connection_failed(container.epoch()));
+        assert!(!container.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn only_the_first_failure_reports_the_change() {
+        let (container, _tx) = make_container().await;
+
+        assert!(container.report_connection_failed(container.epoch()));
+        assert!(!container.report_connection_failed(container.epoch()));
+        assert!(!container.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn a_failure_on_a_replaced_client_changes_nothing() {
+        let (container, tx) = make_container().await;
+        tx.send(Ok(MockClient::new())).await.expect("send client");
+        let replaced_epoch = container.epoch();
+        let did_regen = container
+            .regenerate_client(replaced_epoch, GenerateClientReason::ConnectionFailed)
+            .await
+            .expect("regenerate should work");
+        assert!(did_regen);
+
+        assert!(!container.report_connection_failed(replaced_epoch));
+        assert!(container.is_healthy());
+    }
+}
+
+mod lease {
+    use super::*;
+
+    async fn make_container(
+        clients: Vec<MockClient>,
+    ) -> (
+        ClientContainer<MockClient>,
+        mpsc::Sender<Result<MockClient, ProtocolError>>,
+    ) {
+        let (tx, rx) = mpsc::channel(clients.len());
+        for client in clients {
+            tx.send(Ok(client)).await.expect("send client");
+        }
+        let factory = Arc::new(CapturingFactory {
+            rx: rx.into(),
+            captured_cwnd: Arc::default(),
+        });
+        let container = ClientContainer::new(factory, make_config())
+            .await
+            .expect("factory create");
+        (container, tx)
+    }
+
+    #[tokio::test]
+    async fn a_request_is_counted_under_its_kind_until_its_guard_drops() {
+        let (container, _tx) = make_container(vec![MockClient::new()]).await;
+
+        let (_, _, first) = container.lease(RequestKind::Get, None);
+        let (_, _, second) = container.lease(RequestKind::Get, None);
+        let (_, _, put) = container.lease(RequestKind::Put, None);
+        assert_eq!(container.inflight(RequestKind::Get), 2);
+        assert_eq!(container.inflight(RequestKind::Put), 1);
+        assert_eq!(container.inflight(RequestKind::Query), 0);
+        assert_eq!(container.inflight_total(), 3);
+        drop(put);
+
+        drop(first);
+        assert_eq!(container.inflight(RequestKind::Get), 1);
+        drop(second);
+        assert_eq!(container.inflight(RequestKind::Get), 0);
+    }
+
+    #[tokio::test]
+    async fn a_lease_reports_the_epoch_of_the_client_it_returns() {
+        let (container, tx) = make_container(vec![MockClient::new()]).await;
+        tx.send(Ok(MockClient::new())).await.expect("send client");
+
+        let (before, _, _) = container.lease(RequestKind::Get, None);
+        let did_regen = container
+            .regenerate_client(before.client_epoch, GenerateClientReason::ConnectionFailed)
+            .await
+            .expect("regenerate should work");
+        assert!(did_regen);
+        let (after, _, _) = container.lease(RequestKind::Get, None);
+
+        assert_eq!(before.client_epoch, 0);
+        assert_eq!(after.client_epoch, 1);
+    }
+
+    /// Requests still running on a replaced client are not counted against its successor, and
+    /// finishing them does not change the successor's count.
+    #[tokio::test]
+    async fn a_new_client_starts_with_nothing_in_flight() {
+        let (container, tx) = make_container(vec![MockClient::new()]).await;
+        tx.send(Ok(MockClient::new())).await.expect("send client");
+
+        let (_, _, on_old_client) = container.lease(RequestKind::Put, None);
+        let did_regen = container
+            .regenerate_client(container.epoch(), GenerateClientReason::ConnectionFailed)
+            .await
+            .expect("regenerate should work");
+        assert!(did_regen);
+        assert_eq!(container.inflight(RequestKind::Put), 0);
+
+        let (_, _, on_new_client) = container.lease(RequestKind::Put, None);
+        drop(on_old_client);
+        assert_eq!(container.inflight(RequestKind::Put), 1);
+        drop(on_new_client);
+        assert_eq!(container.inflight(RequestKind::Put), 0);
+    }
+}

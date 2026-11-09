@@ -3,6 +3,7 @@
 #[cfg(all(test, feature = "integration_tests"))]
 mod replicated_store_tests {
     use std::net::SocketAddr;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -93,6 +94,7 @@ mod replicated_store_tests {
         let store = ReplicatedStore::new(
             Arc::new(factory),
             container_config,
+            NonZeroUsize::new(2).expect("2 is not zero"),
             Duration::from_secs(60),
             Duration::from_secs(60),
         )

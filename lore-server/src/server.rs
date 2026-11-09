@@ -1445,8 +1445,9 @@ async fn configure_replicated_immutable_store(
     settings: &ReplicatedStoreSettings,
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!(
-        "Wiring up replicated immutable store to {}",
-        settings.remote_url
+        remote_url = %settings.remote_url,
+        num_clients = settings.num_clients,
+        "Wiring up replicated immutable store"
     );
 
     let certs = if let Some(setting_certs) = &settings.certs {
@@ -1494,7 +1495,8 @@ async fn configure_replicated_immutable_store(
     let store = ReplicatedStore::new(
         Arc::new(factory),
         container_config,
-        Duration::from_secs(settings.periodic_client_refresh_secs),
+        settings.num_clients,
+        Duration::from_secs(settings.periodic_client_refresh_secs.get()),
         Duration::from_secs(settings.client_metrics_interval_seconds),
     )
     .await?;

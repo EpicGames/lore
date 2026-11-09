@@ -2242,6 +2242,68 @@ mod deserialize_quic_internal {
     }
 }
 
+mod replicated_store_settings_num_clients {
+    use super::*;
+
+    pub(super) const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(num_clients: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{num_clients}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_num_clients_is_two() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 2);
+    }
+
+    #[test]
+    fn configured_num_clients_is_kept() {
+        let settings = parse("num_clients = 4").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 4);
+    }
+
+    #[test]
+    fn zero_num_clients_is_rejected() {
+        let error = parse("num_clients = 0").expect_err("zero clients");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod replicated_store_settings_periodic_client_refresh_secs {
+    use super::*;
+
+    #[test]
+    fn zero_refresh_period_is_rejected() {
+        let error = toml::from_str::<ReplicatedStoreSettings>(
+            &super::replicated_store_settings_num_clients::REQUIRED_KEYS.replace(
+                "periodic_client_refresh_secs = 300",
+                "periodic_client_refresh_secs = 0",
+            ),
+        )
+        .expect_err("zero refresh period");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
 mod replicated_store_settings_initial_cwnd_bytes {
     use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
     use lore_server::quic::initial_cwnd::InitialCwndBytes;
