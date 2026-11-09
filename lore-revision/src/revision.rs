@@ -50,7 +50,7 @@ use crate::repository::RepositoryContext;
 use crate::state;
 use crate::state::State;
 use crate::state::StateError;
-use crate::state::TreePath;
+use crate::state::TreeWalk;
 use crate::state::gather_tree_paths;
 use crate::util::path::RelativePath;
 
@@ -1940,18 +1940,17 @@ fn added_without_merge(action: u16, flags: u16) -> bool {
     action == FileAction::Add as u16 && flags & change::Flags::Merge.bits() == 0
 }
 
-pub struct TreeResult {
-    /// list of paths at this level
-    pub paths: Vec<TreePath>,
-}
-
+/// Walks the tree at `revision`. With `include_last_revision`, attributes each entry to the
+/// revision that last changed it
+/// ([`TreePath::last_revision`](crate::state::TreePath::last_revision)).
 pub async fn tree(
     repository: Arc<RepositoryContext>,
     revision: Hash,
     path: RelativePath,
     max_depth: usize,
     can_read: crate::state::CanReadRepository,
-) -> Result<TreeResult, StateError> {
+    include_last_revision: bool,
+) -> Result<TreeWalk, StateError> {
     lore_debug!(
         "Gathering tree in repository {} revision: {} path: {}",
         repository.id,
@@ -1959,8 +1958,15 @@ pub async fn tree(
         path.as_str()
     );
     let state = State::deserialize(repository.clone(), revision).await?;
-    let paths = gather_tree_paths(state, repository, path, max_depth, can_read).await?;
-    Ok(TreeResult { paths })
+    gather_tree_paths(
+        state,
+        repository,
+        path,
+        max_depth,
+        can_read,
+        include_last_revision,
+    )
+    .await
 }
 
 /// What a revision specifier names on a branch.

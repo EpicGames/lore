@@ -3604,6 +3604,46 @@ mod block_single_flight {
             .await;
     }
 
+    /// A walk that attributes its entries holds the attribution load in a box of its own, so the
+    /// future of each entry, which walks a link's subtree through `enumerate_children`, does not
+    /// hold the delta block read.
+    #[tokio::test]
+    async fn an_attributed_walk_keeps_the_delta_read_out_of_its_future() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let repository = Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                ));
+                let state = State::new();
+                let mut tree_walk = lore_revision::state::TreeWalk::default();
+
+                let walk = lore_revision::state::enumerate_children(
+                    state.clone(),
+                    repository.clone(),
+                    ROOT_NODE,
+                    lore_revision::util::path::RelativePath::new(),
+                    0,
+                    0,
+                    0,
+                    lore_revision::state::allow_all_repositories(),
+                    &mut tree_walk,
+                    true,
+                );
+                let delta_read = state.delta_block(repository);
+
+                assert!(
+                    size_of_val(&walk) < size_of_val(&delta_read),
+                    "an attributed walk holds {} bytes, the delta block read {}",
+                    size_of_val(&walk),
+                    size_of_val(&delta_read)
+                );
+            })
+            .await;
+    }
+
     /// A node block read holds its read of the current format, and the fallback to the older
     /// formats, which holds a read as large and the conversion, stays in a box of its own.
     #[tokio::test]

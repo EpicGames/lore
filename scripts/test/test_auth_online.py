@@ -1107,7 +1107,7 @@ def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor)
             node.path
             for node in revision_tree(
                 target, repository_id, signature, authorization=token
-            )
+            ).nodes
         }
 
     granted = tree_paths(both)

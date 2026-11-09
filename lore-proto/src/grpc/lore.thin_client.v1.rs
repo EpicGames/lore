@@ -81,12 +81,14 @@ impl ::prost::Name for DiffConflict {
     }
 }
 /// Per-stream partition table entry. Announces a linked partition and
-/// the stable index that `DiffChange.link_repository_index` will use to
-/// reference it for the remainder of this stream. Server emits each entry
-/// at most once, in discovery order starting at index 1, strictly before
-/// the first `DiffChange` (or `DiffConflict` half) that references it. An
-/// entry for a link the diff touches may have no change referencing it.
-/// Index 0 is reserved for the parent partition and never announced.
+/// the stable index that `DiffChange.link_repository_index`,
+/// `TreeNode.link_repository_index` or `TreeRevision.link_repository_index`
+/// will use to reference it for the remainder of this stream. Server emits
+/// each entry at most once, in discovery order starting at index 1,
+/// strictly before the first `DiffChange` (or `DiffConflict` half),
+/// `TreeNode` or `TreeRevision` that references it. In a diff, an entry for
+/// a link the diff touches may have no change referencing it. Index 0 is
+/// reserved for the parent partition and never announced.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DiffPartition {
     /// Stable per-stream index. Server assigns 1, 2, 3, … in discovery
@@ -131,6 +133,20 @@ pub struct TreeNode {
     /// and non-link entries.
     #[prost(bool, tag = "6")]
     pub tracking: bool,
+    /// Index of the TreeRevision naming the revision that last changed this
+    /// entry. 0 when the request does not ask for attribution or the revision
+    /// can't be resolved.
+    #[prost(uint32, tag = "7")]
+    pub last_revision_index: u32,
+    /// Index into the per-stream partition table built from `DiffPartition`
+    /// payloads: the partition this entry's content resolves under, as for a
+    /// `DiffChange`. For a LINK entry it is the linked repository, for any
+    /// other entry the repository the entry is in. 0 = the request's
+    /// repository (the parent partition, never announced). A non-zero value
+    /// is preceded on the same stream by the `DiffPartition` whose `index`
+    /// matches.
+    #[prost(uint32, tag = "8")]
+    pub link_repository_index: u32,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -714,10 +730,9 @@ impl ::prost::Name for RevisionDiffResponse {
 /// Request to walk the file/directory tree at a specific revision.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RevisionTreeRequest {
-    /// If set and non-empty, only entries at or under this path are
-    /// emitted. The prefix itself is emitted as a DIRECTORY node when
-    /// it exists. If unset or empty, the walk covers the full tree from
-    /// the repository root.
+    /// If set and non-empty, only entries under this path are emitted, not
+    /// the entry at the path itself. If unset or empty, the walk covers the
+    /// full tree from the repository root.
     #[prost(string, optional, tag = "3")]
     pub path_prefix: ::core::option::Option<::prost::alloc::string::String>,
     /// If set, limits the depth of descent below the prefix root. 1
@@ -725,6 +740,13 @@ pub struct RevisionTreeRequest {
     /// children plus grandchildren; etc. 0 or unset means unbounded.
     #[prost(uint32, optional, tag = "4")]
     pub max_depth: ::core::option::Option<u32>,
+    /// If true, populate `TreeNode.last_revision_index` and emit the revisions
+    /// it names as `TreeRevision` payloads. Off by default. Attribution reads the
+    /// delta block of each walked revision and the file metadata blocks of its
+    /// entries, and loads each distinct revision an entry names once. The
+    /// header's `last_revision_included` reports whether the server attributes.
+    #[prost(bool, tag = "5")]
+    pub include_last_revision: bool,
     /// Revision specifier.
     #[prost(oneof = "revision_tree_request::Query", tags = "1, 2")]
     pub query: ::core::option::Option<revision_tree_request::Query>,
@@ -764,6 +786,11 @@ pub struct RevisionTreeHeader {
     /// Resolved signature of the revision being walked.
     #[prost(bytes = "bytes", tag = "2")]
     pub signature: ::prost::bytes::Bytes,
+    /// True when the stream attributes its entries, as
+    /// `RevisionTreeRequest.include_last_revision` asks. A server without
+    /// attribution leaves it false.
+    #[prost(bool, tag = "3")]
+    pub last_revision_included: bool,
 }
 impl ::prost::Name for RevisionTreeHeader {
     const NAME: &'static str = "RevisionTreeHeader";
@@ -775,17 +802,51 @@ impl ::prost::Name for RevisionTreeHeader {
         "/lore.thin_client.v1.RevisionTreeHeader".into()
     }
 }
+/// A revision named by TreeNode.last_revision_index. Emitted once per
+/// revision, in discovery order from index 1, and always before the first
+/// TreeNode naming it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TreeRevision {
+    /// Per-stream index, assigned in discovery order.
+    #[prost(uint32, tag = "1")]
+    pub index: u32,
+    /// Carries only attribution-facing fields: `signature`, `identifier`,
+    /// `number`, `commit_message`, `timestamp` and `committed_by`. Call
+    /// RevisionInfo for the full record. `identifier.branch_id` is zero for a
+    /// revision whose metadata names no branch.
+    #[prost(message, optional, boxed, tag = "2")]
+    pub revision: ::core::option::Option<::prost::alloc::boxed::Box<Revision>>,
+    /// Index into the per-stream partition table built from `DiffPartition`
+    /// payloads: the partition the revision is in. 0 = the request's
+    /// repository (the parent partition, never announced). A non-zero value
+    /// is preceded on the same stream by the `DiffPartition` whose `index`
+    /// matches.
+    #[prost(uint32, tag = "3")]
+    pub link_repository_index: u32,
+}
+impl ::prost::Name for TreeRevision {
+    const NAME: &'static str = "TreeRevision";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.TreeRevision".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.TreeRevision".into()
+    }
+}
 /// Server-streamed response for RevisionTree. First message carries
 /// `payload.header`; subsequent messages stream `TreeNode` items in
-/// server-natural order.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+/// server-natural order, interleaved with `DiffPartition` payloads as the
+/// walk meets linked repositories, and with `TreeRevision` payloads when
+/// attribution is requested.
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RevisionTreeResponse {
-    #[prost(oneof = "revision_tree_response::Payload", tags = "1, 2")]
+    #[prost(oneof = "revision_tree_response::Payload", tags = "1, 2, 3, 4")]
     pub payload: ::core::option::Option<revision_tree_response::Payload>,
 }
 /// Nested message and enum types in `RevisionTreeResponse`.
 pub mod revision_tree_response {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Payload {
         /// Header echoing the resolved revision.
         #[prost(message, tag = "1")]
@@ -793,6 +854,12 @@ pub mod revision_tree_response {
         /// A tree entry (directory, file, or link).
         #[prost(message, tag = "2")]
         Node(super::TreeNode),
+        /// A revision named by a later TreeNode.
+        #[prost(message, tag = "3")]
+        Revision(super::TreeRevision),
+        /// A linked-repository announcement.
+        #[prost(message, tag = "4")]
+        Partition(super::DiffPartition),
     }
 }
 impl ::prost::Name for RevisionTreeResponse {

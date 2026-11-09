@@ -927,7 +927,9 @@ pub mod in_memory {
     use lore_base::types::BranchId;
     use lore_base::types::Context;
     use lore_base::types::Hash;
+    use lore_revision::commit::BasedOn;
     use lore_revision::commit::commit_in_memory_revision;
+    use lore_revision::commit::weave_history;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
@@ -935,7 +937,9 @@ pub mod in_memory {
     use lore_revision::repository::InMemoryContext;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::Content;
     use lore_revision::state::Mark;
+    use lore_revision::state::Rewrite;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
 
@@ -1054,6 +1058,54 @@ pub mod in_memory {
         State::deserialize(repository.clone(), revision)
             .await
             .expect("deserializing the revision must succeed")
+    }
+
+    /// Sets the content of file `node_id` of `state` to `address`, staged with `staged`.
+    pub async fn modify(
+        state: &State,
+        repository: &Arc<RepositoryContext>,
+        node_id: NodeID,
+        address: Address,
+        staged: NodeFlags,
+    ) {
+        state
+            .node_rewrite(
+                repository,
+                node_id,
+                &Content {
+                    mode: 0o644,
+                    size: 11,
+                    address,
+                },
+                Rewrite::Plain,
+            )
+            .await
+            .expect("modifying the file");
+        state
+            .node_mark(
+                repository,
+                node_id,
+                Mark::staged_and_dirty(staged, NodeFlags::DirtyModify),
+            )
+            .await
+            .expect("staging the modification");
+    }
+
+    /// `merged`, woven again as the merge a sync stages for divergent history: the remote latest
+    /// first, and the local latest, which the tree of `merged` was built from, second.
+    pub async fn weave_as_divergent_merge(
+        repository: &Arc<RepositoryContext>,
+        merged: Hash,
+        remote_latest: Hash,
+        local_latest: Hash,
+    ) -> Arc<State> {
+        let state = revision_state(repository, merged).await;
+        state.set_parent_self(remote_latest);
+        state.set_parent_other(local_latest);
+        weave_history(repository.clone(), state.clone(), BasedOn::Other)
+            .await
+            .expect("weaving the merge history");
+        state
     }
 }
 

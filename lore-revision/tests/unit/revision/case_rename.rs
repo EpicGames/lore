@@ -18,7 +18,7 @@ use super::instance::Instance;
 use super::instance::commit;
 use super::instance::create_branch;
 use super::instance::current;
-use super::instance::merge_feature;
+use super::instance::merge_branch;
 use super::instance::names_along;
 use super::instance::renamed;
 use super::instance::revision_state;
@@ -160,7 +160,10 @@ async fn merge_across(name: &str, from: &'static str, to: &'static str) {
         switch_to(&instance, branch::DEFAULT_DEFAULT_NAME).await;
         write(&instance, "Top.txt", "main");
         stage_and_commit(&instance, &instance.path.join("Top.txt"), "Edit on main").await;
-        assert!(merge_feature(&instance).await, "the merge committed");
+        assert!(
+            merge_branch(&instance, "feature").await,
+            "the merge committed"
+        );
 
         let mut expected = renamed(&before, from, to);
         expected.insert(ELSEWHERE.to_string(), b"feature".to_vec());

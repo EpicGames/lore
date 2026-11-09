@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! Helpers shared by `lore.thin_client.v1` RPC handlers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -17,7 +18,10 @@ use lore_revision::change::NodeChange;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::link::LinkPinChange;
 use lore_revision::lore::BranchId;
+use lore_revision::lore::RepositoryId;
+use lore_revision::metadata;
 use lore_revision::metadata::Metadata;
+use lore_revision::metadata::MetadataType;
 use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
@@ -315,5 +319,87 @@ pub(super) async fn diff_conflict_from_pair(
     thin_client_v1::DiffConflict {
         change_from: Some(node_change_to_diff_change(&pair.0, link_repository_index_from).await),
         change_to: Some(node_change_to_diff_change(&pair.1, link_repository_index_to).await),
+    }
+}
+
+/// The `Revision` record of revision `signature`, number `number` on branch `branch_id`, with the
+/// commit message, timestamp and committer its `metadata` holds. A text field that is not valid
+/// UTF-8 is left empty. Every other entry whose key is valid UTF-8 goes to `other`.
+#[lore_macro::test_pub]
+pub(super) fn revision_record(
+    signature: Hash,
+    number: u64,
+    branch_id: BranchId,
+    metadata: &Metadata,
+    mut other: impl FnMut(&str, &[u8], MetadataType),
+) -> thin_client_v1::Revision {
+    let mut revision = thin_client_v1::Revision {
+        signature: signature.into(),
+        identifier: Some(model_v1::RevisionIdentifier {
+            branch_id: branch_id.into(),
+            number,
+        }),
+        number,
+        ..Default::default()
+    };
+    metadata.walk(|key, value, value_type| {
+        let Ok(key) = std::str::from_utf8(key) else {
+            return;
+        };
+        match key {
+            metadata::MESSAGE => {
+                revision.commit_message = std::str::from_utf8(value).unwrap_or_default().to_owned();
+            }
+            metadata::TIMESTAMP => {
+                if let Ok(timestamp) = <[u8; 8]>::try_from(value) {
+                    revision.timestamp = u64::from_le_bytes(timestamp);
+                }
+            }
+            metadata::COMMITTED_BY => {
+                revision.committed_by = std::str::from_utf8(value).unwrap_or_default().to_owned();
+            }
+            _ => other(key, value, value_type),
+        }
+    });
+    revision
+}
+
+/// Per-stream map of linked-repository `RepositoryId` to its assigned index. The parent repository
+/// is index 0 and never stored here.
+#[lore_macro::test_pub]
+pub(super) struct PartitionTable {
+    parent_repository_id: RepositoryId,
+    entries: HashMap<RepositoryId, u32>,
+}
+
+impl PartitionTable {
+    #[lore_macro::test_pub]
+    pub(super) fn new(parent_repository_id: RepositoryId) -> Self {
+        Self {
+            parent_repository_id,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// The index of `partition` on the stream: 0 for the parent repository, or the index it was
+    /// first given. On first sight it takes the next index, and the `DiffPartition` announcing it is
+    /// returned for the stream to send before the index.
+    pub(super) fn resolve(
+        &mut self,
+        partition: RepositoryId,
+    ) -> (u32, Option<thin_client_v1::DiffPartition>) {
+        if partition == self.parent_repository_id {
+            return (0, None);
+        }
+        if let Some(&index) = self.entries.get(&partition) {
+            return (index, None);
+        }
+        let index = (self.entries.len() as u32) + 1;
+        self.entries.insert(partition, index);
+        let announcement = thin_client_v1::DiffPartition {
+            index,
+            link_partition: Bytes::from(partition),
+        };
+        (index, Some(announcement))
     }
 }

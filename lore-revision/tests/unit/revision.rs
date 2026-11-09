@@ -27,6 +27,7 @@ mod remote_comparison;
 mod resolve;
 mod sync;
 mod sync_hold;
+mod tree_walk;
 
 use lore_revision::revision::*;
 

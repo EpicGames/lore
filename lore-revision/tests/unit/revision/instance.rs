@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-#![allow(clippy::disallowed_methods)] // Test fixtures read the working tree directly.
+#![allow(clippy::disallowed_methods)] // Test fixtures read and edit the working tree directly.
 
 //! A repository on a working tree of its own, for tests that commit, sync, switch branches and
 //! merge through it and compare what the working tree holds.
@@ -181,6 +181,53 @@ pub(super) async fn stage_and_commit(instance: &Instance, path: &Path, message: 
         .expect("The commit succeeds without --force")
 }
 
+/// An edit to the working tree.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Edit {
+    /// Renames the first path to the second.
+    Move(&'static str, &'static str),
+    /// Writes the content to the file at the path.
+    Write(&'static str, &'static str),
+    /// Deletes the file or the directory at the path.
+    Delete(&'static str),
+}
+
+/// Makes `edits` in the working tree, stages each move as one, and commits them, answering the
+/// revision.
+pub(super) async fn commit_edits(instance: &Instance, edits: &[Edit], message: &str) -> Hash {
+    for edit in edits {
+        match *edit {
+            Edit::Move(from, to) => {
+                let (from, to) = (instance.path.join(from), instance.path.join(to));
+                std::fs::rename(&from, &to).expect("rename");
+                file::stage::stage_move(
+                    instance.repository.clone(),
+                    &instance.write_token,
+                    from.to_string_lossy().into_owned(),
+                    to.to_string_lossy().into_owned(),
+                    StageOptions {
+                        case_change: StageCaseChange::Rename,
+                        scan: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Failed to stage the move");
+            }
+            Edit::Write(path, content) => write(instance, path, content),
+            Edit::Delete(path) => {
+                let absolute = instance.path.join(path);
+                if absolute.is_dir() {
+                    std::fs::remove_dir_all(absolute).expect("Failed to delete");
+                } else {
+                    std::fs::remove_file(absolute).expect("Failed to delete");
+                }
+            }
+        }
+    }
+    stage_and_commit(instance, &instance.path, message).await
+}
+
 pub(super) async fn switch_to(instance: &Instance, branch: &str) {
     repository::branch_switch(
         instance.repository.clone(),
@@ -224,17 +271,17 @@ pub(super) async fn revision_state(instance: &Instance, revision: Hash) -> Arc<S
         .expect("Failed to read the revision")
 }
 
-/// Merges the `feature` branch into the current one, answering whether the merge committed.
-pub(super) async fn merge_feature(instance: &Instance) -> bool {
+/// Merges branch `name` into the current one, answering whether the merge committed.
+pub(super) async fn merge_branch(instance: &Instance, name: &str) -> bool {
     let before = current(instance).await;
-    let feature = branch::resolve(instance.repository.clone(), "feature")
+    let source = branch::resolve(instance.repository.clone(), name)
         .await
-        .expect("Failed to resolve the feature branch")
+        .expect("Failed to resolve the branch to merge")
         .id;
     Box::pin(branch::merge::merge_start(
         instance.repository.clone(),
         &instance.write_token,
-        feature,
+        source,
         branch::merge::MergeStartOptions {
             message: "Merge".to_string(),
             link_messages: std::collections::HashMap::new(),

@@ -34,6 +34,7 @@ use lore_server::grpc::thinclient::v1::revision_tree::*;
 use lore_storage::hash::hash_string;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tonic::Request;
 use tonic::Response;
@@ -67,6 +68,7 @@ fn make_request(
         query: Some(query),
         path_prefix,
         max_depth,
+        include_last_revision: false,
     });
     request.metadata_mut().insert_bin(
         REPOSITORY_ID_KEY,
@@ -75,18 +77,12 @@ fn make_request(
     request
 }
 
-/// Pushes a fresh branch and one revision for each of `revisions`; each
-/// revision's state contains `revisions[i]` as File nodes at the root.
-/// Returns the branch id and the revision signatures in push order.
-async fn push_branch_with_revisions(
-    repository: &Arc<RepositoryContext>,
-    revisions: &[&[&str]],
-) -> (BranchId, Vec<Hash>) {
-    let write_token = get_write_token();
+/// Creates a branch in `repository`, answering its ID.
+async fn create_branch(repository: &Arc<RepositoryContext>) -> BranchId {
     let branch_id = BranchId::from(uuid::Uuid::now_v7());
     branch::create(
         repository.clone(),
-        &write_token,
+        &get_write_token(),
         branch_id,
         "test-branch",
         branch::default_category(),
@@ -98,6 +94,18 @@ async fn push_branch_with_revisions(
     )
     .await
     .expect("create branch");
+    branch_id
+}
+
+/// Pushes a fresh branch and one revision for each of `revisions`; each
+/// revision's state contains `revisions[i]` as File nodes at the root.
+/// Returns the branch id and the revision signatures in push order.
+async fn push_branch_with_revisions(
+    repository: &Arc<RepositoryContext>,
+    revisions: &[&[&str]],
+) -> (BranchId, Vec<Hash>) {
+    let write_token = get_write_token();
+    let branch_id = create_branch(repository).await;
 
     let mut signatures = Vec::with_capacity(revisions.len());
     let mut parent = Hash::default();
@@ -152,21 +160,7 @@ async fn push_branch_with_revisions(
 /// `top.txt` and `subdir/inner.txt`.
 async fn push_branch_with_subdir(repository: &Arc<RepositoryContext>) -> (BranchId, Hash) {
     let write_token = get_write_token();
-    let branch_id = BranchId::from(uuid::Uuid::now_v7());
-    branch::create(
-        repository.clone(),
-        &write_token,
-        branch_id,
-        "test-branch",
-        branch::default_category(),
-        "creator",
-        1,
-        vec![],
-        false,
-        false,
-    )
-    .await
-    .expect("create branch");
+    let branch_id = create_branch(repository).await;
 
     let mut metadata = Metadata::new();
     metadata.set_branch(branch_id).expect("set branch");
@@ -260,21 +254,7 @@ async fn push_branch_with_link(
     use lore_base::types::Address;
 
     let write_token = get_write_token();
-    let branch_id = BranchId::from(uuid::Uuid::now_v7());
-    branch::create(
-        repository.clone(),
-        &write_token,
-        branch_id,
-        "test-branch",
-        branch::default_category(),
-        "creator",
-        1,
-        vec![],
-        false,
-        false,
-    )
-    .await
-    .expect("create branch");
+    let branch_id = create_branch(repository).await;
 
     let mut metadata = Metadata::new();
     metadata.set_branch(branch_id).expect("set branch");
@@ -355,6 +335,7 @@ async fn unset_query_returns_invalid_argument() {
             query: None,
             path_prefix: None,
             max_depth: None,
+            include_last_revision: false,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
@@ -954,18 +935,48 @@ async fn link_emits_linked_repository_contents() {
         .await
         .expect("handler ok");
 
-        let nodes: Vec<thin_client_v1::TreeNode> = collect(response)
+        let payloads: Vec<Payload> = collect(response)
             .await
             .into_iter()
-            .map(|r| r.expect("stream item"))
-            .filter_map(|item| match item.payload {
-                Some(Payload::Node(n)) => Some(n),
+            .map(|r| r.expect("stream item").payload.expect("a payload"))
+            .collect();
+        let partitions: Vec<(usize, &thin_client_v1::DiffPartition)> = payloads
+            .iter()
+            .enumerate()
+            .filter_map(|(at, payload)| match payload {
+                Payload::Partition(partition) => Some((at, partition)),
+                _ => None,
+            })
+            .collect();
+        let nodes: Vec<thin_client_v1::TreeNode> = payloads
+            .iter()
+            .filter_map(|payload| match payload {
+                Payload::Node(n) => Some(n.clone()),
                 _ => None,
             })
             .collect();
 
         // Expect exactly two entries: the link mount, then the file inside.
         assert_eq!(nodes.len(), 2, "expected link + child, got {nodes:?}");
+        assert_eq!(partitions.len(), 1, "{payloads:?}");
+        let (announced_at, partition) = partitions[0];
+        assert_eq!(partition.index, 1);
+        assert_eq!(
+            RepositoryId::from(partition.link_partition.as_ref()),
+            linked
+        );
+        assert!(
+            matches!(&payloads[announced_at + 1], Payload::Node(link) if link.path == "linked"),
+            "the partition is announced just before the link naming it: {payloads:?}",
+        );
+        assert_eq!(
+            nodes[0].link_repository_index, 1,
+            "the link names the linked repository"
+        );
+        assert_eq!(
+            nodes[1].link_repository_index, 1,
+            "the entry under it is in the linked one"
+        );
 
         let link = &nodes[0];
         assert_eq!(link.path, "linked");
@@ -1299,21 +1310,7 @@ async fn distinct_links_to_same_repository_both_walked() {
             a,
         ));
         let write_token = get_write_token();
-        let branch_id = BranchId::from(uuid::Uuid::now_v7());
-        branch::create(
-            a_context.clone(),
-            &write_token,
-            branch_id,
-            "test-branch",
-            branch::default_category(),
-            "creator",
-            1,
-            vec![],
-            false,
-            false,
-        )
-        .await
-        .expect("create branch");
+        let branch_id = create_branch(&a_context).await;
 
         let mut metadata = Metadata::new();
         metadata.set_branch(branch_id).expect("set branch");
@@ -1470,6 +1467,567 @@ async fn path_prefix_into_unauthorized_link_returns_not_found() {
         ));
         let err = items[1].as_ref().expect_err("expected error item");
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }))
+    .await;
+}
+
+/// Commits `names` as files at the root of the first revision of a new branch, through the commit
+/// path that records each entry's history, and answers the revision.
+async fn commit_files(repository: &Arc<RepositoryContext>, names: &[&str]) -> Hash {
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+
+    let branch_id = create_branch(repository).await;
+    let state = state::State::new();
+    for name in names {
+        let node = Node {
+            flags: NodeFlags::File.bits(),
+            mode: 0o644,
+            size: 1,
+            address: Address {
+                hash: Hash::from_u64(1),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+            name_hash: hash_string(name),
+            ..Default::default()
+        };
+        state
+            .node_add_staged(repository.clone(), ROOT_NODE, node, name)
+            .await
+            .expect("node_add_staged");
+    }
+    let mut metadata = Metadata::new();
+    metadata.set_branch(branch_id).expect("set branch");
+    lore_revision::commit::commit_in_memory_revision(
+        repository.clone(),
+        &get_write_token(),
+        state,
+        metadata,
+        Hash::default(),
+        branch_id,
+    )
+    .await
+    .expect("commit")
+}
+
+/// Attribution follows the request flag, which the header echoes. With it, each entry names the
+/// revision that added it, announced before the first entry naming it. Without it, no entry names
+/// one and no revision is sent.
+#[tokio::test]
+async fn last_revision_is_gated_by_the_request_flag() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let revision = commit_files(&repository_context, &["a.txt", "b.txt"]).await;
+
+        let items = async |include_last_revision| {
+            let mut request =
+                make_request(repository, Query::Signature(revision.into()), None, None);
+            request.get_mut().include_last_revision = include_last_revision;
+            collect(
+                handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all(),
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                )
+                .await
+                .expect("handler ok"),
+            )
+            .await
+            .into_iter()
+            .map(|r| r.expect("stream item"))
+            .collect::<Vec<_>>()
+        };
+
+        let mut nodes = 0;
+        for item in items(false).await {
+            match item.payload {
+                Some(Payload::Header(header)) => assert!(!header.last_revision_included),
+                Some(Payload::Node(node)) => {
+                    nodes += 1;
+                    assert_eq!(node.last_revision_index, 0, "{}", node.path);
+                }
+                Some(Payload::Revision(_)) => panic!("a TreeRevision without the flag"),
+                Some(Payload::Partition(_)) => panic!("a DiffPartition without a link"),
+                None => panic!("a response without a payload"),
+            }
+        }
+        assert_eq!(nodes, 2);
+
+        let mut announced = Vec::new();
+        let mut nodes = 0;
+        for item in items(true).await {
+            match item.payload {
+                Some(Payload::Header(header)) => assert!(header.last_revision_included),
+                Some(Payload::Revision(tree_revision)) => {
+                    let named = tree_revision.revision.expect("the announced revision");
+                    assert_eq!(Hash::from(named.signature.as_ref()), revision);
+                    announced.push(tree_revision.index);
+                }
+                Some(Payload::Node(node)) => {
+                    nodes += 1;
+                    assert!(
+                        announced.contains(&node.last_revision_index),
+                        "{}",
+                        node.path
+                    );
+                }
+                Some(Payload::Partition(_)) => panic!("a DiffPartition without a link"),
+                None => panic!("a response without a payload"),
+            }
+        }
+        assert_eq!(announced, [1]);
+        assert_eq!(nodes, 2);
+    }))
+    .await;
+}
+
+/// `emit_tree_stream` over a hand-made walk, with a loader that answers from the test.
+mod emission {
+    use std::pin::pin;
+
+    use lore_base::error::NodeNotFound;
+    use lore_base::error::SlowDown;
+    use lore_revision::state::AttributedRevision;
+    use lore_revision::state::RepositorySpan;
+    use lore_revision::state::StateError;
+    use lore_revision::state::TreePath;
+
+    use super::*;
+
+    /// What a load answers.
+    type Loaded = Result<(thin_client_v1::Revision, bool), StateError>;
+
+    /// A file entry at `path` naming the revision at `last_revision` from 1, or none for 0.
+    fn entry(path: &str, last_revision: u32) -> TreePath {
+        TreePath {
+            path: lore_revision::util::path::RelativePath::new_from_initial_path(path)
+                .expect("valid path"),
+            address: None,
+            flags: NodeFlags::File,
+            size: 0,
+            mode: 0,
+            tracking: false,
+            last_revision,
+        }
+    }
+
+    /// Runs `test` in the execution context of the test stores, with a repository over them.
+    async fn with_repository(test: impl AsyncFnOnce(Arc<RepositoryContext>)) {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            random::<RepositoryId>(),
+        ));
+        Box::pin(LORE_CONTEXT.scope(execution, test(repository))).await;
+    }
+
+    /// Revisions `signatures` of `repository`.
+    fn revisions(
+        repository: &Arc<RepositoryContext>,
+        signatures: &[u64],
+    ) -> Vec<AttributedRevision> {
+        signatures
+            .iter()
+            .map(|&signature| AttributedRevision {
+                repository: repository.clone(),
+                revision: Hash::from_u64(signature),
+            })
+            .collect()
+    }
+
+    /// The record a load answers for `revision`, a branch named.
+    fn record(revision: &AttributedRevision) -> Loaded {
+        Ok((
+            thin_client_v1::Revision {
+                signature: revision.revision.into(),
+                ..Default::default()
+            },
+            false,
+        ))
+    }
+
+    /// What `emit_tree_stream` sends for `paths` of a walk of `repository` naming `revisions`,
+    /// each loaded as `outcome` answers, with `report` as the walk left it; and the revisions
+    /// loaded, in order.
+    async fn emit(
+        repository: &Arc<RepositoryContext>,
+        paths: &[TreePath],
+        revisions: &[AttributedRevision],
+        outcome: impl Fn(&AttributedRevision) -> Loaded,
+        report: &mut AttributionReport,
+    ) -> (Vec<Result<Payload, Status>>, Vec<Hash>) {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let mut loaded = Vec::new();
+        emit_tree_stream(
+            paths,
+            &[],
+            revisions,
+            repository.id,
+            |revision| {
+                loaded.push(revision.revision);
+                std::future::ready(outcome(revision))
+            },
+            tx,
+            report,
+        )
+        .await;
+        let mut sent = Vec::new();
+        while let Some(item) = rx.recv().await {
+            sent.push(item.map(|response| response.payload.expect("a payload")));
+        }
+        (sent, loaded)
+    }
+
+    /// The signature of each revision `sent` announces, in order, and the index each entry
+    /// carries, after checking that announcements number from 1 and that each index an entry
+    /// carries was announced before it.
+    fn read(sent: Vec<Result<Payload, Status>>) -> (Vec<Hash>, Vec<u32>) {
+        let (mut announced, mut indices) = (Vec::new(), Vec::new());
+        for payload in sent {
+            match payload.expect("a stream item") {
+                Payload::Revision(tree_revision) => {
+                    assert_eq!(tree_revision.index as usize, announced.len() + 1);
+                    let revision = tree_revision.revision.expect("the announced revision");
+                    announced.push(Hash::from(revision.signature.as_ref()));
+                }
+                Payload::Node(node) => {
+                    assert!(node.last_revision_index as usize <= announced.len());
+                    indices.push(node.last_revision_index);
+                }
+                Payload::Header(_) => panic!("a header from emission"),
+                Payload::Partition(_) => panic!("a partition without a span"),
+            }
+        }
+        (announced, indices)
+    }
+
+    /// Each revision is loaded once, in the order entries first name it, and announced before the
+    /// first entry naming it, numbered in that order whatever its place in the walk's table. An
+    /// unattributed entry loads nothing.
+    #[tokio::test]
+    async fn each_revision_is_loaded_once_and_announced_before_its_first_entry() {
+        with_repository(async |repository| {
+            let revisions = revisions(&repository, &[0x11, 0x22]);
+            let paths = [
+                entry("a.txt", 2),
+                entry("b.txt", 1),
+                entry("c.txt", 2),
+                entry("d.txt", 0),
+            ];
+            let mut report = AttributionReport::default();
+            let (sent, loaded) = emit(&repository, &paths, &revisions, record, &mut report).await;
+
+            let (first, second) = (Hash::from_u64(0x22), Hash::from_u64(0x11));
+            assert_eq!(loaded, [first, second]);
+            assert_eq!(read(sent), (vec![first, second], vec![1, 2, 1, 0]));
+            assert_eq!(report.failures.count, 0);
+        })
+        .await;
+    }
+
+    /// A revision that fails to load is loaded once, announced never, and leaves the entries
+    /// naming it unattributed. The next revision takes the next index, and the failure is
+    /// counted.
+    #[tokio::test]
+    async fn a_revision_that_fails_to_load_leaves_its_entries_unattributed() {
+        with_repository(async |repository| {
+            let revisions = revisions(&repository, &[0xbad, 0x22]);
+            let paths = [entry("a.txt", 1), entry("b.txt", 2), entry("c.txt", 1)];
+            let mut report = AttributionReport::default();
+            let outcome = |revision: &AttributedRevision| {
+                if revision.revision == Hash::from_u64(0xbad) {
+                    Err(StateError::from(NodeNotFound))
+                } else {
+                    record(revision)
+                }
+            };
+            let (sent, loaded) = emit(&repository, &paths, &revisions, outcome, &mut report).await;
+
+            assert_eq!(loaded, [Hash::from_u64(0xbad), Hash::from_u64(0x22)]);
+            assert_eq!(read(sent), (vec![Hash::from_u64(0x22)], vec![0, 1, 0]));
+            assert_eq!(report.failures.count, 1);
+            assert!(report.failures.error.is_some());
+        })
+        .await;
+    }
+
+    /// A load refused as `SlowDown` ends the stream with `RESOURCE_EXHAUSTED`, after what was
+    /// sent before it, and is not counted as a failure.
+    #[tokio::test]
+    async fn a_load_refused_as_slow_down_ends_the_stream() {
+        with_repository(async |repository| {
+            let revisions = revisions(&repository, &[0x11, 0x22]);
+            let paths = [entry("a.txt", 1), entry("b.txt", 2), entry("c.txt", 1)];
+            let mut report = AttributionReport::default();
+            let outcome = |revision: &AttributedRevision| {
+                if revision.revision == Hash::from_u64(0x22) {
+                    Err(StateError::from(SlowDown))
+                } else {
+                    record(revision)
+                }
+            };
+            let (mut sent, _) = emit(&repository, &paths, &revisions, outcome, &mut report).await;
+
+            let refusal = sent.pop().expect("the refusal").expect_err("an error");
+            assert_eq!(refusal.code(), tonic::Code::ResourceExhausted);
+            assert_eq!(read(sent), (vec![Hash::from_u64(0x11)], vec![1]));
+            assert_eq!(report.failures.count, 0);
+        })
+        .await;
+    }
+
+    /// A revision whose metadata names no branch is announced, and counted.
+    #[tokio::test]
+    async fn a_revision_naming_no_branch_is_announced_and_counted() {
+        with_repository(async |repository| {
+            let revisions = revisions(&repository, &[0x11]);
+            let paths = [entry("a.txt", 1)];
+            let mut report = AttributionReport::default();
+            let outcome = |revision: &AttributedRevision| {
+                record(revision).map(|(revision, _)| (revision, true))
+            };
+            let (sent, _) = emit(&repository, &paths, &revisions, outcome, &mut report).await;
+
+            assert_eq!(read(sent), (vec![Hash::from_u64(0x11)], vec![1]));
+            assert_eq!(report.missing_branches, 1);
+            assert_eq!(report.failures.count, 0);
+        })
+        .await;
+    }
+
+    /// A stream loads at most `REVISION_PREFETCH` revisions ahead of what it has sent.
+    #[tokio::test]
+    async fn a_stream_loads_at_most_the_prefetch_ahead() {
+        with_repository(async |repository| {
+            let count = REVISION_PREFETCH as u64 * 3;
+            let signatures: Vec<u64> = (1..=count).collect();
+            let revisions = revisions(&repository, &signatures);
+            let paths: Vec<TreePath> = (1..=count as u32)
+                .map(|slot| entry(&format!("{slot}.txt"), slot))
+                .collect();
+            let (tx, mut rx) = mpsc::channel(1);
+            let mut report = AttributionReport::default();
+            let loads = std::sync::atomic::AtomicUsize::new(0);
+            let mut emission = pin!(emit_tree_stream(
+                &paths,
+                &[],
+                &revisions,
+                repository.id,
+                |revision| {
+                    loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    std::future::ready(record(revision))
+                },
+                tx,
+                &mut report,
+            ));
+
+            assert!(futures::poll!(emission.as_mut()).is_pending());
+            assert_eq!(
+                loads.load(std::sync::atomic::Ordering::Relaxed),
+                REVISION_PREFETCH
+            );
+
+            let mut sent = Vec::new();
+            let ((), ()) = tokio::join!(emission, async {
+                while let Some(item) = rx.recv().await {
+                    sent.push(item.map(|response| response.payload.expect("a payload")));
+                }
+            });
+            assert_eq!(
+                loads.load(std::sync::atomic::Ordering::Relaxed),
+                count as usize
+            );
+            let (announced, indices) = read(sent);
+            assert_eq!(announced.len(), count as usize);
+            assert_eq!(indices, (1..=count as u32).collect::<Vec<_>>());
+        })
+        .await;
+    }
+
+    /// Each repository other than the requested one is announced once, before the first entry in
+    /// it, numbered from 1 in that order, and each entry carries the index of the repository its
+    /// span places it in, 0 for the requested one, which is never announced.
+    #[tokio::test]
+    async fn each_linked_repository_is_announced_once_before_its_first_entry() {
+        with_repository(async |repository| {
+            let (outer, inner) = (random::<RepositoryId>(), random::<RepositoryId>());
+            let paths = [
+                entry("a.txt", 0),
+                entry("l/b.txt", 0),
+                entry("l/m/c.txt", 0),
+                entry("l/d.txt", 0),
+                entry("e.txt", 0),
+                entry("k/f.txt", 0),
+            ];
+            let span = |first, repository| RepositorySpan { first, repository };
+            let spans = [
+                span(1, outer),
+                span(2, inner),
+                span(3, outer),
+                span(4, repository.id),
+                span(5, inner),
+                span(6, repository.id),
+            ];
+            let (tx, mut rx) = mpsc::channel(1024);
+            let mut report = AttributionReport::default();
+            emit_tree_stream(
+                &paths,
+                &spans,
+                &[],
+                repository.id,
+                |revision: &AttributedRevision| std::future::ready(record(revision)),
+                tx,
+                &mut report,
+            )
+            .await;
+
+            let mut sent = Vec::new();
+            while let Some(item) = rx.recv().await {
+                sent.push(match item.expect("a stream item").payload {
+                    Some(Payload::Partition(partition)) => (
+                        format!("partition {}", partition.index),
+                        RepositoryId::from(partition.link_partition.as_ref()),
+                    ),
+                    Some(Payload::Node(node)) => (
+                        format!("{} in {}", node.path, node.link_repository_index),
+                        RepositoryId::default(),
+                    ),
+                    payload => panic!("{payload:?} from a walk with no revisions"),
+                });
+            }
+            let none = RepositoryId::default();
+            let expected = [
+                ("a.txt in 0", none),
+                ("partition 1", outer),
+                ("l/b.txt in 1", none),
+                ("partition 2", inner),
+                ("l/m/c.txt in 2", none),
+                ("l/d.txt in 1", none),
+                ("e.txt in 0", none),
+                ("k/f.txt in 2", none),
+            ]
+            .map(|(item, repository)| (item.to_string(), repository));
+            assert_eq!(sent, expected);
+        })
+        .await;
+    }
+
+    /// A link carries the index of the repository it links, announced before it. A revision is
+    /// announced with the index of the repository the entry naming it is placed in: for a link,
+    /// the repository holding it.
+    #[tokio::test]
+    async fn a_link_names_its_target_and_a_revision_its_repository() {
+        with_repository(async |repository| {
+            let linked = repository.to_link_context(random::<RepositoryId>()).await;
+            let revisions = [revisions(&repository, &[0x11]), revisions(&linked, &[0x22])].concat();
+            let link = TreePath {
+                flags: NodeFlags::Link,
+                address: Some(lore_base::types::Address {
+                    hash: Hash::from_u64(0x22),
+                    context: linked.id.into(),
+                }),
+                ..entry("l", 1)
+            };
+            let paths = [link, entry("l/a.txt", 2)];
+            let spans = [RepositorySpan {
+                first: 1,
+                repository: linked.id,
+            }];
+            let (tx, mut rx) = mpsc::channel(1024);
+            let mut report = AttributionReport::default();
+            emit_tree_stream(
+                &paths,
+                &spans,
+                &revisions,
+                repository.id,
+                |revision| std::future::ready(record(revision)),
+                tx,
+                &mut report,
+            )
+            .await;
+
+            let mut sent = Vec::new();
+            while let Some(item) = rx.recv().await {
+                sent.push(match item.expect("a stream item").payload {
+                    Some(Payload::Partition(partition)) => format!(
+                        "partition {} {}",
+                        partition.index,
+                        RepositoryId::from(partition.link_partition.as_ref()) == linked.id
+                    ),
+                    Some(Payload::Revision(revision)) => format!(
+                        "revision {} in {}",
+                        revision.index, revision.link_repository_index
+                    ),
+                    Some(Payload::Node(node)) => format!(
+                        "{} in {} named {}",
+                        node.path, node.link_repository_index, node.last_revision_index
+                    ),
+                    payload => panic!("{payload:?} from emission"),
+                });
+            }
+            assert_eq!(
+                sent,
+                [
+                    "partition 1 true",
+                    "revision 1 in 0",
+                    "l in 1 named 1",
+                    "revision 2 in 1",
+                    "l/a.txt in 1 named 2",
+                ]
+            );
+        })
+        .await;
+    }
+}
+
+/// `load_attributed_revision` reads the record of a pushed revision, with the identifier that
+/// names its branch, and fails for an unknown revision.
+#[tokio::test]
+async fn load_attributed_revision_reads_the_revision_record() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            repository,
+        ));
+        let (branch, signatures) =
+            push_branch_with_revisions(&repository_context, &[&["a.txt"], &["b.txt"]]).await;
+        let attributed = |revision| lore_revision::state::AttributedRevision {
+            repository: repository_context.clone(),
+            revision,
+        };
+
+        let (revision, branch_missing) = load_attributed_revision(&attributed(signatures[1]))
+            .await
+            .expect("a pushed revision loads");
+        assert!(!branch_missing);
+        assert_eq!(Hash::from(revision.signature.as_ref()), signatures[1]);
+        let identifier = revision.identifier.expect("the identifier");
+        assert_eq!(identifier.number, 2);
+        assert_eq!(identifier.branch_id, Into::<bytes::Bytes>::into(branch));
+        assert_eq!(revision.number, 2);
+
+        let unknown = load_attributed_revision(&attributed(Hash::from_u64(0xdead)))
+            .await
+            .expect_err("an unknown revision fails");
+        assert!(!unknown.is_slow_down());
     }))
     .await;
 }

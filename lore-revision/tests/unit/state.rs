@@ -440,11 +440,12 @@ async fn a_block_added_after_a_serialize_reads_the_serialized_file_metadata_list
     );
 }
 
-/// A store that holds every get of the hashes it is told to hold until released, and counts
-/// every get.
-struct HoldingStore {
+/// A store that holds every get of the hashes it is told to hold until released, answers every get
+/// of the hashes it is told to refuse as missing, and counts every get.
+pub(crate) struct HoldingStore {
     inner: Arc<dyn lore_storage::ImmutableStore>,
     held: std::sync::Mutex<Vec<Hash>>,
+    refused: std::sync::Mutex<Vec<Hash>>,
     released: tokio::sync::Notify,
     gets: std::sync::atomic::AtomicUsize,
 }
@@ -453,12 +454,7 @@ struct HoldingStore {
 async fn holding_repository(
     backing: &Arc<RepositoryContext>,
 ) -> (Arc<HoldingStore>, Arc<RepositoryContext>) {
-    let store = Arc::new(HoldingStore {
-        inner: backing.immutable_store(),
-        held: std::sync::Mutex::new(Vec::new()),
-        released: tokio::sync::Notify::new(),
-        gets: std::sync::atomic::AtomicUsize::new(0),
-    });
+    let store = HoldingStore::over(backing.immutable_store());
     let mutable = lore_storage::local::mutable_store::create(
         None::<&str>,
         lore_storage::MutableStoreSettings::default(),
@@ -471,6 +467,22 @@ async fn holding_repository(
 }
 
 impl HoldingStore {
+    /// A store over `inner`, holding and refusing nothing yet.
+    pub(crate) fn over(inner: Arc<dyn lore_storage::ImmutableStore>) -> Arc<Self> {
+        Arc::new(HoldingStore {
+            inner,
+            held: std::sync::Mutex::new(Vec::new()),
+            refused: std::sync::Mutex::new(Vec::new()),
+            released: tokio::sync::Notify::new(),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Answers every later get of `hash` as missing.
+    pub(crate) fn refuse(&self, hash: Hash) {
+        self.refused.lock().expect("refused hashes").push(hash);
+    }
+
     fn gets(&self) -> usize {
         self.gets.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -510,6 +522,14 @@ impl lore_storage::ImmutableStore for HoldingStore {
         address: Address,
     ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .refused
+            .lock()
+            .expect("refused hashes")
+            .contains(&address.hash)
+        {
+            return Err(lore_storage::StoreError::from(lore_base::error::NotFound));
+        }
         self.wait_while_held(&address.hash).await;
         self.inner.clone().get(partition, address).await
     }

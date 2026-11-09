@@ -120,15 +120,20 @@ message RevisionTreeRequest {
     // Signature-based lookup.
     bytes signature = 2;
   }
-  // If set and non-empty, only entries at or under this path are
-  // emitted. The prefix itself is emitted as a DIRECTORY node when
-  // it exists. If unset or empty, the walk covers the full tree from
-  // the repository root.
+  // If set and non-empty, only entries under this path are emitted, not
+  // the entry at the path itself. If unset or empty, the walk covers the
+  // full tree from the repository root.
   optional string path_prefix = 3;
   // If set, limits the depth of descent below the prefix root. 1
   // emits only direct children of the prefix root; 2 emits direct
   // children plus grandchildren; etc. 0 or unset means unbounded.
   optional uint32 max_depth = 4;
+  // If true, populate `TreeNode.last_revision_index` and emit the revisions
+  // it names as `TreeRevision` payloads. Off by default. Attribution reads the
+  // delta block of each walked revision and the file metadata blocks of its
+  // entries, and loads each distinct revision an entry names once. The
+  // header's `last_revision_included` reports whether the server attributes.
+  bool include_last_revision = 5;
 }
 
 // Header for a RevisionTree stream. Echoes the resolved revision so
@@ -139,16 +144,45 @@ message RevisionTreeHeader {
   lore.model.v1.RevisionIdentifier identifier = 1;
   // Resolved signature of the revision being walked.
   bytes signature = 2;
+  // True when the stream attributes its entries, as
+  // `RevisionTreeRequest.include_last_revision` asks. A server without
+  // attribution leaves it false.
+  bool last_revision_included = 3;
+}
+
+// A revision named by TreeNode.last_revision_index. Emitted once per
+// revision, in discovery order from index 1, and always before the first
+// TreeNode naming it.
+message TreeRevision {
+  // Per-stream index, assigned in discovery order.
+  uint32 index = 1;
+  // Carries only attribution-facing fields: `signature`, `identifier`,
+  // `number`, `commit_message`, `timestamp` and `committed_by`. Call
+  // RevisionInfo for the full record. `identifier.branch_id` is zero for a
+  // revision whose metadata names no branch.
+  Revision revision = 2;
+  // Index into the per-stream partition table built from `DiffPartition`
+  // payloads: the partition the revision is in. 0 = the request's
+  // repository (the parent partition, never announced). A non-zero value
+  // is preceded on the same stream by the `DiffPartition` whose `index`
+  // matches.
+  uint32 link_repository_index = 3;
 }
 
 // Server-streamed response for RevisionTree. First message carries
 // `payload.header`; subsequent messages stream `TreeNode` items in
-// server-natural order.
+// server-natural order, interleaved with `DiffPartition` payloads as the
+// walk meets linked repositories, and with `TreeRevision` payloads when
+// attribution is requested.
 message RevisionTreeResponse {
   oneof payload {
     // Header echoing the resolved revision.
     RevisionTreeHeader header = 1;
     // A tree entry (directory, file, or link).
     TreeNode node = 2;
+    // A revision named by a later TreeNode.
+    TreeRevision revision = 3;
+    // A linked-repository announcement.
+    DiffPartition partition = 4;
   }
 }

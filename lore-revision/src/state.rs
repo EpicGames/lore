@@ -163,6 +163,7 @@ use crate::node::NodeBlockData;
 use crate::node::NodeBlockDataV0;
 use crate::node::NodeDelta;
 use crate::node::NodeExtFlags;
+use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFileMetadataBlockData;
 use crate::node::NodeFlags;
@@ -172,6 +173,7 @@ use crate::node::NodeLink;
 use crate::node::NodeNameLock;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
+use crate::node::node_to_file_metadata;
 use crate::repository::DOT_LORE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -1557,6 +1559,12 @@ fn set_block_bit(bits: &mut Vec<u64>, index: usize) {
         bits.resize(word + 1, 0);
     }
     bits[word] |= 1 << (index % 64);
+}
+
+/// Whether block `index`'s bit is set in `bits`.
+fn block_bit(bits: &[u64], index: usize) -> bool {
+    bits.get(index / 64)
+        .is_some_and(|word| word & (1 << (index % 64)) != 0)
 }
 
 /// How wide a directory the child collection sizes for once it knows there is a child.
@@ -6444,6 +6452,253 @@ pub struct TreePath {
     /// True when a link node tracks its parent's branch; false for pinned
     /// links and all non-link nodes.
     pub tracking: bool,
+    /// The revision that last changed this entry, as an index from 1 into
+    /// [`TreeWalk::revisions`]; 0 when the walk does not attribute, the entry has no history, or a
+    /// read for its attribution failed.
+    pub last_revision: u32,
+}
+
+/// A revision a walk attributes entries to, and the context of the repository it is in: for an
+/// entry under a link, the context the walk read the linked repository with.
+#[derive(Clone)]
+pub struct AttributedRevision {
+    pub repository: Arc<RepositoryContext>,
+    pub revision: Hash,
+}
+
+/// Attribution reads that failed, each leaving entries unattributed, and the first of them.
+#[derive(Default)]
+pub struct AttributionFailures {
+    pub count: u32,
+    pub error: Option<StateError>,
+}
+
+impl AttributionFailures {
+    /// Counts a read that failed, keeping the first error.
+    pub fn failed(&mut self, err: StateError) {
+        self.count = self.count.saturating_add(1);
+        if self.error.is_none() {
+            self.error = Some(err);
+        }
+    }
+
+    /// Counts the attribution read that failed with `err`, unless it was refused as `SlowDown`,
+    /// which it returns, to fail the walk.
+    fn failed_unless_refused(&mut self, err: StateError) -> Result<(), StateError> {
+        if err.is_slow_down() {
+            return Err(err);
+        }
+        self.failed(err);
+        Ok(())
+    }
+}
+
+/// Where the entries a walk lists from one repository begin: from entry `first` of
+/// [`TreeWalk::paths`] on, up to the next span, the entries are in `repository`.
+pub struct RepositorySpan {
+    pub first: usize,
+    pub repository: RepositoryId,
+}
+
+/// The entries of a tree walk, the repositories they are in, and with attribution the revisions
+/// they name and what attribution could not read.
+#[derive(Default)]
+pub struct TreeWalk {
+    pub paths: Vec<TreePath>,
+    /// Where the walk enters and leaves each linked repository, in entry order. The entries before
+    /// the first span are in the repository the walk was asked for.
+    pub repository_spans: Vec<RepositorySpan>,
+    /// The revisions entries were attributed to, each once. An entry the walked revision changed, or
+    /// a failed read, can leave one named by no entry.
+    pub revisions: Vec<AttributedRevision>,
+    pub attribution_failures: AttributionFailures,
+    /// The index of each revision in `revisions`, by repository and revision, while the walk runs.
+    indices: HashMap<(RepositoryId, Hash), u32>,
+}
+
+impl TreeWalk {
+    /// Notes that the entries listed from here on are in `repository`.
+    fn enter_repository(&mut self, repository: RepositoryId) {
+        self.repository_spans.push(RepositorySpan {
+            first: self.paths.len(),
+            repository,
+        });
+    }
+
+    /// The index of `revision` of `repository` in `revisions`, from 1, added on first sight. 0,
+    /// leaving the entry unattributed, once the indices reach `u32::MAX`.
+    fn intern(&mut self, repository: &Arc<RepositoryContext>, revision: Hash) -> u32 {
+        let key = (repository.id, revision);
+        if let Some(&index) = self.indices.get(&key) {
+            return index;
+        }
+        let Some(index) = u32::try_from(self.revisions.len() + 1)
+            .ok()
+            .filter(|index| *index < u32::MAX)
+        else {
+            return 0;
+        };
+        self.revisions.push(AttributedRevision {
+            repository: repository.clone(),
+            revision,
+        });
+        self.indices.insert(key, index);
+        index
+    }
+}
+
+/// Attributes the entries a walk lists from one state against that state. A linked subtree is
+/// attributed by one of its own.
+struct TreeAttribution {
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    /// The file-metadata block read last, and its index.
+    block: Option<(usize, Arc<NodeFileMetadataBlock>)>,
+    /// The file-metadata blocks that failed to read, a bit per block index.
+    failed_blocks: Vec<u64>,
+    /// Each entry listed from the state: its index in [`TreeWalk::paths`], and its node.
+    listed: Vec<(u32, NodeID)>,
+}
+
+impl TreeAttribution {
+    fn new(state: Arc<State>, repository: Arc<RepositoryContext>) -> Self {
+        Self {
+            state,
+            repository,
+            block: None,
+            failed_blocks: Vec::new(),
+            listed: Vec::new(),
+        }
+    }
+
+    /// Attributes `node`, listed as entry `entry` of `walk`, to the revision its file history
+    /// records as its last change; [`Self::finish`] attributes the entries the walked revision
+    /// changed to it. A read that fails leaves the entry unattributed, as does an index past
+    /// `u32::MAX`. A read refused as `SlowDown` fails the walk.
+    async fn attribute(
+        &mut self,
+        node: NodeID,
+        entry: usize,
+        walk: &mut TreeWalk,
+    ) -> Result<u32, StateError> {
+        let Ok(entry) = u32::try_from(entry) else {
+            return Ok(0);
+        };
+        self.listed.push((entry, node));
+        match self.recorded_revision(node).await {
+            Ok(revision) if revision.is_zero() => Ok(0),
+            Ok(revision) => Ok(walk.intern(&self.repository, revision)),
+            Err(err) => walk
+                .attribution_failures
+                .failed_unless_refused(err)
+                .map(|()| 0),
+        }
+    }
+
+    /// The revision `node`'s file history records as its last change, as the first entry `lore
+    /// file history` reports after the walked revision: slot 0, or slot 1 where slot 0 is zero.
+    /// Zero for a node with no history.
+    ///
+    /// Reads the metadata with [`State::try_block_file_metadata_existing`], which answers `None`
+    /// for a block the tree does not store, and keeps each block it reads from the store resident
+    /// in the State, up to `MAX_CHECKED_FILE_METADATA_BLOCKS` of them, about 4 MiB: the bound of
+    /// what attribution holds per walked State. A block that failed to read is noted, so the other
+    /// entries in it answer zero without a read.
+    async fn recorded_revision(&mut self, node: NodeID) -> Result<Hash, StateError> {
+        let metadata_node = node_to_file_metadata(node);
+        let block_index = NodeFileMetadataBlock::index(metadata_node);
+        let block = match &self.block {
+            Some((read, block)) if *read == block_index => block,
+            _ => {
+                if block_bit(&self.failed_blocks, block_index) {
+                    return Ok(Hash::default());
+                }
+                match self
+                    .state
+                    .try_block_file_metadata_existing(self.repository.clone(), block_index)
+                    .await
+                {
+                    Ok(None) => return Ok(Hash::default()),
+                    Ok(Some(block)) => &self.block.insert((block_index, block)).1,
+                    Err(err) => {
+                        set_block_bit(&mut self.failed_blocks, block_index);
+                        return Err(err);
+                    }
+                }
+            }
+        };
+        let reader = block.read();
+        let record = reader.node(NodeFileMetadata::index(metadata_node));
+        Ok(record.revision[record.history_slot()])
+    }
+
+    /// Attributes each listed entry the walked revision changed to it, merges included, so a merge
+    /// stands for what it merged in. Matches the walked revision's delta against a set built from
+    /// the smaller of the two: the listed entries, or the delta. A delta that fails to read leaves
+    /// every listed entry unattributed, as which of them it changed is unknown. A read refused as
+    /// `SlowDown` fails the walk.
+    async fn finish(self, walk: &mut TreeWalk) -> Result<(), StateError> {
+        if self.listed.is_empty() {
+            return Ok(());
+        }
+        let changes = match self.state.tree(self.repository.clone()).await {
+            Ok(tree) => tree.delta_count as usize,
+            Err(err) => {
+                self.clear(walk);
+                return walk.attribution_failures.failed_unless_refused(err);
+            }
+        };
+        if changes == 0 {
+            return Ok(());
+        }
+        let delta = match self.state.delta_block(self.repository.clone()).await {
+            Ok(delta) => delta.to_aligned::<NodeDelta>(),
+            Err(err) => {
+                self.clear(walk);
+                return walk.attribution_failures.failed_unless_refused(err);
+            }
+        };
+        let deltas = delta.as_type_slice::<NodeDelta>();
+        let walked = self.state.revision();
+        let mut index = 0;
+        let mut attribute = |walk: &mut TreeWalk, entry: u32| {
+            if index == 0 {
+                index = walk.intern(&self.repository, walked);
+            }
+            if let Some(path) = walk.paths.get_mut(entry as usize) {
+                path.last_revision = index;
+            }
+        };
+        if self.listed.len() <= changes {
+            let listed: HashMap<NodeID, u32> = self
+                .listed
+                .iter()
+                .map(|&(entry, node)| (node, entry))
+                .collect();
+            for delta in deltas {
+                if let Some(&entry) = listed.get(&delta.node) {
+                    attribute(walk, entry);
+                }
+            }
+        } else {
+            let changed: HashSet<NodeID> = deltas.iter().map(|delta| delta.node).collect();
+            for &(entry, node) in &self.listed {
+                if changed.contains(&node) {
+                    attribute(walk, entry);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Leaves every listed entry unattributed.
+    fn clear(&self, walk: &mut TreeWalk) {
+        for &(entry, _) in &self.listed {
+            if let Some(path) = walk.paths.get_mut(entry as usize) {
+                path.last_revision = 0;
+            }
+        }
+    }
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -6456,15 +6711,19 @@ pub fn allow_all_repositories() -> CanReadRepository {
 /// both unbounded link chains and link cycles so a walk terminates.
 pub const MAX_LINK_DEPTH: usize = 8;
 
+/// The entries of the tree of `state` below `path`, `max_depth` levels deep or all of them for 0,
+/// descending the links `can_read` admits. With `include_last_revision`, each entry is attributed
+/// to the revision that last changed it.
 pub async fn gather_tree_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     path: RelativePath,
     max_depth: usize,
     can_read: CanReadRepository,
-) -> Result<Vec<TreePath>, StateError> {
-    let (walk_state, walk_repository, parent_node_id) = if path.is_empty() {
-        (state, repository, ROOT_NODE)
+    include_last_revision: bool,
+) -> Result<TreeWalk, StateError> {
+    let (walk_state, walk_repository, parent_node_id, starts_linked) = if path.is_empty() {
+        (state, repository, ROOT_NODE, false)
     } else {
         let node_link = state
             .find_node_link(repository.clone(), path.as_str())
@@ -6480,15 +6739,19 @@ pub async fn gather_tree_paths(
             return Err(NodeNotFound.into());
         }
         if node_link.revision == state.revision() {
-            (state, repository, node_link.node)
+            (state, repository, node_link.node, false)
         } else {
+            let starts_linked = node_link.repository != repository.id;
             let linked_repo = repository.to_link_context(node_link.repository).await;
             let linked_state = State::deserialize(linked_repo.clone(), node_link.revision).await?;
-            (linked_state, linked_repo, node_link.node)
+            (linked_state, linked_repo, node_link.node, starts_linked)
         }
     };
 
-    let mut paths: Vec<TreePath> = Vec::new();
+    let mut walk = TreeWalk::default();
+    if starts_linked {
+        walk.enter_repository(walk_repository.id);
+    }
     enumerate_children(
         walk_state,
         walk_repository,
@@ -6498,12 +6761,24 @@ pub async fn gather_tree_paths(
         max_depth,
         0,
         can_read,
-        &mut paths,
+        &mut walk,
+        include_last_revision,
     )
     .await?;
-    Ok(paths)
+    walk.indices = HashMap::new();
+    Ok(walk)
 }
 
+/// Walks the children of directory `parent_node_id` of `state` into `walk`. With
+/// `include_last_revision`, attributes each entry against `state`, as a linked subtree is
+/// attributed against its own. A walk that fails part-way leaves the entries it listed from
+/// `state` unattributed.
+///
+/// The attribution state and its pass over the walked revision's delta are a cold path, run once
+/// per walked state and only when attribution is asked for, so they are boxed. Inline, they would
+/// grow the future of every entry by their own size, attribution or not, since an entry that is a
+/// link walks its subtree through this function.
+#[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 async fn enumerate_children(
     state: Arc<State>,
@@ -6514,7 +6789,8 @@ async fn enumerate_children(
     max_depth: usize,
     link_depth: usize,
     can_read: CanReadRepository,
-    result: &mut Vec<TreePath>,
+    walk: &mut TreeWalk,
+    include_last_revision: bool,
 ) -> Result<(), StateError> {
     let block_index = NodeBlock::index(parent_node_id);
     let node_index = Node::index(parent_node_id);
@@ -6526,8 +6802,10 @@ async fn enumerate_children(
         }
         .into());
     }
+    let mut attribution = include_last_revision
+        .then(|| Box::new(TreeAttribution::new(state.clone(), repository.clone())));
     let mut cycle = SiblingCycleGuard::new(parent_node_id);
-    gather_tree_paths_node_recurse(
+    let listed = gather_tree_paths_node_recurse(
         state,
         repository,
         parent.child(),
@@ -6537,19 +6815,34 @@ async fn enumerate_children(
         max_depth,
         link_depth,
         can_read,
-        result,
+        walk,
         &mut cycle,
+        attribution.as_deref_mut(),
     )
-    .await
+    .await;
+    let Some(attribution) = attribution else {
+        return listed;
+    };
+    if let Err(err) = listed {
+        attribution.clear(walk);
+        return Err(err);
+    }
+    Box::pin((*attribution).finish(walk)).await
 }
 
-fn log_linked_subtree_failure(
+/// Skips the linked subtree at `revision` of `repository` that failed with `err`: logs the failure,
+/// at debug level for what is not found, and counts it in `failures` where given. A read refused
+/// as `SlowDown` is returned instead, to fail the walk.
+#[lore_macro::test_pub]
+fn skip_linked_subtree(
     prefix: &str,
     repository: RepositoryId,
     revision: Hash,
-    err: &StateError,
-) {
+    err: StateError,
+    failures: Option<&mut AttributionFailures>,
+) -> Result<(), StateError> {
     match err {
+        StateErrors::SlowDown(_) => return Err(err),
         StateErrors::NotFound(_)
         | StateErrors::NodeNotFound(_)
         | StateErrors::LinkNotFound(_)
@@ -6561,6 +6854,10 @@ fn log_linked_subtree_failure(
             lore_warn!("{prefix} at {repository} @ {revision}: {err}");
         }
     }
+    if let Some(failures) = failures {
+        failures.failed(err);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6574,8 +6871,9 @@ async fn gather_tree_paths_node(
     max_depth: usize,
     link_depth: usize,
     can_read: CanReadRepository,
-    result: &mut Vec<TreePath>,
+    walk: &mut TreeWalk,
     cycle: &mut SiblingCycleGuard,
+    mut attribution: Option<&mut TreeAttribution>,
 ) -> Result<Option<NodeID>, StateError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -6613,20 +6911,33 @@ async fn gather_tree_paths_node(
     // An unresolvable link reference falls back to pinned.
     let tracking = if node.is_link() {
         let link = node.linked_node();
-        state
+        match state
             .link_find(repository.clone(), link.repository, node_id)
             .await
-            .is_ok_and(|link_ref| link_ref.is_tracking())
+        {
+            Ok(link_ref) => link_ref.is_tracking(),
+            Err(err) if err.is_slow_down() => return Err(err),
+            Err(_) => false,
+        }
     } else {
         false
     };
-    result.push(TreePath {
+    let last_revision = match attribution.as_deref_mut() {
+        Some(attribution) => {
+            attribution
+                .attribute(node_id, walk.paths.len(), walk)
+                .await?
+        }
+        None => 0,
+    };
+    walk.paths.push(TreePath {
         path: node_path.clone(),
         address,
         flags,
         size: node.size,
         mode: node.mode as u64,
         tracking,
+        last_revision,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;
@@ -6642,8 +6953,9 @@ async fn gather_tree_paths_node(
             max_depth,
             link_depth,
             can_read,
-            result,
+            walk,
             &mut child_cycle,
+            attribution,
         )
         .await?;
     } else if node.is_link() && depth_remaining && link_depth < MAX_LINK_DEPTH {
@@ -6657,7 +6969,8 @@ async fn gather_tree_paths_node(
             let linked_repo = repository.to_link_context(link.repository).await;
             match State::deserialize(linked_repo.clone(), link.revision).await {
                 Ok(linked_state) => {
-                    if let Err(err) = enumerate_children(
+                    walk.enter_repository(link.repository);
+                    let listed = enumerate_children(
                         linked_state,
                         linked_repo,
                         link.node,
@@ -6666,26 +6979,30 @@ async fn gather_tree_paths_node(
                         max_depth,
                         link_depth + 1,
                         can_read,
-                        result,
+                        walk,
+                        attribution.is_some(),
                     )
-                    .await
-                    {
-                        log_linked_subtree_failure(
+                    .await;
+                    walk.enter_repository(repository.id);
+                    if let Err(err) = listed {
+                        skip_linked_subtree(
                             "Aborting linked subtree",
                             link.repository,
                             link.revision,
-                            &err,
-                        );
+                            err,
+                            attribution
+                                .is_some()
+                                .then_some(&mut walk.attribution_failures),
+                        )?;
                     }
                 }
-                Err(err) => {
-                    log_linked_subtree_failure(
-                        "Skipping linked subtree: cannot load state",
-                        link.repository,
-                        link.revision,
-                        &err,
-                    );
-                }
+                Err(err) => skip_linked_subtree(
+                    "Skipping linked subtree: cannot load state",
+                    link.repository,
+                    link.revision,
+                    err,
+                    None,
+                )?,
             }
         }
     }
@@ -6704,8 +7021,9 @@ fn gather_tree_paths_node_recurse<'a>(
     max_depth: usize,
     link_depth: usize,
     can_read: CanReadRepository,
-    result: &'a mut Vec<TreePath>,
+    walk: &'a mut TreeWalk,
     cycle: &'a mut SiblingCycleGuard,
+    mut attribution: Option<&'a mut TreeAttribution>,
 ) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send + 'a>> {
     Box::pin(async move {
         let mut next = first_child;
@@ -6720,8 +7038,9 @@ fn gather_tree_paths_node_recurse<'a>(
                 max_depth,
                 link_depth,
                 can_read.clone(),
-                result,
+                walk,
                 cycle,
+                attribution.as_deref_mut(),
             )
             .await?;
         }
@@ -10563,6 +10882,11 @@ pub mod test_util {
     use super::*;
 
     impl State {
+        /// The hash of the link list the State was serialized with. For tests.
+        pub fn link_list_hash(&self) -> Hash {
+            self.data_read().hash_link
+        }
+
         /// Drops the State's own hold on the blocks it keeps in memory for reuse: its block cache
         /// and the file metadata blocks kept for checks and attaches. A block nothing else holds
         /// leaves memory, to be loaded again when next asked for. Dirty blocks stay registered for
@@ -10644,10 +10968,7 @@ pub mod test_util {
         /// Whether node block `index` is noted for the next sweep ([`StateRuntime::unswept`]),
         /// which scans a noted block in memory whose flag is set (C15). For tests.
         pub fn block_noted_unswept(&self, index: usize) -> bool {
-            self.runtime_read()
-                .unswept
-                .get(index / 64)
-                .is_some_and(|word| word & (1 << (index % 64)) != 0)
+            super::block_bit(&self.runtime_read().unswept, index)
         }
 
         /// How many times node block `index` is registered for the next save, at most once.

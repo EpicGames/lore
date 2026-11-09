@@ -270,3 +270,56 @@ fn pin_change_tracking_mirrors_to_side() {
     change.tracking_to = true;
     assert!(link_pin_change_to_diff_change(&change, 0).tracking);
 }
+
+/// `revision_record` takes the commit message, timestamp and committer from the metadata, leaves a
+/// text field that is not valid UTF-8 empty and a timestamp of another size zero, and passes every
+/// other entry on.
+#[test]
+fn revision_record_reads_the_common_fields() {
+    use lore_revision::lore::BranchId;
+    use lore_revision::metadata;
+    use lore_revision::metadata::Metadata;
+
+    let branch = BranchId::from(uuid::Uuid::now_v7());
+    let mut stored = Metadata::new();
+    stored
+        .set_binary(metadata::MESSAGE, b"\xffnot text")
+        .expect("message");
+    stored.set_timestamp(1234).expect("timestamp");
+    stored
+        .set_string(metadata::COMMITTED_BY, "committer@example.com")
+        .expect("committer");
+    stored.set_string("custom", "value").expect("custom entry");
+    let mut other = Vec::new();
+    let revision = revision_record(Hash::from_u64(7), 3, branch, &stored, |key, _, _| {
+        other.push(key.to_string());
+    });
+    assert_eq!(revision.signature, bytes::Bytes::from(Hash::from_u64(7)));
+    assert_eq!(
+        revision.identifier,
+        Some(model_v1::RevisionIdentifier {
+            branch_id: branch.into(),
+            number: 3,
+        })
+    );
+    assert_eq!(revision.number, 3);
+    assert_eq!(revision.commit_message, "");
+    assert_eq!(revision.timestamp, 1234);
+    assert_eq!(revision.committed_by, "committer@example.com");
+    assert_eq!(other, ["custom"]);
+
+    let mut stored = Metadata::new();
+    stored
+        .set_string(metadata::MESSAGE, "text")
+        .expect("message");
+    stored
+        .set_binary(metadata::TIMESTAMP, &[1, 2, 3])
+        .expect("timestamp");
+    stored
+        .set_binary(metadata::COMMITTED_BY, b"\xfe")
+        .expect("committer");
+    let revision = revision_record(Hash::from_u64(7), 3, branch, &stored, |_, _, _| {});
+    assert_eq!(revision.commit_message, "text");
+    assert_eq!(revision.timestamp, 0);
+    assert_eq!(revision.committed_by, "");
+}

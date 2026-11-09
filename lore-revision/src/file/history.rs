@@ -627,11 +627,7 @@ pub async fn history(
                 node_id,
                 metadata_node
             );
-            let slot = if metadata_node.revision[0].is_zero() {
-                1
-            } else {
-                0
-            };
+            let slot = metadata_node.history_slot();
             (
                 metadata_node.action[slot],
                 metadata_node.revision[slot],

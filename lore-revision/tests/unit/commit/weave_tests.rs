@@ -7,8 +7,6 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
-use lore_revision::commit::BasedOn;
-use lore_revision::commit::weave_history;
 use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::Content;
@@ -22,7 +20,9 @@ use crate::helper::in_memory::branch_id;
 use crate::helper::in_memory::commit;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
+use crate::helper::in_memory::modify;
 use crate::helper::in_memory::revision_state;
+use crate::helper::in_memory::weave_as_divergent_merge;
 use crate::helper::test_store_create;
 
 /// The revision and the node in it that the first-parent history of `node_id` names.
@@ -41,23 +41,6 @@ async fn first_parent_history(
         .expect("reading the file metadata block");
     let history = block.node(NodeFileMetadata::index(metadata_node));
     (history.revision[0], history.node[0])
-}
-
-/// `merged`, woven again as the merge a sync stages for divergent history: the remote latest
-/// first, and the local latest, which the tree of `merged` was built from, second.
-async fn weave_as_divergent_merge(
-    repository: &Arc<RepositoryContext>,
-    merged: Hash,
-    remote_latest: Hash,
-    local_latest: Hash,
-) -> Arc<State> {
-    let state = revision_state(repository, merged).await;
-    state.set_parent_self(remote_latest);
-    state.set_parent_other(local_latest);
-    weave_history(repository.clone(), state.clone(), BasedOn::Other)
-        .await
-        .expect("weaving the merge history");
-    state
 }
 
 /// Both sides add a file after they diverge, and each takes the same node ID. The remote's add
@@ -409,33 +392,82 @@ async fn weaving_a_merge_of_divergent_history_carries_the_remote_history_before_
     .expect("Task failed");
 }
 
-/// Sets the content of file `node_id` of `state` to `address`, staged with `staged`.
-async fn modify(
-    state: &State,
-    repository: &Arc<RepositoryContext>,
-    node_id: NodeID,
-    address: Address,
-    staged: NodeFlags,
-) {
-    state
-        .node_rewrite(
-            repository,
-            node_id,
-            &Content {
-                mode: 0o644,
-                size: 11,
+/// Each revision committed on its first parent records, for every entry, the revision that last
+/// changed it before: a file its last change, a directory the last change below it, and the root
+/// nothing. Tree walk attribution reads this record.
+#[tokio::test]
+async fn weaving_a_revision_on_its_first_parent_records_the_last_change_of_each_entry() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+        let repository = in_memory::repository(immutable, mutable);
+        let main = branch_id();
+
+        let state = State::new();
+        let dir = add(&state, repository.clone(), ROOT_NODE, directory("a"), "a").await;
+        let touched = add(
+            &state,
+            repository.clone(),
+            dir,
+            file("touched.bin"),
+            "touched.bin",
+        )
+        .await;
+        let untouched = add(
+            &state,
+            repository.clone(),
+            dir,
+            file("untouched.bin"),
+            "untouched.bin",
+        )
+        .await;
+        let first = commit(&repository, &state, Hash::default(), main).await;
+
+        let change = async |parent: Hash, node_id: NodeID, content: u64| {
+            let state = revision_state(&repository, parent).await;
+            let address = Address {
+                hash: Hash::from_u64(content),
+                context: Context::default(),
+            };
+            modify(
+                &state,
+                &repository,
+                node_id,
                 address,
-            },
-            Rewrite::Plain,
-        )
-        .await
-        .expect("modifying the file");
-    state
-        .node_mark(
-            repository,
-            node_id,
-            Mark::staged_and_dirty(staged, NodeFlags::DirtyModify),
-        )
-        .await
-        .expect("staging the modification");
+                NodeFlags::StagedModify,
+            )
+            .await;
+            commit(&repository, &state, parent, main).await
+        };
+        let second = change(first, touched, 0x33).await;
+        let third = change(second, touched, 0x44).await;
+
+        let published = revision_state(&repository, third).await;
+        let content = published
+            .node(repository.clone(), touched)
+            .await
+            .expect("reading the changed file")
+            .address
+            .hash;
+        assert_eq!(content, Hash::from_u64(0x44));
+        let last_change = async |node_id| {
+            first_parent_history(&repository, &published, node_id)
+                .await
+                .0
+        };
+        assert_eq!(last_change(touched).await, second);
+        assert_eq!(last_change(untouched).await, first);
+        assert_eq!(last_change(dir).await, second);
+        assert!(last_change(ROOT_NODE).await.is_zero());
+
+        let fourth = change(third, untouched, 0x55).await;
+        let published = revision_state(&repository, fourth).await;
+        assert_eq!(
+            first_parent_history(&repository, &published, touched)
+                .await
+                .0,
+            third
+        );
+    }))
+    .await
+    .expect("Task failed");
 }

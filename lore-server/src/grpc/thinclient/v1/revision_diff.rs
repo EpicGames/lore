@@ -1,10 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
@@ -36,6 +34,7 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
 
+use super::helpers::PartitionTable;
 use super::helpers::diff_conflict_from_pair;
 use super::helpers::identifier_for_signature;
 use super::helpers::link_pin_change_to_diff_change;
@@ -777,50 +776,24 @@ async fn send_payload(
     SendOutcome::Sent
 }
 
-/// Per-stream map of linked-repository `RepositoryId` to its assigned
-/// index. The parent repository is index 0 and never stored here.
-#[lore_macro::test_pub]
-struct PartitionTable {
-    parent_repository_id: RepositoryId,
-    entries: HashMap<RepositoryId, u32>,
-}
-
 impl PartitionTable {
-    #[lore_macro::test_pub]
-    fn new(parent_repository_id: RepositoryId) -> Self {
-        Self {
-            parent_repository_id,
-            entries: HashMap::new(),
-        }
-    }
-
     /// Resolve `partition` to its index, sending a `DiffPartition` on
     /// first sighting (before the index is returned, so the announcement
     /// always precedes the change that references it). `Err` only when
-    /// the receiver is gone; the table is left unchanged in that case.
+    /// the receiver is gone.
     #[lore_macro::test_pub]
     async fn resolve_or_announce(
         &mut self,
         partition: RepositoryId,
         tx: &mpsc::Sender<Result<RevisionDiffResponse, Status>>,
     ) -> Result<u32, SendOutcome> {
-        if partition == self.parent_repository_id {
-            return Ok(0);
+        let (index, announcement) = self.resolve(partition);
+        if let Some(announcement) = announcement
+            && let SendOutcome::ReceiverDropped =
+                send_payload(tx, Payload::Partition(announcement)).await
+        {
+            return Err(SendOutcome::ReceiverDropped);
         }
-        if let Some(&index) = self.entries.get(&partition) {
-            return Ok(index);
-        }
-        let index = (self.entries.len() as u32) + 1;
-        let announcement = Payload::Partition(thin_client_v1::DiffPartition {
-            index,
-            link_partition: Bytes::from(partition),
-        });
-        match send_payload(tx, announcement).await {
-            SendOutcome::Sent => {
-                self.entries.insert(partition, index);
-                Ok(index)
-            }
-            SendOutcome::ReceiverDropped => Err(SendOutcome::ReceiverDropped),
-        }
+        Ok(index)
     }
 }

@@ -3887,6 +3887,12 @@ impl NodeFileMetadata {
     pub fn index(node: NodeID) -> usize {
         Self::index_clamp(node & NODE_INDEX_MASK) as usize
     }
+
+    /// The slot `lore file history` follows to the change before this revision: 0, or 1 where slot 0
+    /// names no revision.
+    pub fn history_slot(&self) -> usize {
+        if self.revision[0].is_zero() { 1 } else { 0 }
+    }
 }
 
 pub const BLOCK_NODE_FILE_METADATA_COUNT: usize = BLOCK_NODE_COUNT;

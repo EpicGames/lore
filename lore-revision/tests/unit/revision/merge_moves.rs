@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-#![allow(clippy::disallowed_methods)] // Test fixtures rename files in the working tree directly.
 
 //! `lore branch merge` of a move on one branch against changes to the moved node on the other,
 //! as the working tree and the merge revision hold it.
@@ -8,37 +7,23 @@
 use std::collections::BTreeMap;
 
 use lore_revision::branch;
-use lore_revision::file;
 use lore_revision::node::ROOT_NODE;
-use lore_revision::stage::StageCaseChange;
-use lore_revision::stage::StageOptions;
 
+use super::instance::Edit;
 use super::instance::Instance;
+use super::instance::commit_edits;
 use super::instance::create_branch;
 use super::instance::current;
-use super::instance::merge_feature;
+use super::instance::merge_branch;
 use super::instance::names_along;
 use super::instance::renamed;
 use super::instance::revision_state;
 use super::instance::run;
-use super::instance::stage_and_commit;
 use super::instance::switch_to;
 use super::instance::working_tree;
-use super::instance::write;
 
 /// The files every fixture starts from, each holding its own path.
 const TREE: [&str; 4] = ["Dir/a.txt", "Dir/b.txt", "Dir/Sub/c.txt", "Top.txt"];
-
-/// An edit a branch makes to the working tree.
-#[derive(Clone, Copy, Debug)]
-enum Edit {
-    /// Renames the first path to the second.
-    Move(&'static str, &'static str),
-    /// Writes the content to the file at the path.
-    Write(&'static str, &'static str),
-    /// Deletes the file or the directory at the path.
-    Delete(&'static str),
-}
 
 /// A move the tests make on one branch: the node it moves and where to, and a file at or below the
 /// node with the path the move gives it.
@@ -83,41 +68,6 @@ fn moving(moved: &Moved, content: Option<&'static str>) -> Vec<Edit> {
     let mut edits = vec![Edit::Move(moved.from, moved.to)];
     edits.extend(content.map(|content| Edit::Write(moved.file_moved, content)));
     edits
-}
-
-/// Makes `edits` in the working tree, stages each move as one, and commits them.
-async fn commit_edits(instance: &Instance, edits: &[Edit], message: &str) {
-    for edit in edits {
-        match *edit {
-            Edit::Move(from, to) => {
-                let (from, to) = (instance.path.join(from), instance.path.join(to));
-                std::fs::rename(&from, &to).expect("rename");
-                file::stage::stage_move(
-                    instance.repository.clone(),
-                    &instance.write_token,
-                    from.to_string_lossy().into_owned(),
-                    to.to_string_lossy().into_owned(),
-                    StageOptions {
-                        case_change: StageCaseChange::Rename,
-                        scan: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("Failed to stage the move");
-            }
-            Edit::Write(path, content) => write(instance, path, content),
-            Edit::Delete(path) => {
-                let absolute = instance.path.join(path);
-                if absolute.is_dir() {
-                    std::fs::remove_dir_all(absolute).expect("Failed to delete");
-                } else {
-                    std::fs::remove_file(absolute).expect("Failed to delete");
-                }
-            }
-        }
-    }
-    stage_and_commit(instance, &instance.path, message).await;
 }
 
 /// The paths the staged revision marks as in conflict, and the paths of the files it holds.
@@ -178,7 +128,7 @@ async fn merge(
     commit_edits(instance, feature, "Feature").await;
     switch_to(instance, branch::DEFAULT_DEFAULT_NAME).await;
     commit_edits(instance, main, "Main").await;
-    let committed = merge_feature(instance).await;
+    let committed = merge_branch(instance, "feature").await;
     (committed, working_tree(&instance.path))
 }
 

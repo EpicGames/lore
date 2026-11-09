@@ -109,12 +109,14 @@ message DiffConflict {
 }
 
 // Per-stream partition table entry. Announces a linked partition and
-// the stable index that `DiffChange.link_repository_index` will use to
-// reference it for the remainder of this stream. Server emits each entry
-// at most once, in discovery order starting at index 1, strictly before
-// the first `DiffChange` (or `DiffConflict` half) that references it. An
-// entry for a link the diff touches may have no change referencing it.
-// Index 0 is reserved for the parent partition and never announced.
+// the stable index that `DiffChange.link_repository_index`,
+// `TreeNode.link_repository_index` or `TreeRevision.link_repository_index`
+// will use to reference it for the remainder of this stream. Server emits
+// each entry at most once, in discovery order starting at index 1,
+// strictly before the first `DiffChange` (or `DiffConflict` half),
+// `TreeNode` or `TreeRevision` that references it. In a diff, an entry for
+// a link the diff touches may have no change referencing it. Index 0 is
+// reserved for the parent partition and never announced.
 message DiffPartition {
   // Stable per-stream index. Server assigns 1, 2, 3, … in discovery
   // order. Never zero.
@@ -140,6 +142,18 @@ message TreeNode {
   // True when a link entry tracks its parent's branch; false for pinned links
   // and non-link entries.
   bool tracking = 6;
+  // Index of the TreeRevision naming the revision that last changed this
+  // entry. 0 when the request does not ask for attribution or the revision
+  // can't be resolved.
+  uint32 last_revision_index = 7;
+  // Index into the per-stream partition table built from `DiffPartition`
+  // payloads: the partition this entry's content resolves under, as for a
+  // `DiffChange`. For a LINK entry it is the linked repository, for any
+  // other entry the repository the entry is in. 0 = the request's
+  // repository (the parent partition, never announced). A non-zero value
+  // is preceded on the same stream by the `DiffPartition` whose `index`
+  // matches.
+  uint32 link_repository_index = 8;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier
