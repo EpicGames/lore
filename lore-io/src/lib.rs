@@ -52,6 +52,10 @@ mod pool;
 #[cfg(feature = "test-util")]
 pub mod pool;
 #[cfg(not(feature = "test-util"))]
+mod priority;
+#[cfg(feature = "test-util")]
+pub mod priority;
+#[cfg(not(feature = "test-util"))]
 mod psync;
 #[cfg(feature = "test-util")]
 pub mod psync;

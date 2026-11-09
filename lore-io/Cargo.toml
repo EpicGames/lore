@@ -13,10 +13,11 @@ bytes = { workspace = true }
 lore-macro = { workspace = true }
 parking_lot = { workspace = true }
 
-# The uring backend is the only part of the library that calls libc, for eventfd and poll.
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
 
+# For the uring backend's eventfd and poll, the thread disk priority, and the error codes that
+# tell a mount point.
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = { workspace = true }
 
@@ -33,6 +34,9 @@ windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # For IO_REPARSE_TAG_MOUNT_POINT, which tells a directory that a rename would move without
+    # the files it leads to.
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
     # For FILE_SKIP_COMPLETION_PORT_ON_SUCCESS and FILE_SKIP_SET_EVENT_ON_HANDLE, which the
     # completion-port backend needs to own a synchronous completion rather than race the reaper

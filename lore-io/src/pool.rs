@@ -306,15 +306,36 @@ impl SyscallPool {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let task = Arc::new(Task {
-            state: Mutex::new(TaskState::Pending {
-                work: Some(work),
-                waker: None,
-            }),
-        });
-        let job: Arc<dyn Job> = task.clone();
-        let completion: Arc<dyn Completion<T>> = task;
+        let (job, task) = new_task(work);
+        self.enqueue(job);
+        task
+    }
 
+    /// Runs `work` on a thread of its own, outside the pool and its cap, for work that holds its
+    /// thread for minutes and would hold a pool thread from every other file operation as long.
+    /// The thread is named `name` and ends with the work. It counts against no pool cap: each call
+    /// adds a thread for as long as its work runs. Where the system refuses the thread, the work
+    /// goes to the pool.
+    #[lore_macro::test_pub]
+    pub(crate) fn run_on_own_thread<T, F>(&self, name: &str, work: F) -> SyscallTask<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (job, task) = new_task(work);
+        let runner = Arc::clone(&job);
+        if std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || runner.run())
+            .is_err()
+        {
+            self.enqueue(job);
+        }
+        task
+    }
+
+    /// Queues `job` for a pool thread, starting one where none is idle and the cap allows.
+    fn enqueue(&self, job: Arc<dyn Job>) {
         let spawn_worker = {
             let mut state = self.inner.state.lock();
             state.queue.push_back(job);
@@ -333,8 +354,6 @@ impl SyscallPool {
         if spawn_worker && spawn_worker_thread(Arc::clone(&self.inner)).is_err() {
             self.run_without_worker();
         }
-
-        SyscallTask { completion }
     }
 
     /// A snapshot of the pool's occupancy. Taken under the pool's own lock, so it is consistent
@@ -379,6 +398,23 @@ impl SyscallPool {
             job.run();
         }
     }
+}
+
+/// A task for `work`, as the queue or a thread runs it and as its caller awaits it.
+fn new_task<T, F>(work: F) -> (Arc<dyn Job>, SyscallTask<T>)
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let task = Arc::new(Task {
+        state: Mutex::new(TaskState::Pending {
+            work: Some(work),
+            waker: None,
+        }),
+    });
+    let job: Arc<dyn Job> = task.clone();
+    let completion: Arc<dyn Completion<T>> = task;
+    (job, SyscallTask { completion })
 }
 
 /// Starts a worker thread, reporting refusal rather than panicking: a host that has already

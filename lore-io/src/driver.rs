@@ -644,6 +644,38 @@ impl IoDriver {
             .await
     }
 
+    /// Removes the directory at `path` at background disk priority. With `aside`, renames it
+    /// there first, so `path` is free early, or removes it in place where `path` is a mount point
+    /// and cannot be renamed. Without `aside`, removes `path` where it is. Returns the directory
+    /// it removed from, which holds what is left on failure.
+    ///
+    /// The rename refusing tells a mount point: `EXDEV` or `EBUSY` on Unix,
+    /// `ERROR_NOT_SAME_DEVICE` on Windows. A mount point removed in place keeps its own empty
+    /// directory where the system refuses to remove it. On Windows a directory that is a reparse
+    /// point with the mount-point tag, a volume mounted in a folder or a junction, is not renamed,
+    /// since the rename would move the reparse point without the files it leads to: the files are
+    /// removed through it, and the reparse point is kept. Where it leads to the root of a volume,
+    /// the entries there that are both hidden and system, which the system keeps and which deny
+    /// access, are kept too. A directory already gone counts as
+    /// removed, and a missing `path` leaves `aside` as it is. To repeat a call that failed after
+    /// renaming the directory, which it says by returning `aside`, pass `aside` as `path` and no
+    /// `aside`: whatever is at `path` by then is not the directory the first call renamed.
+    ///
+    /// The removal takes minutes for millions of files, so it runs on a thread of its own, outside
+    /// the syscall pool and its cap, at background disk priority, and the thread ends with it.
+    /// Where the system refuses a thread, the job runs on the syscall pool, and the pool thread
+    /// restores its priority before it runs another. Every backend runs this the same way, so it
+    /// goes to the thread directly, as [`Self::write_file_segments_atomic`] goes to the pool.
+    pub async fn remove_dir_all_in_background(
+        &self,
+        path: impl Into<PathBuf>,
+        aside: Option<PathBuf>,
+    ) -> (PathBuf, std::io::Result<()>) {
+        PsyncDriver
+            .remove_dir_all_in_background(path.into(), aside)
+            .await
+    }
+
     pub(crate) async fn file_metadata_raw(
         &self,
         file: Arc<File>,

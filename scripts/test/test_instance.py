@@ -257,8 +257,17 @@ class TestInstanceDelete:
             with pytest.raises(LoreException) as exc_info:
                 repo.repository_instance_delete(cwd=str(outside))
 
-        assert "Failed to delete repository directory" in str(exc_info.value)
-        assert "manually" in str(exc_info.value)
+        # The error names the directory left behind: the instance's own, or the sibling it was
+        # renamed to, whose name starts with the instance's path. The command writes the path
+        # with forward slashes, so both sides are normalized before they are compared.
+        message = os.path.normcase(str(exc_info.value)).lower()
+        directory = os.path.normcase(repo.path).lower()
+        assert f"failed to delete {directory}" in message, (
+            f"Error should name the directory it could not delete. Got: {exc_info.value}"
+        )
+        assert "delete that directory manually" in message, (
+            f"Error should say to delete the directory by hand. Got: {exc_info.value}"
+        )
         assert os.path.exists(os.path.join(repo.path, "test.txt"))
 
     @pytest.mark.skipif(

@@ -44,6 +44,28 @@ async fn panic_on_pool_thread_resumes_on_awaiter() {
     pool.submit(|| panic!("deliberate")).await;
 }
 
+/// Work run on its own thread runs on a thread of that name and takes no pool thread, so the
+/// pool, here of one thread, serves other work while it runs.
+#[tokio::test]
+async fn work_on_its_own_thread_leaves_the_pool_free() {
+    let pool = SyscallPool::new(1);
+    let (release, released) = std::sync::mpsc::channel::<()>();
+
+    let own = pool.run_on_own_thread("lore-io-test-own-thread", move || {
+        released.recv().expect("the release");
+        std::thread::current().name().map(str::to_string)
+    });
+    assert_eq!(pool.submit(|| 7 * 6).await, 42);
+    release.send(()).expect("release the work");
+
+    assert_eq!(own.await.as_deref(), Some("lore-io-test-own-thread"));
+    assert_eq!(
+        pool.stats().threads_high_water,
+        1,
+        "only the pool's own work"
+    );
+}
+
 /// The snapshot is taken under one lock, so a burst cannot be observed with more threads
 /// than the cap allows or with counts that do not add up.
 #[tokio::test(flavor = "multi_thread")]

@@ -12,6 +12,8 @@ mod find;
 #[cfg(target_family = "windows")]
 mod iocp;
 mod pool;
+#[cfg(any(target_os = "macos", target_os = "linux", target_family = "windows"))]
+mod priority;
 mod psync;
 #[cfg(target_family = "windows")]
 mod stat;

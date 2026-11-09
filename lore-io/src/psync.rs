@@ -412,6 +412,23 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn remove_dir_all_in_background(
+        &self,
+        path: PathBuf,
+        aside: Option<PathBuf>,
+    ) -> (PathBuf, std::io::Result<()>) {
+        SyscallPool::global()
+            .run_on_own_thread("lore-io-background-removal", move || {
+                remove_tree_in_background(
+                    path,
+                    aside,
+                    |from, to| std::fs::rename(from, to),
+                    |tree| std::fs::remove_dir_all(tree),
+                )
+            })
+            .await
+    }
+
     pub(crate) async fn sync(&self, file: Arc<File>, data_only: bool) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
@@ -554,6 +571,239 @@ fn remove_non_directory(
         let _ = file_type;
         std::fs::remove_file(path)
     }
+}
+
+/// Removes the directory at `path` at background disk priority, as
+/// [`IoDriver::remove_dir_all_in_background`](crate::IoDriver::remove_dir_all_in_background)
+/// describes, with `rename` renaming a directory and `remove_tree` removing a tree.
+#[lore_macro::test_pub]
+fn remove_tree_in_background(
+    path: PathBuf,
+    aside: Option<PathBuf>,
+    rename: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    remove_tree: impl Fn(&std::path::Path) -> std::io::Result<()>,
+) -> (PathBuf, std::io::Result<()>) {
+    let _background = crate::priority::BackgroundIo::begin();
+    let Some(aside) = aside else {
+        let removed = forgive_missing_tree(remove_tree(&path));
+        return (path, removed);
+    };
+    match is_mount_folder(&path) {
+        Ok(false) => {}
+        Ok(true) => {
+            let volume_root = is_volume_root(&path);
+            let removed = remove_contents(&path, &remove_tree, |entry| {
+                volume_root && is_volume_system_entry(entry)
+            });
+            return (path, removed);
+        }
+        Err(err) => return (path, forgive_missing_tree(Err(err))),
+    }
+    match rename(&path, &aside) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return (path, Ok(())),
+        Err(err) if is_mount_point_refusal(&err) => {
+            let removed = remove_in_place(&path, &remove_tree);
+            return (path, removed);
+        }
+        Err(err) => return (path, Err(err)),
+    }
+    let removed = forgive_missing_tree(remove_tree(&aside));
+    (aside, removed)
+}
+
+/// Answers a removal of a tree that is not there as done.
+fn forgive_missing_tree(removed: std::io::Result<()>) -> std::io::Result<()> {
+    match removed {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        removed => removed,
+    }
+}
+
+/// Removes what the directory at `path` holds, then the directory. A mount point keeps its
+/// directory, which the system refuses to remove while it is mounted. A path that does not exist
+/// is `Ok`, as is an entry removed by someone else during the removal.
+fn remove_in_place(
+    path: &std::path::Path,
+    remove_tree: &impl Fn(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    remove_contents(path, remove_tree, |_| false)?;
+    match std::fs::remove_dir(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound || is_mount_point_refusal(&err) => {
+            Ok(())
+        }
+        removed => removed,
+    }
+}
+
+/// Removes what the directory at `path` holds, except each entry `kept` answers for, and keeps the
+/// directory. A path that does not exist is `Ok`, as is an entry removed by someone else during
+/// the removal.
+fn remove_contents(
+    path: &std::path::Path,
+    remove_tree: &impl Fn(&std::path::Path) -> std::io::Result<()>,
+    kept: impl Fn(&std::fs::DirEntry) -> bool,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
+        let entry = entry?;
+        if kept(&entry) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let child = entry.path();
+        let removed = if file_type.is_dir() {
+            remove_tree(&child)
+        } else {
+            remove_non_directory(&child, file_type)
+        };
+        match removed {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            removed => removed?,
+        }
+    }
+    Ok(())
+}
+
+/// Whether the directory at `path` is a mount folder, which a rename would move without the
+/// files it leads to. On Windows that is a directory that is a reparse point with the
+/// mount-point tag, a volume mounted in a folder or a junction: a rename moves the reparse point
+/// itself, and a removal of the renamed name removes only the reparse point. Unix has none; a
+/// mount point there refuses the rename.
+#[cfg(target_family = "unix")]
+#[lore_macro::test_pub]
+fn is_mount_folder(_path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
+/// Whether the directory at `path` is a mount folder, as the Unix version describes, read from
+/// the name itself through a handle opened without following a reparse point.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+fn is_mount_folder(path: &std::path::Path) -> std::io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TAG_INFO;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut info = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: the handle is open for the call, and `info` is a `FILE_ATTRIBUTE_TAG_INFO` of the
+    // size passed, which the call writes.
+    let queried = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileAttributeTagInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    };
+    if queried == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let reparse_directory = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+    Ok(info.FileAttributes & reparse_directory == reparse_directory
+        && info.ReparseTag == IO_REPARSE_TAG_MOUNT_POINT)
+}
+
+/// Whether the mount folder at `path` leads to the root of a volume, where the system keeps
+/// entries of its own that deny access. Unix has no mount folder.
+#[cfg(target_family = "unix")]
+#[lore_macro::test_pub]
+fn is_volume_root(_path: &std::path::Path) -> bool {
+    false
+}
+
+/// Whether the directory at `path` is the root of a volume, a drive or a volume mounted in a
+/// folder, which `GetVolumeNameForVolumeMountPointW` names. A junction to an ordinary directory
+/// is not. Where the system cannot answer, the directory is taken as not a volume root.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+fn is_volume_root(path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
+    const BACKSLASH: u16 = b'\\' as u16;
+    let mut mount_point: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if mount_point.last() != Some(&BACKSLASH) {
+        mount_point.push(BACKSLASH);
+    }
+    mount_point.push(0);
+    // A volume name is `\\?\Volume{GUID}\`: 49 characters and the terminator.
+    let mut volume_name = [0u16; 50];
+    // SAFETY: `mount_point` is a terminated wide string, and `volume_name` holds the number of
+    // characters passed, which the call writes at most.
+    let named = unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            mount_point.as_ptr(),
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+        )
+    };
+    named != 0
+}
+
+/// Whether `entry` is one the system keeps at the root of a volume. Unix has none.
+#[cfg(target_family = "unix")]
+fn is_volume_system_entry(_entry: &std::fs::DirEntry) -> bool {
+    false
+}
+
+/// Whether `entry` is one the system keeps at the root of a volume, such as
+/// `System Volume Information` and `$RECYCLE.BIN`, which deny access to a removal: an entry both
+/// hidden and system.
+#[cfg(target_family = "windows")]
+fn is_volume_system_entry(entry: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    entry
+        .metadata()
+        .is_ok_and(|metadata| is_hidden_system(metadata.file_attributes()))
+}
+
+/// Whether `attributes` mark an entry both hidden and system.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+fn is_hidden_system(attributes: u32) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_HIDDEN;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_SYSTEM;
+
+    let hidden_system = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM;
+    attributes & hidden_system == hidden_system
+}
+
+/// Whether a rename or removal of a directory failed because the directory is a mount point:
+/// `EXDEV` or `EBUSY` from a rename out of it or a removal of it.
+#[cfg(target_family = "unix")]
+#[lore_macro::test_pub]
+fn is_mount_point_refusal(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EXDEV | libc::EBUSY))
+}
+
+/// Whether a rename of a directory failed because the directory is a mount point:
+/// `ERROR_NOT_SAME_DEVICE`, which a rename of a volume's mount point gives.
+#[cfg(target_family = "windows")]
+#[lore_macro::test_pub]
+fn is_mount_point_refusal(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NOT_SAME_DEVICE as i32)
 }
 
 // A case-sensitive filesystem holds the name it was given, so a path that

@@ -474,6 +474,46 @@ async fn remove_dir_all_keeping_keeps_each_boundary_and_its_ancestors() {
     }
 }
 
+/// A tree is renamed aside, then removed from there, so neither name is left, and a second call
+/// finds nothing left to remove.
+#[tokio::test]
+async fn remove_dir_all_in_background_renames_the_tree_aside_and_removes_it() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-remove-in-background-");
+        let path = dir.child("tree");
+        let aside = dir.child("tree.aside");
+        driver.create_dir_all(path.join("a/b")).await.unwrap();
+        driver
+            .write_file_bytes(
+                path.join("a/b/file.txt"),
+                Bytes::from_static(b"content"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (removed_from, removed) = driver
+            .remove_dir_all_in_background(&path, Some(aside.clone()))
+            .await;
+
+        removed.expect("removes the tree");
+        assert_eq!(removed_from, aside);
+        assert!(
+            driver.symlink_stat(&path).await.is_err(),
+            "the path is free"
+        );
+        assert!(
+            driver.symlink_stat(&aside).await.is_err(),
+            "the tree is gone"
+        );
+        driver
+            .remove_dir_all_in_background(&path, Some(aside.clone()))
+            .await
+            .1
+            .expect("removing a missing tree is Ok");
+    }
+}
+
 /// A listing yields every child with the metadata the walk resolved for it, and ends. The
 /// entries arrive in whatever order the walk finds them, so the test compares them as a set.
 #[tokio::test]

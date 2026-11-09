@@ -5,6 +5,8 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use lore_base::error::MountsBusy;
 use lore_base::types::Hash;
@@ -1316,8 +1318,20 @@ fn is_in_use(error: &io::Error) -> bool {
 /// the target is still free. Windows reports a rename onto a path that is taken as access denied,
 /// the same error a file open in the directory gives, and no wait frees that path.
 #[lore_macro::test_pub]
-fn rename_is_retryable(error: &io::Error, to: &Path) -> bool {
-    is_in_use(error) && !to.exists()
+fn rename_is_retryable<'a>(
+    error: &io::Error,
+    to: &'a Path,
+) -> impl Future<Output = bool> + use<'a> {
+    let in_use = is_in_use(error);
+    async move { in_use && is_free(to).await }
+}
+
+/// Whether nothing is at `path`, linked or not. A path that cannot be checked counts as taken.
+async fn is_free(path: &Path) -> bool {
+    matches!(
+        lore_io::IoDriver::global().symlink_stat(path).await,
+        Err(error) if error.kind() == io::ErrorKind::NotFound
+    )
 }
 
 /// Whether a failed delete of an instance directory is worth reissuing: the files were in use, or
@@ -1350,17 +1364,20 @@ fn is_in_use_for_platform(_error: &io::Error) -> bool {
 /// Runs `operation`, reissuing it with backoff for as long as it fails with an error `retryable`
 /// accepts, up to [`IN_USE_RETRY_LIMIT`] times. Any other failure is reported at once.
 ///
-/// Takes a plain closure returning a future rather than an `AsyncFnMut`, whose higher-ranked
-/// lifetime defeats `Send` inference for the callers that spawn these commands.
+/// Takes plain closures returning futures rather than `AsyncFn`s, whose higher-ranked lifetimes
+/// defeat `Send` inference for the callers that spawn these commands.
 #[lore_macro::test_pub]
-async fn retry_while_in_use<T, F, O>(
+async fn retry_while_in_use<T, E, F, O, R, RO>(
     action: &str,
-    retryable: impl Fn(&io::Error) -> bool,
+    retryable: R,
     mut operation: F,
-) -> io::Result<T>
+) -> Result<T, E>
 where
+    E: fmt::Display,
     F: FnMut() -> O,
-    O: Future<Output = io::Result<T>>,
+    O: Future<Output = Result<T, E>>,
+    R: Fn(&E) -> RO,
+    RO: Future<Output = bool>,
 {
     let mut retry = crate::util::time::retry(
         IN_USE_RETRY_START_MILLIS,
@@ -1370,7 +1387,7 @@ where
     loop {
         match operation().await {
             Ok(value) => return Ok(value),
-            Err(error) if retryable(&error) && retry.wait().await => {
+            Err(error) if retryable(&error).await && retry.wait().await => {
                 lore_debug!("Retrying to {action}, which failed in use: {error}");
             }
             Err(error) => return Err(error),
@@ -1378,17 +1395,159 @@ where
     }
 }
 
-/// Delete the directory at `path` and everything in it, retrying while its files are in use. A
-/// directory that is already gone counts as deleted.
-async fn remove_instance_directory(path: &Path) -> io::Result<()> {
-    let action = format!("delete {}", path.display());
-    retry_while_in_use(&action, delete_is_retryable, || async {
-        match lore_io::IoDriver::global().remove_dir_all(path).await {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            result => result,
-        }
+/// A delete of an instance's files that failed, with the directory that holds what is left.
+#[lore_macro::test_pub]
+#[derive(Debug)]
+struct FailedRemoval {
+    directory: PathBuf,
+    error: io::Error,
+}
+
+impl fmt::Display for FailedRemoval {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Failed to delete {}: {}",
+            self.directory.display(),
+            self.error
+        )
+    }
+}
+
+impl std::error::Error for FailedRemoval {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+/// A [`FailedRemoval`] that ended a delete, with what the delete had done to the instance
+/// before it, which the message tells the user along with the directory to delete by hand.
+#[derive(Debug)]
+struct IncompleteDelete {
+    failure: FailedRemoval,
+    deregistered: bool,
+    unmounted: bool,
+}
+
+impl fmt::Display for IncompleteDelete {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let done = match (self.deregistered, self.unmounted) {
+            (true, true) => "deregistered and unmounted",
+            (true, false) => "deregistered",
+            (false, true) => "unmounted",
+            (false, false) => return write!(f, "{}. Delete that directory manually", self.failure),
+        };
+        write!(
+            f,
+            "{}. The instance is already {done}; delete that directory manually",
+            self.failure
+        )
+    }
+}
+
+impl std::error::Error for IncompleteDelete {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
+}
+
+/// Delete the directory at `path` and everything in it, renamed aside to `aside` first, as
+/// [`lore_io::IoDriver::remove_dir_all_in_background`] does, retrying while its files are in use.
+async fn remove_instance_directory(path: &Path, aside: &Path) -> Result<(), FailedRemoval> {
+    remove_instance_directory_with(path, aside, |path, aside| {
+        lore_io::IoDriver::global().remove_dir_all_in_background(path, aside)
     })
     .await
+}
+
+/// [`remove_instance_directory`] with each attempt made by `attempt`, which takes the arguments
+/// of [`lore_io::IoDriver::remove_dir_all_in_background`] and answers as it does, so a test can
+/// fail one.
+///
+/// Once an attempt answers `aside`, it renamed the directory there, and every later attempt
+/// removes `aside` alone: `path` is free from then on, and whatever is made there is not the
+/// instance's.
+#[lore_macro::test_pub]
+async fn remove_instance_directory_with<A, AO>(
+    path: &Path,
+    aside: &Path,
+    attempt: A,
+) -> Result<(), FailedRemoval>
+where
+    A: Fn(PathBuf, Option<PathBuf>) -> AO,
+    AO: Future<Output = (PathBuf, io::Result<()>)>,
+{
+    let action = format!("delete {}", path.display());
+    let renamed = AtomicBool::new(false);
+    retry_while_in_use(
+        &action,
+        |failure| removal_is_retryable(failure, aside),
+        || {
+            let attempted = if renamed.load(Ordering::Relaxed) {
+                attempt(aside.to_path_buf(), None)
+            } else {
+                attempt(path.to_path_buf(), Some(aside.to_path_buf()))
+            };
+            let renamed = &renamed;
+            async move {
+                match attempted.await {
+                    (_, Ok(())) => Ok(()),
+                    (directory, Err(error)) => {
+                        if directory == aside {
+                            renamed.store(true, Ordering::Relaxed);
+                        }
+                        Err(FailedRemoval { directory, error })
+                    }
+                }
+            }
+        },
+    )
+    .await
+}
+
+/// Whether a failed delete of an instance directory renamed to `aside` is worth reissuing: the
+/// delete is, as [`delete_is_retryable`] answers, and where the rename aside is what failed, the
+/// aside name is still free.
+#[lore_macro::test_pub]
+fn removal_is_retryable<'a>(
+    failure: &FailedRemoval,
+    aside: &'a Path,
+) -> impl Future<Output = bool> + use<'a> {
+    let retryable = delete_is_retryable(&failure.error);
+    let renamed = failure.directory == aside;
+    async move { retryable && (renamed || is_free(aside).await) }
+}
+
+/// The sibling of the directory at `path` that a delete renames it to before removing its files:
+/// `<name>.deleting-<instance ID>`.
+#[lore_macro::test_pub]
+fn deleting_aside_path(path: &Path, instance_id: InstanceId) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_owned();
+    name.push(format!(".deleting-{instance_id}"));
+    path.with_file_name(name)
+}
+
+/// Fail if something already holds `aside`, the name a delete renames the instance to, so a
+/// delete never removes a directory it did not put there.
+async fn require_free_aside_path(aside: &Path) -> Result<(), InstanceError> {
+    match lore_io::IoDriver::global().symlink_stat(aside).await {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(InstanceError::internal(format!(
+            "{} already exists, so the instance cannot be renamed there to delete it. Remove it \
+             first",
+            aside.display()
+        ))),
+        Err(error) => Err(InstanceError::internal_with_context(
+            error,
+            &format!("checking that {} is free", aside.display()),
+        )),
+    }
+}
+
+/// Remove the registration of the instance at `path`: open it as a repository, as a command run
+/// from there would, and remove its keys from the registry.
+async fn deregister_instance_at(path: &Path, instance_id: InstanceId) -> Result<(), InstanceError> {
+    deregister_instance(open_instance_at(path).await?, instance_id).await
 }
 
 /// Open the instance at `path` as a repository, as a command run from there would, to remove its
@@ -1426,8 +1585,12 @@ async fn deregister_instance(
 /// refuses, so a mount in use leaves the instance as it was. Otherwise the registration goes
 /// first. Either way the repository is closed again before anything is deleted, as Windows cannot
 /// delete files that are open. Nothing is destroyed if the instance cannot be opened to
-/// deregister it. A delete that then fails leaves files behind, and says where, for the user to
-/// remove.
+/// deregister it. The directory with the instance's files, the instance directory or a mounted
+/// instance's external directory, is then renamed aside to [`deleting_aside_path`], so its path
+/// is free before its files are deleted, unless the directory is a mount point, or on Windows a
+/// volume mounted in a folder or a junction, which is deleted in place, as
+/// [`lore_io::IoDriver::remove_dir_all_in_background`] describes. A delete that fails after the
+/// deregistration leaves files behind, and says where, for the user to remove.
 ///
 /// In a dry run (the global `dry_run` flag), checks everything a delete would need and emits
 /// events describing what would be deleted, without performing any changes.
@@ -1435,6 +1598,20 @@ async fn deregister_instance(
 /// The caller opens the repository without its stores or directory lock, so that this function
 /// controls when they are held.
 pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), InstanceError> {
+    instance_delete_with(repository, deregister_instance_at).await
+}
+
+/// [`instance_delete`] with the step that deregisters the instance supplied by the caller, so a
+/// failed deregistration can be tested.
+///
+/// `deregister` removes the registration of the instance at a path, as
+/// [`deregister_instance_at`] does. A FUSE instance, opened before it is unmounted, is
+/// deregistered through that opened repository instead.
+#[lore_macro::test_pub]
+async fn instance_delete_with(
+    repository: Arc<RepositoryContext>,
+    deregister: impl AsyncFn(&Path, InstanceId) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
     let dry_run = crate::lore::execution_context().globals().dry_run();
     let instance_id = repository.instance_id;
     let path = repository.path_for_display().to_string();
@@ -1452,6 +1629,16 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
 
     require_working_directory_outside(&path, "delete")?;
     let shared_store = uses_shared_store(&repository).await?;
+    // The directory a delete removes, and the name it renames that directory to first. A taken
+    // name is refused in every case, as only a refused rename tells a mount point.
+    let directory = if vfs.is_virtual() {
+        external_dir_for_instance(instance_id)
+            .forward_any::<InstanceError>("failed to find the external directory")?
+    } else {
+        PathBuf::from(&path)
+    };
+    let aside = deleting_aside_path(&directory, instance_id);
+    require_free_aside_path(&aside).await?;
 
     // A FUSE instance is unmounted first, as a busy mount refuses it and so leaves the instance
     // whole; an SWFS one after it is deregistered.
@@ -1511,11 +1698,10 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
             LoreRepositoryInstanceDeletePhase::Deregistering => {
                 // A registry inside the instance directory goes with it.
                 if shared_store {
-                    let repository = match opened.take() {
-                        Some(repository) => repository,
-                        None => open_instance_at(Path::new(&path)).await?,
+                    let deregistered = match opened.take() {
+                        Some(repository) => deregister_instance(repository, instance_id).await,
+                        None => deregister(Path::new(&path), instance_id).await,
                     };
-                    let deregistered = deregister_instance(repository, instance_id).await;
                     if vfs == VfsType::Fuse {
                         // Unmounted by now, and still registered, so a start mounts it again.
                         deregistered.forward_with::<InstanceError, _>(|| {
@@ -1539,7 +1725,7 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
                 }
             }
             LoreRepositoryInstanceDeletePhase::DeletingFiles => {
-                delete_instance_files(vfs, instance_id, &path).await?;
+                delete_instance_files(vfs, shared_store, &path, &directory, &aside).await?;
             }
         }
     }
@@ -1552,32 +1738,27 @@ pub async fn instance_delete(repository: Arc<RepositoryContext>) -> Result<(), I
     Ok(())
 }
 
-/// Remove what an instance deleted from its registration leaves on disk: its directory, or for a
-/// mounted instance its external directory and, for FUSE, the mount point the unmount emptied.
+/// Remove what a delete leaves of an instance on disk: `directory`, the instance directory or a
+/// mounted instance's external directory, renamed aside to `aside` first, and for FUSE the mount
+/// point at `path` the unmount emptied. `deregistered` says whether the delete removed the
+/// instance's registration, which a failure tells the user.
 async fn delete_instance_files(
     vfs: VfsType,
-    instance_id: InstanceId,
+    deregistered: bool,
     path: &str,
+    directory: &Path,
+    aside: &Path,
 ) -> Result<(), InstanceError> {
-    if !vfs.is_virtual() {
-        return remove_instance_directory(Path::new(path))
-            .await
-            .map_err(|e| {
-                InstanceError::internal(format!(
-                    "Failed to delete repository directory {path}: {e}. Delete the directory \
-                     manually"
-                ))
-            });
-    }
-    let external = external_dir_for_instance(instance_id)
-        .forward_any::<InstanceError>("failed to find the external directory")?;
-    remove_instance_directory(&external).await.map_err(|e| {
-        InstanceError::internal(format!(
-            "Failed to delete external directory {}: {e}. The instance is already \
-             deregistered and unmounted; delete that directory manually",
-            external.display()
-        ))
-    })?;
+    remove_instance_directory(directory, aside)
+        .await
+        .map_err(|failure| {
+            let incomplete = IncompleteDelete {
+                failure,
+                deregistered,
+                unmounted: vfs.is_virtual(),
+            };
+            InstanceError::internal_with_context(incomplete, "deleting the instance's files")
+        })?;
     // Not removed recursively: it is empty once unmounted, and a mount still standing there
     // would take whatever it serves with it.
     if vfs == VfsType::Fuse
