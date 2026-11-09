@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+[server.auth]
+jwt_issuer = "http://localhost:8280"
+# ZITADEL's `aud` holds project and client IDs only. The client finds the host it
+# may send a token to in the `root_domains` claim the Action in setup.js adds.
+jwt_audience = ["lore-project"]
+# Set by the same Action, from the user's roles in the project.
+permission_claim = "lore_actions"
+
+[server.auth.oidc]
+# client_id is in local.toml, which setup.js writes: ZITADEL generates it.
+# ZITADEL adds the project to `aud`, and the user's roles to what the Action
+# sees, only for these scopes.
+scopes = ["openid", "profile", "urn:zitadel:iam:org:project:id:lore-project:aud", "urn:zitadel:iam:org:projects:roles"]
+client_credentials_scopes = [
+    "urn:zitadel:iam:org:project:id:lore-project:aud",
+    "urn:zitadel:iam:org:projects:roles",
+]
+
+[immutable_store.local]
+path = "/tmp/lore-oidc-demo/zitadel-server"
+
+[mutable_store.local]
+path = "/tmp/lore-oidc-demo/zitadel-server"
+
+[telemetry.logger]
+format = "text"

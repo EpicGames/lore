@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+[server.auth]
+jwt_issuer = "http://localhost:8280"
+# ZITADEL's login tokens name the project, and the exchange service's tokens
+# name https://localhost.
+jwt_audience = ["lore-project", "https://localhost"]
+# Tier 2: each entry of the exchanged token's `resources` claim is
+# {resource_id, permission}, with resource_id "urc-<repository ID>".
+resource_claim = "resources"
+
+[server.auth.oidc]
+# client_id is in local.toml, which setup.js writes: ZITADEL generates it.
+# ZITADEL adds the project to `aud` only for the project's `aud` scope. The
+# exchange service needs no roles.
+scopes = ["openid", "profile", "urn:zitadel:iam:org:project:id:lore-project:aud"]
+client_credentials_scopes = ["urn:zitadel:iam:org:project:id:lore-project:aud"]
+resource_template = "https://localhost/partitions/{id}"
+# The exchange service in ../exchange/. It signs with keys of its own, which the
+# server finds through the service's discovery document.
+token_exchange_issuer = "http://localhost:8190"
+
+[immutable_store.local]
+path = "/tmp/lore-oidc-demo/zitadel-tier2-server"
+
+[mutable_store.local]
+path = "/tmp/lore-oidc-demo/zitadel-tier2-server"
+
+[telemetry.logger]
+format = "text"

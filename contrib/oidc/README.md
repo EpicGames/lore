@@ -10,6 +10,7 @@ to the provider.
 | [`keycloak/`](keycloak/README.md) | [Keycloak](https://www.keycloak.org) |
 | [`dex/`](dex/README.md) | [Dex](https://dexidp.io) |
 | [`authentik/`](authentik/README.md) | [authentik](https://goauthentik.io) |
+| [`zitadel/`](zitadel/README.md) | [ZITADEL](https://zitadel.com) |
 
 Each provider runs as Tier 1, where the server reads each caller's actions from a claim in the
 login token and applies them to every repository, and as Tier 2, where the client exchanges its
@@ -21,7 +22,8 @@ configuration reference for the settings.
 > [!WARNING]
 > These setups are for local development only:
 >
-> - The users and the admin accounts have fixed passwords, and the CI client has a fixed secret.
+> - The users and the admin accounts have fixed passwords. The CI client has a fixed secret, or on
+>   ZITADEL a generated one in `zitadel/ci-secret`.
 > - The providers and the exchange service serve plain HTTP, on `127.0.0.1` only.
 > - The exchange service generates its signing key at each start, so restarting it makes the
 >   tokens it issued fail until the clients exchange again.
@@ -35,7 +37,7 @@ Every provider has the same users:
 | --- | --- | --- |
 | `alice@example.com` | `alice` | `admin` |
 | `bob@example.com` | `bob` | `obliterate` |
-| CI client | secret `lore-ci-secret` | `push-protected` (not supported by Dex in Tier 1) |
+| CI client | secret `lore-ci-secret` (generated on ZITADEL) | `push-protected` (not supported by Dex in Tier 1) |
 
 In Tier 1, every token holder gets `read`, and `write` through the server's default
 `implicit_actions`. The provider's roles or groups add the rest:
@@ -135,9 +137,11 @@ The server refuses both. `lore branch unprotect` needs `admin`, unless you creat
 
 ### As the CI client
 
-The CI client logs in with the client credentials grant, with no browser. On Keycloak and
-authentik its client ID is `lore-ci`. Dex can't give a client a role, so its CI client works in
-[Tier 2](#tier-2) only, under the client ID its [README](dex/README.md#the-ci-client) names.
+The CI client logs in with the client credentials grant, with no browser. On Keycloak, authentik
+and ZITADEL its client ID is `lore-ci`. ZITADEL generates the secret, so on ZITADEL replace
+`lore-ci-secret` below with `$(cat <repository>/contrib/oidc/zitadel/ci-secret)`. Dex can't give a
+client a role, so its CI client works in [Tier 2](#tier-2) only, under the client ID its
+[README](dex/README.md#the-ci-client) names.
 
 ```bash
 export LORE_AUTH_PATH=/tmp/lore-oidc-demo/ci
@@ -180,10 +184,10 @@ it asks the server, so don't try this on content you want to keep.
 The server takes the caller's identity from the token's `identity` claim, and from `sub` when the
 token has none. The client records the same value as the creator and committer of each revision.
 Keycloak and authentik add an `identity` claim with the user name, which users can't change
-there. The revisions above then name `alice`, and the CI client's
-user, such as `service-account-lore-ci` on Keycloak. Dex can't add the claim, so revisions there
-name its `sub`, which is stable too. The grants of [Tier 2](#tier-2) name users by the same
-identity.
+there. On ZITADEL, an Action adds one with the user ID, which setup makes the same as the user
+name. The revisions above then name `alice`, and the CI client's user, such as
+`service-account-lore-ci` on Keycloak. Dex can't add the claim, so revisions there name its `sub`,
+which is stable too. The grants of [Tier 2](#tier-2) name users by the same identity.
 
 ## Tier 2
 
@@ -275,7 +279,8 @@ lore push
 ### Tier 2 as the CI client
 
 In a new terminal, log in, clone `game`, and push to its protected `main`. On Dex, the client ID is
-`https://localhost/ci` instead of `lore-ci`:
+`https://localhost/ci` instead of `lore-ci`. On ZITADEL, replace `lore-ci-secret` as in
+[As the CI client](#as-the-ci-client):
 
 ```bash
 export LORE_AUTH_PATH=/tmp/lore-oidc-demo/ci

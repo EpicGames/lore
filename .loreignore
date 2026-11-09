@@ -16,6 +16,8 @@ lore-server/config/local*.toml
 lore-integration-tests/consul-data
 **/.grafana.local.yaml
 contrib/bazel/.rbe-state/
+contrib/oidc/zitadel/local.toml
+contrib/oidc/zitadel/ci-secret
 
 #################
 ## Visual Studio

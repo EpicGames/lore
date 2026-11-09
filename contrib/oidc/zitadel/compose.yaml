@@ -1,0 +1,122 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+name: lore-oidc-zitadel
+
+services:
+  postgresql:
+    image: docker.io/library/postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+
+  # ZITADEL runs as uid 1000, and a new volume belongs to root.
+  bootstrap:
+    image: node:22-alpine
+    command: ["chown", "1000:1000", "/bootstrap"]
+    volumes:
+      - bootstrap:/bootstrap
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v4.20.2
+    command: start-from-init --masterkeyFromEnv
+    environment:
+      # Development only. ZITADEL encrypts its keys and secrets with it, and needs exactly
+      # 32 bytes.
+      ZITADEL_MASTERKEY: lore-oidc-example-not-a-secret-0
+      ZITADEL_EXTERNALDOMAIN: localhost
+      ZITADEL_EXTERNALPORT: 8280
+      ZITADEL_EXTERNALSECURE: "false"
+      # Also read by the healthcheck's `zitadel ready`.
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_DATABASE_POSTGRES_HOST: postgresql
+      ZITADEL_DATABASE_POSTGRES_PORT: 5432
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      # The login built into ZITADEL, rather than the separate login container ZITADEL 4
+      # defaults to.
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "false"
+      # The test users' passwords are their user names.
+      ZITADEL_DEFAULTINSTANCE_PASSWORDCOMPLEXITYPOLICY_MINLENGTH: 3
+      ZITADEL_DEFAULTINSTANCE_PASSWORDCOMPLEXITYPOLICY_HASLOWERCASE: "false"
+      ZITADEL_DEFAULTINSTANCE_PASSWORDCOMPLEXITYPOLICY_HASUPPERCASE: "false"
+      ZITADEL_DEFAULTINSTANCE_PASSWORDCOMPLEXITYPOLICY_HASNUMBER: "false"
+      ZITADEL_DEFAULTINSTANCE_PASSWORDCOMPLEXITYPOLICY_HASSYMBOL: "false"
+      # Without this, every login offers to set up a second factor.
+      ZITADEL_DEFAULTINSTANCE_LOGINPOLICY_MFAINITSKIPLIFETIME: 0s
+      ZITADEL_FIRSTINSTANCE_ORG_NAME: lore
+      # The admin console at http://localhost:8280/ui/console, user admin@lore.localhost,
+      # password admin. ZITADEL adds the organization's domain to the user name.
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_USERNAME: admin
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORD: admin
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      # The machine user setup.js calls the API as.
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: setup
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: setup
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
+      ZITADEL_FIRSTINSTANCE_PATPATH: /bootstrap/admin.pat
+    volumes:
+      - bootstrap:/bootstrap
+    ports:
+      - "127.0.0.1:8280:8080"
+      # The exchange service's port: it shares this container's network.
+      - "127.0.0.1:8190:8190"
+    healthcheck:
+      test: ["CMD", "/app/zitadel", "ready"]
+      interval: 5s
+      retries: 60
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+
+  # ZITADEL finds its instance by the host a request names, and knows only `localhost`. The
+  # containers below share its network, so they reach it as `localhost:8080`.
+  # Runs as root, so it can write to this directory whoever owns it. setup.js gives the files
+  # it writes to the directory's owner.
+  setup:
+    image: node:22-alpine
+    command: ["node", "/srv/setup.js"]
+    network_mode: service:zitadel
+    volumes:
+      - bootstrap:/bootstrap:ro
+      - ./setup.js:/srv/setup.js:ro
+      # setup.js writes local.toml and ci-secret here.
+      - .:/out
+    depends_on:
+      zitadel:
+        condition: service_healthy
+
+  # The token exchange service zitadel-tier2.toml names. `docker compose --profile tier2 up -d`
+  # starts it.
+  exchange:
+    image: node:22-alpine
+    profiles: [tier2]
+    user: node
+    command: ["node", "/srv/exchange/server.js"]
+    network_mode: service:zitadel
+    environment:
+      # Inside the container; compose publishes the port on 127.0.0.1.
+      HOST: 0.0.0.0
+      LOGIN_ISSUERS: http://localhost:8280
+      PROVIDER_URL: http://localhost:8080
+      LOGIN_AUDIENCES: lore-project
+      GRANTS_FILE: /srv/grants.json
+    volumes:
+      - ../exchange:/srv/exchange:ro
+      - ./grants.json:/srv/grants.json:ro
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+volumes:
+  bootstrap:
