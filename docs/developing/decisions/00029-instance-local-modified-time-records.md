@@ -1,6 +1,6 @@
 ---
 status: proposed
-date: 2026-11-03
+date: 2026-11-09
 deciders: Zack Neyland
 ---
 
@@ -38,13 +38,14 @@ keeps the store from growing with every file of every instance, it travels with 
 no extra cost, and its entry is 24 bytes against the store's 84.
 
 Records live in `.lore/records/`, keyed by the path, as 256 shards of 24-byte records sorted by key, each
-shard's file holding the same bytes as its memory. An instance an upgraded client creates is marked as
-holding no store records, and never reads or zeroes the store's. For an instance an older client created, a
-lookup that misses falls back to the store record an older client wrote, and an upgraded client zeroes a
-path's store record when it records a new time for the path or clears it, so the fallback does not answer
-with a stale time. SWFS instances, whose mount
-presents the recorded times, and in-memory instances keep their records in the store. Anchors and
-registrations stay in the mutable store as ADR-00014 decided. The
+shard's file holding the same bytes as its memory, with times little-endian so a shard reads the same on
+every host. An instance an upgraded client creates is marked as holding no store records, and never reads
+or zeroes the store's. For an instance an older client created, a lookup that misses falls back to the
+store record an older client wrote, and an upgraded client zeroes a path's store record when it records a
+new time for the path or clears it, so the fallback does not answer with a stale time, apart from a crash
+between the two writes. SWFS instances, whose mount presents the recorded times, and in-memory instances
+keep their records in the store. Anchors and registrations stay in the mutable store as ADR-00014 decided.
+The
 [instance-local modified-time records](../../proposals/2026-11-03-instance-local-modified-time-records.md)
 LEP gives the design.
 
@@ -58,5 +59,8 @@ LEP gives the design.
   for anchors. A lost record costs a hash, never a wrong answer.
 - Bad, because a client from before this change reads only the store; after a downgrade it hashes the
   files whose records moved, and the records it then writes for a new instance are never read or zeroed
-  by an upgraded client.
+  by an upgraded client. Its clears reach only the store, so an upgraded client trusts its own records
+  again on re-upgrade; a stale one answers only while the file keeps the recorded time.
+- Bad, because an instance an older client created is never marked, and pays a store lookup for each time
+  it records or clears for as long as it exists.
 - Neutral, because restoring committed modification times on sync stays possible.
