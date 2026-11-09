@@ -27,7 +27,6 @@ use tokio::sync::Semaphore;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
-use tracing::info;
 use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
@@ -52,8 +51,6 @@ const PERMIT_TIMEOUT_LABEL_VALUE: &str = "PermitTimeout";
 const ADMISSION_LIMIT_LABEL_VALUE: &str = "AdmissionLimit";
 /// Rejected because the service could not parse the request.
 const PARSE_ERROR_LABEL_VALUE: &str = "ParsingError";
-// todo(plockhart) differentiate this label value and add to alerting rules
-const HANDLE_MESSAGE_TIMEOUT_LABEL_VALUE: &str = "SlowDown";
 const HANDLE_MESSAGE_USER_ERROR_LABEL_VALUE: &str = "User";
 const HANDLE_MESSAGE_INTERNAL_ERROR_LABEL_VALUE: &str = "Internal";
 
@@ -310,12 +307,7 @@ where
             let result = tokio::select! {
                 _timeout = tokio::time::sleep(handler_duration_timeout.saturating_sub(start.elapsed())) => {
                     debug!("Timeout in message handling duration");
-                    Err(ProtocolErrorInfo {
-                        response_error_code: QuicServiceError::SlowDown as QuicErrorStatus,
-                        message_handle_label: HANDLE_MESSAGE_TIMEOUT_LABEL_VALUE,
-                        is_internal_error: true,
-                        is_appropriate_for_logging: true,
-                    })
+                    Err(ProtocolErrorInfo::timed_out())
                 },
                 result = async {
                     service.run_request_handler(context, message).await.map_err(|protocol_error| {
@@ -463,19 +455,7 @@ where
                 );
             }
             Err((header, error)) => {
-                if error.is_appropriate_for_logging {
-                    if error.is_internal_error {
-                        warn!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "internal error handling message");
-                    } else {
-                        info!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "non-internal error handling message");
-                    }
-                } else {
-                    if error.is_internal_error {
-                        debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "internal error handling message");
-                    } else {
-                        debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "non-internal error handling message");
-                    }
-                }
+                error.log(&header);
                 let response_header = header.response_error(error.response_error_code);
                 let (header_buf, header_len) = response_header.response_bytes();
                 send.lock()

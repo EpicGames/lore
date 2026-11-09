@@ -30,6 +30,8 @@ Set at create or clone time from the URL you pass (for example `lore://127.0.0.1
 
 The scheme decides whether the client authenticates the server. `lores://` validates the server certificate, and is the scheme used when the URL has none. `lore://` doesn't: the client accepts any certificate on QUIC connections, and sends gRPC requests to the server, access tokens included, without TLS. Use `lore://` only for a server on the same machine, as in the examples on this page. With a `lores://` remote, the client refuses to connect if the server advertises a storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server.
 
+A `lore-unix://<upstream host>/<repository>` remote reaches a [machine server](../glossary.md#machine-server), a Lore server on the same machine that fronts the [upstream](../glossary.md#upstream) the host names, through the socket `LORE_UDS_SOCKET` names (see [Environment variables](#environment-variables)). Nothing on the socket uses TLS.
+
 With no `remote_url`, commands that need the network fail with `NoRemote` rather than attempting a connection. That is a distinct error from `Disconnected`, which means a remote *is* configured but could not be reached.
 
 Treat the field as fixed once the repository exists. Pointing an established repository at a different remote is not generally safe — the shared store is keyed on this value, among other things — so create or clone against the remote you intend to use rather than editing this afterwards. See the [Quickstart](../tutorials/quickstart.md) for how the remote URL is introduced.
@@ -191,6 +193,22 @@ export LORE_SERVICE_SOCKET=lore_service-my-checkout
 ```
 
 The Python test suite sets this per run, so running it leaves a service you have running alone.
+
+## Environment variables
+
+`LORE_SERVICE_EXECUTABLE`, `LORE_USE_SERVICE` and `LORE_SERVICE_SOCKET` choose the Lore service that carries out commands; the [`[service]` table](#service-table) and [Giving a run its own service](#giving-a-run-its-own-service) describe them. The variable below decides how a process reaches its remote.
+
+| Variable | Effect |
+| --- | --- |
+| `LORE_UDS_SOCKET` | Names the socket of a machine server. Every gRPC channel the process opens goes through it, and a `lore-unix` remote requires it. |
+
+`LORE_UDS_SOCKET` holds the absolute path of a socket a machine server listens on, typically one bind-mounted into a container (see [Container sockets](lore-server-config.md#container-sockets)). With it set, every gRPC channel the process opens, the authentication service's included, connects through the socket in plaintext and keeps the host it would have dialed as the request's authority, which the machine server forwards the request by. A `lore-unix` remote also sends its storage requests through the socket, over one storage connection per process. The process sizes its network threads for that one connection. OIDC login requests, which are HTTP, still go to the network.
+
+- A `lore-unix` remote without the variable fails with an error that names it. An empty value reads as unset.
+- The process uses the path as given, so a relative path resolves against the working directory of each process that connects.
+- A process with the variable set reaches over gRPC only the hosts the machine server forwards to. It can use a remote of another scheme as well only if the machine server forwards that remote's host and the process has network access for the remote's QUIC storage, which it reaches over one storage connection. In a container with no network, as usual, only `lore-unix` remotes work.
+- Each process reads the variable once, from its own environment. The relay does not pass it to the Lore service, so set it for the service as well.
+- A Lore server refuses to start with the variable set in its own environment, since the variable would send the server's own gRPC into a socket (see [Container sockets](lore-server-config.md#container-sockets)).
 
 ## Examples
 

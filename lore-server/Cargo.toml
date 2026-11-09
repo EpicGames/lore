@@ -23,6 +23,8 @@ enum_dispatch = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+hyper = { workspace = true, features = ["server", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
@@ -108,11 +110,18 @@ seeding = ["lore-revision/seeding"]
 # Enables fault-injection in the storage layer (e.g. LORE_MISS_FRAGMENT_WRITES).
 # Used by smoke tests that exercise missing-fragment recovery paths.
 failure_generator = ["lore-storage/failure_generator"]
+# Builds the `uds-bench` example, which the container tests drive.
+uds-bench = []
 
 [[bin]]
 name = "loreserver"
 # The binary holds no unit tests; the library it drives does.
 test = false
+
+[[example]]
+name = "uds-bench"
+path = "examples/uds_bench.rs"
+required-features = ["uds-bench"]
 
 [lib]
 name = "lore_server"

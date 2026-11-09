@@ -11,6 +11,7 @@ use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::session::MAX_CONCURRENT_SESSIONS;
+use lore_server::protocol::storage::session::SessionMap;
 use lore_server::quic::QuicService;
 use lore_server::quic::storage_service_v4::*;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
@@ -33,6 +34,7 @@ fn make_service(
         immutable_store.clone(),
         mutable_store,
         Arc::new(UserAgentFilter::default()),
+        SessionMap::default(),
     )
 }
 
@@ -286,6 +288,7 @@ mod authorized_session {
             immutable_store,
             mutable_store,
             Arc::new(UserAgentFilter::default()),
+            SessionMap::default(),
         )
     }
 
@@ -517,6 +520,7 @@ mod authorized_session {
             immutable_store,
             mutable_store,
             Arc::new(UserAgentFilter::default()),
+            SessionMap::default(),
         );
 
         let token = signed_token(&[&format!("urc-{repo_b}")], &["read", "write"]);
@@ -593,6 +597,7 @@ async fn session_start_trusting_unsigned_identity_names_the_caller_without_a_tok
         immutable_store,
         mutable_store,
         Arc::new(UserAgentFilter::default()),
+        SessionMap::default(),
     );
     let start = |auth_token: Vec<u8>| {
         service.run_request_handler(

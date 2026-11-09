@@ -27,6 +27,7 @@ pub async fn handler(
     request: Request<storage_v1::VerifyRequest>,
     authorizer: &Arc<dyn RepositoryAuthorizer>,
     local_immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
 ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
     // Healing drops the server's index entries for a corrupt fragment.
     if request.get_ref().heal {
@@ -58,6 +59,7 @@ pub async fn handler(
                     correlation_id,
                     user_id,
                     local_immutable_store,
+                    immutable_store,
                 )
                 .await
                 .map(|resp| {

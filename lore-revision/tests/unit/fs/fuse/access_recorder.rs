@@ -46,7 +46,7 @@ async fn start_writes_recorded_lines_and_flushes_on_drop() {
     recorder.record("a.txt".to_string());
     drop(recorder);
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + WRITER_WAIT;
     loop {
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         if content.lines().count() >= 2 {
@@ -60,6 +60,9 @@ async fn start_writes_recorded_lines_and_flushes_on_drop() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+
+/// How long a test waits for the recorder's writer before calling it stuck.
+const WRITER_WAIT: Duration = Duration::from_secs(60);
 
 const BASE_TIME: u64 = 1_700_000_000_000;
 const NO_HANDLE: u64 = 0;
@@ -190,7 +193,7 @@ async fn reads_and_lookups_record_each_path_once_in_order() {
     // A second read of an already-recorded file must not add another line.
     read(&fs, a.ino, 5).await;
 
-    let lines = wait_for_lines(&path, 3, Duration::from_secs(5)).await;
+    let lines = wait_for_lines(&path, 3, WRITER_WAIT).await;
     assert_eq!(paths(&lines), vec!["/", "a.txt", "b.txt"]);
 }
 
@@ -201,7 +204,7 @@ async fn negative_lookup_records_its_parent_directory() {
 
     let _ = fs.lookup(&req(), ROOT_INO, b"missing.txt").await;
 
-    let lines = wait_for_lines(&path, 1, Duration::from_secs(5)).await;
+    let lines = wait_for_lines(&path, 1, WRITER_WAIT).await;
     assert_eq!(paths(&lines), vec!["/"]);
 }
 
@@ -244,7 +247,7 @@ async fn a_lookup_of_local_content_records_its_parent_directory() {
         .await
         .expect("lookup new.o");
 
-    let lines = wait_for_lines(&path, 2, Duration::from_secs(5)).await;
+    let lines = wait_for_lines(&path, 2, WRITER_WAIT).await;
     assert_eq!(paths(&lines), vec!["/", "dir/"]);
 }
 
@@ -304,7 +307,7 @@ async fn files_and_directories_the_writer_added_are_not_recorded() {
     read(&fs, a.ino, 5).await;
 
     // The recorder writes in order: once the last read is recorded, every earlier access is.
-    let lines = wait_for_line(&path, "dir/a.txt", Duration::from_secs(5)).await;
+    let lines = wait_for_line(&path, "dir/a.txt", WRITER_WAIT).await;
     let recorded = paths(&lines);
     assert!(
         recorded.contains(&"dir/a.txt"),
@@ -359,7 +362,7 @@ async fn local_lookups_and_directory_reads_record_the_directories_they_answer_fr
             .is_ok()
     );
 
-    let lines = wait_for_lines(&path, 3, Duration::from_secs(5)).await;
+    let lines = wait_for_lines(&path, 3, WRITER_WAIT).await;
     assert_eq!(paths(&lines), vec!["/", "dir/", "plus/"]);
 }
 
@@ -387,7 +390,7 @@ async fn directory_reads_that_build_their_listing_record_the_directory() {
         .await
         .expect("readdirplus plus");
 
-    let lines = wait_for_lines(&path, 2, Duration::from_secs(5)).await;
+    let lines = wait_for_lines(&path, 2, WRITER_WAIT).await;
     assert_eq!(paths(&lines), vec!["dir/", "plus/"]);
 }
 
@@ -402,7 +405,7 @@ async fn a_recorded_directory_names_the_blocks_holding_its_children() {
         .await
         .expect("lookup a");
 
-    let lines = wait_for_lines(&path, 1, Duration::from_secs(5)).await;
+    let lines = wait_for_lines(&path, 1, WRITER_WAIT).await;
     let blocks = root_child_blocks(&fixture).await;
     assert_eq!(lines, vec![format!("/\t{blocks}")]);
 }

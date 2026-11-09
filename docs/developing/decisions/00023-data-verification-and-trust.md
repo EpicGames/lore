@@ -1,6 +1,7 @@
 ---
 status: accepted
 date: 2026-10-14
+amended: 2026-11-08
 deciders: Mattias Jansson
 ---
 
@@ -36,6 +37,17 @@ and the durable store is reached by configuration. Clients are outside the backe
 look-aside caches and auxiliary servers, which reach a backend through the storage protocol as its
 clients do (a `remote` store, `RemoteImmutableStore`).
 
+**Amended 2026-11-08:** a server that reaches a backend through a `remote` store counts as within
+that backend, for data integrity only. The case that settles it is the machine server
+([machine-level Lore server
+proposal](../../proposals/2026-10-12-machine-level-lore-server-for-containers.md)): a Lore server on
+a build machine that caches content for the machine's containers, with its upstream as the durable
+tier of a composite store. It fronts that backend for the containers, whose clients still check
+what they fetch from it. Authorization does not change: the machine server authorizes each
+container's storage sessions with the container's own tokens, and the upstream authorizes the
+machine server's identity per partition and every forwarded request for the caller's token. The
+trust needs no client certificate, as replicas reach each other with, because it grants no access.
+
 ## Decision Drivers
 
 - A payload from outside a machine's backend is not trusted.
@@ -70,16 +82,23 @@ decided by the source alone, and neither local reads nor transfers within a back
 The contract:
 
 - Untrusted sources: to a client, every server; to a look-aside cache or an auxiliary server, the
-  backend it reaches through the storage protocol; to a server, its clients.
+  backend it reaches through the storage protocol; to a server, its clients. **Amended
+  2026-11-08:** to a server, the backend it reaches through a `remote` store only where that store
+  sets `verify = true`.
 - Every payload from an untrusted source is decompressed and its content hashed against its address
   on ingress, before it is stored or handed on. A client checks what it fetches for reads, caches,
   prefetches and diagnostic queries. A server checks what its clients push, and what it fetches
-  through the storage protocol. A fetched payload that fails is healed once where the source can
+  through the storage protocol. **Amended 2026-11-08:** a server checks what it fetches through a
+  `remote` store only where the store sets `verify = true`. A fetched payload that fails is healed once where the source can
   heal it, and is otherwise an error; a pushed payload that fails is refused. A diagnostic query
   logs one that fails and asks no heal.
 - Trusted sources: a server's replicas and peers, trusted by configuration and TLS, and its durable
   store, trusted by configuration. What a server fetches from them or has replicated to it is
-  stored and served as it arrives, neither decompressed nor hashed.
+  stored and served as it arrives, neither decompressed nor hashed. **Amended 2026-11-08:** so is
+  the backend a server reaches through a `remote` store, trusted by configuration unless the store
+  sets `verify = true`. The store checks the sizes of what it fetches, and stores and serves it as
+  it arrives. A client that finds such a payload corrupt asks the server to heal it, and the server
+  passes the heal on to that backend where its own copy was corrupt or missing.
 - A client can declare its server a trusted source where both are part of the same infrastructure
   and performance comes first, such as a build server streaming from a server in its own backend,
   with the global `trust_remote` (`--trust-remote`), which a storage handle also takes as
@@ -101,7 +120,8 @@ The contract:
 `trust_remote` is the one switch the contract leaves. `ReadOptions::verify`,
 `ReadOptions::trust_local`, the repository's `trust_local` setting, the cache's `verify` parameter,
 the read flight's deferred states and `read_raw`'s debug hash are removed, and `skip_verify` is kept
-as an alias of `trust_remote`.
+as an alias of `trust_remote`. **Amended 2026-11-08:** a server's `remote` store has the
+counterpart, its `verify` setting, off by default, which makes the backend it reaches untrusted.
 
 The integrity of stored data over time, a payload that decays on its media and still decodes, is a
 separate concern, left to the data store integrity feature.
@@ -125,6 +145,14 @@ separate concern, left to the data store integrity feature.
 - Bad, because caches, prefetches and fetches through the storage protocol decompress and hash
   every payload they receive from an untrusted source. Caches and prefetches run off the path a
   command waits on.
+- **Amended 2026-11-08:** Good, because a machine server's misses reach its containers without a
+  decode and a hash on the server, and each container's client still checks what it fetches.
+- **Amended 2026-11-08:** Bad, because a payload corrupted at the upstream reaches a machine
+  server's local tier as it arrived, and the machine server serves it to every container until a
+  client that checks what it fetches catches it and asks the heal. A client that trusts its remote
+  does not catch it.
+- **Amended 2026-11-08:** Bad, because a `remote` store that checked every payload before this
+  amendment trusts its backend after it, unless its configuration sets `verify = true`.
 - Bad, because a payload is checked by decoding it: a machine built without the codec a payload
   from an untrusted source is stored in refuses that payload.
 - Bad, because a server's own reads through a remote store take a payload that still fails its

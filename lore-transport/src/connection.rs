@@ -48,10 +48,16 @@ use crate::types::*;
 pub static MAX_STORAGE_CONNECTIONS: usize = 10;
 pub static DEFAULT_PROTOCOL: &str = "lores";
 
-/// The storage connections a command opens to a remote when it asks for `requested`: 0 for the
-/// default of one, and at most [`MAX_STORAGE_CONNECTIONS`].
+/// The storage connections a command opens to a remote when it asks for `requested`, and the
+/// connections its network threads are sized for: one in a process that names the machine
+/// server's socket, which carries its network traffic, else `requested`, with 0 for the default of
+/// one, and at most [`MAX_STORAGE_CONNECTIONS`].
 pub fn storage_connection_count(requested: usize) -> usize {
-    requested.clamp(1, MAX_STORAGE_CONNECTIONS)
+    if crate::uds::route().is_some() {
+        1
+    } else {
+        requested.clamp(1, MAX_STORAGE_CONNECTIONS)
+    }
 }
 
 /// Start delay in reconnect loop, in milliseconds
@@ -74,6 +80,7 @@ pub fn find(scheme: &str) -> Result<Arc<dyn Protocol>, ProtocolError> {
         let _ = add("urcs", Arc::new(LoreProtocol::default()));
         let _ = add("grpc", Arc::new(GRPCProtocol::default()));
         let _ = add("grpcs", Arc::new(GRPCProtocol::default()));
+        let _ = add(crate::uds::SCHEME, Arc::new(UdsProtocol::default()));
     });
 
     let mut map = PROTOCOL_MAP.lock();
@@ -415,6 +422,9 @@ pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError
     let protocol = parsed_url.scheme();
     let protocol = find(protocol)
         .forward_with::<ProtocolError, _>(|| format!("remote {remote_url} is invalid"))?;
+    if parsed_url.scheme() == crate::uds::SCHEME {
+        crate::uds::socket()?;
+    }
 
     Ok((parsed_url, protocol))
 }
@@ -1660,85 +1670,6 @@ impl Protocol for LoreProtocol {
         )
         .await
     }
-
-    async fn revision(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-        auth_endpoint: &AuthEndpoint,
-        identity: &str,
-        repository: RepositoryId,
-        credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        grpc::revision(
-            connection,
-            remote_url,
-            auth_endpoint,
-            identity,
-            repository,
-            credentials,
-        )
-        .await
-    }
-
-    async fn repository(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-        auth_endpoint: &AuthEndpoint,
-        identity: &str,
-        credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Repository>, ProtocolError> {
-        grpc::repository(connection, remote_url, auth_endpoint, identity, credentials).await
-    }
-
-    async fn admin(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-        auth_endpoint: &AuthEndpoint,
-        identity: &str,
-        repository: RepositoryId,
-        credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        grpc::admin(
-            connection,
-            remote_url,
-            auth_endpoint,
-            identity,
-            repository,
-            credentials,
-        )
-        .await
-    }
-
-    async fn lock(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-        auth_endpoint: &AuthEndpoint,
-        identity: &str,
-        repository: RepositoryId,
-        credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Lock>, ProtocolError> {
-        grpc::lock(
-            connection,
-            remote_url,
-            auth_endpoint,
-            identity,
-            repository,
-            credentials,
-        )
-        .await
-    }
-
-    async fn environment(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-    ) -> Result<Arc<dyn Environment>, ProtocolError> {
-        grpc::environment(connection, remote_url).await
-    }
 }
 
 /// gRPC protocol, using gRPC for both storage and revision
@@ -1768,83 +1699,25 @@ impl Protocol for GRPCProtocol {
         )
         .await
     }
+}
 
-    async fn revision(
+/// The machine server's socket: the storage protocol for storage, gRPC over the same socket for
+/// everything else. See [`crate::uds`].
+#[derive(Default)]
+struct UdsProtocol {}
+
+#[async_trait::async_trait]
+impl Protocol for UdsProtocol {
+    async fn storage(
         &self,
-        connection: Weak<Connection>,
+        _connection: Weak<Connection>,
         remote_url: &str,
         auth_endpoint: &AuthEndpoint,
         identity: &str,
-        repository: RepositoryId,
+        _partition: Partition,
+        _index: usize,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        grpc::revision(
-            connection,
-            remote_url,
-            auth_endpoint,
-            identity,
-            repository,
-            credentials,
-        )
-        .await
-    }
-
-    async fn repository(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-        auth_endpoint: &AuthEndpoint,
-        identity: &str,
-        credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Repository>, ProtocolError> {
-        grpc::repository(connection, remote_url, auth_endpoint, identity, credentials).await
-    }
-
-    async fn admin(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-        auth_endpoint: &AuthEndpoint,
-        identity: &str,
-        repository: RepositoryId,
-        credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        grpc::admin(
-            connection,
-            remote_url,
-            auth_endpoint,
-            identity,
-            repository,
-            credentials,
-        )
-        .await
-    }
-
-    async fn lock(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-        auth_endpoint: &AuthEndpoint,
-        identity: &str,
-        repository: RepositoryId,
-        credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Lock>, ProtocolError> {
-        grpc::lock(
-            connection,
-            remote_url,
-            auth_endpoint,
-            identity,
-            repository,
-            credentials,
-        )
-        .await
-    }
-
-    async fn environment(
-        &self,
-        connection: Weak<Connection>,
-        remote_url: &str,
-    ) -> Result<Arc<dyn Environment>, ProtocolError> {
-        grpc::environment(connection, remote_url).await
+    ) -> Result<Arc<dyn Storage>, ProtocolError> {
+        crate::uds::storage(remote_url, auth_endpoint, identity, credentials).await
     }
 }

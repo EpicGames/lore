@@ -46,7 +46,7 @@ async fn start_session_after_fault(client: &StorageClient) -> Result<u32, Protoc
 }
 
 /// A request on a stream the server has stopped reading reconnects.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_on_a_stream_the_server_stopped_reading_reconnects() {
     let server = TestStorageServer::start();
     let client = client_after_fault(&server, StreamFault::StopReading).await;
@@ -58,7 +58,7 @@ async fn a_request_on_a_stream_the_server_stopped_reading_reconnects() {
 
 /// A request on a stream whose reader has stopped, on an answer to a command never sent,
 /// reconnects.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_on_a_stream_whose_reader_stopped_reconnects() {
     let server = TestStorageServer::start();
     let client = client_after_fault(&server, StreamFault::StrayAnswer).await;

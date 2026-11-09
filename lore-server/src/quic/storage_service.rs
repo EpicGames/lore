@@ -544,10 +544,10 @@ impl QuicService for StorageService {
             }
             ParsedStorageRequest::Verify(verify) => {
                 verify
-                    .handle(
+                    .handle_with(
                         context,
                         self.local_store.clone(),
-                        self.repository_authorizer.clone(),
+                        self.immutable_store.clone(),
                     )
                     .await
             }

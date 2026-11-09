@@ -29,7 +29,7 @@ pub trait Protocol: Send + Sync {
         credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
-    /// Connect to remote revision service
+    /// Connect to remote revision service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn revision(
         &self,
@@ -39,9 +39,19 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Revision>, ProtocolError>;
+    ) -> Result<Arc<dyn Revision>, ProtocolError> {
+        crate::grpc::revision(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote repository service
+    /// Connect to remote repository service, over gRPC as every protocol reaches it.
     async fn repository(
         &self,
         connection: Weak<Connection>,
@@ -49,9 +59,11 @@ pub trait Protocol: Send + Sync {
         auth_endpoint: &AuthEndpoint,
         identity: &str,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Repository>, ProtocolError>;
+    ) -> Result<Arc<dyn Repository>, ProtocolError> {
+        crate::grpc::repository(connection, remote_url, auth_endpoint, identity, credentials).await
+    }
 
-    /// Connect to remote admin service
+    /// Connect to remote admin service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn admin(
         &self,
@@ -61,9 +73,19 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Admin>, ProtocolError>;
+    ) -> Result<Arc<dyn Admin>, ProtocolError> {
+        crate::grpc::admin(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote lock service
+    /// Connect to remote lock service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn lock(
         &self,
@@ -73,14 +95,26 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Lock>, ProtocolError>;
+    ) -> Result<Arc<dyn Lock>, ProtocolError> {
+        crate::grpc::lock(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote environment service
+    /// Connect to remote environment service, over gRPC as every protocol reaches it.
     async fn environment(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-    ) -> Result<Arc<dyn Environment>, ProtocolError>;
+    ) -> Result<Arc<dyn Environment>, ProtocolError> {
+        crate::grpc::environment(connection, remote_url).await
+    }
 }
 
 /// Storage protocol
@@ -118,10 +152,10 @@ pub trait Storage: Send + Sync {
     /// Get only the fragment metadata for an address — no payload bytes.
     ///
     /// Use this when the caller needs `Fragment` (`flags`, `size_payload`, `size_content`) but
-    /// not the payload bytes — e.g. existence-with-size queries, metadata audits. Saves one
-    /// full payload transfer per address vs. `get`. The default implementation falls back to
-    /// `get` and discards the payload, so transports that haven't been updated still work;
-    /// gRPC and QUIC override with optimized wire-level metadata-only paths.
+    /// not the payload bytes, for example to learn whether an address exists and its size. It
+    /// saves one payload transfer per address over `get`. The default implementation falls back
+    /// to `get` and discards the payload; the gRPC, QUIC and socket clients override it with a
+    /// metadata-only request.
     async fn get_metadata(
         &self,
         session_id: u32,

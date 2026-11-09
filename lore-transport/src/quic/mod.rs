@@ -5,7 +5,7 @@ pub mod client;
 pub mod command_header;
 pub mod net_runtime;
 #[cfg(not(feature = "test-util"))]
-mod response_reader;
+pub(crate) mod response_reader;
 #[cfg(feature = "test-util")]
 pub mod response_reader;
 pub mod storage_service;

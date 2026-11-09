@@ -6,7 +6,7 @@ mod exchange;
 mod mode;
 mod oidc;
 mod select;
-mod stub;
+pub(crate) mod stub;
 mod token_only;
 mod ucs_auth;
 mod user_directory;

@@ -37,7 +37,12 @@ async fn heal_needs_write_and_a_plain_verify_does_not() {
                     repository_id: repository.into(),
                     grants: Grants::Actions(actions.iter().map(ToString::to_string).collect()),
                 });
-                handler(request, &authorizer, immutable_store.clone())
+                handler(
+                    request,
+                    &authorizer,
+                    immutable_store.clone(),
+                    immutable_store.clone(),
+                )
             };
 
             let denied = verify(true, &["read"]).await.expect_err("heal needs write");

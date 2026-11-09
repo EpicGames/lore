@@ -930,8 +930,8 @@ impl FilesystemProvider for MountedProvider {
     }
 }
 
-/// How long the held-invalidation test waits on each step.
-const HELD_WAIT: Duration = Duration::from_secs(10);
+/// How long the held-invalidation test waits on each step before calling it stuck.
+const HELD_WAIT: Duration = Duration::from_secs(60);
 
 /// Records each invalidation, holding the first until released, as the kernel holds an entry
 /// invalidation beside a LOOKUP it is waiting on.

@@ -22,7 +22,7 @@ fn other_partition() -> Partition {
 
 /// A command on a session after its connection is lost reconnects, issues the session on the new
 /// connection, and runs under it there, as a priority command after it does.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_command_after_a_reconnect_runs_under_its_session_issued_again() {
     let server = TestStorageServer::start();
     let storage = server.connect(1).await.remove(0);
@@ -49,7 +49,7 @@ async fn a_command_after_a_reconnect_runs_under_its_session_issued_again() {
 /// Sessions issued again after a reconnect each run their commands under their own partition, in
 /// whatever order they are issued: the first issued on the new connection takes the id another
 /// held on the old one, which that other's command must not run under.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sessions_issued_again_after_a_reconnect_keep_their_own_partitions() {
     let server = TestStorageServer::start();
     let storage = server.connect(1).await.remove(0);
@@ -84,7 +84,7 @@ async fn sessions_issued_again_after_a_reconnect_keep_their_own_partitions() {
 
 /// Commands that find their session stale at once after a reconnect issue it on the new connection
 /// once between them.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commands_after_a_reconnect_issue_their_session_once() {
     const COMMANDS: usize = 32;
     let server = TestStorageServer::start();
@@ -115,7 +115,7 @@ async fn commands_after_a_reconnect_issue_their_session_once() {
 
 /// Stopping a session the client started before a reconnect, and has not issued since, stops
 /// nothing on the new connection, where its old id names another session.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_stopped_after_a_reconnect_stops_no_session_of_the_new_connection() {
     let server = TestStorageServer::start();
     let storage = server.connect(1).await.remove(0);
@@ -143,7 +143,7 @@ async fn a_session_stopped_after_a_reconnect_stops_no_session_of_the_new_connect
 }
 
 /// A command on a session the client stopped is refused without reaching the server.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_command_on_a_stopped_session_is_not_sent() {
     let server = TestStorageServer::start();
     let storage = server.connect(1).await.remove(0);
@@ -159,7 +159,7 @@ async fn a_command_on_a_stopped_session_is_not_sent() {
 
 /// A session issued again on the connection a reconnect opens, then stopped, leaves no session
 /// open on that connection.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_issued_again_and_stopped_leaves_no_session_open() {
     let server = TestStorageServer::start();
     let storage = server.connect(1).await.remove(0);
@@ -180,7 +180,7 @@ async fn a_session_issued_again_and_stopped_leaves_no_session_open() {
 
 /// A stop while its session is issued again waits for the issue and stops the session it issued,
 /// so none is left open on the connection the reconnect opened.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_while_its_session_is_issued_again_leaves_no_session_open() {
     let (server, release) = TestStorageServer::start_holding_session_starts();
     release
@@ -220,7 +220,7 @@ async fn a_stop_while_its_session_is_issued_again_leaves_no_session_open() {
 
 /// An issue the server refuses after a reconnect reaches the command as the server's `SlowDown`,
 /// for it to back off on, and a later command issues the session once the server accepts.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_issue_reaches_the_command_and_a_later_one_issues_the_session() {
     let (server, starts) = TestStorageServer::start_controlling_session_starts();
     let storage = server.connect(1).await.remove(0);
@@ -253,7 +253,7 @@ async fn a_refused_issue_reaches_the_command_and_a_later_one_issues_the_session(
 /// Commands that find their session stale while its issue waits on the server share that issue,
 /// and each receives the refusal it ends in, the server asked to start the session once. The
 /// server refuses once every command awaits the issue.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commands_waiting_for_a_refused_issue_each_receive_its_refusal() {
     const COMMANDS: usize = 32;
     let (server, starts) = TestStorageServer::start_controlling_session_starts();
@@ -294,7 +294,7 @@ async fn commands_waiting_for_a_refused_issue_each_receive_its_refusal() {
 
 /// An issue whose command is dropped while the server holds it runs to its end, so a later
 /// command runs under the session it issued and the server starts no other.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_issue_whose_command_is_dropped_issues_the_session() {
     let (server, starts) = TestStorageServer::start_controlling_session_starts();
     let storage = server.connect(1).await.remove(0);

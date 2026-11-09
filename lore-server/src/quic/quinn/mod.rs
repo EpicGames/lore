@@ -8,6 +8,7 @@ pub mod service_store;
 use std::path::Path;
 use std::sync::Arc;
 
+pub(crate) use config::DEFAULT_IDLE_TIMEOUT_MILLIS;
 pub use config::QuinnConfigBuilder;
 use lore_transport::tls;
 pub use quinn_server::QuinnServer;

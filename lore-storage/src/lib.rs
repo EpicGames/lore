@@ -98,6 +98,7 @@ pub use hash::hash_slice;
 pub use hash::hash_string;
 pub use hash::hash_string_bytes;
 // Re-export store traits
+pub use immutable_store::CorrelationHold;
 pub use immutable_store::ImmutableStore;
 pub use immutable_store::StoreError;
 pub(crate) use immutable_store::payload_is_content;

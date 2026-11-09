@@ -3,12 +3,27 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
+use bytes::Bytes;
+use lore_base::error::Disconnected;
+use lore_base::error::NotAuthorized;
+use lore_base::error::NotFound;
+use lore_base::error::Oversized;
+use lore_base::error::SlowDown;
+use lore_base::types::Address;
+use lore_base::types::Fragment;
+use lore_base::types::Hash;
+use lore_base::types::HealResult;
+use lore_base::types::VerifyResult;
+use zerocopy::FromBytes;
+
 use super::QuicOpCode;
 use super::UnknownCommand;
 use super::command_header::CommandHeader;
+use crate::error::ProtocolError;
 
 mod auth;
 pub mod client;
+pub(crate) mod sessions;
 
 pub const MAX_CHUNK_SIZE: usize = lore_base::types::FRAGMENT_SIZE_THRESHOLD
     + size_of::<CommandHeader>()
@@ -106,6 +121,27 @@ impl Display for Command {
     }
 }
 
+/// The error a storage command reports when it fails with `error`.
+pub(crate) fn command_error(command: &Command, error: super::QuicClientError) -> ProtocolError {
+    use super::QuicClientError;
+    match error {
+        QuicClientError::SlowDown => ProtocolError::from(SlowDown),
+        QuicClientError::NotAuthorized => ProtocolError::from(NotAuthorized),
+        QuicClientError::NotFound => ProtocolError::from(NotFound),
+        QuicClientError::Oversized => ProtocolError::from(Oversized {
+            context: format!(
+                "{}: server rejected oversized fragment",
+                command_name(command)
+            ),
+        }),
+        QuicClientError::Terminated => ProtocolError::from(Disconnected),
+        other => ProtocolError::internal(format!(
+            "{}: Failed sending command: {other}",
+            command_name(command)
+        )),
+    }
+}
+
 pub fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Authorize => "authorize",
@@ -174,4 +210,111 @@ impl Display for QueryStatus {
             }
         )
     }
+}
+
+/// The fragment at the front of an `operation` response, leaving `payload` holding what follows it,
+/// which must be that fragment's payload.
+pub(crate) fn read_fragment(
+    payload: &mut Bytes,
+    operation: &str,
+) -> Result<Fragment, ProtocolError> {
+    let Ok((fragment, _)) = Fragment::read_from_prefix(payload) else {
+        return Err(ProtocolError::internal(format!(
+            "{operation}: Invalid server response"
+        )));
+    };
+    bytes::Buf::advance(payload, size_of::<Fragment>());
+    if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+        return Err(ProtocolError::internal(format!(
+            "{operation}: invalid fragment {fragment:?}: {reason}"
+        )));
+    }
+    if payload.len() != fragment.size_payload as usize {
+        return Err(ProtocolError::internal(format!(
+            "{operation}: Invalid server payload for fragment {fragment:?}, got {} bytes",
+            payload.len()
+        )));
+    }
+    Ok(fragment)
+}
+
+/// The hash an `operation` response holds, which is all it holds.
+pub(crate) fn read_hash(payload: &Bytes, operation: &str) -> Result<Hash, ProtocolError> {
+    if payload.len() != size_of::<Hash>() {
+        return Err(ProtocolError::internal(format!(
+            "{operation}: Invalid server response, expected {} bytes got {}",
+            size_of::<Hash>(),
+            payload.len()
+        )));
+    }
+    Ok(Hash::from(&payload[..]))
+}
+
+/// The resolved hash and the fragment at the front of a `get_resolved` response, leaving `payload`
+/// holding what follows them, which must be that fragment's payload.
+pub(crate) fn read_resolved(payload: &mut Bytes) -> Result<(Hash, Fragment), ProtocolError> {
+    let prefix = size_of::<Hash>() + size_of::<Fragment>();
+    if payload.len() < prefix {
+        return Err(ProtocolError::internal(format!(
+            "get_resolved: Invalid server response, expected at least {prefix} bytes got {}",
+            payload.len()
+        )));
+    }
+    let resolved = Hash::from(&payload[..size_of::<Hash>()]);
+    bytes::Buf::advance(payload, size_of::<Hash>());
+    let fragment = read_fragment(payload, "get_resolved")?;
+    Ok((resolved, fragment))
+}
+
+/// The fragment a `get_metadata` response holds, which is all it holds.
+pub(crate) fn read_metadata(payload: &[u8]) -> Result<Fragment, ProtocolError> {
+    Fragment::read_from_bytes(payload).map_err(|_size| {
+        ProtocolError::internal(format!(
+            "get_metadata: expected {} bytes for Fragment, got {}",
+            size_of::<Fragment>(),
+            payload.len()
+        ))
+    })
+}
+
+/// The outcome a `verify` response for `address` holds: whether the fragment is corrupted, then
+/// what healing it did.
+pub(crate) fn read_verify(
+    payload: &[u8],
+    address: &Address,
+) -> Result<VerifyResult, ProtocolError> {
+    let &[corrupted, healed] = payload else {
+        return Err(ProtocolError::internal(format!(
+            "verify: Invalid server payload for address {address}, got {} bytes",
+            payload.len()
+        )));
+    };
+    Ok(VerifyResult {
+        corrupted: corrupted != 0,
+        healed: HealResult::from(healed),
+    })
+}
+
+/// Most addresses one `query` request carries.
+const MAX_QUERY_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
+
+/// Refuses a `query` of `count` addresses, more than one request carries.
+pub(crate) fn check_query_batch(count: usize) -> Result<(), ProtocolError> {
+    if count > MAX_QUERY_BATCH {
+        return Err(ProtocolError::internal(format!(
+            "query: Invalid address batch count: {count}"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a `query` response that holds other than one status for each of `count` addresses.
+pub(crate) fn check_query_statuses(payload: &[u8], count: usize) -> Result<(), ProtocolError> {
+    if payload.len() != count {
+        return Err(ProtocolError::internal(format!(
+            "query: Server returned query payload of wrong size, expected {count} got {}",
+            payload.len()
+        )));
+    }
+    Ok(())
 }

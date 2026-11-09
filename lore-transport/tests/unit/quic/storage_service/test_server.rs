@@ -513,7 +513,7 @@ async fn hold_faulted(
 
 /// The authorization a session start presents, after its action, partition, correlation id and
 /// the authorization's length.
-fn presented_authorization(request: &[u8]) -> String {
+pub(crate) fn presented_authorization(request: &[u8]) -> String {
     let length_at = 18 + usize::from(request[17]);
     let length = usize::from(u16::from_le_bytes([
         request[length_at],

@@ -41,6 +41,13 @@ from lore import Lore, lore_test_env
 
 logger = logging.getLogger(__name__)
 
+# The tests fork a child for every lore they run, while gRPC may serve or call
+# in this process. With fork support on, gRPC restarts its poller in each child,
+# and on macOS the poller logs to the child's stderr before it execs, which the
+# tests read as the command's output. No test uses gRPC in a forked child. gRPC
+# reads the setting when it first initializes, after this module is imported.
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
+
 
 def pytest_addoption(parser):
     """

@@ -233,6 +233,12 @@ The product, the system, the project, and the open-source project. Capital `L` w
 
 ## M
 
+### Machine server
+
+A Lore server on a build machine that serves the containers on that machine, each through a socket of its own: it caches their content on the machine's disk, writes content through to the upstream, and forwards their other requests, unchanged, to the hosts they name. A container names it in a `lore-unix://<upstream host>/<repository>` remote URL.
+
+Also see: upstream, remote.
+
 ### Merge revision
 
 A revision with two parents instead of one, recording both parent state hashes; its tree combines the two parent trees. Lore produces a merge revision when reconciling divergent branch history, including by sync.
@@ -368,6 +374,16 @@ A merge that uses a common ancestor revision plus the two revisions being merged
 
 For more information, see:
 Three-way merge <https://en.wikipedia.org/wiki/Merge_(version_control)>
+
+## U
+
+### Upstream
+
+The remote that another Lore server, such as a machine server, reaches through a `remote` store: it reads the content it lacks from there and writes content through to it.
+
+Compare to: remote.
+
+Also see: machine server.
 
 ## V
 

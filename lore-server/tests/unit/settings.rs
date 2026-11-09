@@ -55,6 +55,29 @@ fn server_settings_default_the_local_store_monitor_table() {
     );
 }
 
+/// A `remote` store opens four storage connections to its upstream unless `[server]` names another
+/// count.
+#[test]
+fn server_settings_default_four_upstream_connections() {
+    let default: ServerSettings = toml::from_str("").expect("[server] with no keys");
+    let named: ServerSettings =
+        toml::from_str("upstream_connections = 2").expect("[server] naming a count");
+
+    assert_eq!(default.upstream_connections, 4);
+    assert_eq!(named.upstream_connections, 2);
+}
+
+/// Each socket limit that `[server.uds]` does not name takes its default.
+#[test]
+fn uds_settings_default_limits_of_their_own() {
+    let uds: UdsSettings = toml::from_str("enabled = true").expect("[server.uds] with defaults");
+
+    assert_eq!(uds.credits, 4000);
+    assert_eq!(uds.credit_bytes, 256 * 1024 * 1024);
+    assert_eq!(uds.max_connections_per_socket, 64);
+    assert_eq!(uds.socket_bytes, 1024 * 1024 * 1024);
+}
+
 #[test]
 fn local_store_monitor_keys_are_optional_one_by_one() {
     let settings: LocalStoreMonitorSettings = toml::from_str(

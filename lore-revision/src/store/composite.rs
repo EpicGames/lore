@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashSet;
+use std::convert::Infallible;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::pin::Pin;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use opentelemetry::metrics::Gauge;
@@ -20,6 +23,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_base::runtime::DetachingJoinSet;
+use lore_base::types::HealResult;
 use lore_error_set::prelude::*;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::claim_for_task;
@@ -59,6 +63,7 @@ use crate::store::StoreMatchResult;
 use crate::store::composite::replica_factory::ReplicaFactory;
 use crate::store::composite::topology_refresh::TopologyRefreshSubscription;
 use crate::store::query_one;
+use crate::util::inflight::InflightGuard;
 use crate::util::inflight::InflightOutput;
 use crate::util::inflight::RequestRole;
 
@@ -433,6 +438,7 @@ impl CompositeStoreBuilder {
                 counter_get_metadata_inflight_receiver: provider
                     .counter("get_metadata.inflight.receiver"),
                 counter_local_caching: provider.counter("local.caching_total"),
+                caching: Arc::new(CachingGauges::new(&provider)),
 
                 provider,
             },
@@ -453,11 +459,73 @@ struct CompositeCopyBehavior {
     supplied: Option<(Fragment, Bytes)>,
 }
 
+/// A write to the local store of a result the durable store or a replica served.
+struct LocalFill {
+    store: Arc<dyn ImmutableStore>,
+    /// The command's claim on the local store, joined in the reading task.
+    joined: Option<lore_storage::local::store_lock::StoreGuard>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    payload: Option<Bytes>,
+    counter: Counter<u64>,
+    /// Counts the write, and the payload it holds, until it ends.
+    caching: CachingWrite,
+}
+
+/// The guard of a read in flight, keyed by its partition and address.
+type InflightGetGuard = InflightGuard<InflightGetsKey, Result<CompositeGetOutput, StoreError>>;
+
+impl LocalFill {
+    /// Writes the result to the local store, holding `hold` until the write ends.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn run(self, hold: InflightGetGuard) -> impl Future<Output = Result<(), StoreError>> + Send {
+        async move {
+            // Named, as the block takes only the fields it names: the count ends with the write.
+            let caching = self.caching;
+            let _claim = claim_for_task(&self.store, self.joined).await;
+            let put_result = self
+                .store
+                .put(
+                    self.partition,
+                    self.address,
+                    self.fragment,
+                    self.payload,
+                    false,
+                )
+                .await;
+            count_result("put_after_get", &self.counter, &put_result);
+            drop(caching);
+            drop(hold);
+            put_result
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CompositeGetOutput {
     get_data: StoreGetData,
     /// The local store answered the read, or a write of the result to it has been spawned.
     local_cache_will_be_warm: bool,
+}
+
+/// `output` without the content a check on receipt expanded, as a read that arrives while `output`
+/// is written to the local store gets it: such a read expands the payload itself where it needs the
+/// content.
+fn without_content(output: &CompositeGetOutput) -> CompositeGetOutput {
+    let data = &output.get_data;
+    CompositeGetOutput {
+        get_data: StoreGetData {
+            fragment: data.fragment,
+            match_made: data.match_made,
+            partition: data.partition,
+            payload: data.payload.clone(),
+            content: None,
+        },
+        local_cache_will_be_warm: output.local_cache_will_be_warm,
+    }
 }
 
 /// A store that is able to propagate read and write operations to local, durable and replica stores.
@@ -602,6 +670,17 @@ impl CompositeStore {
 
     pub fn durable(&self) -> Arc<dyn ImmutableStore> {
         self.durable.target.clone()
+    }
+
+    /// The payload writes to the local tier in flight and the bytes they hold, as the gauges
+    /// last recorded them.
+    #[lore_macro::test_pub]
+    fn caching(&self) -> (u64, u64) {
+        let gauges = &self.instruments.caching;
+        (
+            gauges.writes.load(Ordering::Relaxed),
+            gauges.bytes.load(Ordering::Relaxed),
+        )
     }
 
     pub async fn set_topology_subscription(
@@ -796,14 +875,16 @@ impl CompositeStore {
         operation
     }
 
-    /// `durable_confirmed` is set by a caller that already knows the durable store holds this
-    /// address, so the local copy is recorded durable whichever store answers.
+    /// The result of a read the local store missed, from the durable store or a replica, and the
+    /// write of that result to the local store, for the caller to start. `durable_confirmed` is
+    /// set by a caller that already knows the durable store holds this address, so the local copy
+    /// is recorded durable whichever store answers.
     async fn get_from_remotes(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
         durable_confirmed: bool,
-    ) -> Result<CompositeGetOutput, StoreError> {
+    ) -> Result<(CompositeGetOutput, Option<LocalFill>), StoreError> {
         let mut fan_out = pin!(
             self.fan_out_read(
                 |store| async move {
@@ -829,41 +910,44 @@ impl CompositeStore {
             };
             match query_result {
                 Ok(result) => {
-                    let mut local_cache_will_be_warm = false;
-                    if !self.local_durable {
+                    let fill = (!self.local_durable).then(|| {
+                        let store = self.local.store();
+                        let fragment = result.inner().fragment;
+                        let mut flags = fragment.flags | FragmentFlags::PayloadStoredLocal;
                         // A replica is not this composite's durable store, so its answer keeps the
                         // durable bit the replica reported. Marking it durable here would let
                         // eviction drop a copy that the durable store may never have held.
-                        let is_durable =
-                            durable_confirmed || matches!(result, CompositeStoreHit::Durable(_));
-                        let local_store = self.local.store();
-                        let mut fragment = result.inner().fragment;
-                        let cache_payload = if self.local_metadata_only {
+                        if durable_confirmed || matches!(result, CompositeStoreHit::Durable(_)) {
+                            flags |= FragmentFlags::PayloadStoredDurable;
+                        }
+                        let payload = if self.local_metadata_only {
                             None
                         } else {
                             result.inner().payload.clone()
                         };
-                        let cache_counter = self.instruments.counter_local_caching.clone();
-                        local_cache_will_be_warm = true;
-                        let joined = local_store.try_join_claim();
-                        lore_spawn!(async move {
-                            let _claim = claim_for_task(&local_store, joined).await;
-                            fragment.flags |= FragmentFlags::PayloadStoredLocal;
-                            if is_durable {
-                                fragment.flags |= FragmentFlags::PayloadStoredDurable;
-                            }
-                            let put_result = local_store
-                                .put(partition, address, fragment, cache_payload, false)
-                                .await;
-                            count_result("put_after_get", &cache_counter, &put_result);
-                            put_result
-                        });
-                    }
-                    return Ok(CompositeGetOutput {
-                        get_data: result
-                            .into_counted_result::<StoreError>(&self.instruments.counter_get)?,
-                        local_cache_will_be_warm,
+                        LocalFill {
+                            joined: store.try_join_claim(),
+                            store,
+                            partition,
+                            address,
+                            fragment: Fragment { flags, ..fragment },
+                            caching: self
+                                .instruments
+                                .caching
+                                .start(payload.as_ref().map_or(0, Bytes::len)),
+                            payload,
+                            counter: self.instruments.counter_local_caching.clone(),
+                        }
                     });
+                    let Ok(get_data) =
+                        result.into_counted_result::<Infallible>(&self.instruments.counter_get);
+                    return Ok((
+                        CompositeGetOutput {
+                            get_data,
+                            local_cache_will_be_warm: fill.is_some(),
+                        },
+                        fill,
+                    ));
                 }
                 Err(StoreError::SlowDown(_)) => {
                     error_to_return = StoreError::from(SlowDown);
@@ -996,7 +1080,8 @@ impl CompositeStore {
                         // A put already found the local store short of a full match, and the
                         // durable store has just accepted the copy, so a read adds nothing. The
                         // put's own fragment is the one describing its bytes; the durable copy's
-                        // representation can differ (e.g. compressed there, uncompressed here).
+                        // representation can differ (for example, compressed there, uncompressed
+                        // here).
                         (fragment, Some(payload), true)
                     } else {
                         // Our local store might not have the source content to copy into the
@@ -1077,8 +1162,11 @@ impl CompositeStore {
         Ok(())
     }
 
-    /// See [`Self::get_from_remotes`] for `durable_confirmed`. A caller that joins a read already
-    /// in flight gets that read's outcome, and the local copy keeps that read's durable bit.
+    /// A read the local store misses is made once for every caller of its partition and address:
+    /// callers arriving while it is in flight wait for its result, and those arriving while its
+    /// result is written to the local store take that result [`without_content`]. Such a caller
+    /// gets that read's outcome, and the local copy keeps that read's durable bit. See
+    /// [`Self::get_from_remotes`] for `durable_confirmed`.
     async fn get_implementation(
         self: Arc<Self>,
         partition: Partition,
@@ -1101,11 +1189,26 @@ impl CompositeStore {
 
         match self.inflight_gets.request((partition, address)) {
             RequestRole::RequestMaker(guard) => {
-                let result = self
+                match self
                     .clone()
                     .get_from_remotes(partition, address, durable_confirmed)
-                    .await;
-                guard.broadcast(&result);
+                    .await
+                {
+                    Ok((output, Some(fill))) => {
+                        let held = Ok(without_content(&output));
+                        let result = Ok(output);
+                        lore_spawn!(fill.run(guard.broadcast_and_hold(&result, held)));
+                        result
+                    }
+                    result => {
+                        let result = result.map(|(output, _)| output);
+                        guard.broadcast(&result);
+                        result
+                    }
+                }
+            }
+            RequestRole::Ready(result) => {
+                self.instruments.counter_get_inflight_receiver.add(1, &[]);
                 result
             }
             RequestRole::ResultAwaiter(mut receiver) => {
@@ -1141,6 +1244,44 @@ impl ImmutableStore for CompositeStore {
 
     fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
         self.local.target.try_join_claim()
+    }
+
+    /// Heals the local tier's copy, and then the durable store's, which the local tier was filled
+    /// from. A read's write of `address` to the local tier ends first, so the local check sees the
+    /// copy that write leaves: a payload the durable store served corrupt is dropped, not kept to
+    /// be served again. Healed if either store healed its copy.
+    async fn heal(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<HealResult, StoreError> {
+        self.clone().settle(partition, address).await;
+        let local = self
+            .local
+            .target
+            .clone()
+            .heal(partition, address)
+            .await
+            .unwrap_or_else(|err| {
+                lore_warn!("Healing the local copy of {address} failed: {err}");
+                HealResult::Failed
+            });
+        let durable = self.durable.target.clone().heal(partition, address).await?;
+        Ok(match (local, durable) {
+            (HealResult::Healed, _) | (_, HealResult::Healed) => HealResult::Healed,
+            (HealResult::Failed, _) | (_, HealResult::Failed) => HealResult::Failed,
+            _ => HealResult::NotAttempted,
+        })
+    }
+
+    /// Waits for a read's write of `address` to the local tier, which runs after the read returns.
+    async fn settle(self: Arc<Self>, partition: Partition, address: Address) {
+        self.inflight_gets.settled(&(partition, address)).await;
+    }
+
+    /// The hold of the durable store, which the composite's misses and writes reach.
+    fn hold_correlation(&self, correlation_id: &str) -> Option<lore_storage::CorrelationHold> {
+        self.durable.target.hold_correlation(correlation_id)
     }
 
     fn store_lock(&self) -> Option<Arc<lore_storage::local::store_lock::StoreLock>> {
@@ -1348,6 +1489,7 @@ impl ImmutableStore for CompositeStore {
                 guard.broadcast(&result);
                 result
             }
+            RequestRole::Ready(result) => result,
             RequestRole::ResultAwaiter(mut receiver) => {
                 self.instruments
                     .counter_get_metadata_inflight_receiver
@@ -1447,6 +1589,10 @@ impl ImmutableStore for CompositeStore {
             };
             fragment.flags |= FragmentFlags::PayloadStoredLocal;
             let cache_counter = self.instruments.counter_local_caching.clone();
+            let caching = self
+                .instruments
+                .caching
+                .start(local_payload.as_ref().map_or(0, Bytes::len));
             let joined = local.try_join_claim();
             lore_spawn!(async move {
                 let _claim = claim_for_task(&local, joined).await;
@@ -1454,6 +1600,7 @@ impl ImmutableStore for CompositeStore {
                     .put(partition, address, fragment, local_payload, force)
                     .await;
                 count_result("put", &cache_counter, &put_result);
+                drop(caching);
                 put_result
             });
         }
@@ -1666,4 +1813,57 @@ struct CompositeStoreInstruments {
     counter_get_inflight_receiver: Counter<u64>,
     counter_get_metadata_inflight_receiver: Counter<u64>,
     counter_local_caching: Counter<u64>,
+    caching: Arc<CachingGauges>,
+}
+
+/// The payload writes to the local tier in flight, detached from the reads and puts that started
+/// them, and the payload bytes they hold, as the `local.caching_in_progress` and
+/// `local.caching_bytes` gauges report them.
+#[derive(Debug)]
+struct CachingGauges {
+    writes: AtomicU64,
+    bytes: AtomicU64,
+    in_progress: Gauge<u64>,
+    held: Gauge<u64>,
+}
+
+impl CachingGauges {
+    fn new(provider: &CompositeStoreInstrumentProvider) -> Self {
+        Self {
+            writes: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            in_progress: provider.gauge("local.caching_in_progress"),
+            held: provider.gauge("local.caching_bytes"),
+        }
+    }
+
+    /// Counts a write holding `bytes` of payload until the returned guard drops.
+    fn start(self: &Arc<Self>, bytes: usize) -> CachingWrite {
+        let bytes = bytes as u64;
+        let writes = self.writes.fetch_add(1, Ordering::Relaxed) + 1;
+        let held = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.in_progress.record(writes, &[]);
+        self.held.record(held, &[]);
+        CachingWrite {
+            gauges: self.clone(),
+            bytes,
+        }
+    }
+}
+
+/// A payload write to the local tier, counted in [`CachingGauges`] while it lives.
+#[derive(Debug)]
+struct CachingWrite {
+    gauges: Arc<CachingGauges>,
+    bytes: u64,
+}
+
+impl Drop for CachingWrite {
+    fn drop(&mut self) {
+        let gauges = &self.gauges;
+        let writes = gauges.writes.fetch_sub(1, Ordering::Relaxed) - 1;
+        let held = gauges.bytes.fetch_sub(self.bytes, Ordering::Relaxed) - self.bytes;
+        gauges.in_progress.record(writes, &[]);
+        gauges.held.record(held, &[]);
+    }
 }

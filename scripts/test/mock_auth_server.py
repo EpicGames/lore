@@ -455,6 +455,12 @@ class MockAuthServer:
             self._rules.insert(0, rule)
         return rule
 
+    def remove(self, rule: _Rule) -> None:
+        """Drop `rule`, which `on` returned, so the rules registered before it
+        answer its requests again."""
+        with self._lock:
+            self._rules.remove(rule)
+
     def reset(self) -> None:
         """Drop every rule and record. Health checks answer unconditionally,
         registered here so even they are visible as a rule."""

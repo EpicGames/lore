@@ -234,7 +234,8 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service.
   Read from `LORE_ACCESS_TOKEN` when omitted. Unsafe: a value given here is visible to other users in the process table
   and is kept in the shell history
-* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10; always
+  1 when `LORE_UDS_SOCKET` names a socket)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations

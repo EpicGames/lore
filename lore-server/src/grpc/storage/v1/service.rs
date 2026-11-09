@@ -121,6 +121,7 @@ impl StorageServiceV1 for LoreStorageService {
             request,
             self.repository_authorizer(),
             self.local_immutable_store().clone(),
+            self.immutable_store().clone(),
         )
         .await
     }

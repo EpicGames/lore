@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::Weak;
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -13,36 +11,21 @@ use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
 use crossbeam_epoch as epoch;
-use crossbeam_epoch::Atomic;
-use crossbeam_epoch::Guard;
-use crossbeam_epoch::Owned;
-use futures::FutureExt;
-use futures::future::Map;
-use futures::future::Shared;
 use lore_base::error::Disconnected;
-use lore_base::error::NotAuthorized;
-use lore_base::error::NotFound;
-use lore_base::error::Oversized;
-use lore_base::error::SlowDown;
 use lore_base::lore_debug;
-use lore_base::lore_spawn_net;
 use lore_base::lore_trace;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
-use lore_base::types::HealResult;
 use lore_base::types::KeyType;
 use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
 use lore_error_set::prelude::*;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
-use tokio::task::JoinError;
-use tokio::task::JoinHandle;
 use zerocopy::IntoBytes;
 
-use super::super::QuicClientError;
 use super::super::QuicOpCode;
 use super::super::client::AuthAdapter;
 use super::super::client::BoundSession;
@@ -61,8 +44,21 @@ use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
+use super::check_query_batch;
+use super::check_query_statuses;
+use super::read_fragment;
+use super::read_hash;
+use super::read_metadata;
+use super::read_resolved;
+use super::read_verify;
+use super::sessions;
+use super::sessions::Authorizer;
+use super::sessions::IssueSession;
+use super::sessions::Session;
+use super::sessions::Sessions;
+use super::sessions::session_start_payload;
+use super::sessions::started_session_id;
 use crate::auth::AuthEndpoint;
-use crate::auth::exchange::unsigned_identity_tokens;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
@@ -79,10 +75,7 @@ pub struct StorageClient {
     remote_url: String,
     transport_config: TransportConfig,
     auth_adapter: Arc<dyn AuthAdapter<ErrorType = ProtocolError>>,
-    auth_endpoint: AuthEndpoint,
-    recipient_domain: String,
-    identity: String,
-    credentials: Arc<SuppliedCredentials>,
+    authorizer: Authorizer,
     partition: Partition,
     counter: AtomicUsize,
     quic: Arc<QuicConnection>,
@@ -90,161 +83,8 @@ pub struct StorageClient {
     command_limit: Semaphore,
     sent: AtomicUsize,
     sessions: Sessions,
-    /// This client, for the task that issues a session again ([`StorageClient::rebind`]).
+    /// This client, for the task that issues a session again ([`sessions::rebind`]).
     this: Weak<StorageClient>,
-}
-
-/// A session a [`StorageClient`] hands out: what the server issues it for, and the id the server
-/// knows it by on a connection.
-struct Session {
-    id: u32,
-    partition: Partition,
-    correlation_id: Box<str>,
-    /// The session as the server issued it ([`BoundSession::pack`]), so a command reads its id and
-    /// connection at once.
-    bound: AtomicU64,
-    /// The generation of the connection the latest request issuing this session went to, which the
-    /// id the server answers belongs to.
-    issuing: AtomicU32,
-    /// Held by the task issuing the session again, or by a stop while it takes the session from
-    /// the table, so a stop never overlaps an issue.
-    rebinding: Semaphore,
-    /// The task issuing the session again on the connection of the generation it names, which
-    /// every command that finds the session stale there while it runs awaits.
-    reissue: parking_lot::Mutex<Option<(u32, Reissue)>>,
-}
-
-/// The outcome of the task issuing a session again ([`issued`]).
-type Reissue = Shared<
-    Map<
-        JoinHandle<Result<(), ProtocolError>>,
-        fn(Result<Result<(), ProtocolError>, JoinError>) -> Result<(), ProtocolError>,
-    >,
->;
-
-/// The outcome of the task issuing a session again, or an internal error where it ended without
-/// one.
-fn issued(joined: Result<Result<(), ProtocolError>, JoinError>) -> Result<(), ProtocolError> {
-    joined.unwrap_or_else(|_| {
-        Err(ProtocolError::internal(
-            "session issue ended without outcome",
-        ))
-    })
-}
-
-/// The error of a command on a session the client does not hold.
-fn not_open(session_id: u32) -> ProtocolError {
-    ProtocolError::internal(format!("session {session_id} is not open"))
-}
-
-impl Session {
-    fn bound(&self) -> BoundSession {
-        BoundSession::unpack(self.bound.load(Ordering::Relaxed))
-    }
-}
-
-/// The sessions a [`StorageClient`] handed out, sorted by id. Every command reads the table, and
-/// does so without a lock; a session start or stop, rare beside the commands, replaces it whole.
-#[derive(Default)]
-struct Sessions {
-    issued: Atomic<Vec<Arc<Session>>>,
-    next: AtomicU32,
-}
-
-impl Sessions {
-    /// A session for `partition` and `correlation_id`, bound to no connection, under a new id.
-    fn open(&self, partition: Partition, correlation_id: &str) -> Arc<Session> {
-        let session = Arc::new(Session {
-            id: self.next.fetch_add(1, Ordering::Relaxed) + 1,
-            partition,
-            correlation_id: correlation_id.into(),
-            bound: AtomicU64::new(
-                BoundSession {
-                    id: 0,
-                    generation: NO_GENERATION,
-                }
-                .pack(),
-            ),
-            issuing: AtomicU32::new(NO_GENERATION),
-            rebinding: Semaphore::new(1),
-            reissue: parking_lot::Mutex::new(None),
-        });
-        self.replace(|issued| {
-            let at = issued.partition_point(|held| held.id < session.id);
-            let mut opened = Vec::with_capacity(issued.len() + 1);
-            opened.extend_from_slice(&issued[..at]);
-            opened.push(session.clone());
-            opened.extend_from_slice(&issued[at..]);
-            Some((opened, ()))
-        });
-        session
-    }
-
-    /// The session `id` names, held while `guard` is.
-    fn find<'g>(&self, id: u32, guard: &'g Guard) -> Option<&'g Arc<Session>> {
-        // SAFETY: a table is freed only by `replace`, deferred past every reader pinned when it was
-        // unlinked, or by `drop`, which no reader outlives.
-        let issued = unsafe { self.issued.load(Ordering::Acquire, guard).as_ref() }?;
-        let at = issued
-            .binary_search_by_key(&id, |session| session.id)
-            .ok()?;
-        Some(&issued[at])
-    }
-
-    fn get(&self, id: u32) -> Option<Arc<Session>> {
-        self.find(id, &epoch::pin()).cloned()
-    }
-
-    fn remove(&self, id: u32) -> Option<Arc<Session>> {
-        self.replace(|issued| {
-            let at = issued
-                .binary_search_by_key(&id, |session| session.id)
-                .ok()?;
-            let mut kept = issued.to_vec();
-            let removed = kept.remove(at);
-            Some((kept, removed))
-        })
-    }
-
-    /// Replaces the table with the one `edit` makes of it, making it again from the table another
-    /// replacement put in place first; a table `edit` makes none of stays as it is.
-    fn replace<R>(
-        &self,
-        mut edit: impl FnMut(&[Arc<Session>]) -> Option<(Vec<Arc<Session>>, R)>,
-    ) -> Option<R> {
-        let guard = epoch::pin();
-        let mut current = self.issued.load(Ordering::Acquire, &guard);
-        loop {
-            // SAFETY: as in `find`.
-            let issued = unsafe { current.as_ref() }.map_or(&[][..], Vec::as_slice);
-            let (replacement, edited) = edit(issued)?;
-            match self.issued.compare_exchange(
-                current,
-                Owned::new(replacement),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                &guard,
-            ) {
-                Ok(_) => {
-                    if !current.is_null() {
-                        // SAFETY: unlinked above; a reader still pinned on it holds it until
-                        // its guard drops.
-                        unsafe { guard.defer_destroy(current) };
-                        guard.flush();
-                    }
-                    return Some(edited);
-                }
-                Err(raced) => current = raced.current,
-            }
-        }
-    }
-}
-
-impl Drop for Sessions {
-    fn drop(&mut self) {
-        // SAFETY: `drop` holds the only reference, so no reader is pinned on the table.
-        drop(unsafe { std::mem::take(&mut self.issued).try_into_owned() });
-    }
 }
 
 impl Drop for StorageClient {
@@ -279,10 +119,7 @@ impl StorageClient {
             remote_url: remote_url.to_string(),
             transport_config,
             auth_adapter,
-            auth_endpoint: auth_endpoint.clone(),
-            recipient_domain: recipient_domain.to_string(),
-            identity: identity.to_string(),
-            credentials: credentials.clone(),
+            authorizer: Authorizer::new(auth_endpoint, recipient_domain, identity, credentials),
             partition,
             quic: Arc::new(quic),
             connection_establish: Semaphore::new(1),
@@ -375,121 +212,31 @@ impl StorageClient {
         Ok(storage)
     }
 
-    /// The authorization a session start for `partition` presents, read at each start because the
-    /// server checks storage authorization there: an access token the newest call supplied, as it
-    /// is, or the authorization the newest credentials exchange for, which the cache or the token
-    /// store may serve. For a server without authentication, the unsigned token naming the
-    /// identity that [`unsigned_identity_tokens`] gives. Empty when there is none, or after a failed
-    /// exchange.
-    async fn authorization(&self, partition: Partition) -> Authorization {
-        let (identity_token, access_token) = self.credentials.tokens();
-        if self.auth_endpoint.is_none() {
-            return Authorization {
-                token: unsigned_identity_tokens(
-                    &self.auth_endpoint,
-                    &self.identity,
-                    &identity_token,
-                    &access_token,
-                )
-                .map(|(_, token, _)| token)
-                .unwrap_or_default(),
-                exchanged_with: None,
-            };
-        }
-        let (_, token, _) = crate::auth::exchange::auth_exchange(
-            &self.auth_endpoint,
-            &self.recipient_domain,
-            &self.identity,
-            partition,
-            &identity_token,
-            &access_token,
-        )
-        .await;
-        Authorization {
-            token,
-            exchanged_with: access_token.is_empty().then_some(identity_token),
-        }
+    /// The commands holding the last issue of the session `session_id` names: the handles to it
+    /// beside the session's own.
+    #[cfg(feature = "test-util")]
+    pub fn awaiting_issue(&self, session_id: u32) -> usize {
+        self.sessions.awaiting_issue(session_id)
+    }
+}
+
+impl IssueSession for StorageClient {
+    fn authorizer(&self) -> &Authorizer {
+        &self.authorizer
     }
 
-    /// Issues `session` on the current connection, authorized for its partition.
-    async fn issue(&self, session: &Session) -> Result<(), ProtocolError> {
-        let authorization = self.authorization(session.partition).await;
-        self.issue_presenting(session, authorization).await
+    fn sessions(&self) -> &Sessions {
+        &self.sessions
     }
 
-    /// Issues `session` presenting `authorization`, and once more with a new authorization should
-    /// the server refuse an exchanged one. Its own future, so that what it holds is not held beside
-    /// the exchange that produced `authorization`.
-    async fn issue_presenting(
-        &self,
-        session: &Session,
-        authorization: Authorization,
-    ) -> Result<(), ProtocolError> {
-        let Authorization {
-            token,
-            exchanged_with,
-        } = authorization;
-        match (self.send_issue(session, &token).await, exchanged_with) {
-            (Err(refusal), Some(identity_token))
-                if refusal.is_not_authorized() && !token.is_empty() =>
-            {
-                Box::pin(self.issue_reauthorized(session, token, identity_token, refusal)).await
-            }
-            (issued, _) => issued,
-        }
+    fn upgrade(&self) -> Option<Arc<Self>> {
+        self.this.upgrade()
     }
 
-    /// Issues the session the server refused once more, with a new authorization in place of
-    /// `refused`, which was exchanged with `identity_token`. Cold: only after the server refused an
-    /// exchanged authorization.
-    ///
-    /// The cache would serve `refused` until it expires, so it is forgotten first, and the
-    /// exchange then serves an authorization another caller put in its place, or asks the auth
-    /// service for another. A refusal of the new authorization is final, and so is `refusal` when
-    /// the exchange yields none, or `refused` again.
-    async fn issue_reauthorized(
-        &self,
-        session: &Session,
-        refused: String,
-        identity_token: String,
-        refusal: ProtocolError,
-    ) -> Result<(), ProtocolError> {
-        let partition = session.partition;
-        lore_debug!("Session start for {partition} refused its authorization; exchanging another");
-        crate::auth::exchange::forget_refused_authorization(
-            &self.auth_endpoint,
-            &self.identity,
-            partition,
-            &self.recipient_domain,
-            &identity_token,
-            &refused,
-        )
-        .await;
-        let authorization = self.authorization(partition).await;
-        if authorization.token.is_empty() || authorization.token == refused {
-            return Err(refusal);
-        }
-        self.send_issue(session, &authorization.token).await
+    fn is_live(&self, bound: BoundSession) -> bool {
+        bound.generation == self.quic.generation()
     }
 
-    /// Asks the server to start `session` presenting `token`, and binds it to the id the server
-    /// answers on the connection the request went to.
-    async fn send_issue(&self, session: &Session, token: &str) -> Result<(), ProtocolError> {
-        let payload = session_start_payload(session.partition, &session.correlation_id, token);
-        let response = send_normal_with_reconnect(self, Command::Authorize, session.id, || {
-            [Bytes::default(), payload.clone()]
-        })
-        .await?;
-        let id = started_session_id(&response)?;
-        let generation = session.issuing.load(Ordering::Relaxed);
-        session
-            .bound
-            .store(BoundSession { id, generation }.pack(), Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Stops the session `bound` names on the connection it is bound to, and on no other, where
-    /// its id names another session or none.
     async fn stop(&self, bound: BoundSession) {
         if !self.quic.has_streams().await {
             return;
@@ -504,119 +251,15 @@ impl StorageClient {
         .await;
     }
 
-    /// Issues the session `session_id` names again on the current connection, unless it is bound
-    /// to it already. The issue runs as a task of its own ([`reissue`](Self::reissue)), which every
-    /// command that finds the session stale on the same connection while it runs awaits for its
-    /// outcome, and which runs to its end when they are dropped.
-    async fn rebind(&self, session_id: u32) -> Result<(), ProtocolError> {
-        let running = {
-            let session = self
-                .sessions
-                .get(session_id)
-                .ok_or_else(|| not_open(session_id))?;
-            let generation = self.quic.generation();
-            if session.bound().generation == generation {
-                return Ok(());
-            }
-            let mut reissue = session.reissue.lock();
-            match &*reissue {
-                Some((issuing, running)) if *issuing == generation && running.peek().is_none() => {
-                    running.clone()
-                }
-                _ => {
-                    let client = self.this.upgrade().ok_or_else(|| not_open(session_id))?;
-                    let running = lore_spawn_net!(client.reissue(session.clone()))
-                        .map(issued as fn(_) -> _)
-                        .shared();
-                    *reissue = Some((generation, running.clone()));
-                    running
-                }
-            }
-        };
-        running.await
+    async fn send_issue(&self, session: &Session, token: &str) -> Result<(), ProtocolError> {
+        let payload = session_start_payload(session.partition, &session.correlation_id, token);
+        let response = send_normal_with_reconnect(self, Command::Authorize, session.id, || {
+            [Bytes::default(), payload.clone()]
+        })
+        .await?;
+        session.bind(started_session_id(&response)?);
+        Ok(())
     }
-
-    /// The commands holding the last issue of the session `session_id` names: the handles to it
-    /// beside the session's own.
-    #[cfg(feature = "test-util")]
-    pub fn awaiting_issue(&self, session_id: u32) -> usize {
-        let Some(session) = self.sessions.get(session_id) else {
-            return 0;
-        };
-        let reissue = session.reissue.lock();
-        reissue
-            .as_ref()
-            .and_then(|(_, running)| running.strong_count())
-            .map_or(0, |handles| handles - 1)
-    }
-
-    /// Issues `session` again on the current connection once no stop or other issue of it runs,
-    /// unless a stop took it from the table or an issue bound it to the current connection first.
-    async fn reissue(self: Arc<Self>, session: Arc<Session>) -> Result<(), ProtocolError> {
-        let _rebinding = session.rebinding.acquire().await;
-        if self.sessions.find(session.id, &epoch::pin()).is_none() {
-            return Err(not_open(session.id));
-        }
-        if session.bound().generation == self.quic.generation() {
-            return Ok(());
-        }
-        self.issue(&session).await
-    }
-}
-
-/// Takes the session it names out of its table when dropped, unless the start that opened it
-/// succeeded, so a start that fails or is cancelled leaves no entry in the table.
-struct Opening<'a> {
-    sessions: &'a Sessions,
-    id: u32,
-    started: bool,
-}
-
-impl Drop for Opening<'_> {
-    fn drop(&mut self) {
-        if !self.started {
-            self.sessions.remove(self.id);
-        }
-    }
-}
-
-/// The authorization a session start presents, with the identity token it was exchanged with,
-/// both from one reading of the credentials, so a refusal is judged by what produced the
-/// authorization and not by credentials a later call supplied meanwhile.
-#[derive(Default)]
-struct Authorization {
-    token: String,
-    /// The identity token `token` was exchanged with, empty where the token store supplied the
-    /// credentials. `None` where there is nothing to exchange again, whose refusal is final:
-    /// `token` is an access token the caller supplied, or the server has no authentication.
-    exchanged_with: Option<String>,
-}
-
-/// The payload of a session start for `partition` presenting `token`:
-/// `action(1=0) + partition_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)`.
-fn session_start_payload(partition: Partition, correlation_id: &str, token: &str) -> Bytes {
-    let token_bytes = token.as_bytes();
-    let corr_bytes = correlation_id.as_bytes();
-    let mut payload =
-        BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
-    payload.put_u8(0);
-    payload.extend_from_slice(partition.as_bytes());
-    payload.put_u8(corr_bytes.len() as u8);
-    payload.extend_from_slice(corr_bytes);
-    payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
-    payload.extend_from_slice(token_bytes);
-    payload.freeze()
-}
-
-/// The id of the session a session start's `response` names.
-fn started_session_id(response: &[u8]) -> Result<u32, ProtocolError> {
-    let Ok(session_id) = <[u8; 4]>::try_from(response) else {
-        return Err(ProtocolError::internal(format!(
-            "session_start: expected 4-byte response, got {} bytes",
-            response.len()
-        )));
-    };
-    Ok(u32::from_le_bytes(session_id))
 }
 
 impl ServiceClient for StorageClient {
@@ -660,23 +303,9 @@ impl ServiceClient for StorageClient {
                 }
                 ProtocolError::from(Disconnected)
             }
-            SendWithReconnectError::ClientError(client_error) => match client_error {
-                QuicClientError::SlowDown => ProtocolError::from(SlowDown),
-                QuicClientError::NotAuthorized => ProtocolError::from(NotAuthorized),
-                QuicClientError::NotFound => ProtocolError::from(NotFound),
-                QuicClientError::Oversized => ProtocolError::from(Oversized {
-                    context: format!(
-                        "{}: server rejected oversized fragment",
-                        storage_service::command_name(&failed_request)
-                    ),
-                }),
-                _ => {
-                    let name = storage_service::command_name(&failed_request);
-                    ProtocolError::internal(format!(
-                        "{name}: Failed sending command: {client_error}"
-                    ))
-                }
-            },
+            SendWithReconnectError::ClientError(client_error) => {
+                storage_service::command_error(&failed_request, client_error)
+            }
         }
     }
 
@@ -701,7 +330,7 @@ impl ServiceClient for StorageClient {
         if request_type == Command::Authorize {
             let generation = self.quic.generation();
             if let Some(session) = session {
-                session.issuing.store(generation, Ordering::Relaxed);
+                session.issue_on(generation);
             }
             return BoundSession { id: 0, generation };
         }
@@ -723,7 +352,7 @@ impl ServiceClient for StorageClient {
         if request_type == Command::Authorize {
             return Ok(());
         }
-        self.rebind(session_id).await
+        sessions::rebind(self, session_id, self.quic.generation()).await
     }
 }
 
@@ -734,29 +363,11 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
-        let session = self.sessions.open(partition, correlation_id);
-        let mut opening = Opening {
-            sessions: &self.sessions,
-            id: session.id,
-            started: false,
-        };
-        self.issue(&session).await?;
-        opening.started = true;
-        Ok(session.id)
+        sessions::start(self, partition, correlation_id).await
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
-        let bound = {
-            let Some(session) = self.sessions.get(session_id) else {
-                return Ok(());
-            };
-            let _rebinding = session.rebinding.acquire().await;
-            self.sessions.remove(session_id).map(|_| session.bound())
-        };
-        if let Some(bound) = bound {
-            self.stop(bound).await;
-        }
-        Ok(())
+        sessions::stop(self, session_id).await
     }
 
     async fn get(
@@ -769,25 +380,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() < size_of::<Fragment>() {
-            return Err(ProtocolError::internal("get: Invalid server response"));
-        }
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let fragment = read_fragment(&mut payload, "get")?;
         Ok((fragment, payload))
     }
 
@@ -812,32 +405,7 @@ impl Storage for StorageClient {
             })
             .await?;
 
-        let prefix = size_of::<Hash>() + size_of::<Fragment>();
-        if payload.len() < prefix {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: Invalid server response, expected at least {prefix} bytes got {}",
-                payload.len()
-            )));
-        }
-
-        let resolved_bytes = payload.split_to(size_of::<Hash>());
-        let resolved = Hash::from(&resolved_bytes[..]);
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let (resolved, fragment) = read_resolved(&mut payload)?;
         Ok((resolved, fragment, payload))
     }
 
@@ -851,16 +419,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Fragment>() {
-            return Err(ProtocolError::internal(format!(
-                "get_metadata: expected {} bytes for Fragment, got {}",
-                size_of::<Fragment>(),
-                payload.len()
-            )));
-        }
-
-        let fragment = unsafe { payload.as_ptr().cast::<Fragment>().read_unaligned() };
-        Ok(fragment)
+        read_metadata(&payload)
     }
 
     async fn get_priority(
@@ -873,25 +432,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() < size_of::<Fragment>() {
-            return Err(ProtocolError::internal("get: Invalid server response"));
-        }
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let fragment = read_fragment(&mut payload, "get")?;
         Ok((fragment, payload))
     }
 
@@ -938,13 +479,8 @@ impl Storage for StorageClient {
     }
 
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        const MAX_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
         let address_count = address.len();
-        if address_count > MAX_BATCH {
-            return Err(ProtocolError::internal(format!(
-                "query: Invalid address batch count: {address_count}"
-            )));
-        }
+        check_query_batch(address_count)?;
 
         // Allocate a copy on the heap to avoid lifetime issues
         let address = Bytes::copy_from_slice(address.as_bytes());
@@ -953,14 +489,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != address_count {
-            return Err(ProtocolError::internal(format!(
-                "query: Server returned query payload of wrong size, expected {} got {}",
-                address_count,
-                payload.len()
-            )));
-        }
-
+        check_query_statuses(&payload, address_count)?;
         Ok(payload)
     }
 
@@ -981,18 +510,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        // Response should be 2 bytes: corrupted + healed
-        if payload.len() != 2 {
-            return Err(ProtocolError::internal(format!(
-                "verify: Invalid server payload for address {address}, got {} bytes",
-                payload.len()
-            )));
-        }
-
-        Ok(VerifyResult {
-            corrupted: payload[0] != 0,
-            healed: HealResult::from(payload[1]),
-        })
+        read_verify(&payload, address)
     }
 
     async fn copy(
@@ -1032,15 +550,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Hash>() {
-            return Err(ProtocolError::internal(format!(
-                "mutable_load: Invalid server response, expected {} bytes got {}",
-                size_of::<Hash>(),
-                payload.len()
-            )));
-        }
-
-        Ok(Hash::from(&payload[..]))
+        read_hash(&payload, "mutable_load")
     }
 
     async fn mutable_store(
@@ -1081,15 +591,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Hash>() {
-            return Err(ProtocolError::internal(format!(
-                "mutable_cas: Invalid server response, expected {} bytes got {}",
-                size_of::<Hash>(),
-                payload.len()
-            )));
-        }
-
-        Ok(Hash::from(&payload[..]))
+        read_hash(&payload, "mutable_cas")
     }
 
     async fn close(&self) {

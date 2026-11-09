@@ -152,9 +152,10 @@ pub fn size_threads_for_relaying() {
 
 /// Sizes this process's thread pools for a command that opens `connections` storage
 /// connections to its remote, 0 for the default of one: a network thread for each connection, up
-/// to half of the async and network threads together, taken from the async threads. A configured
-/// network thread count takes precedence. Returns false, and changes nothing, once a runtime
-/// exists, as in a process that relays its calls, or once a count was set.
+/// to half of the async and network threads together, taken from the async threads. A process
+/// that names the machine server's socket opens one, whatever it asks for. A configured network
+/// thread count takes precedence. Returns false, and changes nothing, once a runtime exists, as in
+/// a process that relays its calls, or once a count was set.
 ///
 /// Call it before the first Lore operation, and before building a runtime of your own.
 pub fn size_threads_for_connections(connections: u32) -> bool {
@@ -165,14 +166,16 @@ pub fn size_threads_for_connections(connections: u32) -> bool {
 
 /// Sizes this process's thread pools for running the service: as many network threads as
 /// [`size_threads_for_connections`] gives the most storage connections a command opens to a
-/// remote, added to the async threads rather than taken from them. The service carries the
-/// commands of many callers at once, and can't know in advance how many connections they will ask
-/// for.
+/// remote, one for a service that names the machine server's socket, added to the async threads
+/// rather than taken from them. The service carries the commands of many callers at once, and
+/// can't know in advance how many connections they will ask for.
 ///
 /// Call it before the first Lore operation, and before building a runtime of your own.
 pub fn size_threads_for_service() -> bool {
     size_threads_for(NetConnections::Served(
-        lore_transport::connection::MAX_STORAGE_CONNECTIONS,
+        lore_transport::connection::storage_connection_count(
+            lore_transport::connection::MAX_STORAGE_CONNECTIONS,
+        ),
     ))
 }
 

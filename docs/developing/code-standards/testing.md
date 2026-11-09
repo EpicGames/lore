@@ -435,6 +435,37 @@ service process, so the client relaying to it blocks until the per-test timeout
 kills the worker. A machine without the driver should deselect the tests with
 `-m "smoke and not swfs"`.
 
+### Running the machine server's container tests
+
+The tests in `test_uds_containers.py` run a machine server with a container on
+each of its sockets. They run on Linux only, and skip unless both of these hold:
+
+- `docker` is on `PATH` and reaches the Docker daemon as the user running the
+  tests.
+- `LORE_UDS_CONTAINER_IMAGE` names a Docker image present locally, such as
+  `ubuntu:26.04`. The suite does not pull it. The containers run the `lore` and
+  `uds-bench` binaries built on the host from a read-only mount, so the image
+  must be able to run them.
+
+The tests also need the `uds-bench` example of `lore-server`, and fail without
+it. The example builds only with the crate's `uds-bench` feature, so test and
+clippy runs leave it out. The tests take it from `examples/uds-bench` beside the
+client binary, where Cargo builds it, or from the path `LORE_UDS_BENCH_BINARY`
+names. `LORE_UDS_CONTAINERS`
+sets how many containers reach the machine server through `LORE_UDS_SOCKET`, 8
+by default and at least 2. One more container mounts a socket without the
+variable.
+
+```bash
+cargo build --release -p lore-client -p lore-server --bin lore --bin loreserver
+cargo build --release -p lore-server --features uds-bench --example uds-bench
+LORE_UDS_CONTAINER_IMAGE=ubuntu:26.04 uv run pytest scripts/test/test_uds_containers.py \
+    --lore-client-binary=release --lore-server-binary=release
+```
+
+The tests carry the `slow` marker and share one rig of servers and containers,
+which their `xdist_group` keeps on one worker.
+
 ### Running every test through one service
 
 `LORE_TEST_SHARED_SERVICE=1` starts one service from the build under test before

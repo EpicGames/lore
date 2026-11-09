@@ -20,19 +20,31 @@ use crate::errors::is_refusal;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
 
-// Bridge the connect() function to maintain the 3-argument signature.
-pub async fn connect(
+/// A connection to `remote_url` as `identity` for `repository`: one the connection cache holds, or
+/// one newly opened that asks for the execution's count of storage connections.
+pub fn connect<'a>(
+    remote_url: &'a str,
+    identity: &'a str,
+    repository: crate::lore::RepositoryId,
+) -> impl Future<Output = Result<Arc<Connection>, ProtocolError>> + 'a {
+    connect_over(remote_url, identity, repository, None)
+}
+
+/// [`connect`], asking for `storage_connections` storage connections where it opens a new
+/// connection, or for the execution's count where `None`.
+async fn connect_over(
     remote_url: &str,
     identity: &str,
     repository: crate::lore::RepositoryId,
-) -> Result<std::sync::Arc<lore_transport::Connection>, lore_transport::ProtocolError> {
+    storage_connections: Option<usize>,
+) -> Result<Arc<Connection>, ProtocolError> {
     let execution = crate::lore::execution_context();
     let globals = execution.globals();
     let connection = lore_transport::connect(
         remote_url,
         identity,
         repository,
-        globals.max_connections as usize,
+        storage_connections.unwrap_or(globals.max_connections as usize),
         globals.identity_token(),
         globals.access_token(),
         globals.auth_mode,
@@ -51,15 +63,20 @@ pub async fn connect(
 pub struct RemoteConnections {
     remote_url: Arc<str>,
     identity: Arc<str>,
+    /// The storage connections a connect asks for where it opens a new connection, or the
+    /// execution's count where `None`.
+    storage_connections: Option<usize>,
     connect: Connect,
     connections: parking_lot::Mutex<HashMap<RepositoryId, Remote>>,
 }
 
-/// How [`RemoteConnections`] opens a connection to its remote, as its identity, for a repository.
+/// How [`RemoteConnections`] connects to its remote, as its identity, for a repository, asking for
+/// its storage connections.
 pub type Connect = fn(
     Arc<str>,
     Arc<str>,
     RepositoryId,
+    Option<usize>,
 ) -> BoxFuture<'static, Result<Arc<Connection>, ProtocolError>>;
 
 /// A connect shared by every caller awaiting it.
@@ -108,11 +125,22 @@ impl RemoteConnections {
         Self {
             remote_url: Arc::from(remote_url.into()),
             identity: Arc::from(identity.unwrap_or_default()),
-            connect: |remote_url, identity, repository| {
-                async move { connect(&remote_url, &identity, repository).await }.boxed()
+            storage_connections: None,
+            connect: |remote_url, identity, repository, storage_connections| {
+                async move {
+                    connect_over(&remote_url, &identity, repository, storage_connections).await
+                }
+                .boxed()
             },
             connections: parking_lot::Mutex::default(),
         }
+    }
+
+    /// These connections, each connect asking for `storage_connections` storage connections rather
+    /// than the execution's count where it opens a new connection.
+    pub fn connecting_over(mut self, storage_connections: usize) -> Self {
+        self.storage_connections = Some(storage_connections);
+        self
     }
 
     /// Connections to no remote, each opened by `connect`.
@@ -203,6 +231,7 @@ impl RemoteConnections {
                         self.remote_url.clone(),
                         self.identity.clone(),
                         repository,
+                        self.storage_connections,
                     ));
                     connections.insert(
                         repository,

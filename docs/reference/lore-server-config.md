@@ -89,6 +89,7 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
 | `server.trust_unsigned_identity` | `false` | Without `[server.auth]`, take the caller's identity from an unsigned bearer token on gRPC, HTTP and QUIC. See [Unsigned identity](#unsigned-identity). The server refuses to start if it is set beside `[server.auth]`. |
+| `server.upstream_connections` | `4` | Storage connections the server opens to the [upstream](../glossary.md#upstream) of a `remote` immutable or mutable store for each identity it authenticates there as (see [Remote store mode](#remote-store-mode)), from `1` to `10`; `0` reads as `1`. The connections belong to the upstream and the identity, not to a repository: every repository the server reaches there as that identity shares them, as do its QUIC, gRPC and socket handlers. |
 
 ### Advertised endpoints
 
@@ -478,6 +479,68 @@ Without `[server.auth]`, the server records every caller as `<unknown>`, so a lo
 
 The identity names the caller and grants nothing: permissions stay as described above for a server without `[server.auth]`. Any caller can claim any identity, and hooks receive the token's `is_service_account` claim as given. No caller holds `owner` or `admin`, so only a caller naming the lock's owner can release it: `lore --identity <owner> lock release <path>`. A lock that a client without an identity took is owned by `<unknown>`.
 
+### Container sockets
+
+`[server.uds]` serves the containers of one machine over stream sockets in the filesystem, one socket per container: Unix domain sockets on Linux and macOS, and `AF_UNIX` sockets on Windows. A server that does so is the machine's [machine server](../glossary.md#machine-server); [Run a machine server for containers](../how-to/run-a-machine-server-for-containers.md) sets one up. A client reaches a socket through a `lore-unix://<upstream host>/<repository>` remote, with `LORE_UDS_SOCKET` naming the socket (see the [Lore CLI configuration reference](lore-cli-config.md#environment-variables)). A connection that opens with the storage handshake speaks the storage protocol, and the server answers it from its stores with the same storage service as `[server.quic]`. A connection that opens with the HTTP/2 client preface carries gRPC over plaintext HTTP/2, which the server forwards to the host each request names (see [Forwarded gRPC](#forwarded-grpc)). The server closes a connection that opens with neither. The table does nothing unless it sets `enabled = true`.
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `enabled` | `false` | Whether to serve the sockets. |
+| `sockets` | `[]` | Socket paths, one per container, each in a directory bind-mounted into its container. A relative path resolves against the server's working directory. See [Socket files](#socket-files). |
+| `socket_mode` | `0o666` | Permission bits of each socket file on Unix. On Windows, a mode that lets others write (`0o002`) lets the machine's users connect to the socket; otherwise the socket keeps what its directory grants. |
+| `credits` | `4000` | Requests a connection may have in handling. The server states it in its handshake, and a client never has more requests outstanding. |
+| `credit_bytes` | `268435456` | Bytes a connection may hold (256 MiB): its request bodies in handling, the largest response, `262480` bytes, for each read (`Get`, `GetResolved`) in handling, and its responses the socket has not taken yet. The server states it in its handshake. |
+| `max_connections_per_socket` | `64` | Connections a socket holds at once, storage and gRPC alike, which the container's processes share. The server closes a connection past the limit as it accepts it. A closed connection counts until its requests in handling finish. |
+| `socket_bytes` | `1073741824` | Bytes all of a socket's connections may hold together (1 GiB): request bodies of `4096` bytes or more in handling, the largest response for each read in handling, and responses not yet written. Smaller request bodies count against their connection's `credits` and `credit_bytes` only, so a socket may have up to `max_connections_per_socket` times `credits` of those requests in handling, `256000` by default. |
+| `handler_timeout_seconds` | `50` | Longest the server handles one storage request before it answers `SlowDown`, from `1` to `65535`. The server states it in its handshake. |
+| `forward` | `{}` | Hosts gRPC is forwarded to: a table from the host name a request names to the URL the server reaches that host at. See [Forwarded gRPC](#forwarded-grpc). |
+
+When a connection reaches `credits`, `credit_bytes` or `socket_bytes`, the server stops reading it until a handler finishes or a response is written, and the socket's own buffer holds the client back. The server never answers `SlowDown` for these limits.
+
+The server closes a connection whose first four bytes, or the rest of its storage handshake or HTTP/2 client preface after them, take more than 5 seconds to arrive. It also closes a storage connection whose client takes none of its responses for 30 seconds. No setting changes either bound.
+
+At the shutdown signal, the server stops accepting on its sockets and closes every socket connection, storage and gRPC alike, as it closes its QUIC connections. Requests still in handling get no response. A client reconnects with back-off once a server answers on the socket again, and sends a request the closed connection failed once more.
+
+With `enabled = true`, the server refuses to start unless all of these hold:
+
+- `[server.auth]` is set, since the sockets verify every token.
+- The authorizer grants per partition: `[environment.endpoint] auth_url` is set, or `[server.auth] resource_claim` is (Tier 2). `GlobalGrantsAuthorizer` (Tier 1) lets every authenticated caller reach every partition, so the sockets refuse it.
+- `sockets` names at least one path.
+- `handler_timeout_seconds` is from `1` to `65535`.
+- Every key in `forward` is a bare host name, with no scheme or port, and every value is a valid URL.
+
+An empty `forward` starts the server with a warning: its containers then reach no host over gRPC, so they can't clone or push.
+
+Whatever its configuration, the server refuses to start with `LORE_UDS_SOCKET` set in its own environment: the variable would send the server's own gRPC, such as a `remote` store's calls to its upstream, into a socket (see the [Lore CLI configuration reference](lore-cli-config.md#environment-variables)). An empty value reads as unset.
+
+The server raises a value below its floor instead of refusing it: `credits` to `1`, `credit_bytes` and `socket_bytes` to `524960`, twice the largest message body, and `max_connections_per_socket` to `1`. It lowers `credits` above `1048575` to `1048575`.
+
+#### Socket files
+
+For each path in `sockets`, the server:
+
+- Creates the socket's directory when it is missing. On Unix it leaves the directory's permissions to the operator. On Windows a directory it creates lets only SYSTEM, the Administrators and its owner change it, and the machine's users list and traverse it; the server refuses an existing directory that another account owns or may change.
+- Claims the path with a lock file beside the socket, `<socket>.lock`, and refuses a path that another server has claimed or answers on. The lock file stays after the server stops.
+- Removes whatever file is at the path once nothing answers on it, a socket or not, so a `sockets` entry must name a path that holds no other file. Then binds a new socket at the path and applies `socket_mode` to it.
+- Removes the socket file when it stops.
+
+A socket the server cannot claim or bind stops the server.
+
+#### Forwarded gRPC
+
+A client that names a socket sends every gRPC request through it, with the host it would have dialed as the request's authority: the upstream, its authentication service, and each service endpoint the upstream advertises. `forward` maps each such host name, without its port and compared without regard to case, to the URL the server reaches it at, so it names every one of them. Each socket reaches each host over a connection of its own, with TLS for an `https` URL, so a container that stops reading a response holds up no other container's requests. It answers a request for a host the table does not name with `PERMISSION_DENIED`, and a request it cannot deliver with `UNAVAILABLE`. A request's metadata, its token included, passes through unchanged: the server verifies no token on gRPC, and the host it forwards to authorizes the caller.
+
+```toml
+# Also needs [server.auth] and an authorizer that grants per partition; see above.
+[server.uds]
+enabled = true
+sockets = ["/var/run/lore/build-1/lore.sock", "/var/run/lore/build-2/lore.sock"]
+
+[server.uds.forward]
+"lore.example.com" = "https://lore.example.com:41337"
+"auth.example.com" = "https://auth.example.com"
+```
+
 ## Store settings
 
 Lore Server keeps three stores: an immutable store for content-addressed fragments, a mutable store for branch pointers, and a lock store for distributed locking. Each is configured by a top-level table — `[immutable_store]`, `[mutable_store]`, `[lock_store]` — whose `mode` field selects the backend.
@@ -509,9 +572,27 @@ Each mode reads its settings from a matching sub-table. The `local` mode uses `[
 | `compaction_parallel_groups` | `8` | immutable | Number of compaction groups processed in parallel. |
 
 > [!NOTE]
-> The `composite` mode layers a local cache tier over a durable plugin tier (for example, a local cache in front of S3). It reads `[immutable_store.composite.local]` and `[immutable_store.composite.durable]`, where the durable tier names a plugin mode such as `aws`. Composite and replicated store internals are out of scope here.
+> The `composite` mode layers a local cache tier over a durable plugin tier (for example, a local cache in front of S3). It reads `[immutable_store.composite.local]` and `[immutable_store.composite.durable]`, where the durable tier names a plugin mode such as `aws`, or `remote` (see [Remote store mode](#remote-store-mode)). Composite and replicated store internals are out of scope here.
 
 The lock store's `local` mode takes no sub-table — it uses an in-process, in-memory lock store (a single in-memory map) with no fields to configure. Because it lives entirely within one server process, it coordinates locks only on that node; distributed locking across a multi-node cluster requires a plugin backend such as `aws` (DynamoDB).
+
+### Remote store mode
+
+The `remote` mode keeps a store at another Lore server, the upstream, which the server reaches as a client does: the immutable store reads and writes content there, and the mutable store loads and stores mutable keys there, but lists none. `[immutable_store] mode = "remote"` reads `[immutable_store.remote]`, `[mutable_store] mode = "remote"` reads `[mutable_store.remote]`, and a composite store's durable tier in `remote` mode reads `[immutable_store.composite.durable.remote]`. The server refuses to start in `remote` mode without the table. How many storage connections it opens to the upstream follows `server.upstream_connections` (see [Server and endpoint settings](#server-and-endpoint-settings)).
+
+| Field | Default | Applies to | Description |
+| --- | --- | --- | --- |
+| `remote_url` | required | both | URL of the upstream as a client names it, without a repository, for example `lores://lore.example.com:41337`. |
+| `verify` | `false` | immutable | Whether the store checks each payload the upstream serves against its address, decoding and hashing it. When `false`, the store trusts the upstream and checks only a payload's sizes. Either way, a client checks each payload it fetches from the server against its address, except a client that trusts its remote (`--trust-remote`, or `trust_remote` or `skip_verify` through the C API), which checks only the sizes. A client that finds a payload corrupt asks the server to heal it: the server drops its own copy only if that copy is corrupt, and asks the upstream to heal only where its own copy was corrupt or missing. |
+| `auth_url` | none | immutable | Despite its name, the identity the store authenticates at the upstream as, not a URL. The server uses the login stored for that identity in the token store of the user it runs as. When unset, the store uses the first identity stored there that the upstream accepts. The `remote` mutable store ignores the field and always uses that first identity. |
+
+```toml
+[mutable_store]
+mode = "remote"
+
+[mutable_store.remote]
+remote_url = "lores://lore.example.com:41337"
+```
 
 ## Topology settings
 

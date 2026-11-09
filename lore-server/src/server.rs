@@ -845,6 +845,7 @@ impl QuicPublicStreamHandler {
                         local_store.clone(),
                         mutable_store.clone(),
                         user_agent_filter.clone(),
+                        crate::protocol::storage::session::SessionMap::default(),
                     );
                     Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
                         as Box<dyn StreamDataHandler>
@@ -960,7 +961,7 @@ async fn configure_immutable_store_via_plugin(
                 .as_ref()
                 .ok_or(anyhow!("Missing remote immutable store settings"))?;
 
-            configure_remote_immutable_store(remote_settings)
+            configure_remote_immutable_store(remote_settings, settings.server.upstream_connections)
         }
         _ => {
             // All other modes use the plugin system
@@ -1001,7 +1002,7 @@ async fn configure_mutable_store_via_plugin(
                 .as_ref()
                 .ok_or(anyhow!("Missing remote mutable store settings"))?;
 
-            configure_remote_mutable_store(remote_settings)
+            configure_remote_mutable_store(remote_settings, settings.server.upstream_connections)
         }
         store_mode::REPLICATED => Err(anyhow!("replicated mutable store is not implemented")),
         store_mode::COMPOSITE => Err(anyhow!(
@@ -1429,16 +1430,18 @@ async fn configure_local_mutable_store(
 
 fn configure_remote_immutable_store(
     settings: &RemoteStoreSettings,
+    upstream_connections: u32,
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!(
         "Wiring up remote immutable store to {}",
         settings.remote_url
     );
 
-    Ok(Arc::new(RemoteImmutableStore::new(
-        settings.remote_url.as_str(),
-        settings.auth_url.as_deref(),
-    )))
+    Ok(Arc::new(
+        RemoteImmutableStore::new(settings.remote_url.as_str(), settings.auth_url.as_deref())
+            .verifying(settings.verify)
+            .connecting_over(upstream_connections as usize),
+    ))
 }
 
 async fn configure_replicated_immutable_store(
@@ -1503,16 +1506,19 @@ async fn configure_replicated_immutable_store(
     Ok(store)
 }
 
-fn configure_remote_mutable_store(settings: &RemoteStoreSettings) -> Result<Arc<dyn MutableStore>> {
+fn configure_remote_mutable_store(
+    settings: &RemoteStoreSettings,
+    upstream_connections: u32,
+) -> Result<Arc<dyn MutableStore>> {
     info!("Wiring up remote mutable store to {}", settings.remote_url);
 
     // TODO(mjansson): Identity handling
     let identity = None::<&str>;
 
-    Ok(Arc::new(RemoteMutableStore::new(
-        settings.remote_url.as_str(),
-        identity,
-    )))
+    Ok(Arc::new(
+        RemoteMutableStore::new(settings.remote_url.as_str(), identity)
+            .connecting_over(upstream_connections as usize),
+    ))
 }
 
 async fn configure_composite_store(
@@ -1653,7 +1659,10 @@ async fn configure_composite_substore(
                 .as_ref()
                 .ok_or(anyhow!("Missing composite remote store settings"))?;
 
-            configure_remote_immutable_store(remote_settings)
+            configure_remote_immutable_store(
+                remote_settings,
+                global_settings.server.upstream_connections,
+            )
         }
         store_mode::COMPOSITE => Err(anyhow!(
             "Composite store not supported as a composite substore"
@@ -1925,6 +1934,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (mut settings, settings_hash) = settings;
+    crate::uds::refuse_socket_route(lore_transport::uds::route())?;
     let runtime = runtime();
     let telemetry = settings.telemetry.clone().unwrap_or_default();
     let metrics_config = telemetry.metrics.clone().unwrap_or_default();
@@ -2178,6 +2188,27 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             None
         };
 
+    // The machine server's container sockets, claimed and bound before any endpoint serves. A
+    // socket serves cached content to whoever holds a token for it, so it verifies every token
+    // and runs only under an authorizer that tells partitions apart.
+    let uds_sockets = match settings.server.uds.clone() {
+        Some(uds_settings) if uds_settings.enabled && !is_maintenance => {
+            let Some(jwt_verifier) = jwt_verifier.clone() else {
+                anyhow::bail!(
+                    "[server.uds] requires [server.auth]: the sockets verify every token"
+                );
+            };
+            crate::uds::check_settings(
+                &uds_settings,
+                settings.server.auth.as_ref(),
+                auth_url.as_deref(),
+            )?;
+            let bound = crate::uds::bind_sockets(&uds_settings).await?;
+            Some((uds_settings, bound, jwt_verifier))
+        }
+        _ => None,
+    };
+
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
 
@@ -2399,6 +2430,29 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 shutdown_rx,
             )
         });
+    }
+
+    if let Some((uds_settings, bound, jwt_verifier)) = uds_sockets {
+        let immutable_store = immutable_store.clone();
+        let local_immutable_store = local_store().unwrap_or_else(|| immutable_store.clone());
+        let mutable_store = mutable_store.clone();
+        let repository_authorizer = repository_authorizer.clone();
+        let user_agent_filter = user_agent_filter.clone();
+        let shutdown_rx = _shutdown_rx.clone();
+        lore_spawn!(
+            endpoints,
+            crate::uds::launch_uds_server(
+                uds_settings,
+                bound,
+                immutable_store,
+                local_immutable_store,
+                mutable_store,
+                jwt_verifier,
+                repository_authorizer,
+                user_agent_filter,
+                shutdown_rx,
+            )
+        );
     }
 
     // the internal-only QUIC server. Hosts the ReplicationStoreService —

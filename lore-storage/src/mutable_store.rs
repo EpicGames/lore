@@ -7,6 +7,7 @@ use async_trait::async_trait;
 
 use crate::Hash;
 use crate::Partition;
+use crate::immutable_store::CorrelationHold;
 use crate::immutable_store::StoreError;
 use crate::local::store_lock::StoreGuard;
 use crate::store_types::KeyType;
@@ -42,6 +43,12 @@ pub trait MutableStore: Send + Sync {
     /// [`crate::immutable_store::claim_for_task`] describes. A wrapper delegates it as it
     /// delegates [`Self::hold_for_command`].
     fn try_join_claim(&self) -> Option<StoreGuard> {
+        None
+    }
+
+    /// Keeps what this store holds for calls under `correlation_id`, as
+    /// [`crate::ImmutableStore::hold_correlation`] describes.
+    fn hold_correlation(&self, _correlation_id: &str) -> Option<CorrelationHold> {
         None
     }
 

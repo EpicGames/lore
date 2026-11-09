@@ -22,9 +22,12 @@ prost-types = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 crossbeam-epoch = { workspace = true }
+crossbeam-queue = { workspace = true }
+crossbeam-utils = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+hyper-util = { workspace = true, features = ["tokio"] }
 parking_lot = { workspace = true }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
@@ -46,6 +49,19 @@ url = { workspace = true }
 webpki-roots = { workspace = true }
 zerocopy = { workspace = true }
 lore-macro = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(target_family = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 axum = { workspace = true }

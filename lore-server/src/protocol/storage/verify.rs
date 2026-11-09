@@ -54,6 +54,10 @@ impl Verify {
     }
 }
 
+/// Checks `local_store`'s copy of `address` and, where `heal_flag` asks, drops a corrupt one. A
+/// heal of a copy that is corrupt or missing also asks `store` to heal its own, so a payload the
+/// client refetches is sound. A write of the address to `local_store` that a read through `store`
+/// started ends first, so the check sees the copy it leaves.
 pub async fn handle_verify(
     address: Address,
     heal_flag: u8,
@@ -61,6 +65,7 @@ pub async fn handle_verify(
     correlation_id: String,
     user_id: String,
     local_store: Arc<dyn ImmutableStore>,
+    store: Arc<dyn ImmutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let heal = heal_flag != 0;
@@ -75,6 +80,7 @@ pub async fn handle_verify(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            store.clone().settle(repository, address).await;
             let concrete_local_store: Arc<LocalImmutableStore> =
                 {
                     let any_store: Arc<dyn Any + Send + Sync> = local_store;
@@ -107,11 +113,23 @@ pub async fn handle_verify(
                             } else {
                                 HealResult::NotAttempted
                             };
+                            if heal {
+                                heal_beyond_local(store, repository, address).await;
+                            }
                             Ok(LoreResponse::Verify(VerifyResponse { corrupted: 1, healed }))
                         }
                     }
                 }
                 Err(StoreError::AddressNotFound(_)) => {
+                    if heal
+                        && heal_beyond_local(store, repository, address).await
+                            == HealResult::Healed
+                    {
+                        return Ok(LoreResponse::Verify(VerifyResponse {
+                            corrupted: 1,
+                            healed: HealResult::Healed,
+                        }));
+                    }
                     info!(%address, "Fragment verification failed, fragment not found");
                     Err(MessageHandleError::FragmentNotFound)
                 }
@@ -125,14 +143,34 @@ pub async fn handle_verify(
         .await
 }
 
-#[async_trait]
-impl Message for Verify {
+/// Asks `store` to heal its copy of `address` beyond the local one, and answers what it did. A
+/// failure is logged and answered as [`HealResult::Failed`].
+async fn heal_beyond_local(
+    store: Arc<dyn ImmutableStore>,
+    repository: RepositoryId,
+    address: Address,
+) -> HealResult {
+    match store.heal(repository, address).await {
+        Ok(healed) => {
+            debug!(%address, ?healed, "Asked the store beyond the local one to heal");
+            healed
+        }
+        Err(err) => {
+            warn!(%address, error = %err, "Healing beyond the local store failed");
+            HealResult::Failed
+        }
+    }
+}
+
+impl Verify {
+    /// Handles the request on a connection whose session `context` holds, checking
+    /// `local_store`'s copy and healing beyond it in `store`, as [`handle_verify`] does.
     #[tracing::instrument(name = "Verify::handle", skip_all)]
-    async fn handle(
+    pub async fn handle_with(
         &self,
         context: Arc<AttributeMap>,
-        local_immutable_store: Arc<dyn ImmutableStore>,
-        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        local_store: Arc<dyn ImmutableStore>,
+        store: Arc<dyn ImmutableStore>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -144,6 +182,26 @@ impl Message for Verify {
             repository,
             correlation_id.to_string(),
             user_id,
+            local_store,
+            store,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl Message for Verify {
+    /// With the local store alone known, nothing beyond it is healed; the services call
+    /// [`Verify::handle_with`] with the store beyond it.
+    async fn handle(
+        &self,
+        context: Arc<AttributeMap>,
+        local_immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) -> Result<LoreResponse, MessageHandleError> {
+        self.handle_with(
+            context,
+            local_immutable_store.clone(),
             local_immutable_store,
         )
         .await

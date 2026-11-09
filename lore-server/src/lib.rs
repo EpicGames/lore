@@ -20,6 +20,7 @@ pub mod store;
 pub mod telemetry;
 pub mod tls;
 pub mod topology;
+pub mod uds;
 pub mod util;
 
 #[cfg(not(feature = "test-util"))]

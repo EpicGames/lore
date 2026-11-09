@@ -4,14 +4,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use dashmap::DashMap;
+use lore_base::types::HealResult;
 use lore_error_set::prelude::*;
+use lore_storage::ReadOptions;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
+use lore_storage::read::check_receipt;
 use lore_storage::read::heal_on_receipt;
-use lore_storage::read::verify_receipt;
 use lore_transport::Admin;
 use lore_transport::PartitionSessions;
 use lore_transport::ProtocolError;
+use lore_transport::SessionPool;
 use lore_transport::StorageSession;
 
 use super::StoreObliterateStats;
@@ -32,20 +36,22 @@ use crate::store::StoreGetData;
 use crate::store::StoreMatch;
 use crate::store::StoreMatchResult;
 
-/// An immutable store served by a remote over the storage protocol. The remote is an untrusted
-/// source: a payload it serves is checked against its address on receipt.
+/// An immutable store served by a remote over the storage protocol. A payload the remote serves is
+/// checked against its address on receipt, unless the store trusts the remote
+/// ([`verifying`](Self::verifying)).
 pub struct RemoteImmutableStore {
     connections: protocol::RemoteConnections,
-    /// The session pool this store holds for each partition, which its ops under one correlation
-    /// id share.
-    pools: PartitionSessions,
+    pools: Pools,
+    /// How a payload the remote serves is checked on receipt.
+    receipt: ReadOptions,
 }
 
 impl RemoteImmutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
         RemoteImmutableStore {
             connections: protocol::RemoteConnections::new(remote_url, identity),
-            pools: PartitionSessions::default(),
+            pools: Pools::default(),
+            receipt: ReadOptions::default().no_decompress(),
         }
     }
 
@@ -57,8 +63,22 @@ impl RemoteImmutableStore {
     ) -> Self {
         RemoteImmutableStore {
             connections: protocol::RemoteConnections::with_connection(partition, connection),
-            pools: PartitionSessions::default(),
+            pools: Pools::default(),
+            receipt: ReadOptions::default().no_decompress(),
         }
+    }
+
+    /// This store, checking each payload the remote serves against its address where `verify`, or
+    /// otherwise trusting the remote and checking only the payload's sizes ([`check_receipt`]).
+    pub fn verifying(mut self, verify: bool) -> Self {
+        self.receipt.trust_remote = !verify;
+        self
+    }
+
+    /// See [`RemoteConnections::connecting_over`](protocol::RemoteConnections::connecting_over).
+    pub fn connecting_over(mut self, storage_connections: usize) -> Self {
+        self.connections = self.connections.connecting_over(storage_connections);
+        self
     }
 
     /// A session for ops on `partition`, as [`remote_session`] takes it.
@@ -99,14 +119,110 @@ impl RemoteImmutableStore {
     }
 }
 
-/// A session for ops on `partition`, from the pool `pools` holds under the call's correlation id,
+/// The session pools a remote store's calls share. Calls under a correlation id a hold names share
+/// a pool per partition until the last hold on it drops. Calls under any other share the most
+/// recent pool per partition, which a call under another correlation id replaces.
+#[lore_macro::test_pub]
+#[derive(Default)]
+struct Pools {
+    held: Arc<DashMap<Arc<str>, HeldPools>>,
+    recent: PartitionSessions,
+}
+
+/// The pools of one held correlation id, and the holds on it.
+#[lore_macro::test_pub]
+#[derive(Default)]
+struct HeldPools {
+    holds: usize,
+    pools: Vec<(Partition, Arc<SessionPool>)>,
+}
+
+/// A hold on one correlation id's pools, which drops them as the last hold drops.
+#[lore_macro::test_pub]
+struct PoolsHold {
+    held: Arc<DashMap<Arc<str>, HeldPools>>,
+    correlation_id: Arc<str>,
+}
+
+impl Drop for PoolsHold {
+    fn drop(&mut self) {
+        self.held.remove_if_mut(&*self.correlation_id, |_, held| {
+            held.holds -= 1;
+            held.holds == 0
+        });
+    }
+}
+
+impl Pools {
+    /// A hold on the pools of calls under `correlation_id`. A hold on a correlation id already held
+    /// allocates nothing.
+    #[lore_macro::test_pub]
+    #[allow(clippy::disallowed_methods)] // The shard lock is held for the count alone.
+    fn hold(&self, correlation_id: &str) -> PoolsHold {
+        let mut held = self
+            .held
+            .get_mut(correlation_id)
+            .unwrap_or_else(|| self.held.entry(Arc::from(correlation_id)).or_default());
+        held.holds += 1;
+        PoolsHold {
+            held: self.held.clone(),
+            correlation_id: held.key().clone(),
+        }
+    }
+
+    /// The live pool calls under `correlation_id` share for `partition`.
+    #[lore_macro::test_pub]
+    fn get_live(&self, partition: Partition, correlation_id: &str) -> Option<Arc<SessionPool>> {
+        let Some(held) = self.held.get(correlation_id) else {
+            return self.recent.get_live(partition, correlation_id);
+        };
+        held.pools
+            .iter()
+            .find(|(kept, pool)| *kept == partition && is_live(pool))
+            .map(|(_, pool)| pool.clone())
+    }
+
+    /// Keeps `pool`, started for `partition` under `correlation_id`, for later calls to share, and
+    /// returns the pool to use: one a concurrent call kept first for a held correlation id, or
+    /// `pool`. A held pool that went stale, or whose connection did, is replaced by `pool`.
+    #[lore_macro::test_pub]
+    fn keep(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        pool: Arc<SessionPool>,
+    ) -> Arc<SessionPool> {
+        let Some(mut held) = self.held.get_mut(correlation_id) else {
+            self.recent.hold(partition, pool.clone());
+            return pool;
+        };
+        match held.pools.iter_mut().find(|(kept, _)| *kept == partition) {
+            Some((_, kept)) if is_live(kept) => kept.clone(),
+            Some((_, kept)) => {
+                *kept = pool.clone();
+                pool
+            }
+            None => {
+                held.pools.push((partition, pool.clone()));
+                pool
+            }
+        }
+    }
+}
+
+/// Whether `pool` may serve another call: it is not stale and neither is its connection.
+fn is_live(pool: &SessionPool) -> bool {
+    !pool.is_stale() && !pool.connection_is_stale()
+}
+
+/// A session for ops on `partition`, from the pool `pools` keeps under the call's correlation id,
 /// started on the connection `connections` holds for the partition.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 fn remote_session<'a>(
     connections: &'a protocol::RemoteConnections,
-    pools: &'a PartitionSessions,
+    pools: &'a Pools,
     partition: Partition,
 ) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + 'a {
     async move {
@@ -132,8 +248,9 @@ fn remote_session<'a>(
                     connections.remote_url()
                 )
             })?;
-        pools.hold(partition, pool.clone());
-        Ok(pool.pick())
+        Ok(pools
+            .keep(partition, execution.globals().correlation_id.as_str(), pool)
+            .pick())
     }
 }
 
@@ -147,6 +264,13 @@ fn unsupported_as_internal(err: StoreError) -> StoreError {
     err
 }
 
+/// `err`, the remote's answer that it holds nothing at `address`, as `AddressNotFound` chained to
+/// it under `context` at the caller's location.
+#[track_caller]
+fn missing_on_remote(address: Address, err: ProtocolError, context: &str) -> StoreError {
+    StoreError::AddressNotFound(AddressNotFound::from(address).chain_err_from(err, context))
+}
+
 #[async_trait]
 impl store::ImmutableStore for RemoteImmutableStore {
     /// Nothing on disk to claim.
@@ -157,6 +281,11 @@ impl store::ImmutableStore for RemoteImmutableStore {
         lore_storage::StoreError,
     > {
         Ok(None)
+    }
+
+    /// Keeps a session pool per partition for calls under `correlation_id`, as [`Pools`] does.
+    fn hold_correlation(&self, correlation_id: &str) -> Option<lore_storage::CorrelationHold> {
+        Some(Box::new(self.pools.hold(correlation_id)))
     }
 
     /// The peer answers exact addresses only, so nothing it returns can have come from another
@@ -236,10 +365,11 @@ impl store::ImmutableStore for RemoteImmutableStore {
         }
     }
 
-    /// Serves the payload as the remote stored it, with the content its check on receipt expanded
-    /// ([`verify_receipt`]). A payload that fails the check is fetched again once where the remote
-    /// heals it ([`heal_on_receipt`]). It answers `NotSupported` only for a payload this build
-    /// cannot decode ([`unsupported_as_internal`]).
+    /// Serves the payload as the remote stored it, checked on receipt as [`check_receipt`] does:
+    /// against its address, with the content the check expanded, unless the store trusts the
+    /// remote. A payload that fails the check is fetched again once where the remote heals it
+    /// ([`heal_on_receipt`]). An address the remote lacks is answered `AddressNotFound`. It answers
+    /// `NotSupported` only for a payload this build cannot decode ([`unsupported_as_internal`]).
     async fn get(
         self: Arc<Self>,
         partition: Partition,
@@ -251,20 +381,24 @@ impl store::ImmutableStore for RemoteImmutableStore {
             .map_err(unsupported_as_internal)?;
         let mut heal_attempted = false;
         loop {
-            let (fragment, payload) = session
-                .get(&address)
-                .await
-                .forward::<StoreError>("Remote store get failed")
-                .map_err(unsupported_as_internal)?;
-            match verify_receipt(fragment, payload.clone(), address) {
+            let raw = match session.get(&address).await {
+                Err(err @ ProtocolError::NotFound(_)) => {
+                    return Err(missing_on_remote(address, err, "address missing on remote"));
+                }
+                got => got
+                    .forward::<StoreError>("Remote store get failed")
+                    .map_err(unsupported_as_internal)?,
+            };
+            match check_receipt(&raw, address, self.receipt) {
                 // The peer answers exact addresses only, so anything it served was a full match.
                 Ok(content) => {
+                    let (fragment, payload) = raw;
                     return Ok(StoreGetData {
                         fragment,
                         match_made: StoreMatch::MatchFull,
                         partition,
                         payload: Some(payload),
-                        content: Some(content),
+                        content,
                     });
                 }
                 Err(err) => {
@@ -326,7 +460,9 @@ impl store::ImmutableStore for RemoteImmutableStore {
         let admin = self.admin(partition).await?;
         match admin.obliterate(address).await {
             Ok(()) => Ok(()),
-            Err(ProtocolError::NotFound(_)) => Err(AddressNotFound::from(address).into()),
+            Err(err @ ProtocolError::NotFound(_)) => {
+                Err(missing_on_remote(address, err, "address missing on remote"))
+            }
             Err(other) => Err(other).forward("Remote store obliterate failed"),
         }
     }
@@ -360,6 +496,21 @@ impl store::ImmutableStore for RemoteImmutableStore {
         Ok(())
     }
 
+    /// Asks the remote to check its copy of `address` and repair it. A remote that holds no copy of
+    /// `address` answers [`HealResult::NotAttempted`].
+    async fn heal(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<HealResult, StoreError> {
+        let session = self.session(partition).await?;
+        match session.verify(&address, true).await {
+            Ok(verified) => Ok(verified.healed),
+            Err(ProtocolError::NotFound(_)) => Ok(HealResult::NotAttempted),
+            Err(err) => Err(err).forward::<StoreError>("Remote store heal failed"),
+        }
+    }
+
     async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
         // Noop for remote store
         Ok(())
@@ -372,16 +523,14 @@ impl store::ImmutableStore for RemoteImmutableStore {
 
 pub struct RemoteMutableStore {
     connections: protocol::RemoteConnections,
-    /// The session pool this store holds for each partition, which its ops under one correlation
-    /// id share.
-    pools: PartitionSessions,
+    pools: Pools,
 }
 
 impl RemoteMutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
         RemoteMutableStore {
             connections: protocol::RemoteConnections::new(remote_url, identity),
-            pools: PartitionSessions::default(),
+            pools: Pools::default(),
         }
     }
 
@@ -393,8 +542,14 @@ impl RemoteMutableStore {
     ) -> Self {
         RemoteMutableStore {
             connections: protocol::RemoteConnections::with_connection(partition, connection),
-            pools: PartitionSessions::default(),
+            pools: Pools::default(),
         }
+    }
+
+    /// See [`RemoteConnections::connecting_over`](protocol::RemoteConnections::connecting_over).
+    pub fn connecting_over(mut self, storage_connections: usize) -> Self {
+        self.connections = self.connections.connecting_over(storage_connections);
+        self
     }
 
     /// A session for ops on `partition`, as [`remote_session`] takes it.
@@ -418,6 +573,11 @@ impl store::MutableStore for RemoteMutableStore {
         Ok(None)
     }
 
+    /// Keeps a session pool per partition for calls under `correlation_id`, as [`Pools`] does.
+    fn hold_correlation(&self, correlation_id: &str) -> Option<lore_storage::CorrelationHold> {
+        Some(Box::new(self.pools.hold(correlation_id)))
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -426,9 +586,11 @@ impl store::MutableStore for RemoteMutableStore {
     ) -> Result<Hash, StoreError> {
         let session = self.session(partition).await?;
         match session.mutable_load(&key, key_type).await {
-            Err(ProtocolError::NotFound(_)) => Err(StoreError::from(AddressNotFound::from(
+            Err(err @ ProtocolError::NotFound(_)) => Err(missing_on_remote(
                 Address::zero_context_hash(key),
-            ))),
+                err,
+                "key missing on remote",
+            )),
             loaded => loaded.forward("Remote mutable load failed"),
         }
     }

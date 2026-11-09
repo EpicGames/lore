@@ -189,7 +189,7 @@ async fn read_response(
 }
 
 #[lore_macro::test_pub]
-fn handle_error(status: QuicErrorStatus) -> QuicClientError {
+pub(crate) fn handle_error(status: QuicErrorStatus) -> QuicClientError {
     match status {
         x if x == QuicServiceError::SlowDown as u32 => QuicClientError::SlowDown,
         x if x == QuicServiceError::NotAuthorized as u32 => QuicClientError::NotAuthorized,

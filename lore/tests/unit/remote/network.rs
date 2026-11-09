@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-// The transport is exercised here rather than in the per-OS modules so that
-// every backend is covered by the same test.
+//! The service's socket, at the path in the user's own directory where each system puts it.
 #![cfg(any(target_os = "windows", target_family = "unix"))]
-
-#[cfg(target_os = "windows")]
-mod windows;
 
 use std::io::Read;
 use std::io::Write;
@@ -13,6 +9,10 @@ use std::sync::mpsc::Sender;
 use std::time::Duration;
 use std::time::Instant;
 
+#[cfg(target_family = "unix")]
+use lore::remote::network::unix::uds_sock_path;
+#[cfg(target_os = "windows")]
+use lore::remote::network::windows::uds_sock_path;
 use lore::remote::network::*;
 
 const TEST_STRING: &str = "ABC";
@@ -66,18 +66,11 @@ fn run_both(name: &str) -> String {
 
 /// Removes the lock file a claim on `name` leaves behind.
 fn remove_claim_lock(name: &str) {
-    #[cfg(target_family = "unix")]
-    {
-        let mut lock = unix::uds_sock_path(name).into_os_string();
-        lock.push(".lock");
-        let _ = std::fs::remove_file(lock);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let mut lock = lore::remote::network::windows::uds_sock_file(name).into_os_string();
-        lock.push(".lock");
-        let _ = std::fs::remove_file(lock);
-    }
+    let mut lock = uds_sock_path(name)
+        .expect("the socket path is known")
+        .into_os_string();
+    lock.push(".lock");
+    let _ = std::fs::remove_file(lock);
 }
 
 #[test]
@@ -123,7 +116,7 @@ fn a_claimed_socket_name_refuses_a_second_claim_until_its_listener_drops() {
 #[test]
 fn a_socket_served_without_a_claim_refuses_a_claim() {
     let name = socket_name("uds-unclaimed");
-    let socket = unix::uds_sock_path(&name);
+    let socket = uds_sock_path(&name).expect("the socket path is known");
     std::fs::create_dir_all(socket.parent().expect("the socket has a directory"))
         .expect("the socket directory exists");
     let served = std::os::unix::net::UnixListener::bind(&socket).expect("binds");

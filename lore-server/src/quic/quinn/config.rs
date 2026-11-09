@@ -99,7 +99,7 @@ pub struct QuinnConfigBuilder {
     pub(crate) initial_cwnd: Option<InitialCwndBytes>,
 }
 
-const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
+pub(crate) const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
 const DEFAULT_KEEP_ALIVE_MILLS: u64 = 500;
 const DEFAULT_LISTENERS_COUNT: NonZeroU8 = NonZeroU8::MIN;
 /// Sockets bound when none are configured, on a machine with at least as many processors.

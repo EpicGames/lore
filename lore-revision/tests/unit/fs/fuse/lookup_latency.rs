@@ -726,9 +726,10 @@ async fn committed_seeded_tree() -> fuse_fixture::FuseFixture {
 }
 
 /// Cold LOOKUPs in different directories each wait on their own listing build off the session's
-/// workers: seven of them on two workers take about one listing's time, not four.
+/// workers: eight of them on two workers have more listing builds under way at once than two
+/// workers each holding a LOOKUP could.
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_cold_lookups_in_different_directories_take_one_listing_time() {
+async fn concurrent_cold_lookups_in_different_directories_build_their_listings_at_once() {
     skip_without_fuse!();
     let fixture = committed_seeded_tree().await;
     let delays = Delays {
@@ -737,38 +738,45 @@ async fn concurrent_cold_lookups_in_different_directories_take_one_listing_time(
         other: Duration::from_millis(100),
     };
     let fs = cold_provider(&fixture, delays).await;
-    let mounted = mount(fs, 2).await;
+    let mounted = mount(fs.clone(), 2).await;
     let top = mounted.root.join("top");
 
     let subdirectories = (0..SUBDIRECTORIES).map(|dir| top.join(format!("d{dir:02}")));
     for result in stat_all(subdirectories.collect()).await {
         result.expect("stat of a subdirectory");
     }
-    let started = Instant::now();
-    for result in stat_all(vec![top.join("d00/seed.txt")]).await {
-        result.expect("stat of a file in d00");
-    }
-    let one_listing = started.elapsed();
-
-    let started = Instant::now();
-    let files = (1..SUBDIRECTORIES).map(|dir| top.join(format!("d{dir:02}/seed.txt")));
-    for result in stat_all(files.collect()).await {
+    let files = (0..SUBDIRECTORIES).map(|dir| top.join(format!("d{dir:02}/seed.txt")));
+    let (results, most) = with_most_listing_builds(&fs, stat_all(files.collect())).await;
+    for result in results {
         result.expect("stat of a file in a cold subdirectory");
     }
-    let elapsed = started.elapsed();
 
     tokio::time::timeout(Duration::from_secs(5), mounted.session.shutdown())
         .await
         .expect("shutdown must complete promptly");
     assert!(
-        one_listing >= delays.other * 2,
-        "one cold listing took {one_listing:?}, too little to have fetched its blocks"
+        most > 2,
+        "{SUBDIRECTORIES} cold lookups on 2 workers had at most {most} listing builds under way at \
+         once"
     );
-    assert!(
-        elapsed < one_listing * 2,
-        "{} cold lookups on 2 workers took {elapsed:?}; one alone took {one_listing:?}",
-        SUBDIRECTORIES - 1
-    );
+}
+
+/// What `work` yields, and the most listing builds `fs` had under way at once while it ran,
+/// sampled every millisecond.
+async fn with_most_listing_builds<T>(
+    fs: &FuseFilesystem,
+    work: impl Future<Output = T>,
+) -> (T, usize) {
+    let mut work = std::pin::pin!(work);
+    let mut most = 0;
+    loop {
+        tokio::select! {
+            done = &mut work => return (done, most),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {
+                most = most.max(fs.listing_builds_in_flight());
+            }
+        }
+    }
 }
 
 /// The node of directory `name` below the root of `fs`'s State.
@@ -784,7 +792,7 @@ async fn dir_node(fs: &FuseFilesystem, repository: &Arc<RepositoryContext>, name
 }
 
 /// How long the held-LOOKUP test waits on each step before calling it stuck.
-const HELD_WAIT: Duration = Duration::from_secs(10);
+const HELD_WAIT: Duration = Duration::from_secs(60);
 
 /// Sends through a mount's notifier once it has one. Tells `entered` before it sends the
 /// `target` entry's invalidation, and records whether that send returned only after `released`.

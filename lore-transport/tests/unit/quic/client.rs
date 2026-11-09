@@ -410,7 +410,7 @@ async fn drop_a_held_command(
 /// same connection. Neither the background write nor a stream's reader, which serve every later
 /// command, holds the dropped command's context, and the background write holds none of its
 /// payload, which a caller may lend only until the command is done.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_command_dropped_mid_write_leaves_its_stream_framed() {
     use bytes::Bytes;
     use lore_transport::quic::storage_service::Command;
@@ -469,7 +469,7 @@ async fn a_command_dropped_mid_write_leaves_its_stream_framed() {
 /// A command sent while a stream finishes a dropped frame goes out on another stream rather than
 /// waiting on the held writer. The server reads nothing meanwhile, so it is written only on a
 /// stream other than the dropped frame's.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stream_finishing_a_dropped_frame_is_passed_over() {
     use bytes::Bytes;
     use lore_transport::quic::storage_service::Command;
@@ -501,7 +501,7 @@ async fn a_stream_finishing_a_dropped_frame_is_passed_over() {
 /// A dropped frame whose remainder the server does not take in time has its stream reset. The
 /// command after it on that stream fails as a lost connection does, so it is sent again over a new
 /// connection and answered.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_command_after_a_reset_frame_is_answered_over_a_new_connection() {
     use lore_transport::traits::Storage;
 

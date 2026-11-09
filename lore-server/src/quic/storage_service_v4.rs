@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::runtime::LORE_CONTEXT;
+use lore_storage::CorrelationHold;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
@@ -41,6 +43,7 @@ use crate::protocol::storage::put::handle_put;
 use crate::protocol::storage::query::handle_query;
 use crate::protocol::storage::session::SessionError;
 use crate::protocol::storage::session::SessionMap;
+use crate::protocol::storage::session::correlation_id_or_new;
 use crate::protocol::storage::verify::handle_verify;
 use crate::quic::NO_CONNECTION_ID;
 use crate::quic::NO_CORRELATION_ID;
@@ -54,6 +57,7 @@ use crate::quic::storage_service::is_internal_error;
 use crate::quic::storage_service::message_handle_error_to_label;
 use crate::quic::storage_service::parse_message_for_opcode_v4;
 use crate::telemetry::StorageProtocol;
+use crate::util::setup_execution;
 
 const RESERVED_OPCODE_PING: QuicOpCode = 4;
 const RESERVED_OPCODE_CORRELATE: QuicOpCode = 5;
@@ -104,6 +108,7 @@ pub struct StorageServiceV4 {
 }
 
 impl StorageServiceV4 {
+    /// A storage service for one connection, holding that connection's sessions in `session_map`.
     pub fn new(
         token_verification: Arc<TokenVerification>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
@@ -111,6 +116,7 @@ impl StorageServiceV4 {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         user_agent_filter: Arc<UserAgentFilter>,
+        session_map: SessionMap,
     ) -> Self {
         Self {
             token_verification,
@@ -118,9 +124,20 @@ impl StorageServiceV4 {
             immutable_store,
             local_store,
             mutable_store,
-            session_map: Arc::new(SessionMap::default()),
+            session_map: Arc::new(session_map),
             user_agent_filter,
         }
+    }
+
+    /// What the stores keep for calls under `correlation_id` while a session names it.
+    fn hold_correlation(&self, correlation_id: &str) -> Vec<CorrelationHold> {
+        [
+            self.immutable_store.hold_correlation(correlation_id),
+            self.mutable_store.hold_correlation(correlation_id),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 }
 
@@ -251,7 +268,11 @@ impl QuicService for StorageServiceV4 {
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id, grants, token) {
+                // A session that names no correlation id gets its own before the holds, so its
+                // calls run under what the stores keep for it.
+                let correlation_id = correlation_id_or_new(correlation_id);
+                let held = self.hold_correlation(&correlation_id);
+                match session_map.start(repository, correlation_id, user_id, grants, token, held) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -358,11 +379,16 @@ impl QuicService for StorageServiceV4 {
                         )
                         .await
                     }
-                    crate::quic::storage_service::ParsedStorageRequest::Query(_query) => {
-                        // Query uses the raw bytes, not the parsed struct.
-                        // Re-parse is needed because parse_message_for_opcode_v4 consumed the bytes.
-                        // However, the Query struct stores the bytes internally.
-                        handle_query(&_query.address, repository, self.immutable_store.clone())
+                    crate::quic::storage_service::ParsedStorageRequest::Query(query) => {
+                        LORE_CONTEXT
+                            .scope(
+                                setup_execution(module_path!(), correlation_id, user_id),
+                                handle_query(
+                                    &query.address,
+                                    repository,
+                                    self.immutable_store.clone(),
+                                ),
+                            )
                             .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::Verify(verify) => {
@@ -373,6 +399,7 @@ impl QuicService for StorageServiceV4 {
                             correlation_id,
                             user_id,
                             self.local_store.clone(),
+                            self.immutable_store.clone(),
                         )
                         .await
                     }

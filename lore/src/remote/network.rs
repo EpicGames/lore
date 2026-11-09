@@ -14,30 +14,27 @@ mod os_specific {
     pub use super::stub::uds_supported;
 }
 
-// Reexport the unix specific module
+// Where the socket lives on Unix
 #[cfg(all(target_family = "unix", not(feature = "test-util")))]
 mod unix;
 #[cfg(all(target_family = "unix", feature = "test-util"))]
 pub mod unix;
-#[cfg(target_family = "unix")]
-mod os_specific {
-    pub use super::unix::UdsListener;
-    pub use super::unix::UdsListenerClaim;
-    pub use super::unix::UdsStream;
-    pub use super::unix::uds_supported;
-}
 
-// Reexport the windows specific module
+// Where the socket lives on Windows
 #[cfg(all(target_os = "windows", not(feature = "test-util")))]
 mod windows;
 #[cfg(all(target_os = "windows", feature = "test-util"))]
 pub mod windows;
-#[cfg(target_os = "windows")]
+
+// The socket itself, the same wherever there is one
+#[cfg(any(target_os = "windows", target_family = "unix"))]
+mod socket;
+#[cfg(any(target_os = "windows", target_family = "unix"))]
 mod os_specific {
-    pub use super::windows::UdsListener;
-    pub use super::windows::UdsListenerClaim;
-    pub use super::windows::UdsStream;
-    pub use super::windows::uds_supported;
+    pub use super::socket::UdsListener;
+    pub use super::socket::UdsListenerClaim;
+    pub use super::socket::UdsStream;
+    pub use super::socket::uds_supported;
 }
 
 // Reexport everything from the private OS specific networking module

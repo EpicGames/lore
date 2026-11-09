@@ -598,7 +598,7 @@ mod check_advertised_endpoints {
     }
 
     /// Both schemes end in `s`, so both remotes authenticate the server.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_refuses_a_remote_advertising_an_endpoint_that_skips_server_authentication() {
         add(
             "refuses",
@@ -659,7 +659,7 @@ fn a_refusal_lasts_until_a_session_start_succeeds() {
 
 /// A command's session takes turns over every storage connection, so bulk reads through it,
 /// such as a cache fill, are not held to the rate of the connection a single pick lands on.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_spreads_requests_over_every_storage_connection() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
@@ -682,7 +682,7 @@ async fn a_session_spreads_requests_over_every_storage_connection() {
 /// Calls under one correlation id share the pool the connection pins for a partition, so its
 /// sessions start once however many calls take it. A call under another correlation id pins a
 /// pool of its own in its place, and the sessions of the one it replaces stop.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
@@ -713,7 +713,7 @@ async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
 
 /// A call under another correlation id replaces the pool pinned for its own partition alone: the
 /// pool pinned for another partition keeps serving its correlation id, and its sessions stay open.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replaced_pool_leaves_another_partitions_pool_pinned() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
@@ -743,7 +743,7 @@ async fn a_replaced_pool_leaves_another_partitions_pool_pinned() {
 }
 
 /// An unpinned pool's server-side sessions stop once its last holder drops it.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
@@ -768,7 +768,7 @@ async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
 
 /// The pool that replaces an invalidated one serves on every connection while the invalidated pool
 /// is still held.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalidated_pools_replacement_serves_on_every_connection() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
@@ -804,7 +804,7 @@ async fn an_invalidated_pools_replacement_serves_on_every_connection() {
 
 /// Invalidating a lazy session marks the pool it resolved to stale, so the next resolution starts
 /// a new pool even while another holder keeps the old one and its session ids.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalidated_pool_is_not_handed_out_again() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
@@ -1033,7 +1033,7 @@ mod cache {
 
     /// A call served a connection cached under its key, as an identity, adopts the credentials it
     /// supplied, so the services the connection built present them.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_call_served_a_cached_connection_adopts_its_credentials() {
         in_a_call(async {
             let remote = url::Url::parse("lore://cache-adopting.test.invalid")
@@ -1096,7 +1096,7 @@ mod cache {
     /// A stale connection taken out of the cache drops the pools it pins, so it is freed once no
     /// call holds it, by each way one leaves the cache: replaced by a connection cached under its
     /// key, dropped by a lookup that finds it stale, and marked failed.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stale_connection_taken_out_of_the_cache_drops_the_pools_it_pins() {
         in_a_call(async {
             let server = TestStorageServer::start();
@@ -1132,7 +1132,7 @@ mod cache {
     /// A connection out of the cache pins no pool, so a call still holding it doesn't hold it back
     /// again. One the transport marked stale while it is still cached pins its pools, so the calls
     /// using it share a pool.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connection_out_of_the_cache_pins_no_pool() {
         in_a_call(async {
             let server = TestStorageServer::start();
@@ -1165,7 +1165,7 @@ mod cache {
 
     /// Retiring a connection drops its pins and leaves its pools valid, so a call holding one goes
     /// on using its sessions.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pool_a_call_holds_serves_on_once_its_connection_is_retired() {
         in_a_call(async {
             let server = TestStorageServer::start();
@@ -1187,7 +1187,7 @@ mod cache {
 
     /// A subtask a connect spawns after the connect was cancelled is aborted as it is held, and so
     /// releases the connection it holds.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_subtask_held_after_its_connect_is_cancelled_is_aborted() {
         in_a_call(async {
             let cancelled: SubtaskAborts = Arc::new(parking_lot::Mutex::new(None));
@@ -1296,7 +1296,7 @@ mod cache {
     /// Calls that connect under one key at once share one connection, the first cached. The others
     /// stop connecting and are freed. Whether two calls overlap after the lookup that would have
     /// found the other's is up to the scheduler, so this runs rounds of many.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn calls_that_connect_at_once_share_one_connection() {
         in_a_call(async {
             const CALLS: usize = 16;
@@ -1480,7 +1480,7 @@ mod cache {
     /// The sessions of a pool the connection pins hold the connection back, and a call holds the
     /// connection through them only by holding the pool or one of its sessions. Each hold spans two
     /// checks, the timeout apart: the first check after a change only records it.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_pools_a_connection_pins_hold_it_only_for_a_call_holding_them() {
         in_a_call(async {
             let server = TestStorageServer::start();
@@ -1521,7 +1521,7 @@ mod cache {
 
     /// Closing an unused connection frees it, though the pool it pins holds it, and closes its
     /// storage connections, so the server releases them. It is stale, so nothing reuses it.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn closing_an_unused_connection_frees_it_and_closes_its_storage_at_the_server() {
         in_a_call(async {
             let server = TestStorageServer::start();

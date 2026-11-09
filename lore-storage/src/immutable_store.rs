@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::types::HealResult;
 use lore_error_set::prelude::*;
 
 use crate::Address;
@@ -477,6 +478,9 @@ pub fn claim_for_task(
     }
 }
 
+/// What a store keeps for a correlation id while the hold lives, given up as it drops.
+pub type CorrelationHold = Box<dyn Any + Send + Sync>;
+
 #[async_trait]
 pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
@@ -520,6 +524,13 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// for a store with nothing on disk. A wrapper delegates it as it delegates
     /// [`Self::hold_for_command`].
     fn store_lock(&self) -> Option<Arc<crate::local::store_lock::StoreLock>> {
+        None
+    }
+
+    /// Keeps what this store holds for calls under `correlation_id`, such as its sessions with a
+    /// remote, until this and every other hold on `correlation_id` have dropped. `None` for a store
+    /// that keeps nothing per correlation id; a wrapper delegates it.
+    fn hold_correlation(&self, _correlation_id: &str) -> Option<CorrelationHold> {
         None
     }
 
@@ -772,6 +783,22 @@ pub trait ImmutableStore: Any + Send + Sync {
 
     /// Verify the integrity of the store. If `heal` is true, attempt to repair any issues found.
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError>;
+
+    /// Checks this store's copy of `address` in `partition` and repairs it where it is corrupt, as
+    /// a reader that found the payload corrupt on receipt asks. A store with no copy it can repair
+    /// answers [`HealResult::NotAttempted`]; a wrapper delegates it.
+    async fn heal(
+        self: Arc<Self>,
+        _partition: Partition,
+        _address: Address,
+    ) -> Result<HealResult, StoreError> {
+        Ok(HealResult::NotAttempted)
+    }
+
+    /// Waits until a write of `address` in `partition` to a local tier, which a read here started,
+    /// has ended, so a check of the local copy that follows sees what the write left. A store that
+    /// writes nothing from its reads has nothing to wait for; a wrapper delegates it.
+    async fn settle(self: Arc<Self>, _partition: Partition, _address: Address) {}
 
     /// Copy a fragment from one `(partition, address)` tuple to another within the same store.
     ///

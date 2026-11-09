@@ -6143,6 +6143,37 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         None
     }
 
+    /// Checks the copy of `address` in `partition` on disk and drops it where it is corrupt, so
+    /// the next read misses it here. A copy this store does not hold, holds sound, or keeps only in
+    /// memory needs no heal.
+    async fn heal(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<lore_base::types::HealResult, StoreError> {
+        use lore_base::types::HealResult;
+        if self.path.is_none() {
+            return Ok(HealResult::NotAttempted);
+        }
+        let match_requested = if address.context.is_zero() {
+            StoreMatch::MatchPartition
+        } else {
+            StoreMatch::MatchFull
+        };
+        match self
+            .verify_fragment(address, partition, match_requested, true)
+            .await
+        {
+            Ok(result) => Ok(match (result.verification_result, result.healed) {
+                (Ok(()), _) => HealResult::NotAttempted,
+                (Err(_), true) => HealResult::Healed,
+                (Err(_), false) => HealResult::Failed,
+            }),
+            Err(StoreError::AddressNotFound(_)) => Ok(HealResult::NotAttempted),
+            Err(err) => Err(err),
+        }
+    }
+
     async fn fragment_count(self: Arc<Self>) -> Option<usize> {
         let Ok(_hold) = self.hold(Intent::Read).await else {
             return None;

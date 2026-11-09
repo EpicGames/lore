@@ -656,8 +656,9 @@ const HTTP2_KEEP_ALIVE_INTERVAL: u64 = 30;
 const HTTP2_KEEP_ALIVE_TIMEOUT: u64 = 20;
 
 async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
-    let mut endpoint = tonic::transport::Channel::from_shared(remote.to_string())
-        .internal_with(|| format!("connect: {remote}"))?;
+    let mut endpoint =
+        tonic::transport::Channel::from_shared(crate::uds::channel_uri(remote.to_string()))
+            .internal_with(|| format!("connect: {remote}"))?;
 
     let keep_alive_interval = std::env::var("LORE_HTTP2_KEEP_ALIVE_INTERVAL")
         .ok()
@@ -671,7 +672,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
         .http2_keep_alive_interval(Duration::from_secs(keep_alive_interval))
         .keep_alive_timeout(Duration::from_secs(keep_alive_timeout));
 
-    if remote.starts_with("https://") {
+    if endpoint.uri().scheme_str() == Some("https") {
         endpoint = endpoint
             .tls_config(grpc_client_tls_config())
             .internal_with(|| format!("configuring TLS for {remote}"))?;
@@ -688,7 +689,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
     // Connect from a net-runtime task so the hyper/h2 driver tasks the
     // connection spawns are bound to the net runtime, isolated from compute and
     // file-I/O continuations on the core runtime.
-    let channel = match lore_base::lore_spawn_net!(async move { endpoint.connect().await })
+    let channel = match lore_base::lore_spawn_net!(crate::uds::connect_channel(endpoint))
         .await
         .internal_with(|| format!("gRPC connection task to {remote}"))?
     {

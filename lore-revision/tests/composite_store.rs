@@ -10,12 +10,14 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use lore_base::error::AddressNotFound;
+    use lore_base::lore_spawn;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Fragment;
     use lore_base::types::FragmentFlags;
     use lore_base::types::Hash;
+    use lore_base::types::HealResult;
     use lore_base::types::KeyType;
     use lore_base::types::Partition;
     use lore_revision::fragment::generate_random;
@@ -54,6 +56,10 @@ mod tests {
         /// was put.
         metadata_fragment: Option<Fragment>,
         max_query_batch: Option<usize>,
+        /// A gate each `put` waits at once recorded, for a test holding a write under way.
+        put_gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// A gate each `get` waits at once recorded, for a test holding a read under way.
+        get_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     /// What a succeeding store hands back from `get` where a test has not named a payload of its
@@ -303,6 +309,9 @@ mod tests {
             _address: Address,
         ) -> Result<StoreGetData, StoreError> {
             self.track_invocation("get");
+            if let Some(gate) = &self.get_gate {
+                let _passed = gate.acquire().await.expect("the gate stays open");
+            }
 
             if !self.succeed {
                 return Err(StoreError::internal("Mock store failure"));
@@ -329,6 +338,9 @@ mod tests {
                 .write()
                 .unwrap()
                 .push((fragment, payload.as_ref().map(Bytes::len)));
+            if let Some(gate) = &self.put_gate {
+                let _passed = gate.acquire().await.expect("the gate stays open");
+            }
 
             if self.succeed {
                 Ok(())
@@ -399,6 +411,125 @@ mod tests {
         async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
             Ok(())
         }
+
+        async fn heal(
+            self: Arc<Self>,
+            _partition: Partition,
+            _address: Address,
+        ) -> Result<HealResult, StoreError> {
+            self.track_invocation("heal");
+            Ok(HealResult::Healed)
+        }
+    }
+
+    /// A heal reaches the local tier and the durable store, which holds the copy the local tier was
+    /// filled from.
+    #[tokio::test]
+    async fn a_heal_reaches_the_local_tier_and_the_durable_store() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let (local_store, durable_store) = (
+                    Arc::new(TestStore::failing()),
+                    Arc::new(TestStore::succeeding()),
+                );
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let (_, address, _) = generate_random();
+
+                let healed = composite_store
+                    .heal(random::<RepositoryId>(), address)
+                    .await;
+
+                assert!(matches!(healed, Ok(HealResult::Healed)), "{healed:?}");
+                let heals =
+                    |store: &TestStore<'_>| store.invocations.read().unwrap().get("heal").copied();
+                assert_eq!(heals(&durable_store), Some(1));
+                assert_eq!(heals(&local_store), Some(1));
+            })
+            .await;
+    }
+
+    /// A heal that arrives while a read's payload is written to the local tier waits for the
+    /// write, so it checks the copy the write leaves rather than finding none and leaving a
+    /// corrupt payload the durable store served to be served again.
+    #[tokio::test]
+    async fn a_heal_waits_for_the_local_write_a_read_started() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                // A local store that misses every read and holds every write at the gate.
+                let local_store = Arc::new(TestStore {
+                    put_gate: Some(gate.clone()),
+                    ..TestStore::failing()
+                });
+                let durable_store = Arc::new(TestStore::succeeding());
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let count = |store: &Arc<TestStore<'static>>, verb: &str| {
+                    store
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get(verb)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let repository: Partition = random::<RepositoryId>();
+                let (_, address, _) = generate_random();
+
+                composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("the read");
+                assert_eq!(
+                    composite_store.caching(),
+                    (1, DEFAULT_PAYLOAD.len() as u64),
+                    "the write and its payload are counted while it runs"
+                );
+                let mut healing = std::pin::pin!(composite_store.clone().heal(repository, address));
+                assert!(
+                    futures::poll!(healing.as_mut()).is_pending(),
+                    "the heal waits for the local write"
+                );
+                assert_eq!(
+                    count(&local_store, "heal"),
+                    0,
+                    "no heal before the write ends"
+                );
+
+                gate.add_permits(1);
+                let healed = tokio::time::timeout(tokio::time::Duration::from_secs(5), healing)
+                    .await
+                    .expect("the heal ends once the write has");
+                assert!(matches!(healed, Ok(HealResult::Healed)), "{healed:?}");
+                assert_eq!(count(&local_store, "put"), 1);
+                assert_eq!(count(&local_store, "heal"), 1);
+                assert_eq!(count(&durable_store, "heal"), 1);
+                // The write's count ends before its hold, which the heal waited for.
+                assert_eq!(
+                    composite_store.caching(),
+                    (0, 0),
+                    "the ended write is no longer counted"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1441,6 +1572,198 @@ mod tests {
                     !lock.is_held(),
                     "the flock goes once the cache write has ended and been flushed"
                 );
+            })
+            .await;
+    }
+
+    /// **A read arriving while the local write of what the durable store served is under way takes
+    /// the result the first read fetched,** without the content the first read's check expanded.
+    /// Neither the local store nor the in-flight read has it for that read otherwise, and it would
+    /// fetch the address again; once the write ends, a read the local store still misses asks the
+    /// durable store again.
+    #[tokio::test]
+    async fn a_read_during_the_local_write_of_a_durable_result_takes_that_result() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                // A local store that misses every read and holds every write at the gate.
+                let local_store = Arc::new(TestStore {
+                    put_gate: Some(gate.clone()),
+                    ..TestStore::failing()
+                });
+                // A durable store whose reads carry the content a check on receipt expanded.
+                let mut durable = TestStore::succeeding();
+                if let Some(data) = durable.get_immutable_result.as_mut() {
+                    data.content = data.payload.clone().map(|payload| (data.fragment, payload));
+                }
+                let durable_store = Arc::new(durable);
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let count = |store: &Arc<TestStore<'static>>, verb: &str| {
+                    store
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get(verb)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let repository: Partition = random::<RepositoryId>();
+                let (_, address, _) = generate_random();
+
+                let first = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("the first read");
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&local_store, "put") == 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the local write starts");
+                let second = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("the second read");
+
+                assert_eq!(
+                    count(&durable_store, "get"),
+                    1,
+                    "the second read takes the first one's result"
+                );
+                assert_eq!(second.payload, first.payload);
+                assert!(first.content.is_some());
+                assert!(second.content.is_none(), "the held result keeps no content");
+
+                gate.add_permits(1);
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&durable_store, "get") < 2 {
+                        composite_store
+                            .clone()
+                            .get(repository, address)
+                            .await
+                            .expect("a read after the write");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("a read after the write asks the durable store again");
+            })
+            .await;
+    }
+
+    /// **A read waiting on another read's fetch from the durable store takes the fetched result
+    /// whole, content included, while a read arriving during the local write of that result takes
+    /// the result held for it, without the content.** The test's runtime runs one task at a time,
+    /// so a read seen to have missed the local store has also subscribed to the fetch in flight.
+    #[tokio::test]
+    async fn reads_awaiting_a_fetch_get_its_content_and_reads_during_the_local_write_do_not() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let (get_gate, put_gate) = (
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                );
+                // A local store that misses every read and holds every write at its gate.
+                let local_store = Arc::new(TestStore {
+                    put_gate: Some(put_gate.clone()),
+                    ..TestStore::failing()
+                });
+                // A durable store that holds every read at its gate, and whose reads carry the
+                // content a check on receipt expanded.
+                let mut durable = TestStore {
+                    get_gate: Some(get_gate.clone()),
+                    ..TestStore::succeeding()
+                };
+                if let Some(data) = durable.get_immutable_result.as_mut() {
+                    data.content = data.payload.clone().map(|payload| (data.fragment, payload));
+                }
+                let durable_store = Arc::new(durable);
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let count = |store: &Arc<TestStore<'static>>, verb: &str| {
+                    store
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get(verb)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let repository: Partition = random::<RepositoryId>();
+                let (_, address, _) = generate_random();
+                let read = || {
+                    let store = composite_store.clone();
+                    lore_spawn!(async move { store.get(repository, address).await })
+                };
+
+                let fetching = read();
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&durable_store, "get") == 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the first read reaches the durable store");
+                let waiting = read();
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&local_store, "get") < 2 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the second read misses the local store");
+                get_gate.add_permits(1);
+                let fetched = fetching
+                    .await
+                    .expect("the first read's task")
+                    .expect("the first read");
+                let waited = waiting
+                    .await
+                    .expect("the second read's task")
+                    .expect("the second read");
+                let during_write = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("a read during the local write");
+
+                assert_eq!(
+                    count(&durable_store, "get"),
+                    1,
+                    "the reads share the first one's fetch"
+                );
+                assert!(fetched.content.is_some());
+                assert_eq!(waited.payload, fetched.payload);
+                assert!(
+                    waited.content.is_some(),
+                    "the read waiting on the fetch takes its content"
+                );
+                assert_eq!(during_write.payload, fetched.payload);
+                assert!(
+                    during_write.content.is_none(),
+                    "the held result keeps no content"
+                );
+                put_gate.add_permits(1);
             })
             .await;
     }
