@@ -1189,7 +1189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicas_get_metadata_results_not_cached_locally() {
+    async fn replicas_get_metadata_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1269,15 +1269,15 @@ mod tests {
                     .expect("post-put query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
 
-                // and the local store won't have the cache because composite store won't
-                // cache read replicas
+                // and the local store should have the cache because composite store will
+                // populate it out of band
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let result = local_store
                     .clone()
                     .get_metadata(repository, address)
                     .await
-                    .expect("replica confirmation failed");
-                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
             })
             .await;
     }
@@ -1506,7 +1506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicas_get_results_not_cached_locally() {
+    async fn replicas_get_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1581,20 +1581,20 @@ mod tests {
                 // now composite get should find the address
                 let result = composite_store
                     .clone()
-                    .get_metadata(repository, address)
+                    .get(repository, address)
                     .await
                     .expect("post-put query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
 
-                // and the local store won't have the cache because composite store won't
-                // cache read replicas
+                // and the local store should have the cache, payload included, because
+                // composite store will populate it out of band
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let result = local_store
                     .clone()
                     .get(repository, address)
                     .await
-                    .expect_err("get success");
-                assert!(result.is_address_not_found());
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
             })
             .await;
     }
@@ -1667,7 +1667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replica_query_match_full_results_not_cached_locally() {
+    async fn replica_query_match_full_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1720,10 +1720,10 @@ mod tests {
                     .clone()
                     .put(repository, address, fragment, Some(payload), false)
                     .await
-                    .expect("Put to durable failed");
+                    .expect("Put to replica failed");
 
-                // query via composite: replica resolves MatchFull with a non-zero partition.
-                // because the results came from the replica no caching takes place
+                // query via composite: replica resolves MatchFull with a non-zero partition, so
+                // a background get_metadata is spawned to populate the local store
                 let mut results = [StoreMatchResult::default()];
                 composite_store
                     .clone()
@@ -1733,16 +1733,16 @@ mod tests {
                 assert!(matches!(results[0].match_made, StoreMatch::MatchFull));
                 assert!(!results[0].partition.is_zero());
 
-                // wait for an erroneous background cache write-back
+                // wait for the background cache write-back
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-                // local store should not have the metadata cached
+                // local store should now have the metadata cached
                 let result = local_store
                     .clone()
                     .get_metadata(repository, address)
                     .await
                     .expect("local get_metadata failed");
-                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
             })
             .await;
     }
@@ -2463,10 +2463,11 @@ mod tests {
                 .await;
         }
 
-        /// A read back answered by a replica is not cached locally by the read, so the copy is
-        /// what records the destination there.
+        /// A read back answered by a replica is cached locally by the read itself, so the
+        /// destination is written to the local store once, as when the durable store answers. The
+        /// copy, not the replica, confirms the destination durable, and that write records it.
         #[tokio::test]
-        async fn records_the_destination_locally_when_a_replica_answers_the_read() {
+        async fn writes_the_destination_locally_once_when_a_replica_answers_the_read() {
             let execution = setup_test_execution();
             LORE_CONTEXT
                 .scope(execution, async move {
@@ -2492,6 +2493,12 @@ mod tests {
                     );
                     assert_eq!(count(&replica, "get"), 1);
                     assert_eq!(count(&local, "put"), 1);
+                    let (recorded, _) = local.puts.read().unwrap()[0];
+                    assert_ne!(
+                        recorded.flags & FragmentFlags::PayloadStoredDurable.bits(),
+                        0,
+                        "the copy confirmed the destination durable, so the local record says so"
+                    );
                 })
                 .await;
         }
@@ -4798,6 +4805,44 @@ mod tests {
             vec![make_store().await, make_store().await]
         }
 
+        /// What the composite's local store serves for `address` once the background cache write
+        /// of a remote answer has landed. Panics if it does not land within `PROMPTLY`.
+        async fn cached_locally(
+            composite: &Arc<CompositeStore>,
+            repository: Partition,
+            address: Address,
+        ) -> StoreGetData {
+            tokio::time::timeout(PROMPTLY, async {
+                loop {
+                    if let Ok(cached) = composite.local().get(repository, address).await {
+                        break cached;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the remote answer should be cached locally")
+        }
+
+        /// A composite whose only holder of the content is a read replica, which stores it with
+        /// `flags`. The durable store is empty.
+        async fn composite_reading_from_replica(
+            repository: Partition,
+            address: Address,
+            mut fragment: Fragment,
+            payload: Bytes,
+            flags: lore_base::types::FragmentFlags,
+        ) -> Arc<CompositeStore> {
+            fragment.flags |= flags.bits();
+            let replica = make_store().await;
+            replica
+                .clone()
+                .put(repository, address, fragment, Some(payload), false)
+                .await
+                .expect("put to replica failed");
+            build_composite_with_read_replicas(make_store().await, vec![replica], LONG_DELAY).await
+        }
+
         mod get {
             use super::*;
 
@@ -4848,6 +4893,135 @@ mod tests {
                             0,
                             "durable get must not be called when replica responds within the delay window"
                         );
+                    })
+                    .await;
+            }
+
+            /// A `get` answered by a read replica is cached locally, so the next `get` asks no
+            /// remote store.
+            #[tokio::test]
+            async fn replica_answer_serves_the_next_get_locally() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let replica_inner = make_store().await;
+                        replica_inner
+                            .clone()
+                            .put(repository, address, fragment, Some(payload.clone()), false)
+                            .await
+                            .expect("put to replica failed");
+                        let replica = Arc::new(CountingStore::wrapping(replica_inner));
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![replica.clone()],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let get = || async {
+                            let (_, got_payload) = composite
+                                .clone()
+                                .get(repository, address)
+                                .await
+                                .and_then(lore_storage::StoreGetData::into_payload)
+                                .expect("get should succeed");
+                            assert_eq!(got_payload, payload);
+                        };
+
+                        get().await;
+                        cached_locally(&composite, repository, address).await;
+                        get().await;
+
+                        assert_eq!(replica.get_count.load(Ordering::SeqCst), 1);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            /// A replica answer is not confirmed durable by the composite's durable store, so the
+            /// local copy keeps the durable bit the replica reported. Where the replica holds it
+            /// only locally, the cached copy is protected from eviction: it may be the only copy
+            /// this composite can still reach.
+            #[tokio::test]
+            async fn a_replica_answer_held_only_locally_there_is_not_evicted() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let composite = composite_reading_from_replica(
+                            repository,
+                            address,
+                            fragment,
+                            payload.clone(),
+                            lore_base::types::FragmentFlags::empty(),
+                        )
+                        .await;
+
+                        composite
+                            .clone()
+                            .get(repository, address)
+                            .await
+                            .expect("get should succeed via replica");
+                        cached_locally(&composite, repository, address).await;
+                        composite
+                            .local()
+                            .evict(0, false, None)
+                            .await
+                            .expect("evict failed");
+
+                        let (_, kept) = composite
+                            .local()
+                            .get(repository, address)
+                            .await
+                            .and_then(lore_storage::StoreGetData::into_payload)
+                            .expect("the local copy should survive eviction");
+                        assert_eq!(kept, payload);
+                    })
+                    .await;
+            }
+
+            /// A replica answer the replica reports as durable keeps that bit locally, so the
+            /// cached copy stays evictable.
+            #[tokio::test]
+            async fn a_replica_answer_durable_there_stays_evictable() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let composite = composite_reading_from_replica(
+                            repository,
+                            address,
+                            fragment,
+                            payload,
+                            lore_base::types::FragmentFlags::PayloadStoredDurable,
+                        )
+                        .await;
+
+                        composite
+                            .clone()
+                            .get(repository, address)
+                            .await
+                            .expect("get should succeed via replica");
+                        cached_locally(&composite, repository, address).await;
+                        composite
+                            .local()
+                            .evict(0, false, None)
+                            .await
+                            .expect("evict failed");
+
+                        composite
+                            .local()
+                            .get(repository, address)
+                            .await
+                            .expect_err("the durable local copy should have been evicted");
                     })
                     .await;
             }

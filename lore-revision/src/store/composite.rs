@@ -464,6 +464,7 @@ struct CompositeGetOutput {
 ///
 /// Read immutable operations try local store first, if no required match is made it then goes wide
 /// and reads from read durable store and read replicas. First successful result will be early returned.
+/// A result from either is cached in the local store, whichever answered.
 ///
 /// Write immutable operations will block on writing to the write durable store.
 /// It will then detach spawn tasks to cache data in local store and write replicas.
@@ -795,10 +796,13 @@ impl CompositeStore {
         operation
     }
 
+    /// `durable_confirmed` is set by a caller that already knows the durable store holds this
+    /// address, so the local copy is recorded durable whichever store answers.
     async fn get_from_remotes(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
+        durable_confirmed: bool,
     ) -> Result<CompositeGetOutput, StoreError> {
         let mut fan_out = pin!(
             self.fan_out_read(
@@ -825,12 +829,13 @@ impl CompositeStore {
             };
             match query_result {
                 Ok(result) => {
-                    // If the durable store was the first to answer, then either the
-                    // replicas are too slow or don't have the fragment, so we should build up
-                    // our own local cache
                     let mut local_cache_will_be_warm = false;
-                    if !self.local_durable && matches!(result, CompositeStoreHit::Durable(_)) {
-                        // Cache the found result locally
+                    if !self.local_durable {
+                        // A replica is not this composite's durable store, so its answer keeps the
+                        // durable bit the replica reported. Marking it durable here would let
+                        // eviction drop a copy that the durable store may never have held.
+                        let is_durable =
+                            durable_confirmed || matches!(result, CompositeStoreHit::Durable(_));
                         let local_store = self.local.store();
                         let mut fragment = result.inner().fragment;
                         let cache_payload = if self.local_metadata_only {
@@ -843,8 +848,10 @@ impl CompositeStore {
                         let joined = local_store.try_join_claim();
                         lore_spawn!(async move {
                             let _claim = claim_for_task(&local_store, joined).await;
-                            fragment.flags |= FragmentFlags::PayloadStoredLocal
-                                | FragmentFlags::PayloadStoredDurable;
+                            fragment.flags |= FragmentFlags::PayloadStoredLocal;
+                            if is_durable {
+                                fragment.flags |= FragmentFlags::PayloadStoredDurable;
+                            }
                             let put_result = local_store
                                 .put(partition, address, fragment, cache_payload, false)
                                 .await;
@@ -930,10 +937,6 @@ impl CompositeStore {
 
         if self.cache_metadata
             && best_result.inner().match_made == StoreMatch::MatchFull
-            // If the durable store was the first to answer, then either the
-            // replicas are too slow or don't have the fragment, so we should build up
-            // our own local cache
-            && matches!(best_result, CompositeStoreHit::Durable(_))
             && !self.local_durable
         {
             let local_store = self.local.store();
@@ -1002,7 +1005,11 @@ impl CompositeStore {
                         // If our local store does have it locally, then `get` will resolve faster
                         let get_result = store
                             .clone()
-                            .get_implementation(destination_partition, destination_address)
+                            .get_implementation(
+                                destination_partition,
+                                destination_address,
+                                composite_behavior.copy_behavior.durable,
+                            )
                             .await;
                         count_result("get_after_copy", &cache_counter, &get_result);
 
@@ -1070,10 +1077,13 @@ impl CompositeStore {
         Ok(())
     }
 
+    /// See [`Self::get_from_remotes`] for `durable_confirmed`. A caller that joins a read already
+    /// in flight gets that read's outcome, and the local copy keeps that read's durable bit.
     async fn get_implementation(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
+        durable_confirmed: bool,
     ) -> Result<CompositeGetOutput, StoreError> {
         if let Ok(result) = self
             .local
@@ -1091,7 +1101,10 @@ impl CompositeStore {
 
         match self.inflight_gets.request((partition, address)) {
             RequestRole::RequestMaker(guard) => {
-                let result = self.clone().get_from_remotes(partition, address).await;
+                let result = self
+                    .clone()
+                    .get_from_remotes(partition, address, durable_confirmed)
+                    .await;
                 guard.broadcast(&result);
                 result
             }
@@ -1248,12 +1261,7 @@ impl ImmutableStore for CompositeStore {
                     for (resolved, (pos, address)) in hit.inner().iter().zip(remaining.iter()) {
                         let is_stronger_match = merge_resolved(&mut results[*pos], resolved);
 
-                        // If the results came from the durable store,
-                        // and answered before the replicas could (i.e. they are too slow to be
-                        // worth relying upon, or they couldn't answer),
-                        // then cache the fragment metadata locally to build up our own local cache
-                        if is_durable_result
-                            && self.cache_metadata
+                        if self.cache_metadata
                             && is_stronger_match
                             && resolved.match_made == StoreMatch::MatchFull
                             && !self.local_durable
@@ -1359,7 +1367,10 @@ impl ImmutableStore for CompositeStore {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        Ok(self.get_implementation(partition, address).await?.get_data)
+        Ok(self
+            .get_implementation(partition, address, false)
+            .await?
+            .get_data)
     }
 
     /// A full match is written nowhere. A weaker one the durable store holds is written by
