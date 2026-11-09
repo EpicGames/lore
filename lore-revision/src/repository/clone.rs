@@ -1964,13 +1964,13 @@ pub async fn clone_execute(
     // A missing fragment must not prevent later files from being attempted. Keep the
     // first failure for the terminal result while reporting each failed attempt.
     let mut failure = None;
-    let mut tasks: JoinSet<Result<Option<(Hash, u64)>, CloneError>> = JoinSet::new();
+    let mut tasks: JoinSet<Result<Option<state::ModifiedTimeEntry>, CloneError>> = JoinSet::new();
     let repository = ctx.repository.clone();
     let stats = ctx.stats.clone();
     // Permit cap grows monotonically with queue depth; unused permits cost nothing. Starts from whatever caller configured (default CLONE_FILE_DISCOVERY).
     let mut current_permits = stats.file_inflight.available_permits();
-    // Each `clone_file` returns its (key, mtime) pair, or None for the retain, dry run and
-    // zero byte cases, and they are collected as the JoinSet drains.
+    // Each `clone_file` returns its modified-time entry, where it has one, and they are collected
+    // as the JoinSet drains.
     let modified_times = ctx.modified_times.clone();
 
     while let Some(item) = rx.recv().await {
@@ -2205,7 +2205,7 @@ fn clone_file(
     node: Node,
     repository_path: RelativePath,
     permit: OwnedSemaphorePermit,
-) -> impl Future<Output = Result<Option<(Hash, u64)>, CloneError>> {
+) -> impl Future<Output = Result<Option<state::ModifiedTimeEntry>, CloneError>> {
     let CloneContext {
         repository,
         operation,
@@ -2318,10 +2318,9 @@ fn clone_file(
                 .bytes_transferred
                 .fetch_add(fragment.size_content, Ordering::Relaxed);
 
-            // Compute the (mtime_key, mtime) pair and return it; the caller
-            // (`clone_execute`) collects pairs in a stack-local buffer and
-            // fire-and-forgets a batched mutable-store write when the buffer fills,
-            // so each `clone_file` task avoids awaiting its own bucket write.
+            // Returned rather than recorded here: the caller collects each entry in
+            // `ctx.modified_times`, which is stored once after the clone, so no
+            // `clone_file` task waits on a write of its own.
             stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(state::file_modified_time_entry(
                 &repository,

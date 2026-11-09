@@ -36,7 +36,7 @@ async fn joining_a_cached_repository_lock_returns_the_callers_claims() {
     };
 
     let (created, left_over) =
-        get_or_create_repository_lock(dot_path.clone(), claim(store.clone()).await)
+        get_or_create_repository_lock(dot_path.clone(), claim(store.clone()).await, true)
             .await
             .expect("creates");
     assert!(
@@ -45,7 +45,7 @@ async fn joining_a_cached_repository_lock_returns_the_callers_claims() {
     );
 
     let (joined, kept) =
-        get_or_create_repository_lock(dot_path.clone(), claim(store.clone()).await)
+        get_or_create_repository_lock(dot_path.clone(), claim(store.clone()).await, true)
             .await
             .expect("joins");
     assert!(
@@ -74,6 +74,7 @@ async fn another_spelling_of_a_repository_joins_its_lock() {
     let (first, _) = get_or_create_repository_lock(
         dot_path,
         lore_storage::local::store_lock::StoreHold::default(),
+        true,
     )
     .await
     .expect("creates");
@@ -82,6 +83,7 @@ async fn another_spelling_of_a_repository_joins_its_lock() {
         get_or_create_repository_lock(
             link.join(".lore"),
             lore_storage::local::store_lock::StoreHold::default(),
+            true,
         ),
     )
     .await

@@ -38,6 +38,7 @@ mod node;
 mod notification;
 mod paged_remote;
 mod protocol;
+mod records;
 mod refusal;
 mod relay;
 mod repository;

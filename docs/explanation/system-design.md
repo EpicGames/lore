@@ -1660,11 +1660,13 @@ on the machine that recorded it.
 Deciding whether a given file has changed is made cheap. A file is compared against
 its tracked node by size first, then modification time, and only by content hash
 when the size matches but the recorded modification time differs. The per-file
-modification time is held in the local mutable store, keyed by instance and path,
-rather than on the tree node - so the common case (size and mtime unchanged) is
-confirmed unmodified without ever reading the file's bytes. This is what keeps a full
-scan linear in file count rather than in total bytes: most files are dismissed on
-metadata alone.
+modification time is held in the instance's own Lore directory, in `.lore/records/`,
+keyed by path, rather than on the tree node - so the common case (size and mtime
+unchanged) is confirmed unmodified without ever reading the file's bytes. An SWFS or
+in-memory instance keeps its times in the local mutable store, keyed by instance and
+path, and an instance an older client created still reads a time from there when its
+own records hold none. This is what keeps a full scan linear in file count rather than
+in total bytes: most files are dismissed on metadata alone.
 
 #### 15.3 Paths into the dirty set
 

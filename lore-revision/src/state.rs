@@ -174,6 +174,11 @@ use crate::node::NodeNameLock;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::node::node_to_file_metadata;
+use crate::records::InstanceRecords;
+use crate::records::Lookup;
+use crate::records::Record;
+use crate::records::RecordBatch;
+use crate::records::RecordKey;
 use crate::repository::DOT_LORE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -8767,17 +8772,20 @@ pub fn file_modified_against_node<'a>(
 #[must_use]
 #[lore_macro::test_pub]
 pub struct RecordedModifiedTimes {
-    entries: Box<crossbeam_queue::SegQueue<(Hash, u64)>>,
+    /// Times for the instance's records.
+    records: Box<crossbeam_queue::SegQueue<Record>>,
+    /// The mutable store keys of paths in `records` whose store records an older client may
+    /// have written, to be zeroed.
+    replaced: Box<crossbeam_queue::SegQueue<Hash>>,
+    /// Times for the mutable store, for an instance that keeps its records there.
+    store: Box<crossbeam_queue::SegQueue<(Hash, u64)>>,
     /// Times at or after this are not collected.
     floor: u64,
 }
 
 impl Default for RecordedModifiedTimes {
     fn default() -> Self {
-        Self {
-            entries: Box::default(),
-            floor: u64::MAX,
-        }
+        Self::below(u64::MAX)
     }
 }
 
@@ -8786,7 +8794,9 @@ impl RecordedModifiedTimes {
     /// file whose time it collects ([`read_clock_floor`]).
     pub fn below(floor: u64) -> Self {
         Self {
-            entries: Box::default(),
+            records: Box::default(),
+            replaced: Box::default(),
+            store: Box::default(),
             floor,
         }
     }
@@ -8795,16 +8805,19 @@ impl RecordedModifiedTimes {
     /// `mtime`, where the time is older than the collector's floor.
     pub fn record(&self, repository: &RepositoryContext, path: &RelativePath, mtime: u64) {
         if mtime < self.floor {
-            self.entries
-                .push(file_modified_time_entry(repository, path, mtime));
+            self.push(file_modified_time_entry(repository, path, mtime));
         }
     }
 
-    /// Writes the collected times into `repository`'s mutable store, one task per store group.
+    /// Writes the collected times into the instance's records, or into `repository`'s mutable
+    /// store where the instance keeps them there.
     ///
-    /// The store takes its write lock within the group a key's first byte selects, so
-    /// splitting the times by that byte lets every task run without ever contending with
-    /// another.
+    /// The records are set in one pass per shard and written back with the context's flush.
+    /// Alongside, the store's record of each path that replaces one an older client may have
+    /// written is zeroed where it holds a time, so that no client reads a time the store kept
+    /// for content the path no longer holds. The store work runs one task per store group: the
+    /// store takes its write lock within the group a key's first byte selects, so splitting the
+    /// keys by that byte lets every task run without ever contending with another.
     ///
     /// Without a floor, waits for the filesystem to stamp later than every time written, so that
     /// none of them can be shared by a write that follows — bounded, so a filesystem that does not
@@ -8812,43 +8825,73 @@ impl RecordedModifiedTimes {
     /// waited on forever. See [`wait_until_settled`]. A collector with a floor holds only times
     /// older than a stamp the filesystem has already given, so it has nothing to wait for.
     pub async fn store(&self, repository: Arc<RepositoryContext>) {
-        let mut times = Vec::with_capacity(self.entries.len());
-        let mut mtime_max = 0;
-        while let Some((key, mtime)) = self.entries.pop() {
-            mtime_max = mtime_max.max(mtime);
-            times.push((key, mtime));
-        }
-        if times.is_empty() || execution_context().globals().dry_run() {
-            return;
-        }
-        let Some(store) = repository.try_mutable_store_arc() else {
-            return;
+        let store = match repository.try_mutable_store_arc() {
+            Some(store) if !execution_context().globals().dry_run() => store,
+            _ => {
+                self.discard();
+                return;
+            }
         };
 
-        let mut groups = vec![Vec::new(); lore_storage::local::mutable_store::GROUP_COUNT];
-        for (key, mtime) in times {
-            groups[key.data()[0] as usize].push((key, mtime));
-        }
-
+        let mut mtime_max = 0;
         let mut tasks = JoinSet::new();
-        for items in groups {
-            if items.is_empty() {
-                continue;
+        if !self.store.is_empty() {
+            let mut groups = vec![Vec::new(); lore_storage::local::mutable_store::GROUP_COUNT];
+            while let Some((key, mtime)) = self.store.pop() {
+                mtime_max = mtime_max.max(mtime);
+                groups[key.data()[0] as usize].push((key, mtime));
             }
-            // Each task holds the context, and with it the command's claims on the store, so
-            // that none outlives them when this is dropped part way and its tasks run on to
-            // their next await.
-            lore_spawn!(tasks, {
-                let store = store.clone();
-                let repository = repository.clone();
-                async move {
-                    file_modified_time_store_group(store, repository.root_id(), items).await;
+            for items in groups {
+                if items.is_empty() {
+                    continue;
                 }
-            });
+                // Each task holds the context, and with it the command's claims on the store, so
+                // that none outlives them when this is dropped part way and its tasks run on to
+                // their next await.
+                lore_spawn!(tasks, {
+                    let store = store.clone();
+                    let repository = repository.clone();
+                    async move {
+                        file_modified_time_store_group(store, repository.root_id(), items).await;
+                    }
+                });
+            }
         }
-        while tasks.join_next().await.is_some() {}
+        if !self.replaced.is_empty() {
+            let mut groups = vec![Vec::new(); lore_storage::local::mutable_store::GROUP_COUNT];
+            while let Some(key) = self.replaced.pop() {
+                groups[key.data()[0] as usize].push(key);
+            }
+            for keys in groups {
+                if !keys.is_empty() {
+                    lore_spawn!(
+                        tasks,
+                        zero_store_modified_time_group(repository.clone(), keys)
+                    );
+                }
+            }
+        }
+        drop(store);
 
-        if self.floor == u64::MAX {
+        if let Some(records) = repository.instance_records()
+            && !self.records.is_empty()
+        {
+            let mut batch = RecordBatch::with_capacity(self.records.len());
+            while let Some(record) = self.records.pop() {
+                mtime_max = mtime_max.max(record.mtime());
+                batch.push(record);
+            }
+            if let Err(err) = records.set_all(batch).await {
+                lore_warn!("Failed to record modified times: {err}");
+            }
+        }
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(err) = joined {
+                lore_warn!("Failed to store modified times: {err}");
+            }
+        }
+
+        if self.floor == u64::MAX && mtime_max != 0 {
             wait_until_settled(&repository, mtime_max).await;
         }
     }
@@ -8856,31 +8899,57 @@ impl RecordedModifiedTimes {
     /// Collects an entry built by [`file_modified_time_entry`], for a caller that computed
     /// the key where it had the path rather than where it records, where its time is older than
     /// the collector's floor.
-    pub fn push(&self, entry: (Hash, u64)) {
-        if entry.1 < self.floor {
-            self.entries.push(entry);
+    pub fn push(&self, entry: ModifiedTimeEntry) {
+        match entry {
+            ModifiedTimeEntry::Record(record) if record.mtime() < self.floor => {
+                self.records.push(record);
+            }
+            ModifiedTimeEntry::Replace(record, key) if record.mtime() < self.floor => {
+                self.records.push(record);
+                self.replaced.push(key);
+            }
+            ModifiedTimeEntry::Store(key, mtime) if mtime < self.floor => {
+                self.store.push((key, mtime));
+            }
+            _ => {}
         }
     }
 
     /// Moves the times collected by `other` into this collector.
     pub fn absorb(&self, other: Self) {
-        while let Some(entry) = other.entries.pop() {
-            self.push(entry);
-        }
+        self.move_from(&other);
     }
 
     /// Removes the times collected so far, leaving the collector empty.
     pub fn take(&self) -> Self {
         let taken = Self::default();
-        while let Some(entry) = self.entries.pop() {
-            taken.entries.push(entry);
-        }
+        taken.move_from(self);
         taken
     }
 
     /// Drops the times, for an operation that leaves the current revision elsewhere.
     pub fn discard(&self) {
-        while self.entries.pop().is_some() {}
+        while self.records.pop().is_some() {}
+        while self.replaced.pop().is_some() {}
+        while self.store.pop().is_some() {}
+    }
+
+    /// Moves the times `other` collected into this collector, where they are older than its
+    /// floor.
+    fn move_from(&self, other: &Self) {
+        while let Some(record) = other.records.pop() {
+            if record.mtime() < self.floor {
+                self.records.push(record);
+            }
+        }
+        while let Some(key) = other.replaced.pop() {
+            self.replaced.push(key);
+        }
+        while let Some((key, mtime)) = other.store.pop() {
+            if mtime < self.floor {
+                self.store.push((key, mtime));
+            }
+        }
     }
 }
 
@@ -9008,7 +9077,7 @@ pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) 
     let _ = lore_io::IoDriver::global().remove_file(&path).await;
 }
 
-/// The key a file's modification time is stored under.
+/// The key a file's modification time is stored under in the mutable store.
 ///
 /// The store is case-insensitive over paths, and [`RelativePath`] already carries
 /// the fold, so the key is taken from it rather than folded again. Folding here
@@ -9023,24 +9092,61 @@ pub fn file_modified_time_key(salt: &[u8], instance: InstanceId, path: &impl Fil
     )
 }
 
+/// The key a file's modification time is filed under in the instance's records: a hash of the
+/// repository's salt and the lowercased path, and not the instance, so the records in a copy of
+/// the dot directory describe the copy's files.
+pub fn file_modified_time_record_key(salt: &[u8], path: &impl FilterPath) -> RecordKey {
+    InstanceRecords::key(&hash::hash_function_args_slice(
+        salt,
+        FILE_MTIME,
+        &[],
+        path.as_lowercase_str().as_bytes(),
+    ))
+}
+
+/// A time recorded for a path, keyed for where the instance keeps its records.
+#[derive(Debug, Clone, Copy)]
+pub enum ModifiedTimeEntry {
+    /// For the instance's records.
+    Record(Record),
+    /// For the instance's records, with the key of the path's record in the mutable store, which
+    /// an older client may have written and which is zeroed.
+    Replace(Record, Hash),
+    /// For the mutable store: the key and the time.
+    Store(Hash, u64),
+}
+
 /// The entry recording that `path` held the current revision's content at `mtime`, for a
 /// caller collecting entries to write in one batch rather than one at a time.
 pub fn file_modified_time_entry(
     repository: &RepositoryContext,
     path: &RelativePath,
     mtime: u64,
-) -> (Hash, u64) {
-    (
-        file_modified_time_key(repository.salt(), repository.instance_id, path),
+) -> ModifiedTimeEntry {
+    let Some(records) = repository.instance_records() else {
+        return ModifiedTimeEntry::Store(
+            file_modified_time_key(repository.salt(), repository.instance_id, path),
+            mtime,
+        );
+    };
+    let record = Record::new(
+        file_modified_time_record_key(repository.salt(), path),
         mtime,
-    )
+    );
+    if records.has_store_records() {
+        ModifiedTimeEntry::Replace(
+            record,
+            file_modified_time_key(repository.salt(), repository.instance_id, path),
+        )
+    } else {
+        ModifiedTimeEntry::Record(record)
+    }
 }
 
-pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &impl WalkPath) -> u64 {
+/// The time the mutable store holds for `path`, 0 where it holds none.
+async fn store_modified_time(repository: &RepositoryContext, path: &impl WalkPath) -> u64 {
     let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
-    let mtime = stored_modified_time(&repository, key).await;
-    lore_trace!("Load mtime {mtime} for {path}");
-    mtime
+    stored_modified_time(repository, key).await
 }
 
 /// The modification time stored under `key` in `repository`'s mutable store, 0 for none.
@@ -9056,6 +9162,72 @@ pub(crate) async fn stored_modified_time(repository: &RepositoryContext, key: Ha
                 .unwrap_or_default(),
         ),
         Err(_) => 0,
+    }
+}
+
+/// The time the instance's records hold for `path`. Where the store can hold an older client's
+/// records of the instance, a path with no record falls back to the time the store holds, which
+/// is copied into the instance's records and left in the store, since it still describes the
+/// path's content.
+async fn instance_modified_time(
+    repository: &RepositoryContext,
+    records: &InstanceRecords,
+    path: &impl WalkPath,
+) -> u64 {
+    let key = file_modified_time_record_key(repository.salt(), path);
+    match records.lookup(&key).await {
+        Lookup::Recorded(mtime) => mtime,
+        Lookup::Missing(generation) if records.has_store_records() => {
+            adopt_store_modified_time(repository, records, path, key, generation).await
+        }
+        Lookup::Missing(_) => 0,
+    }
+}
+
+/// The time the mutable store holds for `path`, copied into the instance's records under `key`
+/// unless they have changed since the lookup that returned `generation`.
+async fn adopt_store_modified_time(
+    repository: &RepositoryContext,
+    records: &InstanceRecords,
+    path: &impl WalkPath,
+    key: RecordKey,
+    generation: u64,
+) -> u64 {
+    let mtime = store_modified_time(repository, path).await;
+    if mtime != 0
+        && !crate::runtime::try_execution_context()
+            .is_some_and(|context| context.globals().dry_run())
+    {
+        records.adopt(key, mtime, generation).await;
+    }
+    mtime
+}
+
+pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &impl WalkPath) -> u64 {
+    let mtime = match repository.instance_records() {
+        Some(records) => instance_modified_time(&repository, records, path).await,
+        None => store_modified_time(&repository, path).await,
+    };
+    lore_trace!("Load mtime {mtime} for {path}");
+    mtime
+}
+
+/// Zeroes the mutable store's record under `key` where it holds one, for an instance that keeps
+/// its own records. A store record left beside a newer one would describe content the path no
+/// longer holds to a client that reads only the store.
+async fn zero_store_modified_time(
+    store: &crate::store::handles::WriteHandle<'_>,
+    partition: RepositoryId,
+    key: Hash,
+) {
+    if store
+        .load(partition, key, KeyType::Untyped)
+        .await
+        .is_ok_and(|value| !value.is_zero())
+    {
+        let _ = store
+            .store(partition, key, Hash::default(), KeyType::Untyped)
+            .await;
     }
 }
 
@@ -9075,15 +9247,28 @@ pub async fn file_modified_time_store(
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
     };
-    let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
-    let _ = handle
-        .store(
-            repository.root_id(),
-            key,
-            Hash::from_u64(mtime),
-            KeyType::Untyped,
+    let Some(records) = repository.instance_records() else {
+        let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
+        let _ = handle
+            .store(
+                repository.root_id(),
+                key,
+                Hash::from_u64(mtime),
+                KeyType::Untyped,
+            )
+            .await;
+        return;
+    };
+    records
+        .set(
+            file_modified_time_record_key(repository.salt(), path),
+            mtime,
         )
         .await;
+    if records.has_store_records() {
+        let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
+        zero_store_modified_time(&handle, repository.root_id(), key).await;
+    }
 }
 
 /// Writes one store group's worth of pre-computed `(mtime_key, mtime)` pairs.
@@ -9102,15 +9287,38 @@ async fn file_modified_time_store_group(
     }
 }
 
+/// Zeroes one store group's worth of the store records named by `keys` that hold a time, as
+/// [`zero_store_modified_time`] does.
+async fn zero_store_modified_time_group(repository: Arc<RepositoryContext>, keys: Vec<Hash>) {
+    let Some(handle) = repository.try_write_mutable_store() else {
+        return;
+    };
+    for key in keys {
+        zero_store_modified_time(&handle, repository.root_id(), key).await;
+    }
+}
+
+/// Removes the time recorded for `path`, from the instance's records and, where it can hold
+/// one, from the mutable store.
 pub async fn file_modified_time_clear(repository: Arc<RepositoryContext>, path: &RelativePath) {
     lore_trace!("Clear mtime for {path}");
     let Some(handle) = repository.try_write_mutable_store() else {
         return;
     };
-    let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
-    let _ = handle
-        .store(repository.root_id(), key, Hash::default(), KeyType::Untyped)
+    let Some(records) = repository.instance_records() else {
+        let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
+        let _ = handle
+            .store(repository.root_id(), key, Hash::default(), KeyType::Untyped)
+            .await;
+        return;
+    };
+    records
+        .remove(&file_modified_time_record_key(repository.salt(), path))
         .await;
+    if records.has_store_records() {
+        let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
+        zero_store_modified_time(&handle, repository.root_id(), key).await;
+    }
 }
 
 pub async fn verify_node_name_case(

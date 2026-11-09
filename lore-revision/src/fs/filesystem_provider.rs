@@ -922,7 +922,7 @@ impl InstanceOperationImpl {
     }
 
     /// Collects an entry keyed by the caller, stored and discarded with the recorded times.
-    pub fn record_modified_entry(&self, entry: (crate::lore::Hash, u64)) {
+    pub fn record_modified_entry(&self, entry: crate::state::ModifiedTimeEntry) {
         self.modified_times.push(entry);
     }
 

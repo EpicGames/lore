@@ -52,6 +52,7 @@ pub mod path;
 pub mod progress;
 pub mod proto;
 pub mod protocol;
+pub mod records;
 pub mod relay;
 pub mod repository;
 pub mod revision;

@@ -91,9 +91,10 @@ async fn a_context_without_command_locks_holds_no_write_token() {
 async fn a_context_without_command_locks_holds_no_repository_lock() {
     let temp_dir = lore_base::test_util::TempDir::new("lore-repository-lock-test-");
     let dot_path = temp_dir.path().to_path_buf();
-    let (lock, stores) = get_or_create_repository_lock(dot_path.clone(), StoreHold::default())
-        .await
-        .expect("the repository lock is taken");
+    let (lock, stores) =
+        get_or_create_repository_lock(dot_path.clone(), StoreHold::default(), true)
+            .await
+            .expect("the repository lock is taken");
     let held = Arc::downgrade(&lock);
     let ctx = Arc::try_unwrap(in_memory_context().await)
         .expect("sole owner")
@@ -105,7 +106,7 @@ async fn a_context_without_command_locks_holds_no_repository_lock() {
     assert!(held.upgrade().is_none(), "the copy holds the lock");
     let _later = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        get_or_create_repository_lock(dot_path, StoreHold::default()),
+        get_or_create_repository_lock(dot_path, StoreHold::default(), true),
     )
     .await
     .expect("a later command takes the lock while the copy lives")

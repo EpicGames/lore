@@ -897,6 +897,13 @@ impl RepositoryContext {
         })
     }
 
+    /// The modified times this instance has recorded in its dot directory, where this context
+    /// holds the instance's repository lock and the instance keeps them there. Other contexts
+    /// keep them in the mutable store.
+    pub fn instance_records(&self) -> Option<&Arc<crate::records::InstanceRecords>> {
+        self.repo_lock.as_deref().and_then(RepositoryLock::records)
+    }
+
     pub fn dot_dir_path(&self) -> Result<&Path, crate::errors::InvalidArguments> {
         if let Some(paths) = &self.paths {
             Ok(paths.dot_path.as_ref())
@@ -1075,8 +1082,15 @@ impl RepositoryContext {
     /// cross-process concurrent flushes are safe at the data-structure
     /// level.
     ///
-    /// The mutable store is only flushed when the context holds a write
-    /// token — read-only commands cannot have dirtied it.
+    /// The mutable store, and the instance's records, are only flushed when the
+    /// context holds a write token. A read-only command cannot have dirtied the
+    /// mutable store. It can change the records, by adopting times read from the
+    /// store and by marking a shard it could not read to be replaced. The flush
+    /// of a later command with a write token that shares the repository lock
+    /// writes those changes, and otherwise they are dropped with the lock; the
+    /// next command reads them again. The records are written alongside the
+    /// store flushes, under a sibling of the token, which is released once they
+    /// are written.
     ///
     /// The `Arc<RepositoryLock>` is cloned into the task, so the repository
     /// flock and the store claims it contains outlive the caller's
@@ -1096,16 +1110,29 @@ impl RepositoryContext {
             .is_some()
             .then(|| self.mutable_store.clone());
         let repo_lock = self.repo_lock.clone();
+        let records_token = self
+            .instance_records()
+            .is_some_and(|records| records.is_dirty())
+            .then(|| self.write_token.as_ref().map(RepositoryWriteToken::share))
+            .flatten();
         let own_stores = self.own_stores.clone();
         lore_base::runtime::LORE_CONTEXT.sync_scope(
             Arc::new(crate::interface::ExecutionContext::default())
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
-                    let _ = immutable_store.flush(sync_data).await;
-                    if let Some(mutable_store) = mutable_store {
-                        let _ = mutable_store.flush(sync_data).await;
-                    }
+                    let records = async {
+                        if let (Some(lock), Some(token)) = (&repo_lock, records_token) {
+                            lock.write_back_records(&token).await;
+                        }
+                    };
+                    let stores = async {
+                        let _ = immutable_store.flush(sync_data).await;
+                        if let Some(mutable_store) = mutable_store {
+                            let _ = mutable_store.flush(sync_data).await;
+                        }
+                    };
+                    tokio::join!(records, stores);
                     // The repository flock first, then the store claims it was taken inside.
                     drop(repo_lock);
                     drop(own_stores);
@@ -1387,16 +1414,26 @@ impl RepositoryContext {
             .store(prefetch, Ordering::Relaxed);
     }
 
+    /// Writes back the instance's records, where this context holds a write token, alongside
+    /// the immutable store's flush and then the mutable store's. A failed write-back is logged
+    /// and does not fail the flush: the records are advisory.
     pub async fn flush(&self, sync_data: bool) -> Result<(), RepositoryError> {
-        let immutable_store = self.immutable_store.clone();
-        let immutable_result = immutable_store.flush(sync_data).await;
+        let records = async {
+            if let (Some(lock), Some(token)) = (&self.repo_lock, &self.write_token) {
+                lock.write_back_records(token).await;
+            }
+        };
+        let stores = async {
+            let immutable_store = self.immutable_store.clone();
+            let immutable_result = immutable_store.flush(sync_data).await;
 
-        let mutable_store = self.mutable_store.clone();
-        let mutable_result = mutable_store.flush(sync_data).await;
+            let mutable_store = self.mutable_store.clone();
+            let mutable_result = mutable_store.flush(sync_data).await;
 
-        immutable_result
-            .and(mutable_result)
-            .forward::<RepositoryError>("Failed to flush stores to disk")
+            immutable_result.and(mutable_result)
+        };
+        let ((), result) = tokio::join!(records, stores);
+        result.forward::<RepositoryError>("Failed to flush stores to disk")
     }
 
     /// Returns the remote connection, awaiting the pending connect task on first call.
@@ -1879,7 +1916,11 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
 /// released.
 #[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
-    /// Declared first so it drops first. Rust drops fields in declaration order,
+    /// The instance's recorded modified times, which this lock protects, or `None` where the
+    /// instance keeps them in the mutable store. Written back by the context's flush, before
+    /// the lock is released.
+    records: Option<Arc<crate::records::InstanceRecords>>,
+    /// Declared before the store locks so it drops before them. Rust drops fields in declaration order,
     /// so the repository flock is released before the store locks that contain
     /// it — the reverse of acquisition, which is what containment means on the
     /// way out.
@@ -1900,6 +1941,25 @@ pub(crate) struct RepositoryLock {
     /// Repository creation takes no repository lock, so it builds none of this: its
     /// writes go through the stores, each taking its own claim.
     _stores: lore_storage::local::store_lock::StoreHold,
+}
+
+impl RepositoryLock {
+    /// The instance's recorded modified times, which this lock protects, or `None` where the
+    /// instance keeps them in the mutable store.
+    pub(crate) fn records(&self) -> Option<&Arc<crate::records::InstanceRecords>> {
+        self.records.as_ref()
+    }
+
+    /// Writes back the instance's records, keeping this lock until every write has landed. A
+    /// failure is logged: the records are advisory, and a shard that failed is tried again at
+    /// the next write-back.
+    async fn write_back_records(self: &Arc<Self>, token: &RepositoryWriteToken) {
+        if let Some(records) = &self.records
+            && let Err(err) = records.write_back(token, Arc::clone(self)).await
+        {
+            lore_warn!("Failed to write modified time records: {err}");
+        }
+    }
 }
 
 /// Claims `immutable` and then `mutable` for a use of the repository they belong to, which
@@ -1985,6 +2045,14 @@ static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
     std::sync::RwLock<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
 
+/// Whether an instance of `config` keeps its modified-time records in its dot directory. An SWFS
+/// mount presents the recorded times, which it reads from the store. In-memory stores end with
+/// the process, and records kept on disk would outlive the revision they describe.
+#[lore_macro::test_pub]
+fn keeps_records_on_disk(config: &RepositoryConfig, in_memory: bool) -> bool {
+    config.vfs_type() != VfsType::Swfs && !in_memory
+}
+
 /// Acquire (or reuse, via weak-ref cache) the process-local `RepositoryLock`
 /// for a repository's dot-directory (`.lore/` or `.urc/`).
 ///
@@ -1993,10 +2061,14 @@ static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
 /// reference drops. Concurrent first-time initializers are serialized via a
 /// per-path `tokio::sync::Mutex` so only one thread calls into the OS flock
 /// for a given path at a time; others wait, then observe the cached entry.
+///
+/// A holder this call creates keeps the instance's modified-time records in the dot directory
+/// where `instance_records` is set. A cached holder keeps the choice it was created with.
 #[lore_macro::test_pub]
 pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
     stores: lore_storage::local::store_lock::StoreHold,
+    instance_records: bool,
 ) -> Result<
     (
         Arc<RepositoryLock>,
@@ -2057,7 +2129,13 @@ pub(crate) async fn get_or_create_repository_lock(
         .await
         .internal("Failed to get exclusive access to repository")?;
 
+    let records = if instance_records {
+        Some(crate::records::InstanceRecords::open(&dot_path).await)
+    } else {
+        None
+    };
     let holder = Arc::new(RepositoryLock {
+        records,
         _lock: lock,
         _stores: stores,
     });
@@ -2797,7 +2875,14 @@ pub async fn load_and_connect_with_token(
     // the path that runs most often. The one write this function makes to it waits for
     // the lock, below.
     let repo_lock = match stores {
-        Some(stores) => Some(get_or_create_repository_lock(dot_path.clone(), stores).await?),
+        Some(stores) => Some(
+            get_or_create_repository_lock(
+                dot_path.clone(),
+                stores,
+                keeps_records_on_disk(&config, global.in_memory()),
+            )
+            .await?,
+        ),
         None => None,
     };
 
@@ -3281,6 +3366,11 @@ pub async fn create_local(
     // the same duration: creation takes no repository lock, and the writes
     // below run inside this claim rather than each taking one of its own.
     let in_memory = no_tracking || execution_context().globals().in_memory();
+    if keeps_records_on_disk(&config, in_memory) {
+        crate::records::mark_new_instance(&dotpath, token)
+            .await
+            .internal("Failed to write local repository state: failed to mark the records")?;
+    }
     let (immutable_store, mutable_store, stores) = if in_memory {
         let (imm, mut_) = create_client_memory_stores().await?;
         if !no_tracking {

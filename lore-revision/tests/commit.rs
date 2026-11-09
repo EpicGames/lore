@@ -830,18 +830,26 @@ mod tests {
                 let collector = state::RecordedModifiedTimes::below(floor);
                 collector.record(&created.repository, &relative_path, floor - 1);
                 collector.record(&created.repository, &relative_path, floor);
-                assert_eq!(collector.entries.len(), 1, "recorded");
+                assert_eq!(
+                    collector.records.len() + collector.store.len(),
+                    1,
+                    "recorded"
+                );
                 let entry = |mtime| {
                     state::file_modified_time_entry(&created.repository, &relative_path, mtime)
                 };
                 collector.push(entry(floor - 1));
                 collector.push(entry(floor));
-                assert_eq!(collector.entries.len(), 2, "pushed");
+                assert_eq!(collector.records.len() + collector.store.len(), 2, "pushed");
                 let unbounded = state::RecordedModifiedTimes::default();
                 unbounded.push(entry(floor - 1));
                 unbounded.push(entry(floor));
                 collector.absorb(unbounded);
-                assert_eq!(collector.entries.len(), 3, "absorbed");
+                assert_eq!(
+                    collector.records.len() + collector.store.len(),
+                    3,
+                    "absorbed"
+                );
             })
             .await;
     }
