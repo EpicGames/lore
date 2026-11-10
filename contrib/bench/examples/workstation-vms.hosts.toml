@@ -1,0 +1,18 @@
+# Two VMs, one on each of two workstations, each in the bench-vm container (vm/). The client VM's
+# traffic leaves through its host's address, and the server VM is reached at its host's address
+# through the ports Docker publishes there. The operator reaches the client VM through its host.
+# Replace the addresses, the jump host and the disks with your own.
+[client]
+ip = "192.0.2.10"                     # the client workstation's address, as the server sees it
+ssh = "bench@127.0.0.1:2222"          # the VM's SSH port, published on its host's loopback
+jump = "you@192.0.2.10"               # ...which the operator reaches through the workstation
+data = "/bench"
+rated = { read_mbs = 7200, write_mbs = 6600 }   # the host's NVMe drive holding the VM's raw disk
+notes = "16-vCPU, 32 GiB VM, raw disk image on an NVMe XFS volume"
+
+[server]
+ip = "192.0.2.20"                     # the server workstation's address
+ssh = "bench@192.0.2.20:2222"         # the VM's SSH port, published on that address
+data = "/bench"
+rated = { read_mbs = 560, write_mbs = 530, cache_gb = 78, after_cache_mbs = 160 }  # a SATA QLC SSD
+notes = "16-vCPU, 32 GiB VM, raw disk image on a SATA SSD ext4 volume"

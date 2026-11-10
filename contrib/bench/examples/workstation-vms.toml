@@ -1,0 +1,73 @@
+# P4 and Lore, import and fetch of a game engine's source tree, between two 16-vCPU, 32 GiB VMs on a
+# 30 ms, 5 Gbit/s link. The client VM's host serves the corpus and the binaries on its Docker bridge
+# address (see the README). Replace the URLs and hashes with your own corpus and builds.
+name = "workstation-vms-30ms-5g"
+description = "P4 and Lore, a game engine source tree, two 16-vCPU VMs on a 30 ms, 5 Gbit/s link"
+
+[corpus]
+url = "http://172.17.0.1:8080/corpus/ue-engine.tar.zst"
+sha256 = "533a443d70c397cde6fa0220edd67a67a94256946ed3dc9135f65f01e0c53ff1"
+root = "Engine"
+
+[target]
+kind = "static"
+inventory = "workstation-vms.hosts.toml"
+
+# The workstations' own network settings, so the VMs' TCP and UDP buffers match the hosts', and the
+# kernel's default page-cache thresholds, stated explicitly.
+[host.sysctl]
+"net.ipv4.tcp_rmem" = "4096 131072 33554432"
+"net.ipv4.tcp_wmem" = "4096 16384 33554432"
+"net.core.rmem_max" = 33554432
+"net.core.wmem_max" = 33554432
+"net.ipv4.tcp_congestion_control" = "cubic"
+"net.core.default_qdisc" = "fq_codel"
+"vm.dirty_ratio" = 20
+"vm.dirty_background_ratio" = 10
+
+# A 5 Gbit/s link. The shaper counts Ethernet frames without the 24 bytes of preamble, gap and
+# checksum each one takes on the wire, so 4,920 Mbit/s of frames is 5 Gbit/s on the wire. On bare
+# metal the card's line rate was the limit; here the guest's shaper must be, or the host's card
+# would drop what the guest sends beyond it.
+[[profile]]
+name = "30ms-5g"
+rtt_ms = 30
+rate_mbit = 4920
+queue_bdp = 1.0
+
+[tool.p4]
+p4d = { url = "http://172.17.0.1:8080/bin/p4d", sha256 = "e2c1e11865774782eb37483c0a6f6ebdfc09d9dca6f44880ae59059cdf7b1847" }
+p4 = { url = "http://172.17.0.1:8080/bin/p4", sha256 = "bfbb838cc5794a6a678df65e52841004ca7e192119a1c108adac3d47f6ccb4fc" }
+port = "tcp"
+typemap = "ue"
+submit_threads = 4
+sync_threads = 4
+
+[tool.p4.configurables]   # the performance settings from the Perforce article's SDP configuration
+"net.parallel.max" = 20
+"net.parallel.threads" = 4
+"net.parallel.submit.threads" = 4
+"net.parallel.sync.svrthreads" = 150
+"lbr.autocompress" = 1
+"rpl.compress" = 4
+"filesys.bufsize" = "1M"
+"lbr.bufsize" = "1M"
+"submit.noretransfer" = 1
+"net.backlog" = 2048
+"server.maxcommands" = 2500
+"monitor" = 2
+"track" = 1
+"filetype.bypasslock" = 1
+"filesys.binaryscan" = 0
+
+[tool.lore]
+lore = { url = "http://172.17.0.1:8080/bin/lore", sha256 = "074ac692b8e645f4f998e6615127db01ece32096399a0d1fa5d2df8e629e06c2" }
+loreserver = { url = "http://172.17.0.1:8080/bin/loreserver", sha256 = "ed9dca07d499aeac2d0cd12bb04be90ba1a72e8d0372e78e46fbc75aad4a222b" }
+client_env = { LORE_MAX_CONNECTIONS = "4" }
+
+[run]
+tests = ["import", "fetch"]
+repetitions = 1
+order = "alternate"
+settle_s = 120
+verify_sha256 = "first"

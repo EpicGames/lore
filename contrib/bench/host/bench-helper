@@ -1,0 +1,85 @@
+#!/bin/sh
+# bench-helper: the benchmark user's only command as root. It accepts only the forms below and
+# checks every argument against a fixed pattern or range. The network interface and the data
+# directory come from /etc/bench/helper.conf, which bootstrap.sh writes.
+#
+#   shape PEER_IP DELAY_US RATE_MBIT QUEUE_BYTES [LOSS_PPM [JITTER_US]]
+#       Traffic to PEER_IP goes through netem (delay, and optionally loss and jitter), then tbf at
+#       RATE_MBIT with a queue of QUEUE_BYTES. RATE_MBIT 0 means no rate limit. The queue is bounded
+#       in bytes because segmentation offload hands the qdisc bundles of varying size, so a limit in
+#       packets would bound nothing. Other traffic is not shaped. Shaping also turns segmentation
+#       offload (TSO, GSO) on, which unshape leaves on.
+#   unshape
+#   dropcaches
+#   trim                 fstrim the data directory
+#   sysctl KEY VALUE     KEY from the fixed list below
+set -eu
+# The commands below are the system's, whatever PATH sudo was given.
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+CONF=/etc/bench/helper.conf DRY=
+if [ "$(id -u)" -ne 0 ]; then  # tests only: sudo resets the environment, so root never sees these
+    CONF=${BENCH_HELPER_CONF:-$CONF} DRY=${BENCH_HELPER_DRYRUN:-}
+fi
+. "$CONF"
+
+usage() { sed -n '2,15p' "$0" >&2; exit 2; }
+run() { if [ -n "$DRY" ]; then echo "$*"; else "$@"; fi }
+int() {  # int VALUE MIN MAX: exit unless VALUE is a decimal integer in [MIN, MAX]
+    case "$1" in '' | *[!0-9]*) usage ;; esac
+    [ "${#1}" -le 10 ] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ] || usage
+}
+ipv4() {
+    case "$1" in *[!0-9.]* | *..* | .* | *.) usage ;; esac
+    old=$IFS; IFS=.; set -- $1; IFS=$old
+    [ $# -eq 4 ] || usage
+    for o in "$@"; do int "$o" 0 255; done
+}
+
+case "${1:-}" in
+shape)
+    [ $# -ge 5 ] && [ $# -le 7 ] || usage
+    ipv4 "$2"; int "$3" 0 1000000; int "$4" 0 100000; int "$5" 0 1073741824
+    peer=$2 delay=$3 rate=$4 queue=$5 loss=${6:-0} jitter=${7:-0}
+    int "$loss" 0 1000000; int "$jitter" 0 "$delay"
+    [ "$queue" -ge 262144 ] || queue=262144  # at least the tbf burst
+    netem="delay ${delay}us"
+    [ "$jitter" -eq 0 ] || netem="$netem ${jitter}us"
+    [ "$loss" -eq 0 ] || netem="$netem loss $(awk "BEGIN { printf \"%.4f\", $loss / 10000 }")%"
+    run tc qdisc del dev "$DEV" root 2> /dev/null || true
+    run ethtool -K "$DEV" tso on gso on > /dev/null 2>&1 || true
+    # Band 1:1 takes the traffic to the peer, shaped; band 1:2 everything else, as the card sends
+    # it. A prio root, unlike a rate-limited one, puts no ceiling on either.
+    run tc qdisc add dev "$DEV" root handle 1: prio bands 2 priomap 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1
+    run tc qdisc add dev "$DEV" parent 1:1 handle 10: netem $netem limit 1000000
+    if [ "$rate" -gt 0 ]; then
+        run tc qdisc add dev "$DEV" parent 10:1 handle 20: tbf rate "${rate}mbit" burst 256kb limit "$queue"
+    fi
+    run tc qdisc add dev "$DEV" parent 1:2 handle 30: fq_codel
+    run tc filter add dev "$DEV" parent 1: protocol ip prio 1 u32 match ip dst "$peer/32" flowid 1:1
+    ;;
+unshape)
+    [ $# -eq 1 ] || usage
+    run tc qdisc del dev "$DEV" root 2> /dev/null || true ;;
+dropcaches)
+    [ $# -eq 1 ] || usage
+    run sync; if [ -n "$DRY" ]; then echo "drop_caches 3"; else echo 3 > /proc/sys/vm/drop_caches; fi ;;
+trim)
+    [ $# -eq 1 ] || usage
+    run fstrim "$DATA" ;;
+sysctl)
+    [ $# -eq 3 ] || usage
+    case "$2" in
+    net.ipv4.tcp_congestion_control | net.core.default_qdisc)
+        case "$3" in '' | *[!a-z0-9_]* | [!a-z]*) usage ;; esac ;;
+    net.ipv4.tcp_rmem | net.ipv4.tcp_wmem | net.core.rmem_max | net.core.wmem_max | \
+    net.core.rmem_default | net.core.wmem_default | net.core.netdev_max_backlog | \
+    vm.dirty_ratio | vm.dirty_background_ratio | vm.dirty_bytes | vm.dirty_background_bytes | vm.swappiness)
+        case "$3" in '' | *[!0-9\ ]*) usage ;; esac
+        [ "${#3}" -le 40 ] || usage ;;
+    *) usage ;;
+    esac
+    run sysctl -q -w "$2=$3" ;;
+*)
+    usage ;;
+esac
