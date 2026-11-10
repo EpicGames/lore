@@ -5,8 +5,7 @@ authors:
   - Zack Neyland
 status: Draft
 created: 2026-10-31
-updated: 2026-11-04
-discussion: https://web.lore.internal.epicgames.net/epic/Lore/change-request/1074
+updated: 2026-11-09
 ---
 
 # Copy-on-write instance clone
@@ -95,7 +94,7 @@ them.
   store is the source's own, so the writes land in the source's store and the cloned store never sees them.
   The store is also flushed only after the copy, so dirty mutable-store data would be missing from the cloned
   store. Supporting them needs these steps, in order: flush the source's store before the copy; open the
-  clone's copied stores at the staging path; write the clone's anchors and registration there; and drop the
+  clone's copied stores at the in-progress path; write the clone's anchors and registration there; and drop the
   source's registration and other per-instance keys from the copied store.
 
 ## Proposed Design
@@ -115,10 +114,15 @@ next to `instance list`, `move`, `prune` and `delete`
 - **Clones the instance's directory**, `.lore/` included, through the backend the provider chose. File
   modification times, permissions and symbolic links are kept as they are. Directory times are not, since no
   scan reads them, and keeping them would cost a walk of every directory after a whole-directory clone; the
-  clone never follows a link out of the tree. (Goal 1, Goal 5.)
+  clone never follows a link out of the tree. A repository nested in the tree, one holding a `.lore` directory,
+  is an instance of its own, which stage and reset leave alone, so the clone leaves it out: copied, it would
+  carry that instance's ID, and two trees would share its anchors. An older `.urc` directory is left out too,
+  with the files beside it kept, as stage keeps them. A backend that clones whole directories first finds the
+  nested repositories and the volumes mounted in the tree, whose files a whole-directory clone would not copy,
+  and clones the directories above them, and each mount point, entry by entry. (Goal 1, Goal 5.)
 - **Gives the copy its own identity:** a new instance ID, the source's anchors (current revision, branch and
-  staged state), and a registration at the destination. The copy carries its new ID from the first file the
-  clone writes, so no part of it ever names the source.
+  staged state), and a registration at the destination. The copy carries its new ID before any of the source's
+  files is copied, so no part of it ever names the source.
 - **Carries the instance's state with the directory.** The modified-time records in `.lore/records/`, which
   the clone writes back to disk before it copies `.lore/`, so the first scan hashes nothing they cover (Goal 2);
   records an older client left in the store name the source's ID and do not reach the clone, so the files only
@@ -136,14 +140,16 @@ next to `instance list`, `move`, `prune` and `delete`
   own process, such as the Lore service, which otherwise share one acquisition of that lock
   (`REPOSITORY_LOCK_CACHE` in `lore-revision/src/repository.rs`). So no Lore command changes the source, and
   no sync starts in it, while it is cloned. See Lock hold.
-- **Writes into a staging directory** beside the destination and renames it to the destination once the
-  clone is registered. A clone is either registered at its destination or absent; see Interrupted clones.
+- **Writes into an in-progress directory** beside the destination, gives the copy the source's anchors,
+  renames the directory to the destination, and then registers it. No registration names the destination
+  before the clone is there; see Interrupted clones.
 - **Refuses** a destination that exists, lies inside an instance or has no parent directory, a source with an
   unfinished sync (by the record resumable sync keeps, once that proposal lands), and a source on a local
   store.
-- **Honours the global `--dry-run` flag** by running its checks, printing the provider's answer (shares
-  blocks, or copies N GB in M files, or unsupported and why) and stopping, and reports progress as
-  `RepositoryInstanceClone` begin, progress and complete events, as delete does.
+- **Honours the global `--dry-run` flag** by running the checks that need no lock, printing the
+  provider's answer (shares blocks, or copies N GB in M files, or unsupported and why) and stopping; a dry
+  run that would copy refuses as the clone would, unless `--allow-copy` is given. The command reports
+  progress as `RepositoryInstanceClone` begin, progress and complete events, as delete does.
 
 Measured on the tree above, on APFS: 86 to 107 s and 1.2 to 1.6 GB of disk per clone. The disk is filesystem
 metadata for the clone's own 5.0 million inodes and directory entries, about 280 bytes per entry; no file
@@ -193,11 +199,14 @@ A backend knows filesystems, not Lore: it clones and copies paths and reports wh
 instance IDs, anchors or locks. The provider owns identity, exclusions and locking. Adding a filesystem or an
 OS means adding one backend.
 
-**Detection is per pair of volumes.** For a source and a destination, the OS provider first checks that they
-lie on the same volume (`st_dev` on Unix, the volume serial number on Windows); different volumes get the
-copy backend. On the same volume, it probes for real: it clones a small file into the destination's parent
-with each candidate backend for that filesystem and removes it. The first backend whose probe shares blocks
-is the answer; if none does, the answer is *copies bytes*. The probe, not the OS or the filesystem's name,
+**Detection is per pair of directories.** For a source and a destination, the OS provider probes for real:
+it writes a small file in the source's Lore directory, clones it into the destination's parent with each
+candidate backend, and removes both. Only volumes of two different filesystems get the copy backend without
+a probe. Volume identifiers (`st_dev` on Unix, the volume serial number on Windows) decide nothing: Btrfs
+gives each subvolume its own `st_dev` although `FICLONE` works between them, and two copies of one virtual
+disk can carry the same serial number. The first backend whose probe shares blocks
+is the answer; if none does, the answer is *copies bytes*. A probe that fails for another reason, such as no
+permission to write in the Lore directory, fails the clone. The probe, not the OS or the filesystem's name,
 decides, so a Windows machine with an NTFS system drive and a Dev Drive gets the right answer for each, and a
 filesystem mounted without reflink support gets *copies bytes*.
 
@@ -232,11 +241,11 @@ unasked (Goal 4).
 
 - **Without `--allow-copy`**, a clone whose answer is *copies bytes* or *unsupported* refuses before writing
   anything. The message names the source's and destination's filesystems and volumes and the remedy: put
-  the instances on a filesystem that clones (Dev Drive or ReFS on Windows, APFS on macOS, Btrfs or XFS on
-  Linux) and the destination on the same volume as the source. For *copies bytes*, it also says what
+  the instances on a filesystem that clones (Dev Drive or ReFS on Windows, APFS on macOS, Btrfs, XFS or
+  bcachefs on Linux) and the destination on the same volume as the source. For *copies bytes*, it also says what
   `--allow-copy` would cost.
 - **With `--allow-copy`**, the clone states before it starts that it will copy N GB in M files and hold the
-  store's locks throughout, so every Lore command on every instance sharing the store waits for it. It
+  store's locks throughout, so Lore commands wait for it as Lock hold describes. It
   refuses when the destination's free space is below the bytes it would copy.
 - When the backend shares blocks, `--allow-copy` only lets the clone copy the entries that turn out not to
   clone. It does nothing for *unsupported*, which always refuses.
@@ -244,9 +253,15 @@ unasked (Goal 4).
 ### Lock hold
 
 The clone holds the source's repository lock and the store's locks for its whole length, so no other
-command can start a sync in the source mid-clone or change the anchors the clone copies. Every other Lore
-command on any instance sharing the store waits for the clone to finish (the command path takes the
-repository's locks on entry, `lore/src/call.rs`).
+command can start a sync in the source mid-clone or change the anchors the clone copies. Commands from other
+processes on any instance sharing the store wait for the clone to finish (the command path takes the
+repository's locks on entry, `lore/src/call.rs`). In the clone's own process, such as the Lore service,
+the clone first waits for the commands already holding the source's repository lock, and while it waits no
+more join them, so a stream of overlapping commands cannot keep it out; then commands on the source wait
+too, since the clone holds the repository lock alone there; commands on other
+instances share the process's hold of the store's locks and run. `instance delete` takes the
+source's repository lock to deregister it, so it waits too. `instance move` moves the directory before it takes
+any lock: one that moves the source during the clone makes the clone fail.
 
 How long that is depends on the backend. Only the APFS row on the measured tree is measured; every other
 figure is an **estimate**. The ~1 TB tree is assumed to hold about 11 million entries, about 2.4 million
@@ -274,13 +289,17 @@ from their source or live briefly: an agent's task, a bisect, a review, a one-of
 
 ### Interrupted clones
 
-The clone writes into a staging directory beside the destination, named for the clone, that carries the
-clone's new ID from its first file and has no registration, so Lore never treats it as an instance. On
-success the clone registers the new instance and renames the staging directory to the destination. On
-failure or cancellation it releases the locks first, then removes the staging directory, since nothing else
-writes there and removing millions of entries takes minutes. A crash or power loss leaves the staging
-directory behind: a later clone to the same destination removes a leftover staging directory before it
-starts, and the error a failed clone prints names the directory so the user can delete it.
+The clone writes into an in-progress directory beside the destination, `<destination name>.cloning-<new
+instance ID>`. Its Lore directory is marked as a clone in progress before anything is copied, and it has no
+registration, so Lore never treats it as an instance. On success the clone stores the anchors and syncs them,
+renames the directory to the destination, removes the mark and registers the instance. A failure before the
+rename removes the directory after the command, in the background, since nothing else writes there and
+removing millions of entries takes minutes; a cancelled copy keeps its locks until its work stops. A crash or
+power loss before the rename leaves the directory and the clone's anchor keys, with no registration. A later
+clone to the same destination removes a directory with that name only when it carries the mark, so it removes
+only what a clone wrote, and a removal cut short is finished by the next clone; it leaves anything else beside
+the destination alone. A crash after the rename leaves a working instance that registers itself when a write
+command next opens it.
 
 ## Compatibility
 
@@ -293,14 +312,18 @@ starts, and the error a failed clone prints names the directory so the user can 
   connection without sending a result" (`lore/src/remote/call.rs`). The handshake
   [ADR-00025](../developing/decisions/00025-service-version-compatibility.md) proposes would turn that into a
   clear refusal.
-- **On-disk format** — N/A: a clone writes the same files and store keys as any instance. The staging
-  directory is a sibling of the destination, not part of any instance.
+- **On-disk format** — N/A: a clone writes the same files and store keys as any instance. The in-progress
+  directory is a sibling of the destination, not part of any instance. The in-progress mark, which a crash
+  between the rename and its removal can leave in an instance's Lore directory, is a file older clients
+  ignore.
 - **CLI and public API** — New: `lore repository instance clone <destination> [--allow-copy]`, which prints
   the new instance's path and ID and exits 0, or names the refusal (no block sharing, unsupported provider,
   not enough space, and the existing destination and source checks) and exits non-zero as other instance
   commands do; `--dry-run` prints the provider's answer; `lore_repository_instance_clone` and its `_async`
   form, with an arguments struct holding the destination and the allow-copy flag; and the
-  `RepositoryInstanceClone` events. Existing commands and structs are unchanged.
+  `RepositoryInstanceClone` events. An interrupted clone can leave `<destination name>.cloning-<new
+  instance ID>` beside the destination, a name users see and may delete. Existing commands and structs are
+  unchanged.
 - **Filesystem provider interface** — `FilesystemProvider` gains the clone answer and the clone itself, both
   defaulting to *unsupported*, so existing providers compile and refuse clones until they implement them.
 
@@ -308,10 +331,21 @@ starts, and the error a failed clone prints names the directory so the user can 
 
 - **Concurrency** — The clone holds the source's repository lock, and with it the shared store's locks
   (ADR-00024), for the whole clone; see Lock hold for the times per backend. Every other process using the
-  store waits that long for its next command. The probe and the space check run before the locks are taken
-  and write only a probe file in the destination's parent. Builds and editors in the source are not Lore
-  commands and can still write during the clone; see Risks.
+  store waits that long for its next command. Before the locks are taken, the clone probes the pair, writing a
+  probe file in the source's Lore directory and its clone in the destination's parent, checks the space, takes
+  the in-progress directory's lock file beside the destination, and removes directories that earlier
+  interrupted clones left there. Builds and editors in the source are not Lore commands and can still write
+  during the clone; see Risks.
 - **Memory** — Preserved: the clone walks the tree without holding it; the filesystem does the copying.
+- **Threads** — The walk runs on the calling thread and on threads lent from the syscall pool's cap, at
+  most half of it, so the clone never takes the threads every other file operation in the process runs on,
+  and the pool's threads and the walk's stay within the pool's cap. Measured on APFS on an M3 Max, over
+  100,000 files of 4 KiB in 11,000 directories, three runs each, one walk thread against the calling thread
+  plus eight lent ones: a copy took 15.6 to 19.0 s against 6.9 to 7.0 s, and whole-directory `clonefile`
+  1.15 to 1.24 s against 1.19 to 1.27 s, so lent threads speed up a copy and do not speed up `clonefile`. On
+  APFS the clone first lists each directory of the source once, on the same threads, to find nested
+  repositories: on the same tree that took 0.14 to 0.19 s, against 1.24 to 1.25 s for the whole-directory
+  clone, and 0.33 to 0.37 s on one thread.
 - **Statelessness** — Preserved: the backend choice is made per clone from the probe and not cached across
   operations.
 - **Determinism** — Preserved: a clone's revision, branch and staged state equal its source's, whichever
@@ -334,8 +368,8 @@ N/A — no breaking changes, no migration required.
 No change to the trust model. A clone is a copy of a working tree the user already has, written with the
 user's permissions. It copies symbolic links as links and never follows one, so a crafted tree cannot make
 the clone read or write outside the source and the destination, and the destination checks run on the
-destination's resolved parent. The probe writes one small file in the destination's parent, with the same
-permissions, and removes it.
+destination's resolved parent. The probe writes one small file in the source's Lore directory and clones
+it into the destination's parent, with the same permissions, and removes both.
 
 ## Privacy Considerations
 
@@ -366,10 +400,11 @@ No new data leaves the machine. A clone registers its path in the shared store, 
   it as an assumption to measure; Dev Drive's
   [performance mode](https://learn.microsoft.com/en-us/defender-endpoint/microsoft-defender-endpoint-antivirus-performance-mode)
   scans asynchronously, and the refusal message points copy users to Dev Drive.
-- **Risk:** an interrupted clone leaves its staging directory on disk — *mitigation:* it carries its own ID
-  and no registration, so it is not an instance; a later clone to the same destination removes it, and the
-  failed clone's error names it. Prune retires a registration whose path is missing, as for any instance whose
-  directory is gone.
+- **Risk:** an interrupted clone leaves its in-progress directory on disk — *mitigation:* it carries its own ID
+  and no registration, so it is not an instance; a later clone to the same destination removes it. A clone that
+  fails, rather than crashes, names the directory in its error, removes it and deletes its anchor keys where
+  the store allows. *Accepted:* after a crash, the clone's three small anchor keys stay in the store, and
+  nothing removes them.
 - **Risk:** the probe says a pair of volumes shares blocks, but some entries cannot be cloned (for example a
   nested subvolume or a mount point inside the tree) — *mitigation:* the clone stops and fails rather than
   copying those entries silently, unless `--allow-copy` was given.
