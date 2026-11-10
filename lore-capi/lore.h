@@ -4769,7 +4769,8 @@ typedef struct lore_file_stage_args_t {
   struct lore_string_array_t paths;
   // Case change handling, 0 = error, 1 = update filesystem (keep), 2 = update repository (rename)
   uint32_t case_change;
-  // Force a recursive filesystem scan of directory paths (no effect on file paths)
+  // Walk directory paths recursively on the filesystem, as the global `force` argument also
+  // does (no effect on file paths)
   uint8_t scan;
 } lore_file_stage_args_t;
 
@@ -4907,11 +4908,12 @@ typedef struct lore_lock_file_status_args_t {
 
 // Arguments for querying file locks on a branch, optionally filtered by owner and path.
 typedef struct lore_lock_file_query_args_t {
-  // Branch to query locks on
+  // Branch to query locks on; empty queries every branch, or the current branch where `path`
+  // is given
   struct lore_string_t branch;
-  // Owner filter; empty matches any owner
+  // Owner filter; empty matches any owner. Can't be combined with `path`
   struct lore_string_t owner;
-  // Path filter; empty matches any path
+  // Path filter; empty matches any path. Can't be combined with `owner`
   struct lore_string_t path;
 } lore_lock_file_query_args_t;
 
@@ -9263,6 +9265,10 @@ void lore_lock_file_status_async(const struct lore_global_args_t *globals,
                                  struct lore_event_callback_config_t callback);
 
 // Query which files are currently locked, optionally filtered by user or path.
+//
+// A `path` without a `branch` in `lore_lock_file_query_args_t` queries the current branch. A
+// query giving both `owner` and `path` fails with `LORE_ERROR_CODE_INVALID_ARGUMENTS` before the
+// remote is asked.
 //
 // # Events
 //

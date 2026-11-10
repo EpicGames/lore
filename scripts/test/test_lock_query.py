@@ -6,8 +6,8 @@ import os
 import pytest
 
 from error_types import (
+    ImproperArgumentsError,
     LockInvalidPath,
-    LockQueryFailed,
     InvalidBranch,
 )
 from lore import Lore
@@ -78,8 +78,21 @@ def test_lock_query(new_lore_repo):
     assert [lock.file for lock in output] == ["subdir_a/file_a.txt"]
     assert output[0].owner == "<unknown>"
 
-    with pytest.raises(LockQueryFailed):
-        repo.lock_query(path="non_extant_file.txt")
+    # A path without a branch is queried on the branch the instance is on.
+    output = repo.lock_query(path="subdir_a/file_a.txt")
+    assert [lock.file for lock in output] == ["subdir_a/file_a.txt"]
+    assert repo.lock_query(path="non_extant_file.txt") == []
+    repo.branch_switch("release")
+    output = repo.lock_query(path="subdir_b/file_b.txt")
+    assert [lock.file for lock in output] == ["subdir_b/file_b.txt"]
+    assert repo.lock_query(path="subdir_a/file_a.txt") == []
+
+    # The remote answers no query naming an owner and a path, so the client refuses one before
+    # asking it, with or without a branch. 3 is the invalid-arguments code.
+    for branch in [None, "main"]:
+        with pytest.raises(ImproperArgumentsError) as raised:
+            repo.lock_query(branch, owner="<unknown>", path="subdir_a/file_a.txt")
+        assert raised.value.returncode == 3
 
     with pytest.raises(InvalidBranch):
         repo.lock_query("notdev")

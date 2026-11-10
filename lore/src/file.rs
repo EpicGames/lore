@@ -481,7 +481,8 @@ pub struct LoreFileStageArgs {
     pub paths: LoreArray<LoreString>,
     /// Case change handling, 0 = error, 1 = update filesystem (keep), 2 = update repository (rename)
     pub case_change: u32,
-    /// Force a recursive filesystem scan of directory paths (no effect on file paths)
+    /// Walk directory paths recursively on the filesystem, as the global `force` argument also
+    /// does (no effect on file paths)
     pub scan: u8,
 }
 
@@ -504,6 +505,11 @@ pub struct LoreFileStageArgs {
 ///   and the dirty flags are disregarded. Use this when you need a full
 ///   reconciliation (e.g. after operations that may have changed files
 ///   without going through the dirty-tracking path).
+/// - **Forced directory paths**, with the global `force` argument, are walked
+///   as with [`scan`](LoreFileStageArgs::scan), past the ignore file and the
+///   view: everything in the directory but Lore's own entries is staged,
+///   unchanged files included, with the deletion of what the working tree no
+///   longer holds, except what the view leaves out.
 ///
 /// # Events
 ///

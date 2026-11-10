@@ -4,17 +4,21 @@ use std::sync::Arc;
 
 use lore_error_set::prelude::*;
 
+use crate::filter::FilterMode;
 use crate::hash;
 use crate::lock;
 use crate::lore::BranchId;
+use crate::node::Node;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::state::State;
 use crate::state::StateError;
+use crate::util::path::RelativePath;
 
 pub const LOCK_BATCH_SIZE: usize = 100;
 
 /// The tree a lock command reads its paths against, the staged one or the current one where
-/// nothing is staged, and the branch the working copy is on.
+/// nothing is staged, and the branch the working tree is on.
 pub async fn lock_tree(
     repository: &Arc<RepositoryContext>,
 ) -> Result<(Arc<State>, BranchId), StateError> {
@@ -31,6 +35,35 @@ pub async fn lock_tree(
         State::deserialize(repository.clone(), staged_revision).await?,
         branch,
     ))
+}
+
+/// The node `tree` holds at `path`, which a lock command names, or `None` where the filter leaves
+/// the path out, emitting a `LoreEvent::FilterExclude` there. Unless `force` puts the command past
+/// the filter, the path is asked about as the kind the tree holds there, and is past the ignore slot
+/// where the tree tracks it ([`State::tracks`]).
+///
+/// The tree is read again only where the filter would leave the path out, a cold path, which is
+/// boxed.
+pub async fn lock_path_node(
+    repository: &Arc<RepositoryContext>,
+    tree: &Arc<State>,
+    path: &RelativePath,
+    force: bool,
+) -> Result<Option<Result<Node, StateError>>, StateError> {
+    let node = tree.find_node(repository.clone(), path.as_str()).await;
+    let filter = &repository.filter;
+    let is_directory = Node::asked_as_directory(node.as_ref().ok());
+    if force || !filter.excludes_tree(path, is_directory, FilterMode::Full) {
+        return Ok(Some(node));
+    }
+    let tracked = node.is_ok()
+        && Box::pin(tree.relative_path_tracked_as(repository.clone(), ROOT_NODE, path.as_str()))
+            .await?
+            .is_some();
+    if filter.emit_excludes(path, is_directory, FilterMode::TRACKED.at(tracked)) {
+        return Ok(None);
+    }
+    Ok(Some(node))
 }
 
 pub fn assemble_resource_for_path(path: &str, branch: BranchId) -> lock::LockResource {

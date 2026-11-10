@@ -300,9 +300,9 @@ pub enum LoreCommands {
 
     /// Stage changes for commit.
     ///
-    /// Directory path (including `.`): stages only files already marked
-    /// dirty under that directory. No filesystem walk is performed;
-    /// clean or unmarked files are skipped. Mark files first with
+    /// Without `--scan` or `--force`, a directory path (including `.`)
+    /// stages only files already marked dirty under that directory. No
+    /// filesystem walk is performed; clean or unmarked files are skipped. Mark files first with
     /// `lore dirty` (or `lore status --scan` to reconcile in bulk), or
     /// pass `--scan` here to discover and stage in one pass.
     ///
@@ -315,6 +315,12 @@ pub enum LoreCommands {
     /// one step. Use this when changes were made externally without
     /// going through `lore dirty`, or to recover after losing track of
     /// dirty state.
+    ///
+    /// `--force`: walks a directory path as `--scan` does and stages
+    /// everything in it but Lore's own entries, past the ignore file and
+    /// the view: unchanged files included, with the deletion of what the
+    /// working tree no longer holds, except what the view leaves out.
+    /// `lore --force stage .` stages the whole working tree.
     Stage(file::FileStageArgs),
     /// Mark files as dirty so they show up in `lore status` and get
     /// picked up by `lore stage` (no content is read or staged).

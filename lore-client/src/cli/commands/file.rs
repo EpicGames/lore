@@ -316,8 +316,8 @@ pub struct FileStageArgs {
     /// `lore status --scan` followed by `lore stage`, but performed
     /// in one traversal.
     ///
-    /// Without `--scan`, directory staging stages only files already
-    /// marked dirty under that directory — mark them first with
+    /// Without `--scan` or `--force`, directory staging stages only files
+    /// already marked dirty under that directory — mark them first with
     /// `lore dirty <paths>`, or run `lore status --scan` to reconcile
     /// dirty flags across a tree. Single-file stage paths are always
     /// checked against the filesystem regardless of this flag.
@@ -580,9 +580,9 @@ pub enum FileCommands {
     Dependency(FileDependencyArgs),
     /// Stage changes for commit.
     ///
-    /// Directory paths (including `.`) stage only files already marked
-    /// dirty under that directory; clean or unmarked files are
-    /// skipped. Mark files first with `lore file dirty` (or
+    /// Without `--scan` or `--force`, directory paths (including `.`)
+    /// stage only files already marked dirty under that directory; clean
+    /// or unmarked files are skipped. Mark files first with `lore file dirty` (or
     /// `lore status --scan` to reconcile dirty flags in bulk), or
     /// pass `--scan` here to walk the filesystem and stage in one
     /// pass.
@@ -594,6 +594,11 @@ pub enum FileCommands {
     /// `--scan` walks the filesystem under the given paths, marks
     /// every detected modification/add/delete dirty, and stages them
     /// in one step.
+    ///
+    /// `--force` walks a directory path as `--scan` does and stages
+    /// everything in it but Lore's own entries, past the ignore file and
+    /// the view: unchanged files included, with the deletion of what the
+    /// working tree no longer holds, except what the view leaves out.
     Stage(FileStageArgs),
     /// Mark files as dirty so they show up in `lore status` and get
     /// picked up by directory-scoped `lore stage` (no content is read

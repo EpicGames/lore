@@ -3573,6 +3573,10 @@ pub type LoreLockFileQueryArgs = crate::lock::LoreLockFileQueryArgs;
 
 /// Query which files are currently locked, optionally filtered by user or path.
 ///
+/// A `path` without a `branch` in `lore_lock_file_query_args_t` queries the current branch. A
+/// query giving both `owner` and `path` fails with `LORE_ERROR_CODE_INVALID_ARGUMENTS` before the
+/// remote is asked.
+///
 /// # Events
 ///
 /// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.

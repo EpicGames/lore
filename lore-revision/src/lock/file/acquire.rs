@@ -13,7 +13,6 @@ use crate::branch;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
-use crate::filter::FilterMode;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -23,12 +22,12 @@ use crate::lock::file::release::release;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lock::util::fold_batch_results;
+use crate::lock::util::lock_path_node;
 use crate::lock::util::lock_tree;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_trace;
-use crate::node::Node;
 use crate::repository::RepositoryContext;
 use crate::util::path::RelativePath;
 
@@ -149,19 +148,13 @@ pub async fn acquire(
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
                 .forward_with::<AcquireError, _>(|| format!("Invalid path: {}", path.as_str()))?;
 
-        let node = state
-            .find_node(repository.clone(), relative_path.as_str())
-            .await;
-        if !force
-            && repository.filter.emit_excludes(
-                &relative_path,
-                Node::asked_as_directory(node.as_ref().ok()),
-                FilterMode::Full,
-            )
-        {
+        let Some(node) = lock_path_node(&repository, &state, &relative_path, force)
+            .await
+            .forward::<AcquireError>("checking a lock path against the filter")?
+        else {
             lore_trace!("Path excluded by filter: {}", relative_path.as_str());
             continue;
-        }
+        };
 
         node.forward_with::<AcquireError, _>(|| format!("Invalid path: {}", path.as_str()))?;
         if relative_path.is_empty() {

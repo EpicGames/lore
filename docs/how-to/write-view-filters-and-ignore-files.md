@@ -8,11 +8,10 @@ Lore has two filters with one syntax. A [view filter](../glossary.md#view-filter
 | --- | --- | --- |
 | **Lives in** | `.lore/view` in the [instance](../glossary.md#repository-instance) | `.loreignore` at the repository root, and `.lore/ignore` in the instance |
 | **Set with** | `lore clone --view <file>`, then only `lore sync --view <file>`. Never edit `.lore/view`. | Editing the files. Commit `.loreignore` to share it. |
-| **Applies to** | Clone, sync, branch switch, and reset. Status and stage see only what it keeps. | Status, stage, and dirty marking of untracked paths. Not clone, sync, branch switch, or reset. |
+| **Applies to** | Clone, sync, branch switch, and reset. Status and stage see only what it keeps. | Status, stage, dirty marking, locks, and the sizes `lore file info` reports, for paths neither committed nor staged (with `--revision`, paths that revision doesn't hold), and the destination of `lore stage move`. Not clone, sync, branch switch, or reset. |
 
 - `.lore/ignore` holds exclusions for your instance alone, and is never committed. Its rules win over re-inclusions in `.loreignore`. Lore skips a `!` re-inclusion in it with a warning.
-- As in Git, status, stage, and dirty marking apply ignore rules only to untracked paths: status still reports a committed or staged file's edits and deletion, and stage takes them. Add an ignored file with `lore --force stage <path>`. Remove a tracked one by deleting it and running `lore stage <path>`.
-- Lock commands, and the sizes `lore file info --local` and `--filtered` report, apply ignore rules to tracked files too. Without `--force`, a lock command skips a committed file a rule matches.
+- As in Git, ignore rules apply only to untracked paths: status still reports a committed or staged file's edits and deletion, stage takes them, and lock commands and the sizes `lore file info` reports include the file. The exception is `lore stage move`, which refuses a destination a rule matches, even for a tracked file, unless you give `--force`. Add an ignored file with `lore --force stage <path>`. On a directory, `--force` stages everything the directory holds but Lore's own entries, unchanged files included. Remove a tracked one by deleting it and running `lore stage <path>`.
 - Lore also ignores, as built-in rules, anything named `.lore` or `.urc` at any depth, and names ending in `~mine`, `~theirs`, or `~base` (merge copies), or `.~loretemp`. A forced stage takes only the `~mine` ones.
 
 ## Rule syntax

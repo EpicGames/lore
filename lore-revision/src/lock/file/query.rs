@@ -10,15 +10,14 @@ use crate::branch;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
-use crate::filter::FilterMode;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
+use crate::lock::util::lock_path_node;
 use crate::lock::util::lock_tree;
 use crate::lore::BranchId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
-use crate::node::Node;
 use crate::repository::RepositoryContext;
 use crate::util::path::RelativePath;
 
@@ -79,16 +78,26 @@ pub struct LoreLockFileQueryEventData {
     pub locked_at: u64,
 }
 
+/// Reports the locks the remote holds on `options.branch`, filtered by owner or by path. Without a
+/// branch it reports those on every branch, or, where a path is given, on the branch the instance
+/// is on. An owner and a path together are refused as [`InvalidArguments`], before the remote is
+/// asked, since it answers no query naming both.
 pub async fn query(
     repository: Arc<RepositoryContext>,
     options: QueryOptions,
 ) -> Result<(), QueryError> {
+    if !options.owner.is_empty() && !options.path.is_empty() {
+        return Err(InvalidArguments {
+            reason: "--owner can't be combined with --path".to_string(),
+        }
+        .into());
+    }
     let remote = repository
         .remote()
         .await
         .forward::<QueryError>("Unable to check lock status while offline")?;
 
-    let branch = if options.branch.is_empty() {
+    let mut branch = if options.branch.is_empty() {
         None
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
@@ -115,20 +124,24 @@ pub async fn query(
                 .forward_with::<QueryError, _>(|| format!("Invalid path: {}", options.path))?;
 
         if !execution_context().globals().force() {
-            let (state, _) = lock_tree(&repository)
+            let (state, current_branch) = lock_tree(&repository)
                 .await
                 .forward_any::<QueryError>("Failed to deserialize state")?;
-            let node = state
-                .find_node(repository.clone(), relative_path.as_str())
-                .await;
-            if repository.filter.emit_excludes(
-                &relative_path,
-                Node::asked_as_directory(node.as_ref().ok()),
-                FilterMode::Full,
-            ) {
+            if lock_path_node(&repository, &state, &relative_path, false)
+                .await
+                .forward_any::<QueryError>("checking a lock path against the filter")?
+                .is_none()
+            {
                 lore_trace!("Path excluded by filter: {}", relative_path.as_str());
                 return Ok(());
             }
+            branch = branch.or(Some(current_branch));
+        } else if branch.is_none() {
+            let (_, current_branch) =
+                crate::instance::load_current_anchor(&repository)
+                    .await
+                    .forward_any::<QueryError>("reading the branch the instance is on")?;
+            branch = Some(current_branch);
         }
         Some(relative_path.to_string())
     };

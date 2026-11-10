@@ -534,14 +534,16 @@ async fn mark_through_provider_diff(
 ///   calls to keep dirty flags accurate. Over a provider that holds its state
 ///   in a `State`, whose diff is exact, the stage first marks them through
 ///   that diff, so nothing prior is needed. When [`StageOptions::scan`] is
-///   `true`, the directory is walked recursively on the filesystem, every
-///   contained file is reconciled, and the dirty flags are disregarded.
+///   `true`, or the stage is forced, the directory is walked recursively on the
+///   filesystem, every contained file is reconciled, and the dirty flags are
+///   disregarded.
 pub async fn stage(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-    options: StageOptions,
+    mut options: StageOptions,
 ) -> Result<Hash, StageError> {
+    options.scan |= execution_context().globals().force();
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await

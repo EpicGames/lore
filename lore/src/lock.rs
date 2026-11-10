@@ -165,15 +165,17 @@ fn file_status_local(
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(file_query_local)]
 pub struct LoreLockFileQueryArgs {
-    /// Branch to query locks on
+    /// Branch to query locks on; empty queries every branch, or the current branch where `path`
+    /// is given
     pub branch: LoreString,
-    /// Owner filter; empty matches any owner
+    /// Owner filter; empty matches any owner. Can't be combined with `path`
     pub owner: LoreString,
-    /// Path filter; empty matches any path
+    /// Path filter; empty matches any path. Can't be combined with `owner`
     pub path: LoreString,
 }
 
-/// Queries file locks on a branch, optionally filtered by owner and path.
+/// Queries file locks on a branch, optionally filtered by owner or by path. A query giving both
+/// `owner` and `path` fails with the invalid-arguments error before the remote is asked.
 ///
 /// # Events
 ///

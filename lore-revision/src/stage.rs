@@ -314,7 +314,8 @@ pub struct StageOptions {
     /// When `false` (default), directory paths stage only the files and child
     /// directories currently marked dirty in the repository state. When
     /// `true`, directory paths are walked recursively on the filesystem and
-    /// every file is reconciled, ignoring the dirty flags.
+    /// every file is reconciled, ignoring the dirty flags. A forced stage walks
+    /// them whatever this holds.
     pub scan: bool,
 }
 
