@@ -381,7 +381,7 @@ pub(crate) async fn create_with_metadata(
     // branch creation, instance registration, and metadata are written
     // before the process exits — synced to disk only under `--sync-data`, as
     // every other command's flush is.
-    let _ = repository.flush(call.sync_data()).await;
+    let _ = repository.flush(call.flush_options()).await;
 
     drop(repository);
     drop(connection);

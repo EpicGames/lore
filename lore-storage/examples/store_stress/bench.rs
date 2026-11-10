@@ -18,6 +18,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use lore_storage::CallerBuffer;
+use lore_storage::FlushOptions;
 use lore_storage::Fragment;
 use lore_storage::Lender;
 use lore_storage::LocalImmutableStore;
@@ -114,7 +115,7 @@ pub async fn main(args: &Args) -> u8 {
         true,
     )
     .await;
-    let _ = store.clone().flush(false).await;
+    let _ = store.clone().flush(FlushOptions::default()).await;
     println!(
         "populated {populated} keys in {:.2}s",
         populate.elapsed().as_secs_f64()
@@ -160,7 +161,7 @@ pub async fn main(args: &Args) -> u8 {
             p50s.push(percentile(&latencies, 0.50));
             p99s.push(percentile(&latencies, 0.99));
             if mode == Mode::PutNew {
-                let _ = store.clone().flush(false).await;
+                let _ = store.clone().flush(FlushOptions::default()).await;
             }
         }
         println!(

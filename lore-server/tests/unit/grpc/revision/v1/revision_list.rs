@@ -24,6 +24,7 @@ use lore_server::grpc::handlers::branch_push::PushHandler;
 use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::revision_list::*;
 use lore_server::grpc::revision::v1::service::RevisionListInstruments;
+use lore_storage::FlushOptions;
 use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -2293,8 +2294,8 @@ impl lore_storage::MutableStore for FailingMutableStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().flush(options).await
     }
 }
 

@@ -4,11 +4,11 @@
 //!
 //! The backend surface is the set of operations [`DriverInner`]'s match arms call: `open`,
 //! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
-//! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
-//! `write_file_segments`, `sync`, `metadata`, `stat`, `symlink_stat`, `file_metadata`,
-//! `holds_name_exactly`, `rename`, `copy`, `remove_file`, `read_dir`, `create_dir_all`,
-//! `set_permissions`, `make_owner_writable`, `remove_dir` and `remove_dir_all`. A backend
-//! implements all twenty-six as inherent methods on its own type.
+//! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`, `sync`,
+//! `metadata`, `stat`, `symlink_stat`, `file_metadata`, `holds_name_exactly`, `rename`, `copy`,
+//! `remove_file`, `read_dir`, `create_dir_all`, `set_permissions`, `make_owner_writable`,
+//! `remove_dir` and `remove_dir_all`. A backend implements all twenty-five as inherent methods on
+//! its own type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -342,42 +342,26 @@ impl IoDriver {
             .await
     }
 
-    /// Creates (or truncates, per `options`) `path` and writes the
-    /// gathered contents of all segments in a single backend dispatch —
-    /// open, vectored write, optional sync-all, close. The whole-file
-    /// write twin of [`open_read_head`](Self::open_read_head) for
-    /// multi-segment payloads.
+    /// The storage layer's whole-file write in place, as a single job on the syscall pool, whatever
+    /// the backend: creates or truncates `path` (per `options`), writes the gathered contents of all
+    /// segments, and with `durable` syncs file data and metadata and best-effort syncs the parent
+    /// directory. Unlike [`Self::write_file_segments_atomic`], a process stopped part way, or a
+    /// write that fails, can leave `path` holding part of the contents.
     ///
-    /// Releases the segments after the gather, as
-    /// [`write_file_segments_atomic`](Self::write_file_segments_atomic) does.
-    pub async fn write_file_segments<B: StableBufList>(
+    /// Releases the segments after the gather, and drops `completion` on the thread running the
+    /// operation once the operation has ended, whether or not the call is still awaited, as
+    /// [`Self::write_file_segments_atomic`] does.
+    pub async fn write_file_segments<B: StableBufList, C: Send + 'static>(
         &self,
-        path: impl AsRef<Path>,
+        path: impl Into<PathBuf>,
         options: &OpenOptions,
         buffers: B,
         durable: bool,
+        completion: C,
     ) -> std::io::Result<()> {
-        let std_options = options.to_std();
-        let path = path.as_ref().to_path_buf();
-        match &*self.inner {
-            DriverInner::Psync(driver) => {
-                driver
-                    .write_file_segments(std_options, path, buffers, durable)
-                    .await
-            }
-            #[cfg(target_os = "linux")]
-            DriverInner::Uring(driver) => {
-                driver
-                    .write_file_segments(std_options, path, buffers, durable)
-                    .await
-            }
-            #[cfg(target_family = "windows")]
-            DriverInner::Iocp(driver) => {
-                driver
-                    .write_file_segments(std_options, path, buffers, durable)
-                    .await
-            }
-        }
+        PsyncDriver
+            .write_file_segments(options.to_std(), path.into(), buffers, durable, completion)
+            .await
     }
 
     /// The metadata of `path`.

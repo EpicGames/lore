@@ -229,15 +229,27 @@ impl PsyncDriver {
             .await
     }
 
-    pub(crate) async fn write_file_segments<B: StableBufList>(
+    pub(crate) async fn write_file_segments<B: StableBufList, C: Send + 'static>(
         &self,
         options: std::fs::OpenOptions,
         path: PathBuf,
         buffers: B,
         durable: bool,
+        completion: C,
     ) -> std::io::Result<()> {
         SyscallPool::global()
-            .submit(move || write_segments(options.open(path)?, buffers, durable))
+            .submit(move || {
+                let written = options
+                    .open(&path)
+                    .and_then(|file| write_segments(file, buffers, durable));
+                if written.is_ok() && durable {
+                    // Best-effort, as after an atomic write: the directory entry matters only to a
+                    // file this write created.
+                    let _ = sync_parent_dir(&path);
+                }
+                drop(completion);
+                written
+            })
             .await
     }
 

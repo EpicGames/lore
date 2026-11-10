@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lore_base::test_util::TempDir;
+use lore_storage::FlushOptions;
 use lore_storage::immutable_store::ImmutableStore;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::LocalImmutableStore;
@@ -67,7 +68,7 @@ async fn gc_compaction_reduces_fragment_count() {
             .unwrap();
     }
 
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let count_before = store.clone().fragment_count().await;
 
@@ -129,7 +130,7 @@ async fn gc_protects_non_durable_fragment() {
         )
         .await
         .unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     gc(store.clone(), 1, 1, false, None).await;
 
@@ -178,7 +179,7 @@ async fn fragments_survive_a_stopped_gc_pass() {
             stored.push((address, payload.len()));
         }
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let store: Arc<dyn ImmutableStore> = store;
     let pass = {
@@ -231,7 +232,7 @@ async fn gc_runs_eviction_only() {
             .await
             .unwrap();
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     // max_size=0 skips compaction, max_capacity=1 triggers eviction
     gc(store.clone(), 0, 1, false, None).await;
@@ -376,9 +377,9 @@ impl ImmutableStore for FailingCompactStore {
 
     async fn flush(
         self: Arc<Self>,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), lore_storage::immutable_store::StoreError> {
-        self.inner.clone().flush(sync_data).await
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(

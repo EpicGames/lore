@@ -384,7 +384,7 @@ async fn reconcile_instances(
         }
     }
     if retired_any {
-        let _ = repository.flush(false).await;
+        let _ = repository.flush(FlushOptions::default()).await;
     }
     Ok((live, stale))
 }
@@ -994,6 +994,8 @@ async fn instance_anchor_state(
     (branch_id, branch_name, revision)
 }
 
+use lore_storage::FlushOptions;
+
 use crate::event::LoreEvent;
 
 /// Event data describing an instance — used for both listing and prune notifications.
@@ -1571,7 +1573,7 @@ async fn deregister_instance(
         return Err(WriteRequired.into());
     }
     repository
-        .flush(false)
+        .flush(FlushOptions::default())
         .await
         .forward_any::<InstanceError>("failed to flush the instance removal")
 }
@@ -1808,7 +1810,7 @@ async fn register_instance_at(path: &Path) -> Result<(), InstanceError> {
     update_path(repository.clone()).await?;
     // Synced, since a move then removes the mount point the old registration names.
     repository
-        .flush(true)
+        .flush(FlushOptions::SYNC_DATA)
         .await
         .forward_any::<InstanceError>("failed to flush the instance registration")
 }

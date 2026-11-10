@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use tokio::sync::Notify;
 
+use crate::FlushOptions;
 use crate::types::Address;
 use crate::types::Fragment;
 use crate::types::Hash;
@@ -687,9 +688,9 @@ impl crate::immutable_store::ImmutableStore for HoldingStore {
 
     async fn flush(
         self: Arc<Self>,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), crate::immutable_store::StoreError> {
-        self.inner.clone().flush(sync_data).await
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), crate::immutable_store::StoreError> {

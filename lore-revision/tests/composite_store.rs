@@ -235,7 +235,10 @@ mod tests {
             }
         }
 
-        async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            _options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             Ok(())
         }
     }
@@ -404,7 +407,10 @@ mod tests {
             self.max_query_batch
         }
 
-        async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            _options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             Ok(())
         }
 
@@ -1567,7 +1573,11 @@ mod tests {
                 })
                 .await
                 .expect("the cache write lands");
-                local_store.clone().flush(true).await.expect("flush");
+                local_store
+                    .clone()
+                    .flush(lore_storage::FlushOptions::SYNC_DATA)
+                    .await
+                    .expect("flush");
                 assert!(
                     !lock.is_held(),
                     "the flock goes once the cache write has ended and been flushed"
@@ -3951,7 +3961,10 @@ mod tests {
                 None
             }
 
-            async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+            async fn flush(
+                self: Arc<Self>,
+                _options: lore_storage::FlushOptions,
+            ) -> Result<(), StoreError> {
                 Ok(())
             }
 
@@ -5026,8 +5039,11 @@ mod tests {
                 self.inner.max_query_batch()
             }
 
-            async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-                self.inner.clone().flush(sync_data).await
+            async fn flush(
+                self: Arc<Self>,
+                options: lore_storage::FlushOptions,
+            ) -> Result<(), StoreError> {
+                self.inner.clone().flush(options).await
             }
 
             async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

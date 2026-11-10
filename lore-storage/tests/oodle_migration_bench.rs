@@ -394,7 +394,10 @@ mod tests {
             joined.expect("a filler finishes");
         }
         let dyn_store: Arc<dyn ImmutableStore> = store;
-        dyn_store.flush(false).await.expect("store flushes");
+        dyn_store
+            .flush(lore_storage::FlushOptions::default())
+            .await
+            .expect("store flushes");
         start.elapsed()
     }
 

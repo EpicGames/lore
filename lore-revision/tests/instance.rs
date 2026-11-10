@@ -1094,7 +1094,10 @@ mod tests {
                 )
                 .await
                 .expect("register superseded instance failed");
-                writer.flush(false).await.expect("flush failed");
+                writer
+                    .flush(lore_storage::FlushOptions::default())
+                    .await
+                    .expect("flush failed");
                 let repository_id = writer.id;
                 drop(writer);
 

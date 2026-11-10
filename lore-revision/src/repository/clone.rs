@@ -1514,7 +1514,7 @@ async fn clone_into(
         Err(e) => Err(CloneError::internal(format!("Store task failed: {e}"))),
     };
 
-    let _ = repository.flush(call.sync_data()).await;
+    let _ = repository.flush(call.flush_options()).await;
 
     let operation_result = operation
         .finalize()

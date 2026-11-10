@@ -1871,9 +1871,12 @@ Failures have well-defined user-visible shapes:
 - *Validation failure on push.* The server rejects the push. Fragments uploaded in phase 1
   may be in the immutable store, but no branch latest pointer references them; the failed
   revision is unreachable, and the unreferenced fragments can be obliterated if desired.
+- *Client crash while a flush writes with `--fast-flush`.* The index file being written is
+  left partly written, and the next open drops every entry it held, including those of
+  revisions and branches not yet pushed.
 
-In each case, the user-visible failure is "the operation did not happen, and nothing else
-changed." There is no in-between state to clean up.
+In each case but the last, the user-visible failure is "the operation did not happen, and
+nothing else changed." There is no in-between state to clean up.
 
 ### 17. Access Model, Data Isolation, and Multi-Tenancy
 

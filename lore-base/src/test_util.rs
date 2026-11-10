@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Temporary directories and files for the tests.
+//! Temporary directories and files for the tests, and [`file_identity`], which tells a file written
+//! in place from one replaced.
 //!
 //! [`TempDir`], and [`TempFile`] for a single file, are the only way a test asks
 //! for scratch space on disk. Names carry a random suffix, so a test is isolated
@@ -208,5 +209,46 @@ impl Drop for TempFile {
             // with a far less useful one.
             let _ = inner.keep();
         }
+    }
+}
+
+/// The identity of the file at `path`: its device and inode on Unix, its volume serial number and
+/// file index on Windows. A file written in place keeps its identity, and a file renamed over
+/// `path` brings its own.
+pub fn file_identity(path: &Path) -> (u64, u64) {
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = std::fs::metadata(path)
+            .unwrap_or_else(|error| panic!("Failed to stat {path:?}: {error}"));
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+
+        use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+        use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+
+        let file = std::fs::File::open(path)
+            .unwrap_or_else(|error| panic!("Failed to open {path:?}: {error}"));
+        // SAFETY: all zeroes is a valid `BY_HANDLE_FILE_INFORMATION`, which the call writes through
+        // a handle open for the call.
+        let (queried, info) = unsafe {
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            let queried = GetFileInformationByHandle(file.as_raw_handle(), &raw mut info);
+            (queried, info)
+        };
+        assert_ne!(
+            queried,
+            0,
+            "Failed to query {path:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        (
+            u64::from(info.dwVolumeSerialNumber),
+            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        )
     }
 }

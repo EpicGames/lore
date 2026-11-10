@@ -63,6 +63,7 @@ use zerocopy::IntoBytes;
 
 use crate::Address;
 use crate::Context;
+use crate::FlushOptions;
 use crate::Fragment;
 use crate::FragmentFlags;
 use crate::FragmentReference;
@@ -1317,11 +1318,11 @@ impl ImmutableStoreBucket {
         Ok(BucketFile::empty())
     }
 
-    /// Write the bucket to a temporary file renamed over `path`, so that a process stopped during
-    /// the write leaves the file it last wrote. The bucket is copied and its lock released before
-    /// the write, see [`ImmutableBucketWrite`]. With `sync_data`, the group's packfiles are synced
-    /// between the copy and the write, so that the file points only at payload bytes stored, and
-    /// the file is synced before the rename and its directory after. Without, the file records the
+    /// Write the bucket to `path` as `options` asks, see
+    /// [`crate::local::fan_out::write_bucket_file`]. The bucket is copied and its lock released
+    /// before the write, see [`ImmutableBucketWrite`]. With `sync_data`, the group's packfiles are
+    /// synced between the copy and the write, so that the file points only at payload bytes
+    /// stored, and the file is synced and its directory after. Without, the file records the
     /// sizes of the packfiles a crash could leave shorter than an entry pointing into them, see
     /// [`crate::PackStore::unsettled_sizes`], or, when it cannot, see [`recordable_sizes`], the
     /// packfiles are synced as with `sync_data`.
@@ -1331,7 +1332,7 @@ impl ImmutableStoreBucket {
         bucket_index: usize,
         path: PathBuf,
         changed: bool,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         // A failed write re-arms the flag it claimed, so a bucket flushed only for its access
         // stamps stays a stamp rather than becoming a change that keeps the store claimed.
@@ -1361,7 +1362,7 @@ impl ImmutableStoreBucket {
         // The sizes are held across one await, with no future around it: held across more, or a
         // larger one, they would make this the largest state of the future.
         let mut recorded = false;
-        if !sync_data {
+        if !options.sync_data {
             let mut sizes = [PackfileSize::default(); 1 + TRAILER_SIZES];
             let unsettled = group.packstore.unsettled_sizes(&mut sizes).await;
             if let Some(sizes) = recordable_sizes(&sizes, unsettled) {
@@ -1389,17 +1390,15 @@ impl ImmutableStoreBucket {
         let completion = crate::local::fan_out::write_share(&group.writes);
         #[cfg(feature = "test-util")]
         let completion = crate::test_util::park_store_write(completion).await;
-        lore_io::IoDriver::global()
-            .write_file_segments_atomic(
-                crate::local::fan_out::temporary_path(&path),
-                path,
-                &file_options,
-                contents,
-                sync_data,
-                completion,
-            )
-            .await
-            .internal("Failed to serialize storage bucket")?;
+        crate::local::fan_out::write_bucket_file(
+            path,
+            &file_options,
+            contents,
+            options,
+            completion,
+        )
+        .await
+        .internal("Failed to serialize storage bucket")?;
         failure_guard.success();
 
         Ok(())
@@ -1457,7 +1456,7 @@ impl ImmutableStoreBucket {
         path: &Path,
         group_index: usize,
         bucket_index: usize,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         // An emptied bucket is written out like any other. Skipping it would leave the file it
         // was last written to on disk, and reopening the store would load the entries back.
@@ -1487,7 +1486,7 @@ impl ImmutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        Self::serialize_files(bucket, group, bucket_index, path, was_dirty, sync_data).await
+        Self::serialize_files(bucket, group, bucket_index, path, was_dirty, options).await
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
@@ -1505,7 +1504,7 @@ impl ImmutableStoreBucket {
         path: &Path,
         group_index: usize,
         bucket_index: usize,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
@@ -1519,7 +1518,7 @@ impl ImmutableStoreBucket {
             PathBuf::from(p)
         };
 
-        Self::serialize_files(bucket, group, bucket_index, new_path, true, sync_data).await
+        Self::serialize_files(bucket, group, bucket_index, new_path, true, options).await
     }
 }
 
@@ -1697,8 +1696,13 @@ impl ImmutableStoreGroup {
                     crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
                 if group.needs_whole_group_flush() {
                     let _in_flight = crate::local::fan_out::write_share(&group.writes);
-                    if let Err(err) =
-                        flush_locked_group(group.clone(), group_index, path.clone(), false).await
+                    if let Err(err) = flush_locked_group(
+                        group.clone(),
+                        group_index,
+                        path.clone(),
+                        FlushOptions::default(),
+                    )
+                    .await
                     {
                         lore_base::lore_warn!("Failed to flush group {group_index}: {err}");
                     }
@@ -1768,7 +1772,7 @@ impl ImmutableStoreGroup {
                     path,
                     group_index,
                     bucket_index,
-                    false, /* Don't wait and sync all data to storage media */
+                    FlushOptions::default(),
                 )
                 .await;
             }
@@ -2636,7 +2640,7 @@ impl LocalImmutableStore {
                         path.as_ref(),
                         group_index,
                         bucket_index,
-                        true, /* Wait and sync all data to storage media */
+                        FlushOptions::SYNC_DATA,
                     )
                     .await;
                 });
@@ -3569,7 +3573,7 @@ impl LocalImmutableStore {
             );
             group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
             if group.fan_out_uncommitted() {
-                return flush_locked_group(group, group_index, path, true)
+                return flush_locked_group(group, group_index, path, FlushOptions::SYNC_DATA)
                     .await
                     .forward::<StoreError>("committing the group of an obliterated entry");
             }
@@ -3592,7 +3596,7 @@ impl LocalImmutableStore {
                 path.as_ref(),
                 group_index,
                 bucket_index,
-                true,
+                FlushOptions::SYNC_DATA,
             )
             .await
             .forward::<StoreError>("writing the bucket of an obliterated entry")
@@ -3865,7 +3869,10 @@ impl LocalImmutableStore {
                         path.as_ref(),
                         group_index,
                         bucket_index,
-                        sync_data,
+                        FlushOptions {
+                            sync_data,
+                            ..FlushOptions::default()
+                        },
                     )
                     .await;
                 });
@@ -4883,7 +4890,7 @@ impl LocalImmutableStore {
                 path.as_ref(),
                 group_index,
                 bucket_index,
-                true,
+                FlushOptions::SYNC_DATA,
             )
             .await
             .forward_with::<StoreError, _>(|| {
@@ -5113,7 +5120,7 @@ impl LocalImmutableStore {
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         let Some(path) = path else {
             return Ok(());
@@ -5147,7 +5154,7 @@ impl LocalImmutableStore {
                     crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
                 let _in_flight = crate::local::fan_out::write_share(&group.writes);
 
-                flush_locked_group(group, group_index, path, sync_data).await
+                flush_locked_group(group, group_index, path, options).await
             };
             lore_base::lore_spawn!(
                 tasks,
@@ -5823,7 +5830,11 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             // The write uses the eviction's claim because it lasts until the write finishes. It
             // can't rely on the span of another use of the store: that span may end while the write
             // is still running.
-            let _ = self.clone().flush_all(self.path.clone(), sync_data).await;
+            let options = FlushOptions {
+                sync_data,
+                ..FlushOptions::default()
+            };
+            let _ = self.clone().flush_all(self.path.clone(), options).await;
         }
         drop(writing);
         evicted.into()
@@ -6079,7 +6090,11 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             if heal {
                 drop(evict_permit);
                 drop(compact_permit);
-                let _ = crate::immutable_store::ImmutableStore::flush(self.clone(), false).await;
+                let _ = crate::immutable_store::ImmutableStore::flush(
+                    self.clone(),
+                    FlushOptions::default(),
+                )
+                .await;
 
                 lore_base::lore_debug!("Store healing complete");
             }
@@ -6089,7 +6104,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         Ok(())
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
@@ -6129,7 +6144,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         let hold = self.hold(intent).await?;
         let flushed = self
             .clone()
-            .flush_all(Some(path), sync_data)
+            .flush_all(Some(path), options)
             .await
             .forward("Failed to flush store to disk");
         // The claim this flush took, if it took one, goes here, and releases the flock if
@@ -6575,7 +6590,11 @@ impl LocalImmutableStore {
             self.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
             drop(bucket);
 
-            let _ = crate::immutable_store::ImmutableStore::flush(self.clone(), false).await;
+            let _ = crate::immutable_store::ImmutableStore::flush(
+                self.clone(),
+                FlushOptions::default(),
+            )
+            .await;
             result.healed = true;
         }
 
@@ -6730,8 +6749,9 @@ pub(crate) async fn flush_locked_group(
     group: Arc<ImmutableStoreGroup>,
     group_index: usize,
     path: Arc<PathBuf>,
-    sync_data: bool,
+    options: FlushOptions,
 ) -> Result<(), LocalImmutableStoreError> {
+    let sync_data = options.sync_data;
     let mut first_err: Option<LocalImmutableStoreError> = None;
 
     crate::local::fan_out::roll_pending_commit_forward(
@@ -6824,7 +6844,7 @@ pub(crate) async fn flush_locked_group(
                     path.as_ref(),
                     group_index,
                     bucket_index,
-                    sync_data,
+                    options,
                 )
                 .await;
                 match res {
@@ -6958,7 +6978,7 @@ pub(crate) async fn flush_locked_group(
             }
         }
     } else if first_err.is_none() {
-        // Regular flush at unchanged level: per-file .tmp + atomic rename for flagged buckets only, access stamps included. No marker write — marker already reflects the current level.
+        // Regular flush at unchanged level, for flagged buckets only, access stamps included. No marker write — marker already reflects the current level.
         for bucket_index in 0..active_buckets {
             if !group.needs_flush(bucket_index) {
                 continue;
@@ -6973,7 +6993,7 @@ pub(crate) async fn flush_locked_group(
                 path.as_ref(),
                 group_index,
                 bucket_index,
-                sync_data,
+                options,
             )
             .await;
             if let Err(err) = res

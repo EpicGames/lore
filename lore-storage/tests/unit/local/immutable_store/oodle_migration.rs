@@ -11,6 +11,7 @@ use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
 use lore_base::types::Partition;
 use lore_storage::CompressionMode;
+use lore_storage::FlushOptions;
 use lore_storage::LocalImmutableStore;
 use lore_storage::LocalImmutableStoreError;
 use lore_storage::hash;
@@ -107,7 +108,10 @@ async fn put_as_oodle(store: &Arc<LocalImmutableStore>, address: Address, payloa
 /// fixture's.
 async fn flush(store: &Arc<LocalImmutableStore>) {
     let dyn_store: Arc<dyn ImmutableStore> = store.clone();
-    dyn_store.flush(true).await.expect("store flushes");
+    dyn_store
+        .flush(FlushOptions::SYNC_DATA)
+        .await
+        .expect("store flushes");
 }
 
 /// Put `payload` at `address`. With `with_bytes` false the entry is metadata only: it declares

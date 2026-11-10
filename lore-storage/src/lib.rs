@@ -126,6 +126,7 @@ pub use maintenance::evictor;
 pub use maintenance::gc;
 pub use mutable_store::MutableStore;
 // Re-export options types
+pub use options::FlushOptions;
 pub use options::ReadOptions;
 pub use options::WriteOptions;
 // Re-export packstore

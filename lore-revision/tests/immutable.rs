@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_revision::lore::*;
+use lore_storage::FlushOptions;
 use lore_storage::*;
 
 #[cfg(test)]
@@ -204,7 +205,7 @@ mod tests {
                 // Flush to ensure index files are written
                 store
                     .clone()
-                    .flush(true)
+                    .flush(FlushOptions::SYNC_DATA)
                     .await
                     .expect("Failed to flush store");
 
@@ -301,7 +302,7 @@ mod tests {
 
                 store
                     .clone()
-                    .flush(true)
+                    .flush(FlushOptions::SYNC_DATA)
                     .await
                     .expect("Failed to flush store");
 
@@ -382,7 +383,7 @@ mod tests {
 
                 store
                     .clone()
-                    .flush(true)
+                    .flush(FlushOptions::SYNC_DATA)
                     .await
                     .expect("Failed to flush store");
 
@@ -480,7 +481,7 @@ mod tests {
 
                 store
                     .clone()
-                    .flush(true)
+                    .flush(FlushOptions::SYNC_DATA)
                     .await
                     .expect("Failed to flush store");
 
@@ -590,7 +591,7 @@ mod tests {
 
                 store
                     .clone()
-                    .flush(true)
+                    .flush(FlushOptions::SYNC_DATA)
                     .await
                     .expect("Failed to flush store");
 
@@ -689,7 +690,7 @@ mod tests {
 
                 store
                     .clone()
-                    .flush(true)
+                    .flush(FlushOptions::SYNC_DATA)
                     .await
                     .expect("Failed to flush store");
 
@@ -762,7 +763,7 @@ mod tests {
 
                     store
                         .clone()
-                        .flush(true)
+                        .flush(FlushOptions::SYNC_DATA)
                         .await
                         .expect("Failed to flush store");
 
@@ -865,7 +866,7 @@ mod tests {
 
                     store
                         .clone()
-                        .flush(true)
+                        .flush(FlushOptions::SYNC_DATA)
                         .await
                         .expect("Failed to flush store");
 
@@ -968,7 +969,7 @@ mod tests {
 
                 store
                     .clone()
-                    .flush(true)
+                    .flush(FlushOptions::SYNC_DATA)
                     .await
                     .expect("Failed to flush store");
 

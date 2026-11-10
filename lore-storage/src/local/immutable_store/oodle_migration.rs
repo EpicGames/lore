@@ -26,6 +26,7 @@ use tokio::sync::OwnedRwLockWriteGuard;
 use tokio::task::JoinSet;
 
 use crate::CompressionMode;
+use crate::FlushOptions;
 use crate::LocalImmutableStore;
 use crate::LocalImmutableStoreError;
 use crate::hash;
@@ -307,7 +308,7 @@ async fn migrate_group(
         group.clone(),
         group_index,
         path.clone(),
-        true, /* sync data */
+        FlushOptions::SYNC_DATA,
         flush_guard,
     )
     .await?;
@@ -378,12 +379,12 @@ async fn flush_locked_group_to_end(
     group: Arc<ImmutableStoreGroup>,
     group_index: usize,
     path: Arc<PathBuf>,
-    sync_data: bool,
+    options: FlushOptions,
     flush_guard: tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<(), LocalImmutableStoreError> {
     lore_base::lore_spawn!(async move {
         let _flush_guard = flush_guard;
-        flush_locked_group(group, group_index, path, sync_data).await
+        flush_locked_group(group, group_index, path, options).await
     })
     .await
     .internal("Group flush task failed")

@@ -264,8 +264,11 @@ mod storage_copy_on_write_tests {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(
+            self: Arc<Self>,
+            options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
+            self.inner.clone().flush(options).await
         }
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

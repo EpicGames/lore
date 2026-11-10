@@ -38,16 +38,24 @@ fn the_commands_that_act_on_the_service_are_sized_for_relaying() {
     }
 }
 
-/// `--trust-remote` reaches the command's globals, and without it the remote is not trusted.
+/// `--trust-remote` reaches the command's globals, and `--fast-flush` the options of its flushes,
+/// and each is off without its flag.
 #[test]
-fn trusting_the_remote_reaches_the_globals() {
-    for (args, trusted) in [
-        (vec!["lore", "status"], 0),
-        (vec!["lore", "status", "--trust-remote"], 1),
+fn trusting_the_remote_and_fast_flush_reach_the_globals() {
+    for (args, trusted, fast_flush) in [
+        (vec!["lore", "status"], 0, false),
+        (vec!["lore", "status", "--trust-remote"], 1, false),
+        (vec!["lore", "status", "--fast-flush"], 0, true),
     ] {
         let cli = LoreCli::try_parse_from(&args).expect("the arguments must parse");
         let globals =
             lore_client::cli::lore_globals_from_args(&cli).expect("the globals must resolve");
         assert_eq!(globals.trust_remote, trusted, "{}", args.join(" "));
+        assert_eq!(
+            globals.flush_options().fast_flush,
+            fast_flush,
+            "{}",
+            args.join(" ")
+        );
     }
 }

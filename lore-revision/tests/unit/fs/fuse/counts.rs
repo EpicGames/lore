@@ -25,6 +25,7 @@ use lore_revision::fs::fuse::inode::ROOT_INO;
 use lore_revision::fs::fuse::operation::FuseOperation;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
+use lore_storage::FlushOptions;
 use lore_storage::KeyType;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore;
@@ -100,8 +101,8 @@ impl MutableStore for CountingStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 }
 

@@ -1103,7 +1103,7 @@ impl RepositoryContext {
     /// the repository flock while it claims a store again — the reverse of the
     /// order every command takes them in, and a deadlock against a command in
     /// another process holding that store and waiting for the repository.
-    pub fn try_spawn_post_command_flush(&self, sync_data: bool) {
+    pub fn try_spawn_post_command_flush(&self, options: lore_storage::FlushOptions) {
         let immutable_store = self.immutable_store.clone();
         let mutable_store = self
             .write_token
@@ -1127,9 +1127,9 @@ impl RepositoryContext {
                         }
                     };
                     let stores = async {
-                        let _ = immutable_store.flush(sync_data).await;
+                        let _ = immutable_store.flush(options).await;
                         if let Some(mutable_store) = mutable_store {
-                            let _ = mutable_store.flush(sync_data).await;
+                            let _ = mutable_store.flush(options).await;
                         }
                     };
                     tokio::join!(records, stores);
@@ -1417,7 +1417,7 @@ impl RepositoryContext {
     /// Writes back the instance's records, where this context holds a write token, alongside
     /// the immutable store's flush and then the mutable store's. A failed write-back is logged
     /// and does not fail the flush: the records are advisory.
-    pub async fn flush(&self, sync_data: bool) -> Result<(), RepositoryError> {
+    pub async fn flush(&self, options: lore_storage::FlushOptions) -> Result<(), RepositoryError> {
         let records = async {
             if let (Some(lock), Some(token)) = (&self.repo_lock, &self.write_token) {
                 lock.write_back_records(token).await;
@@ -1425,10 +1425,10 @@ impl RepositoryContext {
         };
         let stores = async {
             let immutable_store = self.immutable_store.clone();
-            let immutable_result = immutable_store.flush(sync_data).await;
+            let immutable_result = immutable_store.flush(options).await;
 
             let mutable_store = self.mutable_store.clone();
-            let mutable_result = mutable_store.flush(sync_data).await;
+            let mutable_result = mutable_store.flush(options).await;
 
             immutable_result.and(mutable_result)
         };
@@ -3203,7 +3203,9 @@ async fn register_instance_and_migrate_anchors(
     }
 
     if migrated_current || migrated_staged {
-        repository.flush(true).await?;
+        repository
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await?;
     }
 
     if migrated_current {
@@ -3458,9 +3460,10 @@ pub async fn create_local(
 
     // Written before returning, since clone drops this handle and loads the
     // repository afresh from disk; synced only under `--sync-data`.
-    let sync_data = crate::runtime::try_execution_context()
-        .is_some_and(|context| context.globals().sync_data());
-    repository.flush(sync_data).await?;
+    let options = crate::runtime::try_execution_context()
+        .map(|context| context.globals().flush_options())
+        .unwrap_or_default();
+    repository.flush(options).await?;
 
     #[cfg(target_os = "linux")]
     if let Some(mount_manager) = fuse_mount_manager {

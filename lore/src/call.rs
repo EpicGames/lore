@@ -278,8 +278,7 @@ async fn prepare_repository_call(
 }
 
 fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {
-    let sync_data = execution_context().globals().sync_data();
-    repository.try_spawn_post_command_flush(sync_data);
+    repository.try_spawn_post_command_flush(execution_context().globals().flush_options());
 
     if let Some(duration) = execution_context().globals().store_keep_alive_duration() {
         repository.spawn_keep_alive(duration);

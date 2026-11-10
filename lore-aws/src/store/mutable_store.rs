@@ -15,6 +15,7 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_base::types::Partition;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore as MutableStoreTrait;
@@ -601,7 +602,7 @@ impl MutableStoreTrait for AwsMutableStore {
         .into()
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         // Noop for AWS
         Ok(())
     }

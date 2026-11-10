@@ -25,6 +25,7 @@ use lore_revision::fs::fuse::fragment_cache::copy_range;
 use lore_revision::fs::fuse::fragment_cache::is_list;
 use lore_revision::fs::fuse::fragment_cache::read_options;
 use lore_revision::repository::RepositoryContext;
+use lore_storage::FlushOptions;
 use lore_storage::FragmentFlags;
 use lore_storage::ImmutableStore;
 use lore_storage::ReadOptions;
@@ -652,8 +653,8 @@ impl ImmutableStore for TestStore {
         self.inner.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
@@ -995,7 +996,7 @@ async fn per_read_operations_of_s0_and_the_default() {
             let address = write(&repository, &content).await;
             repository
                 .immutable_store()
-                .flush(true)
+                .flush(FlushOptions::SYNC_DATA)
                 .await
                 .expect("flush");
             let len = 128 << 10;

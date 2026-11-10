@@ -244,6 +244,10 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on
   writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--fast-flush` — Have the command's flushes write the local stores' index in place rather than replacing each of its
+  files through a temporary file. Faster where creating files is slow, but if the process stops or a write fails while a
+  file is being written, the store drops every entry that file held, including those of revisions and branches not yet
+  pushed
 * `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--trust-remote` — Trust the remote as part of this machine's infrastructure: data fetched from it is not hash
   verified. For machines where performance comes first, such as a build server streaming from a server in its own

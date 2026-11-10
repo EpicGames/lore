@@ -773,18 +773,6 @@ impl IocpDriver {
         PsyncDriver.write_file_bytes(path, data, durable).await
     }
 
-    pub(crate) async fn write_file_segments<B: StableBufList>(
-        &self,
-        options: std::fs::OpenOptions,
-        path: PathBuf,
-        buffers: B,
-        durable: bool,
-    ) -> std::io::Result<()> {
-        PsyncDriver
-            .write_file_segments(options, path, buffers, durable)
-            .await
-    }
-
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.metadata(path).await
     }

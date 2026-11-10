@@ -13,6 +13,7 @@ use lore_base::types::KeyType;
 use lore_storage::Address;
 use lore_storage::CallerBuffer;
 use lore_storage::Context;
+use lore_storage::FlushOptions;
 use lore_storage::Fragment;
 use lore_storage::Hash;
 use lore_storage::Partition;
@@ -455,8 +456,8 @@ impl ImmutableStore for CountingReadStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
@@ -2831,7 +2832,11 @@ async fn a_stream_read_keeps_the_flock_past_its_span_until_the_stream_ends() {
     let partition = Partition::from([0x3a; 16]);
     let context = Context::from([0x3a; 16]);
     let (root, content) = tree::build(&store, partition, context, true).await;
-    store.clone().flush(true).await.expect("flush");
+    store
+        .clone()
+        .flush(FlushOptions::SYNC_DATA)
+        .await
+        .expect("flush");
     assert!(!lock.is_held(), "nothing holds the flock before the read");
 
     let span = store.clone().hold_for_command().await.expect("span");

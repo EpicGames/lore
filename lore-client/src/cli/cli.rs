@@ -145,6 +145,13 @@ pub struct LoreCli {
     #[clap(global = true, long, action)]
     sync_data: bool,
 
+    /// Have the command's flushes write the local stores' index in place rather than replacing each
+    /// of its files through a temporary file. Faster where creating files is slow, but if the
+    /// process stops or a write fails while a file is being written, the store drops every entry
+    /// that file held, including those of revisions and branches not yet pushed
+    #[clap(global = true, long, action)]
+    fast_flush: bool,
+
     /// Cache fragment payloads fetched from remote in the local store
     #[clap(global = true, long, action)]
     pub cache: bool,
@@ -482,6 +489,7 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> Result<LoreGlobalArgs, LoreCliEr
         local: cli.local.into(),
         no_gc: cli.no_gc.into(),
         sync_data: cli.sync_data.into(),
+        fast_flush: cli.fast_flush.into(),
         cache: cli.cache.into(),
         trust_remote: cli.trust_remote.into(),
 

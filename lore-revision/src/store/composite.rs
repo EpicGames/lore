@@ -25,6 +25,7 @@ use lore_base::lore_spawn;
 use lore_base::runtime::DetachingJoinSet;
 use lore_base::types::HealResult;
 use lore_error_set::prelude::*;
+use lore_storage::FlushOptions;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::claim_for_task;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -1727,8 +1728,8 @@ impl ImmutableStore for CompositeStore {
         max_query_batch
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.local.store().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.local.store().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

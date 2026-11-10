@@ -15,6 +15,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use lore_storage::FlushOptions;
 use lore_storage::Hash;
 use lore_storage::KeyType;
 use lore_storage::LocalImmutableStore;
@@ -231,7 +232,7 @@ pub async fn probe(context: &Context<'_>, strong: bool, failures: &mut Vec<Strin
         }
     };
     let id = context.journal.flush_start(Store::Mutable, false, strong);
-    let flushed = context.store.clone().flush(false).await;
+    let flushed = context.store.clone().flush(FlushOptions::default()).await;
     context
         .journal
         .flush_end(Store::Mutable, id, flushed.is_ok());

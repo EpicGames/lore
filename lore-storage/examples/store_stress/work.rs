@@ -18,6 +18,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use lore_storage::CallerBuffer;
+use lore_storage::FlushOptions;
 use lore_storage::Loan;
 use lore_storage::LocalImmutableStore;
 use lore_storage::LocalMutableStore;
@@ -512,7 +513,13 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         "flush" | "sync" => {
             let sync = work.options.end == "sync";
             let id = journal.flush_start(Store::Immutable, sync, work.options.strong_flushes);
-            let flushed = dyn_store.clone().flush(sync).await;
+            let flushed = dyn_store
+                .clone()
+                .flush(FlushOptions {
+                    sync_data: sync,
+                    ..FlushOptions::default()
+                })
+                .await;
             if let Err(err) = &flushed {
                 eprintln!("final flush failed: {err}");
                 work.unexpected("final flush", &err.to_string());
@@ -1268,7 +1275,12 @@ impl Work {
         let running = self.overlaps.start(kind as usize);
         let sync = kind == Kind::FlushSync;
         let id = self.journal.flush_start(Store::Immutable, sync, false);
-        let result = store.flush(sync).await;
+        let result = store
+            .flush(FlushOptions {
+                sync_data: sync,
+                ..FlushOptions::default()
+            })
+            .await;
         self.journal.flush_end(Store::Immutable, id, result.is_ok());
         drop(running);
         self.record(kind, result.map_err(|err| err.to_string()));
@@ -1563,7 +1575,12 @@ impl Work {
                 let id =
                     self.journal
                         .flush_start(Store::Immutable, sync, self.options.strong_flushes);
-                let result = store.flush(sync).await;
+                let result = store
+                    .flush(FlushOptions {
+                        sync_data: sync,
+                        ..FlushOptions::default()
+                    })
+                    .await;
                 self.journal.flush_end(Store::Immutable, id, result.is_ok());
                 result.map_err(|err| err.to_string())
             }
@@ -1720,7 +1737,14 @@ impl Work {
         let id = self
             .journal
             .flush_start(Store::Mutable, sync, self.options.strong_flushes);
-        let result = lore_storage::MutableStore::flush(store, sync).await;
+        let result = lore_storage::MutableStore::flush(
+            store,
+            FlushOptions {
+                sync_data: sync,
+                ..FlushOptions::default()
+            },
+        )
+        .await;
         self.journal.flush_end(Store::Mutable, id, result.is_ok());
         result.map_err(|err| err.to_string())
     }
@@ -1952,7 +1976,7 @@ impl Work {
         let id = self
             .journal
             .flush_start(Store::Immutable, false, self.options.strong_flushes);
-        let flushed = self.dyn_store().flush(false).await;
+        let flushed = self.dyn_store().flush(FlushOptions::default()).await;
         self.journal
             .flush_end(Store::Immutable, id, flushed.is_ok());
         match flushed {

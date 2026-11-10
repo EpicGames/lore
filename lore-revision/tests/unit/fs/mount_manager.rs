@@ -31,6 +31,7 @@ use lore_revision::shared_store::SHARED_STORE_DIR;
 use lore_revision::shared_store::registry::SharedStoreRegistry;
 #[cfg(target_os = "linux")]
 use lore_revision::shared_store::registry::SharedStoreRegistryEntry;
+use lore_storage::FlushOptions;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 
@@ -71,7 +72,7 @@ async fn register_fuse_instance(entry: &SharedStoreRegistryEntry, path: &str) ->
         .await
         .expect("instance registers");
     repository
-        .flush(false)
+        .flush(FlushOptions::default())
         .await
         .expect("registration flushes to disk");
     let dot_lore = external_dir_for_instance(instance_id)
@@ -154,7 +155,10 @@ async fn a_store_whose_instances_cannot_be_listed_is_skipped() {
                 )
                 .await
                 .expect("the dangling registration is stored");
-            broken.flush(false).await.expect("the registration flushes");
+            broken
+                .flush(FlushOptions::default())
+                .await
+                .expect("the registration flushes");
             drop(broken);
             let reopened = registry.entries()[0]
                 .create_null_repository_context()
@@ -200,7 +204,7 @@ async fn an_instance_whose_config_cannot_be_read_is_skipped() {
                 .await
                 .expect("instance registers");
             repository
-                .flush(false)
+                .flush(FlushOptions::default())
                 .await
                 .expect("registration flushes to disk");
             drop(repository);
@@ -301,7 +305,10 @@ async fn a_store_whose_instances_cannot_be_listed_does_not_stop_the_others() {
         )
         .await
         .expect("the dangling registration is stored");
-    broken.flush(false).await.expect("the registration flushes");
+    broken
+        .flush(FlushOptions::default())
+        .await
+        .expect("the registration flushes");
     let reopened = registry.entries()[0]
         .create_null_repository_context()
         .await

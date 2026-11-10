@@ -19,6 +19,7 @@ use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::stage::StageOptions;
+use lore_storage::FlushOptions;
 use zerocopy::IntoBytes;
 
 use crate::helper::RepositoryContextCreationArgsExt;
@@ -184,7 +185,10 @@ async fn a_dry_run_keeps_a_legacy_anchor_file() {
                     .await
                     .expect("Failed to remove the anchor key");
             }
-            initial.flush(true).await.expect("Failed to flush");
+            initial
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             LORE_CONTEXT
                 .scope(
@@ -224,7 +228,10 @@ async fn a_dry_run_writes_no_missing_instance_file() {
                 .expect("The repository must have a dot directory")
                 .join(lore_revision::repository::INSTANCE);
             let instance = std::fs::read(&instance_path).expect("Failed to read the instance");
-            initial.flush(true).await.expect("Failed to flush");
+            initial
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
             lore_io::IoDriver::global()
                 .remove_file(&instance_path)
                 .await

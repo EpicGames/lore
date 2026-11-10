@@ -26,6 +26,7 @@ use lore_server::protocol::storage::messages::LoreResponse;
 use lore_server::protocol::storage::messages::Message;
 use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::messages::MessageParseError;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
@@ -163,7 +164,7 @@ impl ImmutableStore for MockCopyFailStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -274,7 +275,7 @@ impl ImmutableStore for MockCopySuccessStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -625,7 +626,11 @@ async fn test_copy_full_pipeline_success() {
                 .await
                 .expect("Failed to put fragment into repo A");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             // Build a context map connected to repo B (the destination)
             let context_map = Arc::new(AttributeMap::default());
@@ -728,7 +733,11 @@ async fn test_copy_idempotent_via_handler() {
                 .await
                 .expect("Failed to put fragment into repo A");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             let context_map = Arc::new(AttributeMap::default());
             context_map.insert(repo_b);
@@ -854,7 +863,11 @@ async fn test_copy_stream_continuity_not_found_in_middle() {
                 .await
                 .expect("Failed to put fragment 2");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             let context_map = Arc::new(AttributeMap::default());
             context_map.insert(repo_b);

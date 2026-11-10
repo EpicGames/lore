@@ -34,6 +34,7 @@ use lore_revision::repository::VfsType;
 use lore_revision::repository::keeps_records_on_disk;
 use lore_revision::state;
 use lore_revision::util::path::RelativePath;
+use lore_storage::FlushOptions;
 
 use crate::helper::committed_repository;
 use crate::helper::relative_path;
@@ -630,7 +631,10 @@ async fn write_store_time(repository: &RepositoryContext, path: &RelativePath, m
 
 /// What the instance's records hold for `path`, once the times collected are merged.
 async fn instance_record(repository: &RepositoryContext, path: &RelativePath) -> Lookup {
-    repository.flush(false).await.expect("flush");
+    repository
+        .flush(FlushOptions::default())
+        .await
+        .expect("flush");
     repository
         .instance_records()
         .expect("the instance keeps its own records")
@@ -719,7 +723,10 @@ async fn a_new_instance_records_nothing_in_the_store() {
                 "the commit recorded the file's time in the instance"
             );
 
-            repository.flush(false).await.expect("flush");
+            repository
+                .flush(FlushOptions::default())
+                .await
+                .expect("flush");
             let keys: Vec<(&str, Hash)> = ["committed.file", "seed.txt", "cloned.file"]
                 .into_iter()
                 .map(|file| {
@@ -783,7 +790,10 @@ async fn a_copy_given_a_new_identity_reads_the_records_it_carries() {
             let file = relative_path("copied.file");
             let recorded = state::file_modified_time(repository.clone(), &file).await;
             assert_ne!(recorded, 0, "the commit recorded the file's time");
-            repository.flush(false).await.expect("flush");
+            repository
+                .flush(FlushOptions::default())
+                .await
+                .expect("flush");
             let old_identity = repository.instance_id;
             drop(repository);
 
@@ -834,7 +844,7 @@ async fn records_are_written_back_after_the_command() {
             .expect("a dot directory")
             .to_path_buf();
 
-        repository.try_spawn_post_command_flush(false);
+        repository.try_spawn_post_command_flush(FlushOptions::default());
         drop(repository);
         runtime_flush_guarded().await;
 

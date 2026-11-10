@@ -35,6 +35,7 @@ use lore_server::settings::UdsSettings;
 use lore_server::uds::bind_sockets;
 use lore_server::uds::launch_uds_server;
 use lore_storage::CorrelationHold;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore;
@@ -789,8 +790,8 @@ impl MutableStore for MutableDouble {
         self.store.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.store.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.store.clone().flush(options).await
     }
 }
 
@@ -1124,8 +1125,8 @@ impl ImmutableStore for Reads {
         self.store.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.store.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.store.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

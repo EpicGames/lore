@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MIT
 //! `lore_storage_flush` — flush pending writes through the open handle.
 //!
-//! Disk-backed stores call `ImmutableStore::flush(sync_data)` followed by `MutableStore::flush`.
+//! Disk-backed stores call `ImmutableStore::flush` followed by `MutableStore::flush`.
 //! In-memory stores satisfy the trait with a no-op implementation, so the same path serves both
 //! backends — the in-memory case completes successfully without touching disk.
 //!
-//! `sync_data` is sourced from `globals.sync_data` and routed straight into the trait method,
-//! matching the close-time flush behavior.
+//! The flush options come from `globals.sync_data` and `globals.fast_flush`, as the close-time
+//! flush's do.
 
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
@@ -52,17 +52,17 @@ async fn flush_local(
         args,
         flush,
         async move |store, _args| {
-            let sync_data = execution_context().globals().sync_data();
+            let options = execution_context().globals().flush_options();
             store
                 .immutable
                 .clone()
-                .flush(sync_data)
+                .flush(options)
                 .await
                 .forward_any::<StorageError>("immutable store flush")?;
             store
                 .mutable
                 .clone()
-                .flush(sync_data)
+                .flush(options)
                 .await
                 .forward_any::<StorageError>("mutable store flush")?;
             Ok::<(), StorageError>(())

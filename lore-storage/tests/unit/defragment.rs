@@ -6,6 +6,7 @@ use bytes::Bytes;
 use lore_io::IoFile;
 use lore_storage::Address;
 use lore_storage::Context;
+use lore_storage::FlushOptions;
 use lore_storage::Fragment;
 use lore_storage::FragmentReference;
 use lore_storage::Hash;
@@ -977,8 +978,8 @@ mod defragment_integration {
             None
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+            self.inner.clone().flush(options).await
         }
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

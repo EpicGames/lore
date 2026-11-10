@@ -31,6 +31,7 @@ use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
 use lore_storage::Oversized;
 use lore_storage::StoreError;
@@ -2306,7 +2307,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         Ok(())
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 

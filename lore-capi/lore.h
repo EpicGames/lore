@@ -4302,6 +4302,13 @@ typedef struct lore_global_args_t {
   // takes it from the globals it is opened with. Any non-zero value trusts
   // the remote, so a caller zeroes the whole struct, padding included
   uint8_t trust_remote;
+  // Have the call's flushes write the local stores' index in place, rather than replacing each
+  // of its files through a temporary file, which is faster where creating files is slow. If the
+  // process stops or a write fails while a file is being written, the store drops every entry
+  // that file held, including those of revisions and branches not yet pushed. Eviction and
+  // compaction replace the files they write whatever it says, and it is independent of
+  // `sync_data`, which syncs what is written either way. Any non-zero value writes in place
+  uint8_t fast_flush;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote user service.
@@ -12053,7 +12060,7 @@ void lore_storage_close_async(const struct lore_global_args_t *globals,
 
 // Flush pending writes through the handle's stores.
 //
-// On disk-backed stores this performs an fsync honoring `globals.sync_data`.
+// On disk-backed stores this writes as `globals.sync_data` and `globals.fast_flush` ask.
 // On in-memory stores the underlying flush is a no-op and the call still
 // completes with `status: 0`.
 int32_t lore_storage_flush(const struct lore_global_args_t *globals,

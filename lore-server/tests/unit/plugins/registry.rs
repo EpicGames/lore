@@ -34,6 +34,7 @@ use lore_server::plugins::traits::NotificationPluginContext;
 use lore_server::plugins::traits::NotificationPluginFactory;
 use lore_server::plugins::traits::PluginError;
 use lore_server::plugins::traits::TopologyPluginFactory;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::KeyValueStream;
 use lore_storage::MutableStore;
@@ -141,7 +142,7 @@ impl ImmutableStore for MockImmutableStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 
@@ -214,7 +215,7 @@ impl MutableStore for MockMutableStore {
         Err(StoreError::internal("Not implemented"))
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 }

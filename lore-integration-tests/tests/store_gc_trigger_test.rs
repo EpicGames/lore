@@ -23,6 +23,7 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Partition;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::ImmutableStoreSettings;
 use lore_storage::LocalImmutableStore;
@@ -99,7 +100,10 @@ async fn seed_store(path: &std::path::Path, partition: Partition) {
             .await
             .expect("put succeeds");
     }
-    dyn_store.flush(true).await.expect("flush succeeds");
+    dyn_store
+        .flush(FlushOptions::SYNC_DATA)
+        .await
+        .expect("flush succeeds");
 }
 
 /// Loading a store that is over its size cap starts a compaction pass on its own.

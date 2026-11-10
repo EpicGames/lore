@@ -119,7 +119,7 @@ impl<'a> WriteHandle<'a> {
             .await
     }
 
-    pub async fn flush(&self, sync_data: bool) -> Result<(), StoreError> {
-        self.store.clone().flush(sync_data).await
+    pub async fn flush(&self, options: lore_storage::FlushOptions) -> Result<(), StoreError> {
+        self.store.clone().flush(options).await
     }
 }

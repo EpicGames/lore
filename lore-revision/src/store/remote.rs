@@ -7,6 +7,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use lore_base::types::HealResult;
 use lore_error_set::prelude::*;
+use lore_storage::FlushOptions;
 use lore_storage::ReadOptions;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -511,7 +512,7 @@ impl store::ImmutableStore for RemoteImmutableStore {
         }
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         // Noop for remote store
         Ok(())
     }
@@ -632,7 +633,7 @@ impl store::MutableStore for RemoteMutableStore {
             .forward("Remote mutable CAS failed")
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         // Noop for remote store
         Ok(())
     }

@@ -95,15 +95,15 @@ fn close_impl(
         // handle's.
         let store = &internal.store_internal;
         if store.invalid.load(std::sync::atomic::Ordering::Acquire) {
-            let sync_data = lore_revision::lore::execution_context()
+            let options = lore_revision::lore::execution_context()
                 .globals()
-                .sync_data();
+                .flush_options();
             let claims = crate::storage::close::claims_for_flush(store);
             crate::storage::close::spawn_flush_for_closed_tree(
                 store.immutable.clone(),
                 store.mutable.clone(),
                 claims,
-                sync_data,
+                options,
             );
         }
 

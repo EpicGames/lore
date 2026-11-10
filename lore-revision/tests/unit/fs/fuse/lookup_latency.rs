@@ -51,6 +51,7 @@ use lore_revision::repository::prefetch::StopWhen;
 use lore_revision::repository::prefetch::TreePrefetch;
 use lore_revision::repository::prefetch::warm_blocks;
 use lore_revision::state::State;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
@@ -212,8 +213,8 @@ impl ImmutableStore for LatencyStore {
         self.inner.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {

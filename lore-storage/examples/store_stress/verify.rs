@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic;
 use std::time::Instant;
 
+use lore_storage::FlushOptions;
 use lore_storage::FragmentFlags;
 use lore_storage::Hash;
 use lore_storage::LocalImmutableStore;
@@ -177,7 +178,7 @@ async fn deep(dir: &Path, config: &Config, history: &History, report: &mut Repor
                 }
             }
         }
-        if let Err(err) = store.clone().flush(true).await {
+        if let Err(err) = store.clone().flush(FlushOptions::SYNC_DATA).await {
             report.violation("deep-flush-failed", err.to_string());
         }
     }

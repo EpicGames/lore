@@ -37,6 +37,7 @@ use lore_revision::runtime::execution_context;
 use lore_revision::store::composite::CompositeStoreBuilder;
 use lore_revision::store::remote::RemoteImmutableStore;
 use lore_revision::store::remote::RemoteMutableStore;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::assume_server_policies;
@@ -1837,7 +1838,10 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
             info!("Done seeding local store, flushing store to disk.");
             // Since we effectively disabled background flushing, we force a flush once seeding is
             // complete
-            store.flush(true).await.map_err(anyhow::Error::from)?;
+            store
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .map_err(anyhow::Error::from)?;
             info!("Done flushing store to disk.");
 
             result
@@ -2597,8 +2601,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
-    let _ = immutable_store.flush(true).await;
-    let _ = mutable_store.flush(true).await;
+    let _ = immutable_store.flush(FlushOptions::SYNC_DATA).await;
+    let _ = mutable_store.flush(FlushOptions::SYNC_DATA).await;
 
     Ok(hold)
 }

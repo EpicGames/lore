@@ -676,6 +676,40 @@ async fn write_level_header_file(
         .await
 }
 
+/// Write a bucket file of a store group, holding `completion`, a share of the group's writes, until
+/// the write has landed, see [`GroupWrites`]. Without `fast_flush`, to a temporary file renamed
+/// over `path`, so that a process stopped during the write leaves the file it last wrote. With it,
+/// straight into `path`, which saves creating a file per write, and leaves the file partly written
+/// where a process stops part way or the write fails, for the next load to find corrupt. With
+/// `sync_data`, the file is synced either way, and its directory after.
+pub(crate) fn write_bucket_file<B: lore_io::StableBufList, C: Send + 'static>(
+    path: PathBuf,
+    file_options: &lore_io::OpenOptions,
+    contents: B,
+    options: crate::FlushOptions,
+    completion: C,
+) -> impl Future<Output = std::io::Result<()>> {
+    let driver = lore_io::IoDriver::global();
+    if options.fast_flush {
+        futures::future::Either::Left(driver.write_file_segments(
+            path,
+            file_options,
+            contents,
+            options.sync_data,
+            completion,
+        ))
+    } else {
+        futures::future::Either::Right(driver.write_file_segments_atomic(
+            temporary_path(&path),
+            path,
+            file_options,
+            contents,
+            options.sync_data,
+            completion,
+        ))
+    }
+}
+
 /// The file a write of `path` goes to before it is renamed over `path`: `path` with `.tmp`
 /// appended, so that the temporary file of `index_<bb>.new` is `index_<bb>.new.tmp` and does not
 /// collide with that of `index_<bb>`.

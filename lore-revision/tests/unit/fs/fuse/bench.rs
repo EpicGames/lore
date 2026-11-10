@@ -25,6 +25,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::util::path::RelativePath;
+use lore_storage::FlushOptions;
 use lore_storage::hash::hash_string;
 use smallvec::SmallVec;
 
@@ -370,7 +371,7 @@ async fn bench_recorded_mtime_lookup_per_inode_creation() {
                     mtime_for(repository.clone(), &paths[7], BASE_TIME).await,
                     BASE_TIME + 8
                 );
-                mutable.flush(true).await.expect("flush");
+                mutable.flush(FlushOptions::SYNC_DATA).await.expect("flush");
             }
             // Let the first store's background work release its files.
             tokio::time::sleep(Duration::from_millis(200)).await;

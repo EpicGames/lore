@@ -98,9 +98,8 @@ pub trait MutableStore: Send + Sync {
         key_type: KeyType,
     ) -> Result<KeyValueStream, StoreError>;
 
-    /// Flush any pending writes to durable storage.
-    /// When `sync_data` is true, data is synced to the storage media (fsync).
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError>;
+    /// Flush any pending writes to durable storage, as `options` asks.
+    async fn flush(self: Arc<Self>, options: crate::FlushOptions) -> Result<(), StoreError>;
 }
 
 impl Debug for dyn MutableStore {

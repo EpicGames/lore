@@ -29,6 +29,7 @@ use lore_revision::repository::VfsType;
 use lore_revision::repository::load_repository_config_from_dot_dir;
 use lore_revision::revision::sync::SyncOptions;
 use lore_revision::state::State;
+use lore_storage::FlushOptions;
 
 use crate::fuse_service::*;
 
@@ -64,7 +65,10 @@ impl Mounted {
         lore_revision::instance::store_current_anchor(&repository, state.revision())
             .await
             .expect("anchor stores");
-        repository.flush(true).await.expect("flushes");
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .expect("flushes");
         drop(token);
         let mutable = repository
             .try_mutable_store_arc()

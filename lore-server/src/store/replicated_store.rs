@@ -17,6 +17,7 @@ use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
 use lore_base::types::Partition;
 use lore_revision::runtime::execution_context;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
@@ -486,7 +487,7 @@ where
         Some(query::MAX_ADDRESSES)
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 

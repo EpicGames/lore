@@ -217,7 +217,7 @@ async fn migrate_initial_to_typed(
                 &store_path,
                 group_index,
                 bucket_index,
-                true,
+                lore_storage::FlushOptions::SYNC_DATA,
             )
             .await
             .forward::<MutableStoreError>("serialize failed")?;

@@ -273,8 +273,11 @@ mod storage_remote_tests {
             None
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(
+            self: Arc<Self>,
+            options: lore_storage::FlushOptions,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(options).await
         }
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
@@ -7949,8 +7952,11 @@ mod storage_remote_tests {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(
+            self: Arc<Self>,
+            options: lore_storage::FlushOptions,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(options).await
         }
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {

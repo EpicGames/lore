@@ -752,6 +752,13 @@ pub struct LoreGlobalArgs {
     /// takes it from the globals it is opened with. Any non-zero value trusts
     /// the remote, so a caller zeroes the whole struct, padding included
     pub trust_remote: u8,
+    /// Have the call's flushes write the local stores' index in place, rather than replacing each
+    /// of its files through a temporary file, which is faster where creating files is slow. If the
+    /// process stops or a write fails while a file is being written, the store drops every entry
+    /// that file held, including those of revisions and branches not yet pushed. Eviction and
+    /// compaction replace the files they write whatever it says, and it is independent of
+    /// `sync_data`, which syncs what is written either way. Any non-zero value writes in place
+    pub fast_flush: u8,
 }
 
 // Lock the C ABI size of `LoreGlobalArgs` (`lore_global_args_t`), which callers zero-initialize.
@@ -879,6 +886,14 @@ impl LoreGlobalArgs {
 
     pub fn sync_data(&self) -> bool {
         self.sync_data != 0
+    }
+
+    /// The options of the flushes this call makes: its `sync_data` and `fast_flush`.
+    pub fn flush_options(&self) -> lore_storage::FlushOptions {
+        lore_storage::FlushOptions {
+            sync_data: self.sync_data(),
+            fast_flush: self.fast_flush != 0,
+        }
     }
 
     pub fn cache(&self) -> bool {

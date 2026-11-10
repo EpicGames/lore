@@ -22,6 +22,7 @@ use lore_fuse::mount::MountOptions;
 use lore_fuse::session::Session;
 use lore_fuse::session::SessionConfig;
 use lore_fuse::transport::device::DeviceTransport;
+use lore_storage::FlushOptions;
 use parking_lot::Mutex;
 
 use crate::fs::filesystem_provider::FilesystemProvider;
@@ -227,7 +228,13 @@ impl FuseMount {
         // What READs and prefetches fetched is in the local store flagged durable, which
         // schedules no index flush: unflushed, a service started later finds none of it and
         // fetches it all again.
-        if let Err(error) = self.filesystem.served().repository.flush(false).await {
+        if let Err(error) = self
+            .filesystem
+            .served()
+            .repository
+            .flush(FlushOptions::default())
+            .await
+        {
             lore_warn!(
                 "FUSE mount {} could not flush its stores: {error}",
                 self.path.display()

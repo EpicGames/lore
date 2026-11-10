@@ -7025,7 +7025,7 @@ pub type LoreStorageFlushArgs = crate::storage::flush::LoreStorageFlushArgs;
 
 /// Flush pending writes through the handle's stores.
 ///
-/// On disk-backed stores this performs an fsync honoring `globals.sync_data`.
+/// On disk-backed stores this writes as `globals.sync_data` and `globals.fast_flush` ask.
 /// On in-memory stores the underlying flush is a no-op and the call still
 /// completes with `status: 0`.
 #[unsafe(no_mangle)]

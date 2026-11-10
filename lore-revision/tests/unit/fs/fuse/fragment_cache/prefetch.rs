@@ -20,6 +20,7 @@ use lore_revision::fs::fuse::fragment_cache::InodeSlot;
 use lore_revision::fs::fuse::fragment_cache::LeafPolicy;
 use lore_revision::fs::fuse::fragment_cache::prefetch::Stream;
 use lore_revision::repository::RepositoryContext;
+use lore_storage::FlushOptions;
 use lore_storage::ReadOptions;
 use lore_storage::WriteOptions;
 
@@ -889,7 +890,7 @@ async fn sequential_read_counts() {
             let address = write(&repository, &content).await;
             repository
                 .immutable_store()
-                .flush(true)
+                .flush(FlushOptions::SYNC_DATA)
                 .await
                 .expect("flush");
             let reads = size / READ;

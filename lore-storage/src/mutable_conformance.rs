@@ -40,6 +40,7 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
+use crate::FlushOptions;
 use crate::Hash;
 use crate::Partition;
 use crate::immutable_store::StoreError;
@@ -807,12 +808,12 @@ async fn list_null_partition_matches_all(store: &Arc<dyn MutableStore>) -> Resul
 async fn flush_succeeds(store: &Arc<dyn MutableStore>) -> Result<(), String> {
     store
         .clone()
-        .flush(false)
+        .flush(FlushOptions::default())
         .await
         .map_err(|e| format!("flush(false) failed: {e:?}"))?;
     store
         .clone()
-        .flush(true)
+        .flush(FlushOptions::SYNC_DATA)
         .await
         .map_err(|e| format!("flush(true) failed: {e:?}"))?;
     Ok(())

@@ -22,6 +22,7 @@ use lore_server::protocol::storage::messages::Message;
 use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::messages::MessageParseError;
 use lore_server::protocol::storage::verify::*;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreMatch;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
@@ -140,7 +141,11 @@ async fn test_handle_not_found() {
                 .await
                 .expect("Failed to put fragment");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             // Now try to verify a non-existent fragment in the same bucket
             let mut nonexistent_hash = address.hash;
@@ -191,7 +196,11 @@ async fn test_handle_success() {
                 .await
                 .expect("Failed to put fragment");
 
-            store.clone().flush(true).await.expect("Failed to flush");
+            store
+                .clone()
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("Failed to flush");
 
             let context_map = Arc::new(AttributeMap::default());
             context_map.insert(repository);
@@ -269,7 +278,11 @@ async fn store_with_a_corrupt_fragment(
         .await
         .expect("Failed to put fragment");
 
-    store.clone().flush(true).await.expect("Failed to flush");
+    store
+        .clone()
+        .flush(FlushOptions::SYNC_DATA)
+        .await
+        .expect("Failed to flush");
 
     let result = store
         .clone()

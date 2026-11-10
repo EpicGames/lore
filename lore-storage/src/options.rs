@@ -109,6 +109,27 @@ impl From<WriteOptions> for u32 {
     }
 }
 
+/// Options controlling how a store flushes its pending writes. The default syncs nothing and
+/// replaces each index file through a temporary file.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct FlushOptions {
+    /// Sync what the flush writes to the storage media.
+    pub sync_data: bool,
+    /// Write the files of a local store's index in place rather than replacing each through a
+    /// temporary file, which is faster where creating files is slow. A process that stops, or a
+    /// write that fails, while a file is being written leaves it partly written, and the next load
+    /// drops every entry it held. Stores without local index files ignore it.
+    pub fast_flush: bool,
+}
+
+impl FlushOptions {
+    /// Sync what is written, replacing each index file through a temporary file.
+    pub const SYNC_DATA: Self = Self {
+        sync_data: true,
+        fast_flush: false,
+    };
+}
+
 /// Options controlling how a fragment is read from storage.
 ///
 /// A payload the local store holds is read as stored. One fetched from a remote is checked against

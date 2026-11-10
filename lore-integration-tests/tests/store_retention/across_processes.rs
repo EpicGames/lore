@@ -31,6 +31,7 @@ use bytes::Bytes;
 use lore_base::test_util::TempDir;
 use lore_storage::Address;
 use lore_storage::Context;
+use lore_storage::FlushOptions;
 use lore_storage::Fragment;
 use lore_storage::FragmentFlags;
 use lore_storage::Hash;
@@ -692,8 +693,8 @@ impl Stores {
     /// Flushes both stores, as a call ends.
     async fn flush(&self) -> [Outcome; 2] {
         [
-            done(ImmutableStore::flush(self.immutable.clone(), false).await),
-            done(MutableStore::flush(self.mutable.clone(), false).await),
+            done(ImmutableStore::flush(self.immutable.clone(), FlushOptions::default()).await),
+            done(MutableStore::flush(self.mutable.clone(), FlushOptions::default()).await),
         ]
     }
 }

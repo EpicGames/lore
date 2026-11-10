@@ -28,6 +28,7 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::Address;
+use crate::FlushOptions;
 use crate::Hash;
 use crate::Partition;
 use crate::errors::AddressNotFound;
@@ -640,15 +641,14 @@ impl MutableStoreBucket {
         Ok(())
     }
 
-    /// Write the bucket to a temporary file renamed over `path`, so that a process stopped during
-    /// the write leaves the file it last wrote. With `sync_data`, the file is synced before the
-    /// rename and its directory after.
+    /// Write the bucket to `path` as `options` asks, see
+    /// [`crate::local::fan_out::write_bucket_file`].
     async fn serialize_files(
         bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
         group: Arc<MutableStoreGroup>,
         bucket_index: usize,
         path: PathBuf,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalMutableStoreError> {
         let mut failure_guard = SerializeFailureGuard::new(&group.dirty[bucket_index]);
 
@@ -689,17 +689,15 @@ impl MutableStoreBucket {
         let completion = crate::local::fan_out::write_share(&group.writes);
         #[cfg(feature = "test-util")]
         let completion = crate::test_util::park_store_write(completion).await;
-        lore_io::IoDriver::global()
-            .write_file_segments_atomic(
-                crate::local::fan_out::temporary_path(&path),
-                path,
-                &file_options,
-                segments,
-                sync_data,
-                completion,
-            )
-            .await
-            .internal("writing mutable store bucket")?;
+        crate::local::fan_out::write_bucket_file(
+            path,
+            &file_options,
+            segments,
+            options,
+            completion,
+        )
+        .await
+        .internal("writing mutable store bucket")?;
         failure_guard.success();
 
         Ok(())
@@ -711,7 +709,7 @@ impl MutableStoreBucket {
         path: &Path,
         group_index: usize,
         bucket_index: usize,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalMutableStoreError> {
         let count = bucket.entry.len();
         if count == 0 {
@@ -737,7 +735,7 @@ impl MutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        Self::serialize_files(bucket, group, bucket_index, path, sync_data).await
+        Self::serialize_files(bucket, group, bucket_index, path, options).await
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
@@ -750,14 +748,14 @@ impl MutableStoreBucket {
     /// be picked up by the next flush, matching the regular `serialize` path's semantics.
     ///
     /// Reuses `serialize_files` internally, so the bucket goes to `index_<bb>.new.tmp` and is
-    /// renamed to `index_<bb>.new`.
+    /// renamed to `index_<bb>.new`, or with `options.fast_flush` goes to `index_<bb>.new` directly.
     pub async fn serialize_to_new(
         bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
         group: Arc<MutableStoreGroup>,
         path: &Path,
         group_index: usize,
         bucket_index: usize,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalMutableStoreError> {
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
@@ -771,7 +769,7 @@ impl MutableStoreBucket {
             PathBuf::from(p)
         };
 
-        Self::serialize_files(bucket, group, bucket_index, new_path, sync_data).await
+        Self::serialize_files(bucket, group, bucket_index, new_path, options).await
     }
 
     pub fn lookup(&self, partition: Partition, key: Hash) -> (Hash, bool, usize) {
@@ -1567,7 +1565,7 @@ impl LocalMutableStore {
                     path,
                     group_index,
                     bucket_index,
-                    false, /* Don't wait and sync all data to storage media */
+                    FlushOptions::default(),
                 )
                 .await;
             }
@@ -1587,7 +1585,7 @@ impl LocalMutableStore {
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalMutableStoreError> {
         let Some(path) = path else {
             return Ok(());
@@ -1628,7 +1626,7 @@ impl LocalMutableStore {
                     &group.pending_level,
                     path.as_ref(),
                     group_index,
-                    sync_data,
+                    options.sync_data,
                 )
                 .await
                 .map_err(|e| {
@@ -1715,7 +1713,7 @@ impl LocalMutableStore {
                                 path.as_ref(),
                                 group_index,
                                 bucket_index,
-                                sync_data,
+                                options,
                             )
                             .await;
                             match res {
@@ -1735,7 +1733,7 @@ impl LocalMutableStore {
                             && let Err(err) = crate::local::fan_out::write_level_marker(
                                 &group_path,
                                 active_buckets,
-                                sync_data,
+                                options.sync_data,
                                 Some(&group.writes),
                             )
                             .await
@@ -1774,7 +1772,7 @@ impl LocalMutableStore {
                             match crate::local::fan_out::write_level_pending(
                                 &group_path,
                                 active_buckets,
-                                sync_data,
+                                options.sync_data,
                                 Some(&group.writes),
                             )
                             .await
@@ -1819,7 +1817,7 @@ impl LocalMutableStore {
                             && let Err(err) = crate::local::fan_out::write_level_marker(
                                 &group_path,
                                 active_buckets,
-                                sync_data,
+                                options.sync_data,
                                 Some(&group.writes),
                             )
                             .await
@@ -1856,7 +1854,7 @@ impl LocalMutableStore {
                         }
                     }
                 } else if first_err.is_none() {
-                    // Regular flush at unchanged level: per-file .tmp + atomic rename for dirty buckets only. No marker write — marker already reflects the current level.
+                    // Regular flush at unchanged level, for dirty buckets only. No marker write — marker already reflects the current level.
                     for bucket_index in 0..active_buckets {
                         if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
                             continue;
@@ -1871,7 +1869,7 @@ impl LocalMutableStore {
                             path.as_ref(),
                             group_index,
                             bucket_index,
-                            sync_data,
+                            options,
                         )
                         .await;
                         if let Err(err) = res
@@ -2306,7 +2304,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         Ok(stream)
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
@@ -2334,7 +2332,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         let hold = self.hold(Intent::Write).await?;
         let flushed = self
             .clone()
-            .flush_all(Some(path), sync_data)
+            .flush_all(Some(path), options)
             .await
             .map_err(|e| StoreError::internal_with_context(e, "Failed to flush store to disk"));
         // The claim this flush took, if it took one, goes first, so that the flocks this

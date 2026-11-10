@@ -155,7 +155,7 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
                 store.immutable.clone(),
                 store.mutable.clone(),
                 claims,
-                false,
+                lore_storage::FlushOptions::default(),
             );
         });
     }

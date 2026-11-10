@@ -327,8 +327,11 @@ mod fuse_remote_tests {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(
+            self: Arc<Self>,
+            options: lore_storage::FlushOptions,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(options).await
         }
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
@@ -813,7 +816,10 @@ mod fuse_remote_tests {
         lore_revision::instance::store_current_anchor(&repository, revision)
             .await
             .expect("anchor stores");
-        repository.flush(true).await.expect("flushes");
+        repository
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("flushes");
         drop(token);
         unmount_through(&manager, &root).await.expect("unmounts");
 

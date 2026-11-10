@@ -1647,7 +1647,7 @@ async fn hand_over_committed(
     committed: &Arc<State>,
 ) -> Result<(), CommitError> {
     if let Err(error) = repository
-        .flush(execution_context().globals().sync_data())
+        .flush(execution_context().globals().flush_options())
         .await
     {
         operation.drop_serialized_blocks();

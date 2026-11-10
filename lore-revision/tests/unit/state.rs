@@ -76,6 +76,7 @@ fn an_action_records_matching_dirty_and_staged_flags() {
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::state::push_distinct;
 use lore_revision::state::*;
+use lore_storage::FlushOptions;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 
@@ -613,8 +614,8 @@ impl lore_storage::ImmutableStore for HoldingStore {
         self.inner.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().flush(options).await
     }
 
     async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {

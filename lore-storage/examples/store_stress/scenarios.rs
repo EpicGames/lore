@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic;
 use std::time::Duration;
 
+use lore_storage::FlushOptions;
 use lore_storage::LocalImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreMatchResult;
@@ -332,7 +333,13 @@ async fn obliterate(store: &Arc<LocalImmutableStore>, config: &Config, key: u64,
 }
 
 async fn flush(store: &Arc<LocalImmutableStore>, sync: bool) {
-    dyn_store(store).flush(sync).await.expect("flush succeeds");
+    dyn_store(store)
+        .flush(FlushOptions {
+            sync_data: sync,
+            ..FlushOptions::default()
+        })
+        .await
+        .expect("flush succeeds");
 }
 
 /// What a read of `key` under `variant` serves.
@@ -490,7 +497,8 @@ async fn flush_waits_for_a_claimed_bucket_write(dir: PathBuf) -> Outcome {
     })
     .await;
     let flushing = dyn_store(&store);
-    let mut flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let mut flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     let returned = tokio::time::timeout(Duration::from_secs(2), &mut flush).await;
     let outcome = match &returned {
         Ok(Ok(Ok(()))) => {
@@ -643,7 +651,7 @@ async fn stale_new_file_from_an_interrupted_fan_out(dir: PathBuf) -> Outcome {
     let mut fan_out = None;
     let pause = pause_nth(PausePoint::Serializing, 3, || {
         fan_out = Some(lore_base::lore_spawn!(async move {
-            flushing.flush(false).await
+            flushing.flush(FlushOptions::default()).await
         }));
     })
     .await;
@@ -810,7 +818,7 @@ async fn crash_at_every_fan_out_write(dir: PathBuf) -> Outcome {
         let mut task = None;
         let pause = pause_nth_within(PausePoint::Serializing, nth, Duration::from_secs(3), || {
             task = Some(lore_base::lore_spawn!(async move {
-                flushing.flush(false).await
+                flushing.flush(FlushOptions::default()).await
             }));
         })
         .await;
@@ -908,8 +916,11 @@ async fn crash_with_a_reserved_packfile_range(dir: PathBuf) -> Outcome {
     .await;
     let unflushed = crash(&dir, "killed-before-a-flush");
     // A flush may wait for the reserved write, which stays held.
-    let flushed =
-        tokio::time::timeout(Duration::from_secs(3), dyn_store(&store).flush(false)).await;
+    let flushed = tokio::time::timeout(
+        Duration::from_secs(3),
+        dyn_store(&store).flush(FlushOptions::default()),
+    )
+    .await;
     let after_flush = matches!(flushed, Ok(Ok(()))).then(|| crash(&dir, "killed-after-a-flush"));
     pause.resume.notify_one();
     if let Some(task) = held_put {
@@ -966,7 +977,7 @@ async fn cancelled_fan_out_commit_keeps_flushed_entries(dir: PathBuf) -> Outcome
         let mut task = None;
         let pause = pause_nth_within(PausePoint::Serializing, nth, Duration::from_secs(3), || {
             task = Some(lore_base::lore_spawn!(async move {
-                flushing.flush(false).await
+                flushing.flush(FlushOptions::default()).await
             }));
         })
         .await;
@@ -983,7 +994,7 @@ async fn cancelled_fan_out_commit_keeps_flushed_entries(dir: PathBuf) -> Outcome
             let _ = task.await;
         }
         pause.resume.notify_one();
-        let flushed = dyn_store(&store).flush(false).await;
+        let flushed = dyn_store(&store).flush(FlushOptions::default()).await;
         let snapshot = crash(&run, "after-a-later-flush");
         drop(store);
         if let Err(err) = flushed {
@@ -1072,7 +1083,7 @@ async fn cancelled_compaction_leaves_the_store_writable(dir: PathBuf) -> Outcome
             for &key in &fresh {
                 try_put(&store, &config, key, 0).await?;
             }
-            dyn_store(&store).flush(false).await
+            dyn_store(&store).flush(FlushOptions::default()).await
         })
         .await;
         let snapshot = crash(&run, "after-writes");
@@ -1156,7 +1167,11 @@ async fn stat_failure_while_loading_packfiles(dir: PathBuf) -> Outcome {
             put(&store, &config, key, 0).await;
         }
         lore_storage::test_util::fail_packfile_syncs(1);
-        if dyn_store(&store).flush(true).await.is_ok() {
+        if dyn_store(&store)
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .is_ok()
+        {
             return Outcome::Fail("the injected sync failure did not fail the flush".to_string());
         }
         for &key in &stored[12..] {
@@ -1312,12 +1327,12 @@ async fn sync_failure_blocks_durable_flushes(dir: PathBuf) -> Outcome {
     let store = open(&dir, &config).await;
     put(&store, &config, keys[0], 0).await;
     lore_storage::test_util::fail_packfile_syncs(1);
-    let first = dyn_store(&store).flush(true).await;
+    let first = dyn_store(&store).flush(FlushOptions::SYNC_DATA).await;
     put(&store, &config, keys[1], 0).await;
-    let second = dyn_store(&store).flush(true).await;
-    let plain = dyn_store(&store).flush(false).await;
+    let second = dyn_store(&store).flush(FlushOptions::SYNC_DATA).await;
+    let plain = dyn_store(&store).flush(FlushOptions::default()).await;
     put(&store, &config, keys[2], 0).await;
-    let after = dyn_store(&store).flush(true).await;
+    let after = dyn_store(&store).flush(FlushOptions::SYNC_DATA).await;
     let reads = [(keys[0], 0), (keys[1], 0), (keys[2], 0)];
     let mut served = vec![];
     for (key, variant) in reads {
@@ -1325,7 +1340,7 @@ async fn sync_failure_blocks_durable_flushes(dir: PathBuf) -> Outcome {
     }
     drop(store);
     let reopened = open(&dir, &config).await;
-    let restarted = dyn_store(&reopened).flush(true).await;
+    let restarted = dyn_store(&reopened).flush(FlushOptions::SYNC_DATA).await;
     if served
         .iter()
         .any(|read| *read != Read::Served(Served::Correct))
@@ -2297,7 +2312,8 @@ async fn compaction_interrupted_by_a_fan_out(dir: PathBuf) -> Outcome {
         put(&store, &config, key, 0).await;
     }
     let flushing = dyn_store(&store);
-    let fan_out = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let fan_out =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     // The flush queues on the flush lock the held bucket write holds.
     tokio::time::sleep(Duration::from_millis(200)).await;
     pause.resume.notify_one();
@@ -2388,7 +2404,7 @@ async fn size_eviction_interrupted_by_a_fan_out(dir: PathBuf) -> Outcome {
     for &key in &fresh {
         put(&store, &config, key, 0).await;
     }
-    let flushed = dyn_store(&store).flush(false).await;
+    let flushed = dyn_store(&store).flush(FlushOptions::default()).await;
     pause.resume.notify_one();
     let compacted = match compaction {
         Some(compaction) => compaction.await,
@@ -2475,7 +2491,7 @@ async fn a_dropped_compaction_s_bucket_write_lands_before_the_next_flush(dir: Pa
         let _ = compaction.await;
         put(&store, &config, fresh, 0).await;
         let (waited, flushed) = {
-            let mut next = std::pin::pin!(dyn_store(&store).flush(false));
+            let mut next = std::pin::pin!(dyn_store(&store).flush(FlushOptions::default()));
             let waited = tokio::time::timeout(Duration::from_secs(1), &mut next)
                 .await
                 .is_err();
@@ -2565,7 +2581,9 @@ async fn a_successor_store_waits_for_a_dropped_store_s_writes(dir: PathBuf) -> O
                 let flushing = dyn_store(&stores.immutable);
                 (
                     held,
-                    lore_base::lore_spawn!(async move { flushing.flush(false).await }),
+                    lore_base::lore_spawn!(
+                        async move { flushing.flush(FlushOptions::default()).await }
+                    ),
                 )
             };
             if tokio::time::timeout(Duration::from_secs(5), held.issued.notified())

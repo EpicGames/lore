@@ -41,6 +41,7 @@ use lore_revision::instance::InstanceId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_storage::FlushOptions;
 
 use crate::fs::fuse::bench_stats::Summary;
 use crate::fs::fuse::bench_stats::c_path;
@@ -252,7 +253,10 @@ async fn tree(content: Content, files: &[(String, Source)]) -> Tree {
     .await;
     write_dataset(&instance.path, content, files);
     let state = fuse_fixture::test_commit_tree(&instance, "fragment cache bench").await;
-    immutable.flush(true).await.expect("store flush");
+    immutable
+        .flush(FlushOptions::SYNC_DATA)
+        .await
+        .expect("store flush");
     Tree {
         repository: instance.repository.clone(),
         state,
@@ -1069,7 +1073,7 @@ async fn bench_fragment_cache_read_breakdown() {
         .expect("writes");
         repository
             .immutable_store()
-            .flush(true)
+            .flush(FlushOptions::SYNC_DATA)
             .await
             .expect("store flush");
         println!(
@@ -1223,7 +1227,7 @@ async fn bench_hot_inode_reads() {
         .expect("writes");
         repository
             .immutable_store()
-            .flush(true)
+            .flush(FlushOptions::SYNC_DATA)
             .await
             .expect("store flush");
         let (label, strategy) = std::env::var("LORE_BENCH_STRATEGIES")

@@ -37,6 +37,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_storage::CallerBuffer;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::ImmutableStoreSettings;
 use lore_storage::LocalImmutableStore;
@@ -149,8 +150,26 @@ impl Stores {
     /// Flush `store`, syncing what it writes when `sync`.
     pub async fn flush_store(&self, store: Store, sync: bool) -> Result<(), StoreError> {
         match store {
-            Store::Immutable => ImmutableStore::flush(self.immutable.clone(), sync).await,
-            Store::Mutable => MutableStore::flush(self.mutable.clone(), sync).await,
+            Store::Immutable => {
+                ImmutableStore::flush(
+                    self.immutable.clone(),
+                    FlushOptions {
+                        sync_data: sync,
+                        ..FlushOptions::default()
+                    },
+                )
+                .await
+            }
+            Store::Mutable => {
+                MutableStore::flush(
+                    self.mutable.clone(),
+                    FlushOptions {
+                        sync_data: sync,
+                        ..FlushOptions::default()
+                    },
+                )
+                .await
+            }
         }
     }
 

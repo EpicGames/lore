@@ -53,6 +53,7 @@ mod helper;
 mod integration;
 
 use fuse_service::*;
+use lore_storage::FlushOptions;
 
 const CHILD_ENV: &str = "LORE_FUSE_MOUNT_TEST_OUTSIDE_SERVICE_CHILD";
 
@@ -260,7 +261,10 @@ async fn a_service_mount_keeps_writes_under_the_instance_write_directory_across_
         lore_revision::instance::store_current_anchor(&repository, target.revision())
             .await
             .expect("anchor stores");
-        repository.flush(true).await.expect("flushes");
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .expect("flushes");
         drop(token);
         // The mount records its writes in the staged State under the instance's write token,
         // which a context holding a sibling of it would keep from it.
@@ -668,7 +672,10 @@ async fn remount_after_restart_keeps_inode_numbers() {
         lore_revision::instance::store_current_anchor(&repository, target.revision())
             .await
             .expect("anchor stores");
-        repository.flush(true).await.expect("flushes");
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .expect("flushes");
         drop(token);
 
         let probes = [
@@ -2207,7 +2214,10 @@ async fn initialize_child() {
         lore_revision::instance::store_current_anchor(&repository, target.revision())
             .await
             .expect("anchor stores");
-        repository.flush(true).await.expect("flushes");
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .expect("flushes");
         let instance_id = repository.instance_id;
         let inode = inode_of(path.join("scanned.txt")).await;
         drop(repository);

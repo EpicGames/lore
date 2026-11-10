@@ -9,6 +9,7 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Partition;
 use lore_revision::runtime::execution_context;
+use lore_storage::FlushOptions;
 use lore_storage::Fragment;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
@@ -104,7 +105,7 @@ impl ImmutableStore for SlowDownImmutableStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Err(StoreError::from(SlowDown))
     }
 
@@ -225,8 +226,8 @@ impl lore_storage::MutableStore for FailingLoadStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 }
 
@@ -370,8 +371,8 @@ impl lore_storage::MutableStore for GatedLoadStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 }
 
@@ -458,8 +459,8 @@ impl lore_storage::MutableStore for RecordingLoadStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
     }
 }
 

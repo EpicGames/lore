@@ -9,7 +9,7 @@
 //!    `op_enter` at step 1 run to completion; new ops bounce off the invalid flag.
 //! 3. Join the handle's store claims and spawn a fire-and-forget flush task that holds them while
 //!    it calls `immutable.flush()` + `mutable.flush()`. For in-memory stores these are no-ops; for
-//!    disk-backed they honor `globals.sync_data`.
+//!    disk-backed they honor `globals.sync_data` and `globals.fast_flush`.
 //! 4. In a process that retains stores, keep disk-backed stores for the keep-alive window without
 //!    claims, so an open of the same repository in that window reuses them.
 //!
@@ -25,6 +25,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_macro::LoreArgs;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::lore::execution_context;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::StorageError;
@@ -60,17 +61,17 @@ pub(crate) fn claims_for_flush(store: &StoreInternal) -> StoreHold {
 
 /// Fire-and-forget flush of a closing handle's stores, holding `claims` until it is done — see
 /// [`claims_for_flush`]. Stops the stores' garbage collection first. Runs without the caller's
-/// execution context; errors go to void. Disk-backed stores honor `sync_data`; in-memory stores
-/// no-op.
+/// execution context; errors go to void. Disk-backed stores flush as `options` asks; in-memory
+/// stores no-op.
 pub(crate) fn spawn_flush_stores(
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     claims: StoreHold,
-    sync_data: bool,
+    options: FlushOptions,
 ) {
     spawn_without_context(async move {
         immutable_store.clone().stop_gc(false).await;
-        flush_then_release(immutable_store, mutable_store, claims, sync_data).await;
+        flush_then_release(immutable_store, mutable_store, claims, options).await;
     });
 }
 
@@ -81,13 +82,13 @@ pub(crate) fn spawn_flush_for_closed_tree(
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     claims: StoreHold,
-    sync_data: bool,
+    options: FlushOptions,
 ) {
     spawn_without_context(flush_then_release(
         immutable_store,
         mutable_store,
         claims,
-        sync_data,
+        options,
     ));
 }
 
@@ -96,10 +97,10 @@ async fn flush_then_release(
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     claims: StoreHold,
-    sync_data: bool,
+    options: FlushOptions,
 ) {
-    let _ = immutable_store.flush(sync_data).await;
-    let _ = mutable_store.flush(sync_data).await;
+    let _ = immutable_store.flush(options).await;
+    let _ = mutable_store.flush(options).await;
     drop(claims);
 }
 
@@ -174,14 +175,14 @@ fn close_local(
         store.mark_invalid_and_await().await;
 
         // Spawn flush after the drain so it sees a quiesced store.
-        let sync_data = execution_context().globals().sync_data();
+        let options = execution_context().globals().flush_options();
         let claims = claims_for_flush(&store);
         retain_closed_stores(&store, &claims);
         spawn_flush_stores(
             store.immutable.clone(),
             store.mutable.clone(),
             claims,
-            sync_data,
+            options,
         );
 
         Ok::<_, StorageError>(())

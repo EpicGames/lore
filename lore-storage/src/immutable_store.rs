@@ -772,9 +772,8 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Get maximum supported query batch size, if any
     fn max_query_batch(&self) -> Option<usize>;
 
-    /// Flush any pending writes to durable storage.
-    /// When `sync_data` is true, data is synced to the storage media (fsync).
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError>;
+    /// Flush any pending writes to durable storage, as `options` asks.
+    async fn flush(self: Arc<Self>, options: crate::FlushOptions) -> Result<(), StoreError>;
 
     /// Get number of fragments in store, if available
     async fn fragment_count(self: Arc<Self>) -> Option<usize> {
