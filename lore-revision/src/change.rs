@@ -454,16 +454,12 @@ pub fn file_directory_replacement(change: &NodeChange) -> Option<LoreNodeType> {
         .map(|(_, to_type)| to_type)
 }
 
-/// Whether the two sides of a conflict put a file and a directory at one path, which no merge
+/// Whether the two sides of a conflict put nodes of different types at one path, which no merge
 /// below that path resolves.
-pub fn file_directory_clash(source: &NodeChange, target: &NodeChange) -> bool {
+pub fn node_type_clash(source: &NodeChange, target: &NodeChange) -> bool {
     source.to.mapping.node.is_valid_node_id()
         && target.to.mapping.node.is_valid_node_id()
-        && matches!(
-            (source.to.flags.node_type(), target.to.flags.node_type()),
-            (LoreNodeType::File, LoreNodeType::Directory)
-                | (LoreNodeType::Directory, LoreNodeType::File)
-        )
+        && source.to.flags.node_type() != target.to.flags.node_type()
 }
 
 /// The types of the node a change replaces and of the node it replaces it with, where the two

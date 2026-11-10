@@ -1221,7 +1221,7 @@ fn handle_branch_merge_resolve_impl(
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 => {
                 let count = count_atomic.load(Ordering::Relaxed);
                 if count == 0 {
                     println!("No conflicts resolved");

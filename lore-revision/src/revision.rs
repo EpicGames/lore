@@ -716,15 +716,15 @@ fn replaced_mount_paths(changes: &[NodeChange]) -> Vec<RelativePath> {
     paths
 }
 
-/// The paths where one side of a 3-way diff replaced a file with a directory, or a directory with
-/// a file, and the other made a change there or below that cannot stand beside the replacement.
+/// The paths where one side of a 3-way diff replaced a node with one of another type, and the other
+/// made a change there or below that cannot stand beside the replacement.
 ///
 /// Each of `sides` holds one side's replacements, the other side's, each sorted by path, and the
 /// other side's changes the join left to apply. A replacement conflicts where a pair in
 /// `conflicts` stands at or below it, or where a change of the other side is left there. Where
 /// both sides put the same type of node there, the paths below it merge one by one. A pair in
-/// `conflicts` where one side added a file and the other a directory conflicts the same way,
-/// though neither replaced anything.
+/// `conflicts` where the sides put nodes of different types there conflicts the same way, though
+/// neither replaced anything.
 #[lore_macro::test_pub]
 fn conflicting_replacements(
     sides: [(&[Replacement], &[Replacement], &[NodeChange]); 2],
@@ -732,7 +732,7 @@ fn conflicting_replacements(
 ) -> Vec<RelativePath> {
     let mut paths = Vec::new();
     for (source, target) in conflicts {
-        if change::file_directory_clash(source, target) {
+        if change::node_type_clash(source, target) {
             push_unique_path(&mut paths, target.path());
         }
     }

@@ -1983,6 +1983,17 @@ pub enum MergeType {
     Revert,
 }
 
+impl MergeType {
+    /// The command that aborts this merge, cherry-pick or revert.
+    pub(crate) fn abort_command(self) -> &'static str {
+        match self {
+            MergeType::CherryPick => "lore revision cherry-pick abort",
+            MergeType::Revert => "lore revision revert abort",
+            MergeType::None | MergeType::BranchMerge => "lore branch merge abort",
+        }
+    }
+}
+
 /// The same repository with no view filter, so tree operations reach every
 /// node.
 fn full_tree_context(repository: &Arc<RepositoryContext>) -> Arc<RepositoryContext> {
@@ -3337,6 +3348,7 @@ pub async fn branch_merge_abort(
                 r.link_node.child,
                 RelativePath::new(),
                 UNRESOLVED_CONFLICTS,
+                None,
             )
             .await
             .forward::<MergeError>("collecting the link's conflicted paths")?
@@ -4108,23 +4120,22 @@ async fn resolve_single_file(
     Ok(())
 }
 
-/// Resolve a single user path against the given (`context`, `state`).
+/// The files at and below a single user path that a resolve marks resolved, with their nodes in
+/// `state`.
 ///
 /// `node_link` is the entry-node lookup result for `user_relative` against the
 /// parent's staged state. For the parent branch `state` IS the parent staged
 /// state and `mount` is empty; for the link branch `state` is the link's own
 /// state and `mount` is the link's mount path. Directory expansion walks
-/// `state`, then strips `mount` to derive the state-relative path before
-/// calling `resolve_single_file`.
-async fn resolve_path_in_state(
-    operation: &Arc<InstanceOperationImpl>,
+/// `state`, then strips `mount` to derive the state-relative path.
+async fn files_to_resolve(
     context: &Arc<RepositoryContext>,
     state: &Arc<State>,
     mount: &str,
     user_relative: RelativePath,
     node_link: node::NodeLink,
-    merge_type: MergeType,
-) -> Result<(), MergeError> {
+    refusal: stage::ResolveRefusal,
+) -> Result<Vec<(RelativePath, NodeLink)>, MergeError> {
     let block = state
         .block(context.clone(), NodeBlock::index(node_link.node))
         .await
@@ -4132,23 +4143,8 @@ async fn resolve_path_in_state(
     let node = block.node(Node::index(node_link.node));
 
     if node.is_file() {
-        resolve_single_file(
-            operation,
-            context,
-            state,
-            user_relative,
-            node_link,
-            merge_type,
-        )
-        .await?;
-        return Ok(());
+        return Ok(vec![(user_relative, node_link)]);
     }
-    if !node.is_directory() {
-        return Err(MergeError::internal(
-            "Conflict resolution inside linked repositories is not yet supported",
-        ));
-    }
-
     // Expanded paths are user-side (rooted at `user_relative`); inside a
     // link they need the mount prefix stripped before they can be resolved
     // against `state` (which is link-relative).
@@ -4158,10 +4154,12 @@ async fn resolve_path_in_state(
         node_link.node,
         user_relative,
         UNRESOLVED_CONFLICTS,
+        Some(refusal),
     )
     .await
     .forward::<MergeError>("collecting the conflicted paths below a directory")?
     .files;
+    let mut files = Vec::with_capacity(expanded.len());
     for file_path in expanded {
         let state_relative = if mount.is_empty() {
             file_path.clone()
@@ -4177,20 +4175,11 @@ async fn resolve_path_in_state(
             .find_node_link(context.clone(), state_relative.as_str())
             .await
             .unwrap_or_default();
-        if !file_node_link.is_valid() {
-            continue;
+        if file_node_link.is_valid() {
+            files.push((file_path, file_node_link));
         }
-        resolve_single_file(
-            operation,
-            context,
-            state,
-            file_path,
-            file_node_link,
-            merge_type,
-        )
-        .await?;
     }
-    Ok(())
+    Ok(files)
 }
 
 /// A link a resolve has reached, deserialized once however many of its paths are named.
@@ -4211,6 +4200,10 @@ struct ResolveCache {
     link_list: Option<Vec<state::LinkReference>>,
 }
 
+/// The files a resolve marks resolved in one state: the linked repository's that the id names, or
+/// the parent's.
+type FilesToResolve = (Option<RepositoryId>, Vec<(RelativePath, NodeLink)>);
+
 /// Resolves each of `paths` against the state that holds it, which for a path inside a link is
 /// the link's own rather than the parent's.
 async fn resolve_paths(
@@ -4221,6 +4214,9 @@ async fn resolve_paths(
     merge_type: MergeType,
     cache: &mut ResolveCache,
 ) -> Result<(), MergeError> {
+    let refusal = stage::ResolveRefusal::new(repository, state_staged);
+    // Every path is checked before any is marked, so a refused resolve reports nothing resolved.
+    let mut to_resolve: Vec<FilesToResolve> = Vec::new();
     for path in paths.as_slice().iter() {
         let Ok(relative_path) =
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
@@ -4277,6 +4273,14 @@ async fn resolve_paths(
                             .node_path(repository.clone(), link_ref.local_node)
                             .await
                             .forward::<MergeError>("resolving link mount path")?;
+                        let Ok(mount_rel) = RelativePath::from_str(&mount);
+                        if let Some(refused) = refusal
+                            .entering_link(link_ref.local_node as NodeID, &mount_rel)
+                            .await
+                            .forward::<MergeError>("checking the link mount")?
+                        {
+                            return Err(refused.into());
+                        }
                         (mount, link_ref.branch)
                     } else {
                         (String::new(), BranchId::default())
@@ -4290,29 +4294,45 @@ async fn resolve_paths(
                 }
             };
 
-            resolve_path_in_state(
-                operation,
+            let files = files_to_resolve(
                 &touched.link_context,
                 &touched.link_state,
                 &touched.mount_path,
                 relative_path,
                 node_link,
-                merge_type,
+                refusal.inside_link(),
             )
             .await?;
+            to_resolve.push((Some(node_link.repository), files));
             continue;
         }
 
-        resolve_path_in_state(
-            operation,
+        let files = files_to_resolve(
             repository,
             state_staged,
             "",
             relative_path,
             node_link,
-            merge_type,
+            refusal.clone(),
         )
         .await?;
+        to_resolve.push((None, files));
+    }
+
+    for (link, files) in to_resolve {
+        let (context, state) = match link {
+            Some(link) => {
+                let touched = cache
+                    .touched_links
+                    .get(&link)
+                    .ok_or_else(|| MergeError::internal("A resolved link was not read"))?;
+                (&touched.link_context, &touched.link_state)
+            }
+            None => (repository, state_staged),
+        };
+        for (path, node_link) in files {
+            resolve_single_file(operation, context, state, path, node_link, merge_type).await?;
+        }
     }
     Ok(())
 }

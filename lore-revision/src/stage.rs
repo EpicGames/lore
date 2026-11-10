@@ -3503,6 +3503,256 @@ pub(crate) fn determine_merge_action(
     }
 }
 
+/// One side of a merge, cherry-pick or revert in progress, and the link mounts it holds.
+struct MergeSide {
+    state: Arc<State>,
+    mounts: Vec<state::LinkMountInfo>,
+}
+
+struct MergeSides {
+    mine: MergeSide,
+    other: MergeSide,
+}
+
+impl MergeSides {
+    /// The side a resolve to `merge_parent` restores from, and the side it replaces.
+    fn restored_and_replaced(&self, merge_parent: MergeParent) -> (&MergeSide, &MergeSide) {
+        if merge_parent == MergeParent::Mine {
+            (&self.mine, &self.other)
+        } else {
+            (&self.other, &self.mine)
+        }
+    }
+}
+
+/// The state a resolve walks: the parent repository's, or a linked repository's, whose resolver
+/// restores files only.
+#[derive(Clone, Copy, PartialEq)]
+enum ResolveScope {
+    Parent,
+    InsideLink,
+}
+
+struct MergeInProgress {
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    sides: tokio::sync::OnceCell<MergeSides>,
+    abort: &'static str,
+}
+
+/// What a resolve of the merge in progress refuses because resolving it would corrupt a link or
+/// leave its conflicts behind: a type change at a link mount either side of the merge holds, a
+/// link holding unresolved conflicts met from above, and a folder or link conflict inside a
+/// linked repository.
+#[derive(Clone)]
+pub(crate) struct ResolveRefusal {
+    merge: Arc<MergeInProgress>,
+    scope: ResolveScope,
+}
+
+impl ResolveRefusal {
+    /// The refusal for the merge in progress in `state`.
+    pub(crate) fn new(repository: &Arc<RepositoryContext>, state: &Arc<State>) -> Self {
+        Self {
+            merge: Arc::new(MergeInProgress {
+                repository: repository.clone(),
+                state: state.clone(),
+                sides: tokio::sync::OnceCell::new(),
+                abort: branch::merge::get_merge_type(state).abort_command(),
+            }),
+            scope: ResolveScope::Parent,
+        }
+    }
+
+    /// This refusal for a walk over a linked repository's state.
+    pub(crate) fn inside_link(&self) -> Self {
+        Self {
+            merge: self.merge.clone(),
+            scope: ResolveScope::InsideLink,
+        }
+    }
+
+    /// Both sides of the merge, read once on first use.
+    async fn sides(&self) -> Result<&MergeSides, StageError> {
+        let merge = &self.merge;
+        merge
+            .sides
+            .get_or_try_init(async || {
+                let (repository, state) = (&merge.repository, &merge.state);
+                let other = if state.is_cherry_pick() {
+                    MergeParent::CherryPick
+                } else if state.is_revert() {
+                    MergeParent::Revert
+                } else {
+                    MergeParent::Theirs
+                };
+                let side = async |merge_parent| {
+                    let revision = merge_parent_revision(repository, state, merge_parent).await?;
+                    let state = State::deserialize(repository.clone(), revision)
+                        .await
+                        .forward::<StageError>("Failed to deserialize revision state")?;
+                    let mounts = state::collect_link_mounts_below(
+                        &state,
+                        repository,
+                        ROOT_NODE,
+                        &RelativePath::new(),
+                    )
+                    .await
+                    .forward_any::<StageError>("Failed to collect the link mounts of the merge")?;
+                    Ok::<_, StageError>(MergeSide { state, mounts })
+                };
+                let (mine, other) = tokio::try_join!(side(MergeParent::Mine), side(other))?;
+                Ok(MergeSides { mine, other })
+            })
+            .await
+    }
+
+    /// Whether either side holds a link mounted at `path`.
+    async fn mounted_at(&self, path: &RelativePath) -> Result<bool, StageError> {
+        let sides = self.sides().await?;
+        Ok(sides
+            .mine
+            .mounts
+            .iter()
+            .chain(&sides.other.mounts)
+            .any(|mount| mount.mount_path.as_lowercase_str() == path.as_lowercase_str()))
+    }
+
+    /// The refusal for `node` at `path`, which carries an unresolved conflict and is not a file,
+    /// or `None` where a resolve walks into it.
+    async fn at_node(
+        &self,
+        node: &Node,
+        path: &RelativePath,
+    ) -> Result<Option<NotSupported>, StageError> {
+        if self.scope == ResolveScope::InsideLink && !node.is_link() {
+            return Ok(Some(self.inside_link_conflict(path)));
+        }
+        if node.is_link() || self.mounted_at(path).await? {
+            return Ok(Some(self.mount_type_change(path)));
+        }
+        Ok(None)
+    }
+
+    /// The refusal for the link `node` at `path` that a walk meets, where the linked repository
+    /// holds unresolved conflicts.
+    async fn at_link(
+        &self,
+        node: &Node,
+        path: &RelativePath,
+    ) -> Result<Option<NotSupported>, StageError> {
+        // A link nested in a linked repository is not merged with it.
+        if self.scope == ResolveScope::InsideLink {
+            return Ok(None);
+        }
+        let mounted = node.linked_node();
+        let link_context = self
+            .merge
+            .repository
+            .to_link_context(mounted.repository)
+            .await;
+        let link_state = State::deserialize(link_context.clone(), mounted.revision)
+            .await
+            .forward::<StageError>("Failed to deserialize link state")?;
+        if !link_state.is_conflict() {
+            return Ok(None);
+        }
+        let unresolved = collect_merge_paths(
+            link_context,
+            link_state,
+            mounted.node,
+            path.clone(),
+            MergeWalk {
+                unresolved_only: true,
+                whole_directories: true,
+            },
+            None,
+        )
+        .await?;
+        Ok((!unresolved.files.is_empty()).then(|| NotSupported {
+            operation: format!(
+                "resolving the conflicts inside the link at {path} from outside it - name the paths \
+                 inside the link"
+            ),
+        }))
+    }
+
+    /// The refusal for resolving a path inside the link whose node in the parent's state is
+    /// `local_node`, mounted at `mount`, where that node carries an unresolved conflict.
+    pub(crate) async fn entering_link(
+        &self,
+        local_node: NodeID,
+        mount: &RelativePath,
+    ) -> Result<Option<NotSupported>, StageError> {
+        let node = self
+            .merge
+            .state
+            .node(self.merge.repository.clone(), local_node)
+            .await
+            .forward::<StageError>("Failed to read the link node")?;
+        Ok(node
+            .is_staged_merge_unresolved()
+            .then(|| self.mount_type_change(mount)))
+    }
+
+    /// The refusal for restoring `paths` in the parent repository from the side `merge_parent`
+    /// names, where that side holds a link mount at, above or below one of them, or the side it
+    /// replaces holds one below, which restoring removes.
+    async fn restoring(
+        &self,
+        merge_parent: MergeParent,
+        paths: &[RelativePath],
+    ) -> Result<Option<NotSupported>, StageError> {
+        let (restored, replaced) = self.sides().await?.restored_and_replaced(merge_parent);
+        let mount = restored
+            .mounts
+            .iter()
+            .find(|mount| {
+                paths
+                    .iter()
+                    .any(|path| mount.mount_path.overlaps_ignore_case(path))
+            })
+            .or_else(|| {
+                replaced.mounts.iter().find(|mount| {
+                    paths.iter().any(|path| {
+                        path.covers_ignore_case(&mount.mount_path)
+                            && path.as_lowercase_str() != mount.mount_path.as_lowercase_str()
+                    })
+                })
+            });
+        Ok(mount.map(|mount| self.mount_type_change(&mount.mount_path)))
+    }
+
+    /// The refusal for restoring the file at `path` inside a linked repository from a side that
+    /// holds `target` there.
+    fn restoring_file_inside_link(
+        &self,
+        target: &Node,
+        path: &RelativePath,
+    ) -> Option<NotSupported> {
+        (!target.is_file()).then(|| self.inside_link_conflict(path))
+    }
+
+    fn mount_type_change(&self, mount: &RelativePath) -> NotSupported {
+        NotSupported {
+            operation: format!(
+                "resolving a link mount type change at {mount} - abort with `{}`",
+                self.merge.abort
+            ),
+        }
+    }
+
+    fn inside_link_conflict(&self, path: &RelativePath) -> NotSupported {
+        NotSupported {
+            operation: format!(
+                "resolving the folder or link conflict at {path} inside a linked repository - \
+                 abort with `{}`",
+                self.merge.abort
+            ),
+        }
+    }
+}
+
 /// What [`collect_merge_paths`] collected below a node.
 #[derive(Default)]
 pub(crate) struct StagedMergePaths {
@@ -3521,13 +3771,15 @@ pub(crate) struct MergeWalk {
     pub(crate) whole_directories: bool,
 }
 
-/// Collects the paths of the merged nodes at and below `node_id`.
+/// Collects the paths of the merged nodes at and below `node_id`, passing over links, with what
+/// `refusal` refuses on the way.
 pub(crate) fn collect_merge_paths(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
     base_path: RelativePath,
     walk: MergeWalk,
+    refusal: Option<ResolveRefusal>,
 ) -> Pin<Box<dyn Future<Output = Result<StagedMergePaths, StageError>> + Send>> {
     Box::pin(async move {
         let block = state
@@ -3535,13 +3787,6 @@ pub(crate) fn collect_merge_paths(
             .await
             .forward::<StageError>("Failed deserializing state node block")?;
         let node = block.node(Node::index(node_id));
-
-        if node.is_link() {
-            // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
-        }
 
         let collects = |node: &Node| {
             if walk.unresolved_only {
@@ -3559,6 +3804,20 @@ pub(crate) fn collect_merge_paths(
                 files: vec![base_path],
                 holds_conflict: node.is_staged_merge_conflict(),
             });
+        }
+        if let Some(refusal) = &refusal
+            && node.is_staged_merge_unresolved()
+            && let Some(refused) = refusal.at_node(&node, &base_path).await?
+        {
+            return Err(refused.into());
+        }
+        if node.is_link() {
+            if let Some(refusal) = &refusal
+                && let Some(refused) = refusal.at_link(&node, &base_path).await?
+            {
+                return Err(refused.into());
+            }
+            return Ok(StagedMergePaths::default());
         }
 
         let mut collected = StagedMergePaths::default();
@@ -3581,6 +3840,7 @@ pub(crate) fn collect_merge_paths(
                 child_id,
                 child_path,
                 walk,
+                refusal.clone(),
             )
             .await?;
             collected.files.append(&mut child.files);
@@ -3744,28 +4004,26 @@ async fn stage_from_parent_revision_in_operation(
         }
     }
 
-    if !link_paths.is_empty() {
-        Box::pin(stage_link_paths_from_parent_revision(
-            operation.clone(),
-            repository.clone(),
-            token,
-            state.clone(),
-            LoreArray::from_vec(link_paths),
-            merge_parent,
-        ))
-        .await?;
-    }
+    // Every path is checked before any is staged, so a refused resolve stages nothing.
+    let refusal = ResolveRefusal::new(&repository, &state);
+    let link_groups =
+        collect_link_groups(&repository, &state, &link_paths, merge_parent, &refusal).await?;
 
     if parent_paths.is_empty() {
-        return Ok(());
+        return Box::pin(stage_link_groups(
+            operation,
+            repository,
+            token,
+            state,
+            link_groups,
+            merge_parent,
+        ))
+        .await;
     }
     let paths = LoreArray::from_vec(parent_paths);
 
-    let state_target_hash = merge_parent_revision(&repository, &state, merge_parent).await?;
-
-    let state_target = State::deserialize(repository.clone(), state_target_hash)
-        .await
-        .forward::<StageError>("Failed to deserialize revision state")?;
+    let sides = refusal.sides().await?;
+    let state_target = sides.restored_and_replaced(merge_parent).0.state.clone();
 
     // Get current repository state for merge action comparison
     let state_current = State::deserialize(repository.clone(), current_revision)
@@ -3808,9 +4066,8 @@ async fn stage_from_parent_revision_in_operation(
         }
 
         if node_link.repository != repository.id {
-            // TODO(vri): UCS-17955 - Merging and conflict resolution for links
             return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
+                "A path left to the parent repository resolves into a linked repository",
             ));
         }
 
@@ -3829,7 +4086,7 @@ async fn stage_from_parent_revision_in_operation(
                 emit_path_ignore(path.as_str()).await;
                 lore_debug!("Ignoring invalid path, node is not a staged merge: {path}");
             }
-        } else if node.is_directory() {
+        } else {
             let expanded = collect_merge_paths(
                 repository.clone(),
                 state.clone(),
@@ -3839,16 +4096,26 @@ async fn stage_from_parent_revision_in_operation(
                     unresolved_only: false,
                     whole_directories: true,
                 },
+                Some(refusal.clone()),
             )
             .await?;
             resolved_paths.extend(expanded.files);
-        } else {
-            // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
         }
     }
+
+    if let Some(refused) = refusal.restoring(merge_parent, &resolved_paths).await? {
+        return Err(refused.into());
+    }
+
+    Box::pin(stage_link_groups(
+        operation.clone(),
+        repository.clone(),
+        token,
+        state.clone(),
+        link_groups,
+        merge_parent,
+    ))
+    .await?;
 
     let stats = Arc::new(StageStats::default());
     #[cfg(not(feature = "test-util"))]
@@ -4078,9 +4345,8 @@ async fn stage_from_parent_revision_in_operation(
             }
 
             if target_node_link.repository != repository.id {
-                // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                 return Err(StageError::internal(
-                    "Links not yet implemented, cannot perform actions in other repositories",
+                    "A path resolved in the parent repository is restored from a linked repository",
                 ));
             }
 
@@ -4113,17 +4379,7 @@ async fn stage_from_parent_revision_in_operation(
             {
                 // The working tree holds the side not chosen.
                 let replaced = if merge_parent == MergeParent::Mine {
-                    let theirs = if state.is_cherry_pick() {
-                        MergeParent::CherryPick
-                    } else if state.is_revert() {
-                        MergeParent::Revert
-                    } else {
-                        MergeParent::Theirs
-                    };
-                    let revision = merge_parent_revision(&repository, &state, theirs).await?;
-                    State::deserialize(repository.clone(), revision)
-                        .await
-                        .forward::<StageError>("Failed to deserialize revision state")?
+                    sides.other.state.clone()
                 } else {
                     state_current.clone()
                 };
@@ -4253,36 +4509,33 @@ async fn stage_from_parent_revision_in_operation(
     Ok(())
 }
 
-/// Stage paths inside linked repositories from one of the link's merge
+/// The files a resolve restores inside one linked repository, from one of the link's merge
 /// parents (Mine = `parent_self`, Theirs = `parent_other`).
-///
-/// Mirrors `stage_from_parent_revision`'s per-file logic but operates on
-/// each affected link's staged state. After all paths for a link are
-/// processed the link state is re-serialized and the parent's pin updated
-/// via `link::update_link_pin_by_path`.
-pub(crate) async fn stage_link_paths_from_parent_revision(
-    operation: Arc<InstanceOperationImpl>,
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    state: Arc<State>,
-    paths: LoreArray<LoreString>,
+struct LinkGroup {
+    link_context: Arc<RepositoryContext>,
+    link_path: String,
+    link_path_rel: RelativePath,
+    link_state_staged: Arc<State>,
+    link_state_target: Arc<State>,
+    link_state_current: Arc<State>,
+    /// The path from the parent's root, the path in the link and the node the target holds there.
+    files: Vec<(RelativePath, RelativePath, NodeLink)>,
+    link_branch: BranchId,
+}
+
+/// Groups `paths`, which lie inside linked repositories, by link, and checks each against
+/// `refusal` without staging anything.
+async fn collect_link_groups(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    paths: &[LoreString],
     merge_parent: MergeParent,
-) -> Result<(), StageError> {
-    // Group by link repository id so each link's state is loaded once.
-    struct LinkGroup {
-        link_context: Arc<RepositoryContext>,
-        link_path: String,
-        link_path_rel: RelativePath,
-        link_state_staged: Arc<State>,
-        link_state_target: Arc<State>,
-        link_state_current: Arc<State>,
-        // (mount-prefixed user-path, link-relative path)
-        files: Vec<(RelativePath, RelativePath)>,
-        link_branch: BranchId,
-    }
+    refusal: &ResolveRefusal,
+) -> Result<Vec<LinkGroup>, StageError> {
+    let refusal = refusal.inside_link();
     let mut groups: Vec<LinkGroup> = Vec::new();
 
-    for path in paths.as_slice().iter() {
+    for path in paths {
         let Ok(relative_path) =
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
         else {
@@ -4363,6 +4616,12 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
 
             let link_path_rel =
                 RelativePath::from_str(&mount).unwrap_or_else(|_| RelativePath::new());
+            if let Some(refused) = refusal
+                .entering_link(link_ref.local_node as NodeID, &link_path_rel)
+                .await?
+            {
+                return Err(refused.into());
+            }
 
             groups.push(LinkGroup {
                 link_context,
@@ -4393,44 +4652,88 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
             .await
             .forward::<StageError>("Failed deserializing link state node block")?;
         let node = block.node(Node::index(node_link.node));
-        if node.is_file() {
-            if node.is_staged_merge() {
-                group.files.push((relative_path, link_relative));
-            } else {
+        let files = if node.is_file() {
+            if !node.is_staged_merge() {
                 emit_path_ignore(path.as_str()).await;
                 lore_debug!("Ignoring invalid path, link node is not a staged merge: {path}");
+                continue;
             }
-        } else if node.is_directory() {
-            let expanded = collect_merge_paths(
+            vec![(relative_path, link_relative)]
+        } else {
+            collect_merge_paths(
                 group.link_context.clone(),
                 group.link_state_staged.clone(),
                 node_link.node,
-                link_relative.clone(),
+                relative_path,
                 MergeWalk {
                     unresolved_only: false,
                     whole_directories: false,
                 },
+                Some(refusal.clone()),
             )
-            .await?;
-            for f in expanded.files {
-                let user = group.link_path_rel.join(f.as_str());
-                group.files.push((user, f));
+            .await?
+            .files
+            .into_iter()
+            .map(|user| {
+                let link_relative = user
+                    .below(&group.link_path_rel)
+                    .and_then(|below| RelativePath::from_str(below).ok())
+                    .ok_or_else(|| {
+                        StageError::internal(format!(
+                            "{user} lies outside the link mounted at {}",
+                            group.link_path
+                        ))
+                    })?;
+                Ok((user, link_relative))
+            })
+            .collect::<Result<Vec<_>, StageError>>()?
+        };
+        for (user, link_relative) in files {
+            let target = match group
+                .link_state_target
+                .find_node_link(group.link_context.clone(), link_relative.as_str())
+                .await
+            {
+                Ok(target) => target,
+                Err(err) if err.is_node_not_found() => NodeLink::invalid(),
+                Err(err) => {
+                    Err(err).forward::<StageError>("Failed to find the link target node")?
+                }
+            };
+            if target.is_valid() {
+                let target_node = group
+                    .link_state_target
+                    .node(group.link_context.clone(), target.node)
+                    .await
+                    .forward::<StageError>("Failed to read the link target node")?;
+                if let Some(refused) = refusal.restoring_file_inside_link(&target_node, &user) {
+                    return Err(refused.into());
+                }
             }
-        } else {
-            return Err(StageError::internal(
-                "Link nodes inside a link are not supported",
-            ));
+            group.files.push((user, link_relative, target));
         }
     }
+    Ok(groups)
+}
 
+/// Stages the files of `groups` from the merge parent `merge_parent` names, then re-serializes
+/// each link's state and updates the parent's pin via `link::update_link_pin_by_path`.
+async fn stage_link_groups(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: Arc<State>,
+    groups: Vec<LinkGroup>,
+    merge_parent: MergeParent,
+) -> Result<(), StageError> {
     if groups.is_empty() {
         return Ok(());
     }
 
     let stats = Arc::new(StageStats::default());
 
-    for group in &groups {
-        for (mount_path, link_relative) in &group.files {
+    for group in groups.iter().filter(|group| !group.files.is_empty()) {
+        for (mount_path, link_relative, target_node_link) in &group.files {
             let staged_node_link = group
                 .link_state_staged
                 .find_node_link(group.link_context.clone(), link_relative.as_str())
@@ -4467,11 +4770,6 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
 
             // Look up the file in the link's target/current states for the
             // merge-action flags (Add / Modify / Delete / NoFlags).
-            let target_node_link = group
-                .link_state_target
-                .find_node_link(group.link_context.clone(), link_relative.as_str())
-                .await
-                .unwrap_or_default();
             let current_node_link = group
                 .link_state_current
                 .find_node_link(group.link_context.clone(), link_relative.as_str())

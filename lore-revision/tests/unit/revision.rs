@@ -180,22 +180,41 @@ async fn a_file_replaced_by_a_directory_conflicts_only_with_a_change_there_or_be
                 )
                 .is_empty()
             );
+        })
+        .await;
+}
 
-            // One side added a file and the other a directory where the base held nothing.
+#[tokio::test]
+async fn nodes_of_different_types_added_at_one_path_conflict_there() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository = Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+            ));
+            let state = State::new();
             let added = |flags: NodeFlags| {
-                let mut change = at("thing");
+                let mut change = change_at(&repository, &state, "thing");
                 change.action = FileAction::Add;
                 change.to.mapping.node = 1;
                 change.to.flags = flags;
                 change
             };
-            assert_eq!(
-                conflicting_replacements(
-                    [(&[], &[], &[]), (&[], &[], &[])],
-                    &[(added(NodeFlags::File), added(NodeFlags::NoFlags))],
-                ),
-                vec![path("thing")]
-            );
+            let types = [NodeFlags::File, NodeFlags::NoFlags, NodeFlags::Link];
+            for source in types {
+                for target in types.into_iter().filter(|target| *target != source) {
+                    assert_eq!(
+                        conflicting_replacements(
+                            [(&[], &[], &[]), (&[], &[], &[])],
+                            &[(added(source), added(target))],
+                        ),
+                        vec![path("thing")],
+                        "{source:?} against {target:?}"
+                    );
+                }
+            }
         })
         .await;
 }
