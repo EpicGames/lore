@@ -4,7 +4,6 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::path::Path;
-#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -21,6 +20,7 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
 
 use crate::fs::filesystem_provider::setup_test_execution;
+use crate::helper::case_insensitive;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::store_fragment;
 use crate::repository::test_helpers::stored_as_list;
@@ -39,19 +39,6 @@ async fn os_operation(root: &Path) -> Arc<InstanceOperationImpl> {
 
 fn relative(path: &str) -> RelativePath {
     RelativePath::new_from_initial_path(path).expect("relative path")
-}
-
-/// Whether the filesystem under the temporary directory holds one case variation of a name
-/// and answers lookups in any other. Windows and macOS do by default and Linux does not, but a
-/// mount can be either on any of them, so the tests below ask rather than assume — and the
-/// two behaviours are different enough that a test written for one is not a test of the
-/// other.
-fn case_insensitive(dir: &Path) -> bool {
-    let probe = dir.join("CaseProbe");
-    std::fs::write(&probe, b"").expect("write probe");
-    let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
-    std::fs::remove_file(&probe).expect("remove probe");
-    insensitive
 }
 
 /// An empty directory of its own on a filesystem other than the one holding `beside`, or
@@ -631,6 +618,116 @@ async fn rename_refuses_a_destination_of_another_kind() {
     assert!(
         dir.path().join("to").is_dir(),
         "the destination must survive"
+    );
+}
+
+/// A second path to `name` in `dir` naming the same entry: the name in another case where the file
+/// system folds case, and the name through `.` where it does not.
+fn same_entry(dir: &Path, name: &str) -> PathBuf {
+    if case_insensitive(dir) {
+        dir.join(name.to_uppercase())
+    } else {
+        dir.join(".").join(name)
+    }
+}
+
+/// Two paths name one entry only where they lead to the same file, symbolic links followed: a
+/// link to it does, another spelling does where the file system folds case, and another file and a
+/// path naming nothing never do. A first path naming nothing, one through a file included, is
+/// answered as naming nothing.
+#[tokio::test]
+async fn names_one_entry_only_for_paths_to_the_same_file() {
+    let dir = temp_dir();
+    std::fs::write(dir.path().join("file"), b"").expect("write the file");
+    std::fs::write(dir.path().join("other"), b"").expect("write the other file");
+    let folds_case = case_insensitive(dir.path());
+    #[cfg(target_family = "unix")]
+    let linked = std::os::unix::fs::symlink("file", dir.path().join("link")).is_ok();
+    #[cfg(target_family = "windows")]
+    let linked = std::os::windows::fs::symlink_file("file", dir.path().join("link")).is_ok();
+    let operation = os_operation(dir.path()).await;
+
+    let mut cases = vec![
+        ("file", "file", Some(true)),
+        ("file", "FILE", Some(folds_case)),
+        ("file", "other", Some(false)),
+        ("file", "missing", Some(false)),
+        ("file", "other/child", Some(false)),
+        ("missing", "file", None),
+        ("other/child", "file", None),
+    ];
+    if linked {
+        cases.push(("file", "link", Some(true)));
+    }
+    for (from, to, one) in cases {
+        assert_eq!(
+            operation
+                .names_one_entry(&relative(from), &relative(to))
+                .await
+                .expect("an answer"),
+            one,
+            "{from} and {to}"
+        );
+    }
+}
+
+/// A rename holds no unification, which it boxes only where the rename is refused: its future is
+/// smaller than the unification's, which would otherwise make every rename as large.
+#[test]
+fn a_rename_holds_no_unification() {
+    let (from, to) = (Path::new("from"), Path::new("to"));
+    let rename = rename_unifying(from, to);
+    let unification = unify_refused_rename(from, to, std::io::ErrorKind::Other.into());
+    assert!(
+        size_of_val(&rename) < size_of_val(&unification),
+        "the rename holds {} bytes, the unification {}",
+        size_of_val(&rename),
+        size_of_val(&unification)
+    );
+}
+
+/// A refused rename of a file to a path naming its own entry, as a case-only rename does on a file
+/// system that folds case, removes nothing: the refusal is answered and the file keeps what it
+/// holds.
+#[tokio::test]
+async fn a_refused_rename_of_a_file_to_its_own_entry_keeps_it() {
+    let dir = temp_dir();
+    let file = dir.path().join("file");
+    std::fs::write(&file, b"kept").expect("write the file");
+
+    let refused = unify_refused_rename(
+        &file,
+        &same_entry(dir.path(), "file"),
+        std::io::ErrorKind::PermissionDenied.into(),
+    )
+    .await
+    .expect_err("an entry is not unified with itself");
+
+    assert_eq!(std::io::ErrorKind::PermissionDenied, refused.kind());
+    assert_eq!(Some(b"kept".to_vec()), std::fs::read(&file).ok());
+}
+
+/// A refused rename of a directory to a path naming its own entry does not enter it as its own
+/// destination: the refusal is answered and the directory keeps its children.
+#[tokio::test]
+async fn a_refused_rename_of_a_directory_to_its_own_entry_keeps_it() {
+    let dir = temp_dir();
+    let directory = dir.path().join("directory");
+    std::fs::create_dir(&directory).expect("create the directory");
+    std::fs::write(directory.join("entry"), b"kept").expect("write the entry");
+
+    let refused = unify_refused_rename(
+        &directory,
+        &same_entry(dir.path(), "directory"),
+        std::io::ErrorKind::PermissionDenied.into(),
+    )
+    .await
+    .expect_err("an entry is not unified with itself");
+
+    assert_eq!(std::io::ErrorKind::PermissionDenied, refused.kind());
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(directory.join("entry")).ok()
     );
 }
 

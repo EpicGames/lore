@@ -255,6 +255,18 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
+    /// Read from the file system's own identity of the file each path names, symbolic links
+    /// followed, as [`lore_io::IoDriver::names_one_entry`] reads it.
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        Ok(lore_io::IoDriver::global()
+            .names_one_entry(self.absolute(from)?, self.absolute(to)?)
+            .await?)
+    }
+
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
         let path = self.absolute(path)?;
         util::fs::unlink(path).await?;
@@ -504,33 +516,61 @@ async fn copy_and_unlink(from_path: &Path, to_path: &Path) -> std::io::Result<()
 }
 
 /// The OS arm of [`InstanceOperation::rename`]: moves what the file system holds at `from_path` to
-/// `to_path`, by rename where one lands and by hand where none does.
+/// `to_path`, by rename where one lands and by [`unify_refused_rename`] where none does. On
+/// Windows a directory renamed onto a file lands: the system's rename replaces the file with the
+/// directory.
 ///
-/// A file goes to `to_path` whether or not a file is there, one that is there being removed first.
-/// A directory hands each child over under these same rules, a child whose name the destination
-/// also holds recursing again, before it goes; a destination that is not there is created to take
-/// them. A `from_path` and `to_path` of different kinds are refused, there being no move that
-/// leaves one of them. On Windows a directory renamed onto a file is the exception: the system's
-/// rename replaces the file with the directory.
-///
-/// Boxed because it recurses.
+/// Only a refused rename is boxed, the unification recursing through it, so a rename that lands
+/// boxes no future. Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
 fn rename_unifying<'a>(
     from_path: &'a Path,
     to_path: &'a Path,
-) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let driver = lore_io::IoDriver::global();
+) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
+    async move {
         lore_debug!(
             "Try rename {} -> {}",
             from_path.display(),
             to_path.display()
         );
-        if driver.rename(from_path, to_path).await.is_ok() {
-            lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
-            return Ok(());
+        match lore_io::IoDriver::global().rename(from_path, to_path).await {
+            Ok(()) => {
+                lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
+                Ok(())
+            }
+            Err(refused) => {
+                let unifying: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> =
+                    Box::pin(unify_refused_rename(from_path, to_path, refused));
+                unifying.await
+            }
         }
+    }
+}
 
+/// Moves what the file system holds at `from_path` to `to_path` by hand, the rename between them
+/// having been refused with `refused`.
+///
+/// A file goes to `to_path` whether or not a file is there, one that is there being removed first.
+/// A directory hands each child over to `to_path` through [`rename_unifying`], a child whose name
+/// the destination also holds being unified again, before it goes; a destination that is not there
+/// is created to take them. A `from_path` and `to_path` of different kinds are refused, there being
+/// no move that leaves one of them.
+///
+/// A `to_path` naming the entry `from_path` does, as another spelling of its name does on a file
+/// system that folds case, or one that cannot be told apart from it, is not unified: removing or
+/// emptying it could remove the source. `refused` is answered and both stay as they stand.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn unify_refused_rename<'a>(
+    from_path: &'a Path,
+    to_path: &'a Path,
+    refused: std::io::Error,
+) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
+    async move {
+        let driver = lore_io::IoDriver::global();
         let from_kind = driver.stat(from_path).await?.kind;
         let to_kind = match driver.stat(to_path).await {
             Ok(stat) => Some(stat.kind),
@@ -545,6 +585,15 @@ fn rename_unifying<'a>(
                 std::io::ErrorKind::Unsupported,
                 "Unable to rename, file/directory mismatch",
             ));
+        }
+
+        if to_kind.is_some()
+            && !matches!(
+                driver.names_one_entry(from_path, to_path).await,
+                Ok(Some(false) | None)
+            )
+        {
+            return Err(refused);
         }
 
         if from_kind == StatKind::File {
@@ -578,5 +627,5 @@ fn rename_unifying<'a>(
 
         lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
         Ok(())
-    })
+    }
 }

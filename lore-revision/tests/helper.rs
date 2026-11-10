@@ -389,6 +389,21 @@ pub fn test_file_write(path: &std::path::Path, contents: &[u8]) {
         .unwrap_or_else(|_| panic!("Failed to write test file at {}", path.display()));
 }
 
+/// Whether the file system holding `dir` holds one spelling of a name and answers lookups in any
+/// other. Windows and macOS do by default and Linux does not, but a mount can be either on any of
+/// them, so a test asks rather than assumes.
+#[allow(dead_code)]
+pub fn case_insensitive(dir: &std::path::Path) -> bool {
+    #[allow(clippy::disallowed_methods)]
+    {
+        let probe = dir.join("CaseProbe");
+        std::fs::write(&probe, b"").expect("write probe");
+        let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
+        std::fs::remove_file(&probe).expect("remove probe");
+        insensitive
+    }
+}
+
 /// Reconciles the working tree against `state_staged`, mutating it in place as
 /// `lore status --scan` does, and returns the changes detected.
 #[allow(dead_code)]

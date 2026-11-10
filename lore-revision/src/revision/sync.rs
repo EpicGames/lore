@@ -1378,6 +1378,23 @@ pub struct SyncCompleteStats {
 pub struct SyncRealizeStats {
     pub discovery: DiscoveryStats,
     pub complete: SyncCompleteStats,
+    pub kept_moves: KeptMoves,
+}
+
+/// The moves a realize carries out without their rename, leaving the source where it stands: the
+/// rename was refused, and the destination names the source's own entry or cannot be told apart
+/// from it. Counted, with the first, for the one warning the realize ends with.
+#[derive(Default)]
+pub struct KeptMoves {
+    pub count: AtomicUsize,
+    pub first: std::sync::OnceLock<KeptMove>,
+}
+
+/// A move [`KeptMoves`] counts: where it is from and to, and why it was kept.
+pub struct KeptMove {
+    pub from: RelativePath,
+    pub to: RelativePath,
+    pub reason: String,
 }
 
 impl LoreRevisionSyncProgressEventData {

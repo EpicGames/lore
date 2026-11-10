@@ -596,6 +596,51 @@ async fn holds_name_exactly_answers_for_a_name_the_filesystem_holds() {
     }
 }
 
+/// Two paths name one entry where they reach one file, symbolic links followed: the same path, a
+/// link to it, and another spelling where the file system folds case. Another file, a path naming
+/// nothing and a path through a file never do, and a first path naming nothing is answered as
+/// naming nothing.
+#[tokio::test]
+async fn names_one_entry_answers_for_paths_reaching_one_file() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-namesoneentry-");
+        for name in ["Rock.mesh", "Other.mesh"] {
+            driver
+                .write_file_bytes(dir.child(name), Bytes::from_static(b"data"), false)
+                .await
+                .unwrap();
+        }
+        driver.create_dir_all(dir.child("Meshes")).await.unwrap();
+        let folds_case = driver.stat(dir.child("ROCK.MESH")).await.is_ok();
+        let linked = file_link(&dir.child("Rock.mesh"), &dir.child("link"));
+
+        let mut cases = vec![
+            ("Rock.mesh", "Rock.mesh", Some(true)),
+            ("Rock.mesh", "ROCK.MESH", Some(folds_case)),
+            ("Meshes", "MESHES", Some(folds_case)),
+            ("Rock.mesh", "Other.mesh", Some(false)),
+            ("Rock.mesh", "absent", Some(false)),
+            ("Rock.mesh", "Other.mesh/child", Some(false)),
+            ("absent", "Rock.mesh", None),
+            ("Other.mesh/child", "Rock.mesh", None),
+        ];
+        if linked {
+            cases.push(("Rock.mesh", "link", Some(true)));
+        }
+        for (from, to, one) in cases {
+            assert_eq!(
+                driver
+                    .names_one_entry(dir.child(from), dir.child(to))
+                    .await
+                    .expect("an answer"),
+                one,
+                "{from} and {to}, {}",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
 /// A name that cannot exist must never be answered for by some other file. Win32 hands the last
 /// component to a matcher that reads `*` and `?`, and `<`, `>` and `"` as the legacy DOS
 /// wildcards; none of the five is legal in a Windows filename, and `<` and `"` do match

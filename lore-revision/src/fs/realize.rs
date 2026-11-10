@@ -25,6 +25,7 @@ use crate::errors::WriteRequired;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -56,6 +57,8 @@ use crate::repository::RepositoryContext;
 use crate::repository::THEIRS_SUFFIX;
 use crate::repository::clone;
 use crate::repository::clone::CloneContext;
+use crate::revision::sync::KeptMove;
+use crate::revision::sync::KeptMoves;
 use crate::revision::sync::LoreRevisionSyncFileEventData;
 use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::revision::sync::SyncError;
@@ -1321,6 +1324,7 @@ pub async fn realize_changes(
 
     let (producer_result, consumer_result) = tokio::join!(producer, consumer);
     lore_debug!("Modified/added paths realized");
+    report_kept_moves(&stats.kept_moves);
 
     event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
 
@@ -2249,8 +2253,62 @@ fn realize_link_pin_change_boxed(
     ))
 }
 
+/// Recovers from the refusal of a move's rename, `refused`: removes what `to` holds, for the node
+/// to be written there, unless `to` names the entry `from` does, as another spelling of its name
+/// does on a file system that folds case, or cannot be told apart from it. Such a move leaves the
+/// source where it stands, the node being written over the destination as it is, and is counted in
+/// `kept` for the warning the realize ends with.
+async fn recover_refused_move(
+    operation: &InstanceOperationImpl,
+    from: &RelativePath,
+    to: &RelativePath,
+    refused: FsError,
+    kept: &KeptMoves,
+) -> Result<(), SyncError> {
+    let identity = operation.names_one_entry(from, to).await;
+    if matches!(identity, Ok(Some(false) | None)) {
+        lore_trace!("Failed renaming move node, fall back to deleting and recreating: {refused}");
+        return operation
+            .remove_recursive(to)
+            .await
+            .forward::<SyncError>("removing the destination of a refused move");
+    }
+    kept.count.fetch_add(1, Ordering::Relaxed);
+    kept.first.get_or_init(|| {
+        let reason = match identity {
+            Err(err) => {
+                format!(
+                    "{refused}, and the destination cannot be told apart from the source: {err}"
+                )
+            }
+            Ok(_) => refused.to_string(),
+        };
+        KeptMove {
+            from: from.clone(),
+            to: to.clone(),
+            reason,
+        }
+    });
+    Ok(())
+}
+
+/// Warns once for the moves a realize carried out without their rename, `kept`, with how many and
+/// the first, which the realize reports nothing else of.
+fn report_kept_moves(kept: &KeptMoves) {
+    if let Some(KeptMove { from, to, reason }) = kept.first.get() {
+        let count = kept.count.load(Ordering::Relaxed);
+        lore_warn!(
+            "The file system refused the rename of {count} {}, which leaves the source in place; \
+             the first is {from} to {to}: {reason}",
+            if count == 1 { "move" } else { "moves" }
+        );
+    }
+}
+
 /// Realizes on disk a node a change adds, modifies or moves, and stages it in `state_stage` when
 /// given.
+///
+/// A move whose rename fails is realized as [`recover_refused_move`] describes.
 ///
 /// Cloning an added link and recording a staged link in the registry are boxed. Only a link
 /// reaches them, and inline they would make the future of every change realized as large as
@@ -2306,15 +2364,20 @@ fn realize_change_modify_add(
             && change.action == change::FileAction::Move
             && let Some(from_path) = change.move_source()
         {
-            let renamed = operation.rename(from_path, &to_path).await.is_ok();
-            if !renamed {
-                lore_trace!("Failed renaming move node, fall back to deleting and recreating");
-                operation
-                    .remove_recursive(&to_path)
-                    .await
-                    .forward::<SyncError>("Failed to realize move/rename")?;
+            match operation.rename(from_path, &to_path).await {
+                Ok(()) => true,
+                Err(refused) => {
+                    recover_refused_move(
+                        &operation,
+                        from_path,
+                        &to_path,
+                        refused,
+                        &stats.kept_moves,
+                    )
+                    .await?;
+                    false
+                }
             }
-            renamed
         } else {
             false
         };

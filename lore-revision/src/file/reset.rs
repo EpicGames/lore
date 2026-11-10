@@ -29,6 +29,8 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::with_operation;
+use crate::hash::hash_string;
+use crate::hash::hash_string_bytes;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -1601,7 +1603,7 @@ async fn purge_path(
                 stats,
                 repository_root,
                 relative_path,
-                Vec::new(),
+                None,
             ))
             .await;
         }
@@ -1828,13 +1830,13 @@ async fn reset_walk_directory(
             &stats,
             repository.require_path()?,
             &directory_path,
-            Vec::new(),
+            None,
         ))
         .await;
     }
 
     let mut child_dirs: JoinSet<Result<(), ResetError>> = JoinSet::new();
-    let mut node_children_names: Vec<String> = vec![];
+    let mut held: Vec<HeldChild> = vec![];
     let mut failure: Option<ResetError> = None;
     let mut cycle = SiblingCycleGuard::new(node_id);
     let mut dirty_adds = state_staged
@@ -1881,7 +1883,11 @@ async fn reset_walk_directory(
 
         let child_node_path = directory_path.join(&child_node_name);
         if options.purge {
-            node_children_names.push(child_node_name.clone());
+            held.push(HeldChild {
+                folded: child_node.name_hash,
+                exact: hash_string_bytes(child_node_name.as_bytes()),
+                node: child_node_id,
+            });
         }
         replaced.extend(replaced_dirty_adds(
             &dirty_adds,
@@ -1977,12 +1983,13 @@ async fn reset_walk_directory(
         return Ok(());
     }
 
+    let held = HeldChildren::new(state_target, repository.clone(), held);
     Box::pin(purge_untracked_children(
         &operation,
         &stats,
         repository.require_path()?,
         &directory_path,
-        node_children_names,
+        Some(held),
     ))
     .await
 }
@@ -1991,27 +1998,25 @@ async fn reset_walk_directory(
 /// does not, which is what `--purge` adds to restoring the ones it does. No filter is asked:
 /// an untracked path is removed whether an ignore rule or the view matches it or not.
 ///
-/// `node_children_names` names the children the revision holds, each of them settled by the
-/// walk already, restored or, where the view excludes it, removed. It is sorted here to be
-/// matched against each filesystem entry by binary search. The temporary file a write in progress
-/// holds beside a child the revision holds is left alone. An entry [`is_reserved_node_name`]
-/// answers for, such as `.lore` or `.urc`, and a nested repository, a directory holding `.lore`,
-/// are left in place at any depth, with the
-/// directories leading to them. What stands at a layer mount
-/// is left to the layer's own walk, whatever its kind, and a directory on the way to one is
-/// purged around it.
+/// `held` holds the children the revision holds, each of them settled by the walk already,
+/// restored or, where the view excludes it, removed, and an entry [`HeldChildren::leaves`] answers
+/// for is left in place. An entry [`is_reserved_node_name`] answers for, such as `.lore` or
+/// `.urc`, and a nested repository, a directory holding `.lore`, are left in place at any depth,
+/// with the directories leading to them. What stands at a layer mount is left to the layer's own
+/// walk, whatever its kind, and a directory on the way to one is purged around it.
 ///
 /// Each removal runs in a task, and the tasks are drained to [`MAX_CONCURRENT_TREE_TASKS`] after
 /// each spawn. The first failure, of the listing, a removal or a purge around a mount, ends the
 /// listing, and it is answered once the tasks still live have been awaited.
 ///
 /// A directory the working tree does not hold has nothing to purge.
+#[lore_macro::test_pub]
 async fn purge_untracked_children(
     operation: &Arc<InstanceOperationImpl>,
     stats: &Arc<ResetStats>,
     repository_root: &Path,
     directory_path: &RelativePath,
-    mut node_children_names: Vec<String>,
+    held: Option<HeldChildren>,
 ) -> Result<(), ResetError> {
     if !operation
         .file_info(directory_path)
@@ -2029,12 +2034,6 @@ async fn purge_untracked_children(
             format!("Failed to list directory files in {directory_path}")
         })?;
 
-    node_children_names.sort_unstable();
-    let holds = |name: &str| {
-        node_children_names
-            .binary_search_by(|held| held.as_str().cmp(name))
-            .is_ok()
-    };
     let mut probe: Option<PathBuf> = None;
     let mut tasks = JoinSet::new();
     let mut failure = None;
@@ -2050,7 +2049,14 @@ async fn purge_untracked_children(
                 }
             };
         let name = filesystem_child.name.as_str();
-        if is_reserved_node_name(name) || holds(name) || is_write_in_progress(name, holds) {
+        if is_reserved_node_name(name) {
+            continue;
+        }
+        if let Some(held) = held.as_ref()
+            && held
+                .leaves(operation, directory_path, name, filesystem_child.name_hash)
+                .await
+        {
             continue;
         }
 
@@ -2068,7 +2074,7 @@ async fn purge_untracked_children(
                     stats,
                     repository_root,
                     &child_path,
-                    Vec::new(),
+                    None,
                 ))
                 .await
             {
@@ -2138,12 +2144,134 @@ async fn purge_untracked_children(
 #[cfg(feature = "test-util")]
 pub static PURGE_TASKS: crate::test_util::TaskProbe = crate::test_util::TaskProbe::new();
 
-/// Whether `name` is the temporary file a write in progress puts a child `holds` answers for in
-/// place through. The storage layer names it from the child's extension: `a.txt.~loretemp` for
-/// `a.txt`, and `a..~loretemp` for `a`, which has none.
-fn is_write_in_progress(name: &str, holds: impl Fn(&str) -> bool) -> bool {
-    name.strip_suffix(TEMP_FILE_EXTENSION)
-        .is_some_and(|written| holds(written) || written.strip_suffix('.').is_some_and(&holds))
+/// A child the target revision holds in a directory a purge lists.
+#[lore_macro::test_pub]
+struct HeldChild {
+    /// The hash of its name folded, which [`hash_string`] gives.
+    folded: u64,
+    /// The hash of its name as spelled, which [`hash_string_bytes`] gives.
+    exact: u64,
+    node: NodeID,
+}
+
+/// The children the target revision holds in a directory a purge lists, sorted by the folded hash
+/// of their names, with the tree to read a child's name from.
+#[lore_macro::test_pub]
+struct HeldChildren {
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    children: Vec<HeldChild>,
+}
+
+impl HeldChildren {
+    #[lore_macro::test_pub]
+    fn new(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        mut children: Vec<HeldChild>,
+    ) -> Self {
+        children.sort_unstable_by_key(|child| child.folded);
+        Self {
+            state,
+            repository,
+            children,
+        }
+    }
+
+    /// Whether the purge leaves the entry `name` of `directory`, folding to `folded`: one a child
+    /// [`holds`](Self::holds), or the temporary file a write in progress puts such a child in
+    /// place through. The storage layer names that from the child's extension: `a.txt.~loretemp`
+    /// for `a.txt`, and `a..~loretemp` for `a`, which has none.
+    async fn leaves(
+        &self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        name: &str,
+        folded: u64,
+    ) -> bool {
+        if self.holds(operation, directory, name, name, folded).await {
+            return true;
+        }
+        let Some(written) = name.strip_suffix(TEMP_FILE_EXTENSION) else {
+            return false;
+        };
+        for written in std::iter::once(written).chain(written.strip_suffix('.')) {
+            if self
+                .holds(operation, directory, name, written, hash_string(written))
+                .await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a child holds the entry `name` of `directory`, which stands for the name `written`
+    /// its start spells, folding to `folded`: a child spelled as `written`, or one whose name it
+    /// only folds to unless [`names_the_child`](Self::names_the_child) answers that the entry is
+    /// another one. It is then an entry of its own, as on a file system that does not fold case,
+    /// and the purge removes it beside the child the reset restores.
+    async fn holds(
+        &self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        name: &str,
+        written: &str,
+        folded: u64,
+    ) -> bool {
+        let first = self.children.partition_point(|child| child.folded < folded);
+        let folding = || {
+            self.children[first..]
+                .iter()
+                .take_while(move |child| child.folded == folded)
+        };
+        let exact = hash_string_bytes(written.as_bytes());
+        if folding().any(|child| child.exact == exact) {
+            return true;
+        }
+        let suffix = &name[written.len()..];
+        for child in folding() {
+            if Box::pin(self.names_the_child(operation, directory, name, suffix, child.node)).await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the purge holds the entry `name` of `directory` as the child at `node`, compared
+    /// with the child's name followed by `suffix`, which is how the entry spells past the name it
+    /// stands for: all but where the entry is there and that names another entry. An entry gone at
+    /// the check, as a directory the reset of the child replaces is for a moment, is held, since
+    /// its name may name the child once the reset has written it; so is one that cannot be told
+    /// apart from the child, and one folding to a child whose name the tree cannot read. An
+    /// untracked hard link to the child, under a name that folds to the child's, names the child's
+    /// file and is held too.
+    ///
+    /// A cold path, boxed by its caller: it reads the child's name from the tree.
+    async fn names_the_child(
+        &self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        name: &str,
+        suffix: &str,
+        node: NodeID,
+    ) -> bool {
+        let Ok(mut child) = self
+            .state
+            .node_name_clone(self.repository.clone(), node)
+            .await
+        else {
+            return true;
+        };
+        child.push_str(suffix);
+        !matches!(
+            operation
+                .names_one_entry(&directory.join(name), &directory.join(&child))
+                .await,
+            Ok(Some(false))
+        )
+    }
 }
 
 /// Drain the file work channel and run per-file reset work. Each task

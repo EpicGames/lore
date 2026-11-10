@@ -10,11 +10,16 @@
 //! `remove_dir` and `remove_dir_all`. A backend implements all twenty-five as inherent methods on
 //! its own type.
 //!
-//! Every operation dispatches, including the metadata ones a completion backend will keep on the
+//! Those twenty-five dispatch, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
 //! blocking call, so it buys no parallelism. Routing them anyway is what makes a backend able to
-//! override any operation and a driver instance self-contained, rather than partly bypassed. It
+//! override any of them and a driver instance self-contained, rather than partly bypassed. It
 //! also leaves [`crate::pool`] reachable only from the backends.
+//!
+//! The operations every backend runs the same way go to the psync backend directly, outside the
+//! backend surface, and a backend cannot override them: `write_file_segments_atomic`,
+//! `write_file_segments`, `set_len`, `remove_dir_all_keeping` and `names_one_entry` run on the
+//! syscall pool, and `remove_dir_all_in_background` on a thread of its own.
 //!
 //! There is no trait, and none is needed to make that complete: adding a variant to
 //! [`DriverInner`] makes every match here non-exhaustive, and filling those arms in requires
@@ -461,6 +466,24 @@ impl IoDriver {
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.holds_name_exactly(path).await,
         }
+    }
+
+    /// Whether `to` names the entry `from` does, as another spelling of its name does on a file
+    /// system that folds case: `None` where `from` names nothing, and `false` where `to` names
+    /// nothing or another entry. A path through a file names nothing. One entry is one file,
+    /// symbolic links followed: the same device and inode numbers on Unix, the same volume serial
+    /// number and file ID on Windows. Both paths are read in one job, so the answer is about one
+    /// moment.
+    ///
+    /// Takes the paths by value so a caller building them for the call hands them over rather than
+    /// having them copied. Every backend runs this on the syscall pool, so it goes there directly,
+    /// as [`Self::write_file_segments_atomic`] does.
+    pub async fn names_one_entry(
+        &self,
+        from: impl Into<PathBuf>,
+        to: impl Into<PathBuf>,
+    ) -> std::io::Result<Option<bool>> {
+        PsyncDriver.names_one_entry(from.into(), to.into()).await
     }
 
     pub async fn rename(

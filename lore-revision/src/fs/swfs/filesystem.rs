@@ -30,6 +30,7 @@ use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
+use crate::state::StateError;
 use crate::util::path::RelativePath;
 
 #[error_set]
@@ -179,6 +180,36 @@ impl InstanceOperation for SwfsOperation {
         self.record_written(from);
         self.record_written(to);
         Ok(())
+    }
+
+    /// Both resolve to one node of the served State, which finds a child by any spelling of its
+    /// name, compared by its whole link. A path the State holds no node at names nothing, as does
+    /// every path before the mount serves a State.
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        let resources = self.mount.resources();
+        let Some(state) = resources.current_read_state() else {
+            return Ok(None);
+        };
+        let repository = resources.repository();
+        let node_at = async |path: &RelativePath| match state
+            .find_node_link(repository.clone(), path.as_str())
+            .await
+        {
+            Ok(link) if link.is_valid() => Ok(Some((link.repository, link.node, link.revision))),
+            Ok(_) | Err(StateError::NodeNotFound(_)) => Ok(None),
+            Err(err) => Err(FsError::internal_with_context(
+                err,
+                "finding the node a path names",
+            )),
+        };
+        let Some(from) = node_at(from).await? else {
+            return Ok(None);
+        };
+        Ok(Some(node_at(to).await? == Some(from)))
     }
 
     async fn copy_file(

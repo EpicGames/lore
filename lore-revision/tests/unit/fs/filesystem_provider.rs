@@ -24,6 +24,7 @@ use lore_revision::fs::filesystem_provider::create_empty_directory;
 use lore_revision::fs::filesystem_provider::test_util::CommittedCalls;
 use lore_revision::fs::filesystem_provider::test_util::HoldCalls;
 use lore_revision::fs::filesystem_provider::test_util::StoredCalls;
+use lore_revision::fs::filesystem_provider::test_util::TestIdentity;
 use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
@@ -54,6 +55,9 @@ pub struct TestFilesystemProvider {
     pub failing_scans: Arc<Mutex<Vec<String>>>,
     /// Paths whose scan finds the named node stale.
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
+    /// Paths each recursive removal was asked for.
+    pub removed: Arc<Mutex<Vec<String>>>,
+    identity: TestIdentity,
     begin_fails: bool,
     finalize_fails: bool,
     committed_fails: bool,
@@ -69,6 +73,12 @@ pub struct TestFilesystemProvider {
 impl TestFilesystemProvider {
     pub fn new() -> TestFilesystemProvider {
         Self::default()
+    }
+
+    /// This provider, its operations answering whether two paths name one entry as `identity`
+    /// says.
+    pub fn with_identity(self, identity: TestIdentity) -> TestFilesystemProvider {
+        Self { identity, ..self }
     }
 
     /// A provider that fails to begin an operation, as one whose filesystem will not freeze.
@@ -237,6 +247,8 @@ impl FilesystemProvider for TestFilesystemProvider {
                 hold_refuses: self.hold_refuses,
                 failing_scans: self.failing_scans.clone(),
                 stale_on_scan: self.stale_on_scan.clone(),
+                removed: self.removed.clone(),
+                identity: self.identity,
             }),
             self.holds_state,
         )))

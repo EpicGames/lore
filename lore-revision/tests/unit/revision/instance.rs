@@ -14,6 +14,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_base::types::Hash;
 use lore_revision::branch;
+use lore_revision::branch::merge::MergeError;
 use lore_revision::commit;
 use lore_revision::commit::CommitError;
 use lore_revision::commit::CommitOptions;
@@ -274,6 +275,14 @@ pub(super) async fn revision_state(instance: &Instance, revision: Hash) -> Arc<S
 /// Merges branch `name` into the current one, answering whether the merge committed.
 pub(super) async fn merge_branch(instance: &Instance, name: &str) -> bool {
     let before = current(instance).await;
+    try_merge_branch(instance, name)
+        .await
+        .expect("Failed to merge");
+    current(instance).await != before
+}
+
+/// Merges branch `name` into the current one, answering what the merge answers.
+pub(super) async fn try_merge_branch(instance: &Instance, name: &str) -> Result<Hash, MergeError> {
     let source = branch::resolve(instance.repository.clone(), name)
         .await
         .expect("Failed to resolve the branch to merge")
@@ -291,8 +300,6 @@ pub(super) async fn merge_branch(instance: &Instance, name: &str) -> bool {
         },
     ))
     .await
-    .expect("Failed to merge");
-    current(instance).await != before
 }
 
 /// The names `revision` stores along `path`, which is looked up ignoring case.

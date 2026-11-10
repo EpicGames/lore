@@ -687,12 +687,28 @@ pub trait InstanceOperation: Send + Sync {
     ///
     /// A case change is a move like any other, `from` and `to` differing only in spelling. It is
     /// what the unification is for: a file system holding both spellings side by side leaves two
-    /// entries to merge rather than one to rename.
+    /// entries to merge rather than one to rename. Where `to` names the entry `from` does, as it
+    /// does on a file system that folds case, a refused rename is answered as refused and
+    /// nothing is unified.
     fn rename(
         &self,
         from: &RelativePath,
         to: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
+
+    /// Whether `to` names the entry of the working tree `from` does, as another spelling of its
+    /// name does on a file system that folds case: `None` where `from` names nothing, and `false`
+    /// where `to` names nothing or another entry.
+    ///
+    /// A provider answers from the tree it serves. The OS provider reads the file system's own
+    /// identity of each file, symbolic links followed. A provider serving a tree of its own, as
+    /// FUSE and SWFS do, answers by the entry of that tree each path resolves to, any spelling of a
+    /// name finding it, and a path its tree holds no entry at names nothing.
+    fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> impl Future<Output = Result<Option<bool>, FsError>> + Send;
 
     /// Delete a file or empty directory.
     fn remove(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
@@ -1088,7 +1104,8 @@ impl InstanceOperationImpl {
     /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
     /// keeps each nested repository in it, with the directories leading to one. An SWFS mount
     /// deletes nothing on disk, so there the two are the same, and a virtual clone deletes as
-    /// `remove_recursive` does: its provider tracks no nested repository.
+    /// `remove_recursive` does: its provider tracks no nested repository. Nor does a test
+    /// provider, which records the path as `remove_recursive` does.
     pub async fn remove_recursive_keeping_repositories(
         &self,
         path: &RelativePath,
@@ -1099,7 +1116,7 @@ impl InstanceOperationImpl {
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.remove_recursive(path).await,
             StaticDispatchInstanceOperation::Os(this) => {
                 this.remove_recursive_keeping_repositories(path).await
             }
@@ -1334,11 +1351,26 @@ impl InstanceOperation for InstanceOperationImpl {
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.rename(from, to).await,
             StaticDispatchInstanceOperation::Os(this) => this.rename(from, to).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.rename(from, to).await,
             #[cfg(target_os = "linux")]
             StaticDispatchInstanceOperation::Fuse(this) => this.rename(from, to).await,
+        }
+    }
+
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.names_one_entry(from, to).await,
+            StaticDispatchInstanceOperation::Os(this) => this.names_one_entry(from, to).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.names_one_entry(from, to).await,
+            #[cfg(target_os = "linux")]
+            StaticDispatchInstanceOperation::Fuse(this) => this.names_one_entry(from, to).await,
         }
     }
 
@@ -1379,7 +1411,7 @@ impl InstanceOperation for InstanceOperationImpl {
         self.record_change();
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.remove_recursive(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.remove_recursive(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
             #[cfg(target_os = "linux")]
@@ -1575,8 +1607,9 @@ pub mod test_util {
     /// handed over before the call)`.
     pub type StoredCalls = Arc<Mutex<Vec<(String, Address, u64, u16, bool)>>>;
 
-    /// Answers the reads and the directory create these tests make, and records each finalize,
-    /// `stored` and `committed` call and hold. Every other member panics.
+    /// Answers the reads and the directory create these tests make, refuses each rename, and
+    /// records each finalize, `stored` and `committed` call, hold and recursive removal. Every
+    /// other member panics.
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1606,6 +1639,24 @@ pub mod test_util {
         /// Paths whose scan finds the named node of the tree it walks stale, and queues it for
         /// discarding where it is handed a queue.
         pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
+        /// Paths each recursive removal was asked for, which removes nothing.
+        pub removed: Arc<Mutex<Vec<String>>>,
+        /// How `names_one_entry` answers.
+        pub identity: TestIdentity,
+    }
+
+    /// How a [`TestOperation`] answers `names_one_entry`.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub enum TestIdentity {
+        /// From the paths as spelled, as a file system that does not fold case does.
+        #[default]
+        Exact,
+        /// From the paths folded, as a file system that folds case does.
+        Folded,
+        /// As though `from` names nothing, as a path whose entry is gone does.
+        NamesNothing,
+        /// With an error, as a file system that cannot read what a path names does.
+        Fails,
     }
 
     impl TestOperation {
@@ -1718,8 +1769,12 @@ pub mod test_util {
             })
         }
 
-        async fn read_directory(&self, _path: &RelativePath) -> Result<DirectoryListing, FsError> {
-            panic!("Test operation unimplemented except finalize")
+        /// Lists the directory the provider reads from, and panics where it reads from none.
+        async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
+            match &self.reads {
+                Some(reads) => reads.read_directory(path).await,
+                None => panic!("Test operation reads no directory"),
+            }
         }
 
         /// The file under the directory the provider reads from. Reports no file where the
@@ -1775,8 +1830,23 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
+        /// Refuses the rename, as a file system that cannot carry it does.
         async fn rename(&self, _from: &RelativePath, _to: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
+            Err(FsError::internal("Rename refused"))
+        }
+
+        /// Answers for the paths alone, as [`TestIdentity`] says.
+        async fn names_one_entry(
+            &self,
+            from: &RelativePath,
+            to: &RelativePath,
+        ) -> Result<Option<bool>, FsError> {
+            match self.identity {
+                TestIdentity::Exact => Ok(Some(from.as_str() == to.as_str())),
+                TestIdentity::Folded => Ok(Some(from.as_lowercase_str() == to.as_lowercase_str())),
+                TestIdentity::NamesNothing => Ok(None),
+                TestIdentity::Fails => Err(FsError::internal("The entries cannot be told apart")),
+            }
         }
 
         async fn remove(&self, _path: &RelativePath) -> Result<(), FsError> {
@@ -1787,8 +1857,10 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn remove_recursive(&self, _path: &RelativePath) -> Result<(), FsError> {
-            panic!("Test operation unimplemented except finalize")
+        /// Records the path, removing nothing.
+        async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
+            self.removed.lock().push(path.to_string());
+            Ok(())
         }
 
         async fn write_node(

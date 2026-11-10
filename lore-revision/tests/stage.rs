@@ -1160,17 +1160,6 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// Whether the file system under `dir` holds one case variation of a name and answers
-    /// lookups in any other. A mount can be either on any platform, so a test that needs two
-    /// spellings to be two paths asks rather than assumes.
-    fn case_insensitive(dir: &std::path::Path) -> bool {
-        let probe = dir.join("CaseProbe");
-        std::fs::write(&probe, b"").expect("write probe");
-        let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
-        std::fs::remove_file(&probe).expect("remove probe");
-        insensitive
-    }
-
     /// Committed files under a directory the file system now spells in another case, staged
     /// together under `Keep`: the shared directory is renamed back to the tree's case while it is
     /// pre-created, so the walk of each file has to start from that name and not from the one it

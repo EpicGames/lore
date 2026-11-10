@@ -311,6 +311,33 @@ async fn holds_name_exactly_true_only_for_exact_spelling() {
     .await;
 }
 
+/// Two spellings of one path name its one entry, which the served tree finds by any spelling;
+/// another entry, and a path naming nothing, do not, and a first path naming nothing is answered
+/// as naming nothing.
+#[tokio::test]
+async fn names_one_entry_only_for_spellings_of_one_path() {
+    in_context(async {
+        let m = mounted().await;
+        for (from, to, one) in [
+            ("README.md", "readme.MD", Some(true)),
+            ("dir/sub", "DIR/SUB", Some(true)),
+            ("README.md", "dir/sub/b.txt", Some(false)),
+            ("README.md", "missing", Some(false)),
+            ("missing", "README.md", None),
+        ] {
+            assert_eq!(
+                m.operation
+                    .names_one_entry(&path(from), &path(to))
+                    .await
+                    .expect("an answer"),
+                one,
+                "{from} and {to}"
+            );
+        }
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn names_folding_to_lists_case_variants() {
     in_context(async {

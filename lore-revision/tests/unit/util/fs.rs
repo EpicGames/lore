@@ -14,6 +14,8 @@ use lore_revision::util::fs::*;
 use lore_revision::util::path::DepthPath;
 use lore_revision::util::path::RelativePath;
 
+use crate::helper::case_insensitive;
+
 fn temp_dir() -> lore_base::test_util::TempDir {
     lore_base::test_util::TempDir::new("lore-fs-test-")
 }
@@ -137,19 +139,6 @@ fn depth_paths(paths: &[&str]) -> Vec<DepthPath> {
         .iter()
         .map(|path| DepthPath::new((*path).to_string()))
         .collect()
-}
-
-/// Whether the filesystem under the temporary directory holds one case variation of a name
-/// and answers lookups in any other. Windows and macOS do by default and Linux does not, but a
-/// mount can be either on any of them, so the tests below ask rather than assume — and the
-/// two behaviours are different enough that a test written for one is not a test of the
-/// other.
-fn case_insensitive(dir: &Path) -> bool {
-    let probe = dir.join("CaseProbe");
-    std::fs::write(&probe, b"").expect("write probe");
-    let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
-    std::fs::remove_file(&probe).expect("remove probe");
-    insensitive
 }
 
 /// A variation held beside the spelling asked for does not disturb resolving it. Where the

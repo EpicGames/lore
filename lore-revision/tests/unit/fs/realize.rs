@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use lore_revision::change;
 use lore_revision::change::FileAction;
@@ -9,6 +10,7 @@ use lore_revision::change::NodeChangeState;
 use lore_revision::filter::Filter;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
+use lore_revision::fs::filesystem_provider::test_util::TestIdentity;
 use lore_revision::fs::realize::*;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFileMode;
@@ -17,6 +19,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::sync::SyncError;
+use lore_revision::revision::sync::SyncRealizeStats;
 use lore_revision::state;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
@@ -27,6 +30,9 @@ use lore_revision::util::path::RelativePathBuf;
 use lore_storage::hash;
 use zerocopy::FromZeros;
 
+use crate::fs::filesystem_provider::TestFilesystemProvider;
+use crate::fs::filesystem_provider::test_repository_over;
+use crate::fs::filesystem_provider::test_store_create;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
 use crate::repository::test_helpers::file_node;
@@ -1613,6 +1619,86 @@ async fn sync_continues_after_a_materialization_error() {
             let info = operation.file_info(&path).await.unwrap();
             assert!(info.exists(), "available file {name} was not materialized");
             assert_eq!(info.size(), 0);
+        }
+    }))
+    .await;
+}
+
+/// A move whose rename is refused is realized by writing the node at its destination, which is
+/// removed first unless it names the source's own entry or cannot be told from it. On a file system
+/// that folds case a case-only move's destination is its source, which for a directory holds every
+/// child the move carries; elsewhere it is an entry of its own, removed as any other destination
+/// is. A move that keeps its destination is counted, with the first, for the realize's warning.
+#[tokio::test]
+async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
+    Box::pin(with_execution(async {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Making test stores");
+        let cases = [
+            (TestIdentity::Folded, "dir", &[][..]),
+            (TestIdentity::Exact, "dir", &["dir"][..]),
+            (TestIdentity::Folded, "other", &["other"][..]),
+            (TestIdentity::NamesNothing, "dir", &["dir"][..]),
+            (TestIdentity::Fails, "other", &[][..]),
+        ];
+        for (identity, to, removed) in cases {
+            let filesystem = Arc::new(TestFilesystemProvider::new().with_identity(identity));
+            let repository = test_repository_over(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                filesystem.clone(),
+            );
+            let state = State::new();
+            let node = add_clean(&repository, &state, ROOT_NODE, (directory, "dir")).await;
+            let side = |path: &str| NodeChangeState {
+                mapping: NodeMapping {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                    path: relative(path),
+                    node,
+                },
+                observed: None,
+                flags: NodeFlags::NoFlags,
+                address: Default::default(),
+                mode: 0,
+            };
+            let change = NodeChange {
+                action: FileAction::Move,
+                flags: change::Flags::None,
+                from: side("Dir"),
+                to: side(to),
+            };
+            let stats = Arc::new(SyncRealizeStats::default());
+            let operation = repository.file_system().begin_operation().await.unwrap();
+            realize_changes(
+                repository.clone(),
+                operation,
+                Arc::new(vec![change]),
+                None,
+                false,
+                false,
+                stats.clone(),
+            )
+            .await
+            .expect("a refused rename is realized by writing the node");
+
+            let context = format!("the move of Dir to {to} answered {identity:?}");
+            assert_eq!(filesystem.removed.lock().as_slice(), removed, "{context}");
+            let kept = removed
+                .is_empty()
+                .then(|| ("Dir".to_string(), to.to_string()));
+            assert_eq!(
+                (
+                    stats.kept_moves.count.load(Ordering::Relaxed),
+                    stats
+                        .kept_moves
+                        .first
+                        .get()
+                        .map(|kept| (kept.from.to_string(), kept.to.to_string())),
+                ),
+                (usize::from(kept.is_some()), kept),
+                "{context}"
+            );
         }
     }))
     .await;

@@ -22,6 +22,7 @@ mod case_rename;
 mod diff;
 mod instance;
 mod last_merged;
+mod merge_local_work;
 mod merge_moves;
 mod remote_comparison;
 mod resolve;

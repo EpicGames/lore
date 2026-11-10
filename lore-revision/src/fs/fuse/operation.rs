@@ -1397,6 +1397,23 @@ impl InstanceOperation for FuseOperation {
         written(renamed, ACTION, from)
     }
 
+    /// Both name the same entry of the served tree, which finds a child by any spelling of its
+    /// name: their paths as the State spells them are one.
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        let Some(from) = self.entry_at(from).await?.map(|found| found.spelled) else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.entry_at(to)
+                .await?
+                .is_some_and(|found| found.spelled == from),
+        ))
+    }
+
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
         const ACTION: &str = "removing";
         self.writable(ACTION)?;

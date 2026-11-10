@@ -333,6 +333,21 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn names_one_entry(
+        &self,
+        from: PathBuf,
+        to: PathBuf,
+    ) -> std::io::Result<Option<bool>> {
+        SyscallPool::global()
+            .submit(move || {
+                let Some(from) = entry_identity(&from)? else {
+                    return Ok(None);
+                };
+                Ok(Some(entry_identity(&to)? == Some(from)))
+            })
+            .await
+    }
+
     pub(crate) async fn file_metadata(
         &self,
         file: Arc<File>,
@@ -991,6 +1006,81 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
 #[cfg(not(any(target_os = "linux", target_family = "windows")))]
 fn holds_name_exactly_impl(_path: &std::path::Path) -> Option<bool> {
     None
+}
+
+/// Whether `err`, from reaching what a path names, says it names nothing: no entry is there, or a
+/// file stands where a directory leads to it.
+fn names_nothing(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+/// The device and inode numbers of the file `path` names, symbolic links followed, and `None`
+/// where it names nothing.
+#[cfg(target_family = "unix")]
+fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, u64)>> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(err) if names_nothing(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+/// The volume serial number and file ID of the file `path` names, symbolic links followed, and
+/// `None` where it names nothing, read through a handle opened for its attributes alone.
+///
+/// The 128-bit ID is the one `FileIdInfo` answers with, and where the volume does not answer it,
+/// the 64-bit file index `GetFileInformationByHandle` answers with, which `std` and the `same-file`
+/// crate read a file's identity from.
+#[cfg(target_family = "windows")]
+fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, [u8; 16])>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+
+    let file = match std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if names_nothing(&err) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let mut info = FILE_ID_INFO::default();
+    // SAFETY: the handle is open for the call, and `info` is a `FILE_ID_INFO` of the size passed,
+    // which the call writes.
+    let queried = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileIdInfo,
+            (&raw mut info).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    if queried != 0 {
+        return Ok(Some((info.VolumeSerialNumber, info.FileId.Identifier)));
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open for the call, and `info` is the structure the call writes.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &raw mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let mut identifier = [0u8; 16];
+    identifier[..8].copy_from_slice(&index.to_le_bytes());
+    Ok(Some((u64::from(info.dwVolumeSerialNumber), identifier)))
 }
 
 /// Adds the owner's write permission to the directory `path` names itself, through a handle that
