@@ -170,7 +170,7 @@ Also see: address, BLAKE3, partition.
 
 ### Ignore file
 
-An outbound filter (`.loreignore`) declaring which paths are excluded from staging and committing. It applies only to new content; a file already in the committed revision keeps flowing through until explicitly removed. An instance can add exclusions of its own in `ignore` in its Lore directory, which is never committed.
+An outbound filter (`.loreignore`, and `ignore` in an instance's Lore directory) declaring which untracked paths stay out of staging and committing. A committed or staged file keeps flowing through until explicitly removed. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
 
 Compare to: view filter.
 
@@ -393,7 +393,7 @@ A version control system (VCS) is software that records and manages changes to f
 
 ### View filter
 
-A client-side, glob-based inbound filter (`.lore/view`) declaring which paths are materialized to disk. It's applied on every materialization — clone, sync, branch switch, restore — not only at clone time, and local to an instance so it never travels with a clone. Mechanically close to a Perforce stream view but per-instance; closest Git analog: sparse-checkout.
+A client-side, glob-based inbound filter (`.lore/view`) declaring which paths are materialized to disk. It's applied on every materialization — clone, sync, branch switch, reset — not only at clone time, and local to an instance so it never travels with a clone. Mechanically close to a Perforce stream view but per-instance; closest Git analog: sparse-checkout. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
 
 Compare to: ignore file.
 

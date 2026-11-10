@@ -13,6 +13,7 @@ How-To guides are directions. Each one walks through a specific problem or towar
 - [Run parallel instances over a shared store](run-parallel-instances-over-a-shared-store.md) — Lore's equivalent of worktrees: keep many working trees of a repository over one store, and move, prune, and remove them.
 - [Use virtual clones on Linux](use-virtual-clones-on-linux.md) — clone a repository as a FUSE mount the Lore service serves, get your clones back after the service stops, and move and remove them.
 - [Run a machine server for containers](run-a-machine-server-for-containers.md) — serve the containers of a build machine from one Lore server and one content cache, each container through a socket of its own.
+- [Write view filters and ignore files](write-view-filters-and-ignore-files.md) — choose what reaches your working tree and what you can commit, with one rule syntax.
 
 ## Suggested starting points
 

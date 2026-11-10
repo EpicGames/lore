@@ -1289,6 +1289,9 @@ Views shape what the local cache is asked to hold, what the remote is asked to s
 filesystem-level tools (search, indexing, build systems) see. They are useful well beyond the
 obvious "I only work on this directory" case.
 
+For the rule syntax and worked examples, see
+[Write view filters and ignore files](../how-to/write-view-filters-and-ignore-files.md).
+
 #### 12.3 Ignore files: outbound filtering
 
 An *ignore file* (`.loreignore`) is an outbound filter declaring which paths the user does not
@@ -1297,15 +1300,13 @@ not staged, not committed, and not reported in status. A forced stage or a merge
 such a path; status lists it and the commit takes it. Build artifacts, editor temporary files,
 machine-local configuration: all typical inhabitants.
 
-Ignore is purely about *new* content. A file that is already part of the committed revision
-will keep flowing through inbound operations even if a later ignore rule would exclude it; the
-ignore rule does not retroactively eject committed files. Removing such a file from the
-revision is a separate explicit act.
-
 An instance can add rules of its own in `ignore`, in its Lore directory (`.lore/ignore` for a
 regular instance). They use the syntax of `.loreignore`, apply after its rules and wherever it
 applies, and are never committed, so they suit what only one working tree produces. They can only
 exclude: Lore skips a `!` re-inclusion there with a warning.
+
+An ignore file uses the same rule syntax as a view file; see
+[Write view filters and ignore files](../how-to/write-view-filters-and-ignore-files.md).
 
 #### 12.4 FilterMode: which filter applies when
 
