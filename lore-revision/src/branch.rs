@@ -1303,6 +1303,7 @@ async fn load_local_or_remote(
 /// Stores `hash` as the metadata hash of `branch` in the local mutable store, over whatever the key
 /// holds. Tests only: every other metadata write is a compare-and-swap.
 #[lore_macro::test_pub]
+#[allow(dead_code)]
 async fn mutable_store_metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,

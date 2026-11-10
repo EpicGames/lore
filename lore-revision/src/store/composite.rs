@@ -676,6 +676,7 @@ impl CompositeStore {
     /// The payload writes to the local tier in flight and the bytes they hold, as the gauges
     /// last recorded them.
     #[lore_macro::test_pub]
+    #[allow(dead_code)]
     fn caching(&self) -> (u64, u64) {
         let gauges = &self.instruments.caching;
         (
