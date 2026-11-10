@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import shutil
 
 import pytest
 from lore_parsers import parse_jsonl
@@ -305,17 +306,52 @@ def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, scratch_dir):
             )
 
 
+def _merge_with_no_view(repo: Lore) -> Lore:
+    """A clone of `repo` with no view that merges main into a branch at the
+    feature branch's latest, for a merge under a view to be compared with."""
+    control = repo.clone(branch="feature-branch")
+    control.branch_create("control")
+    control.branch_merge_start("main")
+    return control
+
+
+def _assert_merges_agree(control: Lore, merged: Lore):
+    """The merge `merged` made under a view leaves the tree the merge `control`
+    made with no view leaves."""
+    output = control.revision_diff(
+        merged.branch_info().local_latest, target=control.branch_info().local_latest
+    )
+    differences = [
+        line
+        for line in output.splitlines()
+        if line[:2] in {"A ", "M ", "D ", "V ", "C "}
+    ]
+    assert not differences, (
+        "the merge under the view left a tree other than the merge with no view:\n"
+        + output
+    )
+
+
 def _merge_links_under_view(
-    new_lore_repo, scratch_dir, base_links: list[str], change_links
+    new_lore_repo,
+    scratch_dir,
+    base_links: list[str],
+    change_links,
+    base_files: dict[str, str] | None = None,
+    compare: bool = False,
 ) -> tuple[Lore, Lore]:
     """Merge main into a feature branch of a clone that holds `hidden/` out of
     view, after `change_links(repo, link_repo)` changes the links below `hidden/`
-    on main. `base_links` mount the linked repository in the base, not following
-    branches, so the merge's pass over the links it holds leaves them alone and
-    only the adopted subtree changes them. Returns the clone and the linked
-    repository."""
+    on main. `base_files` join the base, and `base_links` mount the linked
+    repository in it, not following branches, so the merge's pass over the links
+    it holds leaves them alone and only the adopted subtree changes them. With
+    `compare`, the merge is pushed and checked against the same merge with no
+    view. Returns the clone and the linked repository."""
     repo: Lore = new_lore_repo()
-    repo.write_commit_push("base", {"keep.txt": "keep v1\n", "hidden/top.txt": "v1\n"})
+    repo.write_commit_push(
+        "base",
+        {"keep.txt": "keep v1\n", "hidden/top.txt": "v1\n"} | (base_files or {}),
+    )
     link_repo: Lore = new_lore_repo()
     link_repo.write_commit_push("linked v1", {"linked.txt": "linked v1\n"})
     for link_path in base_links:
@@ -335,9 +371,17 @@ def _merge_links_under_view(
     repo.commit("main changes the links inside the out-of-view subtree")
     repo.branch_push()
 
+    control = _merge_with_no_view(repo) if compare else None
     clone.revision_sync()
     clone.branch_switch("feature-branch")
-    clone.branch_merge_start("main")
+    merge_output = clone.branch_merge_start("main")
+    assert "out-of-view subtrees" in merge_output, (
+        "expected the merge to adopt the out-of-view subtree wholesale, "
+        "output was:\n" + merge_output
+    )
+    if control:
+        clone.branch_push()
+        _assert_merges_agree(control, clone)
     return clone, link_repo
 
 
@@ -417,6 +461,63 @@ def test_merge_grafts_a_link_moved_in_an_out_of_view_subtree(
 
 @pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
+def test_merge_grafts_a_directory_replaced_by_a_link_in_an_out_of_view_subtree(
+    new_lore_repo, scratch_dir
+):
+    """A link the merged branch puts in place of a directory inside an adopted
+    out-of-view subtree lands in the merge with its link registry entry, as in a
+    merge with no view."""
+    link_path = "hidden/lib"
+
+    def replace_with_link(repo: Lore, link_repo: Lore):
+        shutil.rmtree(os.path.join(repo.path, link_path))
+        repo.stage(scan=True)
+        repo.commit("main removes the directory")
+        repo.link_add(link_path, link_repo.get_id(), "/", disable_branching=True)
+
+    clone, link_repo = _merge_links_under_view(
+        new_lore_repo,
+        scratch_dir,
+        [],
+        replace_with_link,
+        base_files={f"{link_path}/y.txt": "directory\n"},
+        compare=True,
+    )
+
+    links = _registered_links(clone)
+    assert links == {link_path: link_repo.get_id()}, (
+        f"the link in place of the directory is not registered, the registry holds {links}"
+    )
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+def test_merge_grafts_a_link_replaced_by_a_directory_in_an_out_of_view_subtree(
+    new_lore_repo, scratch_dir
+):
+    """A directory the merged branch puts in place of a link inside an adopted
+    out-of-view subtree lands in the merge, and the link leaves the link registry,
+    as in a merge with no view."""
+    link_path = "hidden/lib"
+
+    def replace_with_directory(repo: Lore, _):
+        repo.link_remove(link_path)
+        repo.commit("main removes the link")
+        repo.write_files({f"{link_path}/z.txt": "directory\n"})
+        repo.stage(f"{link_path}/z.txt")
+
+    clone, _ = _merge_links_under_view(
+        new_lore_repo, scratch_dir, [link_path], replace_with_directory, compare=True
+    )
+
+    links = _registered_links(clone)
+    assert links == {}, (
+        f"the link the directory replaced is still registered, the registry holds {links}"
+    )
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
 def test_merge_grafts_links_inside_an_out_of_view_subtree(new_lore_repo, scratch_dir):
     """Links the other branch remounted, added or re-pinned out of view land as it has them.
 
@@ -488,6 +589,72 @@ def test_merge_grafts_links_inside_an_out_of_view_subtree(new_lore_repo, scratch
                 assert input_file.read() == content, (
                     f"merged {link_path}/{name} should hold main's content"
                 )
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+def test_merge_grafts_a_repinned_link_as_its_pin(new_lore_repo, scratch_dir):
+    """A link the other branch re-pins inside an adopted out-of-view subtree lands at the new
+    pin, as in a merge with no view, and the files the linked repository changes between the
+    two pins leave this repository's own files as they are.
+
+    Each repository numbers its nodes from the same start, so a node the linked repository
+    changes has an ID this repository's tree holds too. Each side holds enough files for the two
+    ranges to overlap.
+    """
+    count = 16
+    pinned: Lore = new_lore_repo()
+    pinned.write_commit_push(
+        "Pin one",
+        {f"f{index:02}.txt": f"linked {index} one\n" for index in range(count)},
+    )
+    pin_one = pinned.branch_info().local_latest
+    pinned.write_commit_push(
+        "Pin two",
+        {f"f{index:02}.txt": f"linked {index} two\n" for index in range(count)},
+    )
+    pin_two = pinned.branch_info().local_latest
+
+    own = {f"hidden/f{index:02}.txt": f"own {index}\n" for index in range(count)}
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"keep.txt": "v1\n"} | own)
+    repo.link_add(
+        "hidden/pinned", pinned.get_id(), "/", pin=pin_one, disable_branching=True
+    )
+    repo.commit("A pinned link inside the out-of-view subtree")
+    repo.branch_push()
+
+    clone = repo.clone(view=_write_view_filter(scratch_dir, "/hidden\n"))
+    clone.branch_create("feature-branch")
+    clone.write_commit_push("feature changes the in-view file", {"keep.txt": "v2\n"})
+    clone.branch_switch("main")
+
+    repo.link_update("hidden/pinned", pin=pin_two)
+    repo.commit("main re-pins the link out of view")
+    repo.branch_push()
+
+    control = _merge_with_no_view(repo)
+    clone.revision_sync()
+    clone.branch_switch("feature-branch")
+    merge_output = clone.branch_merge_start("main")
+    assert "out-of-view subtrees" in merge_output, (
+        "expected the merge to adopt the out-of-view subtree wholesale, "
+        "output was:\n" + merge_output
+    )
+    clone.branch_push()
+    _assert_merges_agree(control, clone)
+
+    verify = repo.clone(branch="feature-branch")
+    for path, content in own.items():
+        with verify.open_file(path) as input_file:
+            assert input_file.read() == content, (
+                f"the merge changed {path}, which neither branch changed"
+            )
+    for index in range(count):
+        with verify.open_file(f"hidden/pinned/f{index:02}.txt") as input_file:
+            assert input_file.read() == f"linked {index} two\n", (
+                f"the merged link should expose main's pin at f{index:02}.txt"
+            )
 
 
 @pytest.mark.smoke

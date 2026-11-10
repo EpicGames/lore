@@ -8,22 +8,33 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::Hash;
 use lore_revision::MAX_CONCURRENT_TREE_TASKS;
 use lore_revision::change;
 use lore_revision::change::NodeChangeState;
 use lore_revision::filter::Filter;
 use lore_revision::filter::FilterMode;
 use lore_revision::filter::FilterStates;
+use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::NodeID;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::ChangeStream;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
 use lore_revision::state::diff::*;
 use lore_revision::util::path::RelativePath;
+use lore_storage::hash::hash_slice;
+use lore_storage::hash::hash_string;
 use tokio::sync::Semaphore;
+
+use crate::helper::in_memory;
+use crate::helper::test_store_create;
 
 /// A filter that excludes `x` and re-includes under it, so a query against it steps
 /// to a verdict no root state matches and still descends.
@@ -500,6 +511,157 @@ async fn a_walk_holds_each_subtree_once() {
                 size_of_val(&walk) < pending + size_of::<PendingSubtree>(),
                 "the walk holds {} bytes, the queue loop {pending}",
                 size_of_val(&walk)
+            );
+        })
+        .await;
+}
+
+/// A link named `name` mounting the node `child` of revision `revision` of repository `target`.
+fn link_node(name: &str, target: RepositoryId, revision: Hash, child: NodeID) -> Node {
+    Node {
+        flags: NodeFlags::Link.bits(),
+        mode: 0o755,
+        name_hash: hash_string(name),
+        child,
+        address: Address {
+            hash: revision,
+            context: target.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// The changes a walk between the roots of `from` and `to` emits with `extra`, as the action
+/// letter and the path of each, sorted.
+async fn walk_flagged(
+    repository: &Arc<RepositoryContext>,
+    from: &Arc<State>,
+    to: &Arc<State>,
+    extra: DiffFlags,
+) -> Vec<(String, String)> {
+    let root = |state: &Arc<State>| NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path: RelativePath::new(),
+            node: ROOT_NODE,
+        },
+        observed: None,
+        flags: NodeFlags::NoFlags,
+        address: Address::default(),
+        mode: 0,
+    };
+    let (from, to) = (root(from), root(to));
+    let mut walk = ChangeStream::spawn(async move |changes| {
+        diff_subtree_flagged(
+            from,
+            to,
+            RelativePath::new(),
+            None,
+            extra,
+            &changes,
+            FilterMode::empty(),
+        )
+        .await
+    });
+    let mut emitted = Vec::new();
+    while let Some(change) = walk.next().await {
+        emitted.push((
+            change.action.as_string_short().to_string(),
+            change.path().as_str().to_string(),
+        ));
+    }
+    walk.finish().await.expect("a walk of the two states");
+    emitted.sort();
+    emitted
+}
+
+/// A walk leaving link pins to the link registry neither descends into nor reports a link that
+/// pins another revision of the subtree it mounts, and reports a link that mounts another subtree
+/// as the link. A walk that descends reports what the two pins hold differently instead.
+#[tokio::test]
+async fn a_walk_leaving_link_pins_reports_a_link_only_where_its_mount_changes() {
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let repository = in_memory::repository(immutable, mutable);
+            let target_id: RepositoryId = Context::from(uuid::Uuid::now_v7()).into();
+            let target = repository.to_link_context(target_id).await;
+            let target_branch = in_memory::branch_id();
+            let state = State::new();
+            let sub = in_memory::add(
+                &state,
+                target.clone(),
+                ROOT_NODE,
+                in_memory::directory("sub"),
+                "sub",
+            )
+            .await;
+            in_memory::add(
+                &state,
+                target.clone(),
+                sub,
+                in_memory::file("inner.bin"),
+                "inner.bin",
+            )
+            .await;
+            let outer = in_memory::add(
+                &state,
+                target.clone(),
+                ROOT_NODE,
+                in_memory::file("outer.bin"),
+                "outer.bin",
+            )
+            .await;
+            let first = in_memory::commit(&target, &state, Hash::default(), target_branch).await;
+            let state = in_memory::revision_state(&target, first).await;
+            in_memory::modify(
+                &state,
+                &target,
+                outer,
+                Address::zero_context_hash(hash_slice(b"second")),
+                NodeFlags::StagedModify,
+            )
+            .await;
+            let second = in_memory::commit(&target, &state, first, target_branch).await;
+            let sub_in_second = in_memory::revision_state(&target, second)
+                .await
+                .find_node_link(target.clone(), "sub")
+                .await
+                .expect("the second revision holds sub")
+                .node;
+
+            let parent = async |mounts: [(Hash, NodeID); 2]| {
+                let state = State::new();
+                for (name, (revision, child)) in ["pinned", "remounted"].into_iter().zip(mounts) {
+                    in_memory::add(
+                        &state,
+                        repository.clone(),
+                        ROOT_NODE,
+                        link_node(name, target_id, revision, child),
+                        name,
+                    )
+                    .await;
+                }
+                let revision =
+                    in_memory::commit(&repository, &state, Hash::default(), in_memory::branch_id())
+                        .await;
+                in_memory::revision_state(&repository, revision).await
+            };
+            let from = parent([(first, ROOT_NODE), (first, ROOT_NODE)]).await;
+            let to = parent([(second, ROOT_NODE), (second, sub_in_second)]).await;
+
+            assert_eq!(
+                walk_flagged(&repository, &from, &to, DiffFlags::LeavesLinkPins).await,
+                vec![("M".to_string(), "remounted".to_string())],
+                "a pin moved under the same mount is the link registry's to report"
+            );
+            let descended = walk_flagged(&repository, &from, &to, DiffFlags::empty()).await;
+            assert!(
+                descended.contains(&("M".to_string(), "pinned/outer.bin".to_string()))
+                    && descended.contains(&("M".to_string(), "remounted".to_string())),
+                "a walk that descends reports the file the two pins hold differently: \
+                 {descended:?}"
             );
         })
         .await;

@@ -184,6 +184,10 @@ bitflags! {
         /// parent and the name it was listed with, and the from side is listed with its staged
         /// deletes, which a name the to side holds again pairs with.
         const FilesystemTo = 0b100;
+        /// The walk leaves link pins to the link registry: a link it would descend, one the
+        /// caller can read that mounts the same subtree of the same repository on both
+        /// sides, is neither descended nor reported.
+        const LeavesLinkPins = 0b1000;
     }
 }
 
@@ -310,7 +314,8 @@ pub fn diff_subtree(
 }
 
 /// [`diff_subtree`] with `extra` joined to the flags the sides derive.
-fn diff_subtree_flagged(
+#[lore_macro::test_pub]
+pub(crate) fn diff_subtree_flagged(
     from: NodeChangeState,
     to: NodeChangeState,
     path: RelativePath,
@@ -1666,6 +1671,8 @@ async fn add_change_for_paired_nodes(
                             filter_mode,
                         )
                         .await?;
+                    } else if flags.contains(DiffFlags::LeavesLinkPins) {
+                        lore_debug!("Diff node {subpath} pin left to the link registry");
                     } else {
                         lore_debug!("Diff node {subpath} has linked changes, recurse diff");
                         dispatch_subtree_diff(

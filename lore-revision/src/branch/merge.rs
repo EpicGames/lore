@@ -2206,7 +2206,7 @@ async fn graft_add_node(
     Ok(node_id)
 }
 
-/// Move the staged node at `from_path` to the path `change` adopts and point it at
+/// Move the staged node `change` moves to the path it adopts and point it at
 /// source's content, staged as a per-file merge stages a move: relinked with
 /// `StagedMove` and `StagedMerge`, and the new ancestors staged by
 /// [`graft_stage_ancestors`]. The overwrite before the relink marks the old
@@ -2215,32 +2215,22 @@ async fn graft_move_node(
     repository: Arc<RepositoryContext>,
     state_staged: Arc<State>,
     change: &NodeChange,
-    from_path: &RelativePath,
     source_node: &Node,
 ) -> Result<NodeID, MergeError> {
-    let from = state_staged
-        .find_node_link(repository.clone(), from_path.as_str())
-        .await
-        .forward::<MergeError>("resolving adopted move source")?;
-    graft_overwrite_node(
-        repository.clone(),
-        state_staged.clone(),
-        from.node,
-        source_node,
-    )
-    .await?;
+    let from = change.from.mapping.node;
+    graft_overwrite_node(repository.clone(), state_staged.clone(), from, source_node).await?;
     let parent = crate::fs::realize::relink_moved_node(
         &state_staged,
         &repository,
-        from_path,
-        from.node,
+        &change.from.mapping.path,
+        from,
         change.path(),
         true,
     )
     .await
     .forward::<MergeError>("relinking adopted move")?;
     graft_stage_ancestors(repository, state_staged, parent).await?;
-    Ok(from.node)
+    Ok(from)
 }
 
 /// Drop each link the reconcile deletes from the staged link registry, as a
@@ -2279,7 +2269,15 @@ async fn graft_unregister_deleted_links(
 ///
 /// An add and a delete of one file pair into a move by
 /// [`state::detect_and_coalesce_moves`], as the diff of a merge with no view pairs
-/// them.
+/// them. An add creates its node: a type change is a delete and an add at one path,
+/// so the add sits beside the node of the other kind, which the delete stages for
+/// delete, as staging a type change does. Every other change acts on the staged node
+/// the walk reports it for, since after a type change its path resolves to the added
+/// node.
+///
+/// A link is reconciled as a node and never descended. One that pins another
+/// revision of the same subtree is left to the merge's pass over the link pins, as
+/// in a merge with no view.
 async fn apply_graft_copy(
     repository: Arc<RepositoryContext>,
     state_staged: Arc<State>,
@@ -2297,19 +2295,17 @@ async fn apply_graft_copy(
     // pairs children by name and stops at a directory whose address already
     // matches, so the result is proportional to the difference rather than to
     // the size of the subtree. No oracle here, because this walk has to descend.
-    let repository_staged = repository.clone();
-    let state_staged_diff = state_staged.clone();
-    let repository_to = change.to.mapping.repository.clone();
-    let state_to = change.to.mapping.state.clone();
     let path = change.path().clone();
+    let staged =
+        state::node_change_state(&repository, &state_staged, link.node, path.clone()).await;
+    let source = change.to.clone();
     let mut changes = state::ChangeStream::spawn(async move |changes| {
-        state::diff(
-            repository_staged,
-            state_staged_diff,
-            repository_to,
-            state_to,
-            Some(path),
+        state::diff_subtree_flagged(
+            staged,
+            source,
+            path,
             None,
+            state::DiffFlags::LeavesLinkPins,
             &changes,
             FilterMode::empty(),
         )
@@ -2341,41 +2337,34 @@ async fn apply_graft_copy(
             .await
             .forward::<MergeError>("resolving adopted node")?;
 
-        let staged_id = if let Some(from_path) = adopted.move_source() {
+        let staged_id = if adopted.move_source().is_some() {
             counts.moved += 1;
             graft_move_node(
                 repository.clone(),
                 state_staged.clone(),
                 adopted,
-                from_path,
+                &source_node,
+            )
+            .await?
+        } else if adopted.action == FileAction::Add {
+            counts.added += 1;
+            graft_add_node(
+                repository.clone(),
+                state_staged.clone(),
+                adopted.path(),
                 &source_node,
             )
             .await?
         } else {
-            let staged = state_staged
-                .find_node_link(repository.clone(), adopted.path().as_str())
-                .await
-                .unwrap_or(NodeLink::invalid());
-            if staged.is_valid_or_root() {
-                graft_overwrite_node(
-                    repository.clone(),
-                    state_staged.clone(),
-                    staged.node,
-                    &source_node,
-                )
-                .await?;
-                counts.overwritten += 1;
-                staged.node
-            } else {
-                counts.added += 1;
-                graft_add_node(
-                    repository.clone(),
-                    state_staged.clone(),
-                    adopted.path(),
-                    &source_node,
-                )
-                .await?
-            }
+            graft_overwrite_node(
+                repository.clone(),
+                state_staged.clone(),
+                adopted.from.mapping.node,
+                &source_node,
+            )
+            .await?;
+            counts.overwritten += 1;
+            adopted.from.mapping.node
         };
 
         if source_node.is_link() {
@@ -2405,17 +2394,10 @@ async fn apply_graft_copy(
         if adopted.action != FileAction::Delete {
             continue;
         }
-        let staged = state_staged
-            .find_node_link(repository.clone(), adopted.path().as_str())
-            .await
-            .unwrap_or(NodeLink::invalid());
-        if !staged.is_valid_or_root() {
-            continue;
-        }
         state_staged
             .node_mark(
                 &repository,
-                staged.node,
+                adopted.from.mapping.node,
                 Mark::staged(NodeFlags::StagedDelete | NodeFlags::StagedMerge, true),
             )
             .await

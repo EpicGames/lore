@@ -35,10 +35,12 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use bytes::Bytes;
+pub(crate) use diff::DiffFlags;
 pub use diff::DiffWalkStats;
 pub use diff::GraftOracle;
 #[cfg(target_os = "linux")]
 pub(crate) use diff::diff_states_into;
+pub(crate) use diff::diff_subtree_flagged;
 use futures::future::Either;
 use lore_base::error::InvalidPath;
 use lore_base::lore_drain_tasks;

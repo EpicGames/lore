@@ -213,6 +213,100 @@ mod tests {
             .expect("Failed to stage move");
         }
 
+        /// Stage at `path` an empty link to a repository of its own, not following branches, so
+        /// that the next stage takes the files the working tree holds below `path` into the
+        /// linked repository, as staging below a link's mount does. The rest of the working tree
+        /// is staged first, with `path` set aside, so the staged tree holds the parent of `path`.
+        async fn stage_link(&self, path: &str) {
+            let mount = self.repo_path.join(path);
+            let aside = TempDir::new("diff3-link-mount-");
+            std::fs::rename(&mount, aside.child("mount")).expect("Failed to set the mount aside");
+            self.stage_all().await;
+
+            let repository = &self.repository;
+            let linked_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let linked = repository.to_link_context(linked_id).await;
+            let linked_tree = state::State::new();
+            linked_tree.set_revision_number(1);
+            let pin = linked_tree
+                .serialize(linked, &self.write_token)
+                .await
+                .expect("Failed to serialize the linked tree");
+
+            let (current, staged, _) =
+                state::State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Failed to read the staged tree");
+            let staged = staged.unwrap_or_else(|| {
+                current.set_parent_self(current.revision());
+                current
+            });
+            let (parent, name) = path.rsplit_once('/').expect("a link below a directory");
+            let parent = staged
+                .find_node_link(repository.clone(), parent)
+                .await
+                .expect("the staged tree holds the link's parent")
+                .node;
+            let link = staged
+                .node_add(
+                    repository.clone(),
+                    parent,
+                    lore_revision::node::Node {
+                        flags: NodeFlags::Link.bits(),
+                        name_hash: lore_storage::hash::hash_string(name),
+                        child: lore_revision::node::ROOT_NODE,
+                        address: lore_base::types::Address {
+                            hash: pin,
+                            context: linked_id.into(),
+                        },
+                        ..Default::default()
+                    },
+                    name,
+                )
+                .await
+                .expect("Failed to add the link");
+            staged
+                .node_mark(
+                    repository,
+                    link,
+                    state::Mark::staged(NodeFlags::StagedAdd, true),
+                )
+                .await
+                .expect("Failed to stage the link");
+            staged
+                .link_add(
+                    repository.clone(),
+                    linked_id,
+                    BranchId::default(),
+                    pin,
+                    link,
+                    lore_revision::link::LinkFlags::DisableAutoFollow,
+                )
+                .await
+                .expect("Failed to register the link");
+            let signature = staged
+                .serialize(repository.clone(), &self.write_token)
+                .await
+                .expect("Failed to serialize the staged tree");
+            lore_revision::instance::store_staged_anchor(repository, signature)
+                .await
+                .expect("Failed to store the staged anchor");
+
+            std::fs::rename(aside.child("mount"), &mount).expect("Failed to restore the mount");
+        }
+
+        /// Remove the link at `path`, with its mount, as `lore link remove` does.
+        async fn unlink(&self, path: &str) {
+            lore_revision::link::remove::remove_boxed(
+                self.repository.clone(),
+                &self.write_token,
+                lore_revision::util::path::RelativePath::new_from_initial_path(path)
+                    .expect("a link path"),
+            )
+            .await
+            .expect("Failed to remove the link");
+        }
+
         /// Create a branch starting from the current revision and
         /// switch to it. Returns the new branch ID.
         async fn create_branch(&self, name: &str) -> BranchId {
@@ -980,6 +1074,39 @@ mod tests {
         directories
     }
 
+    /// The directories [`directory_hashes`] lists below `engine/`.
+    async fn engine_directory_hashes(
+        fixture: &DiffFixture,
+        revision: Hash,
+    ) -> Vec<(String, Hash, u64)> {
+        let mut directories = directory_hashes(fixture, revision).await;
+        directories.retain(|(path, _, _)| path.starts_with("engine/"));
+        directories
+    }
+
+    /// The path of each link the link registry of `revision` holds, in path order.
+    async fn link_paths(fixture: &DiffFixture, revision: Hash) -> Vec<String> {
+        let repository = &fixture.repository;
+        let state = state::State::deserialize(repository.clone(), revision)
+            .await
+            .expect("Failed to read the revision");
+        let mut paths = Vec::new();
+        for link in state
+            .link_list(repository.clone())
+            .await
+            .expect("Failed to read the link registry")
+        {
+            paths.push(
+                state
+                    .node_path(repository.clone(), link.local_node)
+                    .await
+                    .expect("Failed to read a link path"),
+            );
+        }
+        paths.sort_unstable();
+        paths
+    }
+
     /// The changes the delta of `revision` records, in path order, as the path, the
     /// `FileAction` number and the change flags. A deleted node's path is read from
     /// the first parent, the tree that holds it.
@@ -1068,6 +1195,11 @@ mod tests {
         Move(&'static str, &'static str),
         /// Create an empty directory.
         MakeDirectory(&'static str),
+        /// Make the directory the working tree holds at the path a link's mount
+        /// ([`DiffFixture::stage_link`]).
+        Link(&'static str),
+        /// Remove the link at the path ([`DiffFixture::unlink`]).
+        Unlink(&'static str),
         /// Commit what main holds so far.
         Commit,
     }
@@ -1117,18 +1249,22 @@ mod tests {
     /// Build the history an adoption test merges, and leave `feature` current with
     /// its working tree restored.
     ///
-    /// The base holds `game/a.txt` and `base`. `feature` changes the in-view
-    /// `game/a.txt` only, so `engine/` matches the base and qualifies for
-    /// adoption, and `control` starts at the same revision for the merge with no
-    /// view. main makes `edits`.
+    /// The base holds `game/a.txt` and `base`, with a link at each of `base_links` mounting
+    /// the files of `base` below it. `feature` changes the in-view `game/a.txt` only, so
+    /// `engine/` matches the base and qualifies for adoption, and `control` starts at the same
+    /// revision for the merge with no view. main makes `edits`.
     async fn reshape_engine(
         fixture: &DiffFixture,
         base: &'static [(&'static str, &'static [u8])],
+        base_links: &[&str],
         edits: &[Edit],
     ) -> ReshapedEngine {
         fixture.write_file("game/a.txt", b"base\n");
         for (path, content) in base {
             fixture.write_file(path, content);
+        }
+        for path in base_links {
+            fixture.stage_link(path).await;
         }
         let base_revision = fixture.stage_and_commit("base").await;
         let main_branch = fixture.main_branch_id;
@@ -1153,6 +1289,8 @@ mod tests {
                     std::fs::create_dir_all(fixture.repo_path.join(path))
                         .expect("Failed to create a directory");
                 }
+                Edit::Link(path) => fixture.stage_link(path).await,
+                Edit::Unlink(path) => fixture.unlink(path).await,
                 Edit::Commit => {
                     fixture
                         .stage_and_commit("main reshapes engine in steps")
@@ -1232,7 +1370,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
                 for no_commit in [false, true] {
                     let fixture = DiffFixture::new().await;
-                    let reshaped = reshape_engine(&fixture, ENGINE_BASE, ENGINE_EDITS).await;
+                    let reshaped = reshape_engine(&fixture, ENGINE_BASE, &[], ENGINE_EDITS).await;
                     let view_repo = engine_excluded_context(&fixture);
                     let mut merged_rev = Box::pin(merge_main_under_view(
                         &view_repo,
@@ -1321,6 +1459,7 @@ mod tests {
                 let reshaped = reshape_engine(
                     &fixture,
                     &[("x.txt", b"x\n"), ("engine/keep.txt", b"keep\n")],
+                    &[],
                     &[Edit::Move("x.txt", "engine/x.txt")],
                 )
                 .await;
@@ -1384,6 +1523,7 @@ mod tests {
                 let reshaped = reshape_engine(
                     &fixture,
                     &[("engine/a/x.txt", b"x\n"), ("engine/a/y.txt", b"y\n")],
+                    &[],
                     &[
                         Edit::Move("engine/a/x.txt", "engine/x.txt"),
                         Edit::Write("engine/a/restage.txt", b"restage\n"),
@@ -1405,15 +1545,9 @@ mod tests {
                     .await
                     .expect("Failed to read the merged revision");
                 let [_, main_rev] = merged.parents();
-                let engine = |directories: Vec<(String, Hash, u64)>| -> Vec<(String, Hash, u64)> {
-                    directories
-                        .into_iter()
-                        .filter(|(path, _, _)| path.starts_with("engine/"))
-                        .collect()
-                };
                 assert_eq!(
-                    engine(directory_hashes(&fixture, merged_rev).await),
-                    engine(directory_hashes(&fixture, main_rev).await),
+                    engine_directory_hashes(&fixture, merged_rev).await,
+                    engine_directory_hashes(&fixture, main_rev).await,
                     "the merge under the view left engine/ other than main holds it",
                 );
                 let delta = delta_changes(&fixture, merged_rev).await;
@@ -1422,6 +1556,258 @@ mod tests {
                     vec![FileAction::Move as u16],
                     "the merge under the view has to record the move, delta {delta:?}",
                 );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A file main replaces with a directory inside an adopted subtree, or a directory it
+    /// replaces with a file, reaches the merge as main holds it, a directory holding
+    /// subdirectories included. The feature branch never touched `engine/`, so the merge leaves
+    /// it as main holds it, as the merge with no view does, and records the type change in the
+    /// delta as that merge does.
+    #[tokio::test]
+    async fn a_type_change_in_an_adopted_subtree_reaches_the_merge() {
+        const FILE: &[(&str, &[u8])] =
+            &[("engine/keep.txt", b"keep\n"), ("engine/thing", b"file\n")];
+        const DIRECTORY: &[(&str, &[u8])] = &[
+            ("engine/keep.txt", b"keep\n"),
+            ("engine/thing/a.txt", b"directory\n"),
+        ];
+        const NESTED: &[(&str, &[u8])] = &[
+            ("engine/keep.txt", b"keep\n"),
+            ("engine/thing/a.txt", b"directory\n"),
+            ("engine/thing/sub/b.txt", b"sub\n"),
+            ("engine/thing/sub/deeper/c.txt", b"deeper\n"),
+        ];
+        const TO_DIRECTORY: &[Edit] = &[
+            Edit::Delete("engine/thing"),
+            Edit::Write("engine/thing/a.txt", b"directory\n"),
+        ];
+        const TO_FILE: &[Edit] = &[
+            Edit::DeleteDirectory("engine/thing"),
+            Edit::Write("engine/thing", b"file\n"),
+        ];
+
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                for (case, base, edits, to_directory) in [
+                    ("a file to a directory", FILE, TO_DIRECTORY, true),
+                    ("a directory to a file", DIRECTORY, TO_FILE, false),
+                    ("nested directories to a file", NESTED, TO_FILE, false),
+                ] {
+                    let fixture = DiffFixture::new().await;
+                    let reshaped = reshape_engine(&fixture, base, &[], edits).await;
+                    let merged_rev = Box::pin(merge_main_under_view(
+                        &engine_excluded_context(&fixture),
+                        &fixture,
+                        reshaped.main_branch,
+                        "merge main",
+                        false,
+                    ))
+                    .await;
+
+                    let repository = fixture.repository.clone();
+                    let merged = state::State::deserialize(repository.clone(), merged_rev)
+                        .await
+                        .expect("Failed to read the merged revision");
+                    let thing = merged
+                        .find_node(repository.clone(), "engine/thing")
+                        .await
+                        .expect("the merge holds engine/thing");
+                    assert_eq!(
+                        thing.is_directory(),
+                        to_directory,
+                        "the merge under the view has to hold engine/thing as main does, \
+                         {case}",
+                    );
+                    let leaked = test_leaked_slots(&merged, &repository).await;
+                    assert!(
+                        leaked.is_empty(),
+                        "the merge under the view, {case}, leaked {leaked:?}"
+                    );
+                    let [_, main_rev] = merged.parents();
+                    assert_eq!(
+                        engine_directory_hashes(&fixture, merged_rev).await,
+                        engine_directory_hashes(&fixture, main_rev).await,
+                        "the merge under the view left engine/ other than main holds it, \
+                         {case}",
+                    );
+
+                    let control_rev = merge_main_into_control(&fixture, &reshaped).await;
+                    assert_eq!(
+                        directory_hashes(&fixture, merged_rev).await,
+                        directory_hashes(&fixture, control_rev).await,
+                        "the merge under the view, {case}, left \
+                         directories the merge with no view does not",
+                    );
+                    assert_eq!(
+                        delta_changes(&fixture, merged_rev).await,
+                        delta_changes(&fixture, control_rev).await,
+                        "the merge under the view, {case}, recorded a \
+                         delta the merge with no view does not",
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A link main replaces with a directory inside an adopted subtree, or a directory it replaces
+    /// with a link, reaches the merge as main holds it: the node at the path is of main's kind,
+    /// the link registry names the links main's does, and the merge leaves `engine/` as main
+    /// holds it.
+    #[tokio::test]
+    async fn a_link_replaced_by_a_directory_or_the_reverse_in_an_adopted_subtree() {
+        const BASE: &[(&str, &[u8])] =
+            &[("engine/keep.txt", b"keep\n"), ("engine/lib/y.txt", b"y\n")];
+        const TO_DIRECTORY: &[Edit] = &[
+            Edit::Unlink("engine/lib"),
+            Edit::Commit,
+            Edit::Write("engine/lib/z.txt", b"directory\n"),
+        ];
+        const TO_LINK: &[Edit] = &[
+            Edit::DeleteDirectory("engine/lib"),
+            Edit::Commit,
+            Edit::Write("engine/lib/z.txt", b"linked\n"),
+            Edit::Link("engine/lib"),
+        ];
+
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                for (case, base_links, edits, to_link) in [
+                    (
+                        "a link to a directory",
+                        &["engine/lib"][..],
+                        TO_DIRECTORY,
+                        false,
+                    ),
+                    ("a directory to a link", &[][..], TO_LINK, true),
+                ] {
+                    let fixture = DiffFixture::new().await;
+                    let reshaped = reshape_engine(&fixture, BASE, base_links, edits).await;
+                    let merged_rev = Box::pin(merge_main_under_view(
+                        &engine_excluded_context(&fixture),
+                        &fixture,
+                        reshaped.main_branch,
+                        "merge main",
+                        false,
+                    ))
+                    .await;
+
+                    let repository = fixture.repository.clone();
+                    let merged = state::State::deserialize(repository.clone(), merged_rev)
+                        .await
+                        .expect("Failed to read the merged revision");
+                    let lib = merged
+                        .find_node(repository.clone(), "engine/lib")
+                        .await
+                        .expect("the merge holds engine/lib");
+                    assert_eq!(
+                        lib.is_link(),
+                        to_link,
+                        "the merge under the view has to hold engine/lib as main does, {case}",
+                    );
+                    let leaked = test_leaked_slots(&merged, &repository).await;
+                    assert!(leaked.is_empty(), "the merge, {case}, leaked {leaked:?}");
+                    let [_, main_rev] = merged.parents();
+                    assert_eq!(
+                        engine_directory_hashes(&fixture, merged_rev).await,
+                        engine_directory_hashes(&fixture, main_rev).await,
+                        "the merge under the view left engine/ other than main holds it, {case}",
+                    );
+                    assert_eq!(
+                        link_paths(&fixture, merged_rev).await,
+                        link_paths(&fixture, main_rev).await,
+                        "the merge under the view registers other links than main, {case}",
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A file main moves across a type change inside an adopted subtree keeps its identity: into
+    /// the directory that replaces it, or up to replace the directory holding it. The reconcile
+    /// pairs the file's delete and add into a move, from or to the path the type change takes, and
+    /// the merge leaves `engine/` as main holds it and records the move, beside the delete of the
+    /// directory the file replaces.
+    #[tokio::test]
+    async fn a_file_moved_across_a_type_change_in_an_adopted_subtree() {
+        const INTO_BASE: &[(&str, &[u8])] =
+            &[("engine/keep.txt", b"keep\n"), ("engine/thing", b"file\n")];
+        const INTO: &[Edit] = &[
+            Edit::Move("engine/thing", "engine/moving"),
+            Edit::Commit,
+            Edit::Move("engine/moving", "engine/thing/a.txt"),
+        ];
+        const UP_BASE: &[(&str, &[u8])] = &[
+            ("engine/keep.txt", b"keep\n"),
+            ("engine/thing/a.txt", b"moved\n"),
+            ("engine/thing/b.txt", b"stays\n"),
+        ];
+        const UP: &[Edit] = &[
+            Edit::Move("engine/thing/a.txt", "engine/moving"),
+            Edit::Commit,
+            Edit::DeleteDirectory("engine/thing"),
+            Edit::Move("engine/moving", "engine/thing"),
+        ];
+        const MOVE: u16 = FileAction::Move as u16;
+        const DELETE: u16 = FileAction::Delete as u16;
+
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                for (case, base, edits, moved, recorded) in [
+                    (
+                        "into the directory replacing it",
+                        INTO_BASE,
+                        INTO,
+                        "engine/thing/a.txt",
+                        &[MOVE][..],
+                    ),
+                    (
+                        "up to replace the directory holding it",
+                        UP_BASE,
+                        UP,
+                        "engine/thing",
+                        &[DELETE, MOVE][..],
+                    ),
+                ] {
+                    let fixture = DiffFixture::new().await;
+                    let reshaped = reshape_engine(&fixture, base, &[], edits).await;
+                    let merged_rev = Box::pin(merge_main_under_view(
+                        &engine_excluded_context(&fixture),
+                        &fixture,
+                        reshaped.main_branch,
+                        "merge main",
+                        false,
+                    ))
+                    .await;
+
+                    let merged = state::State::deserialize(fixture.repository.clone(), merged_rev)
+                        .await
+                        .expect("Failed to read the merged revision");
+                    let [_, main_rev] = merged.parents();
+                    assert_eq!(
+                        engine_directory_hashes(&fixture, merged_rev).await,
+                        engine_directory_hashes(&fixture, main_rev).await,
+                        "the merge under the view left engine/ other than main holds it, {case}",
+                    );
+                    let leaked = test_leaked_slots(&merged, &fixture.repository).await;
+                    assert!(leaked.is_empty(), "the merge, {case}, leaked {leaked:?}");
+                    let delta = delta_changes(&fixture, merged_rev).await;
+                    assert_eq!(
+                        recorded_actions(&delta, moved),
+                        recorded,
+                        "the merge under the view has to record the move, {case}, delta {delta:?}",
+                    );
+                }
             }))
             .await
             .expect("Test task failed");
