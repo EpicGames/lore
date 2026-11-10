@@ -1446,16 +1446,16 @@ async fn try_fast_forward_merge(
                 ))
             })?;
 
-        // Apply the non-conflicting changes to the current head state
-        state::apply_tree_changes(
+        lore_revision::commit::merge_tree_changes(
             repository.clone(),
             state_current.clone(),
             &diff_result.changes,
         )
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| {
             Status::internal(format!(
-                "Failed to apply tree changes for fast-forward merge: {err}"
+                "Failed to merge tree changes for fast-forward merge: {err}"
             ))
         })?;
 

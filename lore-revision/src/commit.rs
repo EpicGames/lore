@@ -3279,7 +3279,7 @@ pub async fn rehash_directory(
             name: name_end - child_node.name_length..name_end,
         };
 
-        if child_node.is_directory() {
+        if child_node.is_directory() && child_node.is_staged() {
             lore_trace!("Spawning rehash of directory node {}", child_node_id);
             let index = child_data.len() as u32;
             child_data.push(child);
@@ -3322,7 +3322,7 @@ pub async fn rehash_directory(
             }
 
             lore_trace!(
-                "File node {} mode 0o{:o} size {} flags 0x{:x} address {}",
+                "Child node {} mode 0o{:o} size {} flags 0x{:x} address {}",
                 child_node_id,
                 child_node.mode,
                 child_node.size,
@@ -4635,15 +4635,42 @@ async fn has_staged_children(
     }
 }
 
-/// Freeze the staged tree into the shape a revision records: dirty tracking
-/// pruned, staged deletions discarded, staged files and links cleared of their
-/// change flags, every affected directory rehashed, and the node delta written.
+/// Freeze the staged tree into the shape a revision records, as [`freeze_tree`] does, and write
+/// the node delta.
 async fn freeze_in_memory_tree(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(), CommitError> {
+    let delta = freeze_tree(repository.clone(), state.clone(), stats).await?;
+    generate_delta_block(repository, state, delta, tracker).await
+}
+
+/// Applies `changes`, the conflict-free changes of a 3-way diff, to `state`, the tree of the
+/// revision they merge onto, and freezes the result into the tree a revision records: nodes staged
+/// for deletion discarded, change flags cleared and every changed directory rehashed. The state
+/// keeps the delta block it was loaded with.
+pub async fn merge_tree_changes(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    changes: &[change::NodeChange],
+) -> Result<(), CommitError> {
+    state::apply_tree_changes(repository.clone(), state.clone(), changes)
+        .await
+        .forward_any::<CommitError>("applying the merged changes")?;
+    freeze_tree(repository, state, CommitStats::new()).await?;
+    Ok(())
+}
+
+/// Freeze a staged tree whose every leaf carries its address into the shape a revision records:
+/// dirty tracking pruned, staged deletions discarded, staged files and links cleared of their
+/// change flags and every affected directory rehashed. Answers the node delta of the changes.
+async fn freeze_tree(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    stats: Arc<CommitStats>,
+) -> Result<Arc<parking_lot::RwLock<BytesMut>>, CommitError> {
     prune_dirty_for_commit(state.clone(), repository.clone()).await?;
 
     let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
@@ -4687,11 +4714,11 @@ async fn freeze_in_memory_tree(
     rehash_directory(repository.clone(), state.clone(), ROOT_NODE).await?;
 
     state
-        .update_tree_root_hash(repository.clone())
+        .update_tree_root_hash(repository)
         .await
         .forward::<CommitError>("Failed to update tree root hash")?;
 
-    generate_delta_block(repository, state, delta, tracker).await
+    Ok(delta)
 }
 
 /// Walk the staged directories under `node_id`, depth first in child order, each directory's files

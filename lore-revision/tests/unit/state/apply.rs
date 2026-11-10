@@ -8,6 +8,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_revision::commit::merge_tree_changes;
 use lore_revision::filter::FilterMode;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::*;
@@ -44,6 +45,17 @@ fn file_at(name: &str, version: u64) -> Node {
     let mut node = file(name);
     node.address.hash = Hash::from_u64(version);
     node.size = version;
+    node
+}
+
+/// A file added at `path` holding content `version`, whose identity derives from the path and the
+/// version, so two revisions adding it add the same file.
+fn added_at(path: &str, version: u64) -> Node {
+    let mut node = file_at(path.rsplit('/').next().unwrap_or(path), version);
+    node.address.context = Context::from(uuid::Uuid::from_u64_pair(
+        lore_storage::hash::hash_string_bytes(path.as_bytes()),
+        version,
+    ));
     node
 }
 
@@ -166,7 +178,7 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
                     &state,
                     repository.clone(),
                     parent,
-                    file_at(name, version),
+                    added_at(path, version),
                     name,
                 )
                 .await;
@@ -183,7 +195,8 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
                 .await;
                 for index in 0..count {
                     let name = format!("f{index:05}.txt");
-                    add(&state, repository.clone(), bulk, file_at(&name, 7), &name).await;
+                    let file = added_at(&format!("Bulk/{name}"), 7);
+                    add(&state, repository.clone(), bulk, file, &name).await;
                 }
                 continue;
             }
@@ -216,8 +229,8 @@ async fn edited(repository: &Arc<RepositoryContext>, base: Hash, edits: &[Edit])
     commit(repository, &state, base, branch_id()).await
 }
 
-/// The content of every node in `state` not staged for deletion, by path. A node staged as a
-/// move fails the test: the state is a stored revision, which records no move of its own.
+/// The content of every node in `state`, by path. A node carrying a staged or a dirty flag fails
+/// the test: the state is a stored revision.
 async fn contents(repository: &Arc<RepositoryContext>, state: &State) -> BTreeMap<String, Content> {
     let mut contents = BTreeMap::new();
     let mut pending = vec![(ROOT_NODE, String::new())];
@@ -231,9 +244,6 @@ async fn contents(repository: &Arc<RepositoryContext>, state: &State) -> BTreeMa
                 .node(repository.clone(), child)
                 .await
                 .expect("reading a child");
-            if node.is_staged_delete() {
-                continue;
-            }
             let name = state
                 .node_name_clone(repository.clone(), child)
                 .await
@@ -243,7 +253,11 @@ async fn contents(repository: &Arc<RepositoryContext>, state: &State) -> BTreeMa
             } else {
                 format!("{prefix}/{name}")
             };
-            assert!(!node.is_staged_move(), "{path} is stored staged as a move");
+            assert!(
+                !node.is_staged() && !node.is_dirty(),
+                "{path} is stored with flags {:#x}",
+                node.flags
+            );
             if node.is_directory() {
                 pending.push((child, path.clone()));
             }
@@ -281,7 +295,7 @@ async fn diff_with(
 /// the stored result.
 async fn apply(repository: &Arc<RepositoryContext>, diff: &DiffResult) -> Hash {
     let merged = revision_state(repository, diff.target).await;
-    apply_tree_changes(repository.clone(), merged.clone(), &diff.changes)
+    merge_tree_changes(repository.clone(), merged.clone(), &diff.changes)
         .await
         .expect("applying the changes");
     merged
@@ -1104,6 +1118,187 @@ async fn a_move_a_fast_forward_merge_applied_is_a_delete_and_an_add() {
                 );
             }
         }
+    })
+    .await;
+}
+
+/// The contents of the revision `revision` and its root hash.
+async fn stored(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> (BTreeMap<String, Content>, Hash) {
+    let state = revision_state(repository, revision).await;
+    let root = state
+        .tree(repository.clone())
+        .await
+        .expect("reading the tree")
+        .hash_root;
+    (contents(repository, &state).await, root)
+}
+
+/// A fast-forward merge onto `target`, a revision on `base`, of the revision making `edits` on
+/// `base` stores the tree a commit of `edits` on `target` stores, its directory addresses and root
+/// hash included.
+async fn assert_merge_stores_a_commit(
+    repository: &Arc<RepositoryContext>,
+    base: Hash,
+    target: Hash,
+    edits: &[Edit],
+) {
+    let source = edited(repository, base, edits).await;
+    let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+        .await
+        .expect("diffing the revisions");
+    assert!(diff.conflicts.is_empty(), "{edits:?}: {:?}", outcome(&diff));
+    let merged = stored(repository, apply(repository, &diff).await).await;
+    let committed = stored(repository, edited(repository, target, edits).await).await;
+    assert_eq!(merged, committed, "{edits:?}");
+}
+
+/// A fast-forward merge stores the tree a commit of the source's edits on the target stores, for
+/// an edit, a move across directories, a rename that only changes case of a file and of a
+/// directory, the latter on a tree hashed under the rule folding case too, a rename of a link, a
+/// delete and an add, a directory the merge empties, an added directory, and a moved file's mode.
+#[tokio::test]
+async fn a_fast_forward_merge_stores_the_tree_a_commit_stores() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
+        let cases: [&[Edit]; 9] = [
+            &[Edit::Write("Dir/Sub/c.txt", 2), Edit::Write("File.txt", 4)],
+            &[Edit::Move("Dir/a.txt", "Dir/Sub/a.txt")],
+            &[Edit::Move("File.txt", "file.txt")],
+            &[Edit::Move("Dir/Sub", "Dir/sub")],
+            &[Edit::Move("Mount", "Linked")],
+            &[Edit::Delete("Dir/b.txt"), Edit::Add("Dir/new.txt", 5)],
+            &[Edit::Delete("Dir/Sub/c.txt")],
+            &[Edit::Bulk(3)],
+            &[
+                Edit::Move("File.txt", "Moved.txt"),
+                Edit::Chmod("Moved.txt", 0o755),
+            ],
+        ];
+        for edits in cases {
+            assert_merge_stores_a_commit(&repository, base, target, edits).await;
+        }
+
+        let folding = case_folding(&repository, &in_memory::token(), base).await;
+        let target = edited(&repository, folding, &[Edit::Write("Other.txt", 3)]).await;
+        assert_merge_stores_a_commit(
+            &repository,
+            folding,
+            target,
+            &[Edit::Move("Dir/Sub", "Dir/sub")],
+        )
+        .await;
+    })
+    .await;
+}
+
+/// Applies `diff` to its target and stores the result unfrozen, the shape an earlier server's
+/// fast-forward merge stored: each merged node and the directories above it staged, at the
+/// target's addresses, and each deleted node kept, staged for deletion.
+async fn apply_unfrozen(repository: &Arc<RepositoryContext>, diff: &DiffResult) -> Hash {
+    let merged = revision_state(repository, diff.target).await;
+    apply_tree_changes(repository.clone(), merged.clone(), &diff.changes)
+        .await
+        .expect("applying the changes");
+    merged
+        .serialize(repository.clone(), &in_memory::token())
+        .await
+        .expect("storing the merged revision")
+}
+
+/// The revision on `base` an unfrozen fast-forward merge stores of the delete of `Dir/a.txt` onto an
+/// edit of `Other.txt`, and the revision committing the delete.
+async fn unfrozen_delete(repository: &Arc<RepositoryContext>, base: Hash) -> (Hash, Hash) {
+    let deleting = edited(repository, base, &[Edit::Delete("Dir/a.txt")]).await;
+    let other = edited(repository, base, &[Edit::Write("Other.txt", 2)]).await;
+    let diff = diff3_collect(repository.clone(), base, deleting, other, None, false)
+        .await
+        .expect("diffing the revisions");
+    let unfrozen = apply_unfrozen(repository, &diff).await;
+    let state = revision_state(repository, unfrozen).await;
+    let kept = state
+        .node(
+            repository.clone(),
+            node_at(repository, &state, "Dir/a.txt").await,
+        )
+        .await
+        .expect("reading the deleted file");
+    assert!(kept.is_staged_delete(), "flags {:#x}", kept.flags);
+    (unfrozen, deleting)
+}
+
+/// A move of a file the target deleted conflicts where the target is an unfrozen fast-forward merge
+/// that keeps the file staged for deletion, as where a client committed the delete, for a move to
+/// another name and a rename that only changes case.
+#[tokio::test]
+async fn a_move_against_a_delete_an_unfrozen_merge_keeps_conflicts() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let (unfrozen, deleting) = unfrozen_delete(&repository, base).await;
+        for to in ["Dir/z.txt", "Dir/A.txt"] {
+            let moving = edited(&repository, base, &[Edit::Move("Dir/a.txt", to)]).await;
+            let mut outcomes = Vec::new();
+            for target in [deleting, unfrozen] {
+                let diff = diff3_collect(repository.clone(), base, moving, target, None, false)
+                    .await
+                    .expect("diffing the revisions");
+                outcomes.push(outcome(&diff));
+            }
+            assert!(!outcomes[0].1.is_empty(), "{to}: {outcomes:?}");
+            assert_eq!(outcomes[0], outcomes[1], "{to}");
+        }
+    })
+    .await;
+}
+
+/// A fast-forward merge onto an unfrozen one stores the tree a commit of the source's edits on it
+/// stores: the file it kept staged for deletion gone, and every directory hashed over what it holds.
+#[tokio::test]
+async fn a_fast_forward_merge_onto_an_unfrozen_merge_stores_the_tree_a_commit_stores() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let (unfrozen, _) = unfrozen_delete(&repository, base).await;
+        assert_merge_stores_a_commit(
+            &repository,
+            base,
+            unfrozen,
+            &[Edit::Write("Dir/Sub/c.txt", 2)],
+        )
+        .await;
+    })
+    .await;
+}
+
+/// A diff from a fast-forward merge to the revision it merged onto lists the edit the merge
+/// applied below a directory the target left alone.
+#[tokio::test]
+async fn a_diff_from_a_fast_forward_merge_to_its_target_lists_what_it_merged() {
+    run(|repository| async move {
+        let diff = diff(
+            &repository,
+            &[Edit::Write("Dir/Sub/c.txt", 2)],
+            &[Edit::Write("Other.txt", 3)],
+        )
+        .await;
+        let merged = revision_state(&repository, apply(&repository, &diff).await).await;
+        let changes = diff_collect(
+            repository.clone(),
+            merged,
+            repository.clone(),
+            revision_state(&repository, diff.target).await,
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("diffing the merged revision");
+        let paths: Vec<String> = changes
+            .iter()
+            .map(|change| change.path().to_string())
+            .collect();
+        assert!(paths.contains(&"Dir/Sub/c.txt".to_string()), "{paths:?}");
     })
     .await;
 }

@@ -10532,7 +10532,8 @@ fn collect_new_addresses_recurse(
 /// Preconditions:
 /// - The changes must be conflict-free (no entries with `Flags::Conflict`)
 /// - All fragment data referenced by the changes must already exist in the immutable store
-pub async fn apply_tree_changes(
+#[lore_macro::test_pub]
+pub(crate) async fn apply_tree_changes(
     repository: Arc<RepositoryContext>,
     target_state: Arc<State>,
     changes: &[NodeChange],

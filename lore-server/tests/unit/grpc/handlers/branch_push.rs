@@ -7,17 +7,21 @@ use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::branch;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+use lore_revision::commit::commit_in_memory_revision;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::Mark;
 use lore_revision::state::State;
 use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_server::grpc::get_write_token;
@@ -199,6 +203,219 @@ async fn serialize_merge_with_a_file(
         "merged.txt",
     )
     .await
+}
+
+/// Stages `node` as an add of `name` below `parent`.
+async fn add_staged(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    parent: NodeID,
+    node: Node,
+    name: &str,
+) -> NodeID {
+    let node_id = state
+        .node_add(repository.clone(), parent, node, name)
+        .await
+        .expect("add the node");
+    state
+        .node_mark(
+            repository,
+            node_id,
+            Mark::staged_and_dirty(NodeFlags::StagedAdd, NodeFlags::DirtyAdd),
+        )
+        .await
+        .expect("stage the add");
+    node_id
+}
+
+/// A change a revision [`commit_files`] commits makes.
+#[derive(Clone, Copy)]
+enum Change {
+    /// Adds a file holding its path, at most one directory deep, with its directory. The file's
+    /// identity derives from its path, so two revisions adding a file at one path add the same
+    /// file.
+    Add(&'static str),
+    /// Deletes the file at the path.
+    Delete(&'static str),
+    /// Moves the file at the first path to the second, in a directory that exists.
+    Move(&'static str, &'static str),
+}
+
+/// The node at `path` of `state`, which exists.
+async fn node_at(repository: &Arc<RepositoryContext>, state: &State, path: &str) -> NodeID {
+    state
+        .find_node_link(repository.clone(), path)
+        .await
+        .expect("find the node")
+        .node
+}
+
+/// Adds the file at `path` to `state`, as [`Change::Add`] describes.
+async fn add_file(repository: &Arc<RepositoryContext>, state: &State, path: &str) {
+    let mut parent = ROOT_NODE;
+    let mut name = path;
+    if let Some((directory, file)) = path.split_once('/') {
+        name = file;
+        parent = match state.find_node_link(repository.clone(), directory).await {
+            Ok(link) if link.is_valid() => link.node,
+            _ => {
+                let node = Node {
+                    mode: 0o755,
+                    name_hash: lore_storage::hash::hash_string(directory),
+                    ..Default::default()
+                };
+                add_staged(repository, state, ROOT_NODE, node, directory).await
+            }
+        };
+    }
+    let file = Context::from(uuid::Uuid::from_u64_pair(
+        lore_storage::hash::hash_string(path),
+        0,
+    ));
+    let address = lore_revision::immutable::write(
+        repository.clone(),
+        file,
+        bytes::Bytes::copy_from_slice(path.as_bytes()),
+        lore_storage::WriteOptions::default(),
+    )
+    .await
+    .expect("write the file content");
+    let node = Node {
+        flags: NodeFlags::File.bits(),
+        mode: 0o644,
+        size: path.len() as u64,
+        address,
+        name_hash: lore_storage::hash::hash_string(name),
+        ..Default::default()
+    };
+    add_staged(repository, state, parent, node, name).await;
+}
+
+/// Commits on `branch` a revision on `parent`, or a first revision where it is zero, that makes
+/// `changes`, and moves the branch's latest to it.
+async fn commit_files(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    parent: Hash,
+    changes: &[Change],
+) -> Hash {
+    let state = if parent.is_zero() {
+        State::new()
+    } else {
+        State::deserialize(repository.clone(), parent)
+            .await
+            .expect("load the parent")
+    };
+    for change in changes {
+        match *change {
+            Change::Add(path) => add_file(repository, &state, path).await,
+            Change::Delete(path) => {
+                let node = node_at(repository, &state, path).await;
+                state
+                    .node_mark(
+                        repository,
+                        node,
+                        Mark::staged_and_dirty(NodeFlags::StagedDelete, NodeFlags::DirtyDelete),
+                    )
+                    .await
+                    .expect("delete the file");
+            }
+            Change::Move(from, to) => {
+                let (directory, name) = to.rsplit_once('/').unwrap_or(("", to));
+                let directory = node_at(repository, &state, directory).await;
+                let node = node_at(repository, &state, from).await;
+                let permit = state.moves_permit().await.expect("the moves permit");
+                state
+                    .node_move_staged(
+                        repository.clone(),
+                        node,
+                        directory,
+                        (name, lore_storage::hash::hash_string(name)),
+                        &permit,
+                        false,
+                    )
+                    .await
+                    .expect("move the file");
+            }
+        }
+    }
+    let mut metadata = lore_revision::metadata::Metadata::new();
+    metadata.set_branch(branch).expect("set branch");
+    commit_in_memory_revision(
+        repository.clone(),
+        &get_write_token(),
+        state,
+        metadata,
+        parent,
+        branch,
+    )
+    .await
+    .expect("commit the revision")
+}
+
+/// [`commit_files`] leaving the latest of `branch` where it is: a revision a client committed on
+/// `parent` and has yet to push.
+async fn commit_unpushed(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    parent: Hash,
+    changes: &[Change],
+) -> Hash {
+    let latest = branch::load_latest(repository.clone(), branch)
+        .await
+        .expect("load the latest revision");
+    try_store_latest(repository.clone(), branch, latest, parent)
+        .await
+        .expect("move the latest revision to the parent");
+    let revision = commit_files(repository, branch, parent, changes).await;
+    try_store_latest(repository.clone(), branch, revision, latest)
+        .await
+        .expect("move the latest revision back");
+    revision
+}
+
+/// The path of every node of the revision `revision` below the root, each failing the test where
+/// it carries a staged or a dirty flag.
+async fn stored_paths(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> std::collections::BTreeSet<String> {
+    let state = State::deserialize(repository.clone(), revision)
+        .await
+        .expect("load the revision");
+    let mut paths = std::collections::BTreeSet::new();
+    let mut pending = vec![(ROOT_NODE, String::new())];
+    while let Some((parent, prefix)) = pending.pop() {
+        for child in state
+            .node_children(repository.clone(), parent)
+            .await
+            .expect("list the children")
+        {
+            let node = state
+                .node(repository.clone(), child)
+                .await
+                .expect("read a child");
+            let name = state
+                .node_name_clone(repository.clone(), child)
+                .await
+                .expect("read a name");
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            assert!(
+                !node.is_staged() && !node.is_dirty(),
+                "{path} is stored with flags {:#x}",
+                node.flags
+            );
+            if node.is_directory() {
+                pending.push((child, path.clone()));
+            }
+            paths.insert(path);
+        }
+    }
+    paths
 }
 
 /// Copy the fragment at `hash` alone, leaving everything it references absent
@@ -1069,6 +1286,121 @@ mod push {
                 .expect("the merge is timed");
             assert!(merge > std::time::Duration::ZERO);
             assert_eq!(phase_total(&summary), summary.elapsed);
+        }))
+        .await;
+    }
+
+    /// Pushes `revision` to `branch`, merging it on the server where the branch moved past its
+    /// parent.
+    async fn push_merging(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        revision: Hash,
+    ) -> PushResult {
+        push(
+            repository.clone(),
+            branch,
+            revision,
+            crate::util::test_support::PUSH_ANY,
+            false,
+            true,
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
+        )
+        .await
+        .expect("push with a fast-forward merge")
+    }
+
+    /// A fast-forward merge stores the tree a commit of the pushed changes on the latest revision
+    /// stores: no node staged, the deleted file gone, and every directory hashed over what it holds.
+    #[tokio::test]
+    async fn a_fast_forward_merge_stores_the_tree_a_commit_stores() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                random::<RepositoryId>(),
+            ));
+            let branch = create_test_branch(&repository).await;
+            let base = commit_files(
+                &repository,
+                branch,
+                Hash::default(),
+                &[Change::Add("dir/a.txt"), Change::Add("dir/b.txt")],
+            )
+            .await;
+            let latest = commit_files(&repository, branch, base, &[Change::Add("other.txt")]).await;
+            let pushed = [Change::Add("dir/c.txt"), Change::Delete("dir/b.txt")];
+            let incoming = commit_unpushed(&repository, branch, base, &pushed).await;
+            let expected = commit_unpushed(&repository, branch, latest, &pushed).await;
+
+            let result = push_merging(&repository, branch, incoming).await;
+            assert!(result.fast_forward_merged);
+
+            assert_eq!(
+                stored_paths(&repository, result.revision).await,
+                stored_paths(&repository, expected).await
+            );
+            let mut roots = Vec::new();
+            for revision in [result.revision, expected] {
+                let state = State::deserialize(repository.clone(), revision)
+                    .await
+                    .expect("load the revision");
+                roots.push(
+                    state
+                        .tree(repository.clone())
+                        .await
+                        .expect("read the tree")
+                        .hash_root,
+                );
+            }
+            assert_eq!(roots[0], roots[1]);
+        }))
+        .await;
+    }
+
+    /// A push moving a file that a fast-forward merge at the latest revision deleted is declined:
+    /// the merge revision's parents and branch reach the 3-way diff as a client's would.
+    #[tokio::test]
+    async fn a_push_moving_a_file_a_merge_at_latest_deleted_is_declined() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                random::<RepositoryId>(),
+            ));
+            let branch = create_test_branch(&repository).await;
+            let base = commit_files(
+                &repository,
+                branch,
+                Hash::default(),
+                &[Change::Add("dir/a.txt"), Change::Add("other.txt")],
+            )
+            .await;
+            let deleting =
+                commit_unpushed(&repository, branch, base, &[Change::Delete("dir/a.txt")]).await;
+            commit_files(&repository, branch, base, &[Change::Add("more.txt")]).await;
+            assert!(
+                push_merging(&repository, branch, deleting)
+                    .await
+                    .fast_forward_merged
+            );
+            let moving = commit_unpushed(
+                &repository,
+                branch,
+                base,
+                &[Change::Move("dir/a.txt", "dir/z.txt")],
+            )
+            .await;
+
+            assert!(!push_merging(&repository, branch, moving).await.success);
         }))
         .await;
     }
