@@ -484,3 +484,19 @@ async fn a_target_through_dot_dot_moves_beside_the_instance() {
         "the instance is beside its old path"
     );
 }
+
+/// A target inside another repository's working tree, known by its `.lore` or older `.urc`
+/// directory, is refused before anything is created.
+#[tokio::test]
+async fn a_move_into_another_repository_is_refused() {
+    for dot in [DOT_LORE, ".urc"] {
+        let instance = Instance::new().await;
+        let other = instance.parent().join("other");
+        std::fs::create_dir_all(other.join(dot)).expect("make another repository");
+        let target = other.join("nested");
+
+        refused_move(&instance, &target).await;
+
+        assert!(!target.exists(), "{dot}: nothing is created at the target");
+    }
+}

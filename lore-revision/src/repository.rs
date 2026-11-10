@@ -1789,11 +1789,24 @@ pub(crate) fn refuse_nesting_in_swfs_mount(
     Ok(())
 }
 
-/// Refuses an SWFS instance at `path` inside another repository's working tree, where it would be
-/// a mount the parent's walks cross.
-pub(crate) fn refuse_swfs_nested_in_repository(
+/// Refuses a new instance at `path` nested in another: inside another repository's working tree,
+/// where it would be a tree the parent's walks cross, or inside an SWFS or FUSE instance's mount,
+/// whose Lore directory is outside its tree and whose files the mount presents.
+pub(crate) fn refuse_instance_nested_at(
     path: &std::path::Path,
 ) -> Result<(), crate::errors::InvalidArguments> {
+    refuse_nesting_in_swfs_mount(path)?;
+    #[cfg(target_os = "linux")]
+    if let Some((mount, _)) = crate::fs::fuse::discover::lore_mount_containing(path) {
+        return Err(crate::errors::InvalidArguments {
+            reason: format!(
+                "unable to put an instance at {} inside the FUSE instance at {}: a virtual \
+                 instance holds no nested instance",
+                path.display(),
+                mount.display()
+            ),
+        });
+    }
     if let Some(parent) = path
         .ancestors()
         .skip(1)
@@ -1801,8 +1814,8 @@ pub(crate) fn refuse_swfs_nested_in_repository(
     {
         return Err(crate::errors::InvalidArguments {
             reason: format!(
-                "unable to put an SWFS instance at {} inside the repository at {}: an SWFS \
-                 instance cannot be nested in another repository",
+                "unable to put an instance at {} inside the repository at {}: an instance \
+                 cannot be nested in another repository",
                 path.display(),
                 parent.display()
             ),

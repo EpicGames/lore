@@ -215,10 +215,11 @@ pub(crate) async fn create_with_metadata(
         }));
     }
 
-    repository::refuse_nesting_in_swfs_mount(path)?;
     if options.vfs_options.vfs_type == VfsType::Swfs {
-        repository::refuse_swfs_nested_in_repository(path)?;
+        repository::refuse_instance_nested_at(path)?;
         repository::refuse_swfs_past_mount_limit()?;
+    } else {
+        repository::refuse_nesting_in_swfs_mount(path)?;
     }
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {

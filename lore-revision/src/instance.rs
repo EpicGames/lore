@@ -2063,6 +2063,7 @@ async fn instance_move_with(
         }
         Some(_) => {}
     }
+    crate::repository::refuse_instance_nested_at(target)?;
 
     let vfs = require_own_mount(instance_id, &source_path, "move")?;
     if vfs.is_virtual()

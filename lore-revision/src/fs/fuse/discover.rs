@@ -99,6 +99,14 @@ pub fn lore_mount_for_path(mountinfo: &str, path: &Path) -> Option<(PathBuf, Ins
     best
 }
 
+/// The innermost `fuse.lore` mount at or above `path` in `/proc/self/mountinfo`, as
+/// [`lore_mount_for_path`] finds it. `None` where there is none, or where the mount table cannot be
+/// read.
+pub fn lore_mount_containing(path: &Path) -> Option<(PathBuf, InstanceId)> {
+    let mountinfo = std::fs::read_to_string(MOUNTINFO_PATH).ok()?;
+    lore_mount_for_path(&mountinfo, path)
+}
+
 /// Discovers `path`'s external `.lore` directory via `/proc/self/mountinfo`, without statting
 /// anything inside the mount. Returns `Ok(None)` when `path` isn't under a `fuse.lore` mount.
 pub fn discover_external_dot_lore(path: &Path) -> Result<Option<PathBuf>, ExternalDirError> {
@@ -115,7 +123,6 @@ pub fn discover_external_dot_lore(path: &Path) -> Result<Option<PathBuf>, Extern
 /// stale, left by a service that ended without unmounting it. Probes the mount point alone, with
 /// a `statfs` its server answers, so a caller on a runtime runs it on a blocking thread.
 pub fn answering_lore_mount(path: &Path) -> Option<PathBuf> {
-    let mountinfo = std::fs::read_to_string(MOUNTINFO_PATH).ok()?;
-    let (mount_point, _) = lore_mount_for_path(&mountinfo, path)?;
+    let (mount_point, _) = lore_mount_containing(path)?;
     (!lore_fuse::mount::is_stale_mount(&mount_point)).then_some(mount_point)
 }

@@ -1016,10 +1016,11 @@ pub async fn clone(
             reason: format!("--dry-run is not supported for {kind} clone"),
         }));
     }
-    repository::refuse_nesting_in_swfs_mount(path)?;
     if swfs {
-        repository::refuse_swfs_nested_in_repository(path)?;
+        repository::refuse_instance_nested_at(path)?;
         repository::refuse_swfs_past_mount_limit()?;
+    } else {
+        repository::refuse_nesting_in_swfs_mount(path)?;
     }
 
     // Read before anything below can create the path, so cleanup only removes what this call created.
