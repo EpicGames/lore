@@ -36,8 +36,10 @@ Use `AbortOnDropHandle` (from `tokio_util`) for background tasks that shouldn't 
 `lore_spawn!` return value in `AbortOnDropHandle::new(...)` and the task is automatically aborted when the handle is
 dropped.
 
-Spawn tasks that must not stop part way, such as a request that is not cancel safe, into a `DetachingJoinSet` (from
-`lore_base::runtime`). Dropping it detaches its tasks, and each task's output is dropped when the task ends.
+When its owner is dropped, detach rather than abort a task that must not stop part way, such as a request that isn't
+cancel safe. A dropped `JoinHandle` detaches its task, so one such task needs no wrapper. Where an owner can await more
+than one such task, spawn them into a `DetachingJoinSet` (from `lore_base::runtime`), which detaches its tasks when
+dropped.
 
 ## Error handling
 
