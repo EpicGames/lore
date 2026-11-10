@@ -30,6 +30,7 @@ use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::runtime::execution_context;
 use crate::stage;
 use crate::stage::StageError;
+use crate::state::NodeMapping;
 use crate::state::State;
 
 /// Event data reported at the start of a cherry-pick.
@@ -210,7 +211,7 @@ pub(crate) async fn cherry_pick(
         repository.clone(),
         token,
         diff,
-        state_current.clone(),
+        NodeMapping::root(repository.clone(), state_current.clone()),
         MergeType::CherryPick,
         false,
         current_branch,

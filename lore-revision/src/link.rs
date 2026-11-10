@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashSet;
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -1844,6 +1845,42 @@ async fn link_pin_diff(
     })
 }
 
+/// Verifies the working tree against the changes the pin move makes, refusing where a local
+/// modification would be overwritten, and returns the changes with what the check settled.
+async fn verify_link_pin_diff(
+    operation: &Arc<InstanceOperationImpl>,
+    link_context: Arc<RepositoryContext>,
+    new_sig: Hash,
+    diff: LinkPinDiff,
+) -> Result<Arc<Vec<NodeChange>>, LinkError> {
+    let LinkPinDiff { changes, current } = diff;
+    if changes.is_empty() {
+        return Ok(changes);
+    }
+    lore_info!(
+        "Verifying {} link changes with local file system",
+        changes.len()
+    );
+
+    let options = Arc::new(SyncOptions {
+        revision: Some(new_sig.to_string()),
+        ..Default::default()
+    });
+
+    sync_verify_filesystem(
+        link_context.clone(),
+        Arc::new(SyncVerifyArgs {
+            changes,
+            repository_current: link_context,
+            operation: operation.clone(),
+            current,
+            options,
+        }),
+    )
+    .await
+    .forward::<LinkError>("Failed verifying local file system")
+}
+
 /// Verifies the working tree against the changes the pin move makes and realizes them there.
 async fn realize_link_pin_diff(
     operation: &Arc<InstanceOperationImpl>,
@@ -1853,33 +1890,10 @@ async fn realize_link_pin_diff(
     diff: LinkPinDiff,
     overwrite_local: bool,
 ) -> Result<(), LinkError> {
-    let LinkPinDiff { changes, current } = diff;
-
-    let changes = if !changes.is_empty() && !overwrite_local {
-        lore_info!(
-            "Verifying {} link changes with local file system",
-            changes.len()
-        );
-
-        let options = Arc::new(SyncOptions {
-            revision: Some(new_sig.to_string()),
-            ..Default::default()
-        });
-
-        sync_verify_filesystem(
-            link_context.clone(),
-            Arc::new(SyncVerifyArgs {
-                changes: changes.clone(),
-                repository_current: link_context,
-                operation: operation.clone(),
-                current,
-                options,
-            }),
-        )
-        .await
-        .forward::<LinkError>("Failed verifying local file system")?
+    let changes = if overwrite_local {
+        diff.changes
     } else {
-        changes
+        verify_link_pin_diff(operation, link_context, new_sig, diff).await?
     };
 
     // The realize deletes before it moves, so a directory whose files move out is still occupied
@@ -2455,6 +2469,52 @@ pub struct PlannedLinkPin {
     remount: Option<(RelativePath, NodeID)>,
 }
 
+impl PlannedLinkPin {
+    /// Where the link's mount lands at the pin it moves to.
+    fn mount_source(&self) -> LinkMountSource {
+        match &self.remount {
+            Some((_, node)) => LinkMountSource::Node(*node),
+            None => LinkMountSource::SamePath,
+        }
+    }
+}
+
+/// Check the working tree against what [`apply_link_pins`] realizes for `planned`, refusing where a
+/// local modification would be overwritten.
+pub async fn verify_link_pins(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    planned: &[PlannedLinkPin],
+) -> Result<(), LinkError> {
+    for planned_pin in planned {
+        let link_path = RelativePath::from_str(&planned_pin.link_path)
+            .internal_with(|| format!("Invalid link path {}", planned_pin.link_path))?;
+        if repository
+            .filter
+            .excludes_tree(&link_path, true, FilterMode::View)
+        {
+            continue;
+        }
+        let link_context = repository
+            .to_link_context(planned_pin.link_node.address.context.into())
+            .await;
+        let pin = ResolvedLinkPin::resolve(
+            &link_context,
+            LinkPinRealizeTarget {
+                link_path,
+                old_signature: planned_pin.target_pin,
+                new_signature: planned_pin.incoming_pin,
+                current_node: planned_pin.link_node.child,
+                mount_source: planned_pin.mount_source(),
+            },
+        )
+        .await?;
+        let diff = link_pin_diff(&link_context, &pin).await?;
+        verify_link_pin_diff(operation, link_context, pin.new_signature, diff).await?;
+    }
+    Ok(())
+}
+
 /// The link node at `link_path`, or `None` when the state has no link there.
 async fn link_node_at_path(
     state: &Arc<State>,
@@ -2486,17 +2546,59 @@ async fn link_node_at_path(
 /// link's pin only means something on the parent branch whose mirror produced
 /// it, so it moves by its own branch merge. Links whose node is in `skip_nodes`
 /// keep the pin they have.
-pub async fn classify_link_pins(
+pub fn classify_link_pins<'a>(
+    repository: Arc<RepositoryContext>,
+    state_staged: &'a Arc<State>,
+    state_incoming: &'a Arc<State>,
+    resolution: LinkPinResolution,
+    skip_nodes: &'a [NodeID],
+) -> impl Future<Output = Result<Vec<PlannedLinkPin>, LinkError>> + 'a {
+    classify_link_pins_except(
+        repository,
+        state_staged,
+        state_incoming,
+        resolution,
+        skip_nodes,
+        &[],
+    )
+}
+
+/// [`classify_link_pins`] read before the merge lands, for every link but those whose node is in
+/// `left_out`.
+///
+/// A link merged in its own right lands at a pin its merge has yet to produce, which is what a
+/// remount of it is read against, so the caller leaves it out.
+pub fn classify_link_pins_before_merge<'a>(
+    repository: Arc<RepositoryContext>,
+    state_current: &'a Arc<State>,
+    state_incoming: &'a Arc<State>,
+    resolution: LinkPinResolution,
+    left_out: &'a [NodeID],
+) -> impl Future<Output = Result<Vec<PlannedLinkPin>, LinkError>> + 'a {
+    classify_link_pins_except(
+        repository,
+        state_current,
+        state_incoming,
+        resolution,
+        &[],
+        left_out,
+    )
+}
+
+/// [`classify_link_pins`] over every link but those whose node is in `left_out`.
+async fn classify_link_pins_except(
     repository: Arc<RepositoryContext>,
     state_staged: &Arc<State>,
     state_incoming: &Arc<State>,
     resolution: LinkPinResolution,
     skip_nodes: &[NodeID],
+    left_out: &[NodeID],
 ) -> Result<Vec<PlannedLinkPin>, LinkError> {
-    let link_list = state_staged
+    let mut link_list = state_staged
         .link_list(repository.clone())
         .await
         .forward::<LinkError>("Failed to list links")?;
+    link_list.retain(|link_reference| !left_out.contains(&link_reference.local_node));
 
     // Classify every link before changing any of them, so a divergent pin stops
     // the operation with nothing carried.

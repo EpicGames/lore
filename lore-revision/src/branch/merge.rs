@@ -443,6 +443,26 @@ pub struct ConflictRealizeContext {
     pub conflicts: Arc<Vec<(NodeChange, NodeChange)>>,
 }
 
+/// A merge of one repository worked out from its branches, with nothing written yet.
+struct PreparedMerge {
+    source: MergeSource,
+    /// The revision the merge starts from, at the path the working tree holds it.
+    current: NodeMapping,
+    diff: PreparedDiff,
+}
+
+/// The revisions a merge of one repository runs between.
+#[derive(Clone, Copy)]
+struct MergeSource {
+    source_branch: BranchId,
+    current_branch: BranchId,
+    /// The source revision the merge takes in.
+    revision: Hash,
+    revision_number: u64,
+    current_signature: Hash,
+}
+
+/// `current` is the revision the merge starts from, at the path the working tree holds it.
 #[allow(clippy::too_many_arguments)]
 async fn merge_repository(
     repository: Arc<RepositoryContext>,
@@ -450,9 +470,27 @@ async fn merge_repository(
     source_branch: BranchId,
     current_branch: BranchId,
     current_signature: Hash,
-    state_current: Arc<State>,
+    current: NodeMapping,
     inherit: &MetadataInherit,
 ) -> Result<MergeRepositoryResult, MergeError> {
+    let source = resolve_merge_source(
+        &repository,
+        source_branch,
+        current_branch,
+        current_signature,
+    )
+    .await?;
+    let merge = prepare_merge(repository.clone(), source, current).await?;
+    apply_prepared_merge(repository, token, merge, inherit).await
+}
+
+/// The revision of `source_branch` a merge into `current_signature` on `current_branch` takes in.
+async fn resolve_merge_source(
+    repository: &Arc<RepositoryContext>,
+    source_branch: BranchId,
+    current_branch: BranchId,
+    current_signature: Hash,
+) -> Result<MergeSource, MergeError> {
     let latest_merge = branch::load_latest(repository.clone(), source_branch)
         .await
         .ok();
@@ -566,26 +604,33 @@ async fn merge_repository(
         state.revision_number()
     };
 
-    lore_info!("Starting merge of branch {source_branch} revision {revision}");
-    event::LoreEvent::BranchMergeStartBegin(LoreBranchMergeStartBeginEventData {
-        branch: source_branch,
-        revision,
-        revision_number,
-    })
-    .send();
-
     if current_branch == source_branch && current_signature == revision {
         return Err(MergeError::internal("Cannot merge a branch with itself"));
     }
 
+    Ok(MergeSource {
+        source_branch,
+        current_branch,
+        revision,
+        revision_number,
+        current_signature,
+    })
+}
+
+/// Diff `source`'s revisions for a merge that starts from `current`.
+async fn prepare_merge(
+    repository: Arc<RepositoryContext>,
+    source: MergeSource,
+    current: NodeMapping,
+) -> Result<PreparedMerge, MergeError> {
     // Diff over the full tree. A view-scoped diff drops the other branch's
     // out-of-view changes and leaves this branch divergent from it.
     let diff = branch::diff3_collect_with_graft(
         full_tree_context(&repository),
-        source_branch,
-        revision,
-        current_branch,
-        current_signature,
+        source.source_branch,
+        source.revision,
+        source.current_branch,
+        source.current_signature,
         None,  /* No path */
         true,  /* Include identical changes for merge tracking */
         false, /* Do not autoresolve, this is done later */
@@ -596,8 +641,143 @@ async fn merge_repository(
     .await
     .forward::<MergeError>("running diff3 for merge")?;
 
-    // Capture the diff's revision endpoints before `apply_diff` consumes it —
-    // `merge_start_all` needs the corresponding states to realize conflict
+    Ok(PreparedMerge {
+        source,
+        diff: prepare_diff(&repository, diff),
+        current,
+    })
+}
+
+/// Work out the merge of `source_branch` into `current_signature` and check it against the
+/// working copy, refusing it where a local modification would be overwritten.
+async fn check_merge(
+    repository: &Arc<RepositoryContext>,
+    source_branch: BranchId,
+    current_branch: BranchId,
+    current_signature: Hash,
+    current: NodeMapping,
+) -> Result<PreparedMerge, MergeError> {
+    let source =
+        resolve_merge_source(repository, source_branch, current_branch, current_signature).await?;
+    let mut merge = prepare_merge(repository.clone(), source, current).await?;
+    with_operation(repository.file_system(), async |operation| {
+        let PreparedDiff {
+            changes, conflicts, ..
+        } = &mut merge.diff;
+        verify_diff_against_filesystem(
+            &operation,
+            repository,
+            &merge.current,
+            changes,
+            conflicts,
+            MergeType::BranchMerge,
+        )
+        .await?;
+        // Applying checks again where it writes; clearing `LocalMode` lets that check settle it
+        // afresh.
+        for change in changes
+            .iter_mut()
+            .chain(conflicts.iter_mut().map(|(_, change_to)| change_to))
+        {
+            change.flags.remove(change::Flags::LocalMode);
+        }
+        Ok::<_, MergeError>(())
+    })
+    .await?;
+    Ok(merge)
+}
+
+/// Check the pins the main repository's merge carries onto links not merged in their own right
+/// against the working copy, refusing where a local modification would be overwritten.
+///
+/// The pins are carried after the main repository's merge is written. Its diff carries no pin, so
+/// `state_current` stands in for the merged state to work them out before, except at a link the
+/// diff replaces, which lands with the tree rather than as a carried pin.
+async fn check_link_pins(
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    diff: &PreparedDiff,
+    merged_nodes: &[NodeID],
+) -> Result<(), MergeError> {
+    let replaced: std::collections::HashSet<&str> = diff
+        .changes
+        .iter()
+        .chain(diff.conflicts.iter().map(|(_, change_to)| change_to))
+        .filter(|change| change.from.is_link() || change.to.is_link())
+        .map(|change| change.path().as_lowercase_str())
+        .collect();
+    let mut left_out = merged_nodes.to_vec();
+    if !replaced.is_empty() {
+        let link_list = state_current
+            .link_list(repository.clone())
+            .await
+            .forward::<MergeError>("listing links")?;
+        for link_reference in &link_list {
+            let link_path = state_current
+                .node_path(repository.clone(), link_reference.local_node)
+                .await
+                .forward::<MergeError>("resolving link node path")?;
+            if replaced.contains(link_path.to_lowercase().as_str()) {
+                left_out.push(link_reference.local_node);
+            }
+        }
+    }
+
+    let (state_base, state_source) = tokio::try_join!(
+        state::State::deserialize(repository.clone(), diff.base),
+        state::State::deserialize(repository.clone(), diff.source),
+    )
+    .forward::<MergeError>("deserializing diff endpoint states")?;
+    let planned = link::classify_link_pins_before_merge(
+        repository.clone(),
+        state_current,
+        &state_source,
+        link::LinkPinResolution::ThreeWay(state_base),
+        &left_out,
+    )
+    .await
+    .forward::<MergeError>("comparing link pins with the merged branch")?;
+    if planned.is_empty() {
+        return Ok(());
+    }
+    with_operation(repository.file_system(), async |operation| {
+        link::verify_link_pins(&operation, repository, &planned)
+            .await
+            .forward::<MergeError>("checking link pins against the working copy")
+    })
+    .await
+}
+
+/// Apply `merge` over the working copy and store its staged state.
+async fn apply_prepared_merge(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    merge: PreparedMerge,
+    inherit: &MetadataInherit,
+) -> Result<MergeRepositoryResult, MergeError> {
+    let PreparedMerge {
+        source:
+            MergeSource {
+                source_branch,
+                current_branch,
+                revision,
+                revision_number,
+                ..
+            },
+        current,
+        diff,
+    } = merge;
+
+    lore_info!("Starting merge of branch {source_branch} revision {revision}");
+    event::LoreEvent::BranchMergeStartBegin(LoreBranchMergeStartBeginEventData {
+        branch: source_branch,
+        revision,
+        revision_number,
+    })
+    .send();
+
+    // Capture the diff's revision endpoints before `apply_prepared_diff` consumes
+    // it — `merge_start_all` needs the corresponding states to realize conflict
     // markers at a remapped mount path without re-running diff3.
     let (diff_base, diff_source, diff_target) = (diff.base, diff.source, diff.target);
 
@@ -606,11 +786,11 @@ async fn merge_repository(
         conflicts,
         state_staged,
         stats,
-    } = apply_diff(
+    } = apply_prepared_diff(
         repository.clone(),
         token,
         diff,
-        state_current,
+        current,
         MergeType::BranchMerge,
         // If this merge is reconciling a remote LATEST with local LATEST of a branch
         // reverse the parent order in order to keep the remote history as the main
@@ -735,7 +915,7 @@ pub async fn merge_start(
                 branch,
                 current_branch,
                 state_current.revision(),
-                state_current,
+                NodeMapping::root(repository.clone(), state_current),
                 &options.inherit_metadata,
             )
             .await?;
@@ -920,7 +1100,12 @@ async fn merge_start_link(
         branch,
         link_branch,
         link_reference.signature,
-        link_state,
+        NodeMapping {
+            repository: link_context.clone(),
+            state: link_state,
+            path: link_path_rel.clone(),
+            node: link_node.child,
+        },
         &options.inherit_metadata,
     )
     .await
@@ -994,6 +1179,14 @@ struct EligibleLink {
     link_context: Arc<RepositoryContext>,
     link_reference: state::LinkReference,
     resolved_branch: BranchId,
+}
+
+/// A link merge checked against the working copy, waiting to be written.
+struct PlannedLinkMerge<'a> {
+    eligible: &'a EligibleLink,
+    source: MergeSource,
+    /// The revision the merge starts from, at the path the working tree holds it.
+    current: NodeMapping,
 }
 
 /// A link whose merge produced a (possibly conflicted) staged state. Its pin
@@ -1249,9 +1442,10 @@ async fn seed_resumed_merged_links(
 ///
 /// Reads top-down: enumerate eligible links, load existing
 /// `LinkMergeState` for resume detection, seed `merged_links` for any
-/// already-merged entries, merge each remaining eligible link in turn,
-/// and finalize either as a merge-in-conflict (if any link conflicted)
-/// or by merging the main repository.
+/// already-merged entries, check the merge of each remaining eligible link
+/// and of the main repository against the working copy, write each link's
+/// merge in turn, and finalize either as a merge-in-conflict (if any link
+/// conflicted) or by writing the main repository's merge.
 async fn merge_start_all(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1280,6 +1474,7 @@ async fn merge_start_all(
     let mut has_link_conflicts = false;
     let mut pending_conflict_realizes: Vec<PendingConflictRealize> = Vec::new();
 
+    let mut planned_links = Vec::new();
     for eligible in &eligible_links {
         // Resume: already merged on a prior pass.
         if link_merge_entries
@@ -1355,13 +1550,69 @@ async fn merge_start_all(
         .await
         .forward::<MergeError>("deserializing eligible link state")?;
 
-        let result = merge_repository(
-            eligible.link_context.clone(),
-            token,
+        let link_path_rel = RelativePath::from_str(&eligible.link_path)
+            .internal_with(|| format!("link not found: {}", eligible.link_path))?;
+        let current = NodeMapping {
+            repository: eligible.link_context.clone(),
+            state: link_state,
+            path: link_path_rel,
+            node: eligible.link_node.child,
+        };
+        // Every merge is checked before any is written, so a refused one leaves no merge
+        // started. Each link's diff is dropped once checked and worked out again from the same
+        // revisions to be written, so only one link's diff is held at a time.
+        let source = check_merge(
+            &eligible.link_context,
             branch,
             eligible.resolved_branch,
             eligible.link_reference.signature,
-            link_state,
+            current.clone(),
+        )
+        .await
+        .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?
+        .source;
+        planned_links.push(PlannedLinkMerge {
+            eligible,
+            source,
+            current,
+        });
+    }
+
+    // The main repository's merge starts from `state_current` whatever the links' merges
+    // write, so it is checked here, before any of theirs is written.
+    let main_merge = check_merge(
+        &repository,
+        branch,
+        current_branch,
+        state_current.revision(),
+        NodeMapping::root(repository.clone(), state_current.clone()),
+    )
+    .await?;
+    let merged_nodes: Vec<NodeID> = merged_links
+        .iter()
+        .map(|merged| merged.link_reference.local_node)
+        .chain(
+            planned_links
+                .iter()
+                .map(|planned| planned.eligible.link_reference.local_node),
+        )
+        .collect();
+    check_link_pins(&repository, &state_current, &main_merge.diff, &merged_nodes).await?;
+
+    for planned in planned_links {
+        let PlannedLinkMerge {
+            eligible,
+            source,
+            current,
+        } = planned;
+        let link_path_rel = current.path.clone();
+        let merge = prepare_merge(eligible.link_context.clone(), source, current)
+            .await
+            .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?;
+        let result = apply_prepared_merge(
+            eligible.link_context.clone(),
+            token,
+            merge,
             &options.inherit_metadata,
         )
         .await
@@ -1398,8 +1649,6 @@ async fn merge_start_all(
             };
             link_merge_entries.push(link_merge_entry);
 
-            let link_path_rel = RelativePath::from_str(&eligible.link_path)
-                .internal_with(|| format!("link not found: {}", eligible.link_path))?;
             merged_links.push(MergedLink {
                 link_path: eligible.link_path.clone(),
                 link_path_rel,
@@ -1462,6 +1711,7 @@ async fn merge_start_all(
         options,
         state_current,
         current_branch,
+        main_merge,
         &merged_links,
         &link_merge_entries,
         dry_run,
@@ -1562,7 +1812,7 @@ async fn finalize_link_conflict_state(
     Ok(signature)
 }
 
-/// Finalize the parent merge: run main repo merge, apply collected link pin
+/// Finalize the parent merge: apply `main_merge`, apply collected link pin
 /// updates to its staged state, persist, and auto-commit if no conflicts.
 #[allow(clippy::too_many_arguments)]
 async fn finalize_main_merge(
@@ -1572,6 +1822,7 @@ async fn finalize_main_merge(
     options: MergeStartOptions,
     state_current: Arc<State>,
     current_branch: BranchId,
+    main_merge: PreparedMerge,
     merged_links: &[MergedLink],
     link_merge_entries: &[LinkMergeEntry],
     dry_run: bool,
@@ -1582,13 +1833,10 @@ async fn finalize_main_merge(
         state_staged,
         endpoints,
         ..
-    } = merge_repository(
+    } = apply_prepared_merge(
         repository.clone(),
         token,
-        branch,
-        current_branch,
-        state_current.revision(),
-        state_current.clone(),
+        main_merge,
         &options.inherit_metadata,
     )
     .await?;
@@ -2170,50 +2418,113 @@ async fn apply_graft_copy(
 /// Check every path the diff touches against the working copy, refusing the merge where a
 /// local modification would be overwritten.
 ///
-/// The conflicts are checked after the changes, so the failure reported is the earliest one
-/// the merge would have hit. The moves among the changes answer for both where a directory is
-/// deleted, and are copied only where the diff deletes a directory.
+/// A linked repository's diff is spelled from its own root, so each change is verified where
+/// `current` stands, below the link's mount. A change outside the subtree the link exposes has
+/// nothing on disk to verify.
 async fn verify_diff_against_filesystem(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
-    state_current: &Arc<State>,
+    current: &NodeMapping,
     changes: &mut [NodeChange],
     conflicts: &mut [(NodeChange, NodeChange)],
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
+    let conflicts = conflicts.iter_mut().map(|(_, change_to)| change_to);
+    if current.path.is_empty() {
+        return verify_spelled_diff(
+            operation,
+            repository,
+            current,
+            changes.iter_mut().collect(),
+            conflicts.collect(),
+            merge_type,
+        )
+        .await;
+    }
+
+    let source = link::link_source_path(repository.clone(), &current.state, current.node)
+        .await
+        .forward::<MergeError>("resolving the path the link exposes")?;
+    let mut mounted_changes = spell_from_mount(changes.iter_mut(), &current.path, &source);
+    let mut mounted_conflicts = spell_from_mount(conflicts, &current.path, &source);
+    verify_spelled_diff(
+        operation,
+        repository,
+        current,
+        mounted_changes
+            .iter_mut()
+            .map(|(_, mounted)| mounted)
+            .collect(),
+        mounted_conflicts
+            .iter_mut()
+            .map(|(_, mounted)| mounted)
+            .collect(),
+        merge_type,
+    )
+    .await?;
+    for (change, mounted) in mounted_changes.into_iter().chain(mounted_conflicts) {
+        change.flags = mounted.flags;
+    }
+    Ok(())
+}
+
+/// Each of `changes` the subtree at `source` holds, paired with a copy spelled from `mount`, where
+/// the working tree holds that subtree.
+fn spell_from_mount<'a>(
+    changes: impl Iterator<Item = &'a mut NodeChange>,
+    mount: &RelativePath,
+    source: &RelativePath,
+) -> Vec<(&'a mut NodeChange, NodeChange)> {
+    let at_mount = |path: &RelativePath| path.below(source).map(|below| mount.join(below));
+    changes
+        .filter(|change| change.path().below(source).is_some())
+        .map(|change| {
+            let mut mounted = change.clone();
+            mounted.from.mapping.path = match change.action {
+                FileAction::Move => change.move_source().and_then(at_mount),
+                _ => at_mount(&change.from.mapping.path),
+            }
+            .unwrap_or_default();
+            mounted.to.mapping.path = at_mount(&change.to.mapping.path).unwrap_or_default();
+            (change, mounted)
+        })
+        .collect()
+}
+
+/// [`verify_diff_against_filesystem`] for changes spelled as the working tree holds them, and
+/// the incoming side of each conflict.
+///
+/// The conflicts are checked after the changes, so the failure reported is the earliest one
+/// the merge would have hit. The moves among the changes answer for both where a directory is
+/// deleted, and are copied only where the diff deletes a directory.
+async fn verify_spelled_diff(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    current: &NodeMapping,
+    changes: Vec<&mut NodeChange>,
+    conflicts: Vec<&mut NodeChange>,
+    merge_type: MergeType,
+) -> Result<(), MergeError> {
     let deletes_a_directory = changes
         .iter()
-        .chain(conflicts.iter().map(|(_, change_to)| change_to))
+        .chain(&conflicts)
         .any(|change| change.action == FileAction::Delete && change.from.flags.is_directory());
     let moves = if deletes_a_directory {
         changes
             .iter()
             .filter(|change| change.move_source().is_some())
-            .cloned()
+            .map(|change| (**change).clone())
             .collect()
     } else {
         Vec::new()
     };
     let incoming = Arc::new(crate::fs::realize::IncomingMoves::new(Arc::new(moves)));
     verify_changes_against_filesystem(
-        operation,
-        repository,
-        state_current,
-        changes.iter_mut().collect(),
-        &incoming,
-        merge_type,
+        operation, repository, current, changes, &incoming, merge_type,
     )
     .await?;
     verify_changes_against_filesystem(
-        operation,
-        repository,
-        state_current,
-        conflicts
-            .iter_mut()
-            .map(|(_, change_to)| change_to)
-            .collect(),
-        &incoming,
-        merge_type,
+        operation, repository, current, conflicts, &incoming, merge_type,
     )
     .await?;
     lore_debug!("File system verification complete");
@@ -2231,7 +2542,7 @@ async fn verify_diff_against_filesystem(
 fn verify_changes_against_filesystem<'a>(
     operation: &'a Arc<InstanceOperationImpl>,
     repository: &'a Arc<RepositoryContext>,
-    state_current: &'a Arc<State>,
+    current: &'a NodeMapping,
     mut changes: Vec<&'a mut NodeChange>,
     incoming: &'a Arc<crate::fs::realize::IncomingMoves>,
     merge_type: MergeType,
@@ -2260,7 +2571,7 @@ fn verify_changes_against_filesystem<'a>(
                 let stats = stats.clone();
                 let repository = repository.clone();
                 let operation = operation.clone();
-                let state_current = state_current.clone();
+                let current = current.clone();
                 let incoming = incoming.clone();
                 async move {
                     let mut change = change;
@@ -2269,9 +2580,9 @@ fn verify_changes_against_filesystem<'a>(
                     let no_force_hash_check = false;
                     crate::fs::realize::verify_filesystem(
                         &mut change,
-                        repository.clone(),
+                        repository,
                         operation,
-                        crate::state::NodeMapping::root(repository, state_current),
+                        current,
                         no_forward_changes,
                         realizes_every_change,
                         no_force_hash_check,
@@ -2431,17 +2742,21 @@ async fn realize_diff_over_filesystem(args: RealizeDiff<'_>) -> Result<(), Merge
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn apply_diff(
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    mut diff: DiffResult,
-    state_current: Arc<State>,
-    merge_type: MergeType,
-    reverse_parents: bool,
-    target_branch: BranchId,
-    inherit: &MetadataInherit,
-) -> Result<ApplyDiffResults, MergeError> {
+/// A diff sorted and narrowed to what applying it to one repository writes.
+struct PreparedDiff {
+    base: Hash,
+    source: Hash,
+    target: Hash,
+    changes: Vec<NodeChange>,
+    conflicts: Vec<(NodeChange, NodeChange)>,
+    /// Subtrees the target branch never touched. Nothing inside one needs a three-way merge,
+    /// so it skips per-file verify and realize.
+    grafts: Vec<NodeChange>,
+}
+
+/// `diff` sorted, without what applying it to `repository` leaves to another repository, and
+/// with its grafts set apart.
+fn prepare_diff(repository: &RepositoryContext, mut diff: DiffResult) -> PreparedDiff {
     lore_debug!(
         "Branch diff found {} changes and {} conflicts",
         diff.changes.len(),
@@ -2469,37 +2784,88 @@ pub async fn apply_diff(
         // contexts, so realizing those conflicts at the parent mount path
         // would write `.mine`/`.theirs`/`.base` sidecars at the wrong absolute
         // path and the in-link state would never gain the merge metadata.
-        // For `MergeScope::All` the parent merge runs only AFTER links are
-        // merged in place — the link pins have been updated to the merged
-        // signature, so `state::diff` no longer surfaces inner-link conflicts
-        // at this layer. Either way the parent diff path is the wrong place
-        // to realize these.
+        // For `MergeScope::All` each link is merged in its own context. Either
+        // way the parent diff path is the wrong place to realize these.
         diff.conflicts.retain(|(from, to)| {
             from.to.mapping.repository.id == repository.id
                 && to.to.mapping.repository.id == repository.id
         });
     }
 
-    // A graft covers a whole subtree the target branch never touched. Nothing
-    // inside it needs a three-way merge, so it skips per-file verify and
-    // realize.
     let grafts: Vec<NodeChange> = diff
         .changes
         .extract_if(.., |change| change.action == FileAction::Graft)
         .collect();
 
-    let state_from = state::State::deserialize(repository.clone(), diff.source)
+    PreparedDiff {
+        base: diff.base,
+        source: diff.source,
+        target: diff.target,
+        changes: diff.changes,
+        conflicts: diff.conflicts,
+        grafts,
+    }
+}
+
+/// `current` is the revision the diff applies to, at the path the working tree holds it.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn apply_diff<'a>(
+    repository: Arc<RepositoryContext>,
+    token: &'a RepositoryWriteToken,
+    diff: DiffResult,
+    current: NodeMapping,
+    merge_type: MergeType,
+    reverse_parents: bool,
+    target_branch: BranchId,
+    inherit: &'a MetadataInherit,
+) -> impl Future<Output = Result<ApplyDiffResults, MergeError>> + 'a {
+    let diff = prepare_diff(&repository, diff);
+    apply_prepared_diff(
+        repository,
+        token,
+        diff,
+        current,
+        merge_type,
+        reverse_parents,
+        target_branch,
+        inherit,
+    )
+}
+
+/// [`apply_diff`] for a prepared diff.
+#[allow(clippy::too_many_arguments)]
+async fn apply_prepared_diff(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    diff: PreparedDiff,
+    current: NodeMapping,
+    merge_type: MergeType,
+    reverse_parents: bool,
+    target_branch: BranchId,
+    inherit: &MetadataInherit,
+) -> Result<ApplyDiffResults, MergeError> {
+    let PreparedDiff {
+        base,
+        source,
+        target,
+        mut changes,
+        mut conflicts,
+        grafts,
+    } = diff;
+
+    let state_from = state::State::deserialize(repository.clone(), source)
         .await
         .forward::<MergeError>("deserializing diff source state")?;
-    let state_to = state::State::deserialize(repository.clone(), diff.target)
+    let state_to = state::State::deserialize(repository.clone(), target)
         .await
         .forward::<MergeError>("deserializing diff target state")?;
-    let state_base = state::State::deserialize(repository.clone(), diff.base)
+    let state_base = state::State::deserialize(repository.clone(), base)
         .await
         .forward::<MergeError>("deserializing diff base state")?;
 
     // Prepare the merged staged state
-    let state_staged = state::State::deserialize(repository.clone(), diff.target)
+    let state_staged = state::State::deserialize(repository.clone(), target)
         .await
         .forward::<MergeError>("deserializing target state for staging")?;
 
@@ -2513,12 +2879,7 @@ pub async fn apply_diff(
     // mount point before writing.
     let skip_filesystem = repository.is_link();
 
-    // Cross-link changes were filtered out earlier (right after sort) for
-    // non-link contexts. For a link context the set is unfiltered and the
-    // diff paths are link-root-relative.
     let stats = Arc::new(sync::SyncRealizeStats::default());
-    let mut changes = diff.changes;
-    let mut conflicts = diff.conflicts;
     let dry_run = execution_context().globals().dry_run();
 
     // One operation covers the whole diff: every path it verifies and realizes is in the
@@ -2527,7 +2888,7 @@ pub async fn apply_diff(
         verify_diff_against_filesystem(
             &operation,
             &repository,
-            &state_current,
+            &current,
             &mut changes,
             &mut conflicts,
             merge_type,
@@ -2536,7 +2897,7 @@ pub async fn apply_diff(
         let changes = Arc::new(changes);
         let conflicts = Arc::new(conflicts);
         apply_diff_grafts(&repository, &state_staged, &grafts).await?;
-        link::check_incoming_mount_overlaps(repository.clone(), &state_current, &changes)
+        link::check_incoming_mount_overlaps(repository.clone(), &current.state, &changes)
             .await
             .forward::<MergeError>("checking incoming link source paths")?;
         realize_diff_over_filesystem(RealizeDiff {

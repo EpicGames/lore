@@ -6,6 +6,7 @@ import pytest
 from error_types import (
     LinkMountDivergedError,
     LinkPinDivergedError,
+    LocalChanges,
     UnresolvedConflictError,
 )
 from link_helpers import (
@@ -610,11 +611,6 @@ def test_link_pin_update_divergent_does_not_silently_pick_a_side(new_lore_repo):
         "A refused merge should leave main's pin alone"
     )
 
-    repo.branch_merge_abort()
-    assert link_pin(repo, source_repo.get_id()) == revision_two, (
-        "Aborting should leave main's pin alone"
-    )
-
 
 @pytest.mark.smoke
 def test_link_pin_update_divergent_creates_no_branch_for_a_merged_in_link(
@@ -748,9 +744,6 @@ def test_link_remount_divergent_does_not_silently_pick_a_side(new_lore_repo):
     with pytest.raises(LinkMountDivergedError):
         repo.branch_merge_start("feature-branch", message="Merge divergent remounts")
 
-    assert_mount_exposes(repo, link_path, "first", ["a.txt"])
-
-    repo.branch_merge_abort()
     assert_mount_exposes(repo, link_path, "first", ["a.txt"])
 
 
@@ -1089,3 +1082,157 @@ def test_link_merge_of_divergent_history_keeps_the_remote_history_off_a_local_fi
     assert [(e["revision"], e["path"], e["action"]) for e in history] == [
         (local_pin, "local.txt", "add")
     ]
+
+
+# ---------------------------------------------------------------------------
+# Local work inside a link: a link merge verifies each path where the mount
+# materializes it, and refuses to overwrite it as a plain merge does.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "nested, source_path, link_files, incoming, local",
+    [
+        pytest.param(
+            False,
+            "/",
+            {"a.txt": "base\n"},
+            {"a.txt": "theirs\n"},
+            "a.txt",
+            id="changed-file",
+        ),
+        pytest.param(
+            False,
+            "sub",
+            {"sub/a.txt": "base\n"},
+            {"a.txt": "theirs\n"},
+            "a.txt",
+            id="changed-file-subtree-mount",
+        ),
+        pytest.param(
+            True,
+            "/",
+            {"a.txt": "base\n"},
+            {"a.txt": "theirs\n"},
+            "a.txt",
+            id="changed-file-nested-link",
+        ),
+        pytest.param(
+            False,
+            "/",
+            {"item/inner.txt": "base\n"},
+            {"item": "theirs\n"},
+            "item/inner.txt",
+            id="folder-replaced-by-file",
+        ),
+        pytest.param(
+            False,
+            "/",
+            {"keep.txt": "keep\n"},
+            {"b.txt": "theirs\n"},
+            "b.txt",
+            id="untracked-file-added",
+        ),
+    ],
+)
+def test_link_merge_start_refuses_local_work_inside_the_link(
+    new_lore_repo, nested, source_path, link_files, incoming, local
+):
+    """`merge start` refuses a merge that would overwrite a local edit or an untracked file
+    inside a link and starts nothing, so it merges once the local work is reset.
+
+    `incoming` is written below the mount on main, the merged branch, replacing a folder
+    where it names a file; `local` is the path below the mount edited on disk first.
+    """
+    if nested:
+        repo, _ = make_parent_with_link(
+            new_lore_repo, "linked/repo", {"outer.txt": "o\n"}
+        )
+        mount = "linked/repo/inner"
+        inner = make_repo(new_lore_repo, link_files)
+        repo.link_add(mount, inner.get_id(), source_path)
+        repo.commit("Link a repository inside the link")
+        repo.push()
+    else:
+        mount = "linked/repo"
+        repo, _ = make_parent_with_link(
+            new_lore_repo, mount, link_files, source_path=source_path
+        )
+
+    # The change lands on main from a clone, so `repo` never switches across it.
+    repo.branch_create("feature-branch")
+    upstream = repo.clone(branch="main")
+    for path in incoming:
+        upstream.rmtree(f"{mount}/{path}")
+    upstream.write_files(
+        {f"{mount}/{path}": content for path, content in incoming.items()}
+    )
+    upstream.stage(scan=True)
+    upstream.commit("Change inside the link")
+    upstream.push()
+
+    edited = f"{mount}/{local}"
+    repo.write_files({edited: "local edit\n"})
+
+    with pytest.raises(LocalChanges):
+        repo.branch_merge_start("main", message="Merge main")
+    with repo.open_file(edited) as f:
+        assert f.read() == "local edit\n", f"{edited} should keep the local edit"
+
+    repo.reset(edited, purge=True)
+    repo.branch_merge_start("main", no_commit=True)
+    if nested:
+        # A merge in a nested link doesn't realize its files yet.
+        return
+    for path, content in incoming.items():
+        with repo.open_file(f"{mount}/{path}") as f:
+            assert f.read() == content, f"{mount}/{path} should hold the merge"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "edited",
+    ["linked/b/a.txt", "main.txt", "linked/fixed/a.txt"],
+    ids=["second-link", "main-repository", "fixed-link-pin"],
+)
+def test_merge_start_refuses_local_work_before_merging_any_link(new_lore_repo, edited):
+    """`merge start` checks every link, the main repository and the pins it carries before
+    merging any of them, so local work in one refuses the merge with nothing merged, and it
+    merges once the local work is reset."""
+    repo, _ = make_parent_with_link(
+        new_lore_repo, "linked/a", {"a.txt": "base\n"}, {"main.txt": "base\n"}
+    )
+    second = make_repo(new_lore_repo, {"a.txt": "base\n"})
+    repo.link_add("linked/b", second.get_id(), "/")
+    fixed = make_repo(new_lore_repo, {"a.txt": "base\n"})
+    repo.link_add("linked/fixed", fixed.get_id(), "/", disable_branching=True)
+    repo.commit("Add a second link and a fixed link")
+    repo.push()
+
+    repo.branch_create("feature-branch")
+    fixed.write_commit_push("Change the fixed link", {"a.txt": "theirs\n"})
+    upstream = repo.clone(branch="main")
+    upstream.link_update("linked/fixed")
+    upstream.write_files(
+        {path: "theirs\n" for path in ["linked/a/a.txt", "linked/b/a.txt", "main.txt"]}
+    )
+    upstream.stage(scan=True)
+    upstream.commit("Change both links, the main repository and the fixed link's pin")
+    upstream.push()
+    changed = ["linked/a/a.txt", "linked/b/a.txt", "main.txt", "linked/fixed/a.txt"]
+
+    repo.write_files({edited: "local edit\n"})
+
+    with pytest.raises(LocalChanges):
+        repo.branch_merge_start("main", message="Merge main")
+    for path in changed:
+        expected = "local edit\n" if path == edited else "base\n"
+        with repo.open_file(path) as f:
+            assert f.read() == expected, f"{path} should hold {expected!r}"
+
+    repo.reset(edited, purge=True)
+    repo.branch_merge_start("main", message="Merge main")
+    for path in changed:
+        with repo.open_file(path) as f:
+            assert f.read() == "theirs\n", f"{path} should hold the merge"

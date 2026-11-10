@@ -29,6 +29,7 @@ use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::runtime::execution_context;
 use crate::stage;
 use crate::stage::StageError;
+use crate::state::NodeMapping;
 use crate::state::State;
 
 /// Event data reported at the start of a revert.
@@ -206,7 +207,7 @@ pub(crate) async fn revert(
         repository.clone(),
         token,
         diff,
-        state_current.clone(),
+        NodeMapping::root(repository.clone(), state_current.clone()),
         MergeType::Revert,
         false,
         current_branch,
