@@ -674,14 +674,8 @@ async fn test_dispatch_pre_hook_timeout_shortens_default() {
 
 #[tokio::test]
 async fn test_dispatch_pre_panic_isolation() {
-    // Temporarily set a silent panic hook to suppress the custom panic output
-    // from urc-core's execution_initialize(). The panic is still caught by
-    // catch_unwind, but we don't want it printing to stderr during tests.
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {
-        // Intentionally silent - this test verifies panic isolation
-    }));
-
+    // The panic hook is the process's, shared by the tests running beside this one, so the hook's
+    // panic prints.
     let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
         "panic".to_string(),
         Box::new(PanicPreHook::new("panic", &[HookPoint::BranchPush])),
@@ -697,9 +691,6 @@ async fn test_dispatch_pre_panic_isolation() {
         )
         .await;
 
-    // Restore previous panic hook before assertions (so assertion failures are visible)
-    std::panic::set_hook(prev_hook);
-
     match result.unwrap_err() {
         HookError::Panic { hook_name, message } => {
             assert_eq!(hook_name, "panic");
@@ -711,10 +702,6 @@ async fn test_dispatch_pre_panic_isolation() {
 
 #[tokio::test]
 async fn test_dispatch_pre_panic_does_not_affect_other_hooks() {
-    // Temporarily set a silent panic hook to suppress the custom panic output
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-
     let counter = Arc::new(AtomicUsize::new(0));
 
     let hooks: Vec<(String, Box<dyn Hook>)> = vec![
@@ -740,9 +727,6 @@ async fn test_dispatch_pre_panic_does_not_affect_other_hooks() {
             dispatcher.dispatch_pre(HookPoint::BranchPush, &ctx),
         )
         .await;
-
-    // Restore previous panic hook before assertions
-    std::panic::set_hook(prev_hook);
 
     assert!(result.is_err());
 
@@ -911,10 +895,6 @@ async fn test_spawn_post_wrong_hook_point() {
 
 #[tokio::test]
 async fn test_spawn_post_panic_isolation() {
-    // Temporarily set a silent panic hook to suppress the custom panic output
-    let prev_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-
     LORE_CONTEXT
         .scope(test_execution_context(), async {
             let post_count = Arc::new(AtomicUsize::new(0));
@@ -939,9 +919,6 @@ async fn test_spawn_post_panic_isolation() {
             dispatcher.spawn_post(HookPoint::BranchPush, ctx);
 
             tokio::time::sleep(Duration::from_millis(50)).await;
-
-            // Restore previous panic hook before assertions
-            std::panic::set_hook(prev_hook);
 
             assert_eq!(post_count.load(Ordering::SeqCst), 1);
         })

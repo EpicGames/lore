@@ -126,10 +126,7 @@ def settled_footprint(store: Path, timeout: float = 60) -> SimpleNamespace:
 
 
 def answers_hello(path: Path) -> bool:
-    """Whether a server answers a storage hello on the socket at `path`. Where
-    Python has no AF_UNIX, as on Windows, whether the socket file exists."""
-    if not hasattr(socket, "AF_UNIX"):
-        return path.exists()
+    """Whether a server answers a storage hello on the socket at `path`."""
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(5)
@@ -138,6 +135,10 @@ def answers_hello(path: Path) -> bool:
             return connection.recv(8, socket.MSG_WAITALL) == STORAGE_HELLO[:8]
     except OSError:
         return False
+
+
+# What the server logs once every socket it serves listens.
+LISTENING = "Lore socket server listening"
 
 
 class MachineServer:
@@ -166,10 +167,22 @@ class MachineServer:
         self.running = (proc, log_fd)
         # The gRPC port the launch waits for can open before the sockets do.
         deadline = monotonic() + 30
-        while not all(answers_hello(path) for path in self.sockets):
+        while not self.listening():
             assert proc.poll() is None, f"M exited:\n{self.log_text()}"
-            assert monotonic() < deadline, f"M opened no socket:\n{self.log_text()}"
+            assert monotonic() < deadline, (
+                f"M's sockets never listened:\n{self.log_text()}"
+            )
             sleep(0.2)
+
+    def listening(self) -> bool:
+        """Whether this launch's sockets listen: each answers a storage hello,
+        or, where Python has no AF_UNIX, as on Windows, the server has logged
+        that its sockets listen, which it does once every one of them does. A
+        socket's file is no sign: it exists from the bind, before the socket
+        listens, and a connection made in between is refused."""
+        if not hasattr(socket, "AF_UNIX"):
+            return LISTENING in self.log_text()
+        return all(answers_hello(path) for path in self.sockets)
 
     def stop(self) -> None:
         if self.running is not None:

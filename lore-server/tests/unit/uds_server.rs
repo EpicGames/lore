@@ -217,23 +217,25 @@ impl TestServer {
             .chain(extra_sockets.iter().cloned())
             .collect();
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let (listening, listens) = tokio::sync::oneshot::channel();
         let mut serving = lore_base::lore_spawn!(serve(
             dir.path().to_path_buf(),
             sockets.clone(),
             setup,
-            shutdown_rx
+            shutdown_rx,
+            Some(listening),
         ));
-        // Waits for the socket files rather than connecting, which would take one of their places.
+        // Waits until the sockets listen rather than connecting, which would take one of their
+        // places; a socket's file exists from its bind, before it listens.
         timeout(PATIENCE, async {
-            while !sockets.iter().all(|socket| file_at(socket)) {
-                if serving.is_finished() {
-                    panic!("the server stopped starting: {:?}", (&mut serving).await);
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
+            // A server that fails to start drops the sender as it returns, so a closed channel is
+            // answered with what the server returned.
+            if listens.await.is_err() {
+                panic!("the server stopped starting: {:?}", (&mut serving).await);
             }
         })
         .await
-        .expect("the server binds its sockets");
+        .expect("the server's sockets listen within PATIENCE");
         Self {
             socket,
             extra_sockets,
@@ -261,7 +263,9 @@ impl TestServer {
     /// A raw connection that sent `hello`, with the server's hello read when it answered one. A
     /// connection the server closed at once may refuse the hello itself.
     async fn hello(&self, hello: &[u8]) -> (AsyncStream, Option<ServerHello>) {
-        let mut stream = local_socket::connect(&self.socket).await.unwrap();
+        let mut stream = local_socket::connect(&self.socket)
+            .await
+            .expect("connect to the listening socket");
         if stream.write_all(hello).await.is_err() {
             return (stream, None);
         }
@@ -275,12 +279,14 @@ impl TestServer {
 }
 
 /// Serves `sockets` over stores in `dir`, with what `setup` changes, until `shutdown` turns true.
-/// Returns at once with the error that stops the server starting.
+/// Returns at once with the error that stops the server starting. `listening`, where given, is sent
+/// once every socket listens.
 async fn serve(
     dir: PathBuf,
     sockets: Vec<PathBuf>,
     setup: Setup,
     shutdown: watch::Receiver<bool>,
+    listening: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> anyhow::Result<()> {
     let mut settings: UdsSettings = toml::from_str("enabled = true").unwrap();
     settings.sockets = sockets;
@@ -319,6 +325,9 @@ async fn serve(
     .await
     .unwrap();
     let bound = bind_sockets(&settings).await?;
+    if let Some(listening) = listening {
+        let _ = listening.send(());
+    }
     launch_uds_server(
         settings,
         bound,
@@ -658,7 +667,10 @@ async fn a_client_hello_with_a_flag_set_is_closed_unanswered() {
 
             let (_stream, hello) = server.hello(&flagged).await;
 
-            assert!(hello.is_none());
+            assert!(
+                hello.is_none(),
+                "a hello with a flag set is closed unanswered, not answered with {hello:?}"
+            );
         })
         .await;
 }
@@ -1241,6 +1253,7 @@ async fn a_second_server_on_a_held_socket_fails_to_start() {
                     vec![server.socket.clone()],
                     Setup::default(),
                     shutdown_rx,
+                    None,
                 ),
             )
             .await
@@ -1277,6 +1290,7 @@ async fn a_socket_that_cannot_be_bound_fails_startup_and_leaves_no_socket() {
                     vec![bound.clone(), not_a_directory.join("lore.sock")],
                     Setup::default(),
                     shutdown_rx,
+                    None,
                 ),
             )
             .await
