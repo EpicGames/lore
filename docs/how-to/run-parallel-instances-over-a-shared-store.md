@@ -7,7 +7,7 @@ In this guide, you'll set up a shared store, add an instance for each branch, bu
 If you've used Git worktrees, instances cover the same ground without a main repository:
 
 - **No instance owns the store.** Delete any instance, the first one you cloned included, and the others keep working.
-- **Every instance is a clone.** You create each one with `lore clone`. No instance has to exist before the others, and none needs a command of its own.
+- **Every instance is a clone.** You create each one with `lore clone`, or copy one you have with `lore repository instance clone`. No instance has to exist before the others.
 - **Branches and revisions live in the store.** A revision committed in one instance is in every other instance at once, before you push it, and it stays after you delete the instance that committed it.
 - **The store outlives its instances.** Deleting the last instance leaves the store in place, and the next clone uses it again.
 
@@ -86,6 +86,22 @@ lore clone lore://127.0.0.1:41337/my-project my-project-b
 ```
 
 The clone fetches only what the store doesn't already hold. Every `lore clone` option works the same over a shared store: `--branch` starts the instance on another branch, and `--view` gives it a sparse view of its own.
+
+### Clone an instance you already have
+
+Each instance writes every file its view selects, so a full working tree costs its full size on disk again. To copy an instance instead, run from it:
+
+```bash
+lore repository instance clone ~/my-project-c
+```
+
+The clone is an instance of its own, on the source's branch, revision, and staged state, with the source's uncommitted changes. On the source's volume, on a filesystem that clones files (APFS on macOS, Btrfs, XFS with reflink or bcachefs on Linux, Dev Drive or ReFS on Windows), it shares the source's data blocks and takes little space. Its first `lore status --scan` hashes only the files a scan of the source would: those with no [modified-time record](../glossary.md#modified-time-record), and those changed since theirs.
+
+The clone first waits for Lore commands already running on the source instance in its process to finish. While it runs, Lore commands on the source instance wait for it, and so do Lore commands from other processes on every instance over the store. `lore repository instance delete` waits too, since it opens the store to deregister the source before it removes any file. `lore repository instance move` doesn't wait: it renames the source before it opens the store, so moving the source while the clone copies it makes the clone fail. On Windows the move is refused while the clone lists a directory of the source. Commands that don't open the store, such as `lore repository config get`, don't wait either. Where the Lore service runs your commands, it runs them in its own process with the clone, so commands it runs on other instances over the store don't wait.
+
+A repository nested inside the instance is an instance of its own, and the clone leaves it out. An instance that keeps its own store in `.lore/`, and a virtual clone, can't be cloned this way, and the destination can't be inside an instance, the source included.
+
+Elsewhere, such as on NTFS, on ext4, or on another volume, the clone is refused, and the message says what a full copy would cost. Pass `--allow-copy` to make the copy anyway. A copy writes every file and takes as long as that does. Run with `--dry-run` first to see whether a clone shares blocks. Where it can't, the dry run says what a copy would cost and is refused as the clone would be; add `--allow-copy` to see the copy it would make.
 
 ## Work across instances
 

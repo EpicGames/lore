@@ -494,7 +494,7 @@ async fn remove_dir_all_in_background_renames_the_tree_aside_and_removes_it() {
             .unwrap();
 
         let (removed_from, removed) = driver
-            .remove_dir_all_in_background(&path, Some(aside.clone()))
+            .remove_dir_all_in_background(&path, Some(aside.clone()), false)
             .await;
 
         removed.expect("removes the tree");
@@ -508,7 +508,7 @@ async fn remove_dir_all_in_background_renames_the_tree_aside_and_removes_it() {
             "the tree is gone"
         );
         driver
-            .remove_dir_all_in_background(&path, Some(aside.clone()))
+            .remove_dir_all_in_background(&path, Some(aside.clone()), false)
             .await
             .1
             .expect("removing a missing tree is Ok");

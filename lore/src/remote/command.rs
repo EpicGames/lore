@@ -172,4 +172,5 @@ pub enum LoreCommand {
     FileAudit(crate::file::LoreFileAuditArgs),
     RepositoryInstanceDelete(crate::repository::LoreRepositoryInstanceDeleteArgs),
     RepositoryInstanceMove(crate::repository::LoreRepositoryInstanceMoveArgs),
+    RepositoryInstanceClone(crate::repository::LoreRepositoryInstanceCloneArgs),
 }

@@ -7,5 +7,6 @@ mod fuse;
 mod hold;
 mod mount_manager;
 mod os;
+mod os_clone;
 mod realize;
 mod swfs;

@@ -2,13 +2,15 @@
 # SPDX-License-Identifier: MIT
 """Smoke tests for repository instance management commands.
 
-Tests the `lore repository instance delete` and `lore repository instance move`
-commands added for SWFS instance management.
+Tests the `lore repository instance delete`, `move` and `clone` commands.
 """
 
+import json
 import logging
 import os
+import subprocess
 import sys
+import time
 
 import pytest
 from lore import Lore
@@ -16,6 +18,7 @@ from error_types import LoreException
 from service_util import LORE_SERVICE_ENVIRONMENT
 
 INVALID_ARGUMENTS = 3
+NOT_SUPPORTED = 9
 
 logger = logging.getLogger(__name__)
 
@@ -676,6 +679,332 @@ class TestInstanceMove:
             assert (target / name).read_bytes() == expected, (
                 f"{name} should be readable through the mount at the target"
             )
+
+
+def _shared_store_instance(new_lore_repo, contents: dict[str, bytes]) -> Lore:
+    """An instance on a shared store, synced to a revision holding `contents`."""
+    origin: Lore = new_lore_repo()
+    origin.write_commit_push("Seed", contents)
+    origin.shared_store_create(origin.remote)
+    return origin.clone(use_shared_store=True)
+
+
+def _read(root, relative: str) -> bytes:
+    with open(os.path.join(root, relative), "rb") as file:
+        return file.read()
+
+
+def _listed(path, listing: str) -> bool:
+    return str(path) in listing or str(path).replace("\\", "/") in listing
+
+
+def _clone_events(source: Lore, destination, *flags: str, check: bool = True) -> list[dict]:
+    """The events `lore repository instance clone` sends, as JSON objects."""
+    output = source.run(
+        ["repository", "instance", "clone", str(destination), *flags], json=True, check=check
+    )
+    return [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+
+
+def _events_named(events: list[dict], name: str) -> list[dict]:
+    return [event["data"] for event in events if event.get("tagName") == name]
+
+
+def _event(events: list[dict], name: str) -> dict:
+    found = _events_named(events, name)
+    assert found, f"no {name} event in {events}"
+    return found[0]
+
+
+def _uuid7_hex() -> str:
+    """A UUIDv7 as 32 hex digits, the form a clone names its in-progress directory with."""
+    milliseconds = time.time_ns() // 1_000_000
+    rest = int.from_bytes(os.urandom(10), "big")
+    value = (milliseconds << 80) | (0x7 << 76) | ((rest >> 64) & 0xFFF) << 64
+    value |= (0b10 << 62) | (rest & ((1 << 62) - 1))
+    return f"{value:032x}"
+
+
+@pytest.fixture
+def other_volume(scratch_dir):
+    """A small HFS+ volume mounted for the test, which shares no blocks with the volume the
+    repositories are on and cannot clone files itself, but keeps permissions and links."""
+    if sys.platform != "darwin":
+        pytest.skip("the volume is made with hdiutil, which only macOS has")
+    image = scratch_dir("other_volume_image", create=True) / "volume.dmg"
+    mount = scratch_dir("other_volume", create=True)
+    for command in (
+        ["hdiutil", "create", "-size", "50m", "-fs", "HFS+", "-volname", "LoreTest", str(image)],
+        ["hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), str(image)],
+    ):
+        made = subprocess.run(command, capture_output=True, text=True)
+        if made.returncode != 0:
+            pytest.skip(f"hdiutil cannot make a volume here: {made.stderr}")
+    try:
+        yield mount
+    finally:
+        subprocess.run(["hdiutil", "detach", "-force", str(mount)], capture_output=True)
+
+
+@pytest.mark.smoke
+@pytest.mark.own_vfs(
+    "an instance clone copies an on-disk instance; a virtual instance's provider refuses it"
+)
+class TestInstanceClone:
+    """Tests for `lore repository instance clone`."""
+
+    def test_instance_clone_is_a_registered_clean_copy(self, new_lore_repo, scratch_dir):
+        """A clone holds the source's files, has an ID of its own, and is registered."""
+        contents = {"root.txt": os.urandom(1024), "nested/leaf.txt": os.urandom(4096)}
+        source = _shared_store_instance(new_lore_repo, contents)
+        destination = scratch_dir("clone_destination")
+
+        clone = source.repository_instance_clone(str(destination), allow_copy=True)
+
+        for relative, data in contents.items():
+            assert _read(destination, relative) == data, f"{relative} differs in the clone"
+        source_id = _read(source.dot_path(), "instance")
+        clone_id = _read(clone.dot_path(), "instance")
+        assert clone_id != source_id, "the clone needs an instance ID of its own"
+        listed = source.repository_instance_list()
+        assert _listed(destination, listed) and _listed(source.path, listed), (
+            f"Both instances should be registered. Output: {listed}"
+        )
+        assert clone_id.hex() in listed
+        status = clone.status(scan=True)
+        assert "root.txt" not in status and "leaf.txt" not in status, (
+            f"A fresh clone should have a clean status. Output: {status}"
+        )
+        branch_line = [line for line in status.splitlines() if line.startswith("On branch")]
+        assert branch_line and branch_line[0] in source.status(), (
+            "the clone is on the source's branch and revision"
+        )
+
+    def test_instance_clone_first_scan_trusts_the_inherited_records(
+        self, new_lore_repo, scratch_dir
+    ):
+        """The clone's first scan hashes no file its records cover.
+
+        A file changed in the clone behind the scan's back, keeping its size and modification
+        time, is only seen by hashing it, so a scan that reports nothing hashed nothing.
+        """
+        contents = {"root.txt": b"a" * 4096}
+        source = _shared_store_instance(new_lore_repo, contents)
+        destination = scratch_dir("clone_records")
+
+        clone = source.repository_instance_clone(str(destination), allow_copy=True)
+
+        path = os.path.join(destination, "root.txt")
+        stat = os.stat(path)
+        with open(path, "r+b") as file:
+            file.write(b"b" * 4096)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+        status = clone.status(scan=True)
+        assert "root.txt" not in status, (
+            f"The first scan should trust the records the clone inherited. Output: {status}"
+        )
+
+    def test_instance_clone_refuses_an_existing_destination(
+        self, new_lore_repo, scratch_dir
+    ):
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        destination = scratch_dir("clone_existing", create=True)
+
+        with pytest.raises(LoreException) as exc_info:
+            source.repository_instance_clone(str(destination))
+        assert exc_info.value.returncode == INVALID_ARGUMENTS, exc_info.value
+
+        assert not os.listdir(destination)
+
+    def test_instance_clone_refuses_a_destination_inside_an_instance(
+        self, new_lore_repo
+    ):
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        destination = os.path.join(source.path, "inside")
+
+        with pytest.raises(LoreException) as exc_info:
+            source.repository_instance_clone(destination)
+        assert exc_info.value.returncode == INVALID_ARGUMENTS, exc_info.value
+
+        assert not os.path.exists(destination)
+
+    def test_instance_clone_refuses_an_instance_with_a_local_store(
+        self, new_lore_repo, scratch_dir
+    ):
+        repo: Lore = new_lore_repo()
+        destination = scratch_dir("clone_local_store")
+
+        with pytest.raises(LoreException) as exc_info:
+            repo.repository_instance_clone(str(destination))
+        assert exc_info.value.returncode == NOT_SUPPORTED, exc_info.value
+
+        assert not os.path.exists(destination)
+
+    def test_instance_clone_dry_run_changes_nothing(self, new_lore_repo, scratch_dir):
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        destination = scratch_dir("clone_dry_run")
+
+        source.repository_instance_clone(str(destination), dry_run=True, allow_copy=True)
+
+        assert not os.path.exists(destination)
+        assert not _listed(destination, source.repository_instance_list())
+
+    def test_instance_clone_dry_run_states_that_it_shares_blocks(
+        self, new_lore_repo, scratch_dir
+    ):
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        destination = scratch_dir("clone_dry_run_answer")
+
+        events = _clone_events(source, destination, "--allow-copy", "--dry-run")
+
+        begin = _event(events, "repositoryInstanceCloneBegin")
+        if begin["method"] == "copiesBytes":
+            pytest.skip(f"this volume does not share blocks: {begin['reason']}")
+        assert begin["method"] == "sharesBlocks"
+        assert not os.path.exists(destination)
+
+    def test_instance_clone_refuses_another_volume(self, other_volume, new_lore_repo):
+        """A clone to a volume that cannot share the source's blocks is refused before anything
+        is written, naming what a copy would cost."""
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        destination = other_volume / "clone"
+
+        with pytest.raises(LoreException) as exc_info:
+            source.repository_instance_clone(str(destination))
+        assert exc_info.value.returncode == NOT_SUPPORTED, exc_info.value
+
+        assert not [name for name in os.listdir(other_volume) if name.startswith("clone")]
+        assert not _listed(destination, source.repository_instance_list())
+
+    def test_instance_clone_dry_run_states_the_copy(self, other_volume, new_lore_repo):
+        contents = {"root.txt": b"a" * 1000, "nested/leaf.txt": b"b" * 24}
+        source = _shared_store_instance(new_lore_repo, contents)
+        destination = other_volume / "clone"
+
+        events = _clone_events(source, destination, "--allow-copy", "--dry-run")
+
+        begin = _event(events, "repositoryInstanceCloneBegin")
+        assert begin["method"] == "copiesBytes"
+        assert begin["fileCount"] >= len(contents)
+        assert begin["size"] >= 1024
+        assert not os.path.exists(destination)
+
+    def test_instance_clone_allow_copy_copies_to_another_volume(
+        self, other_volume, new_lore_repo
+    ):
+        contents = {"root.txt": os.urandom(1024), "nested/leaf.txt": os.urandom(4096)}
+        source = _shared_store_instance(new_lore_repo, contents)
+        destination = other_volume / "clone"
+
+        clone = source.repository_instance_clone(str(destination), allow_copy=True)
+
+        for relative, data in contents.items():
+            assert _read(destination, relative) == data, f"{relative} differs in the copy"
+        assert _read(clone.dot_path(), "instance") != _read(source.dot_path(), "instance")
+        assert _listed(destination, source.repository_instance_list())
+        status = clone.status(scan=True)
+        assert "root.txt" not in status and "leaf.txt" not in status, (
+            f"A fresh copy should have a clean status. Output: {status}"
+        )
+        assert not [
+            name for name in os.listdir(other_volume) if name.startswith("clone.cloning-")
+        ], "the copy leaves no in-progress directory behind"
+
+    def test_instance_clone_removes_a_directory_an_interrupted_clone_left(
+        self, new_lore_repo, scratch_dir
+    ):
+        """A directory an interrupted clone left beside the destination, named for a clone to it
+        and marked as a clone in progress, is removed by the next clone there."""
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        parent = scratch_dir("clone_leftover_parent", create=True)
+        destination = os.path.join(parent, "clone")
+        leftover = f"{destination}.cloning-{_uuid7_hex()}"
+        os.makedirs(os.path.join(leftover, ".lore"))
+        os.makedirs(os.path.join(leftover, "nested"))
+        with open(os.path.join(leftover, ".lore", "clone-in-progress"), "wb"):
+            pass
+        with open(os.path.join(leftover, "nested", "partial.txt"), "wb") as handle:
+            handle.write(b"partial")
+
+        events = _clone_events(source, destination, "--allow-copy")
+
+        removed = [
+            progress["path"]
+            for progress in _events_named(events, "repositoryInstanceCloneProgress")
+            if progress["phase"] == "removingLeftover"
+        ]
+        assert len(removed) == 1 and removed[0].endswith(os.path.basename(leftover))
+        assert sorted(os.listdir(parent)) == ["clone"]
+        assert _read(destination, "root.txt") == b"data"
+
+    def test_instance_clone_leaves_siblings_alone(self, new_lore_repo, scratch_dir):
+        """Directories beside the destination that a clone did not leave are not taken over:
+        one named otherwise, and one named like a clone's but not marked as one."""
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        parent = scratch_dir("clone_sibling_parent", create=True)
+        destination = os.path.join(parent, "clone")
+        siblings = [destination + ".cloning-notes", f"{destination}.cloning-{_uuid7_hex()}"]
+        for sibling in siblings:
+            os.makedirs(sibling)
+            with open(os.path.join(sibling, "kept.txt"), "wb") as handle:
+                handle.write(b"kept")
+
+        source.repository_instance_clone(destination, allow_copy=True)
+
+        for sibling in siblings:
+            assert _read(sibling, "kept.txt") == b"kept", sibling
+        assert _read(destination, "root.txt") == b"data"
+        assert sorted(os.listdir(parent)) == sorted(
+            ["clone", *(os.path.basename(sibling) for sibling in siblings)]
+        ), "the clone leaves no in-progress directory behind"
+
+    def test_instance_clone_resolves_a_relative_target_against_the_working_directory(
+        self, new_lore_repo, scratch_dir
+    ):
+        """A relative target names a path beside where the command was run."""
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        working_directory = scratch_dir("clone_relative_cwd", create=True)
+
+        source.repository_instance_clone(
+            "relative_clone", allow_copy=True, cwd=str(working_directory)
+        )
+
+        assert _read(working_directory / "relative_clone", "root.txt") == b"data"
+        assert _listed(working_directory / "relative_clone", source.repository_instance_list())
+
+    def test_instance_clone_resolves_a_relative_target_for_a_service(
+        self, new_lore_repo, lore_service_runner, scratch_dir
+    ):
+        """A service resolves a relative target against the caller's directory, not its own."""
+        lore_service_runner.start()
+        origin: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+        origin.write_commit_push("Seed", {"root.txt": b"data"})
+        origin.shared_store_create(origin.remote)
+        source = origin.clone(use_shared_store=True)
+        working_directory = scratch_dir("clone_relative_service_cwd", create=True)
+
+        source.repository_instance_clone(
+            "relative_clone", allow_copy=True, cwd=str(working_directory)
+        )
+
+        assert _read(working_directory / "relative_clone", "root.txt") == b"data"
+        assert _listed(working_directory / "relative_clone", source.repository_instance_list())
+
+    def test_instance_clone_carries_the_staged_state(self, new_lore_repo, scratch_dir):
+        """A file staged in the source is staged in the clone."""
+        source = _shared_store_instance(new_lore_repo, {"root.txt": b"data"})
+        source.write_files({"staged.txt": b"staged"})
+        source.stage("staged.txt")
+        destination = scratch_dir("clone_staged")
+
+        clone = source.repository_instance_clone(str(destination), allow_copy=True)
+
+        def staged_lines(status: str) -> list[str]:
+            return [line.strip() for line in status.splitlines() if "staged.txt" in line]
+
+        source_lines = staged_lines(source.status())
+        assert source_lines, "the source lists the staged file"
+        assert staged_lines(clone.status()) == source_lines
 
 
 @pytest.mark.smoke

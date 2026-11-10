@@ -610,6 +610,36 @@ class Lore:
             **kwargs,
         )
 
+    def repository_instance_clone(
+        self,
+        destination: str,
+        dry_run: bool = False,
+        allow_copy: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ) -> "Lore":
+        """Clone this instance to `destination`, which a relative path names against the `cwd` the
+        command runs in, and return the clone."""
+        resolved = os.path.join(kwargs.get("cwd") or self.path, str(destination))
+        # Recorded before the clone exists, so a clone that fails partway is removed with the test.
+        self.created_paths.append(resolved)
+        self.run(
+            ["repository", "instance", "clone", str(destination)]
+            + (["--dry-run"] if dry_run else [])
+            + (["--allow-copy"] if allow_copy else []),
+            **kwargs,
+        )
+        return Lore(
+            base_env=self.base_env,
+            remote_path=self.remote_path,
+            remote_url=self.remote,
+            lore_executable_path=self.lore_executable_path,
+            path=resolved,
+            name=os.path.basename(resolved),
+            create_repo=False,
+            created_paths=self.created_paths,
+            environment_vars=self.environment_vars,
+        )
+
     def repository_store(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "store"], **kwargs)
 

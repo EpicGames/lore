@@ -6,6 +6,11 @@
 //! the operating system via the lore-io driver. The directory listings and name lookups
 //! the operation is built on sit here with it, reaching the driver for this provider alone.
 
+#[cfg(not(feature = "test-util"))]
+mod clone;
+#[cfg(feature = "test-util")]
+pub mod clone;
+
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -20,13 +25,17 @@ use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::prelude::*;
 use lore_io::StatKind;
+use lore_io::clone::CloneStats;
 
+use super::filesystem_provider::CloneAnswer;
+use super::filesystem_provider::CloneRun;
 use super::filesystem_provider::DirectoryEntry;
 use super::filesystem_provider::DirectoryListing;
 use super::filesystem_provider::FileInfo;
 use super::filesystem_provider::FilesystemDiffContext;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
+use super::filesystem_provider::InstanceCloneError;
 use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::StaticDispatchDirectoryListing;
@@ -72,6 +81,27 @@ impl FilesystemProvider for OsFilesystem {
             StaticDispatchInstanceOperation::Os(OsFilesystem::begin_operation(self)),
             self.holds_state(),
         )))
+    }
+
+    async fn clone_answer(
+        &self,
+        source: &Path,
+        dot_path: &Path,
+        destination: &Path,
+    ) -> Result<CloneAnswer, InstanceCloneError> {
+        clone::answer(source, dot_path, destination).await
+    }
+
+    async fn clone_instance(
+        &self,
+        source: &Path,
+        dot_path: &Path,
+        destination: &Path,
+        answer: &CloneAnswer,
+        copy_unclonable: bool,
+        run: &CloneRun,
+    ) -> Result<CloneStats, InstanceCloneError> {
+        clone::clone(source, dot_path, destination, answer, copy_unclonable, run).await
     }
 }
 

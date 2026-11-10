@@ -10,6 +10,7 @@ use lore_base::types::Fragment;
 use lore_error_set::WrapInternal;
 use lore_error_set::error_set;
 
+use crate::fs::filesystem_provider::CloneAnswer;
 use crate::fs::filesystem_provider::DirectoryListing;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
@@ -77,6 +78,17 @@ impl FilesystemProvider for SwfsFilesystem {
             StaticDispatchInstanceOperation::Swfs(self.begin_operation().await?),
             holds_state,
         )))
+    }
+
+    async fn clone_answer(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+    ) -> Result<CloneAnswer, crate::fs::filesystem_provider::InstanceCloneError> {
+        Ok(CloneAnswer::Unsupported {
+            reason: "this virtual filesystem provider can't clone instances".to_string(),
+        })
     }
 }
 

@@ -26,8 +26,12 @@
 //!   kernel finishes during the issuing call never reach the port, and the
 //!   rest are completed by a single reaper. Control-plane operations run on
 //!   the syscall pool.
+//!
+//! The [`clone`] module is the exception: blocking calls that clone or copy a
+//! directory tree, which a caller on an async runtime runs on a blocking thread.
 
 mod buffer;
+pub mod clone;
 mod dir;
 #[cfg(not(feature = "test-util"))]
 mod driver;
@@ -59,12 +63,15 @@ pub mod priority;
 mod psync;
 #[cfg(feature = "test-util")]
 pub mod psync;
+pub mod rename;
 #[cfg(not(feature = "test-util"))]
 mod stat;
 #[cfg(feature = "test-util")]
 pub mod stat;
 #[cfg(target_os = "linux")]
 mod uring;
+#[cfg(target_family = "windows")]
+pub mod win_path;
 
 pub use buffer::StableBuf;
 pub use buffer::StableBufList;

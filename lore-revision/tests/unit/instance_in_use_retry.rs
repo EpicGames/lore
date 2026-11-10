@@ -90,11 +90,17 @@ async fn a_delete_is_retried_in_use_and_a_rename_aside_only_while_the_aside_name
     };
     let busy = io::ErrorKind::ResourceBusy;
 
-    assert!(removal_is_retryable(&failure(&path, busy), &aside).await);
+    assert!(removal_is_retryable(&failure(&path, busy), Some(&aside)).await);
     std::fs::create_dir(&aside).expect("take the aside name");
-    assert!(!removal_is_retryable(&failure(&path, busy), &aside).await);
-    assert!(removal_is_retryable(&failure(&aside, busy), &aside).await);
-    assert!(!removal_is_retryable(&failure(&aside, io::ErrorKind::PermissionDenied), &aside).await);
+    assert!(!removal_is_retryable(&failure(&path, busy), Some(&aside)).await);
+    assert!(removal_is_retryable(&failure(&aside, busy), Some(&aside)).await);
+    assert!(
+        !removal_is_retryable(
+            &failure(&aside, io::ErrorKind::PermissionDenied),
+            Some(&aside)
+        )
+        .await
+    );
 }
 
 /// Once an attempt has renamed the instance aside, a retry removes the aside alone: a new
@@ -109,7 +115,7 @@ async fn a_retry_after_the_rename_aside_removes_only_the_aside() {
     std::fs::write(path.join("old.txt"), b"old").expect("write a file of the instance");
     let attempts = Mutex::new(Vec::new());
 
-    let result = remove_instance_directory_with(&path, &aside, |from, to| {
+    let result = remove_instance_directory_with(&path, Some(&aside), |from, to| {
         let first = {
             let mut attempts = attempts.lock().expect("the attempts");
             attempts.push((from.clone(), to.clone()));

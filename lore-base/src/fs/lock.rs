@@ -52,6 +52,15 @@ impl FSLock {
         Self::try_take(Self::open_lock_file(&path)?)
     }
 
+    /// What the name of the lock file guarding a path appends to the path's name.
+    pub const FILE_LOCK_SUFFIX: &str = ".lock";
+
+    /// The lock file [`acquire_file_lock`](Self::acquire_file_lock) takes to guard `path`, whose
+    /// directory exists: `path` with `.lock` appended, in its canonical directory.
+    pub fn lock_file_of(path: impl AsRef<Path>) -> std::io::Result<std::path::PathBuf> {
+        Self::file_lock_path(path.as_ref(), false)
+    }
+
     /// The lock file guarding `path`: `path` with `.lock` appended, in its canonical directory.
     fn file_lock_path(
         path: &Path,
@@ -69,7 +78,7 @@ impl FSLock {
             std::fs::create_dir_all(&path)?;
         }
         let mut path = path.canonicalize()?;
-        file_name.push(".lock");
+        file_name.push(Self::FILE_LOCK_SUFFIX);
         path.push(file_name);
         Ok(path)
     }

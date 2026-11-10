@@ -119,6 +119,9 @@ use crate::filter::LoreFilterExcludeEventData;
 use crate::find::LoreRevisionFindEventData;
 use crate::immutable::LoreFragmentWriteEventData;
 use crate::instance::LoreBranchMultipleInstanceEventData;
+use crate::instance::LoreRepositoryInstanceCloneBeginEventData;
+use crate::instance::LoreRepositoryInstanceCloneCompleteEventData;
+use crate::instance::LoreRepositoryInstanceCloneProgressEventData;
 use crate::instance::LoreRepositoryInstanceDeleteBeginEventData;
 use crate::instance::LoreRepositoryInstanceDeleteCompleteEventData;
 use crate::instance::LoreRepositoryInstanceDeleteProgressEventData;
@@ -1337,6 +1340,12 @@ pub enum LoreEvent {
     RepositoryInstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData),
     /// The completion of an instance move operation.
     RepositoryInstanceMoveComplete(LoreRepositoryInstanceMoveCompleteEventData),
+    /// The start of an instance clone operation.
+    RepositoryInstanceCloneBegin(LoreRepositoryInstanceCloneBeginEventData),
+    /// Progress during an instance clone operation.
+    RepositoryInstanceCloneProgress(LoreRepositoryInstanceCloneProgressEventData),
+    /// The completion of an instance clone operation.
+    RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

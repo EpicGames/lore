@@ -45,6 +45,9 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore repository instance`↴](#lore-repository-instance)
 * [`lore repository instance list`↴](#lore-repository-instance-list)
 * [`lore repository instance prune`↴](#lore-repository-instance-prune)
+* [`lore repository instance delete`↴](#lore-repository-instance-delete)
+* [`lore repository instance move`↴](#lore-repository-instance-move)
+* [`lore repository instance clone`↴](#lore-repository-instance-clone)
 * [`lore repository config`↴](#lore-repository-config)
 * [`lore repository config get`↴](#lore-repository-config-get)
 * [`lore repository update-path`↴](#lore-repository-update-path)
@@ -580,9 +583,20 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now
   hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when
   it is not mounted
+* `delete` — Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and
+  delete associated directories
+* `move` — Move the current instance to a new path
+* `clone` — Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged
+  state. The clone shares the instance's data blocks, and is refused where the destination's filesystem or volume
+  cannot share them unless --allow-copy is given. The instance must use a shared store and not be a virtual clone, and
+  the path must not be inside another instance. While the clone runs, commands on the instance, and commands from
+  other processes on every instance over the store, wait for it where they open the store. An instance delete waits
+  too, since it opens the store to deregister the instance before it removes any file. An instance move renames the
+  instance before it opens the store, so a move makes the clone fail, or on Windows is refused while the clone lists
+  one of its directories
 
 ## `lore repository instance list`
 
@@ -592,11 +606,50 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a
+Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a
 different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not
 mounted
 
 **Usage:** `lore repository instance prune`
+
+## `lore repository instance delete`
+
+Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and delete associated
+directories
+
+**Usage:** `lore repository instance delete`
+
+## `lore repository instance move`
+
+Move the current instance to a new path
+
+**Usage:** `lore repository instance move <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Target path to move the instance to
+
+## `lore repository instance clone`
+
+Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged state. The
+clone shares the instance's data blocks, and is refused where the destination's filesystem or volume cannot share them
+unless --allow-copy is given. The instance must use a shared store and not be a virtual clone, and the path must not be
+inside another instance. While the clone runs, commands on the instance, and commands from other processes on every
+instance over the store, wait for it where they open the store. An instance delete waits too, since it opens the store
+to deregister the instance before it removes any file. An instance move renames the instance before it opens the
+store, so a move makes the clone fail, or on Windows is refused while the clone lists one of its directories
+
+**Usage:** `lore repository instance clone [OPTIONS] <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Path to create the clone at; it must not exist, and must be on the instance's volume for the clone
+  to share its data blocks
+
+###### **Options:**
+
+* `--allow-copy` — Copy the instance's files where the clone cannot share their data blocks, rather than refusing. A
+  copy takes as long as writing every file, and commands wait for it as they wait for every clone
 
 ## `lore repository config`
 

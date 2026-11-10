@@ -16,8 +16,8 @@ parking_lot = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { workspace = true }
 
-# For the uring backend's eventfd and poll, the thread disk priority, and the error codes that
-# tell a mount point.
+# For the uring backend's eventfd and poll, the thread disk priority, the error codes that tell
+# a mount point, and the clone backends' `clonefile`, `fcopyfile`, `FICLONE`, `statfs` and `statvfs`.
 [target.'cfg(target_family = "unix")'.dependencies]
 libc = { workspace = true }
 
@@ -34,6 +34,10 @@ windows-sys = { workspace = true, features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # `FSCTL_DUPLICATE_EXTENTS_TO_FILE` and the integrity and sparse controls the ReFS clone
+    # backend issues with it, and the reparse-point controls the clone copies a link or
+    # junction with.
+    "Win32_System_Ioctl",
     # For IO_REPARSE_TAG_MOUNT_POINT, which tells a directory that a rename would move without
     # the files it leads to.
     "Win32_System_SystemServices",

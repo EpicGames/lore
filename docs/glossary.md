@@ -71,7 +71,7 @@ A command-line interface (CLI) is the text-based way to drive Lore, through the 
 
 ### Clone
 
-The act of creating a local repository instance from a remote URL (`lore clone`), and the resulting repository instance. Lore-native — not a Git-ism.
+The act of creating a local repository instance from a remote URL (`lore clone`), and the resulting repository instance. An instance clone (`lore repository instance clone`) creates one from an instance already on the machine instead, sharing its data blocks, or copying them where the user allows it. Lore-native — not a Git-ism.
 
 Compare to: repository instance.
 
@@ -258,6 +258,12 @@ A typed key-value blob attached to a file, revision, branch, or repository — t
 
 Also see: immutable store, mutable store.
 
+### Modified-time record
+
+The time at which a file of an instance last held its revision's content, kept so a scan can skip hashing a file whose time has not moved: in the instance's Lore directory, or in the mutable store for an SWFS or in-memory instance. An instance clone carries its source's records.
+
+Also see: repository instance.
+
 ### Multi-tenancy
 
 Hosting many unrelated repositories on one backend deployment without cross-tenant content leakage, even when tenants can guess each other's content hashes. It's enforced by partition-scoped access.
@@ -302,7 +308,7 @@ Also see: sync.
 
 ### Repository instance
 
-A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
+A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`, or copied from another instance on the machine by `lore repository instance clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
 
 Also see: shared store, working tree.
 
@@ -393,7 +399,7 @@ A version control system (VCS) is software that records and manages changes to f
 
 ### View filter
 
-A client-side, glob-based inbound filter (`.lore/view`) declaring which paths are materialized to disk. It's applied on every materialization — clone, sync, branch switch, reset — not only at clone time, and local to an instance so it never travels with a clone. Mechanically close to a Perforce stream view but per-instance; closest Git analog: sparse-checkout. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
+A client-side, glob-based inbound filter (`.lore/view`) declaring which paths are materialized to disk. It's applied on every materialization — clone, sync, branch switch, reset — not only at clone time, and local to an instance so it never travels with a clone from a remote; an instance clone copies it with the rest of the Lore directory. Mechanically close to a Perforce stream view but per-instance; closest Git analog: sparse-checkout. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
 
 Compare to: ignore file.
 

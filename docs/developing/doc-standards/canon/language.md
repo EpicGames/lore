@@ -118,8 +118,8 @@ Lore-native primitives. Use as written; define inline on first use.
 | `latest` | The local pointer to the most recent revision on a branch. Lore's analog to Git's `HEAD`, but per-branch and not exposed as a roving pointer. |
 | `working tree` | The on-disk state of a repository instance. |
 | `stage` | The set of changes recorded for the next commit. The verb (`lore stage`) and the noun. |
-| `repository instance` | An addressable copy of a repository on a peer. Created by `lore clone`. |
-| `clone` | The act (`lore clone`) and the resulting repository instance. Lore-native — not a Git-ism. |
+| `repository instance` | An addressable copy of a repository on a peer. Created by `lore clone`, or by `lore repository instance clone` from another instance. |
+| `clone` | The act (`lore clone`) and the resulting repository instance; `lore repository instance clone` makes one from an instance already on the machine. Lore-native — not a Git-ism. |
 | `fragment` | Lore's content-addressed unit of storage. |
 | `sync` | Lore's analog to Git's `pull`. |
 | `view filter` | Client-side glob-based path include/exclude, user-defined per instance and changeable in place (`lore clone --view`, `lore sync --view`). Close to a P4 stream view, but per-instance rather than server-side. Closest Git analog: sparse-checkout. |

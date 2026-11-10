@@ -41,6 +41,8 @@ pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
 pub use lore_revision::auth::AuthMode;
 pub use lore_revision::auth::AuthPath;
 pub use lore_revision::auth::UnknownAuthMode;
+pub use lore_revision::instance::LoreRepositoryInstanceCloneMethod;
+pub use lore_revision::instance::LoreRepositoryInstanceClonePhase;
 pub use lore_revision::repository::LoreSharedStoreMode;
 
 use crate::call_delegation::dispatch_command;
@@ -8197,6 +8199,73 @@ pub extern "C" fn lore_repository_instance_move(
 pub extern "C" fn lore_repository_instance_move_async(
     globals: &LoreGlobalArgs,
     args: &LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRepositoryInstanceCloneArgs = crate::repository::LoreRepositoryInstanceCloneArgs;
+
+/// Clone the current repository instance to `args->target_path`, sharing its data blocks where
+/// the destination allows it, and register the clone as an instance of its own on the same
+/// revision, branch and staged state. The clone holds the instance's and the store's locks while
+/// it copies, so other calls on the instance, and calls from other processes on the store, that
+/// open the store wait for it. An instance delete waits too, since it opens the store to deregister
+/// the instance before it removes any file. An instance move renames the instance before it opens
+/// the store, so a move makes the clone fail, or on Windows is refused while the clone lists one of
+/// its directories. `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_BEGIN` says how the clone is made, once the
+/// instance's store and the destination have passed their checks and before any of the instance
+/// is copied; a refusal before that, of the store or the destination, comes only with the
+/// completion. Delivers `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_PROGRESS` per phase, and each event
+/// interval (`globals->event_interval_ms`) while it copies, and
+/// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE`, which names the new instance.
+///
+/// Fails with:
+/// - error code 9 (not supported) for a clone that cannot share blocks while `args->allow_copy`
+///   is zero, refused before anything is copied or, for an entry that turns out not to share
+///   blocks, partway through the copy; and for an instance with a local store or a virtual
+///   clone, whatever `args->allow_copy` is;
+/// - error code 3 (invalid arguments) for a destination that exists before the clone moves into
+///   place, names no directory, has no parent directory that can be resolved, has a name too
+///   long for the directory the clone writes beside it, is nested in another instance or a
+///   virtual clone's mount, or is where another live instance is registered, and where a path
+///   inside the copy is taken while the clone writes it;
+/// - error code 4 (invalid path) where the instance's Lore directory lies outside its tree;
+/// - error code 118 (oversized) for a copy the destination has no room for, and where a volume the
+///   clone writes fills while it runs;
+/// - error code 82 (file not found) where the instance, or an entry the clone needs, is moved or
+///   removed while it is copied.
+///
+/// Failures every repository call can report, such as code 89 (repository not found), are
+/// reported as for those calls; any other failure of the clone is internal.
+///
+/// A failure while the clone registers itself, after it is at `args->target_path`, leaves the
+/// instance there; it registers itself when a write command next opens it. A failure before that
+/// leaves nothing at `args->target_path`: the call returns once it has tried to remove what the
+/// clone copied, which takes minutes for a large tree; what it cannot remove the next clone to the
+/// same destination removes.
+///
+/// With `dry_run` set in `globals`, runs the checks that take no lock, sending
+/// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_BEGIN` as the clone does, fails as the clone would where
+/// one of those checks refuses it, and otherwise sends a
+/// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE` with a zero instance ID, and writes nothing but
+/// the probe files it removes again. The checks for
+/// another live instance registered at the destination and for a branch to clone need the store,
+/// so only the clone itself makes them.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_clone(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceCloneArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_clone`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_clone_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceCloneArgs,
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, dispatch_command);

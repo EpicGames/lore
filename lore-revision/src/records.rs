@@ -48,7 +48,7 @@ pub const RECORDS_DIR: &str = "records";
 /// File in [`RECORDS_DIR`] that marks an instance as one that has never kept records in the
 /// mutable store. See [`mark_new_instance`].
 #[lore_macro::test_pub]
-const NO_STORE_RECORDS: &str = "no-store";
+pub(crate) const NO_STORE_RECORDS: &str = "no-store";
 
 const SHARD_COUNT: usize = 256;
 #[lore_macro::test_pub]
@@ -566,18 +566,32 @@ pub async fn mark_new_instance(
     dot_path: &Path,
     _token: &RepositoryWriteToken,
 ) -> std::io::Result<()> {
-    let directory = dot_path.join(RECORDS_DIR);
-    match lore_io::IoDriver::global().remove_dir_all(&directory).await {
+    match lore_io::IoDriver::global()
+        .remove_dir_all(dot_path.join(RECORDS_DIR))
+        .await
+    {
         Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err),
         _ => {}
     }
+    mark_holding_no_store_records(dot_path).await
+}
+
+/// Marks the instance whose Lore directory is `dot_path` as one that has never kept records in
+/// the mutable store, as [`mark_new_instance`] does, without clearing the records the directory
+/// holds.
+///
+/// # Errors
+///
+/// The error writing the mark.
+pub(crate) async fn mark_holding_no_store_records(dot_path: &Path) -> std::io::Result<()> {
+    let directory = dot_path.join(RECORDS_DIR);
     lore_io::IoDriver::global()
         .create_dir_all(&directory)
         .await?;
     lore_io::IoDriver::global()
         .write_file_bytes(directory.join(NO_STORE_RECORDS), bytes::Bytes::new(), false)
-        .await?;
-    Ok(())
+        .await
+        .map(drop)
 }
 
 fn header() -> [u8; HEADER_SIZE] {

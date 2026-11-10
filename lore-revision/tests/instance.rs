@@ -7,10 +7,18 @@ mod tests {
     use std::time::Duration;
 
     use futures::StreamExt;
+    use lore_base::error::NotSupported;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
     use lore_revision::branch;
+    use lore_revision::fs::filesystem_provider::CloneAnswer;
+    use lore_revision::fs::filesystem_provider::CloneRun;
+    use lore_revision::fs::filesystem_provider::FilesystemProvider;
+    use lore_revision::fs::filesystem_provider::FsError;
+    use lore_revision::fs::filesystem_provider::InstanceCloneError;
+    use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
+    use lore_revision::fs::os::OsFilesystem;
     use lore_revision::instance::ANCHOR_CURRENT;
     use lore_revision::instance::ANCHOR_CURRENT_BRANCH;
     use lore_revision::instance::ANCHOR_STAGED;
@@ -25,6 +33,7 @@ mod tests {
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;
     use lore_revision::repository;
+    use lore_revision::repository::CONFIG;
     use lore_revision::repository::DOT_LORE;
     use lore_revision::repository::INSTANCE;
     use lore_revision::repository::RepositoryAccess;
@@ -33,6 +42,7 @@ mod tests {
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::repository::SALT_LORE;
     use lore_revision::repository::SharedStoreToUseConfig;
+    use lore_storage::Hash;
     use lore_storage::store_types::KeyType;
 
     include!("helper.rs");
@@ -1153,6 +1163,1451 @@ mod tests {
                     instance_ids(&list_instances(&repository).await.expect("list failed")),
                     vec![current]
                 );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A new instance at `root` on the shared store at `shared`, as `lore repository create`
+    /// leaves it, opened as `lore repository instance clone` opens it: for writing, holding its
+    /// repository lock alone. It has a branch and no revision yet.
+    async fn new_shared_store_instance(root: &Path, shared: &Path) -> Arc<RepositoryContext> {
+        let config = RepositoryConfig {
+            remote_url: Some("lore://localhost/lore-instance-clone-test".to_string()),
+            shared_store_to_use: Some(SharedStoreToUseConfig {
+                use_shared_store: Some(true),
+                shared_store_path: Some(shared.display().to_string()),
+            }),
+            ..RepositoryConfig::default()
+        };
+        {
+            let write_token = RepositoryWriteToken::acquire(root).await;
+            repository::create_local(
+                root,
+                &write_token,
+                RepositoryId::from(uuid::Uuid::now_v7()),
+                Context::from(uuid::Uuid::now_v7()),
+                branch::DEFAULT_DEFAULT_NAME.to_string(),
+                config,
+                false,
+            )
+            .await
+            .expect("create_local failed");
+        }
+        test_file_write(&root.join("tracked.txt"), b"tracked");
+        let write_token = RepositoryWriteToken::acquire(root).await;
+        repository::load_and_connect_exclusive(root, write_token)
+            .await
+            .expect("load_and_connect_exclusive failed")
+    }
+
+    /// [`new_shared_store_instance`] with a current revision, branch and staged state of its
+    /// own, each different.
+    async fn shared_store_checkout(root: &Path, shared: &Path) -> Arc<RepositoryContext> {
+        let repository = new_shared_store_instance(root, shared).await;
+        let handle = repository
+            .try_write_mutable_store()
+            .expect("a write context");
+        for function in [ANCHOR_CURRENT, ANCHOR_CURRENT_BRANCH, ANCHOR_STAGED] {
+            let (key, key_type) = anchor_key(SALT_LORE, function, repository.instance_id);
+            handle
+                .store(
+                    repository.id,
+                    key,
+                    Hash::from_context(Context::from(uuid::Uuid::now_v7())),
+                    key_type,
+                )
+                .await
+                .expect("store an anchor");
+        }
+        repository
+    }
+
+    /// The anchors of `instance_id`, in the order current revision, branch, staged.
+    async fn anchors_of(repository: &RepositoryContext, instance_id: InstanceId) -> Vec<Hash> {
+        let mut anchors = Vec::new();
+        for function in [ANCHOR_CURRENT, ANCHOR_CURRENT_BRANCH, ANCHOR_STAGED] {
+            let (key, key_type) = anchor_key(SALT_LORE, function, instance_id);
+            anchors.push(
+                repository
+                    .read_mutable_store()
+                    .load(repository.id, key, key_type)
+                    .await
+                    .unwrap_or_default(),
+            );
+        }
+        anchors
+    }
+
+    /// A directory holding a file, whose permissions keep its owner from adding or removing
+    /// entries, made writable again when dropped so the test's directory can be removed.
+    struct ReadOnly(#[cfg_attr(not(target_family = "unix"), allow(dead_code))] std::path::PathBuf);
+
+    impl ReadOnly {
+        fn new(path: &Path) -> Self {
+            std::fs::create_dir_all(path).expect("create the directory");
+            test_file_write(&path.join("file"), b"file");
+            #[cfg(target_family = "unix")]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+                    .expect("make it read-only");
+            }
+            Self(path.to_path_buf())
+        }
+    }
+
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            #[cfg(target_family = "unix")]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+
+    /// The entries of `parent` other than `kept`, as names.
+    fn entries_besides(parent: &Path, kept: &[&Path]) -> Vec<String> {
+        std::fs::read_dir(parent)
+            .expect("read the parent")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| !kept.contains(&path.as_path()))
+            .map(|path| path.display().to_string())
+            .collect()
+    }
+
+    /// Plans, makes and finishes a clone of `repository` to `destination`, as the command does.
+    /// Tests that check what a clone carries pass `allow_copy`, so they also run on volumes that
+    /// cannot clone, as CI's NTFS and ext4 volumes are.
+    async fn clone_instance(
+        repository: &Arc<RepositoryContext>,
+        destination: &Path,
+        allow_copy: bool,
+    ) -> Result<(), instance::InstanceError> {
+        let destination = destination.display().to_string();
+        let Some(plan) =
+            instance::instance_clone_plan(repository.clone(), &destination, allow_copy).await?
+        else {
+            return Ok(());
+        };
+        let cloned = instance::instance_clone(repository.clone(), &plan).await;
+        instance::instance_clone_finish(plan).await;
+        cloned
+    }
+
+    /// A filesystem provider that answers `answer` for every clone and clones through the OS
+    /// provider, or fails partway when `fails` is set, as a backend does when an entry it
+    /// promised to share cannot be cloned.
+    struct AnsweringProvider {
+        answer: CloneAnswer,
+        fails: bool,
+        os: OsFilesystem,
+    }
+
+    #[async_trait::async_trait]
+    impl FilesystemProvider for AnsweringProvider {
+        async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+            FilesystemProvider::begin_operation(&self.os).await
+        }
+
+        async fn clone_answer(
+            &self,
+            _source: &Path,
+            _dot_path: &Path,
+            _destination: &Path,
+        ) -> Result<CloneAnswer, InstanceCloneError> {
+            Ok(self.answer.clone())
+        }
+
+        async fn clone_instance(
+            &self,
+            source: &Path,
+            dot_path: &Path,
+            destination: &Path,
+            answer: &CloneAnswer,
+            copy_unclonable: bool,
+            run: &CloneRun,
+        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+            if self.fails {
+                return Err(NotSupported {
+                    operation: "cloning an entry".to_string(),
+                }
+                .into());
+            }
+            self.os
+                .clone_instance(source, dot_path, destination, answer, copy_unclonable, run)
+                .await
+        }
+    }
+
+    fn answering(root: &Path, answer: CloneAnswer, fails: bool) -> Arc<dyn FilesystemProvider> {
+        Arc::new(AnsweringProvider {
+            answer,
+            fails,
+            os: OsFilesystem::new(root),
+        })
+    }
+
+    /// The answer of a provider that cannot share blocks on the volume of `root`: copying `size`
+    /// with `available` free.
+    fn copies(root: &Path, size: u64, available: u64) -> CloneAnswer {
+        CloneAnswer::CopiesBytes {
+            reason: "the volume does not clone files".to_string(),
+            size: lore_io::clone::TreeSize {
+                size,
+                file_count: 1,
+                entry_count: 1,
+            },
+            volume: lore_io::clone::volume_of(root).expect("the volume"),
+            available,
+        }
+    }
+
+    /// A clone gets an instance ID of its own, the source's anchors, a registration at its path,
+    /// and the source's files and modified-time records, including those not yet written back. It
+    /// leaves the source's lock file behind, carries no mark of a clone in progress, and leaves
+    /// nothing beside it.
+    #[tokio::test]
+    async fn an_instance_clone_has_its_own_id_and_the_source_anchors_and_records() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-shared-");
+                let root = TempDir::new("lore-instance-clone-root-");
+                let parent = TempDir::new("lore-instance-clone-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let source = repository.instance_id;
+                let record: lore_revision::records::RecordKey = [1u8; 16];
+                repository
+                    .instance_records()
+                    .expect("the instance keeps its records on disk")
+                    .set(record, 42)
+                    .await;
+                let destination = parent.join("clone");
+
+                clone_instance(&repository, &destination, true)
+                    .await
+                    .expect("instance_clone failed");
+
+                let dot = destination.join(DOT_LORE);
+                let clone = InstanceId::read_from_file(dot.join(INSTANCE)).expect("clone ID");
+                assert_ne!(clone, source, "the clone needs an instance ID of its own");
+                assert_eq!(
+                    std::fs::read(destination.join("tracked.txt")).expect("read the clone"),
+                    b"tracked"
+                );
+                assert!(
+                    dot.join(lore_revision::records::RECORDS_DIR)
+                        .join("01")
+                        .is_file(),
+                    "records held in memory are written back before the copy"
+                );
+                assert!(
+                    dot.join(lore_revision::records::RECORDS_DIR)
+                        .join(lore_revision::records::NO_STORE_RECORDS)
+                        .is_file(),
+                    "the clone is marked as holding no store records"
+                );
+                assert!(
+                    root.join(DOT_LORE).join("lock").exists() && !dot.join("lock").exists(),
+                    "the lock file does not carry over"
+                );
+                assert!(!dot.join(instance::CLONE_IN_PROGRESS_MARK).exists());
+                let source_anchors = anchors_of(&repository, source).await;
+                assert!(!source_anchors[0].is_zero());
+                assert_eq!(anchors_of(&repository, clone).await, source_anchors);
+                let instances = list_instances(&repository).await.expect("list failed");
+                let registered = instances
+                    .iter()
+                    .find(|instance| instance.instance_id == clone)
+                    .expect("the clone is registered");
+                let resolved = destination.canonicalize().expect("resolve the clone");
+                assert_eq!(
+                    registered.path,
+                    lore_revision::util::path::clean(resolved.to_string_lossy().into_owned())
+                );
+                assert_eq!(
+                    entries_besides(&parent, &[&destination]),
+                    Vec::<String>::new(),
+                    "no in-progress directory or lock file is left beside the clone"
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// An instance before its first commit has a branch and no revision, and its clone takes
+    /// the same.
+    #[tokio::test]
+    async fn a_clone_of_an_instance_with_no_revision_yet_takes_its_branch() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-new-shared-");
+                let root = TempDir::new("lore-instance-clone-new-root-");
+                let parent = TempDir::new("lore-instance-clone-new-parent-");
+                let repository = new_shared_store_instance(&root, &shared).await;
+                let destination = parent.join("clone");
+
+                clone_instance(&repository, &destination, true)
+                    .await
+                    .expect("a new instance is cloned");
+
+                let clone = InstanceId::read_from_file(destination.join(DOT_LORE).join(INSTANCE))
+                    .expect("clone ID");
+                let source_anchors = anchors_of(&repository, repository.instance_id).await;
+                assert!(source_anchors[0].is_zero(), "no revision yet");
+                assert!(!source_anchors[1].is_zero(), "a branch");
+                assert_eq!(anchors_of(&repository, clone).await, source_anchors);
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone of an instance an older client made, which is not marked as holding no store
+    /// records, is marked: its new instance ID has none.
+    #[tokio::test]
+    async fn a_clone_of_an_unmarked_instance_is_marked() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-unmarked-shared-");
+                let root = TempDir::new("lore-instance-clone-unmarked-root-");
+                let parent = TempDir::new("lore-instance-clone-unmarked-parent-");
+                let mark = |root: &Path| {
+                    root.join(DOT_LORE)
+                        .join(lore_revision::records::RECORDS_DIR)
+                        .join(lore_revision::records::NO_STORE_RECORDS)
+                };
+                let repository = shared_store_checkout(&root, &shared).await;
+                std::fs::remove_file(mark(&root)).expect("unmark the source");
+                let destination = parent.join("clone");
+
+                clone_instance(&repository, &destination, true)
+                    .await
+                    .expect("instance_clone failed");
+
+                assert!(mark(&destination).is_file(), "the clone is marked");
+                assert!(!mark(&root).exists(), "the source is left as it was");
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone whose last step fails leaves its in-progress directory until it is finished, then
+    /// nothing at the destination or beside it, a read-only directory it copied included, and no
+    /// keys for the clone in the store.
+    #[tokio::test]
+    async fn a_failed_instance_clone_leaves_no_instance_behind() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-fail-shared-");
+                let root = TempDir::new("lore-instance-clone-fail-root-");
+                let parent = TempDir::new("lore-instance-clone-fail-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let _read_only = ReadOnly::new(&root.join("read-only"));
+                let destination = parent.join("clone");
+                let plan = instance::instance_clone_plan(
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                let result = instance::instance_clone_with(
+                    repository.clone(),
+                    &plan,
+                    async |_: &Path, _: &Path| Err(std::io::Error::other("refused")),
+                    instance::register_clone,
+                )
+                .await;
+
+                assert!(result.is_err());
+                assert!(
+                    plan.in_progress().is_dir(),
+                    "the in-progress directory stays until the clone is finished"
+                );
+                let clone_id = plan.clone_id();
+                instance::instance_clone_finish(plan).await;
+                assert!(!destination.exists());
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+                assert_eq!(
+                    instance_ids(&list_instances(&repository).await.expect("list failed")),
+                    vec![repository.instance_id],
+                    "the clone has no registration"
+                );
+                assert_eq!(
+                    anchors_of(&repository, clone_id).await,
+                    vec![Hash::default(); 3],
+                    "the clone's anchors are removed"
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone cancelled after its plan and before its copy starts, as a command dropped while it
+    /// waits for the instance's lock is, leaves nothing beside the destination: no in-progress
+    /// directory and no lock file.
+    #[tokio::test]
+    async fn a_clone_cancelled_before_its_copy_leaves_no_lock_file() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-cancelled-shared-");
+                let root = TempDir::new("lore-instance-clone-cancelled-root-");
+                let parent = TempDir::new("lore-instance-clone-cancelled-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let plan = instance::instance_clone_plan(
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+                assert_eq!(
+                    entries_besides(&parent, &[]).len(),
+                    1,
+                    "the plan holds the in-progress directory's lock file"
+                );
+
+                drop(plan);
+
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// An empty directory made at the destination after the clone checked it, and before the
+    /// clone moves into place, is kept: the move refuses to replace it, and the clone fails as
+    /// invalid arguments, leaving nothing beside the destination once it is finished.
+    #[tokio::test]
+    async fn a_directory_made_at_the_destination_before_the_move_is_kept() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-kept-shared-");
+                let root = TempDir::new("lore-instance-clone-kept-root-");
+                let parent = TempDir::new("lore-instance-clone-kept-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let plan = instance::instance_clone_plan(
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                let result = instance::instance_clone_with(
+                    repository.clone(),
+                    &plan,
+                    async |from: &Path, to: &Path| {
+                        std::fs::create_dir(to).expect("make a directory there");
+                        instance::move_clone_into_place(from, to).await
+                    },
+                    instance::register_clone,
+                )
+                .await;
+                instance::instance_clone_finish(plan).await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_invalid_arguments()),
+                    "{:?}",
+                    result.err()
+                );
+                assert_eq!(
+                    std::fs::read_dir(&destination)
+                        .expect("the directory is kept")
+                        .count(),
+                    0,
+                    "and stays empty"
+                );
+                assert_eq!(
+                    entries_besides(&parent, &[destination.as_path()]),
+                    Vec::<String>::new()
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone stopped as it moves into place leaves an in-progress copy that names its own ID,
+    /// never the source's, and no registration. The next clone to the same destination removes
+    /// the copy.
+    #[tokio::test]
+    async fn an_interrupted_instance_clone_leaves_no_registration_and_is_removed_by_the_next() {
+        use futures::FutureExt;
+
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-crash-shared-");
+                let root = TempDir::new("lore-instance-clone-crash-root-");
+                let parent = TempDir::new("lore-instance-clone-crash-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let plan = instance::instance_clone_plan(
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                let interrupted = std::panic::AssertUnwindSafe(instance::instance_clone_with(
+                    repository.clone(),
+                    &plan,
+                    async |_: &Path, _: &Path| panic!("interrupted before the move"),
+                    instance::register_clone,
+                ))
+                .catch_unwind()
+                .await;
+                let left = plan.in_progress().to_path_buf();
+                // The process ends without finishing, which releases the in-progress lock.
+                drop(plan);
+
+                assert!(interrupted.is_err());
+                assert!(!destination.exists());
+                let left_id = InstanceId::read_from_file(left.join(DOT_LORE).join(INSTANCE))
+                    .expect("the in-progress copy names an instance");
+                assert_ne!(left_id, repository.instance_id);
+                assert_eq!(
+                    instance_ids(&list_instances(&repository).await.expect("list failed")),
+                    vec![repository.instance_id]
+                );
+
+                clone_instance(&repository, &destination, true)
+                    .await
+                    .expect("clone again");
+                assert_eq!(
+                    entries_besides(&parent, &[&destination]),
+                    Vec::<String>::new(),
+                    "the interrupted clone's in-progress directory and lock file are removed"
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone removes beside its destination only a directory an interrupted clone left: one
+    /// named for a clone to that destination, with a `UUIDv7` instance ID, and holding the mark of
+    /// a clone in progress. A directory named like one but unmarked, or named otherwise, stays.
+    #[tokio::test]
+    async fn only_a_marked_clone_left_in_progress_is_removed() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-leftover-shared-");
+                let root = TempDir::new("lore-instance-clone-leftover-root-");
+                let parent = TempDir::new("lore-instance-clone-leftover-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let left = parent.join(format!("clone.cloning-{}", InstanceId::generate()));
+                let unmarked = parent.join(format!("clone.cloning-{}", InstanceId::generate()));
+                let named_otherwise = parent.join("clone.cloning-notes");
+                std::fs::create_dir_all(left.join(DOT_LORE)).expect("create the leftover");
+                test_file_write(
+                    &left.join(DOT_LORE).join(instance::CLONE_IN_PROGRESS_MARK),
+                    b"",
+                );
+                for kept in [&unmarked, &named_otherwise] {
+                    std::fs::create_dir_all(kept.join(DOT_LORE)).expect("create a sibling");
+                    test_file_write(&kept.join("kept.txt"), b"kept");
+                }
+
+                clone_instance(&repository, &destination, true)
+                    .await
+                    .expect("instance_clone failed");
+
+                assert!(!left.exists(), "the marked leftover is removed");
+                assert!(unmarked.join("kept.txt").is_file());
+                assert!(named_otherwise.join("kept.txt").is_file());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// An in-progress directory whose clone still holds its lock is not taken for a leftover.
+    #[tokio::test]
+    async fn a_clone_in_progress_keeps_its_directory_from_another() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-busy-shared-");
+                let root = TempDir::new("lore-instance-clone-busy-root-");
+                let parent = TempDir::new("lore-instance-clone-busy-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let first = instance::instance_clone_plan(
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+                std::fs::create_dir_all(first.in_progress().join(DOT_LORE))
+                    .expect("start the first clone");
+                test_file_write(
+                    &first
+                        .in_progress()
+                        .join(DOT_LORE)
+                        .join(instance::CLONE_IN_PROGRESS_MARK),
+                    b"",
+                );
+
+                let second = instance::instance_clone_plan(
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                assert!(
+                    first.in_progress().is_dir(),
+                    "a clone in progress keeps its directory"
+                );
+                instance::instance_clone_finish(second).await;
+                instance::instance_clone_finish(first).await;
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A provider that cannot clone, as a virtual instance's is, is refused before anything is
+    /// written, even with a copy allowed.
+    #[tokio::test]
+    async fn an_instance_clone_the_provider_cannot_make_is_refused() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-unsupported-shared-");
+                let root = TempDir::new("lore-instance-clone-unsupported-root-");
+                let parent = TempDir::new("lore-instance-clone-unsupported-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let provider = answering(
+                    &root,
+                    CloneAnswer::Unsupported {
+                        reason: "this filesystem provider cannot clone instances".to_string(),
+                    },
+                    false,
+                );
+
+                let result = instance::instance_clone_plan_with(
+                    provider,
+                    repository,
+                    &parent.join("clone").display().to_string(),
+                    true,
+                )
+                .await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_not_supported()),
+                    "an unsupported clone is refused: {:?}",
+                    result.err()
+                );
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone that would copy is refused without a copy allowed, and made with one, by copying.
+    #[tokio::test]
+    async fn an_instance_clone_that_would_copy_needs_a_copy_allowed() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-copy-shared-");
+                let root = TempDir::new("lore-instance-clone-copy-root-");
+                let parent = TempDir::new("lore-instance-clone-copy-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let provider = answering(&root, copies(&root, 7, u64::MAX), false);
+
+                let refused = instance::instance_clone_plan_with(
+                    provider.clone(),
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    false,
+                )
+                .await;
+                assert!(
+                    refused.as_ref().is_err_and(|err| err.is_not_supported()),
+                    "a copy is refused unless allowed: {:?}",
+                    refused.err()
+                );
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+
+                let plan = instance::instance_clone_plan_with(
+                    provider,
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("a copy allowed is planned")
+                .expect("not a dry run");
+                instance::instance_clone(repository.clone(), &plan)
+                    .await
+                    .expect("the copy is made");
+                instance::instance_clone_finish(plan).await;
+
+                assert_eq!(
+                    std::fs::read(destination.join("tracked.txt")).expect("read the copy"),
+                    b"tracked"
+                );
+                assert_eq!(
+                    list_instances(&repository)
+                        .await
+                        .expect("list failed")
+                        .len(),
+                    2
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A copy allowed is still refused, as oversized, when the destination has less room than it
+    /// takes.
+    #[tokio::test]
+    async fn an_instance_copy_that_does_not_fit_is_refused() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-space-shared-");
+                let root = TempDir::new("lore-instance-clone-space-root-");
+                let parent = TempDir::new("lore-instance-clone-space-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+
+                let result = instance::instance_clone_plan_with(
+                    answering(&root, copies(&root, 100, 99), false),
+                    repository,
+                    &parent.join("clone").display().to_string(),
+                    true,
+                )
+                .await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_oversized()),
+                    "a copy that does not fit is refused: {:?}",
+                    result.err()
+                );
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone whose backend cannot clone an entry it promised to share fails as not supported,
+    /// and leaves no instance behind.
+    #[tokio::test]
+    async fn an_instance_clone_that_fails_partway_leaves_no_instance_behind() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-partway-shared-");
+                let root = TempDir::new("lore-instance-clone-partway-root-");
+                let parent = TempDir::new("lore-instance-clone-partway-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let shares = CloneAnswer::SharesBlocks {
+                    backend: lore_io::clone::Backend::Apfs,
+                    volume: lore_io::clone::volume_of(&root).expect("the volume"),
+                    entry_by_entry: Default::default(),
+                };
+                let plan = instance::instance_clone_plan_with(
+                    answering(&root, shares, true),
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    false,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                let result = instance::instance_clone(repository.clone(), &plan).await;
+                instance::instance_clone_finish(plan).await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_not_supported()),
+                    "{:?}",
+                    result.err()
+                );
+                assert!(!destination.exists());
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+                assert_eq!(
+                    instance_ids(&list_instances(&repository).await.expect("list failed")),
+                    vec![repository.instance_id]
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A destination that is empty, exists, lies inside an instance, or whose name leaves no room
+    /// for the in-progress directory's name beside it, is refused as invalid arguments, as a move
+    /// refuses such a target.
+    #[tokio::test]
+    async fn a_clone_to_a_destination_that_exists_is_nested_or_is_named_too_long_is_refused() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-refused-shared-");
+                let root = TempDir::new("lore-instance-clone-refused-root-");
+                let parent = TempDir::new("lore-instance-clone-refused-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                std::fs::create_dir(parent.join("taken")).expect("take the destination");
+
+                // A name the in-progress directory beside it would take past 255 bytes.
+                let too_long = parent.join("n".repeat(210));
+                for destination in [
+                    parent.join("taken"),
+                    root.join("inside"),
+                    too_long.clone(),
+                    std::path::PathBuf::new(),
+                ] {
+                    let result = clone_instance(&repository, &destination, true).await;
+                    assert!(
+                        result.as_ref().is_err_and(|err| err.is_invalid_arguments()),
+                        "{}: {:?}",
+                        destination.display(),
+                        result.err()
+                    );
+                }
+                assert!(!root.join("inside").exists());
+                assert!(!too_long.exists());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// An instance with stores of its own is refused, since the clone's anchors and registration
+    /// would be written to stores the copy does not read.
+    #[tokio::test]
+    async fn a_local_store_instance_clone_is_refused() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let root = TempDir::new("lore-instance-clone-local-root-");
+                let parent = TempDir::new("lore-instance-clone-local-parent-");
+                create_checkout(&root).await;
+                let write_token = RepositoryWriteToken::acquire(&root).await;
+                let repository = repository::load_and_connect_exclusive(&root, write_token)
+                    .await
+                    .expect("load_and_connect_exclusive failed");
+
+                let result = clone_instance(&repository, &parent.join("clone"), true).await;
+
+                assert!(result.is_err_and(|err| err.is_not_supported()));
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A provider that, while it copies, registers `other` at `target` and makes the destination
+    /// that instance's, as a second clone to the same destination that finishes first does, then
+    /// clones through the OS provider.
+    struct RacingProvider {
+        repository: Arc<RepositoryContext>,
+        other: InstanceId,
+        target: String,
+        os: OsFilesystem,
+    }
+
+    #[async_trait::async_trait]
+    impl FilesystemProvider for RacingProvider {
+        async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+            FilesystemProvider::begin_operation(&self.os).await
+        }
+
+        async fn clone_answer(
+            &self,
+            source: &Path,
+            dot_path: &Path,
+            destination: &Path,
+        ) -> Result<CloneAnswer, InstanceCloneError> {
+            self.os.clone_answer(source, dot_path, destination).await
+        }
+
+        async fn clone_instance(
+            &self,
+            source: &Path,
+            dot_path: &Path,
+            destination: &Path,
+            answer: &CloneAnswer,
+            copy_unclonable: bool,
+            run: &CloneRun,
+        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+            instance::store_instance_registration(&self.repository, self.other, &self.target)
+                .await
+                .expect("register the other instance");
+            let taken = Path::new(&self.target).join(DOT_LORE);
+            std::fs::create_dir_all(&taken).expect("take the destination");
+            self.other
+                .write_to_file(taken.join(INSTANCE))
+                .await
+                .expect("name the other instance");
+            self.os
+                .clone_instance(source, dot_path, destination, answer, copy_unclonable, run)
+                .await
+        }
+    }
+
+    /// A clone whose destination another instance takes and registers while it copies fails at
+    /// the move, and leaves that instance's registration in place.
+    #[tokio::test]
+    async fn a_clone_whose_destination_is_taken_meanwhile_retires_no_other_instance() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-race-shared-");
+                let root = TempDir::new("lore-instance-clone-race-root-");
+                let parent = TempDir::new("lore-instance-clone-race-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let target = lore_revision::util::path::clean(
+                    parent
+                        .canonicalize()
+                        .expect("resolve the parent")
+                        .join("clone")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                let other = InstanceId::generate();
+                let provider: Arc<dyn FilesystemProvider> = Arc::new(RacingProvider {
+                    repository: repository.clone(),
+                    other,
+                    target,
+                    os: OsFilesystem::new(&root),
+                });
+                let plan = instance::instance_clone_plan_with(
+                    provider,
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                let result = instance::instance_clone(repository.clone(), &plan).await;
+                instance::instance_clone_finish(plan).await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_invalid_arguments()),
+                    "the move finds the destination taken: {:?}",
+                    result.err()
+                );
+                assert!(
+                    instance_ids(&list_instances(&repository).await.expect("list failed"))
+                        .contains(&other),
+                    "the instance that took the destination stays registered"
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A call whose global data directory is `global`.
+    fn execution_in(global: &Path) -> Arc<lore_revision::interface::ExecutionContext> {
+        Arc::new(
+            lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                Default::default(),
+                lore_revision::relay::EventDispatcher::no_dispatch(),
+                "test-user".to_string(),
+            )
+            .with_environment(lore_base::env::CallEnvironment {
+                values: [Some(global.display().to_string()), None],
+            }),
+        )
+    }
+
+    /// A destination that a live instance is registered at, as an SWFS instance outside its
+    /// service is at a path that does not exist, is refused, and that instance stays registered.
+    #[tokio::test]
+    async fn a_clone_to_where_a_live_instance_is_registered_is_refused() {
+        let global = TempDir::new("lore-instance-clone-live-global-");
+        let execution = execution_in(&global);
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-live-shared-");
+                let root = TempDir::new("lore-instance-clone-live-root-");
+                let parent = TempDir::new("lore-instance-clone-live-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let target = lore_revision::util::path::clean(
+                    parent
+                        .canonicalize()
+                        .expect("resolve the parent")
+                        .join("clone")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                let other = InstanceId::generate();
+                let external =
+                    lore_revision::global::external_dir::external_lore_dir(other).expect("dir");
+                std::fs::create_dir_all(&external).expect("make the external directory");
+                std::fs::write(external.join(CONFIG), b"[vfs]\nvfs_type = \"Swfs\"\n")
+                    .expect("write the external config");
+                instance::store_instance_registration(&repository, other, &target)
+                    .await
+                    .expect("register the other instance");
+                assert_eq!(
+                    instance_staleness(&target, other).await,
+                    InstanceStaleness::Active
+                );
+
+                let result = clone_instance(&repository, &destination, true).await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_invalid_arguments()),
+                    "{:?}",
+                    result.err()
+                );
+                assert!(
+                    instance_ids(&list_instances(&repository).await.expect("list failed"))
+                        .contains(&other)
+                );
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A directory a removal renamed aside to `….removing` and did not finish is removed by the
+    /// next clone to the same destination, whatever is left in it.
+    #[tokio::test]
+    async fn a_removal_cut_short_is_finished_by_the_next_clone() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-removing-shared-");
+                let root = TempDir::new("lore-instance-clone-removing-root-");
+                let parent = TempDir::new("lore-instance-clone-removing-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let removing =
+                    parent.join(format!("clone.cloning-{}.removing", InstanceId::generate()));
+                std::fs::create_dir_all(removing.join("partial")).expect("make the leftover");
+                test_file_write(&removing.join("partial/file.txt"), b"partial");
+
+                clone_instance(&repository, &destination, true)
+                    .await
+                    .expect("instance_clone failed");
+
+                assert!(!removing.exists());
+                assert_eq!(
+                    entries_besides(&parent, &[&destination]),
+                    Vec::<String>::new()
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A provider that clones through the OS provider and then gives the source's Lore directory
+    /// another instance's ID, as a move or delete of the source during the copy leaves it.
+    struct ReplacingProvider {
+        os: OsFilesystem,
+    }
+
+    #[async_trait::async_trait]
+    impl FilesystemProvider for ReplacingProvider {
+        async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+            FilesystemProvider::begin_operation(&self.os).await
+        }
+
+        async fn clone_answer(
+            &self,
+            source: &Path,
+            dot_path: &Path,
+            destination: &Path,
+        ) -> Result<CloneAnswer, InstanceCloneError> {
+            self.os.clone_answer(source, dot_path, destination).await
+        }
+
+        async fn clone_instance(
+            &self,
+            source: &Path,
+            dot_path: &Path,
+            destination: &Path,
+            answer: &CloneAnswer,
+            copy_unclonable: bool,
+            run: &CloneRun,
+        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+            let stats = self
+                .os
+                .clone_instance(source, dot_path, destination, answer, copy_unclonable, run)
+                .await;
+            InstanceId::generate()
+                .write_to_file(dot_path.join(INSTANCE))
+                .await
+                .expect("replace the source");
+            stats
+        }
+    }
+
+    /// A source moved or deleted while it is copied fails the clone as not found, leaving no
+    /// instance at the destination and no keys for the clone.
+    #[tokio::test]
+    async fn a_source_moved_during_its_clone_fails_the_clone() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-moved-shared-");
+                let root = TempDir::new("lore-instance-clone-moved-root-");
+                let parent = TempDir::new("lore-instance-clone-moved-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let provider: Arc<dyn FilesystemProvider> = Arc::new(ReplacingProvider {
+                    os: OsFilesystem::new(&root),
+                });
+                let plan = instance::instance_clone_plan_with(
+                    provider,
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                let result = instance::instance_clone(repository.clone(), &plan).await;
+                instance::instance_clone_finish(plan).await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_file_not_found()),
+                    "{:?}",
+                    result.err()
+                );
+                assert!(!destination.exists());
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+                assert_eq!(
+                    instance_ids(&list_instances(&repository).await.expect("list failed")),
+                    vec![repository.instance_id]
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone run on an instance other than the one its plan was made for, as after the source
+    /// was moved away and another instance moved to its path between the two, fails as not
+    /// found and copies nothing.
+    #[tokio::test]
+    async fn a_clone_of_an_instance_other_than_the_planned_one_fails() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-other-shared-");
+                let roots = TempDir::new("lore-instance-clone-other-roots-");
+                let parent = TempDir::new("lore-instance-clone-other-parent-");
+                let (path, other_path) = (roots.join("source"), roots.join("other"));
+                std::fs::create_dir_all(&path).expect("create the source");
+                std::fs::create_dir_all(&other_path).expect("create the other instance");
+                let planned = shared_store_checkout(&path, &shared).await;
+                let other = shared_store_checkout(&other_path, &shared).await;
+                let other_id = other.instance_id;
+                let destination = parent.join("clone");
+                let plan = instance::instance_clone_plan_with(
+                    Arc::new(OsFilesystem::new(&path)),
+                    planned.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+                drop((planned, other));
+                std::fs::rename(&path, roots.join("moved")).expect("move the source away");
+                std::fs::rename(&other_path, &path).expect("move the other instance in");
+                let write_token = RepositoryWriteToken::acquire(&path).await;
+                let there = repository::load_and_connect_exclusive(&path, write_token)
+                    .await
+                    .expect("open the instance at the source's path");
+                assert_eq!(there.instance_id, other_id);
+
+                let result = instance::instance_clone(there.clone(), &plan).await;
+                instance::instance_clone_finish(plan).await;
+
+                assert!(
+                    result.as_ref().is_err_and(|err| err.is_file_not_found()),
+                    "{:?}",
+                    result.err()
+                );
+                assert!(!destination.exists());
+                assert_eq!(entries_besides(&parent, &[]), Vec::<String>::new());
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A clone whose registration fails after it is at its destination leaves it there, with its
+    /// own ID and the source's anchors, and the next write command opened in it registers it.
+    #[tokio::test]
+    async fn a_clone_whose_registration_fails_registers_itself_when_next_opened() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-unregistered-shared-");
+                let root = TempDir::new("lore-instance-clone-unregistered-root-");
+                let parent = TempDir::new("lore-instance-clone-unregistered-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let destination = parent.join("clone");
+                let plan = instance::instance_clone_plan(
+                    repository.clone(),
+                    &destination.display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                let result = instance::instance_clone_with(
+                    repository.clone(),
+                    &plan,
+                    async |from: &Path, to: &Path| std::fs::rename(from, to),
+                    async |_: &Arc<RepositoryContext>, _: InstanceId, _: &str| {
+                        Err(instance::InstanceError::internal(
+                            "the registry is unavailable",
+                        ))
+                    },
+                )
+                .await;
+                instance::instance_clone_finish(plan).await;
+
+                assert!(result.is_err());
+                let clone = InstanceId::read_from_file(destination.join(DOT_LORE).join(INSTANCE))
+                    .expect("the clone is at its destination");
+                assert!(
+                    !destination
+                        .join(DOT_LORE)
+                        .join(instance::CLONE_IN_PROGRESS_MARK)
+                        .exists()
+                );
+                assert_eq!(
+                    anchors_of(&repository, clone).await,
+                    anchors_of(&repository, repository.instance_id).await
+                );
+                assert!(
+                    !instance_ids(&list_instances(&repository).await.expect("list failed"))
+                        .contains(&clone)
+                );
+
+                drop(repository);
+                let token = RepositoryWriteToken::acquire(&destination).await;
+                let opened = repository::load_and_connect_with_token(
+                    &destination,
+                    RepositoryAccess::ReadWrite,
+                    Some(token),
+                )
+                .await
+                .expect("open the clone");
+                assert!(
+                    instance_ids(&list_instances(&opened).await.expect("list failed"))
+                        .contains(&clone),
+                    "opening the clone registers it"
+                );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    /// A provider whose copy runs on a thread of its own until `release` is set, keeping what
+    /// the clone hands it to hold, as the OS provider's blocking copy does, while the future that
+    /// started it never completes. `started` is set once the copy has its hold.
+    struct DetachedProvider {
+        os: OsFilesystem,
+        release: Arc<std::sync::atomic::AtomicBool>,
+        started: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl FilesystemProvider for DetachedProvider {
+        async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+            FilesystemProvider::begin_operation(&self.os).await
+        }
+
+        async fn clone_answer(
+            &self,
+            source: &Path,
+            dot_path: &Path,
+            destination: &Path,
+        ) -> Result<CloneAnswer, InstanceCloneError> {
+            self.os.clone_answer(source, dot_path, destination).await
+        }
+
+        async fn clone_instance(
+            &self,
+            _source: &Path,
+            _dot_path: &Path,
+            _destination: &Path,
+            _answer: &CloneAnswer,
+            _copy_unclonable: bool,
+            run: &CloneRun,
+        ) -> Result<lore_io::clone::CloneStats, InstanceCloneError> {
+            let hold = Arc::clone(&run.hold);
+            let release = Arc::clone(&self.release);
+            self.started
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            std::thread::spawn(move || {
+                while !release.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                drop(hold);
+            });
+            futures::future::pending().await
+        }
+    }
+
+    /// A clone dropped while its copy still runs keeps the source's repository lock until the
+    /// copy ends, so a command on the source waits for it.
+    #[tokio::test]
+    async fn a_dropped_clone_keeps_the_lock_until_its_copy_ends() {
+        // Offline, so the command's open reaches the lock without first dialing the instance's
+        // remote, which nothing serves and which Windows takes seconds to refuse.
+        let execution =
+            test_execution_with(lore_revision::interface::LoreGlobalArgs::default().set_offline());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let shared = TempDir::new("lore-instance-clone-dropped-shared-");
+                let root = TempDir::new("lore-instance-clone-dropped-root-");
+                let parent = TempDir::new("lore-instance-clone-dropped-parent-");
+                let repository = shared_store_checkout(&root, &shared).await;
+                let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let provider: Arc<dyn FilesystemProvider> = Arc::new(DetachedProvider {
+                    os: OsFilesystem::new(&root),
+                    release: Arc::clone(&release),
+                    started: Arc::clone(&started),
+                });
+                let plan = instance::instance_clone_plan_with(
+                    provider,
+                    repository.clone(),
+                    &parent.join("clone").display().to_string(),
+                    true,
+                )
+                .await
+                .expect("plan the clone")
+                .expect("not a dry run");
+
+                // Dropped once its copy has started, however long the clone takes to reach it.
+                let clone = instance::instance_clone(repository.clone(), &plan);
+                let copying = async {
+                    while !started.load(std::sync::atomic::Ordering::Relaxed) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                };
+                tokio::select! {
+                    _ = clone => panic!("the clone never ends while it copies"),
+                    reached = tokio::time::timeout(Duration::from_secs(10), copying) => {
+                        reached.expect("the copy starts");
+                    }
+                }
+                drop(repository);
+
+                // A command on the source reaches the gate of its repository lock and waits
+                // there, without opening the instance, for as long as the copy runs.
+                let dot = root.join(DOT_LORE);
+                let gate = |dot: &Path| {
+                    format!(
+                        "{} waiting to share the lock, {} to hold it alone",
+                        repository::shared_callers_waiting(dot),
+                        repository::exclusive_callers_waiting(dot)
+                    )
+                };
+                let mut opening = std::pin::pin!(repository::load_and_connect_with_token(
+                    &root,
+                    RepositoryAccess::ReadOnly,
+                    None,
+                ));
+                let at_gate = async {
+                    loop {
+                        tokio::select! {
+                            _ = &mut opening => panic!("a command on the source waits for the copy"),
+                            () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                        }
+                        if repository::shared_callers_waiting(&dot) == 1 {
+                            return;
+                        }
+                    }
+                };
+                if tokio::time::timeout(Duration::from_secs(10), at_gate)
+                    .await
+                    .is_err()
+                {
+                    panic!("the command never reached the gate: {}", gate(&dot));
+                }
+
+                release.store(true, std::sync::atomic::Ordering::Relaxed);
+                match tokio::time::timeout(Duration::from_secs(10), opening).await {
+                    Ok(opened) => drop(opened.expect("open the source")),
+                    Err(elapsed) => panic!(
+                        "the lock is not released once the copy ends ({elapsed}): {}",
+                        gate(&dot)
+                    ),
+                }
+                instance::instance_clone_finish(plan).await;
             }))
             .await
             .expect("Test failed");

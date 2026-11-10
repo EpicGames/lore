@@ -279,3 +279,194 @@ fn other_errors_are_not_retried() {
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
     assert_eq!(attempts, 1);
 }
+
+/// The pool lends at most half its cap in all, and starts no more threads than its cap less what
+/// it lent, while work keeps completing on the rest.
+#[tokio::test]
+async fn a_pool_lends_at_most_half_its_cap_and_keeps_the_rest_running() {
+    let pool = SyscallPool::new(8);
+    let first = pool.lend(3);
+    let second = pool.lend(100);
+    let third = pool.lend(100);
+    assert_eq!((first.count(), second.count(), third.count()), (3, 1, 0));
+
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Arc::new(Mutex::new(released));
+    let blocked: Vec<_> = (0..8)
+        .map(|_| {
+            let released = Arc::clone(&released);
+            pool.submit(move || {
+                let _ = released.lock().recv();
+            })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.stats().executing < 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the pool runs its share");
+    assert_eq!(pool.stats().threads, 4, "the cap less what is lent");
+
+    for _ in 0..8 {
+        release.send(()).expect("release a job");
+    }
+    for task in blocked {
+        task.await;
+    }
+    drop((first, second, third));
+    assert_eq!(pool.lend(100).count(), 4, "what was lent comes back");
+}
+
+/// Idle threads past the cap less what is lent end at once, rather than at their keep-alive.
+#[tokio::test]
+async fn idle_threads_past_the_cap_end_when_threads_are_lent() {
+    let pool = SyscallPool::new(8);
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Arc::new(Mutex::new(released));
+    let blocked: Vec<_> = (0..8)
+        .map(|_| {
+            let released = Arc::clone(&released);
+            pool.submit(move || {
+                let _ = released.lock().recv();
+            })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.stats().executing < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("eight threads run");
+    for _ in 0..8 {
+        release.send(()).expect("release a job");
+    }
+    for task in blocked {
+        task.await;
+    }
+    // A thread hands its job's result over before it counts itself idle.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.stats().executing > 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the threads go idle");
+
+    let lent = pool.lend(4);
+
+    assert_eq!(lent.count(), 4);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.stats().threads > 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the threads past the cap end");
+}
+
+/// Threads busy with work are not lent.
+#[tokio::test]
+async fn busy_threads_are_not_lent() {
+    let pool = SyscallPool::new(8);
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Arc::new(Mutex::new(released));
+    let blocked: Vec<_> = (0..6)
+        .map(|_| {
+            let released = Arc::clone(&released);
+            pool.submit(move || {
+                let _ = released.lock().recv();
+            })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.stats().executing < 6 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("six threads run");
+
+    assert_eq!(pool.lend(100).count(), 2);
+
+    for _ in 0..6 {
+        release.send(()).expect("release a job");
+    }
+    for task in blocked {
+        task.await;
+    }
+}
+
+/// Jobs that queued while threads were lent run on the whole cap once the threads come back,
+/// with no later submission needed to start a thread for them.
+#[tokio::test]
+async fn jobs_queued_while_threads_were_lent_get_the_threads_back() {
+    let pool = SyscallPool::new(8);
+    let lent = pool.lend(4);
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = Arc::new(Mutex::new(released));
+    let blocked: Vec<_> = (0..8)
+        .map(|_| {
+            let released = Arc::clone(&released);
+            pool.submit(move || {
+                let _ = released.lock().recv();
+            })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.stats().queued > 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the pool runs its share");
+    let stats = pool.stats();
+    assert_eq!(
+        (stats.threads, stats.queued),
+        (4, 4),
+        "the rest wait for threads"
+    );
+
+    drop(lent);
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while pool.stats().executing < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the queued jobs run on the threads given back");
+    for _ in 0..8 {
+        release.send(()).expect("release a job");
+    }
+    for task in blocked {
+        task.await;
+    }
+}
+
+/// A refusal among threads reserved together hands back every slot not started and runs a job
+/// where no worker is alive, as a single refused thread does.
+#[test]
+fn refused_threads_reserved_together_release_their_slots() {
+    let pool = SyscallPool::new(4);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let flag = Arc::clone(&ran);
+    {
+        let mut state = pool.inner.state.lock();
+        state.queue.push_back(queued_job(move || {
+            flag.fetch_add(1, Ordering::SeqCst);
+        }));
+        state.running += 3;
+    }
+
+    pool.run_without_workers(3);
+
+    assert_eq!(ran.load(Ordering::SeqCst), 1, "the job never ran");
+    assert_eq!(
+        pool.inner.state.lock().running,
+        0,
+        "slots were not released"
+    );
+}

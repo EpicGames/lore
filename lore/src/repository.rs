@@ -37,6 +37,7 @@ use lore_revision::util::config::SaveableConfig;
 use lore_revision::util::path::RelativePath;
 
 use crate::call::no_repository_call;
+use crate::call::repository_call_exclusive_planned;
 use crate::call::repository_call_no_store;
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -1554,6 +1555,60 @@ async fn instance_move_local(
             let target = args.target_path.as_str().to_string();
             async move { lore_revision::instance::instance_move(repository, &target).await }
         },
+    )
+    .await
+}
+
+/// Arguments for cloning the current repository instance to a new path.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(instance_clone_local)]
+pub struct LoreRepositoryInstanceCloneArgs {
+    /// Path the clone is created at, which must not exist; a relative path is resolved against
+    /// `globals->working_directory`, or the process's working directory where that is empty
+    pub target_path: LoreString,
+    /// Nonzero to copy the instance's files where the clone cannot share their data blocks;
+    /// zero refuses such a clone
+    pub allow_copy: u8,
+}
+
+/// Clones the current repository instance as `args` describes, in this process or in the service
+/// the call is relayed to.
+pub async fn instance_clone(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceCloneArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, instance_clone_local).await
+}
+
+async fn instance_clone_local(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryInstanceCloneArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    // Cloned holding the source's repository lock alone, so no Lore command that takes the
+    // instance's lock changes it while it is copied.
+    repository_call_exclusive_planned(
+        globals,
+        callback,
+        args,
+        instance_clone,
+        move |repository, args| {
+            let target_path = args.target_path.as_str().to_string();
+            async move {
+                lore_revision::instance::instance_clone_plan(
+                    repository,
+                    &target_path,
+                    args.allow_copy != 0,
+                )
+                .await
+            }
+        },
+        async move |repository, _token, plan: &lore_revision::instance::InstanceClonePlan| {
+            lore_revision::instance::instance_clone(repository, plan).await
+        },
+        lore_revision::instance::instance_clone_finish,
     )
     .await
 }

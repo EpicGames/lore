@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -916,6 +917,20 @@ impl RepositoryContext {
         self.repo_lock.as_deref().and_then(RepositoryLock::records)
     }
 
+    /// Writes the instance's records back to its Lore directory now, as the flush that ends a
+    /// command does. Does nothing where this context holds no records or no write token.
+    ///
+    /// # Errors
+    ///
+    /// The first error writing a shard. A shard that failed stays changed, so the next write-back
+    /// tries it again.
+    pub(crate) async fn write_back_instance_records(&self) -> std::io::Result<()> {
+        match (&self.repo_lock, &self.write_token) {
+            (Some(lock), Some(token)) => lock.write_back_records(token).await,
+            _ => Ok(()),
+        }
+    }
+
     pub fn dot_dir_path(&self) -> Result<&Path, crate::errors::InvalidArguments> {
         if let Some(paths) = &self.paths {
             Ok(paths.dot_path.as_ref())
@@ -1135,7 +1150,7 @@ impl RepositoryContext {
                 lore_spawn_guarded!(async move {
                     let records = async {
                         if let (Some(lock), Some(token)) = (&repo_lock, records_token) {
-                            lock.write_back_records(&token).await;
+                            lock.write_back_records_or_warn(&token).await;
                         }
                     };
                     let stores = async {
@@ -1432,7 +1447,7 @@ impl RepositoryContext {
     pub async fn flush(&self, options: lore_storage::FlushOptions) -> Result<(), RepositoryError> {
         let records = async {
             if let (Some(lock), Some(token)) = (&self.repo_lock, &self.write_token) {
-                lock.write_back_records(token).await;
+                lock.write_back_records_or_warn(token).await;
             }
         };
         let stores = async {
@@ -1935,10 +1950,10 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
     load_repository_config_from_dot_dir(&get_dot_lore_path(path.as_ref())?)
 }
 
-/// Process-local holder for the repository directory `FSLock`. Lifetime is
-/// managed via an `Arc` + weak-ref cache so overlapping commands share one
-/// acquisition; the underlying flock drops when the last strong reference is
-/// released.
+/// Process-local holder for the repository directory `FSLock`. Lifetime is managed via an `Arc`
+/// and a weak-ref cache, so overlapping commands that share the lock take one acquisition between
+/// them, and an exclusive holder is shared with none; the underlying flock drops when the last
+/// strong reference is released.
 #[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
     /// The instance's recorded modified times, which this lock protects, or `None` where the
@@ -1966,6 +1981,10 @@ pub(crate) struct RepositoryLock {
     /// Repository creation takes no repository lock, so it builds none of this: its
     /// writes go through the stores, each taking its own claim.
     _stores: lore_storage::local::store_lock::StoreHold,
+    /// This holder's place in its directory's [`RepositoryLockGate`]: shared with the other
+    /// holders of the process, or alone. Declared last, so the flock is released before an
+    /// exclusive holder in this process can be created for the directory.
+    admission: LockAdmission,
 }
 
 impl RepositoryLock {
@@ -1975,16 +1994,106 @@ impl RepositoryLock {
         self.records.as_ref()
     }
 
-    /// Writes back the instance's records, keeping this lock until every write has landed. A
-    /// failure is logged: the records are advisory, and a shard that failed is tried again at
-    /// the next write-back.
-    async fn write_back_records(self: &Arc<Self>, token: &RepositoryWriteToken) {
-        if let Some(records) = &self.records
-            && let Err(err) = records.write_back(token, Arc::clone(self)).await
-        {
-            lore_warn!("Failed to write modified time records: {err}");
+    /// Writes back the instance's records, keeping this lock until every write has landed.
+    ///
+    /// # Errors
+    ///
+    /// The first error writing a shard. A shard that failed stays changed, so the next write-back
+    /// tries it again.
+    async fn write_back_records(
+        self: &Arc<Self>,
+        token: &RepositoryWriteToken,
+    ) -> std::io::Result<()> {
+        match &self.records {
+            Some(records) => records.write_back(token, Arc::clone(self)).await,
+            None => Ok(()),
         }
     }
+
+    /// [`Self::write_back_records`], logging a failure: the records are advisory.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments beside the write-back's
+    /// future, in every flush; the write-back's future is mapped rather than awaited in a block,
+    /// which would hold it twice.
+    fn write_back_records_or_warn<'a>(
+        self: &'a Arc<Self>,
+        token: &'a RepositoryWriteToken,
+    ) -> impl Future<Output = ()> + 'a {
+        futures::FutureExt::map(self.write_back_records(token), |written| {
+            if let Err(err) = written {
+                lore_warn!("Failed to write modified time records: {err}");
+            }
+        })
+    }
+
+    /// Whether a command can share this holder, which it can unless the holder is held alone or
+    /// a command waits to hold the lock alone. A command turned away waits for its turn at the
+    /// gate, behind the one waiting to hold the lock alone, so commands that keep a shared holder
+    /// alive never keep that one out for good.
+    fn admits_sharing(&self) -> bool {
+        match &self.admission {
+            LockAdmission::Shared {
+                exclusive_waiting, ..
+            } => exclusive_waiting.load(Ordering::Acquire) == 0,
+            LockAdmission::Exclusive { .. } => false,
+        }
+    }
+}
+
+/// How a command holds an instance's repository lock against the other commands of its process,
+/// which take the flock once between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[lore_macro::test_pub]
+pub(crate) enum LockSharing {
+    /// Shares one holder with the other commands of the process.
+    Shared,
+    /// Holds the lock alone: waits for every other command of the process on the instance to
+    /// release it, and keeps them out until it is done.
+    Exclusive,
+}
+
+/// The per-directory state that orders holders of one repository lock within the process.
+#[derive(Default)]
+struct RepositoryLockGate {
+    /// Serializes taking the flock, so only one caller at a time reaches into it.
+    init: tokio::sync::Mutex<()>,
+    /// Read by every shared holder for its life and written by an exclusive one, so an exclusive
+    /// holder exists only while no shared one does.
+    admission: Arc<tokio::sync::RwLock<()>>,
+    /// The callers waiting to hold the lock alone. While any waits, a shared holder admits no more
+    /// commands, which queue at `admission` behind it instead.
+    exclusive_waiting: Arc<AtomicUsize>,
+    /// The callers waiting at `admission` to share the lock, which tests read to tell a caller
+    /// waiting there from one waiting on the flock.
+    shared_waiting: Arc<AtomicUsize>,
+}
+
+/// A caller counted in one of the counts of a [`RepositoryLockGate`]'s waiting callers until it is
+/// dropped, as it is once the caller is admitted or gives up.
+struct Waiting(Arc<AtomicUsize>);
+
+impl Waiting {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum LockAdmission {
+    Shared {
+        _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+        /// The gate's count of callers waiting to hold the lock alone.
+        exclusive_waiting: Arc<AtomicUsize>,
+    },
+    Exclusive {
+        _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    },
 }
 
 /// Claims `immutable` and then `mutable` for a use of the repository they belong to, which
@@ -2061,14 +2170,53 @@ where
 
 static REPOSITORY_LOCK_CACHE: OnceLock<DashMap<PathBuf, Weak<RepositoryLock>>> = OnceLock::new();
 
-/// Per-path init mutexes used to serialize first-time flock acquisition for a
-/// given repository path. Held only during the double-checked-locking init
-/// dance in `get_or_create_repository_lock`. The sync `RwLock` around the map
-/// is held only briefly to read or insert a per-path `tokio::sync::Mutex`; it
-/// is never held across an `.await`.
-static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
-    std::sync::RwLock<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+/// Per-path gates that serialize first-time flock acquisition for a repository path and order
+/// shared and exclusive holders of it; see [`RepositoryLockGate`]. The sync `RwLock` around the
+/// map is held only briefly to read or insert a gate; it is never held across an `.await`.
+static REPOSITORY_LOCK_GATES: OnceLock<
+    std::sync::RwLock<HashMap<PathBuf, Arc<RepositoryLockGate>>>,
 > = OnceLock::new();
+
+/// How many callers wait at the gate to share the repository lock of the Lore directory at
+/// `dot_path`.
+#[cfg(feature = "test-util")]
+pub fn shared_callers_waiting(dot_path: &Path) -> usize {
+    let key = dot_path
+        .canonicalize()
+        .unwrap_or_else(|_| dot_path.to_path_buf());
+    repository_lock_gate(&key)
+        .shared_waiting
+        .load(Ordering::Acquire)
+}
+
+/// How many callers wait to hold the repository lock of the Lore directory at `dot_path` alone.
+#[cfg(feature = "test-util")]
+pub fn exclusive_callers_waiting(dot_path: &Path) -> usize {
+    let key = dot_path
+        .canonicalize()
+        .unwrap_or_else(|_| dot_path.to_path_buf());
+    repository_lock_gate(&key)
+        .exclusive_waiting
+        .load(Ordering::Acquire)
+}
+
+/// The gate of the directory `key` names.
+fn repository_lock_gate(key: &Path) -> Arc<RepositoryLockGate> {
+    let gates = REPOSITORY_LOCK_GATES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Some(existing) = gates
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+    {
+        return existing.clone();
+    }
+    gates
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.to_path_buf())
+        .or_default()
+        .clone()
+}
 
 /// Whether an instance of `config` keeps its modified-time records in its dot directory. An SWFS
 /// mount presents the recorded times, which it reads from the store. In-memory stores end with
@@ -2081,11 +2229,14 @@ fn keeps_records_on_disk(config: &RepositoryConfig, in_memory: bool) -> bool {
 /// Acquire (or reuse, via weak-ref cache) the process-local `RepositoryLock`
 /// for a repository's dot-directory (`.lore/` or `.urc/`).
 ///
-/// Overlapping commands in the same process share one `Arc<RepositoryLock>` —
-/// the OS-level flock is acquired once and released when the last strong
-/// reference drops. Concurrent first-time initializers are serialized via a
-/// per-path `tokio::sync::Mutex` so only one thread calls into the OS flock
-/// for a given path at a time; others wait, then observe the cached entry.
+/// With [`LockSharing::Shared`], overlapping commands in the same process share one
+/// `Arc<RepositoryLock>` — the OS-level flock is acquired once and released when the last strong
+/// reference drops. With [`LockSharing::Exclusive`], the caller waits until no other holder for
+/// the directory is alive in the process and gets one of its own, which no other caller joins;
+/// they wait for it instead. An exclusive caller waits for the holders alive when it comes; while
+/// it waits, a shared holder admits no more commands, which queue behind it at the gate.
+/// Concurrent first-time initializers are serialized per directory so only one thread calls into
+/// the OS flock for a given path at a time; others wait, then observe the cached entry.
 ///
 /// A holder this call creates keeps the instance's modified-time records in the dot directory
 /// where `instance_records` is set. A cached holder keeps the choice it was created with.
@@ -2094,6 +2245,7 @@ pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
     stores: lore_storage::local::store_lock::StoreHold,
     instance_records: bool,
+    sharing: LockSharing,
 ) -> Result<
     (
         Arc<RepositoryLock>,
@@ -2109,7 +2261,10 @@ pub(crate) async fn get_or_create_repository_lock(
     // guards its creator supplied, on whichever store objects that command was using;
     // dropping this caller's would leave it holding the repository flock with no claim
     // of its own, which is the shape the containment exists to prevent.
-    if let Some(holder) = cache.get(&dot_path).and_then(|w| w.upgrade()) {
+    if sharing == LockSharing::Shared
+        && let Some(holder) = cache.get(&dot_path).and_then(|w| w.upgrade())
+        && holder.admits_sharing()
+    {
         return Ok((holder, stores));
     }
 
@@ -2117,33 +2272,44 @@ pub(crate) async fn get_or_create_repository_lock(
     // take a second flock on it, which excludes the first inside this very process. Bound
     // before the insert below, so no shard guard from the lookup is still held by then.
     let key = dot_path.canonicalize().unwrap_or_else(|_| dot_path.clone());
-    let cached = cache.get(&key).and_then(|w| w.upgrade());
-    if let Some(holder) = cached {
+    if let Some(holder) = cache
+        .get(&key)
+        .and_then(|w| w.upgrade())
+        .filter(|holder| sharing == LockSharing::Shared && holder.admits_sharing())
+    {
         cache.insert(dot_path, Arc::downgrade(&holder));
         return Ok((holder, stores));
     }
 
-    // Slow path: serialize init attempts per directory so only one of them calls
-    // into the OS flock.
-    let mutexes =
-        REPOSITORY_LOCK_INIT_MUTEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
-    let init_mutex = {
-        if let Some(existing) = mutexes.read().unwrap().get(&key) {
-            existing.clone()
-        } else {
-            let mut w = mutexes.write().unwrap();
-            w.entry(key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+    let gate = repository_lock_gate(&key);
+    let admission = match sharing {
+        LockSharing::Shared => {
+            let _waiting = Waiting::new(&gate.shared_waiting);
+            LockAdmission::Shared {
+                _guard: gate.admission.clone().read_owned().await,
+                exclusive_waiting: Arc::clone(&gate.exclusive_waiting),
+            }
+        }
+        LockSharing::Exclusive => {
+            let _waiting = Waiting::new(&gate.exclusive_waiting);
+            LockAdmission::Exclusive {
+                _guard: gate.admission.clone().write_owned().await,
+            }
         }
     };
 
-    let _guard = init_mutex.lock().await;
+    // Serialize init attempts per directory so only one of them calls into the OS flock.
+    let _guard = gate.init.lock().await;
 
-    // Re-check the cache — another task may have finished initializing while
-    // we were waiting on the init mutex.
-    let cached = cache.get(&key).and_then(|w| w.upgrade());
-    if let Some(holder) = cached {
+    // Re-check the cache: another task may have finished initializing while this caller waited at
+    // the gate. A shared caller admitted at the gate joins any holder alive, whether or not a
+    // caller now waits to hold the lock alone: its admission proves no holder is held alone, and
+    // a holder of its own would take a second flock on the directory.
+    let admitted = cache
+        .get(&key)
+        .and_then(|w| w.upgrade())
+        .filter(|_| sharing == LockSharing::Shared);
+    if let Some(holder) = admitted {
         cache.insert(dot_path, Arc::downgrade(&holder));
         return Ok((holder, stores));
     }
@@ -2163,6 +2329,7 @@ pub(crate) async fn get_or_create_repository_lock(
         records,
         _lock: lock,
         _stores: stores,
+        admission,
     });
     if key != dot_path {
         cache.insert(key, Arc::downgrade(&holder));
@@ -2735,14 +2902,75 @@ pub async fn load_and_connect(
 /// command and hand siblings (via [`RepositoryWriteToken::share`]) to each
 /// construction, keeping the per-path write mutex held across the whole
 /// flow without deadlocking on re-acquisition.
+pub fn load_and_connect_with_token(
+    path: &Path,
+    access: RepositoryAccess,
+    write_token: Option<RepositoryWriteToken>,
+) -> impl Future<Output = Result<Arc<RepositoryContext>, RepositoryError>> + '_ {
+    open_repository(path, access, write_token, LockSharing::Shared)
+}
+
+/// Opens the instance at `path` for writing where its Lore directory holds no instance file, which
+/// recovers its instance ID from the store, or gives it a new one, as a write command's open does,
+/// so that it can then be opened without its stores. Does nothing where the file is there, and in a
+/// dry run, which writes no file.
+///
+/// # Errors
+///
+/// [`RepositoryError`] where the instance cannot be opened.
+pub async fn recover_missing_instance_file(path: &Path) -> Result<(), RepositoryError> {
+    let instance_file = get_dot_lore_path(path)?.join(INSTANCE);
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    match lore_io::IoDriver::global()
+        .symlink_stat(&instance_file)
+        .await
+    {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Any other failure is the plan's own open to report.
+        _ => return Ok(()),
+    }
+    let token = RepositoryWriteToken::acquire(path).await;
+    let repository = Box::pin(load_and_connect_with_token(
+        path,
+        RepositoryAccess::ReadWrite,
+        Some(token),
+    ))
+    .await?;
+    repository
+        .flush(lore_storage::FlushOptions::default())
+        .await?;
+    Ok(())
+}
+
+/// [`load_and_connect_with_token`] for a write command that holds the instance's repository lock
+/// alone, keeping out the other commands of its process as well as those of other processes: it
+/// waits for the commands of its process that hold the lock, and while it waits, or holds the lock,
+/// commands of its process that open the instance wait for it.
+pub fn load_and_connect_exclusive(
+    path: &Path,
+    write_token: RepositoryWriteToken,
+) -> impl Future<Output = Result<Arc<RepositoryContext>, RepositoryError>> + '_ {
+    open_repository(
+        path,
+        RepositoryAccess::ReadWrite,
+        Some(write_token),
+        LockSharing::Exclusive,
+    )
+}
+
+/// Opens the repository at `path` as [`load_and_connect_with_token`] describes, holding its
+/// repository lock as `sharing` says.
 ///
 /// Instance ID recovery and instance registration are boxed. They run only for
 /// an instance missing its ID file or its registration, and inline they would
 /// make every command's future as large as theirs.
-pub async fn load_and_connect_with_token(
+async fn open_repository(
     path: &Path,
     access: RepositoryAccess,
     write_token: Option<RepositoryWriteToken>,
+    sharing: LockSharing,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
     require_text_root(path)?;
     debug_assert!(
@@ -2905,6 +3133,7 @@ pub async fn load_and_connect_with_token(
                 dot_path.clone(),
                 stores,
                 keeps_records_on_disk(&config, global.in_memory()),
+                sharing,
             )
             .await?,
         ),

@@ -2544,6 +2544,7 @@ dependencies = [
  "clap_complete",
  "libc",
  "lore",
+ "lore-base",
  "lore-client",
  "lore-macro",
  "parking_lot",

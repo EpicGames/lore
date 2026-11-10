@@ -443,6 +443,7 @@ impl PsyncDriver {
         &self,
         path: PathBuf,
         aside: Option<PathBuf>,
+        make_writable: bool,
     ) -> (PathBuf, std::io::Result<()>) {
         SyscallPool::global()
             .run_on_own_thread("lore-io-background-removal", move || {
@@ -450,7 +451,13 @@ impl PsyncDriver {
                     path,
                     aside,
                     |from, to| std::fs::rename(from, to),
-                    |tree| std::fs::remove_dir_all(tree),
+                    |tree| {
+                        if make_writable {
+                            remove_tree_making_it_writable(tree)
+                        } else {
+                            std::fs::remove_dir_all(tree)
+                        }
+                    },
                 )
             })
             .await
@@ -864,8 +871,8 @@ fn is_pattern_unit(unit: u16) -> bool {
 ///
 /// A plain path is capped at `MAX_PATH` by the calls themselves: past that they
 /// want the `\\?\` verbatim prefix, which is a rewrite of the path rather than a
-/// longer buffer - `lore_base::fs::win_path` does that, and lore-io does not
-/// depend on lore-base. A path that arrives already verbatim may be longer, so
+/// longer buffer, which [`crate::win_path::to_extended_wide`] makes and these
+/// calls do not. A path that arrives already verbatim may be longer, so
 /// there is room for one, and anything past even that is left to what `std`
 /// answers, since `std` prefixes on its own.
 #[cfg(target_family = "windows")]
@@ -1006,6 +1013,65 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
 #[cfg(not(any(target_os = "linux", target_family = "windows")))]
 fn holds_name_exactly_impl(_path: &std::path::Path) -> Option<bool> {
     None
+}
+
+/// Removes the tree at `path`, as `std::fs::remove_dir_all` does. Where a directory in it denies
+/// the removal, as one without its owner's write permission does on Unix, the owner is given read,
+/// write and search permission on every directory in the tree, and the removal is tried once more.
+#[lore_macro::test_pub]
+fn remove_tree_making_it_writable(path: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_directories_owner_writable(path)?;
+            std::fs::remove_dir_all(path)
+        }
+        removed => removed,
+    }
+}
+
+/// Gives the owner read, write and search permission on the directory at `path` and on every
+/// directory below it. A link listed in the tree is not followed, and a directory gone meanwhile is
+/// left out. A directory replaced by a link between its stat and its change would be followed;
+/// the tree is one that a removal has renamed aside, which no other process writes.
+#[cfg(target_family = "unix")]
+fn make_directories_owner_writable(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const OWNER_ALL: u32 = 0o700;
+    let mut waiting = vec![path.to_path_buf()];
+    while let Some(directory) = waiting.pop() {
+        let mode = match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => metadata.permissions().mode(),
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        if mode & OWNER_ALL != OWNER_ALL {
+            std::fs::set_permissions(
+                &directory,
+                std::fs::Permissions::from_mode((mode & 0o7777) | OWNER_ALL),
+            )?;
+        }
+        let entries = match std::fs::read_dir(&directory) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            entries => entries?,
+        };
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                waiting.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Nothing to do: Windows removes an entry whatever the attributes of the directory that holds
+/// it, and `std::fs::remove_dir_all` clears a read-only file's attribute itself.
+#[cfg(target_family = "windows")]
+#[allow(clippy::unnecessary_wraps)]
+fn make_directories_owner_writable(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Whether `err`, from reaching what a path names, says it names nothing: no entry is there, or a

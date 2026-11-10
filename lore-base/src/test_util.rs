@@ -94,10 +94,18 @@ impl TempDir {
     /// identifies the directory under `LORE_KEEP_TEST_DATA`, and what someone
     /// looking at a stale directory has to work back from.
     pub fn new(prefix: &str) -> Self {
-        let inner = tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir()
-            .unwrap_or_else(|error| panic!("Failed to create a temp directory: {error}"));
+        Self::created(tempfile::Builder::new().prefix(prefix).tempdir())
+    }
+
+    /// Creates a directory named `<prefix><random>` under `parent`, for a test that needs its
+    /// scratch space on a particular volume.
+    pub fn new_in(parent: &Path, prefix: &str) -> Self {
+        Self::created(tempfile::Builder::new().prefix(prefix).tempdir_in(parent))
+    }
+
+    fn created(made: std::io::Result<tempfile::TempDir>) -> Self {
+        let inner =
+            made.unwrap_or_else(|error| panic!("Failed to create a temp directory: {error}"));
         // The guard still removes the directory by its own path; both name the
         // same directory.
         let path = canonical_without_verbatim(inner.path());

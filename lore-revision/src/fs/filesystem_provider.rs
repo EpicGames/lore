@@ -5,7 +5,10 @@
 //! This module defines the two-trait architecture that separates operation context creation
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
+use std::collections::HashSet;
 use std::fs::Metadata;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -17,10 +20,16 @@ use lore_base::error::InvalidArguments;
 use lore_base::error::InvalidPath;
 use lore_base::error::LocalModifications;
 use lore_base::error::NotSupported;
+use lore_base::error::Oversized;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
 use lore_error_set::prelude::*;
+use lore_io::clone::Backend;
+use lore_io::clone::CloneStats;
+use lore_io::clone::Progress;
+use lore_io::clone::TreeSize;
+use lore_io::clone::Volume;
 
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
@@ -378,6 +387,124 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     async fn read_held_file(&self, _path: &RelativePath) -> Result<Option<Bytes>, FsError> {
         Ok(None)
     }
+
+    /// What cloning the instance tree at `source`, whose Lore directory is at `dot_path`, to
+    /// `destination` would do, answered before anything is written but probe files, which are
+    /// removed. A provider that cannot clone answers [`CloneAnswer::Unsupported`].
+    async fn clone_answer(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+    ) -> Result<CloneAnswer, InstanceCloneError> {
+        Ok(CloneAnswer::Unsupported {
+            reason: "this filesystem provider cannot clone instances".to_string(),
+        })
+    }
+
+    /// Clones the instance tree at `source`, whose Lore directory is at `dot_path`, into
+    /// `destination` as `answer` describes, leaving out the Lore directory's transient state and
+    /// the files a clone writes for itself. `destination` exists and holds those files. An entry
+    /// that fails to clone fails the clone, unless `copy_unclonable` lets it be copied.
+    /// `run` counts what the clone does, can stop it, and holds what the clone keeps until the
+    /// work it started has ended, even where the future is dropped before it.
+    async fn clone_instance(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+        _answer: &CloneAnswer,
+        _copy_unclonable: bool,
+        _run: &CloneRun,
+    ) -> Result<CloneStats, InstanceCloneError> {
+        Err(NotSupported {
+            operation: "cloning an instance with this filesystem provider".to_string(),
+        }
+        .into())
+    }
+}
+
+/// What a running clone of an instance counts and keeps.
+pub struct CloneRun {
+    /// What the clone has done so far, and the request to stop it.
+    pub progress: Arc<Progress>,
+    /// Kept until the work the clone started has ended, even where the future that started it
+    /// is dropped first.
+    pub hold: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// What a filesystem provider's clone of an instance fails with.
+#[error_set]
+pub enum InstanceCloneError {
+    /// A path the clone needs is gone.
+    FileNotFound,
+    /// A path the clone writes is taken.
+    InvalidArguments,
+    /// A path the clone is given names no place to clone to.
+    InvalidPath,
+    /// An entry cannot be cloned where the clone promised to share blocks.
+    NotSupported,
+    /// A volume the clone writes is full, the destination's or the source's.
+    Oversized,
+}
+
+/// What cloning an instance's tree to a destination would do, as its filesystem provider answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CloneAnswer {
+    /// The clone shares the source's data blocks through `backend`, so it costs filesystem
+    /// metadata, not content. `volume` holds the destination. `entry_by_entry` names the
+    /// directories, relative to the tree, that a backend that clones whole directories clones
+    /// entry by entry instead, as found before the clone.
+    SharesBlocks {
+        backend: Backend,
+        volume: Volume,
+        entry_by_entry: Arc<HashSet<PathBuf>>,
+    },
+    /// The clone copies `size` onto `volume`, which has `available` bytes free, because of
+    /// `reason`, which names the volumes.
+    CopiesBytes {
+        reason: String,
+        size: TreeSize,
+        volume: Volume,
+        available: u64,
+    },
+    /// No clone is possible, because of `reason`.
+    Unsupported { reason: String },
+}
+
+/// The error an I/O failure `err` of a clone reports, by its kind, with `context` saying what was
+/// being done.
+#[lore_macro::test_pub]
+pub(crate) fn clone_io_failure(err: std::io::Error, context: &str) -> InstanceCloneError {
+    let message = format!("{context}: {err}");
+    match err.kind() {
+        std::io::ErrorKind::NotFound => FileNotFound { resource: message }.into(),
+        std::io::ErrorKind::AlreadyExists => InvalidArguments { reason: message }.into(),
+        std::io::ErrorKind::Unsupported => NotSupported { operation: message }.into(),
+        std::io::ErrorKind::StorageFull
+        | std::io::ErrorKind::QuotaExceeded
+        | std::io::ErrorKind::FileTooLarge => Oversized { context: message }.into(),
+        _ => InstanceCloneError::internal_with_context(err, context),
+    }
+}
+
+/// The path of the Lore directory at `dot_path` relative to the working tree at `tree`, which
+/// holds it in a directory a clone copies.
+#[lore_macro::test_pub]
+pub(crate) fn lore_directory_within<'a>(
+    tree: &Path,
+    dot_path: &'a Path,
+) -> Result<&'a Path, InstanceCloneError> {
+    dot_path.strip_prefix(tree).map_err(|_outside| {
+        InvalidPath {
+            path: format!(
+                "{}: the Lore directory is outside the working tree at {}",
+                dot_path.display(),
+                tree.display()
+            ),
+        }
+        .into()
+    })
 }
 
 /// Runs `work` inside one filesystem operation, finalizing it whether or not the work

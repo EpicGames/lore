@@ -174,6 +174,111 @@ where
         .await
 }
 
+/// Write repository call that holds the instance's repository lock alone, in three steps.
+///
+/// - `plan` runs on the instance opened without stores, before the instance's repository lock
+///   is taken, and keeps nothing of that opened instance. `None` ends the call there.
+///   An instance whose instance file is missing is first opened with its stores, which recovers
+///   its ID as a write command does. That step is boxed, as only that cold path makes it large, so
+///   the call's future holds its box alone.
+/// - `command` runs with the plan, holding the lock alone: it waits for the other commands of
+///   this process that hold the instance's repository lock to finish and keeps them out until
+///   it is done, as the lock keeps out other processes. Otherwise as [`repository_call_write`].
+/// - `finish` runs with the plan after `command`, whatever it returned, and where the instance
+///   could not be opened for it, without the call's hold of the lock. The flush that ends
+///   `command` may still hold it. Where the call's future is dropped first, `finish` does not
+///   run, so what it cleans up needs another way to be cleaned up too.
+///
+/// The locked steps repeat [`repository_call_write`]'s body rather than sharing a helper with it:
+/// a helper holds the call's arguments a second time, which grew the future of every write
+/// command by 72 to 136 bytes.
+pub async fn repository_call_exclusive_planned<Arg, T, P, FutP, FutF, ResT, ErrT>(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    args: Arg,
+    caller: T,
+    plan: impl FnOnce(Arc<RepositoryContext>, Arg) -> FutP,
+    command: impl AsyncFnOnce(Arc<RepositoryContext>, RepositoryWriteToken, &P) -> Result<ResT, ErrT>,
+    finish: impl FnOnce(P) -> FutF,
+) -> i32
+where
+    ErrT: EventError + FfiError + HasTrace,
+    Arg: std::fmt::Debug,
+    FutP: Future<Output = Result<Option<P>, ErrT>> + 'static,
+    FutF: Future<Output = ()> + 'static,
+{
+    let (repository_path, execution) = match prepare_repository_call(globals, callback).await {
+        Ok(v) => v,
+        Err(status) => return status,
+    };
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            log_command_info(&caller, &args);
+            let time_start = Instant::now();
+
+            let detail = 'call: {
+                if let Err(err) =
+                    Box::pin(repository::recover_missing_instance_file(&repository_path)).await
+                {
+                    break 'call LoreErrorDetail::from_error(&err);
+                }
+                let planned = {
+                    let unlocked = match repository::load_and_connect_with_token(
+                        &repository_path,
+                        RepositoryAccess::NoStore,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(repository) => repository,
+                        Err(err) => break 'call LoreErrorDetail::from_error(&err),
+                    };
+                    let planned = plan(unlocked.clone(), args).await;
+                    let weak = Arc::downgrade(&unlocked);
+                    drop(unlocked);
+                    check_no_lingering_repository(Some(weak));
+                    planned
+                };
+                let plan = match planned {
+                    Ok(Some(plan)) => plan,
+                    Ok(None) => break 'call LoreErrorDetail::default(),
+                    Err(err) => break 'call LoreErrorDetail::from_error(&err),
+                };
+
+                let token = RepositoryWriteToken::acquire(&repository_path).await;
+                let (detail, weak_repository) = 'locked: {
+                    let context_token = token.share();
+                    let repository = match repository::load_and_connect_exclusive(
+                        &repository_path,
+                        context_token,
+                    )
+                    .await
+                    {
+                        Ok(repository) => repository,
+                        Err(err) => {
+                            // Released before `finish`, as the command releases it when it ends.
+                            drop(token);
+                            break 'locked (LoreErrorDetail::from_error(&err), None);
+                        }
+                    };
+                    let detail = LoreErrorDetail::from_result(
+                        command(repository.clone(), token, &plan).await,
+                    );
+                    (detail, Some(post_command_cleanup(repository)))
+                };
+                check_no_lingering_repository(weak_repository);
+
+                finish(plan).await;
+                detail
+            };
+
+            log_command_done(&caller, time_start);
+            execution_context().dispatcher.complete(detail).await
+        })
+        .await
+}
+
 /// Repository call that doesn't open stores. For notification /
 /// config-introspection commands that need a `RepositoryContext` but neither
 /// read nor write stores; skips the `FSLock` and never mints a write token.

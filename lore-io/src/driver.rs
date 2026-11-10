@@ -663,10 +663,13 @@ impl IoDriver {
     /// since the rename would move the reparse point without the files it leads to: the files are
     /// removed through it, and the reparse point is kept. Where it leads to the root of a volume,
     /// the entries there that are both hidden and system, which the system keeps and which deny
-    /// access, are kept too. A directory already gone counts as
-    /// removed, and a missing `path` leaves `aside` as it is. To repeat a call that failed after
-    /// renaming the directory, which it says by returning `aside`, pass `aside` as `path` and no
-    /// `aside`: whatever is at `path` by then is not the directory the first call renamed.
+    /// access, are kept too. With `make_writable`, where a directory in the tree denies the removal,
+    /// as one without its owner's write permission does on Unix, every directory in the tree is
+    /// made readable, writable and searchable by its owner, and the removal is tried once more. A
+    /// directory already gone counts as removed, and a missing `path` leaves `aside` as it is. To
+    /// repeat a call that failed after renaming the directory, which it says by returning `aside`,
+    /// pass `aside` as `path` and no `aside`: whatever is at `path` by then is not the directory the
+    /// first call renamed.
     ///
     /// The removal takes minutes for millions of files, so it runs on a thread of its own, outside
     /// the syscall pool and its cap, at background disk priority, and the thread ends with it.
@@ -677,9 +680,10 @@ impl IoDriver {
         &self,
         path: impl Into<PathBuf>,
         aside: Option<PathBuf>,
+        make_writable: bool,
     ) -> (PathBuf, std::io::Result<()>) {
         PsyncDriver
-            .remove_dir_all_in_background(path.into(), aside)
+            .remove_dir_all_in_background(path.into(), aside, make_writable)
             .await
     }
 

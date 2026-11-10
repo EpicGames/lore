@@ -14,4 +14,5 @@ pub mod runtime;
 pub mod test_util;
 pub mod text;
 pub mod types;
+pub mod units;
 pub mod version;

@@ -286,3 +286,81 @@ fn a_mount_of_an_instance_with_no_external_directory_is_refused() {
         .to_string();
     assert!(error.contains("no external directory"), "{error}");
 }
+
+fn volume() -> lore_io::clone::Volume {
+    lore_io::clone::Volume {
+        id: 1,
+        filesystem: "apfs".to_string(),
+        mount_point: "/".into(),
+    }
+}
+
+fn copies(size: u64, available: u64) -> lore_revision::fs::filesystem_provider::CloneAnswer {
+    lore_revision::fs::filesystem_provider::CloneAnswer::CopiesBytes {
+        reason: "the volume does not clone files".to_string(),
+        size: lore_io::clone::TreeSize {
+            size,
+            file_count: 1,
+            entry_count: 1,
+        },
+        volume: volume(),
+        available,
+    }
+}
+
+fn refusal(
+    answer: &lore_revision::fs::filesystem_provider::CloneAnswer,
+    allow_copy: bool,
+) -> Result<(), InstanceError> {
+    refuse_clone(answer, allow_copy, "/source", "/destination")
+}
+
+#[test]
+fn a_clone_that_shares_blocks_is_made() {
+    let answer = lore_revision::fs::filesystem_provider::CloneAnswer::SharesBlocks {
+        backend: lore_io::clone::Backend::Apfs,
+        volume: volume(),
+        entry_by_entry: Default::default(),
+    };
+
+    assert!(refusal(&answer, false).is_ok());
+}
+
+#[test]
+fn a_clone_that_would_copy_is_refused_unless_a_copy_is_allowed() {
+    assert!(refusal(&copies(100, 1000), false).is_err_and(|err| err.is_not_supported()));
+    assert!(refusal(&copies(100, 1000), true).is_ok());
+}
+
+#[test]
+fn a_copy_is_refused_as_oversized_when_the_destination_has_less_room() {
+    assert!(refusal(&copies(100, 99), true).is_err_and(|err| err.is_oversized()));
+    assert!(refusal(&copies(100, 100), true).is_ok());
+}
+
+#[test]
+fn an_unsupported_clone_is_refused_even_with_a_copy_allowed() {
+    let answer = lore_revision::fs::filesystem_provider::CloneAnswer::Unsupported {
+        reason: "this filesystem provider cannot clone instances".to_string(),
+    };
+
+    assert!(refusal(&answer, false).is_err_and(|err| err.is_not_supported()));
+    assert!(refusal(&answer, true).is_err_and(|err| err.is_not_supported()));
+}
+
+/// Only a name made of the destination's, `.cloning-` and a `UUIDv7` instance ID is a clone's
+/// in-progress directory.
+#[test]
+fn only_a_clone_s_name_is_taken_for_one_in_progress() {
+    let named = |name: &str| names_clone_in_progress("proj".as_ref(), name.as_ref());
+    let v7 = InstanceId::generate();
+    let v4 = InstanceId::from_hex(&uuid::Uuid::new_v4().simple().to_string()).expect("an ID");
+
+    assert!(named(&format!("proj.cloning-{v7}")));
+    assert!(!named("proj.cloning-notes"));
+    assert!(!named("proj.cloning-2"));
+    assert!(!named(&format!("proj.cloning-{v4}")));
+    assert!(!named(&format!("proj.cloning-{v7}.lock")));
+    assert!(!named(&format!("other.cloning-{v7}")));
+    assert!(!named(&format!("proj.cloning-{v7}x")));
+}
