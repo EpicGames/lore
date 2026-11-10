@@ -41,7 +41,8 @@ def lore_local_server(server_root, server_env, executable_path):
 
 
 def _kill_shared_xdist_server(basetemp: Path) -> None:
-    """Kill the server gw0 launched for every worker to share, if it is running."""
+    """Kill the server one worker launched for every worker to share, if it is
+    running."""
     info_path = basetemp / "lore_server_info.json"
     if not info_path.exists():
         return
@@ -65,8 +66,8 @@ class _SessionCleanup:
 
     The sweep lives here rather than in a session fixture because the controller
     is the only process that runs after all workers are done. A worker finishing
-    its own tests says nothing about the others, and gw0's basetemp holds the
-    store of the server every worker is still talking to.
+    its own tests says nothing about the others, and the launching worker's
+    basetemp holds the store of the server every worker is still talking to.
     """
 
     @staticmethod
