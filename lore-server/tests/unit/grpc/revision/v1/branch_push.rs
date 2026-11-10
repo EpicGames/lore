@@ -15,20 +15,22 @@ use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::revision::v1::branch_push::*;
 use lore_server::hooks::HookDispatcher;
+use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use opentelemetry::KeyValue;
 use rand::random;
 use tonic::Request;
 
-use super::hook_recorder::Seen;
-use super::hook_recorder::recording_dispatcher;
 use crate::grpc::push_protected::PUSH_PROTECTED;
 use crate::grpc::push_protected::TIERS;
 use crate::grpc::push_protected::Tier;
 use crate::grpc::push_protected::allow_all;
 use crate::notification::testing::MockNotificationSender;
+use crate::store::test_support::FailingLoadStore;
 use crate::store::test_support::test_store_create;
+use crate::util::hook_recorder::Seen;
+use crate::util::hook_recorder::recording_dispatcher;
 
 struct TestInstrumentProvider {}
 
@@ -582,7 +584,7 @@ async fn service_account_claim_no_longer_bypasses_protection() {
 }
 
 #[tokio::test]
-async fn push_to_deleted_branch_reinstates_name() {
+async fn push_to_deleted_branch_fails_not_found_and_leaves_it_deleted() {
     let repository = random::<RepositoryId>();
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
@@ -590,7 +592,7 @@ async fn push_to_deleted_branch_reinstates_name() {
     let mut notification_sender = MockNotificationSender::new();
     notification_sender
         .expect_branch_pushed()
-        .times(2)
+        .times(1)
         .returning(|_, _, _, _, _| ());
     let notification_sender = Arc::new(notification_sender);
     let instrument_provider = TestInstrumentProvider {};
@@ -619,8 +621,8 @@ async fn push_to_deleted_branch_reinstates_name() {
         .await
         .expect("seed push should succeed");
 
-        // Create a child of main, then delete it. Pushing to the
-        // deleted id should reinstate the name → id mapping.
+        // Create a child of main, then delete it. A push to the deleted
+        // id fails as not found, which a client answers with a create.
         let child = create_child_branch(&repository_context, "feature", main, main_latest).await;
         branch::delete(repository_context.clone(), child)
             .await
@@ -636,7 +638,7 @@ async fn push_to_deleted_branch_reinstates_name() {
         );
 
         let child_revision = build_revision(&repository_context, main_latest, 2).await;
-        let response = handler(
+        let err = handler(
             make_request(repository, child, child_revision, false, false),
             allow_all(),
             immutable_store.clone(),
@@ -648,14 +650,13 @@ async fn push_to_deleted_branch_reinstates_name() {
             &instrument_provider,
         )
         .await
-        .expect("push to deleted branch should reinstate and succeed");
-        assert!(!response.into_inner().revision_signature.is_empty());
-
-        // Name now points back to the original branch id.
-        let restored = branch::load_name_to_id_local(repository_context.clone(), "feature")
-            .await
-            .expect("name lookup after reinstate");
-        assert_eq!(BranchId::from(restored), child);
+        .expect_err("a push to a deleted branch fails");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let mapping = branch::load_name_to_id_local(repository_context.clone(), "feature").await;
+        assert!(
+            mapping.as_ref().is_err_and(|err| err.is_branch_not_found()),
+            "the push leaves the deleted name unmapped: {mapping:?}",
+        );
     }))
     .await;
 }
@@ -720,6 +721,243 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
         .await
         .expect_err("push to deleted branch with claimed name should fail");
         assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }))
+    .await;
+}
+
+/// The branch that took the name of a deleted branch named `feature`.
+#[derive(Clone, Copy, Debug)]
+enum NameHolder {
+    /// Named `Feature`, the same name in another case.
+    InAnotherCase,
+    /// Named `feature`, with a metadata key that can't be read.
+    Unreadable,
+    /// Named `feature`, with a metadata key naming a blob the store doesn't hold.
+    MetadataMissing,
+    /// Named `other`, with `feature` mapped to it, as a restore under `feature` that hasn't
+    /// finished, or a leftover mapping, leaves it.
+    NamedOtherwise,
+}
+
+/// Pushes to a deleted branch named `feature` after a new branch took the name as `holder`
+/// describes. Answers the push's error code, and whether the name still maps to the new branch.
+async fn push_to_deleted_branch_whose_name_is_held(holder: NameHolder) -> (tonic::Code, bool) {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .return_once(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        handler(
+            make_request(repository, main, main_latest, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("seed push should succeed");
+
+        let original = create_child_branch(&repository_context, "feature", main, main_latest).await;
+        branch::delete(repository_context.clone(), original)
+            .await
+            .expect("delete should succeed");
+        let holder_name = match holder {
+            NameHolder::InAnotherCase => "Feature",
+            NameHolder::Unreadable | NameHolder::MetadataMissing => "feature",
+            NameHolder::NamedOtherwise => "other",
+        };
+        let holder_id =
+            create_child_branch(&repository_context, holder_name, main, main_latest).await;
+        if let NameHolder::NamedOtherwise = holder {
+            branch::claim_name(
+                repository_context.clone(),
+                "feature",
+                BranchId::default(),
+                holder_id,
+            )
+            .await
+            .expect("feature maps to the branch named other");
+        }
+        let (metadata_key, metadata_key_type) = branch::mutable_key(
+            lore_revision::repository::SALT_LORE,
+            branch::METADATA,
+            repository,
+            holder_id,
+        );
+        let push_store = match holder {
+            NameHolder::InAnotherCase | NameHolder::NamedOtherwise => mutable_store.clone(),
+            NameHolder::Unreadable => FailingLoadStore::for_key(
+                mutable_store.clone(),
+                metadata_key,
+                StoreError::internal("injected metadata failure"),
+            ),
+            NameHolder::MetadataMissing => {
+                mutable_store
+                    .clone()
+                    .store(
+                        repository,
+                        metadata_key,
+                        random::<Hash>(),
+                        metadata_key_type,
+                    )
+                    .await
+                    .expect("the holder's metadata key names a blob the store doesn't hold");
+                mutable_store.clone()
+            }
+        };
+
+        let stale_revision = build_revision(&repository_context, main_latest, 2).await;
+        let code = handler(
+            make_request(repository, original, stale_revision, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            push_store,
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("a push to a deleted branch whose name another branch holds fails")
+        .code();
+
+        let mapped = branch::load_name_to_id_local(repository_context.clone(), "feature")
+            .await
+            .expect("the name maps to a branch");
+        (code, BranchId::from(mapped) == holder_id)
+    }))
+    .await
+}
+
+/// A push to a deleted branch whose name a live branch holds in another case fails with
+/// `ALREADY_EXISTS`, as for the same case, and the name keeps naming that branch.
+#[tokio::test]
+async fn push_to_deleted_branch_fails_when_name_taken_in_another_case() {
+    assert_eq!(
+        push_to_deleted_branch_whose_name_is_held(NameHolder::InAnotherCase).await,
+        (tonic::Code::AlreadyExists, true)
+    );
+}
+
+/// A push to a deleted branch whose name maps to another branch with metadata fails with
+/// `ALREADY_EXISTS`, as the create the client would send next does, whatever the metadata holds:
+/// another name, or a blob the store doesn't hold. The name keeps naming that branch.
+#[tokio::test]
+async fn push_to_deleted_branch_fails_when_the_name_maps_to_a_branch_with_metadata() {
+    for holder in [NameHolder::NamedOtherwise, NameHolder::MetadataMissing] {
+        assert_eq!(
+            push_to_deleted_branch_whose_name_is_held(holder).await,
+            (tonic::Code::AlreadyExists, true),
+            "{holder:?}"
+        );
+    }
+}
+
+/// A push to a deleted branch whose name maps to a branch whose metadata key can't be read fails,
+/// and the name keeps naming that branch.
+#[tokio::test]
+async fn push_to_deleted_branch_fails_when_the_name_holder_is_unreadable() {
+    assert_eq!(
+        push_to_deleted_branch_whose_name_is_held(NameHolder::Unreadable).await,
+        (tonic::Code::Internal, true)
+    );
+}
+
+/// A push to a deleted branch whose name maps to an id without metadata fails as not found, as for
+/// a name nothing maps, and leaves the stale mapping as it is.
+#[tokio::test]
+async fn push_to_deleted_branch_over_a_stale_mapping_fails_not_found() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_pushed()
+        .times(1)
+        .returning(|_, _, _, _, _| ());
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let hook_dispatcher = HookDispatcher::empty();
+        handler(
+            make_request(repository, main, main_latest, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect("seed push should succeed");
+
+        let child = create_child_branch(&repository_context, "feature", main, main_latest).await;
+        branch::delete(repository_context.clone(), child)
+            .await
+            .expect("delete should succeed");
+        let stale = BranchId::from(uuid::Uuid::now_v7());
+        branch::claim_name(
+            repository_context.clone(),
+            "feature",
+            BranchId::default(),
+            stale,
+        )
+        .await
+        .expect("the deleted name is claimed for an id without metadata");
+
+        let child_revision = build_revision(&repository_context, main_latest, 2).await;
+        let err = handler(
+            make_request(repository, child, child_revision, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+        )
+        .await
+        .expect_err("a push to a deleted branch fails");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        let mapped = branch::load_name_to_id_local(repository_context.clone(), "feature")
+            .await
+            .expect("the stale mapping stays");
+        assert_eq!(BranchId::from(mapped), stale);
     }))
     .await;
 }

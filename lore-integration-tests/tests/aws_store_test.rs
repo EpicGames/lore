@@ -51,6 +51,7 @@ mod aws_store_tests {
     use crate::common::aws_common::FRAGMENTS_TABLE_NAME;
     use crate::common::aws_common::MUTABLE_STORE_TABLE_NAME;
     use crate::common::aws_common::STORE_BUCKET_NAME;
+    use crate::common::aws_common::dynamodb_setup;
     use crate::common::aws_common::setup;
     use crate::setup_execution;
 
@@ -1510,155 +1511,6 @@ mod aws_store_tests {
             .await
     }
 
-    /// Regression test for a silent push failure on newly created repositories.
-    ///
-    /// `branch::create` for a default branch (no revisions yet) calls
-    /// `store_latest(prev=0, latest=0)`, which goes through
-    /// `compare_and_swap(expected=0, value=0)` and writes a `{value=0000…}` row
-    /// to `DynamoDB`. Previously the zero-expected CAS condition was
-    /// `attribute_not_exists(pk) AND attribute_not_exists(sk)` — an item-existence
-    /// check that fails when the row already exists, even with a zero value. The
-    /// handler for the resulting `ConditionalCheckFailedException` returned the
-    /// stored zero as the "previous" value, which the caller mistook for a
-    /// successful swap. The branch pointer was never advanced.
-    ///
-    /// The fix changes the condition to check the value attribute directly:
-    /// `attribute_not_exists(#v) OR #v = :expected`, which matches both an absent
-    /// row and a row whose value is zero.
-    #[tokio::test]
-    async fn test_compare_and_swap_zero_expected_succeeds_when_row_holds_zero_value() -> TestResult
-    {
-        let hash = random::<Hash>();
-        let new_value = random::<Hash>();
-        let repository = random::<RepositoryId>();
-
-        let (_immutable_store, mutable_store, execution) = initialize_store().await?;
-        LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                // Replicate what branch::create does for a default branch: CAS from zero to
-                // zero, which writes {value=0000…} into DynamoDB without the caller noticing
-                // the value is the same as "no entry".
-                assert_eq!(
-                    Hash::default(),
-                    mutable_store
-                        .clone()
-                        .compare_and_swap(
-                            repository,
-                            hash,
-                            Hash::default(),
-                            Hash::default(),
-                            KeyType::BranchLatestPointer,
-                        )
-                        .await?,
-                    "initialisation CAS must succeed"
-                );
-
-                // The row now exists in DynamoDB with value=0000… . A zero value is treated
-                // as absent by both the local and AWS stores, so load returns AddressNotFound.
-                assert!(
-                    mutable_store
-                        .clone()
-                        .load(repository, hash, KeyType::BranchLatestPointer)
-                        .await
-                        .is_err(),
-                    "a zero-valued row must look absent to load"
-                );
-
-                // Now replicate the first real push: CAS from zero to a real revision hash.
-                // Before the fix this silently no-oped because the item-existence condition
-                // failed and the handler returned the stored zero as the previous value,
-                // making the caller think the swap had succeeded.
-                assert_eq!(
-                    Hash::default(),
-                    mutable_store
-                        .clone()
-                        .compare_and_swap(
-                            repository,
-                            hash,
-                            Hash::default(),
-                            new_value,
-                            KeyType::BranchLatestPointer,
-                        )
-                        .await?,
-                    "push CAS must succeed against the zero-valued row"
-                );
-
-                // The write must have actually landed — a clone would no longer be empty.
-                assert_eq!(
-                    new_value,
-                    mutable_store
-                        .clone()
-                        .load(repository, hash, KeyType::BranchLatestPointer)
-                        .await?,
-                    "branch pointer must reflect the pushed revision"
-                );
-
-                Ok(())
-            })
-            .await
-    }
-
-    /// A zero-valued row must block a CAS that expects a non-zero value.
-    ///
-    /// The stored zero does not equal the non-zero expected hash, so the swap
-    /// must not take effect. The returned previous value is zero (the actual
-    /// stored value), which differs from the non-zero expected, signalling
-    /// failure to the caller.
-    #[tokio::test]
-    async fn test_compare_and_swap_zero_value_row_blocks_nonzero_expected() -> TestResult {
-        let hash = random::<Hash>();
-        let new_value = random::<Hash>();
-        let wrong_expected = random::<Hash>(); // non-zero, does not match stored zero
-        let repository = random::<RepositoryId>();
-
-        let (_immutable_store, mutable_store, execution) = initialize_store().await?;
-        LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                // Write the zero-valued row (simulating branch::create for an empty branch).
-                mutable_store
-                    .clone()
-                    .compare_and_swap(
-                        repository,
-                        hash,
-                        Hash::default(),
-                        Hash::default(),
-                        KeyType::BranchLatestPointer,
-                    )
-                    .await?;
-
-                // CAS with a non-zero expected must not swap — the stored value is zero.
-                let previous = mutable_store
-                    .clone()
-                    .compare_and_swap(
-                        repository,
-                        hash,
-                        wrong_expected,
-                        new_value,
-                        KeyType::BranchLatestPointer,
-                    )
-                    .await?;
-
-                // previous != wrong_expected signals failure to the caller.
-                assert_ne!(
-                    previous, wrong_expected,
-                    "previous must not equal wrong_expected — the swap must not have taken effect"
-                );
-
-                // The row must be unchanged — still holds zero, which loads as absent.
-                assert!(
-                    mutable_store
-                        .clone()
-                        .load(repository, hash, KeyType::BranchLatestPointer)
-                        .await
-                        .is_err(),
-                    "row must still hold zero after a failed CAS"
-                );
-
-                Ok(())
-            })
-            .await
-    }
-
     #[tokio::test]
     async fn test_list_mutable_branch_ids() -> TestResult {
         let repository = random::<RepositoryId>();
@@ -1876,23 +1728,40 @@ mod aws_store_tests {
             .await
     }
 
-    #[tokio::test]
-    async fn aws_mutable_store_satisfies_conformance_battery() -> TestResult {
+    /// The mutable store on `DynamoDB` alone, the client it writes through, for reading and writing
+    /// its items directly, and the execution its calls run in.
+    async fn mutable_store_on_dynamodb() -> Result<
+        (
+            Arc<AwsMutableStore>,
+            lore_aws::dynamodb::DynamoDb,
+            Arc<ExecutionContext>,
+        ),
+        Box<dyn Error>,
+    > {
         let execution = setup_execution("test".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let (_, dynamo, _) = setup(vec![MUTABLE_STORE_TABLE_NAME]).await?;
-
+                let dynamo = dynamodb_setup(vec![MUTABLE_STORE_TABLE_NAME]).await?;
                 let settings = AwsMutableStoreSettings::new(
                     DynamoDbMutableStoreSettings::new(MUTABLE_STORE_TABLE_NAME.to_string()),
                     false,
                 );
-
-                let store: Arc<dyn MutableStore> = Arc::new(AwsMutableStore::new(
-                    dynamo,
+                let store = Arc::new(AwsMutableStore::new(
+                    dynamo.clone(),
                     &settings,
                     Arc::new(LocalStore::default()),
                 ));
+                Ok((store, dynamo, execution_context()))
+            })
+            .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn aws_mutable_store_satisfies_conformance_battery() -> TestResult {
+        let (store, _, execution) = mutable_store_on_dynamodb().await?;
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let store: Arc<dyn MutableStore> = store;
 
                 lore_storage::mutable_conformance::verify_mutable_store(
                     store,
@@ -1910,5 +1779,406 @@ mod aws_store_tests {
                 Ok(())
             })
             .await
+    }
+
+    /// The mutable store's compare-and-swap against the conditions `DynamoDB` evaluates, each
+    /// checked on the item the store leaves.
+    mod swaps_on_dynamodb {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use aws_sdk_dynamodb::primitives::Blob;
+        use aws_sdk_dynamodb::types::AttributeValue;
+        use lore_aws::dynamodb::DynamoDb;
+        use lore_aws::store::mutable_store::AwsMutableStore;
+        use lore_aws::store::mutable_store::MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE;
+        use lore_aws::store::mutable_store::MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE;
+        use lore_aws::store::mutable_store::MUTABLE_STORE_VALUE_ATTRIBUTE;
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_revision::lore::RepositoryId;
+        use lore_storage::MutableStore;
+        use lore_storage::StoreError;
+        use rand::random;
+        use zerocopy::IntoBytes;
+
+        use super::TestResult;
+        use super::mutable_store_on_dynamodb;
+        use super::typed_key;
+        use crate::common::aws_common::MUTABLE_STORE_TABLE_NAME;
+
+        const KEY_TYPE: KeyType = KeyType::BranchId;
+
+        /// The key of the item the store keeps for `key` in `repository`.
+        fn item_key(repository: RepositoryId, key: Hash) -> HashMap<String, AttributeValue> {
+            HashMap::from([
+                (
+                    MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
+                    AttributeValue::B(Blob::new(Context::from(repository).as_bytes())),
+                ),
+                (
+                    MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
+                    AttributeValue::B(Blob::new(typed_key(key, KEY_TYPE).as_bytes())),
+                ),
+            ])
+        }
+
+        /// The value of the item the store keeps for `key`, or `None` when there is no item.
+        async fn item(
+            dynamo: &DynamoDb,
+            repository: RepositoryId,
+            key: Hash,
+        ) -> Result<Option<Hash>, Box<dyn std::error::Error>> {
+            let output = dynamo
+                .get_item(
+                    &Arc::from(MUTABLE_STORE_TABLE_NAME),
+                    item_key(repository, key),
+                    true,
+                )
+                .await?;
+            let Some(item) = output.item() else {
+                return Ok(None);
+            };
+            match item.get(MUTABLE_STORE_VALUE_ATTRIBUTE) {
+                Some(AttributeValue::B(value)) => Ok(Some(Hash::from(value.as_ref()))),
+                other => Err(format!("an item with the value {other:?}").into()),
+            }
+        }
+
+        /// Writes an item for `key` holding zero, as a version that wrote such items left one.
+        async fn put_zero_item(
+            dynamo: &DynamoDb,
+            repository: RepositoryId,
+            key: Hash,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let mut zero = item_key(repository, key);
+            zero.insert(
+                MUTABLE_STORE_VALUE_ATTRIBUTE.to_string(),
+                AttributeValue::B(Blob::new(Hash::default().as_bytes())),
+            );
+            dynamo
+                .put_item(&Arc::from(MUTABLE_STORE_TABLE_NAME), zero)
+                .await?;
+            Ok(())
+        }
+
+        async fn swap(
+            store: &Arc<AwsMutableStore>,
+            repository: RepositoryId,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+        ) -> Result<Hash, StoreError> {
+            store
+                .clone()
+                .compare_and_swap(repository, key, expected, value, KEY_TYPE)
+                .await
+        }
+
+        /// What a load of `key` reads, zero for a key it does not find.
+        async fn load(
+            store: &Arc<AwsMutableStore>,
+            repository: RepositoryId,
+            key: Hash,
+        ) -> Result<Hash, StoreError> {
+            match store.clone().load(repository, key, KEY_TYPE).await {
+                Err(err) if err.is_address_not_found() => Ok(Hash::default()),
+                loaded => loaded,
+            }
+        }
+
+        #[tokio::test]
+        async fn a_swap_from_zero_creates_the_item() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (repository, key, value) = (random(), random(), random());
+                    assert_eq!(
+                        swap(&store, repository, key, Hash::default(), value).await?,
+                        Hash::default()
+                    );
+                    assert_eq!(item(&dynamo, repository, key).await?, Some(value));
+                    Ok(())
+                })
+                .await
+        }
+
+        /// A matching swap to zero deletes the item.
+        #[tokio::test]
+        async fn a_matching_swap_to_zero_deletes_the_item() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (repository, key, value) = (random(), random(), random());
+                    store
+                        .clone()
+                        .store(repository, key, value, KEY_TYPE)
+                        .await?;
+                    assert_eq!(
+                        swap(&store, repository, key, value, Hash::default()).await?,
+                        value
+                    );
+                    assert_eq!(item(&dynamo, repository, key).await?, None);
+                    assert_eq!(load(&store, repository, key).await?, Hash::default());
+                    Ok(())
+                })
+                .await
+        }
+
+        /// A swap from a value the key does not hold, to a value or to zero, answers the held
+        /// value and leaves the item.
+        #[tokio::test]
+        async fn a_mismatched_swap_answers_the_held_value_and_leaves_the_item() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (repository, key, value) = (random(), random(), random());
+                    store
+                        .clone()
+                        .store(repository, key, value, KEY_TYPE)
+                        .await?;
+                    for to in [random(), Hash::default()] {
+                        assert_eq!(swap(&store, repository, key, random(), to).await?, value);
+                        assert_eq!(item(&dynamo, repository, key).await?, Some(value));
+                    }
+                    Ok(())
+                })
+                .await
+        }
+
+        /// A swap from a value on an absent key answers zero, by a put and by a delete, and
+        /// writes no item.
+        #[tokio::test]
+        async fn a_swap_from_a_value_on_an_absent_key_answers_zero_and_writes_no_item() -> TestResult
+        {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (repository, key) = (random(), random());
+                    for to in [random(), Hash::default()] {
+                        assert_eq!(
+                            swap(&store, repository, key, random(), to).await?,
+                            Hash::default()
+                        );
+                        assert_eq!(item(&dynamo, repository, key).await?, None);
+                    }
+                    Ok(())
+                })
+                .await
+        }
+
+        /// A swap from zero to zero on an absent key succeeds and writes no item.
+        #[tokio::test]
+        async fn a_swap_from_zero_to_zero_on_an_absent_key_writes_no_item() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (repository, key) = (random(), random());
+                    assert_eq!(
+                        swap(&store, repository, key, Hash::default(), Hash::default()).await?,
+                        Hash::default()
+                    );
+                    assert_eq!(item(&dynamo, repository, key).await?, None);
+                    Ok(())
+                })
+                .await
+        }
+
+        /// A swap from a value to itself answers the held value and leaves the item as it is.
+        #[tokio::test]
+        async fn a_swap_to_the_expected_value_answers_the_held_value() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (repository, key, value, other) = (random(), random(), random(), random());
+                    store
+                        .clone()
+                        .store(repository, key, value, KEY_TYPE)
+                        .await?;
+                    assert_eq!(swap(&store, repository, key, value, value).await?, value);
+                    assert_eq!(swap(&store, repository, key, other, other).await?, value);
+                    assert_eq!(item(&dynamo, repository, key).await?, Some(value));
+
+                    let absent = random();
+                    assert_eq!(
+                        swap(&store, repository, absent, other, other).await?,
+                        Hash::default()
+                    );
+                    assert_eq!(item(&dynamo, repository, absent).await?, None);
+                    Ok(())
+                })
+                .await
+        }
+
+        /// An item holding zero, as an older version wrote one, is absent: a load does not find it,
+        /// a swap from a value answers zero and leaves it, a swap from zero to a value replaces it,
+        /// and a swap from zero to zero or a store of zero deletes it.
+        ///
+        /// Older versions wrote such an item for a branch with no revision, whose latest pointer
+        /// they swapped from zero to zero. A swap from zero refused over it, and answering the zero
+        /// it holds, reads as made: the first push to the branch would be lost.
+        #[tokio::test]
+        async fn an_old_item_holding_zero_is_absent() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: RepositoryId = random();
+                    let zero_item = async |key: Hash| {
+                        put_zero_item(&dynamo, repository, key).await?;
+                        assert_eq!(item(&dynamo, repository, key).await?, Some(Hash::default()));
+                        Ok::<_, Box<dyn std::error::Error>>(key)
+                    };
+
+                    let key = zero_item(random()).await?;
+                    assert_eq!(load(&store, repository, key).await?, Hash::default());
+                    for to in [random(), Hash::default()] {
+                        assert_eq!(
+                            swap(&store, repository, key, random(), to).await?,
+                            Hash::default(),
+                            "a swap from a value to {to}"
+                        );
+                        assert_eq!(item(&dynamo, repository, key).await?, Some(Hash::default()));
+                    }
+                    let value = random();
+                    assert_eq!(
+                        swap(&store, repository, key, Hash::default(), value).await?,
+                        Hash::default()
+                    );
+                    assert_eq!(item(&dynamo, repository, key).await?, Some(value));
+
+                    let key = zero_item(random()).await?;
+                    assert_eq!(
+                        swap(&store, repository, key, Hash::default(), Hash::default()).await?,
+                        Hash::default()
+                    );
+                    assert_eq!(item(&dynamo, repository, key).await?, None, "0 -> 0");
+
+                    let key = zero_item(random()).await?;
+                    store
+                        .clone()
+                        .store(repository, key, Hash::default(), KEY_TYPE)
+                        .await?;
+                    assert_eq!(item(&dynamo, repository, key).await?, None, "a store of 0");
+                    Ok(())
+                })
+                .await
+        }
+
+        /// Racers swapping one key from zero, absent or held by an old zero item, to values of
+        /// their own: exactly one wins, every other answers the winner's value, and the item holds
+        /// it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn racing_swaps_from_zero_have_one_winner() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: RepositoryId = random();
+                    for round in 0..8 {
+                        let key: Hash = random();
+                        if round % 2 == 1 {
+                            put_zero_item(&dynamo, repository, key).await?;
+                        }
+                        let values: Vec<Hash> = (0..16).map(|_| random()).collect();
+                        let mut racers = tokio::task::JoinSet::new();
+                        for value in values.clone() {
+                            let store = store.clone();
+                            lore_base::lore_spawn!(racers, async move {
+                                (
+                                    value,
+                                    swap(&store, repository, key, Hash::default(), value).await,
+                                )
+                            });
+                        }
+                        let mut answers = Vec::new();
+                        while let Some(joined) = racers.join_next().await {
+                            let (value, held) = joined?;
+                            answers.push((value, held?));
+                        }
+                        let winners: Vec<Hash> = answers
+                            .iter()
+                            .filter(|(_, held)| held.is_zero())
+                            .map(|(value, _)| *value)
+                            .collect();
+                        assert_eq!(winners.len(), 1, "round {round}: {answers:?}");
+                        assert!(
+                            answers
+                                .iter()
+                                .all(|(_, held)| held.is_zero() || *held == winners[0]),
+                            "round {round}: every loser answers the winner's value: {answers:?}"
+                        );
+                        assert_eq!(item(&dynamo, repository, key).await?, Some(winners[0]));
+                    }
+                    Ok(())
+                })
+                .await
+        }
+
+        /// A swap to zero racing a swap from the same value: exactly one is made, the other
+        /// answers what the first left, and the item is what the answers say.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_swap_to_zero_racing_a_swap_from_the_value_ends_as_the_answers_say() -> TestResult
+        {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: RepositoryId = random();
+                    let mut removals_won = 0;
+                    for round in 0..40 {
+                        let (key, held, next): (Hash, Hash, Hash) = (random(), random(), random());
+                        store.clone().store(repository, key, held, KEY_TYPE).await?;
+                        let removing = {
+                            let store = store.clone();
+                            lore_base::lore_spawn!(async move {
+                                swap(&store, repository, key, held, Hash::default()).await
+                            })
+                        };
+                        let moving = {
+                            let store = store.clone();
+                            lore_base::lore_spawn!(async move {
+                                swap(&store, repository, key, held, next).await
+                            })
+                        };
+                        let (removal, move_) = (removing.await??, moving.await??);
+                        let left = item(&dynamo, repository, key).await?;
+                        if removal == held {
+                            removals_won += 1;
+                            assert_eq!(move_, Hash::default(), "round {round}");
+                            assert_eq!(left, None, "round {round}");
+                        } else {
+                            assert_eq!(move_, held, "round {round}: one swap is made");
+                            assert_eq!(removal, next, "round {round}");
+                            assert_eq!(left, Some(next), "round {round}");
+                        }
+                    }
+                    tracing::info!(removals_won, "rounds the removal won, of 40");
+                    Ok(())
+                })
+                .await
+        }
+
+        /// Racers swapping and removing a few keys form one history per key, and every key that
+        /// ends absent has no item.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn racing_swaps_and_removals_form_one_history() -> TestResult {
+            let (store, dynamo, execution) = mutable_store_on_dynamodb().await?;
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: RepositoryId = random();
+                    let keys: Vec<Hash> = (0..4).map(|_| random()).collect();
+                    let racing: Arc<dyn MutableStore> = store.clone();
+                    let ends = lore_storage::mutable_conformance::race_swaps(
+                        &racing, repository, KEY_TYPE, &keys, 8, 50,
+                    )
+                    .await?;
+                    for (key, end) in keys.iter().zip(&ends) {
+                        let expected = (!end.is_zero()).then_some(*end);
+                        assert_eq!(item(&dynamo, repository, *key).await?, expected);
+                    }
+                    Ok(())
+                })
+                .await
+        }
     }
 }

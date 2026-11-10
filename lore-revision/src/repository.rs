@@ -738,6 +738,17 @@ fn remote_arc(state: RemoteState) -> SharedRemote {
     Arc::new(tokio::sync::RwLock::new(state))
 }
 
+/// Whether the current command's mutable writes are discarded: true in a client's dry run, where
+/// [`RepositoryContext::new_with_state`] wraps the mutable store of each context it builds in a
+/// [`WriteDiscardingMutableStore`](crate::store::write_discarding::WriteDiscardingMutableStore),
+/// which contexts derived from those keep. A read after a discarded write answers what the store
+/// held before it. A context built otherwise, such as by [`RepositoryContext::new_server_context`],
+/// keeps its store as it is given.
+pub(crate) fn discards_mutable_writes() -> bool {
+    crate::runtime::try_execution_context()
+        .is_some_and(|context| context.is_client() && context.globals().dry_run())
+}
+
 /// A context's remote, which contexts made from it share: the connection, its pending connect,
 /// or why there is none.
 pub(crate) type SharedRemote = Arc<tokio::sync::RwLock<RemoteState>>;
@@ -779,11 +790,12 @@ impl RepositoryContext {
         filter: Arc<Filter>,
         filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
     ) -> Self {
-        let mutable_store: Arc<dyn MutableStore> = match crate::runtime::try_execution_context() {
-            Some(context) if context.is_client() && context.globals().dry_run() => Arc::new(
+        let mutable_store: Arc<dyn MutableStore> = if discards_mutable_writes() {
+            Arc::new(
                 crate::store::write_discarding::WriteDiscardingMutableStore::new(mutable_store),
-            ),
-            _ => mutable_store,
+            )
+        } else {
+            mutable_store
         };
         let file_system = filesystem_provider.unwrap_or_else(|| {
             Self::default_filesystem(
@@ -3699,6 +3711,7 @@ pub async fn branch_switch(
     let context = execution_context();
     let global = context.globals();
 
+    let by_id = Context::from_str(&branch).is_ok();
     let branch = branch::resolve(repository.clone(), branch.as_str())
         .await
         .forward::<RepositoryError>("Invalid branch")?;
@@ -3751,6 +3764,10 @@ pub async fn branch_switch(
             }
             .into());
         }
+    }
+
+    if by_id && !global.dry_run() {
+        branch::cache_name_mapping(repository.clone(), branch.id, branch_name).await;
     }
 
     if !options.bare {
@@ -3817,21 +3834,6 @@ pub async fn branch_switch(
 
         if branch_location == LoreBranchLocation::Remote {
             branch::store_last_sync(repository.clone(), branch.id, branch_latest_local).await;
-        }
-
-        // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
-        let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
-            .await
-            .unwrap_or_default();
-        if mapped != Context::default() && mapped != branch.id && !global.force() {
-            return Err(RepositoryError::internal(
-                "Given branch's name is already used by another branch",
-            ));
-        }
-        if mapped == Context::default() || global.force() {
-            branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
-                .await
-                .forward::<RepositoryError>("restoring name-to-id mapping")?;
         }
 
         if !options.bare {

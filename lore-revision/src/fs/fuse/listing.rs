@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use lore_base::text::fold_eq;
 use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use smallvec::SmallVec;
@@ -20,7 +21,6 @@ use crate::errors::NotSupported;
 use crate::filter::FilterStates;
 use crate::fs::fuse::FuseProviderError;
 use crate::fs::fuse::filesystem::ListingHook;
-use crate::fs::fuse::inode_number::fold_eq;
 use crate::fs::fuse::served::Served;
 use crate::fs::fuse::view::child_filter;
 use crate::fs::fuse::view::filter_states_to_u8;

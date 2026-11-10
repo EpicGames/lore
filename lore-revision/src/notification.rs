@@ -276,6 +276,8 @@ pub fn register_notification_service(id: &str, service: Arc<dyn NotificationServ
     notification_service_registry().insert(id.to_string(), service);
 }
 
+/// Sends a repository's notifications to their subscribers. A caller can await a call where no
+/// deadline stops it, so each call must return promptly.
 #[async_trait]
 pub trait NotificationSender
 where

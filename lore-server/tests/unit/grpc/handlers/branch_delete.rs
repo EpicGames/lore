@@ -19,6 +19,7 @@ use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
 use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::hooks::HookDispatcher;
+use lore_server::hooks::HookPoint;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use mockall::predicate::eq;
@@ -29,6 +30,7 @@ use tonic::Request;
 use crate::notification::testing::MockNotificationSender;
 use crate::store::test_support::test_store_create;
 
+#[derive(Clone)]
 struct TestInstrumentProvider {}
 
 impl InstrumentProvider for TestInstrumentProvider {
@@ -133,7 +135,7 @@ async fn sends_delete_notification_for_deleted_branch() {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let hook_dispatcher = HookDispatcher::empty();
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
         handler(
             request,
             &crate::util::test_support::allow_all_authorizer(),
@@ -169,7 +171,7 @@ async fn no_delete_notification_for_branch_not_exists() {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let hook_dispatcher = HookDispatcher::empty();
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
         handler(
             request,
             &crate::util::test_support::allow_all_authorizer(),
@@ -218,7 +220,7 @@ async fn no_delete_notification_for_branch_delete_errors() {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let hook_dispatcher = HookDispatcher::empty();
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
         let response = handler(
             request,
             &crate::util::test_support::allow_all_authorizer(),
@@ -232,6 +234,100 @@ async fn no_delete_notification_for_branch_delete_errors() {
         .unwrap_err();
 
         assert_eq!(response.code(), tonic::Code::FailedPrecondition);
+    }))
+    .await;
+}
+
+/// A delete that settles a restore stopped after its claim, dropped while it reads the branch's
+/// metadata, as one whose deadline passes or whose client leaves is, still settles it, notifies of
+/// the deleted branch and spawns its post hooks: the delete runs on in a task of its own, which
+/// notifies after the restore's name maps to nothing.
+#[tokio::test]
+async fn a_dropped_delete_settles_a_stopped_restore() {
+    let repository = random::<RepositoryId>();
+    let branch = BranchId::from(uuid::Uuid::now_v7());
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let (notify, mut notified) = tokio::sync::mpsc::unbounded_channel();
+    let mut notification_sender = MockNotificationSender::new();
+    notification_sender
+        .expect_branch_deleted()
+        .with(eq(repository), eq(branch))
+        .times(1)
+        .returning(move |_, _| {
+            notify
+                .send(())
+                .expect("the test waits for the notification");
+        });
+    let notification_sender = Arc::new(notification_sender);
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        create_test_branch(repository_context.clone(), branch).await;
+        branch::delete(repository_context.clone(), branch)
+            .await
+            .expect("the branch is archived");
+        crate::util::test_support::stop_restore_after_claim(
+            &repository_context,
+            branch,
+            "stopped-name",
+        )
+        .await;
+        let gated = crate::util::test_support::gate_metadata_loads(
+            mutable_store.clone(),
+            repository,
+            branch,
+            0,
+        );
+        let mut request = Request::new(BranchDeleteRequest {
+            branch: branch.into(),
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+
+        let (hook_dispatcher, mut post_hooks) =
+            crate::util::hook_recorder::post_recording_dispatcher(&[HookPoint::BranchDelete]);
+        let authorizer = crate::util::test_support::allow_all_authorizer();
+        crate::util::test_support::drop_at_gated_load(
+            handler(
+                request,
+                &authorizer,
+                immutable_store.clone(),
+                gated.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                &instrument_provider,
+            ),
+            &gated,
+        )
+        .await;
+
+        crate::util::test_support::wait_for_message(
+            &mut notified,
+            (),
+            "the dropped delete notifies of the deleted branch",
+        )
+        .await;
+        crate::util::test_support::wait_for_message(
+            &mut post_hooks,
+            HookPoint::BranchDelete,
+            "the dropped delete spawns its post hooks",
+        )
+        .await;
+        assert_eq!(
+            branch::load_name_to_id_local(repository_context, "stopped-name")
+                .await
+                .ok(),
+            None,
+            "the dropped delete settles the stopped restore"
+        );
     }))
     .await;
 }

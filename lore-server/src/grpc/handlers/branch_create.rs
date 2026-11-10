@@ -20,11 +20,13 @@ use tracing::debug;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::BranchWriteFollowUp;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::ServerResultExt;
+use crate::grpc::create_branch_detached;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
-use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::require_action;
 use crate::hooks::HookContext;
@@ -56,11 +58,6 @@ fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<()
     Ok(())
 }
 
-// Branch existence checks and write ordering are implemented in
-// urc-core/src/branch.rs::create(). See the documentation there for the
-// full decision matrix. The query handler in branch_query.rs uses the
-// same existence model.
-
 #[tracing::instrument(name = "BranchCreate::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchCreateRequest>,
@@ -68,8 +65,8 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
-    hook_dispatcher: &HookDispatcher,
-    instrument_provider: &impl InstrumentProvider,
+    hook_dispatcher: &Arc<HookDispatcher>,
+    instrument_provider: &(impl InstrumentProvider + Clone + Send + 'static),
 ) -> Result<Response<BranchCreateResponse>, Status> {
     require_action(authorizer, &request, Action::Write).await?;
     let repository_id = get_repository(request.metadata())?;
@@ -119,28 +116,30 @@ pub async fn handler(
             let stack: Vec<BranchPoint> = stack.into_iter().map(BranchPoint::from).collect();
             debug!({BRANCH_ID} = %branch, branch_name = name, stack = ?stack, "Creating branch");
 
-            let write_token = get_write_token();
-            let branch = lore_revision::branch::create(
+            let branch = create_branch_detached(
                 repository.clone(),
-                &write_token,
                 branch,
-                name.as_str(),
-                category.as_str(),
-                creator.as_str(),
+                name,
+                category,
+                creator,
                 created,
                 stack,
-                false,
-                false, /* Do not create linked repository branches */
+                BranchWriteFollowUp {
+                    notification_sender,
+                    hook_dispatcher: hook_dispatcher.clone(),
+                    hook_context: hook_ctx,
+                    instrument_provider: instrument_provider.clone(),
+                },
             )
-            .await
+            .await?
             .filter_slow_down()?
-            .map_err(|err| Status::invalid_argument(err.to_string()))?;
-
-            notification_sender
-                .branch_created(repository_id, branch)
-                .await;
-
-            hook_dispatcher.spawn_post(HookPoint::BranchCreate, hook_ctx);
+            .warn_map_err(|err| {
+                if err.is_invalid_arguments() || err.is_branch_already_exists() {
+                    Status::invalid_argument(err.to_string())
+                } else {
+                    Status::internal(err.to_string())
+                }
+            })?;
 
             let revision = branch::load_latest(repository, branch)
                 .await
@@ -149,9 +148,7 @@ pub async fn handler(
                 // only fail with BranchAlreadyExists.
                 .unwrap_or_default();
 
-            debug!("Created branch {name} ({branch}) at revision {revision}");
-            let num_branches_created = instrument_provider.counter("num_branches_created");
-            num_branches_created.add(1, &[]);
+            debug!({BRANCH_ID} = %branch, %revision, "Created branch");
 
             Ok(Response::new(BranchCreateResponse {
                 revision: revision.into(),

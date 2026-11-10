@@ -5,6 +5,7 @@ use std::alloc::Layout;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
+use lore_base::allocator::GrowVec;
 use lore_base::allocator::RpmallocHeapAllocator;
 use lore_base::allocator::set_allocation_counting;
 use lore_base::allocator::thread_allocation_count;
@@ -94,4 +95,25 @@ fn dealloc_is_not_counted() {
         1,
         "dropping the box must not add a second count for its dealloc"
     );
+}
+
+/// Removals from a `GrowVec`, shifting, swapping and down to empty, allocate nothing.
+#[test]
+fn growvec_removals_allocate_nothing() {
+    let _lock = TEST_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut values: GrowVec<u32, 8> = GrowVec::new();
+    for value in 0..40 {
+        values.push(value);
+    }
+    set_allocation_counting(true);
+    let _restore = DisableCountingOnDrop;
+    let before = thread_allocation_count();
+    values.remove(0);
+    values.remove(17);
+    values.swap_remove(3);
+    while !values.is_empty() {
+        values.swap_remove(0);
+    }
+    let _ = std::hint::black_box(&values);
+    assert_eq!(thread_allocation_count() - before, 0);
 }

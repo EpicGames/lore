@@ -11,6 +11,7 @@ use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataType;
+use lore_revision::metadata::branch::ARCHIVE_KEYS;
 use lore_revision::metadata::branch::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -31,7 +32,7 @@ use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
 /// Validate that read-only fields have not been changed between the current and proposed
-/// metadata blobs.
+/// metadata blobs, and that none of the keys archives and restores write was added.
 pub(crate) fn validate_read_only_fields(
     current: &Metadata,
     proposed: &Metadata,
@@ -51,6 +52,11 @@ pub(crate) fn validate_read_only_fields(
             (Ok(_), Err(_)) => {
                 return Err(Status::invalid_argument(format!(
                     "cannot remove read-only key '{key}'"
+                )));
+            }
+            (Err(_), Ok(_)) if ARCHIVE_KEYS.contains(key) => {
+                return Err(Status::invalid_argument(format!(
+                    "cannot add read-only key '{key}'"
                 )));
             }
             (Err(_), Ok(_) | Err(_)) => {}

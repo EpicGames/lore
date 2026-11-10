@@ -309,6 +309,67 @@ where
         }
     }
 
+    /// Removes the element at `index` and returns it, moving every element after it down one
+    /// place, or answers `None` and changes nothing when `index` is not below the length, as
+    /// `VecDeque::remove` does. Frees the last chunk once it holds nothing.
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        if index >= self.len() {
+            return None;
+        }
+
+        let (start_chunk_index, element_index) = Self::split_index(index);
+        let item = self.chunks[start_chunk_index].element[element_index];
+        let last_chunk_index = self.chunks.len() - 1;
+        for chunk_index in start_chunk_index..=last_chunk_index {
+            let from = if chunk_index == start_chunk_index {
+                element_index
+            } else {
+                0
+            };
+            let end = if chunk_index == last_chunk_index {
+                self.partial_len
+            } else {
+                N
+            };
+            self.chunks[chunk_index]
+                .element
+                .copy_within(from + 1..end, from);
+            if chunk_index < last_chunk_index {
+                let carry = self.chunks[chunk_index + 1].element[0];
+                self.chunks[chunk_index].element[N - 1] = carry;
+            }
+        }
+        self.truncate_last();
+        Some(item)
+    }
+
+    /// Removes the element at `index` and returns it, moving the last element into its place, or
+    /// answers `None` and changes nothing when `index` is not below the length, as
+    /// `VecDeque::swap_remove_back` does. Frees the last chunk once it holds nothing.
+    pub fn swap_remove(&mut self, index: usize) -> Option<T> {
+        let len = self.len();
+        if index >= len {
+            return None;
+        }
+
+        let item = self[index];
+        self[index] = self[len - 1];
+        self.truncate_last();
+        Some(item)
+    }
+
+    /// Drops the last element, and the last chunk with it once that chunk holds nothing, so that a
+    /// chunk is held only while it holds an element.
+    fn truncate_last(&mut self) {
+        self.partial_len -= 1;
+        if self.partial_len == 0 {
+            self.chunks.pop();
+            if !self.chunks.is_empty() {
+                self.partial_len = N;
+            }
+        }
+    }
+
     pub fn to_vec(&self) -> Vec<T>
     where
         T: Clone,

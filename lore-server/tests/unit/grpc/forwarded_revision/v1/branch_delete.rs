@@ -27,6 +27,7 @@ use tonic::Request;
 use crate::notification::testing::MockNotificationSender;
 use crate::store::test_support::test_store_create;
 
+#[derive(Clone)]
 struct TestInstrumentProvider {}
 
 impl InstrumentProvider for TestInstrumentProvider {
@@ -135,7 +136,7 @@ async fn missing_user_id_returns_internal_error() {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let hook_dispatcher = HookDispatcher::empty();
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
         let err = handler(
             request,
             immutable_store,
@@ -180,7 +181,7 @@ mod base_branch_delete_handler {
             ));
             create_test_branch(repository_context, branch_id).await;
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let response = handler(
                 make_forwarded_request(repository, branch_id),
                 immutable_store,
@@ -213,7 +214,7 @@ mod base_branch_delete_handler {
         let instrument_provider = TestInstrumentProvider {};
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let err = handler(
                 make_forwarded_request(repository, branch_id),
                 immutable_store,

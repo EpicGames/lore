@@ -1185,7 +1185,7 @@ pub async fn clone(
         // concurrent same-path clones; the mutex is meaningful even in NoStore
         // mode because both clones still race on the destination directory's
         // file materialization. Sharing here means downstream helpers
-        // (`branch::create` → `store_name_to_id` / `metadata_store` /
+        // (`branch::create` → `create_record`'s metadata swap / `claim_name` /
         // `store_latest`) see a context with write capability and can populate
         // the (in-memory or on-disk) mutable store.
         let load_token = Some(write_token.share());
@@ -1446,37 +1446,14 @@ async fn clone_into(
 
     let branch_name = branch::name(&metadata).unwrap_or_default().to_string();
 
-    let store_task: tokio::task::JoinHandle<Result<(), CloneError>> = lore_spawn!({
-        let repository = repository.clone();
-        let branch_name = branch_name.clone();
-        let branch_metadata = branch.metadata;
-        async move {
-            if !branch::exist_local(repository.clone(), branch_id).await {
-                branch::mutable_store_metadata(repository.clone(), branch_id, branch_metadata)
-                    .await
-                    .forward::<CloneError>("Failed to create local branch")?;
-                branch::store_name_to_id(repository.clone(), branch_id, branch_name)
-                    .await
-                    .forward::<CloneError>("Failed to create local branch")?;
-            }
-            if !revision.is_zero() {
-                let local_latest = branch::load_latest(repository.clone(), branch_id)
-                    .await
-                    .unwrap_or_default();
-                branch::store_latest(
-                    repository.clone(),
-                    branch_id,
-                    local_latest,
-                    revision,
-                    BranchLatestStatus::Convergent,
-                )
-                .await
-                .forward::<CloneError>("Failed to create local branch")?;
-                branch::store_last_sync(repository.clone(), branch_id, revision).await;
-            }
-            Ok::<(), CloneError>(())
-        }
-    });
+    let store_task: tokio::task::JoinHandle<Result<(), CloneError>> =
+        lore_spawn!(store_cloned_branch(
+            repository.clone(),
+            branch_id,
+            branch_name.clone(),
+            branch.metadata,
+            revision,
+        ));
 
     event::LoreEvent::RepositoryCloneBegin(LoreRepositoryCloneBeginEventData {
         repository: repository.id,
@@ -1541,6 +1518,66 @@ async fn clone_into(
     .send();
 
     Ok(())
+}
+
+/// Stores the cloned branch `branch_id` in the local store. Where the store lacks the branch, it
+/// swaps `branch_metadata` in as its metadata from none and claims `branch_name` for it unless
+/// another branch holds the name or the mapping changes during the clone
+/// ([`branch::claim_name_unless_held`]), failing where its read of the mapping fails. Metadata
+/// another writer stored first is left as it is, with its name, and logged. A non-zero `revision`
+/// is stored as the branch's latest, converged with the remote, and as its last sync.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn store_cloned_branch(
+    repository: Arc<RepositoryContext>,
+    branch_id: crate::lore::BranchId,
+    branch_name: String,
+    branch_metadata: Hash,
+    revision: Hash,
+) -> impl Future<Output = Result<(), CloneError>> {
+    async move {
+        if !branch::exist_local(repository.clone(), branch_id).await {
+            let held = branch::mutable_try_store(
+                repository.clone(),
+                branch::METADATA,
+                branch_id,
+                Hash::default(),
+                branch_metadata,
+            )
+            .await
+            .forward::<CloneError>("Failed to create local branch")?;
+            if !held.is_zero() {
+                lore_warn!(
+                    "Another writer stored the metadata of the cloned branch {branch_id} first, so the clone leaves it"
+                );
+            } else if !branch::claim_name_unless_held(repository.clone(), &branch_name, branch_id)
+                .await
+                .forward::<CloneError>("Failed to create local branch")?
+            {
+                lore_warn!(
+                    "The name {branch_name} names another branch or changed during the clone, so it doesn't name the cloned branch {branch_id}"
+                );
+            }
+        }
+        if !revision.is_zero() {
+            let local_latest = branch::load_latest(repository.clone(), branch_id)
+                .await
+                .unwrap_or_default();
+            branch::store_latest(
+                repository.clone(),
+                branch_id,
+                local_latest,
+                revision,
+                BranchLatestStatus::Convergent,
+            )
+            .await
+            .forward::<CloneError>("Failed to create local branch")?;
+            branch::store_last_sync(repository, branch_id, revision).await;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]

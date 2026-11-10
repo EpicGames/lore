@@ -90,6 +90,32 @@ def test_branch_metadata_clear_defaults_to_current_branch(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_branch_metadata_keeps_the_archive_keys(new_lore_repo):
+    """Archive keys are read-only: a set or clear fails, and clearing all keeps them."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Initial commit", {"file.txt": ["Line one\n"]})
+    repo.branch_create("kept-keys")
+    repo.write_commit_push("Branch commit", {"file.txt": ["Line one\nBranch\n"]})
+    branch_id = parse_jsonl(repo.branch_info(json=True), "branchInfo")[0]["id"]
+    repo.branch_switch("main")
+    repo.branch_archive("kept-keys")
+    repo.branch_create("kept-keys", id=branch_id)
+
+    before = get_metadata_dict(repo.branch_metadata_get(branch="kept-keys", json=True))
+    assert "archived" in before, before.keys()
+
+    for key in ["archived", "restored", "restoring", "released"]:
+        with pytest.raises(ImproperArgumentsError):
+            repo.branch_metadata_set([key, "1"], branch="kept-keys")
+        with pytest.raises(ImproperArgumentsError):
+            repo.branch_metadata_clear([key], branch="kept-keys")
+    repo.branch_metadata_clear(branch="kept-keys")
+
+    after = get_metadata_dict(repo.branch_metadata_get(branch="kept-keys", json=True))
+    assert after["archived"] == before["archived"]
+
+
+@pytest.mark.smoke
 def test_branch_metadata_set_single_arg_rejected(new_lore_repo):
     """A lone argument has no value; the set must be rejected, not panic."""
     repo: Lore = new_lore_repo()

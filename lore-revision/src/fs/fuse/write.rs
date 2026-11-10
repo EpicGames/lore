@@ -39,6 +39,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
+use lore_base::text::fold_eq;
 use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_fuse::abi::Attr;
@@ -72,7 +73,6 @@ use crate::fs::fuse::inode::InodeTable;
 use crate::fs::fuse::inode::Name;
 use crate::fs::fuse::inode::NewChild;
 use crate::fs::fuse::inode::ROOT_INO;
-use crate::fs::fuse::inode_number::fold_eq;
 use crate::fs::fuse::listing::Hit;
 use crate::fs::fuse::listing::Listing;
 use crate::fs::fuse::listing::ListingEntry;

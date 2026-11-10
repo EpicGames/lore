@@ -18,6 +18,8 @@ use zerocopy::IntoBytes;
 
 use crate::store_fixture::wait_for;
 
+mod removal;
+
 fn write_bucket_file(path: &Path, version: u32) {
     let entry = MutableStoreEntry::default();
     let mut header = MutableStoreHeader::new_zeroed();
@@ -2066,20 +2068,24 @@ async fn an_unsynced_flush_replaces_the_bucket_file() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn local_mutable_store_satisfies_conformance_battery() {
-    let store = lore_storage::local::mutable_store::create(
-        None::<&std::path::Path>,
+    lore_storage::mutable_conformance::verify_mutable_store(
+        make_in_memory_mutable().await,
+        lore_storage::mutable_conformance::Capabilities::new("LocalMutableStore"),
+    )
+    .await;
+}
+
+/// A local mutable store kept in memory, with default settings.
+pub(crate) async fn make_in_memory_mutable() -> Arc<LocalMutableStore> {
+    create(
+        None::<&Path>,
         MutableStoreSettings::default(),
         make_in_memory_immutable().await,
     )
     .await
-    .expect("create store");
-    lore_storage::mutable_conformance::verify_mutable_store(
-        store,
-        lore_storage::mutable_conformance::Capabilities::new("LocalMutableStore"),
-    )
-    .await;
+    .expect("Failed to create in-memory mutable store")
 }
 
 async fn make_in_memory_immutable() -> Arc<dyn ImmutableStore> {
@@ -2989,34 +2995,6 @@ async fn populated_bucket(store: &LocalMutableStore) -> (usize, usize) {
         }
     }
     panic!("a store populates a bucket");
-}
-
-/// **A flush settles a bucket it has nothing to write for**, so an emptied bucket
-/// above the committed level does not keep the store claimed.
-#[tokio::test]
-async fn a_flush_settles_an_emptied_bucket_it_has_nothing_to_write_for() {
-    use lore_storage::mutable_store::MutableStore;
-
-    let dir = lore_base::test_util::TempDir::new("ms_empty_settle_");
-    let store = Arc::new(
-        LocalMutableStore::new(
-            Some(dir.to_path_buf()),
-            client_settings(),
-            make_in_memory_immutable().await,
-        )
-        .await
-        .unwrap(),
-    );
-    let lock = store.lock.clone().expect("a disk-backed store has a lock");
-    let _ = store.group[0].bucket(0);
-    store.group[0].dirty[0].store(true, atomic::Ordering::Relaxed);
-
-    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
-    assert!(
-        !store.group[0].dirty[0].load(atomic::Ordering::Relaxed),
-        "the flag was settled"
-    );
-    assert!(!lock.is_held(), "so nothing keeps the store claimed");
 }
 
 /// **A reload takes the levels a fresh survey read and drops every flag**, for the

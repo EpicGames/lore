@@ -23,8 +23,8 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
-    hook_dispatcher: &HookDispatcher,
-    instrument_provider: &impl InstrumentProvider,
+    hook_dispatcher: &Arc<HookDispatcher>,
+    instrument_provider: &(impl InstrumentProvider + Clone + Send + 'static),
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
 

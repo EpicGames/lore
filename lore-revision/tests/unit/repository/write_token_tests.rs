@@ -6,8 +6,8 @@
 //! attaches the outer `Client` write token (held by clone for cross-thread
 //! exclusion on the destination path) must grant write capability via
 //! `try_write_mutable_store`. Without this, `branch::create`'s internal
-//! helpers (`store_name_to_id`, `metadata_store`, `store_latest`) fail
-//! with `WriteRequired`.
+//! writes (`create_record`'s metadata swap, `claim_name`, `store_latest`)
+//! fail with `WriteRequired`.
 use std::sync::Arc;
 
 use lore_revision::repository::RepositoryContext;

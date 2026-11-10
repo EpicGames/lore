@@ -21,6 +21,7 @@ use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
 use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
+use lore_storage::KeyType;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
@@ -41,6 +42,11 @@ use lore_transport::RevisionListStart;
 use tokio::sync::Notify;
 use zerocopy::IntoBytes;
 
+use crate::helper::in_memory;
+use crate::hooked_store::Answered;
+use crate::hooked_store::HookedStore;
+use crate::hooked_store::StoreCall;
+
 /// What a page answers: a revision number on the remote's branch, or a revision signature.
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Anchor {
@@ -54,12 +60,13 @@ struct Page {
     older: Hash,
 }
 
-/// A remote holding one branch at `latest`, with its metadata at `metadata`, which answers a
-/// revision list with the page registered for its anchor and counts the revision lists it is asked
-/// for. An anchor with no page is not found, a list for an anchor registered as failing fails, and
-/// a list for an anchor registered as stalling is never answered. A page item carries the state of
-/// a revision the remote holds, and no state otherwise. A remote with a `refusal` answers every
-/// branch query with it.
+/// A remote holding one branch at `latest`, with its metadata at `metadata`, which answers a query
+/// by any name with that branch. It answers a revision list with the page registered for its
+/// anchor and counts the revision lists it is asked for. An anchor with no page is not found, a
+/// list for an anchor registered as failing fails, and a list for an anchor registered as stalling
+/// is never answered. A page item carries the state of a revision the remote holds, and no state
+/// otherwise. A remote with a `refusal` answers every branch query with it. It records each name a
+/// branch query asks for.
 pub(crate) struct PagedRemote {
     branch: BranchId,
     latest: Hash,
@@ -76,6 +83,7 @@ pub(crate) struct PagedRemote {
     listed_metadata: Vec<(Hash, Hash)>,
     lists: AtomicUsize,
     refusal: Option<ProtocolError>,
+    queried_names: std::sync::Mutex<Vec<String>>,
 }
 
 /// Signals a [`PagedRemote`]'s `abandoned` when the list left unanswered that holds it is dropped.
@@ -219,6 +227,7 @@ impl PagedRemote {
             listed_metadata: Vec::new(),
             lists: AtomicUsize::new(0),
             refusal: None,
+            queried_names: std::sync::Mutex::default(),
         }
     }
 
@@ -276,6 +285,14 @@ impl PagedRemote {
         self.lists.load(Ordering::Relaxed)
     }
 
+    /// The names the branch queries asked for, in order.
+    pub(crate) fn queried_names(&self) -> Vec<String> {
+        self.queried_names
+            .lock()
+            .expect("the queried names' lock")
+            .clone()
+    }
+
     /// Wait until a list left unanswered starts.
     pub(crate) async fn stalled(&self) {
         self.stalled.notified().await;
@@ -326,6 +343,26 @@ pub(crate) async fn counted_client_stores() -> (ClientStores, Arc<CountingStore>
         queries: AtomicUsize::new(0),
     });
     (stores_over(counting.clone(), mutable), counting)
+}
+
+/// [`client_stores`] whose mutable store runs `hook` before each load, store and compare-and-swap
+/// it forwards.
+pub(crate) async fn hooked_client_stores(
+    hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
+) -> ClientStores {
+    answering_client_stores(hook, None).await
+}
+
+/// [`hooked_client_stores`] whose mutable store also shows each call it answers without an error
+/// to `answered`, if any ([`HookedStore`]), so a test can write between a command's calls.
+pub(crate) async fn answering_client_stores(
+    hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
+    answered: Option<Answered>,
+) -> ClientStores {
+    let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
+        .await
+        .expect("in-memory stores should be creatable");
+    stores_over(immutable, HookedStore::wrap(mutable, hook, answered))
 }
 
 fn stores_over(immutable: Arc<dyn ImmutableStore>, mutable: Arc<dyn MutableStore>) -> ClientStores {
@@ -518,22 +555,44 @@ pub(crate) fn client_on_storage(
     remote: Arc<PagedRemote>,
     storage: Vec<Arc<dyn lore_transport::Storage>>,
 ) -> Arc<RepositoryContext> {
+    Arc::new(client_context(stores, Some(remote), storage))
+}
+
+/// A client context on `stores` that holds a write token, with `remote` as its remote or none.
+/// Built in the calling execution context, as a command builds its contexts, so a dry run's store
+/// discards its writes.
+pub(crate) fn writing_client_on(
+    stores: &ClientStores,
+    remote: Option<Arc<PagedRemote>>,
+) -> Arc<RepositoryContext> {
+    Arc::new(client_context(stores, remote, Vec::new()).with_write_token(in_memory::token()))
+}
+
+fn client_context(
+    stores: &ClientStores,
+    remote: Option<Arc<PagedRemote>>,
+    storage: Vec<Arc<dyn lore_transport::Storage>>,
+) -> RepositoryContext {
     let repository_id = lore_revision::lore::RepositoryId::default();
-    Arc::new(RepositoryContext::new_with_state(
-        None,
-        stores.immutable.clone(),
-        stores.mutable.clone(),
-        repository_id,
-        lore_revision::instance::InstanceId::default(),
-        RemoteState::Connected(Connection::detached_revision(
+    let remote = match remote {
+        Some(remote) => RemoteState::Connected(Connection::detached_revision(
             storage,
             Ok(()),
             repository_id,
             remote,
         )),
+        None => RemoteState::Offline,
+    };
+    RepositoryContext::new_with_state(
+        None,
+        stores.immutable.clone(),
+        stores.mutable.clone(),
+        repository_id,
+        lore_revision::instance::InstanceId::default(),
+        remote,
         Arc::default(),
         None,
-    ))
+    )
 }
 
 /// A client context on in-memory stores whose remote is `remote`, and a context over the same
@@ -651,12 +710,21 @@ impl Revision for PagedRemote {
     async fn branch_query(
         &self,
         branch: Option<BranchId>,
-        _: Option<&str>,
+        name: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError> {
+        if let Some(name) = name {
+            self.queried_names
+                .lock()
+                .expect("the queried names' lock")
+                .push(name.to_string());
+        }
         if let Some(refusal) = &self.refusal {
             return Err(refusal.clone());
         }
-        assert_eq!(branch, Some(self.branch), "the remote's branch is queried");
+        assert!(
+            branch.is_none_or(|branch| branch == self.branch),
+            "the remote's branch is queried by its id or by a name: got {branch:?}"
+        );
         Ok(BranchQueryResponse {
             id: self.branch,
             latest: self.latest,

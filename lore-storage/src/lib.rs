@@ -13,6 +13,7 @@ pub mod fragment_engine;
 pub mod fragment_flags;
 pub mod fs_util;
 pub mod gc_event;
+#[cfg(feature = "test-util")]
 pub mod mutable_conformance;
 
 use std::sync::OnceLock;

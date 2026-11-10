@@ -54,7 +54,8 @@ pub mod query_output_accumulation;
 
 pub const METRICS_TABLE_NAME_KEY: &str = "table_name";
 const METRICS_PUT_ITEM_CONTEXT: &str = "put_item";
-const METRICS_PUT_ITEM_CONDITIONAL_ATTRIBUTE: &str = "conditional";
+const METRICS_DELETE_ITEM_CONTEXT: &str = "delete_item";
+const METRICS_CONDITIONAL_ATTRIBUTE: &str = "conditional";
 
 const METRICS_BATCH_OPERATION_TOTAL_SIZE: &str = "batch_operation_size";
 const SIZE_BOUNDARIES: [f64; 15] = [
@@ -135,6 +136,24 @@ pub struct ConditionParts {
     pub expression_values: HashMap<String, AttributeValue>,
 }
 
+/// A condition as a request's setters take it: the expression, then the names and the values, an
+/// empty map as none, since `DynamoDB` refuses a request whose names or values are empty.
+type RequestCondition = (
+    String,
+    Option<HashMap<String, String>>,
+    Option<HashMap<String, AttributeValue>>,
+);
+
+impl ConditionParts {
+    fn into_request(self) -> RequestCondition {
+        (
+            self.condition_expression,
+            (!self.expression_names.is_empty()).then_some(self.expression_names),
+            (!self.expression_values.is_empty()).then_some(self.expression_values),
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct ScanConfig {
     pub segment: Option<i32>,
@@ -160,9 +179,10 @@ pub struct ScanPage {
     pub last_evaluated_key: Option<HashMap<String, AttributeValue>>,
 }
 
-/// Encapsulate the components of a `DynamoDB` conditional put. See the `DynamoDB` docs for details.
+/// Encapsulate the components of a `DynamoDB` conditional put or delete. See the `DynamoDB` docs
+/// for details.
 /// <https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html>
-pub trait DynamoDbPutCondition {
+pub trait DynamoDbCondition {
     /// Consume the condition to create its intrinsic parts
     fn into_parts(self) -> ConditionParts;
 }
@@ -388,6 +408,19 @@ impl DynamoDbImpl {
         result
     }
 
+    /// The labels of a write of the operation `context` to `table_name`, conditional or not.
+    fn write_labels(
+        &self,
+        context: &'static str,
+        table_name: &Arc<str>,
+        conditional: bool,
+    ) -> LabelArray {
+        let mut labels = self.instruments.get_labels_for_operation_context(context);
+        labels.push(KeyValue::new(METRICS_TABLE_NAME_KEY, table_name.clone()));
+        labels.push(KeyValue::new(METRICS_CONDITIONAL_ATTRIBUTE, conditional));
+        labels
+    }
+
     #[tracing::instrument(name = "DynamoDbImpl::put_item", skip_all)]
     pub async fn put_item(
         &self,
@@ -403,14 +436,7 @@ impl DynamoDbImpl {
 
         put.observe(
             self.instruments.operation_latency_histogram.clone(),
-            {
-                let mut labels = self
-                    .instruments
-                    .get_labels_for_operation_context(METRICS_PUT_ITEM_CONTEXT);
-                labels.push(KeyValue::new(METRICS_TABLE_NAME_KEY, table_name.clone()));
-                labels.push(KeyValue::new(METRICS_PUT_ITEM_CONDITIONAL_ATTRIBUTE, false));
-                labels
-            },
+            self.write_labels(METRICS_PUT_ITEM_CONTEXT, table_name, false),
             observe_aws_operation_callback(self.slow_operation_duration),
         )
         .await
@@ -426,42 +452,21 @@ impl DynamoDbImpl {
         condition: T,
     ) -> Result<PutItemOutput, AwsError<SdkError<PutItemError>>>
     where
-        T: DynamoDbPutCondition + 'static,
+        T: DynamoDbCondition + 'static,
     {
-        let ConditionParts {
-            condition_expression,
-            expression_names,
-            expression_values,
-        } = condition.into_parts();
-
-        let mut put_item_request = self
-            .client
+        let (expression, names, values) = condition.into_parts().into_request();
+        self.client
             .put_item()
             .table_name(&**table_name)
             .set_item(Some(item))
             .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
-            .condition_expression(condition_expression);
-
-        for (k, v) in expression_names {
-            put_item_request = put_item_request.expression_attribute_names(k, v);
-        }
-
-        for (k, v) in expression_values {
-            put_item_request = put_item_request.expression_attribute_values(k, v);
-        }
-
-        put_item_request
+            .condition_expression(expression)
+            .set_expression_attribute_names(names)
+            .set_expression_attribute_values(values)
             .send()
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
-                {
-                    let mut labels = self
-                        .instruments
-                        .get_labels_for_operation_context(METRICS_PUT_ITEM_CONTEXT);
-                    labels.push(KeyValue::new(METRICS_TABLE_NAME_KEY, table_name.clone()));
-                    labels.push(KeyValue::new(METRICS_PUT_ITEM_CONDITIONAL_ATTRIBUTE, true));
-                    labels
-                },
+                self.write_labels(METRICS_PUT_ITEM_CONTEXT, table_name, true),
                 observe_aws_operation_callback(self.slow_operation_duration),
             )
             .await
@@ -475,14 +480,6 @@ impl DynamoDbImpl {
         table_name: &Arc<str>,
         key: HashMap<String, AttributeValue>,
     ) -> Result<DeleteItemOutput, AwsError<SdkError<DeleteItemError>>> {
-        let labels = {
-            let mut labels = self
-                .instruments
-                .get_labels_for_operation_context("delete_item");
-            labels.push(KeyValue::new(METRICS_TABLE_NAME_KEY, table_name.clone()));
-            labels
-        };
-
         self.client
             .delete_item()
             .table_name(&**table_name)
@@ -491,7 +488,40 @@ impl DynamoDbImpl {
             .send()
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
-                labels,
+                self.write_labels(METRICS_DELETE_ITEM_CONTEXT, table_name, false),
+                observe_aws_operation_callback(self.slow_operation_duration),
+            )
+            .await
+            .output
+            .map_err(AwsError::sdk_error)
+    }
+
+    /// Deletes the item at `key` when it meets `condition`. A refused condition fails with
+    /// `ConditionalCheckFailedException` carrying the item as the condition found it, or no item
+    /// when there was none.
+    #[tracing::instrument(name = "DynamoDbImpl::delete_item_conditional", skip_all)]
+    pub async fn delete_item_conditional<T>(
+        &self,
+        table_name: &Arc<str>,
+        key: HashMap<String, AttributeValue>,
+        condition: T,
+    ) -> Result<DeleteItemOutput, AwsError<SdkError<DeleteItemError>>>
+    where
+        T: DynamoDbCondition + 'static,
+    {
+        let (expression, names, values) = condition.into_parts().into_request();
+        self.client
+            .delete_item()
+            .table_name(&**table_name)
+            .set_key(Some(key))
+            .return_values_on_condition_check_failure(ReturnValuesOnConditionCheckFailure::AllOld)
+            .condition_expression(expression)
+            .set_expression_attribute_names(names)
+            .set_expression_attribute_values(values)
+            .send()
+            .observe(
+                self.instruments.operation_latency_histogram.clone(),
+                self.write_labels(METRICS_DELETE_ITEM_CONTEXT, table_name, true),
                 observe_aws_operation_callback(self.slow_operation_duration),
             )
             .await
@@ -976,7 +1006,7 @@ mock! {
             condition: T,
         ) -> Result<PutItemOutput, AwsError<SdkError<PutItemError>>>
         where
-            T: DynamoDbPutCondition + 'static;
+            T: DynamoDbCondition + 'static;
 
         #[tracing::instrument(name = "DynamoDbImpl::delete_item", skip_all)]
         pub async fn delete_item(
@@ -984,6 +1014,16 @@ mock! {
             table_name: &Arc<str>,
             key: HashMap<String, AttributeValue>,
         ) -> Result<DeleteItemOutput, AwsError<SdkError<DeleteItemError>>>;
+
+        #[tracing::instrument(name = "DynamoDbImpl::delete_item_conditional", skip_all)]
+        pub async fn delete_item_conditional<T>(
+            &self,
+            table_name: &Arc<str>,
+            key: HashMap<String, AttributeValue>,
+            condition: T,
+        ) -> Result<DeleteItemOutput, AwsError<SdkError<DeleteItemError>>>
+        where
+            T: DynamoDbCondition + 'static;
 
         #[tracing::instrument(name = "DynamoDbImpl::transact_write_items", skip_all)]
         pub async fn transact_write_items(

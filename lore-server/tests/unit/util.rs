@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 mod cert_metrics;
+pub(crate) mod hook_recorder;
 mod local_store_monitor;
 pub(crate) mod test_support;
 

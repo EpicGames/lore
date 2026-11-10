@@ -14,6 +14,7 @@ use crate::layer;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore_debug;
+use crate::lore_info;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state::State;
@@ -158,13 +159,42 @@ pub async fn create(
             } else if force {
                 match branch::resolve(repository.clone(), branch.as_str()).await {
                     Ok(resolved) => {
-                        if let Err(err) = branch::delete(repository.clone(), resolved.id).await {
-                            lore_debug!("Failed to delete existing local branch: {err}");
-                        }
-                        if let Ok(remote) = repository.remote().await {
-                            let _ =
-                                branch::delete_remote(remote.clone(), repository.id, resolved.id)
-                                    .await;
+                        // A mapping the branch's metadata doesn't account for is released alone:
+                        // archiving the branch would archive it under its own name.
+                        let stale = match branch::release_unless(
+                            repository.clone(),
+                            resolved.id,
+                            branch.as_str(),
+                            branch::accounts_for_name,
+                        )
+                        .await
+                        {
+                            Ok(stale) => stale,
+                            Err(err) if err.is_branch_not_found() => false,
+                            Err(err) => {
+                                return Err(err).forward::<CreateError>(
+                                    "releasing the name for force-recreate",
+                                );
+                            }
+                        };
+                        if stale {
+                            lore_info!(
+                                "Released the name {branch}, which mapped to branch {} named otherwise",
+                                resolved.id
+                            );
+                        } else {
+                            if let Err(err) = branch::delete(repository.clone(), resolved.id).await
+                            {
+                                lore_debug!("Failed to delete existing local branch: {err}");
+                            }
+                            if let Ok(remote) = repository.remote().await {
+                                let _ = branch::delete_remote(
+                                    remote.clone(),
+                                    repository.id,
+                                    resolved.id,
+                                )
+                                .await;
+                            }
                         }
 
                         // Retry the creation

@@ -7,8 +7,9 @@
 //! checks them against every implementation, rather than restating them in each store's own tests
 //! in each store's own words.
 //!
-//! It is deliberately not `#[cfg(test)]`. The implementations live in several crates; each calls
-//! [`verify_mutable_store`] from a test of its own, with the construction that crate already uses.
+//! It is behind the `test-util` feature rather than `#[cfg(test)]`: the implementations live in
+//! several crates, and each calls [`verify_mutable_store`] from a test of its own, with the
+//! construction that crate already uses.
 //!
 //! The clauses, derived from [`crate::local::mutable_store::LocalMutableStore`] behaviour:
 //!
@@ -20,14 +21,24 @@
 //!    `AddressNotFound`, whether or not an entry existed before.
 //! 4. **Partition and key type isolate entries.** A value stored under one partition or key type
 //!    cannot be read under another.
-//! 5. **Compare-and-swap returns the previous value.** The returned hash is what was stored
-//!    before the call. A returned value equal to `expected` means the swap succeeded; any other
-//!    value means it did not and nothing was changed.
+//! 5. **Compare-and-swap returns the previous value.** The returned hash is what the key held
+//!    when the store compared it with `expected`. A returned value equal to `expected` means the
+//!    swap succeeded; any other value means it did not and nothing was changed.
 //! 6. **`list` with `Untyped` is always empty.** Typed entries are never reported under
 //!    [`KeyType::Untyped`].
 //! 7. **`list` filters by key type and partition.** Only entries of the requested type appear,
 //!    and only entries belonging to the requested partition — unless the partition is null, in
-//!    which case all partitions are included.
+//!    which case all partitions are included. A key a store or a swap to zero removed is not
+//!    listed.
+//! 8. **A swap to zero removes the key.** A compare-and-swap whose expected value matches and
+//!    whose new value is zero leaves the key absent, and one from zero to zero leaves an absent
+//!    key absent. A removed key is created again by a swap from zero.
+//! 9. **Concurrent swaps form one history.** Every swap a racer makes answers zero or a value the
+//!    key held, a swap that changes nothing answers zero or a value the key held while the call
+//!    ran, no two swaps that change the key succeed from one non-zero value, and the key ends
+//!    holding what those swaps leave it, see [`race_swaps`]. The key holds zero again each time a
+//!    swap removes it, so swaps from zero succeed once per removal, and a zero answer is not placed
+//!    in time.
 //!
 //! # Known violations
 //!
@@ -36,7 +47,9 @@
 //! gets fixed without being delisted fails the test just as loudly as a new regression. The list
 //! is the work queue toward full compliance.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt;
 
@@ -82,6 +95,24 @@ pub enum Check {
     /// When the key does not exist and `expected` is non-zero, compare-and-swap does nothing and
     /// returns `Hash::default()` (not equal to `expected`).
     CasDoesNothingWhenMissingAndExpectedIsNonZero,
+    /// When the current value equals `expected` and the new value is zero, compare-and-swap
+    /// removes the key and returns the previous value.
+    CasToZeroRemovesKey,
+    /// When the current value differs from `expected`, a compare-and-swap to zero leaves the entry
+    /// unchanged and returns the current value.
+    CasToZeroFailsWhenExpectedDoesNotMatch,
+    /// When the key does not exist and `expected` is non-zero, a compare-and-swap to zero does
+    /// nothing and returns `Hash::default()`.
+    CasToZeroOnMissingAnswersZero,
+    /// When the key does not exist, a compare-and-swap from zero to zero succeeds and creates no
+    /// entry.
+    CasZeroToZeroOnMissingIsNoOp,
+    /// A key a compare-and-swap removed is created again by a compare-and-swap from zero.
+    CasRecreatesRemovedKey,
+    /// A compare-and-swap from the current value to that same value succeeds and leaves it.
+    CasToHeldValueSucceeds,
+    /// Compare-and-swaps raced over a few keys form one history per key, see [`race_swaps`].
+    ConcurrentSwapsFormOneHistory,
     /// `list` with [`KeyType::Untyped`] returns an empty stream regardless of what is stored.
     ListUntypedIsEmpty,
     /// Entries stored with a typed key type appear in a subsequent `list` for that type.
@@ -92,6 +123,8 @@ pub enum Check {
     ListRespectsPartition,
     /// `list` with a null partition returns entries from all partitions.
     ListNullPartitionMatchesAll,
+    /// `list` leaves out a key a store of zero removed and one a compare-and-swap to zero removed.
+    ListLeavesOutRemovedKeys,
     /// `flush` completes without error for both `sync_data = false` and `sync_data = true`.
     FlushSucceeds,
 }
@@ -147,6 +180,7 @@ macro_rules! require_eq {
 }
 
 /// Run the whole battery. Panics on the first unexpected outcome, naming the check and the store.
+/// It must run on a multi-thread runtime, as [`race_swaps`] does.
 pub async fn verify_mutable_store(store: Arc<dyn MutableStore>, caps: Capabilities) {
     settle(
         &caps,
@@ -215,6 +249,41 @@ pub async fn verify_mutable_store(store: Arc<dyn MutableStore>, caps: Capabiliti
     );
     settle(
         &caps,
+        Check::CasToZeroRemovesKey,
+        cas_to_zero_removes_key(&store).await,
+    );
+    settle(
+        &caps,
+        Check::CasToZeroFailsWhenExpectedDoesNotMatch,
+        cas_to_zero_fails_when_expected_does_not_match(&store).await,
+    );
+    settle(
+        &caps,
+        Check::CasToZeroOnMissingAnswersZero,
+        cas_to_zero_on_missing_answers_zero(&store).await,
+    );
+    settle(
+        &caps,
+        Check::CasZeroToZeroOnMissingIsNoOp,
+        cas_zero_to_zero_on_missing_is_no_op(&store).await,
+    );
+    settle(
+        &caps,
+        Check::CasRecreatesRemovedKey,
+        cas_recreates_removed_key(&store).await,
+    );
+    settle(
+        &caps,
+        Check::CasToHeldValueSucceeds,
+        cas_to_held_value_succeeds(&store).await,
+    );
+    settle(
+        &caps,
+        Check::ConcurrentSwapsFormOneHistory,
+        concurrent_swaps_form_one_history(&store).await,
+    );
+    settle(
+        &caps,
         Check::ListUntypedIsEmpty,
         list_untyped_is_empty(&store).await,
     );
@@ -237,6 +306,11 @@ pub async fn verify_mutable_store(store: Arc<dyn MutableStore>, caps: Capabiliti
         &caps,
         Check::ListNullPartitionMatchesAll,
         list_null_partition_matches_all(&store).await,
+    );
+    settle(
+        &caps,
+        Check::ListLeavesOutRemovedKeys,
+        list_leaves_out_removed_keys(&store).await,
     );
     settle(&caps, Check::FlushSucceeds, flush_succeeds(&store).await);
 }
@@ -649,6 +723,384 @@ async fn cas_does_nothing_when_missing_and_expected_is_nonzero(
     Ok(())
 }
 
+/// Compare-and-swap of `key` in `partition` from `expected` to `value`, answering the value it
+/// held.
+async fn swap(
+    store: &Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    expected: Hash,
+    value: Hash,
+) -> Result<Hash, String> {
+    store
+        .clone()
+        .compare_and_swap(partition, key, expected, value, KeyType::BranchMetadata)
+        .await
+        .map_err(|e| format!("compare_and_swap({expected} -> {value}) failed: {e:?}"))
+}
+
+/// What a load of `key` in `partition` reads, zero for a key it does not find.
+async fn load_or_zero(
+    store: &Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    key_type: KeyType,
+) -> Result<Hash, String> {
+    match store.clone().load(partition, key, key_type).await {
+        Ok(value) => Ok(value),
+        Err(err) if is_not_found(&err) => Ok(Hash::default()),
+        Err(err) => Err(format!("load failed: {err:?}")),
+    }
+}
+
+/// Clause 8: a matching swap to zero removes the key.
+async fn cas_to_zero_removes_key(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, key, value) = unique_fixture();
+    store
+        .clone()
+        .store(partition, key, value, KeyType::BranchMetadata)
+        .await
+        .map_err(|e| format!("store failed: {e:?}"))?;
+    let previous = swap(store, partition, key, value, Hash::default()).await?;
+    require_eq!(
+        previous,
+        value,
+        "a swap to zero must return the previous value on success"
+    );
+    let loaded = load_or_zero(store, partition, key, KeyType::BranchMetadata).await?;
+    require!(
+        loaded.is_zero(),
+        "load after a swap to zero must return AddressNotFound, got {loaded:?}"
+    );
+    Ok(())
+}
+
+/// Clause 8, failure branch: a swap to zero from the wrong value leaves the entry.
+async fn cas_to_zero_fails_when_expected_does_not_match(
+    store: &Arc<dyn MutableStore>,
+) -> Result<(), String> {
+    let (partition, key, actual) = unique_fixture();
+    let wrong_expected = nonzero_hash();
+    store
+        .clone()
+        .store(partition, key, actual, KeyType::BranchMetadata)
+        .await
+        .map_err(|e| format!("store failed: {e:?}"))?;
+    let returned = swap(store, partition, key, wrong_expected, Hash::default()).await?;
+    require_eq!(
+        returned,
+        actual,
+        "a refused swap to zero must return the current value"
+    );
+    let loaded = load_or_zero(store, partition, key, KeyType::BranchMetadata).await?;
+    require_eq!(
+        loaded,
+        actual,
+        "a refused swap to zero must leave the entry"
+    );
+    Ok(())
+}
+
+/// Clause 8, missing-key branch: a swap to zero from a value the key never held answers zero.
+async fn cas_to_zero_on_missing_answers_zero(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, key, expected) = unique_fixture();
+    let returned = swap(store, partition, key, expected, Hash::default()).await?;
+    require_eq!(
+        returned,
+        Hash::default(),
+        "a swap to zero of a missing key must return Hash::default()"
+    );
+    let loaded = load_or_zero(store, partition, key, KeyType::BranchMetadata).await?;
+    require!(
+        loaded.is_zero(),
+        "a swap to zero of a missing key must create nothing, got {loaded:?}"
+    );
+    Ok(())
+}
+
+/// Clause 8, zero-to-zero branch: a swap from zero to zero of a missing key succeeds and creates
+/// nothing.
+async fn cas_zero_to_zero_on_missing_is_no_op(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, key, _) = unique_fixture();
+    let returned = swap(store, partition, key, Hash::default(), Hash::default()).await?;
+    require_eq!(
+        returned,
+        Hash::default(),
+        "a swap from zero to zero of a missing key must succeed"
+    );
+    let loaded = load_or_zero(store, partition, key, KeyType::BranchMetadata).await?;
+    require!(
+        loaded.is_zero(),
+        "a swap from zero to zero must create nothing, got {loaded:?}"
+    );
+    Ok(())
+}
+
+/// Clause 8, recreation: a removed key is absent, so a swap from zero creates it again.
+async fn cas_recreates_removed_key(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, key, first) = unique_fixture();
+    let second = nonzero_hash();
+    swap(store, partition, key, Hash::default(), first).await?;
+    swap(store, partition, key, first, Hash::default()).await?;
+    let returned = swap(store, partition, key, Hash::default(), second).await?;
+    require_eq!(
+        returned,
+        Hash::default(),
+        "a swap from zero of a removed key must succeed"
+    );
+    let loaded = load_or_zero(store, partition, key, KeyType::BranchMetadata).await?;
+    require_eq!(loaded, second, "the recreated key must hold the new value");
+    Ok(())
+}
+
+/// Clause 5, unchanged branch: a swap from the current value to itself succeeds.
+async fn cas_to_held_value_succeeds(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, key, value) = unique_fixture();
+    store
+        .clone()
+        .store(partition, key, value, KeyType::BranchMetadata)
+        .await
+        .map_err(|e| format!("store failed: {e:?}"))?;
+    let returned = swap(store, partition, key, value, value).await?;
+    require_eq!(returned, value, "a swap to the current value must succeed");
+    let loaded = load_or_zero(store, partition, key, KeyType::BranchMetadata).await?;
+    require_eq!(loaded, value, "a swap to the current value must leave it");
+    Ok(())
+}
+
+/// Clause 9, over a few fresh keys.
+async fn concurrent_swaps_form_one_history(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, _, _) = unique_fixture();
+    let keys: Vec<Hash> = (0..4).map(|_| nonzero_hash()).collect();
+    race_swaps(store, partition, KeyType::BranchMetadata, &keys, 8, 40)
+        .await
+        .map(drop)
+}
+
+/// One compare-and-swap a racer of [`race_swaps`] made: the index of its key, the value it
+/// expected, the value it swapped to, the value the store answered, and when the call started and
+/// answered.
+#[derive(Clone, Copy, Debug)]
+pub struct RacedSwap {
+    pub key: usize,
+    pub expected: Hash,
+    pub value: Hash,
+    pub held: Hash,
+    pub started: Instant,
+    pub answered: Instant,
+}
+
+/// Races `racers` tasks, each making `swaps` compare-and-swaps of a random one of `keys`, of
+/// `key_type` in `partition`, and checks the answers. Each swap is from the value a load of the
+/// key reads, or from the value the racer last saw the key hold, to that same value, to a value
+/// unique to the swap, or to zero. `keys` must be absent when the race starts, and the race must
+/// run on a multi-thread runtime: on a current-thread one, racers of a store whose swap doesn't
+/// suspend never overlap.
+///
+/// Answers the value each key holds at the end, in the order of `keys`, once:
+///
+/// - every swap that changed nothing, refused or to the value it expected, answered zero or a
+///   value the key held while the call ran: for a non-zero value, the swap that gave the key that
+///   value started no later than the call answered, and the swap that changed the key from it, if
+///   any, answered no earlier than the call started,
+/// - every swap that changed the key from a non-zero value swapped from a value such a swap gave
+///   it, and no two changed it from one value,
+/// - the swaps that changed the key chain from zero into one history, which ends in at most one
+///   value,
+/// - and a load of the key reads where that history ends.
+///
+/// # Errors
+///
+/// A current-thread runtime, the first key whose answers fail any of these, or a store call that
+/// fails.
+pub async fn race_swaps(
+    store: &Arc<dyn MutableStore>,
+    partition: Partition,
+    key_type: KeyType,
+    keys: &[Hash],
+    racers: usize,
+    swaps: usize,
+) -> Result<Vec<Hash>, String> {
+    require_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::MultiThread,
+        "the race runs on a multi-thread runtime"
+    );
+    let shared: Arc<[Hash]> = Arc::from(keys);
+    let mut tasks = tokio::task::JoinSet::new();
+    for racer in 0..racers {
+        lore_base::lore_spawn!(
+            tasks,
+            race(
+                store.clone(),
+                partition,
+                key_type,
+                shared.clone(),
+                racer,
+                swaps
+            )
+        );
+    }
+    let mut made = Vec::with_capacity(racers * swaps);
+    while let Some(joined) = tasks.join_next().await {
+        made.extend(joined.map_err(|e| format!("racer task failed: {e}"))??);
+    }
+    let mut ends = Vec::with_capacity(keys.len());
+    for (index, key) in keys.iter().enumerate() {
+        let end = history_end(made.iter().filter(|swap| swap.key == index))
+            .map_err(|why| format!("key {key}: {why}"))?;
+        let loaded = load_or_zero(store, partition, *key, key_type).await?;
+        require_eq!(
+            loaded,
+            end,
+            "key {key}: a load must read where the swaps' history ends"
+        );
+        ends.push(end);
+    }
+    Ok(ends)
+}
+
+/// One racer of [`race_swaps`], answering the swaps it made.
+async fn race(
+    store: Arc<dyn MutableStore>,
+    partition: Partition,
+    key_type: KeyType,
+    keys: Arc<[Hash]>,
+    racer: usize,
+    swaps: usize,
+) -> Result<Vec<RacedSwap>, String> {
+    let mut seen = vec![Hash::default(); keys.len()];
+    let mut made = Vec::with_capacity(swaps);
+    for swap in 0..swaps {
+        let key = rand::random_range(0..keys.len());
+        let expected = if rand::random_bool(0.5) {
+            load_or_zero(&store, partition, keys[key], key_type).await?
+        } else {
+            seen[key]
+        };
+        let value = if rand::random_ratio(1, 4) {
+            expected
+        } else if rand::random_ratio(1, 3) {
+            Hash::default()
+        } else {
+            raced_value(racer, swap)
+        };
+        let started = Instant::now();
+        let held = store
+            .clone()
+            .compare_and_swap(partition, keys[key], expected, value, key_type)
+            .await
+            .map_err(|e| format!("compare_and_swap failed: {e:?}"))?;
+        let answered = Instant::now();
+        seen[key] = if held == expected { value } else { held };
+        made.push(RacedSwap {
+            key,
+            expected,
+            value,
+            held,
+            started,
+            answered,
+        });
+    }
+    Ok(made)
+}
+
+/// The non-zero value swap `swap` of racer `racer` swaps to, which no other swap uses.
+fn raced_value(racer: usize, swap: usize) -> Hash {
+    let mut bytes = [0u8; 32];
+    bytes[0] = 0x5a;
+    bytes[8..16].copy_from_slice(&(racer as u64).to_le_bytes());
+    bytes[16..24].copy_from_slice(&(swap as u64).to_le_bytes());
+    Hash::from(bytes)
+}
+
+/// Where the history of one key's raced swaps ends, as [`race_swaps`] checks it.
+pub fn history_end<'a>(swaps: impl Iterator<Item = &'a RacedSwap>) -> Result<Hash, String> {
+    let (changed, unchanged): (Vec<&RacedSwap>, Vec<&RacedSwap>) =
+        swaps.partition(|swap| swap.held == swap.expected && swap.value != swap.expected);
+    let given: HashMap<Hash, &RacedSwap> = changed
+        .iter()
+        .filter(|swap| !swap.value.is_zero())
+        .map(|swap| (swap.value, *swap))
+        .collect();
+    let mut taken: HashMap<Hash, &RacedSwap> = HashMap::new();
+    let mut from_zero = Vec::new();
+    for swap in &changed {
+        if swap.expected.is_zero() {
+            from_zero.push(swap.value);
+            continue;
+        }
+        require!(
+            given.contains_key(&swap.expected),
+            "a swap changed the key from {}, which no swap gave it",
+            swap.expected
+        );
+        require!(
+            taken.insert(swap.expected, *swap).is_none(),
+            "two swaps changed the key from {}",
+            swap.expected
+        );
+    }
+    for swap in &unchanged {
+        answered_while_held(swap, &given, &taken)?;
+    }
+    let mut walked = 0;
+    let mut end = Hash::default();
+    for start in from_zero {
+        walked += 1;
+        let mut at = start;
+        while let Some(next) = taken.get(&at) {
+            walked += 1;
+            require!(
+                walked <= changed.len(),
+                "the swaps' history loops through {at}"
+            );
+            at = next.value;
+        }
+        if !at.is_zero() {
+            require!(end.is_zero(), "the history ends at both {end} and {at}");
+            end = at;
+        }
+    }
+    require_eq!(
+        walked,
+        changed.len(),
+        "every swap that changed the key must chain from zero"
+    );
+    Ok(end)
+}
+
+/// Checks that `swap`, which changed nothing, answered zero or a value the key held while the call
+/// ran, as [`race_swaps`] describes. `given` maps each non-zero value a swap that changed the key
+/// gave it to that swap, and `taken` each non-zero value such a swap changed it from to that swap.
+/// A zero answer is not placed in time, as the key is absent over several spans.
+fn answered_while_held(
+    swap: &RacedSwap,
+    given: &HashMap<Hash, &RacedSwap>,
+    taken: &HashMap<Hash, &RacedSwap>,
+) -> Result<(), String> {
+    let held = swap.held;
+    if held.is_zero() {
+        return Ok(());
+    }
+    let Some(giver) = given.get(&held) else {
+        return Err(format!(
+            "a swap that changed nothing answered {held}, which the key never held"
+        ));
+    };
+    require!(
+        giver.started <= swap.answered,
+        "a swap answered {held} before the swap that gave the key that value started"
+    );
+    if let Some(taker) = taken.get(&held) {
+        require!(
+            taker.answered >= swap.started,
+            "a swap started after the swap from {held} answered, and answered {held}"
+        );
+    }
+    Ok(())
+}
+
 // ── list ──────────────────────────────────────────────────────────────────────
 
 /// Clause 6: the early-return for `Untyped` produces an empty stream even when typed entries
@@ -797,6 +1249,32 @@ async fn list_null_partition_matches_all(store: &Arc<dyn MutableStore>) -> Resul
     require!(
         all_values.contains(&value_b),
         "list(null partition) must include entries from partition_b"
+    );
+    Ok(())
+}
+
+/// Clause 7, removed keys: a key a store of zero removed, and one a swap to zero removed, are not
+/// listed.
+async fn list_leaves_out_removed_keys(store: &Arc<dyn MutableStore>) -> Result<(), String> {
+    let (partition, stored, value) = unique_fixture();
+    let swapped = nonzero_hash();
+    for key in [stored, swapped] {
+        store
+            .clone()
+            .store(partition, key, value, KeyType::BranchMetadata)
+            .await
+            .map_err(|e| format!("store failed: {e:?}"))?;
+    }
+    store
+        .clone()
+        .store(partition, stored, Hash::default(), KeyType::BranchMetadata)
+        .await
+        .map_err(|e| format!("store-zero failed: {e:?}"))?;
+    swap(store, partition, swapped, value, Hash::default()).await?;
+    let items = collect_list(store, partition, KeyType::BranchMetadata).await?;
+    require!(
+        items.is_empty(),
+        "list must leave out keys a store or a swap to zero removed, got {items:?}"
     );
     Ok(())
 }

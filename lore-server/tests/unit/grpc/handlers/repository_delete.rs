@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
+use lore_base::types::Hash;
 use lore_proto::RepositoryDeleteRequest;
+use lore_revision::branch;
+use lore_revision::branch::BranchLatestStatus;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -17,6 +20,7 @@ use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_registry::RepositoryRegistry;
 use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
+use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::repository_delete::*;
 use lore_telemetry::InstrumentProvider;
 use rand::random;
@@ -205,6 +209,122 @@ async fn the_creator_must_reach_the_repository_to_delete() {
         .expect("a creator who reaches the repository may delete");
     }))
     .await;
+}
+
+/// A repository delete, by the handler or the v1 handler, releases every name's mapping, whatever
+/// name the branch's metadata holds, and deletes the latest and metadata of every branch a name
+/// maps to. The branch named `feature` in its metadata is mapped only from the name `alias`, while
+/// `feature` maps to the branch `other`.
+#[tokio::test]
+async fn teardown_releases_every_name_mapping() {
+    for v1 in [false, true] {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let id = random::<RepositoryId>();
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                id,
+            ));
+            let write_token = get_write_token();
+            let mut branches = Vec::new();
+            for name in ["feature", "other"] {
+                let created = branch::create(
+                    repository.clone(),
+                    &write_token,
+                    Context::from(uuid::Uuid::now_v7()),
+                    name,
+                    branch::default_category(),
+                    "alice",
+                    1,
+                    vec![],
+                    false,
+                    false,
+                )
+                .await
+                .expect("Could not create the branch");
+                branch::store_latest(
+                    repository.clone(),
+                    created,
+                    Hash::default(),
+                    Hash::from([1; 32]),
+                    BranchLatestStatus::Convergent,
+                )
+                .await
+                .expect("Failed to store the latest revision");
+                branches.push(created);
+            }
+            let [feature, other] = branches[..] else {
+                unreachable!("two branches are created");
+            };
+            branch::claim_name(repository.clone(), "feature", feature, other)
+                .await
+                .expect("the name moves to the other branch");
+            branch::claim_name(repository.clone(), "alias", Context::default(), feature)
+                .await
+                .expect("an absent name is claimed");
+
+            let request = verified_delete_request(id, &["owner"], false);
+            if v1 {
+                let (metadata, extensions, request) = request.into_parts();
+                lore_server::grpc::repository::v1::repository_delete::handler(
+                    Request::from_parts(
+                        metadata,
+                        extensions,
+                        lore_proto::lore::repository::v1::RepositoryDeleteRequest {
+                            id: request.id,
+                        },
+                    ),
+                    &RepositoryRegistry::Unregistered,
+                    &global_grants(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &TestInstrumentProvider,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                handler(
+                    request,
+                    &RepositoryRegistry::Unregistered,
+                    &global_grants(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &TestInstrumentProvider,
+                )
+                .await
+                .map(|_| ())
+            }
+            .expect("owner permits the delete");
+
+            for name in ["feature", "other", "alias"] {
+                assert!(
+                    branch::load_name_to_id_local(repository.clone(), name)
+                        .await
+                        .is_err_and(|err| err.is_branch_not_found()),
+                    "v1 {v1}: the name {name} is released"
+                );
+            }
+            for branch_id in [feature, other] {
+                assert!(
+                    branch::metadata_hash(repository.clone(), branch_id)
+                        .await
+                        .is_err_and(|err| err.is_branch_not_found()),
+                    "v1 {v1}: the metadata of {branch_id} is deleted"
+                );
+                assert!(
+                    branch::load_latest_local(repository.clone(), branch_id)
+                        .await
+                        .is_err_and(|err| err.is_branch_not_found()),
+                    "v1 {v1}: the latest of {branch_id} is deleted"
+                );
+            }
+        }))
+        .await;
+    }
 }
 
 mod zero_repository_id {

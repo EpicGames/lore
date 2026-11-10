@@ -200,7 +200,9 @@ pub mod oodle_migration;
 
 `cfg(test)` is set only when cargo compiles the crate itself as a test. The tests in `tests/unit/` link the library as built normally, so a `#[cfg(test)]` item or a `#[cfg_attr(test, ...)]` in library code is not there for them. When moving inline tests out, change each one to `feature = "test-util"`.
 
-Used this way the feature adds access and nothing else: wider visibility, accessors, constructors, and wrappers over code that already exists. Helper code stays in `tests/unit/` and its dependencies in `[dev-dependencies]`. Release builds never see it: cargo applies a dev-dependency's features only to builds that include the dev-dependencies. Do not make an item `pub` unconditionally for a test. It becomes API other crates can reach, and the compiler stops reporting it once it falls out of use.
+Used this way the feature adds access and nothing else: wider visibility, accessors, constructors, and wrappers over code that already exists. Helper code stays in `tests/unit/` and its dependencies in `[dev-dependencies]`. Release builds never see the feature: cargo applies a dev-dependency's features only to builds that include the dev-dependencies. Don't make an item `pub` unconditionally for a test. It becomes API other crates can reach, and the compiler stops reporting it once it falls out of use.
+
+A crate may stop or fail its own code at a test point, so that its race tests run in every unit run. Make the point a call under `#[cfg(feature = "test-util")]` that returns at once unless a test armed it. lore-storage's `park_packfile_write` and `park_store_write`, and lore-revision's `test_util::BranchStep`, are such points. Put the scheduling points that the State's node operations need under `state-stress` instead, as the scenarios above describe.
 
 ---
 

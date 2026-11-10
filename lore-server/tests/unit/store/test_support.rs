@@ -231,13 +231,14 @@ impl lore_storage::MutableStore for FailingLoadStore {
     }
 }
 
-/// A [`lore_storage::MutableStore`] that holds each `load` of a gated key until
-/// the test calls [`GatedLoadStore::open`]. A held load counts as in flight
-/// until it returns or is cancelled, so a test can see how many loads run at
-/// once and whether cancelled loads are released.
+/// A [`lore_storage::MutableStore`] that holds each `load` of a gated key, after
+/// the first loads it lets through, until the test calls [`GatedLoadStore::open`].
+/// A held load counts as in flight until it returns or is cancelled, so a test can
+/// see how many loads run at once and whether cancelled loads are released.
 pub struct GatedLoadStore {
     inner: Arc<dyn lore_storage::MutableStore>,
     gated: std::collections::HashSet<lore_base::types::Hash>,
+    passing: std::sync::atomic::AtomicUsize,
     open: tokio::sync::watch::Sender<bool>,
     in_flight: tokio::sync::watch::Sender<usize>,
     max_in_flight: std::sync::atomic::AtomicUsize,
@@ -248,9 +249,20 @@ impl GatedLoadStore {
         inner: Arc<dyn lore_storage::MutableStore>,
         gated: impl IntoIterator<Item = lore_base::types::Hash>,
     ) -> Arc<Self> {
+        Self::passing_first(inner, gated, 0)
+    }
+
+    /// A store that lets the first `passing` loads of its gated keys through, and
+    /// holds the loads after them.
+    pub fn passing_first(
+        inner: Arc<dyn lore_storage::MutableStore>,
+        gated: impl IntoIterator<Item = lore_base::types::Hash>,
+        passing: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             gated: gated.into_iter().collect(),
+            passing: std::sync::atomic::AtomicUsize::new(passing),
             open: tokio::sync::watch::Sender::new(false),
             in_flight: tokio::sync::watch::Sender::new(0),
             max_in_flight: Default::default(),
@@ -324,7 +336,16 @@ impl lore_storage::MutableStore for GatedLoadStore {
         key: lore_base::types::Hash,
         key_type: lore_base::types::KeyType,
     ) -> Result<lore_base::types::Hash, StoreError> {
-        if !self.gated.contains(&key) {
+        if !self.gated.contains(&key)
+            || self
+                .passing
+                .try_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok()
+        {
             return self.inner.clone().load(partition, key, key_type).await;
         }
         let _in_flight = InFlight::enter(&self);

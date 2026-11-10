@@ -7,6 +7,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_proto::BranchListRequest;
 use lore_proto::BranchListResponse;
 use lore_revision::branch;
+use lore_revision::lore::BranchId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use tokio::task::JoinSet;
@@ -114,22 +115,12 @@ async fn branch_list_handler(
                 .iter()
                 .any(|b| b.id.as_ref() == default_branch.data())
         {
-            warn!(
-                %default_branch,
-                name = repo_metadata.default_branch_name,
-                "Default branch missing from list, recreating name-to-id mapping"
-            );
-            // no filter_slow_down()? usage here: recreating the mapping is a
-            // best-effort repair; the listing is still answered without it.
-            if let Err(err) = branch::store_name_to_id(
+            repair_default_branch_mapping(
                 repository.clone(),
                 default_branch,
                 &repo_metadata.default_branch_name,
             )
-            .await
-            {
-                warn!(%err, "Failed to recreate default branch name-to-id mapping");
-            }
+            .await;
 
             if let Ok(metadata) = branch::metadata(repository.clone(), default_branch)
                 .await
@@ -145,4 +136,36 @@ async fn branch_list_handler(
     }
 
     Ok(Response::new(BranchListResponse { branches }))
+}
+
+/// Claims `name` for `default_branch`, the default branch the listing found missing, unless another
+/// branch holds the name ([`branch::claim_name_unless_held`]), and logs one warning naming the
+/// outcome. The repair is best effort, so it answers nothing, and a retryable failure doesn't fail
+/// the listing. A name another branch holds stays with it, so each listing warns again.
+fn repair_default_branch_mapping(
+    repository: Arc<RepositoryContext>,
+    default_branch: BranchId,
+    name: &str,
+) -> impl Future<Output = ()> {
+    let claim = branch::claim_name_unless_held(repository, name, default_branch);
+    async move {
+        match claim.await {
+            Ok(true) => warn!(
+                %default_branch,
+                %name,
+                "The default branch is missing from the list. Its name maps to it."
+            ),
+            Ok(false) => warn!(
+                %default_branch,
+                %name,
+                "The default branch is missing from the list. Another branch holds its name, which stays with that branch."
+            ),
+            Err(err) => warn!(
+                %default_branch,
+                %name,
+                %err,
+                "The default branch is missing from the list. Claiming its name failed."
+            ),
+        }
+    }
 }

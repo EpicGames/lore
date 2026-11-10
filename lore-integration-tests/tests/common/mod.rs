@@ -91,6 +91,9 @@ pub(crate) mod aws_common {
     const AWS_ACCESS_KEY_ID: &str = "lorelocal";
     const AWS_SECRET_ACCESS_KEY: &str = "lorelocal";
 
+    /// The endpoint of `DynamoDB` Local, as `lore-integration-tests/compose.yaml` runs it.
+    const DYNAMODB_ENDPOINT: &str = "http://127.0.0.1:9090";
+
     pub async fn setup(
         tables: Vec<&str>,
     ) -> Result<(S3, DynamoDb, DynamoDb), Box<dyn Error + 'static>> {
@@ -98,9 +101,15 @@ pub(crate) mod aws_common {
 
         Ok((
             s3_client("http://127.0.0.1:9000".to_string()).await?,
-            dynamodb_client("http://127.0.0.1:9090".to_string(), tables.clone()).await?,
-            dynamodb_client("http://127.0.0.1:9090".to_string(), tables).await?,
+            dynamodb_client(DYNAMODB_ENDPOINT.to_string(), tables.clone()).await?,
+            dynamodb_client(DYNAMODB_ENDPOINT.to_string(), tables).await?,
         ))
+    }
+
+    /// A client of `DynamoDB` Local alone, holding `tables`, with the tracing [`setup`] starts.
+    pub async fn dynamodb_setup(tables: Vec<&str>) -> Result<DynamoDb, Box<dyn Error + 'static>> {
+        let _ = tracing_subscriber::fmt::try_init();
+        dynamodb_client(DYNAMODB_ENDPOINT.to_string(), tables).await
     }
 
     async fn create_store_bucket(client: &aws_sdk_s3::Client) -> Result<(), Box<dyn Error>> {

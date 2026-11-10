@@ -1375,17 +1375,19 @@ def test_query_deleted_branch_by_id(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_branch_reset_relists_locally_archived_branch(new_lore_repo):
-    """A deleted branch should re-appear in the local branch list after a reset."""
+@pytest.mark.parametrize("command", ["reset", "switch"])
+def test_branch_reset_and_switch_leave_a_locally_archived_branch_archived(
+    new_lore_repo, command
+):
+    """A reset or a switch onto an archived branch by id leaves it archived, and a create
+    restores it."""
     repo: Lore = new_lore_repo()
 
-    # Base revision on main.
     with repo.open_file("base.txt", "w+") as f:
         f.write("base v1\n")
     repo.stage(scan=True, offline=True)
     repo.commit("v1", offline=True)
 
-    # Feature branch with a known id, carrying its own revision.
     feature_id = generate_branch_id()
     repo.branch_create("feature", id=feature_id, offline=True)
     repo.branch_switch("feature", offline=True)
@@ -1395,21 +1397,52 @@ def test_branch_reset_relists_locally_archived_branch(new_lore_repo):
     repo.commit("feature v1", offline=True)
     feature_rev = repo.revision_history(1, offline=True)[0].signature
 
-    # Archive it locally while it is not the current branch — this zeroes
-    # the local name->id mapping and drops it from the local branch list.
     repo.branch_switch("main", offline=True)
     repo.branch_archive("feature", local=True)
     assert "feature" not in repo.branch_list(offline=True).local_branches, (
         "local archive should remove the branch from the local branch list"
     )
 
-    # Reset the archived branch by id (its name no longer resolves locally).
-    repo.branch_reset(feature_rev, branch=feature_id, offline=True)
+    if command == "reset":
+        repo.branch_reset(feature_rev, branch=feature_id, offline=True)
+    else:
+        repo.branch_switch(feature_id, offline=True)
 
-    # The reset must have restored the branch's local name->id mapping, so
-    # it shows up in the local branch list again.
+    assert "feature" not in repo.branch_list(offline=True).local_branches, (
+        f"branch {command} should leave an archived branch archived"
+    )
+    repo.branch_create("feature", id=feature_id, offline=True)
     assert "feature" in repo.branch_list(offline=True).local_branches, (
-        "branch reset should restore the branch's local name->id mapping"
+        "branch create with the archived branch's id should restore it"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("command", ["reset", "switch"])
+def test_branch_reset_and_switch_by_id_list_a_branch_the_clone_had_not_seen(
+    new_lore_repo, command
+):
+    """A reset or a switch by id onto a live branch a clone has never looked up lists it
+    locally."""
+    repo: Lore = new_lore_repo()
+    text_file = "file.txt"
+
+    repo.write_commit_push("Initial commit", {text_file: ["Line one\n"]})
+    branch_point = repo.revision_history(1)[0].signature
+    other = repo.clone()
+
+    branch_id = generate_branch_id()
+    repo.branch_create("seen-later", id=branch_id)
+    repo.write_commit_push("Branch commit", {text_file: ["Line one\nBranch\n"]})
+    repo.branch_switch("main")
+
+    if command == "reset":
+        other.branch_reset(branch_point, branch=branch_id)
+    else:
+        other.branch_switch(branch_id)
+
+    assert "seen-later" in other.branch_list(offline=True).local_branches, (
+        f"a branch {command} by id should cache the name of a branch the remote holds live"
     )
 
 
@@ -1551,6 +1584,35 @@ def test_branch_archive_missing_remote_branch_is_quiet(new_lore_repo):
     )
     assert "[Error]" not in output, (
         f"Archiving a remotely archived branch should not report an error; got {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_branch_archive_known_only_on_remote(new_lore_repo):
+    """A clone made before a branch existed archives the branch by id."""
+    repo: Lore = new_lore_repo()
+    text_file = "file.txt"
+
+    repo.write_commit_push("Initial commit", {text_file: ["Line one\n"]})
+    other = repo.clone()
+
+    branch_id = generate_branch_id()
+    repo.branch_create("remote-only", id=branch_id)
+    repo.write_commit_push("Branch commit", {text_file: ["Line one\nBranch\n"]})
+    repo.branch_switch("main")
+
+    other.branch_archive(branch_id)
+
+    remote_info = parse_jsonl(
+        other.branch_info(branch_id, json=True, remote=True), "branchInfo"
+    )[0]
+    assert remote_info["archived"] is True, "the archive must reach the remote"
+    local_info = parse_jsonl(
+        other.branch_info(branch_id, json=True, local=True, offline=True),
+        "branchInfo",
+    )[0]
+    assert local_info["archived"] is True, (
+        "the archive must release the name the clone cached from the remote"
     )
 
 

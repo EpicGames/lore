@@ -14,12 +14,12 @@ use std::time::Duration;
 use std::time::Instant;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::text::fold_eq;
 use lore_base::types::Address;
 use lore_revision::fs::fuse::inode::InodeKind;
 use lore_revision::fs::fuse::inode::InodeTable;
 use lore_revision::fs::fuse::inode::NewChild;
 use lore_revision::fs::fuse::inode::ROOT_INO;
-use lore_revision::fs::fuse::inode_number::fold_eq;
 use lore_revision::instance::InstanceId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;

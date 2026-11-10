@@ -3,7 +3,7 @@
 
 mod fan_out;
 mod immutable_store;
-mod mutable_store;
+pub(crate) mod mutable_store;
 mod store_lock;
 
 /// Run the flush `flush` starts, whose fan-out commit renames a `.new` file over the bucket file at

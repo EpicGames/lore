@@ -68,7 +68,7 @@ use crate::aws_error::AwsError;
 use crate::default_aws_timeout_millis;
 use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
-use crate::dynamodb::DynamoDbPutCondition;
+use crate::dynamodb::DynamoDbCondition;
 use crate::dynamodb::DynamoDbQuery;
 use crate::dynamodb::error::SdkError as DynamoDbSdkError;
 use crate::s3::S3;
@@ -417,7 +417,7 @@ impl DynamoDbQuery for PartitionAssociationQuery {
 #[derive(Debug, PartialEq)]
 pub(crate) struct RowAbsent;
 
-impl DynamoDbPutCondition for RowAbsent {
+impl DynamoDbCondition for RowAbsent {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
             condition_expression: "attribute_not_exists(#hash)".to_string(),
@@ -434,7 +434,7 @@ impl DynamoDbPutCondition for RowAbsent {
 #[derive(Debug, PartialEq)]
 pub(crate) struct StateUnchanged(pub(crate) FragmentState);
 
-impl DynamoDbPutCondition for StateUnchanged {
+impl DynamoDbCondition for StateUnchanged {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
             condition_expression: "#state = :state".to_string(),

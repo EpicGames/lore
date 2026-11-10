@@ -13,6 +13,10 @@ use crate::local::store_lock::StoreGuard;
 use crate::store_types::KeyType;
 use crate::store_types::KeyValueStream;
 
+/// Values held by keys of a [`KeyType`] within a [`Partition`].
+///
+/// A key holds zero when it is absent, and a stored zero is an absent key: every method treats it
+/// as one, and a write that removes the key removes it.
 #[async_trait]
 pub trait MutableStore: Send + Sync {
     /// Claims this store for the span it is about to be used — a storage handle from
@@ -54,7 +58,7 @@ pub trait MutableStore: Send + Sync {
 
     /// Returns the mutable value stored for `key` with the type `key_type` within `partition`.
     ///
-    /// Returns `StoreError::AddressNotFound` if no value of the given type is stored for the given key.
+    /// Returns `StoreError::AddressNotFound` when the key holds zero.
     /// Other errors indicate store inconsistency or inability to perform the load.
     async fn load(
         self: Arc<Self>,
@@ -65,7 +69,8 @@ pub trait MutableStore: Send + Sync {
 
     /// Store a new mutable value for `key` of type `key_type` within `partition`.
     ///
-    /// Storing a null hash (`Hash::default()`) removes the key.
+    /// Storing a null hash (`Hash::default()`) removes the key, and leaves no entry or item for
+    /// it, one holding zero included.
     /// Errors indicate store inconsistency or inability to perform the store.
     async fn store(
         self: Arc<Self>,
@@ -75,12 +80,23 @@ pub trait MutableStore: Send + Sync {
         key_type: KeyType,
     ) -> Result<(), StoreError>;
 
-    /// Compare and swap a mutable value for `key` with the type `key_type` within `partition`.
+    /// Swaps the value of `key` with the type `key_type` within `partition` from `expected` to
+    /// `value`, atomically with respect to every other write of the key:
     ///
-    /// Updates the value for the given key if the current value matches `expected`
-    /// or the key does not exist. Returns the previous value of the key (equal to
-    /// `expected` if the swap succeeded).
-    /// Errors indicate store inconsistency or inability to perform the operation.
+    /// - A key holding other than `expected` is left unchanged.
+    /// - A key holding `expected` holds `value` after the call, created if absent. For a zero
+    ///   `value` the key is removed, and no entry or item is left for it, one holding zero
+    ///   included.
+    /// - A swap from a non-zero value to the same value leaves the key and its entry or item
+    ///   unchanged, and a swap from zero to zero leaves an absent key without an entry or item.
+    ///
+    /// Returns the value the key held when the store compared it with `expected`, at an instant
+    /// while the call ran. It equals `expected` when the swap is made. No interleaving of writers
+    /// makes a swap succeed from a value other than `expected`, or answer a value the key did not
+    /// hold while the call ran. The swap compares values alone: a key that holds `expected` again,
+    /// or is absent again after a removal, swaps as if it never changed, so a caller that has to
+    /// tell those apart encodes it in the value. Errors indicate store inconsistency or inability
+    /// to perform the operation.
     async fn compare_and_swap(
         self: Arc<Self>,
         partition: Partition,
@@ -90,7 +106,8 @@ pub trait MutableStore: Send + Sync {
         key_type: KeyType,
     ) -> Result<Hash, StoreError>;
 
-    /// List all the key-value pairs of a given type for the given partition.
+    /// List all the key-value pairs of a given type for the given partition, leaving out the keys
+    /// that hold zero.
     /// If the partition is null, it must match all partitions the user have access to
     async fn list(
         self: Arc<Self>,

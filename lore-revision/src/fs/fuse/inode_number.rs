@@ -3,6 +3,7 @@
 //! Derived inode numbers: a pure function of an inode's identity, so numbers
 //! survive remounts and service restarts without a persisted counter.
 
+use lore_base::text::fold_eq;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::fs::fuse::inode::InodeEntry;
@@ -70,12 +71,4 @@ pub fn identity_matches(entry: &InodeEntry, identity: &Identity<'_>) -> bool {
     }
     entry.kind.identity() == identity.kind
         && std::str::from_utf8(&entry.name).is_ok_and(|name| fold_eq(name, identity.name))
-}
-
-/// Whether `a` and `b` are the same name under the lowercasing
-/// [`hash_string`](lore_storage::hash::hash_string) hashes: two ASCII names compare in one pass
-/// without allocating, any other pair by [`str::to_lowercase`].
-pub fn fold_eq(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
-        || (!(a.is_ascii() && b.is_ascii()) && a.to_lowercase() == b.to_lowercase())
 }

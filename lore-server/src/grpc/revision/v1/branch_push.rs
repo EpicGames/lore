@@ -53,10 +53,10 @@ use crate::util::setup_execution;
 /// `FailedPrecondition` with a detail message that distinguishes the
 /// two cases and embeds the current branch latest. Pushing to a branch
 /// id whose metadata is missing returns `NotFound`. Pushing to a
-/// deleted branch reinstates the name → id mapping if the name is
-/// still free, or returns `AlreadyExists` if claimed by a different
-/// live branch. The pre-handlers run between reading the branch and
-/// reinstating its mapping, so a rejected push writes nothing.
+/// deleted branch returns `NotFound` too, so the client restores it
+/// with a create, or `AlreadyExists` if its name is claimed by a
+/// different live branch. The push never writes the name → id
+/// mapping.
 ///
 /// A fragment of the pushed revision the server does not hold is the
 /// other `FailedPrecondition`, and the only one carrying an address in

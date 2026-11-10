@@ -994,9 +994,10 @@ per-ID entries (latest pointer, metadata pointer) hang off the ID, not the name.
 
 The decoupling matters. A branch ID never changes for the lifetime of the branch; it is what
 identifies the branch's history. A branch name is a label that can be archived (the
-name-to-ID mapping is removed, but the branch metadata and latest pointer remain), restored
-(the mapping is put back), or reused (a new branch can take the name of an archived one
-without clobbering the archived branch's history). Tools that need to refer to a branch
+name-to-ID mapping is removed and the metadata records the archive; the metadata and latest
+pointer stay), restored (the mapping is put back and the metadata records the
+restore), or reused (a new branch can take the name of an archived one without clobbering the
+archived branch's history). Tools that need to refer to a branch
 unambiguously refer to it by ID; tools that need to present the branch to a human user
 use the name and let the mutable store resolve it.
 
@@ -1014,7 +1015,11 @@ the immutable store (where it gets a new hash), and issues a `cas` on the branch
 metadata pointer to refer to the new blob's hash. Renaming a branch, advancing repository
 metadata, restoring an archived name, registering a repository in the catalog - all reduce to
 "write the new immutable blob (if any), then `cas` the relevant key in the mutable
-store." The protocol exposes the `load`, `store`, and `cas` operations directly; clients and
+store." No `cas` spans two keys. A restore writes the branch's metadata and its name's mapping,
+so it first records in the metadata the name it claims. A restore that stops between the two
+writes leaves that record, and the next restore or archive of the branch settles it: it releases
+the name, and keeps a record of it until a later restore removes it.
+The protocol exposes the `load`, `store`, and `cas` operations directly; clients and
 servers coordinate every mutable-state change through the same contract.
 
 This is the only true serialization point in the architecture. Two clients reading do not
@@ -1215,9 +1220,11 @@ cheap to load, and fully resident in memory while in use.
 For each entity type, Lore reserves a set of *built-in* keys that the system itself reads or
 writes. Examples include `message`, `timestamp`, `created-by`, `committed-by`,
 `change-request`, and `cherry-picked-from` on a revision; `category`, `creator`, `created`,
-and `protect` on a branch; `name`, `description`, `default-branch`, `creator`, and `created`
-on a repository. Some built-in keys are read-only (assigned by the system at creation and
-never modified); others can be set or updated by users, but the key itself is reserved.
+`protect`, and the `archived`, `restored`, `restoring` and `released` keys that archives and
+restores write on a branch; `name`, `description`, `default-branch`, `creator`, and `created` on a
+repository. Some built-in keys are read-only: the system assigns them, at creation or, for the
+keys archives and restores write, when it archives or restores the branch, and no metadata set
+or clear changes them. Others can be set or updated by users, but the key itself is reserved.
 
 The remaining key space is free for application use. Tools and integrations attach their own
 keys for purposes the system itself does not know about - code review IDs, build provenance,
@@ -2288,15 +2295,18 @@ production layout.
 
 The `MutableStore` trait exposes a narrow API: `load`, `store`, `cas`, `list`, each
 taking a typed key. The `cas` (compare-and-swap) operation is what gives Lore atomic
-state transitions (§9.4); every backend must implement it correctly.
+state transitions (§9.4); every backend must implement it correctly. A key holds zero
+when it's absent: a `cas` from zero creates the key, and a `cas` or `store` to zero
+removes it and leaves no entry behind.
 
 Lore ships with:
 
 - *Local file store.* File-backed key-value store with a bucketed layout, using
   filesystem locking for the `cas` primitive. The default for clients and
   small servers.
-- *AWS DynamoDB store.* DynamoDB's conditional-write support maps directly onto the
-  `cas` primitive. Suitable for multi-region server deployments where the
+- *AWS DynamoDB store.* DynamoDB's conditional writes map onto the `cas` primitive: a
+  conditional put or delete, or a strongly consistent read for a swap whose new value is the one
+  it expects. Suitable for multi-region server deployments where the
   mutable store is the only true serialization point and DynamoDB's consistency
   guarantees are the right fit.
 

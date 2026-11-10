@@ -9,6 +9,8 @@
 //!
 //! Derive it with `lore_macro::ValidateText` for a struct carrying text, and
 //! declare a type that carries none with [`carries_no_text`].
+//!
+//! [`fold_eq`] compares two names the way Lore keys them, regardless of case.
 
 use crate::error::InvalidArguments;
 
@@ -113,3 +115,12 @@ carries_no_text!(
     crate::types::KeyType,
     crate::types::Partition,
 );
+
+/// Whether `a` and `b` are equal once lowercased by [`str::to_lowercase`], as Lore compares the
+/// names it keys and hashes lowercased: file names and branch names. Two ASCII names, and names
+/// that differ only in ASCII case, compare without allocating.
+#[inline]
+pub fn fold_eq(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+        || (!(a.is_ascii() && b.is_ascii()) && a.to_lowercase() == b.to_lowercase())
+}

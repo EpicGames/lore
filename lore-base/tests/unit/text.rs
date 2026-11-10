@@ -44,3 +44,38 @@ fn a_value_that_carries_no_text_passes() {
     assert!(7u64.validate_text().is_ok());
     assert!(lore_base::types::Hash::default().validate_text().is_ok());
 }
+
+/// Names are the same exactly where their lowercases are, including the Kelvin sign, which
+/// lowercases to an ASCII `k`, a final capital sigma, which lowercases to `ς`, and the dotted
+/// capital I, which lowercases to two characters.
+#[test]
+fn fold_eq_holds_where_the_lowercases_are_equal() {
+    let pairs = [
+        ("Rock.MESH", "rock.mesh", true),
+        ("rock.mesh", "paper.mesh", false),
+        ("a", "ab", false),
+        ("\u{212a}elvin", "kelvin", true),
+        ("\u{00c4}pfel", "\u{00e4}pfel", true),
+        (
+            "\u{039f}\u{0394}\u{039f}\u{03a3}",
+            "\u{03bf}\u{03b4}\u{03bf}\u{03c2}",
+            true,
+        ),
+        (
+            "\u{039f}\u{0394}\u{039f}\u{03a3}",
+            "\u{03bf}\u{03b4}\u{03bf}\u{03c3}",
+            false,
+        ),
+        ("\u{0130}", "i\u{307}", true),
+        ("\u{0130}", "i", false),
+    ];
+    for (a, b, same) in pairs {
+        assert_eq!(
+            a.to_lowercase() == b.to_lowercase(),
+            same,
+            "{a} against {b}"
+        );
+        assert_eq!(fold_eq(a, b), same, "{a} against {b}");
+        assert_eq!(fold_eq(b, a), same, "{b} against {a}");
+    }
+}

@@ -16,6 +16,8 @@ lore-server/config/local*.toml
 lore-integration-tests/consul-data
 **/.grafana.local.yaml
 contrib/bazel/.rbe-state/
+/context/specs/
+/context/plans/
 contrib/oidc/zitadel/local.toml
 contrib/oidc/zitadel/ci-secret
 

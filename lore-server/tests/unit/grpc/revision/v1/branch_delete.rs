@@ -3,35 +3,37 @@
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::types::BranchPoint;
-use lore_base::types::Hash;
 use lore_proto::lore::revision::v1::BranchDeleteRequest;
 use lore_proto::lore::revision::v1::BranchDeleteResponse;
 use lore_revision::branch;
-use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
 use lore_revision::branch::protect;
 use lore_revision::instance::store_current_anchor_branch;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::state;
 use lore_server::grpc::get_write_token;
-use lore_server::grpc::handlers::branch_push;
-use lore_server::grpc::handlers::branch_push::PushHandler;
-use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::branch_delete::*;
 use lore_server::hooks::HookDispatcher;
+use lore_server::hooks::HookPoint;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
+use mockall::predicate::eq;
 use opentelemetry::KeyValue;
 use rand::random;
 use tonic::Request;
 
-use super::hook_recorder::Seen;
-use super::hook_recorder::recording_dispatcher;
 use crate::notification::testing::MockNotificationSender;
 use crate::store::test_support::test_store_create;
+use crate::util::hook_recorder::Seen;
+use crate::util::hook_recorder::post_recording_dispatcher;
+use crate::util::hook_recorder::recording_dispatcher;
+use crate::util::test_support::create_test_branch;
+use crate::util::test_support::drop_at_gated_load;
+use crate::util::test_support::gate_metadata_loads;
+use crate::util::test_support::stop_restore_after_claim;
+use crate::util::test_support::wait_for_message;
 
+#[derive(Clone)]
 struct TestInstrumentProvider {}
 
 impl InstrumentProvider for TestInstrumentProvider {
@@ -41,69 +43,6 @@ impl InstrumentProvider for TestInstrumentProvider {
     fn labels(&self) -> &[KeyValue] {
         &[]
     }
-}
-
-/// Returns the latest revision the test branch was forked at, so
-/// callers can assert against the resulting `latest` field.
-async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: BranchId) -> Hash {
-    let write_token = get_write_token();
-    let main = lore_revision::branch::create(
-        repository_context.clone(),
-        &write_token,
-        BranchId::from(uuid::Uuid::now_v7()),
-        branch::DEFAULT_DEFAULT_NAME,
-        branch::default_category(),
-        "test-creator",
-        1,
-        vec![],
-        false,
-        false,
-    )
-    .await
-    .expect("Could not create main branch");
-
-    let state = state::State::new();
-    state.set_parent_self(Hash::default());
-    state.set_revision_number(1);
-    let state_hash = state
-        .serialize(repository_context.clone(), &write_token)
-        .await
-        .expect("Failed to serialize state");
-
-    let latest = branch_push::push(
-        repository_context.clone(),
-        main,
-        state_hash,
-        crate::util::test_support::PUSH_ANY,
-        true,
-        false,
-        DEFAULT_HISTORY_STEP_SIZE,
-        lore_server::grpc::server::RevisionListAcceleration::default(),
-        &mut PushReport::new(PushHandler::Legacy, Default::default()),
-    )
-    .await
-    .expect("Failed to push latest revision")
-    .revision;
-
-    lore_revision::branch::create(
-        repository_context.clone(),
-        &write_token,
-        branch,
-        "test-name",
-        branch::personal_category(),
-        "BranchCreator",
-        12345,
-        vec![BranchPoint {
-            branch: main,
-            revision: latest,
-        }],
-        false,
-        false,
-    )
-    .await
-    .expect("Could not create test branch");
-
-    latest
 }
 
 /// Creates a single root-style branch (empty stack) — useful for
@@ -161,7 +100,7 @@ mod direct_handling {
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let response = handler(
                 make_request(repository, branch_id),
                 &crate::util::test_support::allow_all_authorizer(),
@@ -188,6 +127,148 @@ mod direct_handling {
             assert!(!branch.metadata.is_empty());
             assert_eq!(branch.latest, bytes::Bytes::from(latest));
             assert_eq!(branch.stack.len(), 1);
+        }))
+        .await;
+    }
+
+    /// A delete of a branch whose restore stopped after it claimed the name, as a server that
+    /// stops there leaves it, settles the restore: it succeeds as a delete does, notifying once,
+    /// and leaves the name unmapped and the metadata without the restore's record.
+    #[tokio::test]
+    async fn delete_settles_a_restore_that_stopped_after_its_claim() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_deleted()
+            .times(1)
+            .return_once(|_, _| ());
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context.clone(), branch_id).await;
+            branch::delete(repository_context.clone(), branch_id)
+                .await
+                .expect("the branch is archived");
+            stop_restore_after_claim(&repository_context, branch_id, "test-name").await;
+            assert_eq!(
+                branch::load_name_to_id_local(repository_context.clone(), "test-name")
+                    .await
+                    .ok(),
+                Some(branch_id)
+            );
+
+            let response = handler(
+                make_request(repository, branch_id),
+                &crate::util::test_support::allow_all_authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &None, /* no forwarded requests */
+                &Arc::new(HookDispatcher::empty()),
+                &instrument_provider,
+            )
+            .await
+            .expect("the delete settles the restore");
+
+            assert!(response.into_inner().branch.expect("a branch").deleted);
+            let mapping =
+                branch::load_name_to_id_local(repository_context.clone(), "test-name").await;
+            assert!(
+                mapping.as_ref().is_err_and(|err| err.is_branch_not_found()),
+                "got {mapping:?}"
+            );
+            let metadata = branch::metadata(repository_context, branch_id)
+                .await
+                .expect("the archived branch keeps its metadata");
+            assert!(metadata.get_string(branch::RESTORING).is_err());
+        }))
+        .await;
+    }
+
+    /// A delete that settles a restore stopped after its claim, dropped while it reads the
+    /// branch's metadata, as one whose deadline passes or whose client leaves is, still settles
+    /// it, notifies of the deleted branch and spawns its post hooks: the delete runs on in a task of
+    /// its own, which notifies after the restore's name maps to nothing. The handler's own read of
+    /// the metadata, before the delete, goes through.
+    #[tokio::test]
+    async fn a_dropped_delete_settles_a_stopped_restore() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let (notify, mut notified) = tokio::sync::mpsc::unbounded_channel();
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_deleted()
+            .with(eq(repository), eq(branch_id))
+            .times(1)
+            .returning(move |_, _| {
+                notify
+                    .send(())
+                    .expect("the test waits for the notification");
+            });
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context.clone(), branch_id).await;
+            branch::delete(repository_context.clone(), branch_id)
+                .await
+                .expect("the branch is archived");
+            stop_restore_after_claim(&repository_context, branch_id, "stopped-name").await;
+            let gated = gate_metadata_loads(mutable_store.clone(), repository, branch_id, 1);
+
+            let (hook_dispatcher, mut post_hooks) =
+                post_recording_dispatcher(&[HookPoint::BranchDelete]);
+            let authorizer = crate::util::test_support::allow_all_authorizer();
+            drop_at_gated_load(
+                handler(
+                    make_request(repository, branch_id),
+                    &authorizer,
+                    immutable_store.clone(),
+                    gated.clone(),
+                    notification_sender.clone(),
+                    &None, /* no forwarded requests */
+                    &hook_dispatcher,
+                    &instrument_provider,
+                ),
+                &gated,
+            )
+            .await;
+
+            wait_for_message(
+                &mut notified,
+                (),
+                "the dropped delete notifies of the deleted branch",
+            )
+            .await;
+            wait_for_message(
+                &mut post_hooks,
+                HookPoint::BranchDelete,
+                "the dropped delete spawns its post hooks",
+            )
+            .await;
+            assert_eq!(
+                branch::load_name_to_id_local(repository_context, "stopped-name")
+                    .await
+                    .ok(),
+                None,
+                "the dropped delete settles the stopped restore"
+            );
         }))
         .await;
     }
@@ -219,7 +300,7 @@ mod direct_handling {
             ));
             create_test_branch(repository_context, branch_id).await;
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let first = handler(
                 make_request(repository, branch_id),
                 &crate::util::test_support::allow_all_authorizer(),
@@ -265,7 +346,7 @@ mod direct_handling {
         Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
             let unknown = BranchId::from(uuid::Uuid::now_v7());
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let err = handler(
                 make_request(repository, unknown),
                 &crate::util::test_support::allow_all_authorizer(),
@@ -303,7 +384,7 @@ mod direct_handling {
             // Branches with empty stack are treated as the default branch.
             create_root_branch(repository_context, branch_id).await;
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let err = handler(
                 make_request(repository, branch_id),
                 &crate::util::test_support::allow_all_authorizer(),
@@ -345,7 +426,7 @@ mod direct_handling {
                 .await
                 .expect("should set current anchor");
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let err = handler(
                 make_request(repository, branch_id),
                 &crate::util::test_support::allow_all_authorizer(),
@@ -385,7 +466,7 @@ mod direct_handling {
                 .await
                 .expect("should protect");
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let err = handler(
                 make_request(repository, branch_id),
                 &crate::util::test_support::allow_all_authorizer(),
@@ -626,7 +707,7 @@ mod forwarded_request {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let response = handler(
                 make_request(repository, branch_id),
@@ -666,7 +747,7 @@ mod forwarded_request {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let err = handler(
                 make_request(repository, branch_id),
@@ -701,7 +782,7 @@ mod forwarded_request {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let branch_id = BranchId::from(uuid::Uuid::now_v7());
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let err = handler(
                 make_request(repository, branch_id),
@@ -749,7 +830,7 @@ mod forwarded_request {
             ));
             create_test_branch(repository_context, branch_id).await;
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
             let response = handler(
                 make_request(repository, branch_id),

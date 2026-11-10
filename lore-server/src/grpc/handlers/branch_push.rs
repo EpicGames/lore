@@ -900,8 +900,8 @@ struct VerifiedParents {
     other: Option<Arc<State>>,
 }
 
-/// Pushes `latest` as the latest revision of `branch`, mapping the name of a deleted branch
-/// back to it.
+/// Pushes `latest` as the latest revision of `branch`. A branch whose name doesn't map to it, as
+/// an archive leaves it, fails as not found.
 #[allow(clippy::too_many_arguments)]
 pub async fn push(
     repository: Arc<RepositoryContext>,
@@ -945,7 +945,8 @@ pub(crate) async fn load_branch_and_head(
 }
 
 /// Pushes `latest` as the latest revision of `branch` from the branch `metadata` and the
-/// `loaded` head read for it, mapping the name of a deleted branch back to it.
+/// `loaded` head read for it. A branch whose name doesn't map to it, as an archive leaves it,
+/// fails as not found.
 ///
 /// The name check runs beside the fragment verification of the incoming revision. Both complete
 /// before the head moves, and a failed branch check is reported ahead of any failure of the
@@ -1071,90 +1072,70 @@ fn check_push_access(metadata: &Metadata, access: PushAccess) -> Result<(), Stat
     Ok(())
 }
 
-/// Ensures `name` maps to `branch`, mapping it back when no live branch claims it.
-async fn ensure_name_maps_to_branch(
+/// Fails unless `name` maps to `branch`, writing nothing: only a create restores a branch. A push
+/// to an archived branch whose name maps to nothing, or to an id without metadata, fails as
+/// `NOT_FOUND`, so the client restores the branch with a create and pushes again. One whose name
+/// maps to another branch with metadata fails as in use, as that create would.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn ensure_name_maps_to_branch(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     name: &str,
-) -> Result<(), Status> {
-    if name.is_empty() {
-        return Ok(());
-    }
+) -> impl Future<Output = Result<(), Status>> {
+    async move {
+        if name.is_empty() {
+            return Ok(());
+        }
 
-    // The `None` arm reinstates the mapping, so an unreadable name key must
-    // not reach it: that would rebind the name away from whichever branch
-    // currently owns it.
-    match none_or_status(
-        branch::load_name_to_id_local(repository.clone(), name).await,
-        BranchError::is_branch_not_found,
-    )? {
-        Some(mapped) if BranchId::from(mapped) == branch => Ok(()),
-        Some(other) => {
-            let other_id = BranchId::from(other);
-            if other_branch_still_claims_name(&repository, other_id, name).await? {
-                info!(
-                    {BRANCH_ID} = %branch,
-                    %name,
-                    claimed_by = %other_id,
-                    "Cannot reinstate deleted branch: name claimed by another branch",
-                );
-                Err(Status::already_exists(format!(
-                    "Branch name '{name}' is in use by a different branch"
-                )))
-            } else {
-                debug!(
-                    {BRANCH_ID} = %branch,
-                    %name,
-                    stale = %other_id,
-                    "Stale name → id mapping, reinstating to current branch",
-                );
-                branch::store_name_to_id(repository, branch, name)
-                    .await
-                    .filter_slow_down()?
-                    .warn_map_err(|err| {
-                        Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
-                    })
-            }
+        let held = none_or_status(
+            branch::load_name_to_id_local(repository.clone(), name).await,
+            BranchError::is_branch_not_found,
+        )?
+        .unwrap_or_default();
+        if held == branch {
+            return Ok(());
         }
-        None => {
-            // No mapping (deleted — the underlying store treats zero
-            // values as missing — or never written). Reinstate the
-            // mapping so the pushed branch is live again.
-            debug!({BRANCH_ID} = %branch, %name, "Reinstating name → id mapping for push");
-            branch::store_name_to_id(repository, branch, name)
-                .await
-                .filter_slow_down()?
-                .warn_map_err(|err| {
-                    Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
-                })
+        if !held.is_zero() && holder_has_metadata(&repository, held, name).await? {
+            info!(
+                {BRANCH_ID} = %branch,
+                %name,
+                claimed_by = %held,
+                "Cannot push to archived branch: name claimed by another branch",
+            );
+            return Err(Status::already_exists(format!(
+                "Branch name '{name}' is in use by a different branch"
+            )));
         }
+        debug!({BRANCH_ID} = %branch, %name, "Push to an archived branch, which a create restores");
+        Err(Status::not_found(format!("Branch '{name}' is archived")))
     }
 }
 
-/// True iff `other_id` exists and its metadata still names it `name`. A
-/// mismatch (dead branch, missing metadata, or a rename that left an
-/// orphan name pointer) is treated as a stale mapping the caller can
-/// safely overwrite. A store that cannot answer is reported rather than
-/// read as a mismatch, so an unreadable branch never has its name
-/// reassigned.
-async fn other_branch_still_claims_name(
+/// True iff `holder`, the branch `name` maps to, has metadata, whatever name it holds: a create
+/// refuses a name that maps to such a branch. A branch without metadata is a stale mapping, which a
+/// create claims. Any other failure to read the metadata hash is reported rather than read as none.
+async fn holder_has_metadata(
     repository: &Arc<RepositoryContext>,
-    other_id: BranchId,
+    holder: BranchId,
     name: &str,
 ) -> Result<bool, Status> {
-    let Ok(metadata_hash) = branch::metadata_hash(repository.clone(), other_id)
+    match branch::metadata_hash(repository.clone(), holder)
         .await
         .filter_slow_down()?
-    else {
-        return Ok(false);
-    };
-    let Ok(metadata) = branch::load_metadata(repository.clone(), metadata_hash)
-        .await
-        .filter_slow_down()?
-    else {
-        return Ok(false);
-    };
-    Ok(branch::name(&metadata).unwrap_or("") == name)
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.is_branch_not_found() => Ok(false),
+        Err(err) => Err(err).warn_map_err(|err| holder_unreadable(name, err)),
+    }
+}
+
+/// The failure of a push whose read of the metadata of the branch `name` maps to fails.
+fn holder_unreadable(name: &str, err: &BranchError) -> Status {
+    Status::internal(format!(
+        "Failed to read the metadata of the branch '{name}' maps to: {err}"
+    ))
 }
 
 /// The latest revision of `branch`, zero when it has none, and the state of `latest`.
@@ -1733,7 +1714,7 @@ async fn collect_new_addresses(
 ///
 /// A missing fragment is reported as `FAILED_PRECONDITION` naming the address,
 /// whether the walk cannot read it or the store answers that it is absent.
-/// `NOT_FOUND` is left to name an absent branch, which a caller reinstates.
+/// `NOT_FOUND` is left to name an absent branch, which a caller restores with a create.
 async fn verify_fragments(
     repository: Arc<RepositoryContext>,
     parent_state: Arc<State>,

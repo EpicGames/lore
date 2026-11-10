@@ -703,6 +703,12 @@ impl MutableStoreBucket {
         Ok(())
     }
 
+    /// Writes bucket `bucket_index` of group `group_index` to its file under `path` when it is
+    /// flagged, and clears its flag. A bucket a removal emptied is written as a file of no entries,
+    /// over the file that holds what it removed.
+    ///
+    /// A flagged bucket must hold its whole content, as one read from its file, redistributed by
+    /// a fan-out or built by a migration does: the file written replaces the bucket's file.
     pub async fn serialize(
         bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
         group: Arc<MutableStoreGroup>,
@@ -711,11 +717,6 @@ impl MutableStoreBucket {
         bucket_index: usize,
         options: FlushOptions,
     ) -> Result<(), LocalMutableStoreError> {
-        let count = bucket.entry.len();
-        if count == 0 {
-            return Ok(());
-        }
-
         // Ensure only one serialization/deserialization of this bucket is happening at any given time
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
@@ -739,10 +740,10 @@ impl MutableStoreBucket {
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
-    /// `serialize` path in two ways: (1) bypasses the `count == 0` early-exit and the
-    /// `dirty.swap(false) → skip-if-was-false` short-circuit, because every `[0..committed_level]`
-    /// bucket must be rewritten at the new layout to overwrite stale level-N files even if it's
-    /// empty post-redistribute; (2) always clears dirty after claiming ownership. The clear is
+    /// `serialize` path in two ways: (1) bypasses the `dirty.swap(false) → skip-if-was-false`
+    /// short-circuit, because every `[0..committed_level]` bucket must be rewritten at the new
+    /// layout to overwrite stale level-N files even if it's clean and empty post-redistribute;
+    /// (2) always clears dirty after claiming ownership. The clear is
     /// safe because the caller holds the bucket's read lock — no concurrent writer can set
     /// dirty=true while we hold it, so any post-release write will correctly re-set dirty and
     /// be picked up by the next flush, matching the regular `serialize` path's semantics.
@@ -772,6 +773,8 @@ impl MutableStoreBucket {
         Self::serialize_files(bucket, group, bucket_index, new_path, options).await
     }
 
+    /// Finds the entry of `key` in `partition`. Answers the value it holds, `true` and its sorted
+    /// slot, or zero, `false` and the sorted slot an entry for the key is inserted at.
     pub fn lookup(&self, partition: Partition, key: Hash) -> (Hash, bool, usize) {
         let count = self.entry.len();
         let mut start = 0;
@@ -860,7 +863,8 @@ impl MutableStoreBucket {
 
     /// Sends this bucket's keys of `key_type` under `partition`, or under every partition for the
     /// zero one, down `stream`, the bucket being bucket `bucket_index` of a group at
-    /// `active_buckets` buckets. Fails at the first key `stream` refuses.
+    /// `active_buckets` buckets. Fails at the first key `stream` refuses. An entry holding zero
+    /// isn't sent.
     ///
     /// The bucket holds the entries whose bucket byte, `data[1]`, falls in
     /// `[bucket_index * stride, (bucket_index + 1) * stride)`, where `stride = 256 /
@@ -882,7 +886,7 @@ impl MutableStoreBucket {
             if Key::key_type_from_hash(&entry.key) != key_type as u8 {
                 return Ok(false);
             }
-            if partition.is_zero() || entry.partition == partition {
+            if (partition.is_zero() || entry.partition == partition) && !entry.value.is_zero() {
                 stream.send((entry.key, entry.value))?;
             }
             Ok(true)
@@ -929,31 +933,64 @@ impl MutableStoreBucket {
         Ok(())
     }
 
-    pub fn test_inject(&mut self, partition: Partition, key: Hash, value: Hash) {
-        let (existing_value, match_made, insert_slot) = self.lookup(partition, key);
-
-        if match_made {
-            // Previous entry found
-            if existing_value == value {
-                return;
-            }
-            let entry_index = self.sorted_index[insert_slot] as usize;
-            self.entry[entry_index].value = value;
-        } else {
+    /// Sets the entry of `key` in `partition` to `value`, and removes it for a zero `value`, where
+    /// `looked_up` is what [`Self::lookup`] answered for the key. Answers whether the bucket
+    /// changed: an entry holding `value` already, and a zero `value` for a key with no entry,
+    /// leave it as it is. An entry holding zero is removed as any other is.
+    fn set(
+        &mut self,
+        partition: Partition,
+        key: Hash,
+        value: Hash,
+        looked_up: (Hash, bool, usize),
+    ) -> bool {
+        let (held, found, slot) = looked_up;
+        if !found {
             if value.is_zero() {
-                return;
+                return false;
             }
-
-            // inject new entry
             let count = self.entry.len();
-            self.sorted_index.insert(insert_slot, count as u32);
-
+            self.sorted_index.insert(slot, count as u32);
             self.entry.push(MutableStoreEntry {
                 key,
                 partition,
                 value,
             });
+            return true;
         }
+        if value.is_zero() {
+            self.remove_at(slot);
+            return true;
+        }
+        if held == value {
+            return false;
+        }
+        let entry_index = self.sorted_index[slot] as usize;
+        self.entry[entry_index].value = value;
+        true
+    }
+
+    /// Removes the entry at sorted slot `slot`. The last entry moves into the removed entry's
+    /// place and the slot naming it is renamed, so no other entry moves, and the sorted slots
+    /// after `slot` move down one. Allocates nothing.
+    ///
+    /// The slot naming the last entry is found by the index it holds, not by a search on the
+    /// entry's key, so it is found whatever order the slots are in, and no slot is left naming
+    /// past the entries, even in a bucket read from a file whose slots are out of order. The scan
+    /// is one pass over the slots, as the shift that removes `slot` is.
+    fn remove_at(&mut self, slot: usize) {
+        let entry_index = self.sorted_index[slot] as usize;
+        let last = self.entry.len() - 1;
+        if entry_index != last
+            && let Some(moved_slot) = self
+                .sorted_index
+                .iter()
+                .position(|&index| index as usize == last)
+        {
+            self.sorted_index[moved_slot] = entry_index as u32;
+        }
+        self.sorted_index.remove(slot);
+        self.entry.swap_remove(entry_index);
     }
 }
 
@@ -1673,7 +1710,7 @@ impl LocalMutableStore {
                 let needs_two_phase_commit = fan_out_aware && committed_level != active_buckets;
 
                 if needs_two_phase_commit && first_err.is_none() {
-                    // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
+                    // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping clean buckets at index >= committed_level). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
                     if let Err(e) = lore_io::IoDriver::global()
                         .create_dir_all(&group_path)
                         .await
@@ -1698,15 +1735,11 @@ impl LocalMutableStore {
                             }
                             // bucket() not try_bucket(): must_overwrite_old paths need a guard
                             // for serialize_to_new even on slots that were never touched.
+                            // A flagged bucket is written even when a removal emptied it: a
+                            // group without a level marker can hold its file from the flat
+                            // layout, which the commit would otherwise leave holding the removed
+                            // entries.
                             let bucket = group.bucket(bucket_index).clone().read_owned().await;
-                            // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
-                            if bucket.entry.is_empty() && !must_overwrite_old {
-                                // Nothing to write and no older file to overwrite, so the flag
-                                // is settled here, under the read lock every writer is
-                                // excluded by: left set, it would keep the store claimed.
-                                group.dirty[bucket_index].store(false, atomic::Ordering::Relaxed);
-                                continue;
-                            }
                             let res = MutableStoreBucket::serialize_to_new(
                                 bucket,
                                 group.clone(),
@@ -2058,29 +2091,9 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
             })?;
         }
 
-        let (existing_value, match_made, insert_slot) = bucket.lookup(partition, key.hash());
-
-        if match_made {
-            // Previous entry found
-            if existing_value == value {
-                return Ok(());
-            }
-            let entry_index = bucket.sorted_index[insert_slot] as usize;
-            bucket.entry[entry_index].value = value;
-        } else {
-            if value.is_zero() {
-                return Ok(());
-            }
-
-            // inject new entry
-            let count = bucket.entry.len();
-            bucket.sorted_index.insert(insert_slot, count as u32);
-
-            bucket.entry.push(MutableStoreEntry {
-                key: key.hash(),
-                partition,
-                value,
-            });
+        let looked_up = bucket.lookup(partition, key.hash());
+        if !bucket.set(partition, key.hash(), value, looked_up) {
+            return Ok(());
         }
 
         // Flagged while the write lock is still held, so a flush serializing under the
@@ -2192,39 +2205,10 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
             })?;
         }
 
-        let (existing_value, match_made, insert_slot) = bucket.lookup(partition, key.hash());
-
-        if match_made {
-            // Previous entry found, check if we can CAS
-            if existing_value != expected {
-                // Value is not the expected, return stored value
-                return Ok(existing_value);
-            }
-            // Already the value asked for: the swap succeeds with nothing to change, so the
-            // bucket is left unflagged — a flagged bucket is rewritten by the next flush, and
-            // keeps the store claimed until it is.
-            if value == existing_value {
-                return Ok(existing_value);
-            }
-            // Value is the expected, swap to new value
-            let entry_index = bucket.sorted_index[insert_slot] as usize;
-            bucket.entry[entry_index].value = value;
-        } else {
-            // Previous entry not found, check if we can CAS
-            if !expected.is_zero() {
-                // Value is not the expected, return stored value
-                return Ok(Hash::default());
-            }
-
-            // inject new entry
-            let count = bucket.entry.len();
-            bucket.sorted_index.insert(insert_slot, count as u32);
-
-            bucket.entry.push(MutableStoreEntry {
-                key: key.hash(),
-                partition,
-                value,
-            });
+        let looked_up = bucket.lookup(partition, key.hash());
+        let held = looked_up.0;
+        if held != expected || !bucket.set(partition, key.hash(), value, looked_up) {
+            return Ok(held);
         }
 
         // Flagged while the write lock is still held, so a flush serializing under the
@@ -2233,8 +2217,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         drop(bucket);
         self.clone().schedule_flush(group_index).await;
 
-        // Value was created or updated, return previously stored value (the expected) to indicate this
-        Ok(existing_value)
+        Ok(held)
     }
 
     async fn list(

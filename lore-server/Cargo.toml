@@ -99,6 +99,8 @@ temp-env = { workspace = true }
 # `start_paused` for the tests that time push phases on a virtual clock.
 tokio = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true, features = ["test-util"] }
+# The points where a test stops a branch write, to leave a restore stopped part way.
+lore-revision = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []

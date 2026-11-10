@@ -5,8 +5,11 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
+use aws_sdk_dynamodb::error::SdkError;
+use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::types::AttributeValue;
+use aws_sdk_dynamodb::types::error::ConditionalCheckFailedException;
 use aws_smithy_types::Blob;
 use lore_base::error::AddressNotFound;
 use lore_base::error::SlowDown;
@@ -31,6 +34,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use smallvec::SmallVec;
 use tracing::Instrument;
+use tracing::Level;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -40,7 +44,7 @@ use crate::aws_error::AwsError;
 use crate::default_aws_timeout_millis;
 use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
-use crate::dynamodb::DynamoDbPutCondition;
+use crate::dynamodb::DynamoDbCondition;
 use crate::dynamodb::DynamoDbQuery;
 
 pub const MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE: &str = "repository_id";
@@ -98,6 +102,17 @@ impl MutableStoreEntry {
         self.value = Some(value);
         self
     }
+
+    /// This entry as a `DynamoDB` item.
+    fn to_item(&self) -> Result<HashMap<String, AttributeValue>, StoreError> {
+        serde_dynamo::to_item(self).map_err(|e| {
+            warn!(entry = ?self, error = ?e, "Failed to convert mutable store entry to a DynamoDB item");
+            StoreError::internal_with_context(
+                e,
+                "failed to convert mutable store entry to dynamo attribute value map",
+            )
+        })
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,18 +141,8 @@ impl CompareAndSwapCondition {
         );
         expression_values.insert(VALUE_PLACEHOLDER.to_string(), expected_value);
 
-        // When expected is zero the caller treats "absent" and "stored zero" as equivalent
-        // starting states. The condition must match both:
-        //   - the value attribute is missing entirely (row was never written, or was deleted)
-        //   - the value attribute is present but equals zero (e.g. written by branch initialization)
-        //
-        // The previous condition (`attribute_not_exists(pk) AND attribute_not_exists(sk)`)
-        // only matched the first case. When E.G. `branch::create` is called for a default branch
-        // with no revisions it writes {value=0000…} via compare_and_swap(expected=0, value=0),
-        // creating the row. Subsequent pushes then call compare_and_swap(expected=0, value=X)
-        // and found the condition failing (row exists), DynamoDB returning the existing
-        // {value=0000…} via AllOld, and the code incorrectly interpreting previous==expected
-        // as a successful swap — silently dropping the write.
+        // A key holds zero both with no item and with an item holding zero, so a swap from zero
+        // matches either, where an item-existence condition would refuse the second.
         let condition_expression = if expected.is_zero() {
             format!(
                 "attribute_not_exists({VALUE_ATTRIBUTE_ALIAS}) OR {VALUE_ATTRIBUTE_ALIAS} = {VALUE_PLACEHOLDER}"
@@ -154,7 +159,7 @@ impl CompareAndSwapCondition {
     }
 }
 
-impl DynamoDbPutCondition for CompareAndSwapCondition {
+impl DynamoDbCondition for CompareAndSwapCondition {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
             condition_expression: self.condition_expression,
@@ -260,11 +265,7 @@ impl AwsMutableStore {
         repository: Context,
         key: Hash,
     ) -> Result<Hash, StoreError> {
-        let entry = MutableStoreEntry::new(repository, key);
-        let key_item = serde_dynamo::to_item(&entry).map_err(|e| {
-            warn!("Failed to convert mutable store entry: {entry:?} to dynamo attribute value map: {e:?}");
-            StoreError::internal_with_context(e, "failed to convert mutable store entry {entry:?} to dynamo attribute value map")
-        })?;
+        let key_item = MutableStoreEntry::new(repository, key).to_item()?;
 
         let response = self
             .dynamodb
@@ -297,18 +298,13 @@ impl AwsMutableStore {
             Ok(_) => Err(StoreError::from(AddressNotFound::from(
                 Address::zero_context_hash(key),
             ))),
-            Err(err) => {
-                warn!(
-                    "Got unexpected error from AWS sdk while loading {key} from the mutable store for repository: {repository}: {err:?}"
-                );
-                Err(match err {
-                    AwsError::AwsSdkError(_sdk_error) => StoreError::from(SlowDown),
-                    _ => StoreError::internal_with_context(
-                        err,
-                        "Got unexpected error from AWS sdk while loading {key} from the mutable store for repository: {repository}",
-                    ),
-                })
-            }
+            Err(err) => Err(request_failed(
+                err,
+                repository,
+                key,
+                "DynamoDB read of a mutable key failed",
+                Level::WARN,
+            )),
         }
     }
 
@@ -320,120 +316,108 @@ impl AwsMutableStore {
     ) -> Result<(), StoreError> {
         let entry = MutableStoreEntry::new(repository, key);
         if value.is_zero() {
-            let item = serde_dynamo::to_item(&entry).map_err(|e| {
-                warn!("Failed to convert mutable store entry: {entry:?} to dynamo attribute value map: {e:?}");
-                StoreError::internal_with_context(e, "Failed to convert mutable store entry: {entry:?} to dynamo attribute value map")
-            })?;
+            let item = entry.to_item()?;
 
-            self.dynamodb.delete_item(&self.mutable_store_table_name, item).await.map(|_| ())
+            self.dynamodb
+                .delete_item(&self.mutable_store_table_name, item)
+                .await
+                .map(|_| ())
                 .map_err(|err| {
-                    warn!("Failed to delete item while storing empty value to mutable store for key: {key} in repository: {repository}: {err:?}");
-                    match err {
-                        AwsError::AwsSdkError(_sdk_error) => StoreError::from(SlowDown),
-                        _ => StoreError::internal_with_context(err, "Failed to delete item while storing empty value to mutable store for key: {key} in repository: {repository}: {err:?}"),
-                    }
+                    request_failed(
+                        err,
+                        repository,
+                        key,
+                        "DynamoDB delete of a mutable key stored as zero failed",
+                        Level::WARN,
+                    )
                 })
         } else {
-            let entry = entry.with_value(value);
-            let item = serde_dynamo::to_item(&entry).map_err(|e| {
-                warn!("Failed to convert mutable store entry: {entry:?} to dynamo attribute value map: {e:?}");
-                StoreError::internal_with_context(e, "Failed to serialize mutable entry for DynamoDB compare-and-swap")
-            })?;
+            let item = entry.with_value(value).to_item()?;
             self.dynamodb
                 .put_item(&self.mutable_store_table_name, item)
                 .await
                 .map(|_| ())
                 .map_err(|err| {
-                    debug!({REPOSITORY_ID} = %repository, key = %key, error = ?err,
-                        "Failed to put item while storing mutable value for key");
-                    match err {
-                        AwsError::AwsSdkError(_sdk_error) => StoreError::from(SlowDown),
-                        _ => StoreError::internal_with_context(
-                            err,
-                            "Failed to put item while storing mutable value for key",
-                        ),
-                    }
+                    request_failed(
+                        err,
+                        repository,
+                        key,
+                        "DynamoDB put of a mutable key failed",
+                        Level::DEBUG,
+                    )
                 })
         }
     }
 
-    async fn compare_and_swap_typed(
+    /// Swaps `key` from `expected` to `value` as [`MutableStoreTrait::compare_and_swap`] describes:
+    /// by a put on the swap's condition, by a delete on it for a zero `value`, and by a read for
+    /// a `value` equal to a non-zero `expected`, which has nothing to write.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments. The delete is written
+    /// out here for the same reason: a function of its own would hold another.
+    #[allow(clippy::manual_async_fn)]
+    fn compare_and_swap_typed(
         self: Arc<Self>,
         repository: Context,
         key: Hash,
         expected: Hash,
         value: Hash,
-    ) -> Result<Hash, StoreError> {
-        let entry = MutableStoreEntry::new(repository, key).with_value(value);
-
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
-            warn!("Failed to convert mutable store entry: {entry:?} to dynamo attribute value map: {e:?}");
-            StoreError::internal_with_context(e, "failed to convert mutable store entry {entry:?} to dynamo attribute value map")
-        })?;
-
-        let result = self
-            .dynamodb
-            .put_item_conditional(
-                &self.mutable_store_table_name,
-                item,
-                CompareAndSwapCondition::new(expected)?,
-            )
-            .await;
-
-        match result {
-            Ok(_) => Ok(expected),
-            Err(AwsError::AwsSdkError(sdk_error))
-                if sdk_error
-                    .as_service_error()
-                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
-            {
-                if let Some(PutItemError::ConditionalCheckFailedException(e)) =
-                    sdk_error.as_service_error()
-                {
-                    match e.item() {
-                        Some(item) => {
-                            let entry: MutableStoreEntry =
-                                    serde_dynamo::from_item(item.to_owned()).map_err(|e| {
-                                        warn!("Failed to parse mutable store value from item: {item:?}: {e}");
-                                        StoreError::internal_with_context(e, "Failed to convert mutable store value from item: {item:?}")
-                                    })?;
-                            entry.value.ok_or_else(|| {
-                                warn!("Could not extract value from existing item");
-                                StoreError::internal("Could not extract value from existing item")
-                            })
-                        }
-                        None => {
-                            if expected.is_zero() {
-                                // We expected no value to exist, and the request failed the
-                                // precondition, but returned no existing item. This shouldn't ever
-                                // happen.
-                                warn!(
-                                    "Precondition failed when compare and swap to insert new value, but no existing value found?"
-                                );
-                                Err(StoreError::internal(
-                                    "Precondition failed when compare and swap to insert new value, but no existing value found?",
-                                ))
-                            } else {
-                                // We expected a value to exist, the precondition failed with no
-                                // value, meaning the item did not exist at all, so we just return
-                                // an empty hash.
-                                Ok(Hash::default())
-                            }
-                        }
-                    }
-                } else {
-                    unreachable!()
-                }
+    ) -> impl Future<Output = Result<Hash, StoreError>> {
+        async move {
+            if value.is_zero() {
+                let item = MutableStoreEntry::new(repository, key).to_item()?;
+                let condition = CompareAndSwapCondition::new(expected)?;
+                let result = self
+                    .dynamodb
+                    .delete_item_conditional(&self.mutable_store_table_name, item, condition)
+                    .await;
+                return match result {
+                    Ok(_) => Ok(expected),
+                    Err(err) => match condition_refusal(&err, |e| match e {
+                        DeleteItemError::ConditionalCheckFailedException(refusal) => Some(refusal),
+                        _ => None,
+                    }) {
+                        Some(refusal) => held_on_refusal(expected, refusal.item()),
+                        None => Err(request_failed(
+                            err,
+                            repository,
+                            key,
+                            "DynamoDB write of a mutable key's compare and swap failed",
+                            Level::WARN,
+                        )),
+                    },
+                };
             }
-            Err(err) => {
-                warn!("DynamoDB conditional put failed for compare and swap of {entry:?}: {err:?}");
-                Err(match err {
-                    AwsError::AwsSdkError(_sdk_error) => StoreError::from(SlowDown),
-                    _ => StoreError::internal_with_context(
+            if value == expected {
+                return match self.load_typed(repository, key).await {
+                    Err(err) if err.is_address_not_found() => Ok(Hash::default()),
+                    held => held,
+                };
+            }
+
+            let item = MutableStoreEntry::new(repository, key)
+                .with_value(value)
+                .to_item()?;
+            let condition = CompareAndSwapCondition::new(expected)?;
+            let result = self
+                .dynamodb
+                .put_item_conditional(&self.mutable_store_table_name, item, condition)
+                .await;
+            match result {
+                Ok(_) => Ok(expected),
+                Err(err) => match condition_refusal(&err, |e| match e {
+                    PutItemError::ConditionalCheckFailedException(refusal) => Some(refusal),
+                    _ => None,
+                }) {
+                    Some(refusal) => held_on_refusal(expected, refusal.item()),
+                    None => Err(request_failed(
                         err,
-                        "DynamoDB conditional put failed for compare and swap of {entry:?}",
-                    ),
-                })
+                        repository,
+                        key,
+                        "DynamoDB write of a mutable key's compare and swap failed",
+                        Level::WARN,
+                    )),
+                },
             }
         }
     }
@@ -507,6 +491,78 @@ impl AwsMutableStore {
         }.in_current_span());
 
         Ok(stream)
+    }
+}
+
+/// The refusal `err` reports when `DynamoDB` refused a write on its condition, or `None` for any
+/// other failure. `pick` takes the refusal out of the operation's error.
+fn condition_refusal<E>(
+    err: &AwsError<SdkError<E>>,
+    pick: impl FnOnce(&E) -> Option<&ConditionalCheckFailedException>,
+) -> Option<&ConditionalCheckFailedException> {
+    match err {
+        AwsError::AwsSdkError(sdk_error) => sdk_error.as_service_error().and_then(pick),
+        _ => None,
+    }
+}
+
+/// The value a swap from `expected` answers when `DynamoDB` refused its write and returned `item`,
+/// the item as the swap's condition found it: the value the item holds, or zero for no item or an
+/// item with no value.
+///
+/// # Errors
+///
+/// An internal error when the item cannot be read, or when it holds `expected`, which the
+/// condition matches: answered, `expected` would read as a swap made.
+fn held_on_refusal(
+    expected: Hash,
+    item: Option<&HashMap<String, AttributeValue>>,
+) -> Result<Hash, StoreError> {
+    let held = match item {
+        Some(item) => {
+            let entry: MutableStoreEntry =
+                serde_dynamo::from_item(item.to_owned()).map_err(|e| {
+                    warn!(?item, error = %e, "Failed to parse mutable store value from item");
+                    StoreError::internal_with_context(
+                        e,
+                        "Failed to convert mutable store value from item",
+                    )
+                })?;
+            entry.value.unwrap_or_default()
+        }
+        None => Hash::default(),
+    };
+    if held == expected {
+        warn!(%expected, "DynamoDB refused a compare and swap from the value the key holds");
+        return Err(StoreError::internal(
+            "DynamoDB refused a compare and swap from the value the key holds",
+        ));
+    }
+    Ok(held)
+}
+
+/// The error a `DynamoDB` request for `key` in `repository` fails with, other than on a write's
+/// condition: a slow-down for an error the SDK reports, and an internal error named `what` for any
+/// other. Logs `what` with the error, at debug for [`Level::DEBUG`] and at warn otherwise.
+#[track_caller]
+fn request_failed<E>(
+    err: AwsError<E>,
+    repository: Context,
+    key: Hash,
+    what: &'static str,
+    level: Level,
+) -> StoreError
+where
+    AwsError<E>: std::error::Error + Send + Sync + 'static,
+{
+    if level == Level::DEBUG {
+        debug!({REPOSITORY_ID} = %repository, key = %key, error = ?err, "{what}");
+    } else {
+        warn!({REPOSITORY_ID} = %repository, key = %key, error = ?err, "{what}");
+    }
+    match err {
+        AwsError::AwsSdkError(_sdk_error) => StoreError::from(SlowDown),
+        _ => StoreError::internal_with_context(err, what),
     }
 }
 
@@ -623,12 +679,14 @@ mod test {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
     use aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput;
     use aws_sdk_dynamodb::operation::get_item::GetItemOutput;
     use aws_sdk_dynamodb::operation::put_item::PutItemError;
     use aws_sdk_dynamodb::operation::put_item::PutItemOutput;
     use aws_sdk_dynamodb::types::AttributeValue;
     use aws_sdk_dynamodb::types::error::ConditionalCheckFailedException;
+    use aws_sdk_dynamodb::types::error::ProvisionedThroughputExceededException;
     use aws_sdk_s3::primitives::SdkBody;
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::client::result::SdkError;
@@ -966,13 +1024,8 @@ mod test {
         );
     }
 
-    /// Regression test: pushing to a default branch whose LATEST key was initialised to
-    /// {value=0000…} by `branch::create` must succeed, not silently no-op.
-    ///
-    /// Previously the zero-expected CAS condition was `attribute_not_exists(pk) AND
-    /// attribute_not_exists(sk)`, which fails when the row already exists. `DynamoDB` then
-    /// returns the existing item via `AllOld`; the code saw `previous == expected == 0` and
-    /// incorrectly treated the failed swap as a success, leaving the branch pointer unadvanced.
+    /// A swap from zero of a key whose item holds zero puts the new value and answers zero: the
+    /// swap's condition matches an item holding zero as it matches no item.
     #[tokio::test]
     async fn test_compare_and_swap_zero_expected_with_existing_zero_value() {
         let hash = random::<Hash>();
@@ -1059,5 +1112,251 @@ mod test {
                 .await
                 .expect("should not have returned an error")
         );
+    }
+
+    const KEY_TYPE: KeyType = KeyType::BranchLatestPointer;
+
+    /// The item key of `hash` in `repository`, with no value.
+    fn item_key(repository: Context, hash: Hash) -> HashMap<String, AttributeValue> {
+        serde_dynamo::to_item(MutableStoreEntry::new(
+            repository,
+            AwsMutableStore::typed_key(hash, KEY_TYPE),
+        ))
+        .unwrap()
+    }
+
+    /// The item of `hash` in `repository` holding `value`.
+    fn item(repository: Context, hash: Hash, value: Hash) -> HashMap<String, AttributeValue> {
+        serde_dynamo::to_item(
+            MutableStoreEntry::new(repository, AwsMutableStore::typed_key(hash, KEY_TYPE))
+                .with_value(value),
+        )
+        .unwrap()
+    }
+
+    /// The service error `error`, as the SDK reports one.
+    fn refused<E>(error: E) -> AwsError<SdkError<E, HttpResponse>> {
+        AwsError::sdk_error(SdkError::ServiceError(
+            aws_smithy_runtime_api::client::result::ServiceError::builder()
+                .source(error)
+                .raw(HttpResponse::new(
+                    400u16.try_into().unwrap(),
+                    SdkBody::empty(),
+                ))
+                .build(),
+        ))
+    }
+
+    /// A put refused on its condition, returning `item`.
+    fn refused_put(
+        item: Option<HashMap<String, AttributeValue>>,
+    ) -> AwsError<SdkError<PutItemError, HttpResponse>> {
+        refused(PutItemError::ConditionalCheckFailedException(
+            ConditionalCheckFailedException::builder()
+                .set_item(item)
+                .build(),
+        ))
+    }
+
+    /// A delete refused on its condition, returning `item`.
+    fn refused_delete(
+        item: Option<HashMap<String, AttributeValue>>,
+    ) -> AwsError<SdkError<DeleteItemError, HttpResponse>> {
+        refused(DeleteItemError::ConditionalCheckFailedException(
+            ConditionalCheckFailedException::builder()
+                .set_item(item)
+                .build(),
+        ))
+    }
+
+    async fn swap(
+        dynamodb: DynamoDb,
+        repository: Context,
+        hash: Hash,
+        expected: Hash,
+        value: Hash,
+    ) -> Result<Hash, lore_storage::StoreError> {
+        Arc::new(initialize_mutable_store(dynamodb).await)
+            .compare_and_swap(repository.into(), hash, expected, value, KEY_TYPE)
+            .await
+    }
+
+    /// A swap to zero deletes the item on the swap's condition, whether it swaps from a value or
+    /// from zero, and answers `expected` when the delete is made.
+    #[tokio::test]
+    async fn a_swap_to_zero_deletes_the_item_on_its_condition() {
+        for expected in [random::<Hash>(), Hash::default()] {
+            let (hash, repository) = (random::<Hash>(), random::<Context>());
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb
+                .expect_delete_item_conditional()
+                .with(
+                    eq(Arc::<str>::from(MUTABLE_STORE_TABLE_NAME)),
+                    eq(item_key(repository, hash)),
+                    eq(CompareAndSwapCondition::new(expected).unwrap()),
+                )
+                .times(1)
+                .return_once(|_, _, _| Ok(DeleteItemOutput::builder().build()));
+
+            assert_eq!(
+                swap(dynamodb, repository, hash, expected, Hash::default())
+                    .await
+                    .expect("swaps"),
+                expected,
+                "from {expected}"
+            );
+        }
+    }
+
+    /// A refused swap to zero answers the value of the item `DynamoDB` returns with the refusal.
+    #[tokio::test]
+    async fn a_refused_swap_to_zero_answers_the_held_value() {
+        let (hash, repository) = (random::<Hash>(), random::<Context>());
+        let (expected, held) = (random::<Hash>(), random::<Hash>());
+        let returned = item(repository, hash, held);
+        let mut dynamodb = MockDynamoDb::default();
+        dynamodb
+            .expect_delete_item_conditional::<CompareAndSwapCondition>()
+            .return_once(move |_, _, _| Err(refused_delete(Some(returned))));
+
+        assert_eq!(
+            swap(dynamodb, repository, hash, expected, Hash::default())
+                .await
+                .expect("swaps"),
+            held
+        );
+    }
+
+    /// A refused swap answers zero when `DynamoDB` returns no item with the refusal, or an item
+    /// with no value, by a put and by a delete alike.
+    #[tokio::test]
+    async fn a_refused_swap_answers_zero_for_no_item_or_an_item_without_a_value() {
+        for to_zero in [false, true] {
+            for valueless in [false, true] {
+                let (hash, repository) = (random::<Hash>(), random::<Context>());
+                let returned = valueless.then(|| item_key(repository, hash));
+                let mut dynamodb = MockDynamoDb::default();
+                if to_zero {
+                    dynamodb
+                        .expect_delete_item_conditional::<CompareAndSwapCondition>()
+                        .return_once(move |_, _, _| Err(refused_delete(returned)));
+                } else {
+                    dynamodb
+                        .expect_put_item_conditional::<CompareAndSwapCondition>()
+                        .return_once(move |_, _, _| Err(refused_put(returned)));
+                }
+                let value = if to_zero {
+                    Hash::default()
+                } else {
+                    random::<Hash>()
+                };
+
+                assert_eq!(
+                    swap(dynamodb, repository, hash, random::<Hash>(), value)
+                        .await
+                        .expect("swaps"),
+                    Hash::default(),
+                    "to zero {to_zero}, an item without a value {valueless}"
+                );
+            }
+        }
+    }
+
+    /// A refusal whose returned item meets the swap's condition contradicts it, so the swap fails
+    /// rather than answer `expected`, which would read as made: by a put and by a delete, from a
+    /// value or from zero with no item returned.
+    #[tokio::test]
+    async fn a_refusal_that_answers_the_expected_value_fails_the_swap() {
+        for to_zero in [false, true] {
+            for from_zero in [false, true] {
+                let (hash, repository) = (random::<Hash>(), random::<Context>());
+                let expected = if from_zero {
+                    Hash::default()
+                } else {
+                    random::<Hash>()
+                };
+                let returned = (!from_zero).then(|| item(repository, hash, expected));
+                let mut dynamodb = MockDynamoDb::default();
+                let value = if to_zero {
+                    dynamodb
+                        .expect_delete_item_conditional::<CompareAndSwapCondition>()
+                        .return_once(move |_, _, _| Err(refused_delete(returned)));
+                    Hash::default()
+                } else {
+                    dynamodb
+                        .expect_put_item_conditional::<CompareAndSwapCondition>()
+                        .return_once(move |_, _, _| Err(refused_put(returned)));
+                    random::<Hash>()
+                };
+
+                let swapped = swap(dynamodb, repository, hash, expected, value).await;
+                assert!(
+                    swapped.is_err(),
+                    "to zero {to_zero}, from zero {from_zero}: answered {swapped:?}"
+                );
+            }
+        }
+    }
+
+    /// A delete that fails other than on its condition fails the swap as a put does: an SDK error
+    /// as a slow-down, any other as an internal error.
+    #[tokio::test]
+    async fn a_failed_delete_fails_the_swap() {
+        for sdk in [true, false] {
+            let (hash, repository) = (random::<Hash>(), random::<Context>());
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb
+                .expect_delete_item_conditional::<CompareAndSwapCondition>()
+                .return_once(move |_, _, _| {
+                    Err(if sdk {
+                        refused(DeleteItemError::ProvisionedThroughputExceededException(
+                            ProvisionedThroughputExceededException::builder().build(),
+                        ))
+                    } else {
+                        AwsError::JoinError
+                    })
+                });
+
+            let err = swap(
+                dynamodb,
+                repository,
+                hash,
+                random::<Hash>(),
+                Hash::default(),
+            )
+            .await
+            .expect_err("the swap fails");
+            assert_eq!(err.is_slow_down(), sdk, "an SDK error {sdk}: {err:?}");
+        }
+    }
+
+    /// A swap from the held value to itself reads the item and writes nothing, answering what the
+    /// item holds: the value, another value, or zero for no item.
+    #[tokio::test]
+    async fn a_swap_to_the_expected_value_reads_and_writes_nothing() {
+        let value = random::<Hash>();
+        for held in [Some(value), Some(random::<Hash>()), None] {
+            let (hash, repository) = (random::<Hash>(), random::<Context>());
+            let returned = held.map(|held| item(repository, hash, held));
+            let mut dynamodb = MockDynamoDb::default();
+            dynamodb
+                .expect_get_item()
+                .with(
+                    eq(Arc::<str>::from(MUTABLE_STORE_TABLE_NAME)),
+                    eq(item_key(repository, hash)),
+                    eq(true),
+                )
+                .times(1)
+                .return_once(move |_, _, _| {
+                    Ok(GetItemOutput::builder().set_item(returned).build())
+                });
+
+            assert_eq!(
+                swap(dynamodb, repository, hash, value, value)
+                    .await
+                    .expect("swaps"),
+                held.unwrap_or_default()
+            );
+        }
     }
 }
