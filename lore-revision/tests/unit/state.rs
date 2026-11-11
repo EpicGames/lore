@@ -3610,3 +3610,25 @@ async fn walk_children_restarts_past_a_child_moved_away() {
     assert_eq!(visited, vec![a]);
     assert!(walked.may_repeat, "a restarted walk may repeat");
 }
+
+#[tokio::test]
+async fn a_node_link_crosses_a_link_where_its_repository_or_revision_differs() {
+    with_state(|repository, state| async move {
+        state.set_revision(Hash::from([1; 32]));
+        let link = |node, repository, revision: u8| NodeLink {
+            node,
+            repository,
+            revision: Hash::from([revision; 32]),
+        };
+        let own = repository.id;
+        let other = RepositoryId::from([9; 16]);
+
+        assert!(!link(1, own, 1).crosses_link(&repository, &state));
+        assert!(!link(ROOT_NODE, own, 1).crosses_link(&repository, &state));
+        assert!(link(1, other, 1).crosses_link(&repository, &state));
+        assert!(link(1, own, 2).crosses_link(&repository, &state));
+        assert!(link(ROOT_NODE, other, 1).crosses_link(&repository, &state));
+        assert!(!NodeLink::invalid().crosses_link(&repository, &state));
+    })
+    .await;
+}

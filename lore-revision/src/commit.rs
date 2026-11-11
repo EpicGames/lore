@@ -3946,10 +3946,7 @@ async fn node_at_path(
         Err(state::StateError::NodeNotFound(_)) => return Ok(None),
         Err(error) => return Err(error),
     };
-    if !node_link.node.is_valid_node_id()
-        || node_link.repository != repository.id
-        || node_link.revision != state.revision()
-    {
+    if !node_link.is_valid() || node_link.crosses_link(repository, state) {
         return Ok(None);
     }
     Ok(Some(node_link.node))
