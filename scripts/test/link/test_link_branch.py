@@ -3,7 +3,7 @@
 import re
 
 import pytest
-from error_types import LinkDivergedError
+from error_types import BranchDivergedError, LinkDivergedError
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
@@ -742,16 +742,14 @@ def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
     parent_repo.stage("vendor/lib/linked.txt")
     parent_repo.commit("Edit through the mount")
 
-    # A link is pushed once per parent revision walked, so the kinds are
-    # collected as a set rather than counted.
-    kinds = {
+    kinds = sorted(
         (event["flagLink"], event["flagLayer"])
         for event in parse_jsonl(parent_repo.push(json=True), "branchPush")
-    }
+    )
 
-    assert kinds == {(False, False), (False, True), (True, False)}, (
+    assert kinds == [(False, False), (False, True), (True, False)], (
         "Push must report the parent as neither a link nor a layer, the layer as "
-        f"a layer, and the link as a link, got {kinds}"
+        f"a layer, and the link as a link, each once, got {kinds}"
     )
 
 
@@ -1019,6 +1017,138 @@ def test_link_push_onto_a_moved_link_branch_fails_as_diverged(new_lore_repo):
 
     with pytest.raises(LinkDivergedError):
         parent.push()
+
+
+@pytest.mark.smoke
+def test_link_push_reports_every_diverged_link(new_lore_repo):
+    """A push that stops at several diverged links names each of them."""
+    parent, first_link = make_parent_with_link(new_lore_repo, "vendor/first")
+    second_link = make_repo(new_lore_repo, {"linked.txt": "second linked content\n"})
+    parent.link_add("vendor/second", second_link.get_id(), "/")
+    parent.commit("Add a second link")
+    parent.push()
+
+    for link_repo in (first_link, second_link):
+        link_repo.clone().write_commit_push(
+            "Move linked main", {"linked.txt": "moved on upstream\n"}
+        )
+    edits = {
+        "vendor/first/linked.txt": "edited through the first mount\n",
+        "vendor/second/linked.txt": "edited through the second mount\n",
+    }
+    parent.write_files(edits)
+    parent.stage(list(edits))
+    parent.commit("Edit through both mounts")
+
+    with pytest.raises(LinkDivergedError) as failure:
+        parent.push(json=True)
+
+    output = str(failure.value)
+    completes = parse_jsonl(output, "complete")
+    error_logs = [log for log in parse_jsonl(output, "log") if log["level"] == "error"]
+    assert [complete["status"] for complete in completes] == [52], completes
+    # The failing completion logs its own error, beside one line for the other failure.
+    assert len(error_logs) == 2, error_logs
+
+
+@pytest.mark.smoke
+def test_push_of_a_diverged_layer_pushes_nothing(new_lore_repo):
+    """A push whose layer has diverged fails before it pushes the repository."""
+    parent = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    layer_repo: Lore = new_lore_repo(parent.name + "_layer")
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(None, {"lay/layered.txt": b"layer content"})
+    parent.layer_add("lay", layer_repo, "lay/")
+    pushed = parent.branch_info().remote_latest
+
+    layer_repo.write_commit_push(
+        "Move layer main", {"lay/layered.txt": b"moved on upstream"}
+    )
+    edits = {
+        "lay/layered.txt": "edited through the parent\n",
+        DEFAULT_PARENT_FILE: "edited\n",
+    }
+    parent.write_files(edits)
+    parent.stage(list(edits))
+    parent.commit("Edit the layer and the parent")
+
+    with pytest.raises(BranchDivergedError):
+        parent.push()
+
+    assert parent.branch_info().remote_latest == pushed
+
+
+def make_parent_reaching_shared_twice(new_lore_repo) -> tuple[Lore, Lore]:
+    """Returns (parent, shared): the parent links `first` and `second`, each of
+    which links `shared` at `<name>/shared`, all pushed."""
+    parent = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    shared = make_repo(new_lore_repo, {"shared.txt": "shared content\n"})
+    for name in ("first", "second"):
+        middle = make_repo(new_lore_repo, {f"{name}.txt": f"{name} content\n"})
+        parent.link_add(name, middle.get_id(), "/")
+        parent.commit(f"Link {name}")
+        parent.push()
+        parent.link_add(f"{name}/shared", shared.get_id(), "/")
+        parent.commit(f"Link the shared repository in {name}")
+        parent.push()
+    return parent, shared
+
+
+@pytest.mark.smoke
+def test_link_push_of_diverged_revisions_of_one_branch_pushes_nothing(new_lore_repo):
+    """Edits made through two mounts of one linked branch, each on the revision
+    its mount pins, are diverged revisions of that branch: the push fails as a
+    diverged link before it pushes either."""
+    parent, shared = make_parent_reaching_shared_twice(new_lore_repo)
+    pushed = shared.branch_info().remote_latest
+    for name in ("first", "second"):
+        mounted_file = f"{name}/shared/{name}-edit.txt"
+        parent.write_files({mounted_file: f"edited through {name}\n"})
+        parent.stage(mounted_file)
+        parent.commit(f"Edit the shared repository through {name}")
+
+    with pytest.raises(LinkDivergedError):
+        parent.push()
+
+    assert shared.branch_info().remote_latest == pushed
+
+
+@pytest.mark.smoke
+def test_link_push_pushes_a_repository_two_links_reach_once(new_lore_repo):
+    """Two linked repositories that both link a third push the third once, at the
+    newest revision either of them names, which holds the other."""
+    parent, shared = make_parent_reaching_shared_twice(new_lore_repo)
+
+    # Each edit lands on the shared branch's latest revision, which the second
+    # mount is moved onto first, so the revisions the two name are on one line.
+    for name in ("first", "second"):
+        if name == "second":
+            first_pin = re.search(
+                r"Link path: first/shared .*?Revision:\s*(\w+)",
+                parent.link_list(),
+                re.DOTALL,
+            ).group(1)
+            parent.link_update(f"{name}/shared", pin=first_pin)
+            parent.commit(f"Move {name}/shared onto the first edit")
+        mounted_file = f"{name}/shared/{name}-edit.txt"
+        parent.write_files({mounted_file: f"edited through {name}\n"})
+        parent.stage(mounted_file)
+        parent.commit(f"Edit the shared repository through {name}")
+
+    shared_pushes = [
+        event
+        for event in parse_jsonl(parent.push(json=True), "branchPush")
+        if event["repository"] == shared.get_id()
+    ]
+
+    assert len(shared_pushes) == 1, (
+        "Both links reach the shared repository on one branch, which should be "
+        f"pushed once, got {len(shared_pushes)}: {shared_pushes}"
+    )
+    verify = parent.clone()
+    assert verify.file_exists("first/shared/first-edit.txt")
+    assert verify.file_exists("second/shared/first-edit.txt")
+    assert verify.file_exists("second/shared/second-edit.txt")
 
 
 @pytest.mark.smoke

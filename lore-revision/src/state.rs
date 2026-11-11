@@ -5485,6 +5485,13 @@ impl State {
         self.data_read().hash_link_merge
     }
 
+    /// Points the state at the link list `hash`, so that a test can name one the store doesn't
+    /// hold.
+    #[cfg(feature = "test-util")]
+    pub fn set_link_list_hash(&self, hash: Hash) {
+        self.data_write().hash_link = hash;
+    }
+
     pub fn set_link_merge_hash(&self, hash: Hash) {
         let mut data = self.data_write();
         data.hash_link_merge = hash;

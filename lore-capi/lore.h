@@ -1174,6 +1174,10 @@ typedef struct lore_branch_push_event_data_t {
 
 // Data for the event sent before a revision's parent is rewritten during push.
 typedef struct lore_branch_push_revision_update_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision being updated.
   struct lore_hash_t revision;
   // The previous parent revision.
@@ -1184,12 +1188,20 @@ typedef struct lore_branch_push_revision_update_begin_event_data_t {
 
 // Data for the event sent after a revision's parent is rewritten during push.
 typedef struct lore_branch_push_revision_update_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The updated revision.
   struct lore_hash_t revision;
 } lore_branch_push_revision_update_end_event_data_t;
 
 // Data for the event sent before fragments are transferred during push.
 typedef struct lore_branch_push_fragment_begin_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments to transfer.
   uint64_t fragments;
   // The total number of bytes to transfer.
@@ -1198,6 +1210,10 @@ typedef struct lore_branch_push_fragment_begin_event_data_t {
 
 // Data for the event sent as fragments are transferred during push.
 typedef struct lore_branch_push_fragment_progress_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments transferred so far.
   uint64_t complete;
   // The total number of fragments to transfer.
@@ -1210,6 +1226,10 @@ typedef struct lore_branch_push_fragment_progress_event_data_t {
 
 // Data for the event sent after fragments are transferred during push.
 typedef struct lore_branch_push_fragment_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The number of fragments transferred.
   uint64_t fragments;
   // The number of bytes transferred.
@@ -1228,6 +1248,10 @@ typedef struct lore_branch_push_branch_create_begin_event_data_t {
 
 // Data for the event sent after a branch is created on the remote.
 typedef struct lore_branch_push_branch_create_end_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision the branch points to on the remote.
   struct lore_hash_t remote_revision;
 } lore_branch_push_branch_create_end_event_data_t;
@@ -1246,6 +1270,10 @@ typedef struct lore_branch_push_revision_push_begin_event_data_t {
 
 // Data for the event sent when the remote assigns a pushed revision a new identity.
 typedef struct lore_branch_push_revision_push_update_event_data_t {
+  // The repository being pushed.
+  lore_repository_id_t repository;
+  // The branch being pushed.
+  lore_branch_id_t branch;
   // The revision before the remote reassigned it.
   struct lore_hash_t old_revision;
   // The revision the remote assigned.
@@ -3348,7 +3376,7 @@ typedef struct lore_revision_commit_stats_event_data_t {
 // Emitted once, when the push finishes, at statistics level one and above. A
 // push that failed reports what it had done by then. The counts are cumulative
 // across every revision, link and layer the push registers, where
-// [`LoreBranchPushFragmentProgressEventData`] reports the revision in flight.
+// `lore_branch_push_fragment_progress_event_data_t` reports one revision's share.
 //
 // A push stores no payload of its own: a fragment the peer was asked about is
 // deduplicated, copied or put, unless the push ended before it was reached.

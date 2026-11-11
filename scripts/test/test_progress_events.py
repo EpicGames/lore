@@ -428,6 +428,11 @@ def test_push_progress_events(new_lore_repo):
     assert len(fragment_progress_events) > 0, (
         "Expected at least one fragment progress event"
     )
+    pushed = (push_events[0]["repository"], push_events[0]["branch"])
+    for event in fragment_begin_events + fragment_progress_events + fragment_end_events:
+        assert (event["repository"], event["branch"]) == pushed, (
+            f"Fragment events name the branch they push, got {event}"
+        )
 
     # Work done must never exceed totals
     assert_work_lte_total(

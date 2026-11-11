@@ -1081,7 +1081,7 @@ pub async fn load_last_sync(
 
     if let Ok(metadata) = metadata_local(repository.clone(), branch).await
         && let Ok(branch_metadata) = branch_metadata(repository.clone(), branch, &metadata).await
-        && let Some(parent) = branch_metadata.stack.first()
+        && let Some(parent) = branch_metadata.branch_point()
     {
         Ok(parent.revision)
     } else {

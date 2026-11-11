@@ -23,24 +23,46 @@ fn address(seed: u8) -> Address {
     }
 }
 
-/// Statistics level zero reports nothing, so it keeps nothing beyond what a
-/// progress event reads: the fragments registered, which `copied` and `put`
-/// sum to, and the bytes uploaded.
+/// Statistics level zero reports nothing, so it keeps nothing.
 #[test]
 fn a_count_is_kept_only_where_something_reports_it() {
-    for (statistics, deduplicated) in [(false, 0), (true, 3)] {
+    for (statistics, expected) in [(false, 0), (true, 1)] {
         let stats = PushStats::new(statistics);
         stats.deduplicated(3);
         stats.copied();
-        stats.put(64);
+        stats.put();
 
         let counts = stats.snapshot();
-        assert_eq!(counts.deduplicated, deduplicated, "statistics {statistics}");
-        assert_eq!(counts.copied, 1, "statistics {statistics}");
-        assert_eq!(counts.put, 1, "statistics {statistics}");
-        assert_eq!(stats.registered(), 2, "statistics {statistics}");
-        assert_eq!(stats.put_bytes(), 64, "statistics {statistics}");
+        assert_eq!(counts.deduplicated, 3 * expected, "statistics {statistics}");
+        assert_eq!(counts.copied, expected, "statistics {statistics}");
+        assert_eq!(counts.put, expected, "statistics {statistics}");
     }
+}
+
+/// Revisions pushed at once share the push-wide counts, and each progress event reports only what
+/// its own revision registered and uploaded.
+#[test]
+fn a_progress_counts_its_own_revision_alone() {
+    let stats = Arc::new(PushStats::new(true));
+    let first = PushProgress::new(stats.clone());
+    let second = PushProgress::new(stats.clone());
+
+    first.copied();
+    second.put(64);
+    second.put(16);
+
+    let repository = lore_base::types::RepositoryId::from([3; 16]);
+    let branch = lore_base::types::BranchId::from([4; 16]);
+    let first_event = first.event(repository, branch);
+    assert_eq!(first_event.complete, 1);
+    assert_eq!(first_event.bytes_transferred, 0);
+    let second_event = second.event(repository, branch);
+    assert_eq!(second_event.complete, 2);
+    assert_eq!(second_event.bytes_transferred, 80);
+
+    let counts = stats.snapshot();
+    assert_eq!(counts.copied, 1);
+    assert_eq!(counts.put, 2);
 }
 
 /// A fragment the peer is missing reaches the caller as the address it is, rather than as a
@@ -455,14 +477,14 @@ mod duplicate_association {
         store_local(&repository, wanted).await;
         let peer = CopyingPeer::new(slow_downs, refusal);
         let session = peer.session(repository.id);
-        let stats = PushStats::new(false);
+        let progress = PushProgress::new(Arc::new(PushStats::new(false)));
 
-        let result = duplicate_association(&repository, &session, wanted, &stats).await;
+        let result = duplicate_association(&repository, &session, wanted, &progress).await;
 
         Duplicated {
             result,
             copies: peer.copies(),
-            copied: stats.snapshot().copied,
+            copied: progress.complete(),
             flags: stored_flags(&repository, wanted).await,
         }
     }
@@ -507,9 +529,522 @@ mod duplicate_association {
     }
 }
 
+/// The order a push pushes its targets in: each once the targets it comes after have pushed, one
+/// target of a repository at a time, a bounded number at once.
+mod schedule {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    fn target(after: Vec<usize>, group: usize) -> TargetOrder {
+        TargetOrder { after, group }
+    }
+
+    /// What pushing some targets did: the targets pushed, in the order they started, and the
+    /// failed ones.
+    struct Pushed {
+        started: Vec<usize>,
+        failed: Vec<usize>,
+    }
+
+    /// Push the targets of `orders`, failing those `failing` names.
+    async fn push(orders: &[TargetOrder], failing: &[usize]) -> Pushed {
+        let started = Mutex::new(vec![]);
+        let failures = schedule_targets(orders, |target| {
+            started.lock().unwrap().push(target);
+            let fails = failing.contains(&target);
+            async move {
+                tokio::task::yield_now().await;
+                if fails {
+                    Err(PushError::internal("the push failed"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        Pushed {
+            started: started.into_inner().unwrap(),
+            failed: failures.into_iter().map(|(target, _)| target).collect(),
+        }
+    }
+
+    /// A target starts once each target it comes after has pushed.
+    #[tokio::test]
+    async fn a_target_starts_after_the_targets_it_comes_after() {
+        let orders = [target(vec![1], 0), target(vec![], 1), target(vec![0], 2)];
+
+        let pushed = push(&orders, &[]).await;
+
+        assert_eq!(pushed.started, vec![1, 0, 2]);
+        assert!(pushed.failed.is_empty(), "{:?}", pushed.failed);
+    }
+
+    /// A failed target holds back the targets after it, and the others push.
+    #[tokio::test]
+    async fn a_failed_target_holds_back_only_the_targets_after_it() {
+        let orders = [
+            target(vec![1], 0),
+            target(vec![], 1),
+            target(vec![], 2),
+            target(vec![0], 3),
+        ];
+
+        let mut pushed = push(&orders, &[1]).await;
+
+        pushed.started.sort_unstable();
+        assert_eq!(pushed.started, vec![1, 2]);
+        assert_eq!(pushed.failed, vec![1]);
+    }
+
+    /// Targets waiting on each other fail the first of them rather than waiting forever.
+    #[tokio::test]
+    async fn targets_waiting_on_each_other_fail() {
+        let orders = [target(vec![1], 0), target(vec![0], 1)];
+
+        let pushed = push(&orders, &[]).await;
+
+        assert_eq!(pushed.failed, vec![0]);
+        assert_eq!(pushed.started, Vec::<usize>::new());
+    }
+
+    /// The most targets pushing at once in `orders`, and the most of one group.
+    async fn most_at_once(orders: &[TargetOrder]) -> (usize, usize) {
+        let pushing = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let group_pushing = AtomicUsize::new(0);
+        let group_most = AtomicUsize::new(0);
+
+        let failures = schedule_targets(orders, |target| {
+            let grouped = orders[target].group == 0;
+            let (pushing, most, group_pushing, group_most) =
+                (&pushing, &most, &group_pushing, &group_most);
+            async move {
+                most.fetch_max(pushing.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                if grouped {
+                    group_most.fetch_max(
+                        group_pushing.fetch_add(1, Ordering::SeqCst) + 1,
+                        Ordering::SeqCst,
+                    );
+                }
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                pushing.fetch_sub(1, Ordering::SeqCst);
+                if grouped {
+                    group_pushing.fetch_sub(1, Ordering::SeqCst);
+                }
+                Ok(())
+            }
+        })
+        .await;
+
+        assert!(failures.is_empty());
+        (most.into_inner(), group_most.into_inner())
+    }
+
+    /// As many targets push at once as the bound allows, and targets of one repository one at a
+    /// time.
+    #[tokio::test]
+    async fn targets_push_at_once_up_to_the_bound_and_one_per_repository() {
+        let orders: Vec<TargetOrder> = (0..3 * MAX_CONCURRENT_TARGETS)
+            .map(|position| target(vec![], if position % 3 == 0 { 0 } else { position }))
+            .collect();
+
+        assert_eq!(most_at_once(&orders).await, (MAX_CONCURRENT_TARGETS, 1));
+    }
+}
+
+/// Placing the revisions other targets link against a target's plan, and the order targets push
+/// in.
+mod place {
+    use std::collections::HashSet;
+
+    use lore_base::types::BranchId;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::state::LinkReference;
+    use lore_revision::state::State;
+
+    use super::*;
+    use crate::branch::with_execution;
+    use crate::branch::write_branch_revision;
+    use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::client_on;
+    use crate::paged_remote::client_stores;
+
+    fn branch() -> BranchId {
+        BranchId::from([7; 16])
+    }
+
+    /// A target of `branch()` at `latest` on `repository`, whose plan pushes `local` as revisions
+    /// of its branch.
+    pub(super) async fn target(
+        repository: Arc<RepositoryContext>,
+        latest: Hash,
+        local: &[Hash],
+        pending: Vec<Hash>,
+    ) -> PushTarget {
+        let remote = repository.remote().await.expect("the client is connected");
+        let plan = TargetPlan {
+            remote,
+            default_branch: branch(),
+            branch_metadata: lore_base::types::BranchMetadata::default(),
+            branch_point: Hash::default(),
+            remote_latest: Hash::default(),
+            remote_metadata: Hash::default(),
+            remote_deleted: false,
+            remote_revision: None,
+            remote_history: 0,
+            local_history: local.len(),
+            diverged: false,
+            revisions: local
+                .iter()
+                .map(|&revision| TargetRevision {
+                    revision,
+                    local: true,
+                    links: vec![],
+                })
+                .collect(),
+            pushed: local.iter().copied().collect(),
+            peer_latest: vec![(branch(), Hash::default())],
+        };
+        PushTarget {
+            repository,
+            branch: branch(),
+            latest,
+            mount: None,
+            plan,
+            linked: vec![],
+            pending,
+            scanned: 0,
+        }
+    }
+
+    /// Write a revision of `branch()`, named `name` so that revisions on the same parent differ.
+    async fn write_on_branch(
+        repository: &Arc<RepositoryContext>,
+        parent_self: Hash,
+        parent_other: Hash,
+        revision_number: u64,
+        name: &str,
+    ) -> Hash {
+        let mut metadata = Metadata::new();
+        metadata.set_branch(branch()).expect("recording the branch");
+        metadata
+            .set_string("name", name)
+            .expect("naming the revision");
+        let metadata = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("writing the revision metadata");
+        let token = repository
+            .try_write_token()
+            .expect("a client context carries a write token");
+        let state = State::new();
+        state.set_parent_self(parent_self);
+        state.set_parent_other(parent_other);
+        state.set_revision_number(revision_number);
+        state.set_metadata_hash(metadata);
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("writing the revision")
+    }
+
+    /// Store the repository's metadata, naming `branch()` its default branch, and `branch()`'s
+    /// own, which planning a target reads.
+    async fn store_repository_metadata(repository: &Arc<RepositoryContext>) {
+        let mut metadata = Metadata::new();
+        for (key, value) in [
+            (lore_revision::repository::NAME, "pushed"),
+            (lore_revision::repository::DESCRIPTION, ""),
+            (lore_revision::repository::DEFAULT_BRANCH_NAME, "main"),
+            (lore_revision::repository::CREATOR, ""),
+        ] {
+            metadata
+                .set_string(key, value)
+                .expect("describing the repository");
+        }
+        metadata
+            .set_context(lore_revision::repository::DEFAULT_BRANCH, branch())
+            .expect("naming the default branch");
+        metadata
+            .set_u64(lore_revision::repository::CREATED, 0)
+            .expect("dating the repository");
+        let metadata = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("writing the repository metadata");
+        lore_revision::repository::metadata_store_hash(repository.clone(), metadata)
+            .await
+            .expect("storing the repository metadata");
+
+        let mut branch_metadata = Metadata::new();
+        branch_metadata
+            .set_string("name", "main")
+            .expect("naming the branch");
+        let branch_metadata = branch_metadata
+            .serialize(repository.clone())
+            .await
+            .expect("writing the branch metadata");
+        lore_revision::branch::mutable_store_metadata(
+            repository.clone(),
+            branch(),
+            branch_metadata,
+        )
+        .await
+        .expect("storing the branch metadata");
+    }
+
+    /// The revisions `target`'s plan pushes, each with whether it is offered.
+    fn pushed(target: &PushTarget) -> Vec<(Hash, bool)> {
+        target
+            .plan
+            .revisions
+            .iter()
+            .map(|pushed| (pushed.revision, pushed.local))
+            .collect()
+    }
+
+    /// A linked revision of another branch that descends from the target's latest revision is
+    /// uploaded, not made the target's latest, so a newer revision of the target's own branch
+    /// still extends the plan.
+    #[tokio::test]
+    async fn another_branchs_revision_is_uploaded_and_a_newer_one_extends_the_plan() {
+        Box::pin(with_execution(async {
+            let stores = client_stores().await;
+            let writer = &stores.writer;
+            let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+            let latest = write_on_branch(writer, base, Hash::default(), 2, "latest").await;
+            let other = write_branch_revision(writer, latest, 3, 0xB0).await;
+            let between = write_on_branch(writer, latest, Hash::default(), 3, "between").await;
+            let newer = write_on_branch(writer, between, Hash::default(), 4, "newer").await;
+            let client = client_on(&stores, Arc::new(PagedRemote::new(branch(), base)));
+            let mut target = target(client, latest, &[latest], vec![other, newer]).await;
+
+            place_pending(&mut target)
+                .await
+                .expect("placing the linked revisions");
+
+            assert_eq!(target.latest, newer);
+            assert_eq!(
+                pushed(&target),
+                vec![
+                    (latest, true),
+                    (other, false),
+                    (between, true),
+                    (newer, true)
+                ]
+            );
+        }))
+        .await;
+    }
+
+    /// A linked revision older than the target's latest one leaves its plan as it was.
+    #[tokio::test]
+    async fn an_older_revision_leaves_the_plan_as_it_was() {
+        Box::pin(with_execution(async {
+            let stores = client_stores().await;
+            let writer = &stores.writer;
+            let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+            let latest = write_on_branch(writer, base, Hash::default(), 2, "latest").await;
+            let client = client_on(&stores, Arc::new(PagedRemote::new(branch(), base)));
+            let mut target = target(client, latest, &[latest], vec![base]).await;
+
+            place_pending(&mut target)
+                .await
+                .expect("placing the linked revision");
+
+            assert_eq!(target.latest, latest);
+            assert_eq!(pushed(&target), vec![(latest, true)]);
+        }))
+        .await;
+    }
+
+    /// A linked revision of the target's branch that reaches its latest revision only through a
+    /// merge replaces the plan with its own, which uploads the merged line.
+    #[tokio::test]
+    async fn a_newer_revision_through_a_merge_replaces_the_plan() {
+        Box::pin(with_execution(async {
+            let stores = client_stores().await;
+            let writer = &stores.writer;
+            store_repository_metadata(writer).await;
+            let base = write_on_branch(writer, Hash::default(), Hash::default(), 1, "base").await;
+            let latest = write_on_branch(writer, base, Hash::default(), 2, "latest").await;
+            let remote_line = write_on_branch(writer, base, Hash::default(), 2, "remote").await;
+            let merge = write_on_branch(writer, remote_line, latest, 3, "merge").await;
+            let client = client_on(&stores, Arc::new(PagedRemote::new(branch(), base)));
+            let mut target = target(client, latest, &[latest], vec![merge]).await;
+
+            place_pending(&mut target)
+                .await
+                .expect("placing the linked revision");
+
+            assert_eq!(target.latest, merge);
+            assert_eq!(
+                pushed(&target).into_iter().collect::<HashSet<_>>(),
+                HashSet::from([(latest, false), (remote_line, true), (merge, true)])
+            );
+        }))
+        .await;
+    }
+
+    /// A target comes after the targets pushing the revisions it links, and a layer after the
+    /// pushing repository. Targets of one repository share a group.
+    #[tokio::test]
+    async fn targets_come_after_what_they_link_and_layers_after_the_repository() {
+        Box::pin(with_execution(async {
+            let stores = client_stores().await;
+            let client = client_on(
+                &stores,
+                Arc::new(PagedRemote::new(branch(), Hash::default())),
+            );
+            let pushed_revision = Hash::from([1; 32]);
+            let held_revision = Hash::from([2; 32]);
+            let mut root = target(client.clone(), Hash::default(), &[], vec![]).await;
+            root.linked = vec![(1, pushed_revision), (2, held_revision)];
+            let mut link =
+                target(client.clone(), pushed_revision, &[pushed_revision], vec![]).await;
+            link.mount = Some(Mount::Link {
+                target: 0,
+                revision: Hash::default(),
+                link: LinkReference::default(),
+            });
+            let mut layer = target(client, Hash::default(), &[], vec![]).await;
+            layer.mount = Some(Mount::Layer("lay".into()));
+
+            let (_targets, orders) = order_targets(vec![root, link, layer]);
+
+            let ordered: Vec<(Vec<usize>, usize)> = orders
+                .into_iter()
+                .map(|order| (order.after, order.group))
+                .collect();
+            assert_eq!(ordered, vec![(vec![1], 0), (vec![], 0), (vec![0], 0)]);
+        }))
+        .await;
+    }
+}
+
+/// How a failed push names the link or layer it pushed, and what it fails with.
+mod failure {
+    use lore_base::error::SlowDown;
+    use lore_base::types::BranchId;
+    use lore_revision::state::LinkReference;
+    use lore_revision::state::State;
+
+    use super::*;
+    use crate::branch::null_repository;
+    use crate::branch::with_execution;
+
+    fn link(local_node: u32) -> LinkReference {
+        LinkReference {
+            local_node,
+            ..LinkReference::default()
+        }
+    }
+
+    /// A layer is named by its path, and a link inside a linked repository by the path of each
+    /// mount on the way to it.
+    #[tokio::test]
+    async fn a_mount_is_named_by_its_path_in_the_pushing_repository() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let branch = BranchId::from([7; 16]);
+
+            let layer = mount_name(&[], &repository, branch, Some(&Mount::Layer("lay/".into())))
+                .await
+                .expect("a layer is named");
+            assert_eq!(
+                layer,
+                MountName {
+                    kind: "layer",
+                    path: "lay".into(),
+                    branch: branch.to_string(),
+                }
+            );
+            assert_eq!(mount_name(&[], &repository, branch, None).await, None);
+        }))
+        .await;
+    }
+
+    /// A push that failed several times fails with the first failure.
+    #[test]
+    fn several_failures_fail_with_the_first() {
+        let failed = report_failures(vec![
+            (PushError::from(Disconnected), "first".into()),
+            (PushError::from(SlowDown), "second".into()),
+        ]);
+
+        assert!(failed.is_disconnected(), "{failed:?}");
+    }
+
+    /// A revision whose link list can't be read fails the push with the read's error.
+    #[tokio::test]
+    async fn an_unreadable_link_list_fails() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = State::new();
+            state.set_link_list_hash(Hash::from([9; 32]));
+
+            let links = revision_links(&repository, &state).await;
+
+            let Err(err) = links else {
+                panic!("an unreadable link list fails");
+            };
+            assert!(err.is_address_not_found(), "{err:?}");
+        }))
+        .await;
+    }
+
+    /// A link inside a linked repository is named by the path of each mount on the way to it,
+    /// each the node holding the link where the revision holding it can't be read.
+    #[tokio::test]
+    async fn a_nested_link_is_named_by_each_mount_on_the_way() {
+        Box::pin(with_execution(async {
+            let branch = BranchId::from([7; 16]);
+            let stores = crate::paged_remote::client_stores().await;
+            let client = crate::paged_remote::client_on(
+                &stores,
+                Arc::new(crate::paged_remote::PagedRemote::new(
+                    branch,
+                    Hash::default(),
+                )),
+            );
+            let mut middle =
+                super::place::target(client.clone(), Hash::default(), &[], vec![]).await;
+            middle.mount = Some(Mount::Link {
+                target: 0,
+                revision: Hash::default(),
+                link: link(3),
+            });
+            let targets = vec![
+                super::place::target(client.clone(), Hash::default(), &[], vec![]).await,
+                middle,
+            ];
+
+            let nested = Mount::Link {
+                target: 1,
+                revision: Hash::default(),
+                link: link(5),
+            };
+            let name = mount_name(&targets, &client, branch, Some(&nested))
+                .await
+                .expect("a link is named");
+
+            assert_eq!((name.kind, name.path.as_str()), ("link", "node 3/node 5"));
+        }))
+        .await;
+    }
+}
+
 /// Uploading the payloads the peer is missing.
 mod upload {
     use lore_base::error::NotAuthorized;
+    use lore_base::types::BranchId;
+    use lore_base::types::RepositoryId;
+    use lore_transport::StorageSession;
 
     use super::*;
     use crate::branch::with_execution;
@@ -539,6 +1074,58 @@ mod upload {
             pushed.as_ref().is_err_and(|err| err.is_not_authorized()),
             "got {pushed:?}"
         );
+    }
+
+    /// Pushes sharing upload slots start no more uploads between them than there are slots.
+    #[tokio::test(start_paused = true)]
+    async fn pushes_sharing_upload_slots_start_no_more_uploads_than_there_are_slots() {
+        with_execution(async {
+            let repository = null_repository().await;
+            let session = Arc::new(StorageSession::pending(std::future::pending));
+            let slots = Arc::new(tokio::sync::Semaphore::new(2));
+            let mut pushes = vec![];
+            let mut progresses = vec![];
+            for push in 0..2u8 {
+                let absent: Vec<Address> =
+                    (0..3).map(|seed| address(0xF0 + 3 * push + seed)).collect();
+                for &wanted in &absent {
+                    store_local(&repository, wanted).await;
+                }
+                let progress = Arc::new(PushProgress::new(Arc::new(PushStats::new(false))));
+                progresses.push(progress.clone());
+                pushes.push(push_fragments_within(
+                    repository.clone(),
+                    session.clone(),
+                    PushQueryResult {
+                        absent,
+                        ..PushQueryResult::default()
+                    },
+                    progress,
+                    slots.clone(),
+                ));
+            }
+
+            let stalled = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                futures::future::join_all(pushes),
+            )
+            .await;
+
+            assert!(
+                stalled.is_err(),
+                "the uploads wait on a session that never connects"
+            );
+            let queued: u64 = progresses
+                .iter()
+                .map(|progress| {
+                    progress
+                        .event(RepositoryId::default(), BranchId::default())
+                        .bytes_total
+                })
+                .sum();
+            assert_eq!(queued, 2 * b"payload".len() as u64);
+        })
+        .await;
     }
 }
 

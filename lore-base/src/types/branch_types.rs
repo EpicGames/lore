@@ -36,6 +36,11 @@ pub struct BranchMetadata {
 }
 
 impl BranchMetadata {
+    /// The branch point the branch was created at, where it was created from another branch.
+    pub fn branch_point(&self) -> Option<&BranchPoint> {
+        self.stack.first()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: BranchId,
