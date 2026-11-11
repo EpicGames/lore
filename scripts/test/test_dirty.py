@@ -3085,6 +3085,7 @@ def assert_scan_answers_from_records(repo: Lore, file_count: int):
     assert summary["modifies"] == 0, summary
 
 
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
 @pytest.mark.smoke
 def test_scan_answers_from_instance_records(new_lore_repo):
     """The modified times a commit records live in the instance's own `.lore/records/`, so the
@@ -3105,6 +3106,7 @@ def test_scan_answers_from_instance_records(new_lore_repo):
             assert f.read(4) == b"LOMT", shard
 
 
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
 @pytest.mark.smoke
 def test_clone_and_sync_record_times_in_the_instance(new_lore_repo):
     """A clone records the times of the files it writes in the new instance's records, and so
@@ -3131,6 +3133,7 @@ def test_clone_and_sync_record_times_in_the_instance(new_lore_repo):
     assert_scan_answers_from_records(clone, 2 * file_count)
 
 
+@pytest.mark.own_vfs("copies an instance's directory, where a virtual clone keeps its .lore outside its mount")
 @pytest.mark.smoke
 def test_a_copied_instance_answers_from_the_records_it_carries(new_lore_repo, scratch_dir):
     """A copy of an instance's directory that keeps modification times carries records that
@@ -3158,6 +3161,7 @@ def test_a_copied_instance_answers_from_the_records_it_carries(new_lore_repo, sc
     assert_scan_answers_from_records(copy, file_count)
 
 
+@pytest.mark.own_vfs("counts the hash checks and modified-time matches a scan of an ordinary working tree makes, where a virtual clone's status diffs by address")
 @pytest.mark.smoke
 def test_sync_drops_the_marker_of_a_path_it_rewrites_by_the_instance_records(new_lore_repo):
     """A sync that rewrites a path a scan marked drops the marker against the time it recorded

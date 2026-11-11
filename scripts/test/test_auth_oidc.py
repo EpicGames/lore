@@ -291,6 +291,10 @@ def test_a_lore_token_is_stored_without_an_exchange(oidc_env, make_repo):
     assert KEY_USER.user_id in repo.run(urc_args=["auth", "list"])
 
 
+ADVERTISES_ANOTHER_DOCUMENT = (
+    "changes the discovery document the provider advertises, which a service caches per issuer"
+)
+
 CLIENT_ID = "ci-bot"
 CLIENT_SECRET = "ci-secret-do-not-log"
 LITERAL_WARNING = "is visible to other users in the process table"
@@ -305,7 +309,15 @@ def login_as_client(repo: Lore, remote_url: str, *args: str, **kwargs) -> str:
 
 @pytest.mark.smoke
 @pytest.mark.parametrize(
-    "methods", [None, ["client_secret_post"]], ids=["basic", "post"]
+    "methods",
+    [
+        pytest.param(None, id="basic"),
+        pytest.param(
+            ["client_secret_post"],
+            id="post",
+            marks=pytest.mark.runs_in_process(ADVERTISES_ANOTHER_DOCUMENT),
+        ),
+    ],
 )
 def test_a_client_login_takes_the_secret_from_the_environment(
     oidc_env, make_repo, methods
@@ -678,6 +690,7 @@ def logged_in_repo(oidc_env, make_repo) -> Lore:
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process(ADVERTISES_ANOTHER_DOCUMENT)
 def test_logout_revokes_the_refresh_token(oidc_env, make_repo):
     """`auth logout` revokes the login's refresh token at the revocation
     endpoint the provider advertises (RFC 7009), as the public client, and
@@ -718,6 +731,7 @@ def test_logout_without_a_revocation_endpoint_is_local(oidc_env, make_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process(ADVERTISES_ANOTHER_DOCUMENT)
 def test_a_login_without_a_refresh_token_is_not_revoked(oidc_env, make_repo):
     """A client credentials login stores no refresh token, so its logout asks
     the provider nothing: the access token belongs to the confidential client,
@@ -738,6 +752,7 @@ def test_a_login_without_a_refresh_token_is_not_revoked(oidc_env, make_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process(ADVERTISES_ANOTHER_DOCUMENT)
 def test_removing_one_authorization_revokes_nothing(oidc_env, make_repo):
     """`auth logout --resource` removes one authorization token and keeps the
     login, so its refresh token is not revoked."""
@@ -768,6 +783,7 @@ def closed_port() -> int:
 
 
 @pytest.mark.smoke
+@pytest.mark.runs_in_process(ADVERTISES_ANOTHER_DOCUMENT)
 def test_logout_at_an_unreachable_provider_still_removes_the_login(oidc_env, make_repo):
     """A revocation endpoint that cannot be reached fails the logout, which
     says so, and the login is removed all the same."""

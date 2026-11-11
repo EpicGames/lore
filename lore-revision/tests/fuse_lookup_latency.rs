@@ -57,13 +57,44 @@ mod fuse_fixture;
 #[path = "helper.rs"]
 mod helper;
 
+/// Attributes owned by the user running the test, as a mount's are: the kernel checks a write
+/// through a read-write mount against them.
 fn attr_context() -> AttrContext {
-    AttrContext {
-        uid: 1000,
-        gid: 1000,
-        blksize: 1 << 17,
-        base_time: 1_700_000_000_000,
+    AttrContext::for_mounting_user(1 << 17, 1_700_000_000_000)
+}
+
+/// How long a wait on the writers, the syncs or the measured LOOKUPs may take.
+const WAIT_LIMIT: Duration = Duration::from_secs(60);
+
+/// Waits until `count` reaches `at_least`, failing once `stopped` answers true or [`WAIT_LIMIT`]
+/// passes. Call it before the work is asked to stop.
+async fn wait_for_first_changes(count: &AtomicU64, at_least: u64, stopped: impl Fn() -> bool) {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    while count.load(Ordering::SeqCst) < at_least {
+        assert!(!stopped(), "the work stopped before its first changes");
+        assert!(
+            Instant::now() < deadline,
+            "{} of {at_least} first changes in {WAIT_LIMIT:?}",
+            count.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
+}
+
+/// Joins `threads` once every one has finished, failing where [`WAIT_LIMIT`] passes first.
+async fn join_within_limit<T>(threads: Vec<std::thread::JoinHandle<T>>) -> Vec<T> {
+    let deadline = Instant::now() + WAIT_LIMIT;
+    while !threads.iter().all(std::thread::JoinHandle::is_finished) {
+        assert!(
+            Instant::now() < deadline,
+            "threads still run after {WAIT_LIMIT:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    threads
+        .into_iter()
+        .map(|thread| thread.join().expect("a thread"))
+        .collect()
 }
 
 /// Unmounts on drop, lazily if a plain unmount is refused.
@@ -345,8 +376,12 @@ async fn timed_lookups(mounted: &Mounted, paths: Vec<CString>, builds: &Arc<Atom
             .collect();
         let _ = done.send(measured);
     });
-    let (samples, built): (Vec<u64>, Vec<bool>) =
-        finished.await.expect("lookup thread").into_iter().unzip();
+    let (samples, built): (Vec<u64>, Vec<bool>) = tokio::time::timeout(WAIT_LIMIT, finished)
+        .await
+        .expect("the LOOKUPs finish")
+        .expect("lookup thread")
+        .into_iter()
+        .unzip();
     // A worker counts an inline LOOKUP after it sends the reply, so the last count can land just
     // after its stat returns.
     let counted = Instant::now() + Duration::from_secs(1);
@@ -587,9 +622,10 @@ async fn lookups_under_writers(label: &str, writers: [(&str, Writes); 4], budget
             })
         })
         .collect();
-    while ops.load(Ordering::SeqCst) < 4 * 4 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    wait_for_first_changes(&ops, 4 * 4, || {
+        threads.iter().any(|thread| thread.is_finished())
+    })
+    .await;
 
     let paths = names
         .iter()
@@ -608,10 +644,7 @@ async fn lookups_under_writers(label: &str, writers: [(&str, Writes); 4], budget
     );
     // Every writer returns before any directory is listed: a writer still saving in the same
     // directory legitimately shows its temporary.
-    let finished: Vec<(PathBuf, PathBuf)> = threads
-        .into_iter()
-        .map(|thread| thread.join().expect("writer"))
-        .collect();
+    let finished: Vec<(PathBuf, PathBuf)> = join_within_limit(threads).await;
     for (dir, last) in finished {
         assert_eq!(
             std::fs::metadata(&last)
@@ -811,9 +844,7 @@ async fn warm_lookups_during_a_sync_stay_within_budget() {
         )
     };
     // Syncs run back to back from here, so the LOOKUPs overlap one throughout.
-    while syncs.load(Ordering::SeqCst) < 1 {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    wait_for_first_changes(&syncs, 1, || syncer.is_finished()).await;
 
     let paths = measured
         .iter()
@@ -827,7 +858,10 @@ async fn warm_lookups_during_a_sync_stay_within_budget() {
     let builds_during = builds.load(Ordering::SeqCst) - builds_before;
     let syncs_during = syncs.load(Ordering::SeqCst) - syncs_before;
     stop.store(true, Ordering::SeqCst);
-    syncer.await.expect("syncer");
+    tokio::time::timeout(WAIT_LIMIT, syncer)
+        .await
+        .expect("the syncs stop")
+        .expect("syncer");
 
     println!(
         "syncs of {SYNC_CHANGES} changes completed during the LOOKUPs: {syncs_during}, with \
