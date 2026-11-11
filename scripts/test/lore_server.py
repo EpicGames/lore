@@ -7,18 +7,24 @@ import json
 import logging
 import os
 import random
+import re
 import signal
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from time import sleep
 
 import pytest
-
 from cleanup_util import remove_tree, remove_tree_contents
 from error_types import ServerException
+
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
 
 logger = logging.getLogger(__name__)
 
@@ -129,32 +135,23 @@ _handed_out_ports: set[int] = set()
 # hands the port back immediately before the launch.
 _reserved_ports: dict[int, tuple[socket.socket, socket.socket]] = {}
 
-# Ephemeral draws come first: they are the OS's own opinion of what is free.
-# They are drawn in batches because holding several sockets at once forces the
-# OS to return distinct numbers, whereas one-at-a-time draws tend to return the
-# same handful of ports repeatedly — the case where a single excluded block can
-# swallow every attempt.
-_EPHEMERAL_ATTEMPTS = 128
-_EPHEMERAL_BATCH = 16
-
-# Scanned only when every ephemeral draw failed. Above the registered-port
-# range and below the usual ephemeral ranges, so the scan neither fights the OS
-# for ephemeral ports nor collides with well-known services.
+# The ports `allocate_free_port` hands out: below the default ephemeral range of
+# Linux (from 32768) and of macOS and Windows (from 49152), so the scan skips
+# none of them as ephemeral by default, and above the ports common services
+# listen on.
 _SCAN_RANGE_START = 20000
 _SCAN_RANGE_END = 32000
-_SCAN_ATTEMPTS = 512
 
 
 @functools.cache
 def _excluded_port_ranges() -> tuple[tuple[int, int], ...]:
     """Port ranges the OS refuses to bind, best effort (Windows only).
 
-    Hyper-V, WSL and Docker reserve blocks of the ephemeral range through
-    winnat; binding inside one fails with WSAEACCES (WinError 10013) even
-    though nothing is listening, and the blocks are large enough to swallow a
-    long run of consecutive ephemeral draws. netsh reports them, which lets us
-    skip whole blocks instead of probing every port in them. Any failure to
-    query or parse just means we probe the hard way.
+    Hyper-V, WSL and Docker reserve blocks of ports through winnat; binding
+    inside one fails with WSAEACCES (WinError 10013) even though nothing is
+    listening. netsh reports them, which lets the scan skip whole blocks
+    instead of probing every port in them. If netsh fails or its output does
+    not parse, the scan probes every port.
     """
     if sys.platform != "win32":
         return ()
@@ -191,8 +188,57 @@ def _excluded_port_ranges() -> tuple[tuple[int, int], ...]:
     return tuple(ranges)
 
 
+@functools.cache
+def _ephemeral_port_ranges() -> tuple[tuple[int, int], ...]:
+    """Port ranges the OS assigns a port from on its own, to a bind to port 0 or
+    an outgoing connection, best effort.
+
+    Read from /proc on Linux, from sysctl on macOS and from netsh on Windows. If
+    the read fails, there are none, and the scan relies on the default ranges
+    lying above it.
+    """
+    try:
+        if sys.platform == "linux":
+            shown = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text()
+        elif sys.platform == "darwin":
+            shown = subprocess.run(
+                ["sysctl", "-n"]
+                + [
+                    f"net.inet.ip.portrange.{key}"
+                    for key in ("first", "last", "hifirst", "hilast")
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=True,
+            ).stdout
+        elif sys.platform == "win32":
+            ranges = []
+            for protocol in ("tcp", "udp"):
+                shown = subprocess.run(
+                    ["netsh", "interface", "ipv4", "show", "dynamicport", protocol],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                ).stdout
+                start, count = (int(n) for n in re.findall(r":\s*(\d+)", shown))
+                ranges.append((start, start + count - 1))
+            return tuple(ranges)
+        else:
+            return ()
+        bounds = [int(n) for n in shown.split()]
+        return tuple(zip(bounds[::2], bounds[1::2], strict=True))
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        logger.warning("Could not read the ephemeral port ranges: %s", e)
+        return ()
+
+
 def _is_excluded_port(port: int) -> bool:
-    return any(start <= port <= end for start, end in _excluded_port_ranges())
+    """Whether the scan skips `port`: the OS refuses to bind it, or may assign it
+    on its own."""
+    ranges = (*_excluded_port_ranges(), *_ephemeral_port_ranges())
+    return any(start <= port <= end for start, end in ranges)
 
 
 def _reserve_port(
@@ -236,98 +282,93 @@ def _set_exclusive_addr(*socks: socket.socket) -> None:
             pass
 
 
-def _draw_ephemeral_ports(host: str, count: int) -> list[int]:
-    """Ask the OS for up to `count` distinct ephemeral port numbers.
+@functools.cache
+def _port_lock_fd() -> int:
+    """The descriptor of this user's port lock file, open for the life of the
+    process.
 
-    Every socket is held open until all draws are done, so the OS cannot return
-    the same number twice within one batch.
+    Each harness process locks the byte at a port's offset in the file before
+    it probes the port. The OS releases a process's locks when it exits,
+    however it exits. On POSIX, closing any descriptor of the file also
+    releases them, so the process opens the file once. The file is never
+    removed: a run that recreated it would not see the locks of a run still
+    holding the old one.
+
+    On POSIX the file is in /tmp, named for the user's ID: a process can lock
+    only a file it can open for writing, and /tmp holds it whatever the
+    process's temporary directory is. On Windows it is in the user's temporary
+    directory.
     """
-    socks: list[socket.socket] = []
-    ports: list[int] = []
+    if sys.platform == "win32":
+        path = Path(tempfile.gettempdir()) / "lore-smoke-ports.lock"
+    else:
+        path = Path("/tmp") / f"lore-smoke-ports-{os.getuid()}.lock"
+    return os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def _lock_port(port: int) -> bool:
+    """Take this process's lock on `port`, held until the process exits; False
+    if the port is locked already: by another process, or on Windows by this
+    one. The locked byte lies past the end of the empty lock file, which both
+    `fcntl.lockf` and `msvcrt.locking` allow."""
+    fd = _port_lock_fd()
     try:
-        for _ in range(count):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                sock.bind((host, 0))
-            except OSError:
-                # Ephemeral range exhausted — work with what we have.
-                sock.close()
-                break
-            socks.append(sock)
-            ports.append(sock.getsockname()[1])
-    finally:
-        for sock in socks:
-            sock.close()
-    return ports
+        if sys.platform == "win32":
+            os.lseek(fd, port, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB, 1, port)
+    except (BlockingIOError, PermissionError):
+        return False
+    return True
 
 
 def allocate_free_port(host: str = "127.0.0.1") -> int:
     """Reserve a loopback port free for both TCP and UDP.
 
-    Tried in order, widening only as needed:
-
-    1. Ephemeral draws from the OS, in batches of distinct numbers.
-    2. A scan of a fixed range well clear of the ephemeral range, from a
-       randomized offset so concurrent workers don't converge on one port.
-
-    Ports known to be OS-excluded, and ports this process already handed out,
-    are skipped without a probe.
+    The port comes from a scan of `_SCAN_RANGE_START` to `_SCAN_RANGE_END`,
+    from a randomized offset so concurrent workers don't converge on one port.
+    Ports this process already handed out, ports the OS refuses to bind or may
+    assign on its own, and ports another harness process has locked are
+    skipped without a probe.
 
     The returned port stays bound by this process until the server that will
     use it is launched, so nothing else can claim it in the meantime. Callers
     that launch through `launch_lore_server` get that release for free;
     anything launching a server itself must call `release_reserved_ports`.
+
+    Between that release and the server's bind, only a process outside the
+    harness that binds the number explicitly can take the port: the OS assigns
+    no port outside its ephemeral ranges on its own, to a bind to port 0 or to
+    an outgoing connection, and this process holds the port's lock until it
+    exits, so no other harness process of the same user probes it.
     """
     assert host == "127.0.0.1", (
         f"allocate_free_port only supports 127.0.0.1, got {host!r}"
     )
     probes = 0
     last_err: OSError | None = None
-
-    def claim(port: int) -> bool:
-        nonlocal probes, last_err
-        if port in _handed_out_ports or _is_excluded_port(port):
-            return False
+    span = _SCAN_RANGE_END - _SCAN_RANGE_START
+    start_offset = random.randrange(span)
+    for step in range(span):
+        port = _SCAN_RANGE_START + (start_offset + step) % span
+        if port in _handed_out_ports or _is_excluded_port(port) or not _lock_port(port):
+            continue
         probes += 1
         reserved = _reserve_port(host, port)
         if isinstance(reserved, OSError):
             last_err = reserved
-            return False
+            continue
         _handed_out_ports.add(port)
         _reserved_ports[port] = reserved
-        return True
-
-    remaining = _EPHEMERAL_ATTEMPTS
-    while remaining > 0:
-        batch = min(remaining, _EPHEMERAL_BATCH)
-        drawn = _draw_ephemeral_ports(host, batch)
-        for port in drawn:
-            if claim(port):
-                return port
-        if len(drawn) < batch:
-            break  # OS ran out of ephemeral ports; go straight to the scan
-        remaining -= batch
-
-    # Every ephemeral candidate failed, so the ephemeral range is likely
-    # covered by excluded blocks. Scan a fixed range instead.
-    span = _SCAN_RANGE_END - _SCAN_RANGE_START
-    start_offset = random.randrange(span)
-    for step in range(min(_SCAN_ATTEMPTS, span)):
-        port = _SCAN_RANGE_START + (start_offset + step) % span
-        if claim(port):
-            logger.warning(
-                "No ephemeral port was free for both TCP and UDP; "
-                "fell back to scanned port %d",
-                port,
-            )
-            return port
+        return port
 
     raise ServerException(
-        f"Could not find a port free for both TCP and UDP on {host} after "
-        f"{probes} probes ({_EPHEMERAL_ATTEMPTS} ephemeral draws, then a scan of "
-        f"{_SCAN_RANGE_START}-{_SCAN_RANGE_END}), skipping "
-        f"{len(_excluded_port_ranges())} OS-excluded ranges; "
-        f"last bind error: {last_err}"
+        f"Could not find a port free for both TCP and UDP on {host} in "
+        f"{_SCAN_RANGE_START}-{_SCAN_RANGE_END - 1} after {probes} probes, "
+        f"skipping {len(_excluded_port_ranges())} OS-excluded ranges, the "
+        f"ephemeral ranges {_ephemeral_port_ranges()} and the ports other "
+        f"harness processes hold; last bind error: {last_err}"
     )
 
 
@@ -361,9 +402,9 @@ def release_reserved_ports(server_env, label: str = "") -> None:
 
     Ports come from `allocate_free_port`, which keeps them bound so no other
     process can take the number while the caller writes configs. The server
-    cannot bind a port we are still holding, so the reservation has to be
-    dropped here — as late as possible, to keep the unprotected window down to
-    the gap between this call and the server's own bind.
+    cannot bind a port we are still holding, so the reservation is dropped
+    here, immediately before the launch. `allocate_free_port` describes what
+    keeps the port free from here to the server's bind.
 
     A port with no reservation was either supplied on the command line or
     already released by an earlier launch on the same ports, so it is probed

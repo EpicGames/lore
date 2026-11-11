@@ -717,7 +717,7 @@ def lore_main_server_ports(request, tmp_path_factory, launches_main_server):
     """Resolve the main loreserver's {quic, grpc, http, internal} ports.
 
     For each port: if its CLI option was explicitly passed, use that value;
-    otherwise ask the OS for a free ephemeral port. Under pytest-xdist, the
+    otherwise allocate one with `allocate_free_port`. Under pytest-xdist, the
     worker that launches the server resolves them and publishes them via
     lore_server_info.json, so the other workers connect to the ports it
     actually launched on.
