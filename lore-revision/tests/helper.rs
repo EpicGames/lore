@@ -442,12 +442,26 @@ pub async fn test_scan_path_with_intent(
     path: Option<lore_revision::util::path::RelativePath>,
     intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
 ) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_path_result(repository, state_staged, state_current, path, intent)
+        .await
+        .expect("Failed to diff filesystem")
+}
+
+/// [`test_scan_path_with_intent`], answering the diff's failure rather than panicking on it.
+#[allow(dead_code)]
+pub async fn test_scan_path_result(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    path: Option<lore_revision::util::path::RelativePath>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Result<Vec<lore_revision::change::NodeChange>, lore_revision::state::StateError> {
     let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
         repository.file_system().as_ref(),
     )
     .await
     .expect("Failed to start filesystem operation");
-    let changes = lore_revision::state::diff_filesystem(
+    let changes = match lore_revision::state::diff_filesystem(
         &operation,
         lore_revision::fs::filesystem_provider::FilesystemDiffTree {
             repository: repository.clone(),
@@ -463,15 +477,74 @@ pub async fn test_scan_path_with_intent(
         std::sync::Arc::new(Vec::new()),
     )
     .await
-    .expect("Failed to diff filesystem")
-    .collect()
-    .await
-    .expect("Failed to diff filesystem");
+    {
+        Ok(changes) => changes.collect().await,
+        Err(err) => Err(err),
+    };
     operation
         .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
+}
+
+/// What `status` reports of `paths`, or of the whole repository for `None`, by path: the action
+/// and whether the change is dirty. `scan` asks for `--scan`.
+#[allow(dead_code)]
+pub async fn test_status_files_at(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    paths: Option<Vec<lore_revision::util::path::RelativePath>>,
+    scan: bool,
+) -> std::collections::BTreeMap<String, (lore_revision::interface::LoreFileAction, bool)> {
+    let files = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    let captured = files.clone();
+    let callback: lore_revision::interface::LoreEventCallback = Some(Box::new(move |event| {
+        if let lore_revision::event::LoreEvent::RepositoryStatusFile(data) = event {
+            captured.lock().expect("status files").insert(
+                data.path.as_str().to_string(),
+                (data.action, data.flag_dirty != 0),
+            );
+        }
+    }));
+    let execution = std::sync::Arc::new(
+        lore_revision::interface::ExecutionContext::new_client_with_user_id(
+            lore_revision::interface::LoreGlobalArgs::default(),
+            lore_revision::relay::EventDispatcher::new(callback),
+            "test-user".to_string(),
+        ),
+    );
+    lore_base::runtime::LORE_CONTEXT
+        .scope(
+            execution.clone(),
+            lore_revision::repository::status::status_boxed(
+                repository,
+                paths,
+                lore_revision::repository::status::StatusOptions {
+                    staged: true,
+                    scan,
+                    check_dirty: false,
+                    reset: false,
+                    sync_point: false,
+                    revision_only: false,
+                    count: false,
+                },
+            ),
+        )
+        .await
+        .expect("status");
+    execution.dispatcher.drain().await;
+    files.lock().expect("status files").clone()
+}
+
+/// Each path's action in `reported`, as status lists it.
+#[allow(dead_code)]
+pub fn test_status_actions(
+    reported: std::collections::BTreeMap<String, (lore_revision::interface::LoreFileAction, bool)>,
+) -> Vec<(String, lore_revision::interface::LoreFileAction)> {
+    reported
+        .into_iter()
+        .map(|(path, (action, _))| (path, action))
+        .collect()
 }
 
 /// [`test_scan`] read one change at a time, for the walk's other consumption path.

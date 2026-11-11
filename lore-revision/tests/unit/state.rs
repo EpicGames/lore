@@ -34,6 +34,7 @@ mod pending;
 mod relocate;
 mod reparent;
 mod save;
+mod scoped_diff;
 mod served;
 mod stream;
 mod sweep;

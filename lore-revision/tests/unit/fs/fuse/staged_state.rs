@@ -6,18 +6,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use lore_base::runtime::LORE_CONTEXT;
-use lore_revision::event::LoreEvent;
-use lore_revision::interface::ExecutionContext;
-use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreFileAction;
-use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::node::NodeExtFlags;
 use lore_revision::node::ROOT_NODE;
-use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::status::StatusOptions;
-use lore_revision::repository::status::status_boxed;
 use lore_revision::state::State;
 
 /// The dirty action a node carries.
@@ -83,49 +75,5 @@ pub async fn status_files(
     repository: Arc<RepositoryContext>,
     scan: bool,
 ) -> BTreeMap<String, (LoreFileAction, bool)> {
-    status_files_at(repository, None, scan).await
-}
-
-/// [`status_files`] of `paths` alone, where given.
-pub async fn status_files_at(
-    repository: Arc<RepositoryContext>,
-    paths: Option<Vec<lore_revision::util::path::RelativePath>>,
-    scan: bool,
-) -> BTreeMap<String, (LoreFileAction, bool)> {
-    let files = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
-    let captured = files.clone();
-    let callback: LoreEventCallback = Some(Box::new(move |event| {
-        if let LoreEvent::RepositoryStatusFile(data) = event {
-            captured.lock().expect("status files").insert(
-                data.path.as_str().to_string(),
-                (data.action, data.flag_dirty != 0),
-            );
-        }
-    }));
-    let execution = Arc::new(ExecutionContext::new_client_with_user_id(
-        LoreGlobalArgs::default(),
-        EventDispatcher::new(callback),
-        "test-user".to_string(),
-    ));
-    LORE_CONTEXT
-        .scope(
-            execution.clone(),
-            status_boxed(
-                repository,
-                paths,
-                StatusOptions {
-                    staged: true,
-                    scan,
-                    check_dirty: false,
-                    reset: false,
-                    sync_point: false,
-                    revision_only: false,
-                    count: false,
-                },
-            ),
-        )
-        .await
-        .expect("status");
-    execution.dispatcher.drain().await;
-    files.lock().expect("status files").clone()
+    crate::helper::test_status_files_at(repository, None, scan).await
 }

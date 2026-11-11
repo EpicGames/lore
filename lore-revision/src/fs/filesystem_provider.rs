@@ -48,6 +48,7 @@ use crate::lore_trace;
 use crate::node::Node;
 use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
@@ -270,6 +271,15 @@ impl FilesystemDiffIntent {
         )
     }
 
+    /// The intent a walk takes below a directory that replaced a file, all of whose content is
+    /// new, so that a walk reporting tracked content alone reports it.
+    pub fn below_replacement(self) -> Self {
+        match self {
+            FilesystemDiffIntent::ReportTracked => FilesystemDiffIntent::Report,
+            intent => intent,
+        }
+    }
+
     /// What the walk stages beyond marking, where it stages at all.
     pub fn stage(self) -> Option<StageIntent> {
         match self {
@@ -277,6 +287,23 @@ impl FilesystemDiffIntent {
             _ => None,
         }
     }
+}
+
+/// Where a marking walk adds the directories leading to a path a caller names that the `from`
+/// tree lacks: below `node` of the `from` tree, which the leading `skip` bytes of the path name,
+/// with their separator. Past a link, `node` is in the tree the walk reached.
+#[derive(Debug, Clone, Copy)]
+pub struct ChainRoot {
+    pub node: NodeID,
+    pub skip: u32,
+}
+
+impl ChainRoot {
+    /// The root, standing for none of the path.
+    pub const ROOT: ChainRoot = ChainRoot {
+        node: crate::node::ROOT_NODE,
+        skip: 0,
+    };
 }
 
 /// What to diff against the filesystem: `from` is the tree it is compared against and
@@ -291,17 +318,17 @@ pub struct FilesystemDiffContext {
     /// The path as the file system spells it, which parts from the mappings' own spelling only
     /// where the two name a component with different case.
     pub filesystem_path: RelativePath,
-    /// The filter's verdict at `filesystem_path`, or at its parent where `asks_path` is set,
+    /// The filter's verdict at `filesystem_path`, or at its parent where `named_path` is set,
     /// which each child steps from rather than refolding the ancestors it already accounts for.
     pub states: FilterStates,
     /// The same verdict on the `from` side, which diverges from `states` once a move
     /// puts the two sides at different paths.
     pub from_states: FilterStates,
-    /// Whether the walk asks the filter about `filesystem_path` itself once it reads what the
-    /// working tree holds there, `states` and `from_states` then being the verdict at its parent.
-    /// A walk over a path a caller names does; below it, each listing asks about the entries it
-    /// lists.
-    pub asks_path: bool,
+    /// Set for a walk over a path a caller names, to where a marking walk starts the directories
+    /// leading to it. The walk asks the filter about `filesystem_path` itself once it reads what
+    /// the working tree holds there, `states` and `from_states` then being the verdict at its
+    /// parent; below it, each listing asks about the entries it lists.
+    pub named_path: Option<ChainRoot>,
     pub filter_mode: FilterMode,
     pub intent: FilesystemDiffIntent,
     pub layer_mounts: Arc<Vec<LayerMountInfo>>,

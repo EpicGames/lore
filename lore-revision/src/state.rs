@@ -120,6 +120,7 @@ use crate::filter::FilterPath;
 use crate::filter::FilterStates;
 use crate::filter::WalkPath;
 use crate::fragment::FragmentFlags;
+use crate::fs::filesystem_provider::ChainRoot;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
@@ -4815,55 +4816,101 @@ impl State {
         root: NodeID,
         path: &str,
     ) -> Result<(NodeLink, Option<LinkedState>), StateError> {
-        let mut path = RelativePath::from_str(path).unwrap();
-        let mut current_node = root;
-        let mut repository = repository;
-        while !path.is_empty() {
-            let current_name = path.pop_root();
-            if is_reserved_node_name(current_name) {
-                return Err(NodeNotFound.into());
-            }
-            let name_hash = hash::hash_string(current_name);
+        let stop = self.find_to_link(&repository, root, path, false).await?;
+        self.find_relative_from(repository, path, stop).await
+    }
 
+    /// [`Self::find_relative`] resumed where [`Self::find_to_link`] stopped on `path`, for a
+    /// caller that reads the stop itself first.
+    ///
+    /// Not an `async fn`: only a link crossed awaits, and its future holds only what crossing
+    /// it needs rather than the whole stop.
+    pub(crate) fn find_relative_from<'a>(
+        &self,
+        repository: Arc<RepositoryContext>,
+        path: &'a str,
+        stop: PathStop,
+    ) -> impl Future<Output = Result<(NodeLink, Option<LinkedState>), StateError>> + Send + 'a {
+        let link = match stop.at {
+            Stop::End => {
+                return futures::future::Either::Left(std::future::ready(Ok((
+                    NodeLink {
+                        node: stop.node,
+                        repository: repository.id,
+                        revision: self.revision(),
+                    },
+                    None,
+                ))));
+            }
+            Stop::Missing => {
+                return futures::future::Either::Left(std::future::ready(Err(NodeNotFound.into())));
+            }
+            Stop::Link(link) => link,
+        };
+        let rest = path.get(stop.length + 1..).unwrap_or_default();
+        futures::future::Either::Right(async move {
+            let repository = repository.to_link_context(link.repository).await;
+            let link_state = State::deserialize(repository.clone(), link.revision).await?;
+            let (found, held) =
+                Box::pin(link_state.find_relative(repository.clone(), link.node, rest)).await?;
+            Ok((found, held.or(Some((repository, link_state)))))
+        })
+    }
+
+    /// Where a walk of `path` below `root` stops: at its end, at the first link it crosses, or
+    /// at a link it ends at where `ends_at_links` says, or at the deepest node it reaches where
+    /// the tree holds nothing at the next component or the component is a name no node may
+    /// carry.
+    pub(crate) async fn find_to_link(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        root: NodeID,
+        path: &str,
+        ends_at_links: bool,
+    ) -> Result<PathStop, StateError> {
+        let mut node = root;
+        let mut length = 0;
+        let mut rest = path;
+        while !rest.is_empty() {
+            let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            if is_reserved_node_name(name) {
+                return Ok(PathStop::missing(node, length));
+            }
+            let name_hash = hash::hash_string(name);
             // Under `state-hooks` the log borrows the find's answer; the block ends that borrow
             // before the awaits after it.
-            current_node = {
-                let found = self
-                    .find_subnode(repository.clone(), current_node, name_hash)
-                    .await;
+            let found = {
+                let found = self.find_subnode(repository.clone(), node, name_hash).await;
                 #[cfg(feature = "state-hooks")]
-                crate::state::node::hooks::log::hop(&self.hooks, (current_node, name_hash), &found);
+                crate::state::node::hooks::log::hop(&self.hooks, (node, name_hash), &found);
                 found
-            }?;
-
-            // If the node is a link, resolve and enter that link
-            if !path.is_empty() {
-                let iblock = NodeBlock::index(current_node);
-                let inode = Node::index(current_node);
-                let block = self.block(repository.clone(), iblock).await?;
-                let node = block.node(inode);
-
-                if node.is_link() {
-                    let link = node.linked_node();
-                    repository = repository.to_link_context(link.repository).await;
-                    let link_state = State::deserialize(repository.clone(), link.revision).await?;
-                    let (found, held) = Box::pin(link_state.find_relative(
-                        repository.clone(),
-                        link.node,
-                        path.as_str(),
-                    ))
+            };
+            node = match found {
+                Ok(found) => found,
+                Err(err) if err.is_node_not_found() => return Ok(PathStop::missing(node, length)),
+                Err(err) => return Err(err),
+            };
+            length = path.len() - rest.len() + name.len();
+            rest = tail;
+            if !rest.is_empty() || ends_at_links {
+                let block = self
+                    .block(repository.clone(), NodeBlock::index(node))
                     .await?;
-                    return Ok((found, held.or(Some((repository, link_state)))));
+                let found = block.node(Node::index(node));
+                if found.is_link() {
+                    return Ok(PathStop {
+                        node,
+                        length,
+                        at: Stop::Link(found.linked_node()),
+                    });
                 }
             }
         }
-
-        let found = NodeLink {
-            node: current_node,
-            repository: repository.id,
-            revision: self.revision(),
-        };
-        Ok((found, None))
+        Ok(PathStop {
+            node,
+            length,
+            at: Stop::End,
+        })
     }
 
     pub async fn find_node_link(
@@ -7463,6 +7510,348 @@ pub async fn whole_move(change: &NodeChange) -> Result<Option<NodeChange>, State
     }))
 }
 
+/// Where a walk of a path stops, as [`State::find_to_link`] answers it: at `node`, which the
+/// leading `length` bytes of the path name.
+#[derive(Clone, Copy)]
+pub(crate) struct PathStop {
+    pub(crate) node: NodeID,
+    pub(crate) length: usize,
+    pub(crate) at: Stop,
+}
+
+/// What a walk of a path stops at.
+#[derive(Clone, Copy)]
+pub(crate) enum Stop {
+    /// The end of the path.
+    End,
+    /// A link, which mounts what it names.
+    Link(NodeLink),
+    /// A component the tree lacks, `node` being the deepest it holds on the path.
+    Missing,
+}
+
+impl PathStop {
+    /// No node, where the tree holds none to walk from.
+    const NONE: PathStop = PathStop::missing(INVALID_NODE, 0);
+
+    const fn missing(node: NodeID, length: usize) -> Self {
+        PathStop {
+            node,
+            length,
+            at: Stop::Missing,
+        }
+    }
+
+    /// The node the path names, a link not entered, or an invalid node where the tree holds
+    /// none.
+    fn named(&self) -> NodeID {
+        match self.at {
+            Stop::End | Stop::Link(_) => self.node,
+            Stop::Missing => INVALID_NODE,
+        }
+    }
+
+    /// The length of the mount and what the link mounts, where the walk stopped at a link.
+    fn link(&self) -> Option<(usize, NodeLink)> {
+        match self.at {
+            Stop::Link(link) => Some((self.length, link)),
+            _ => None,
+        }
+    }
+}
+
+/// One side of a diff at a path: the tree, and the node it holds there, which is invalid where
+/// it holds none.
+#[derive(Clone)]
+pub(crate) struct DiffSide {
+    pub(crate) repository: Arc<RepositoryContext>,
+    pub(crate) state: Arc<State>,
+    pub(crate) node: NodeID,
+}
+
+impl DiffSide {
+    /// Where `path` below this side's node stops.
+    async fn stop(&self, path: &str) -> Result<PathStop, StateError> {
+        if !self.node.is_valid_or_root_node_id() {
+            return Ok(PathStop::NONE);
+        }
+        self.state
+            .find_to_link(&self.repository, self.node, path, true)
+            .await
+    }
+
+    /// This side entering a link at `linked`, the node of the linked tree it mounts.
+    async fn enter(self, linked: &NodeLink) -> Result<DiffSide, StateError> {
+        let (repository, state) = linked.resolve(self.repository, self.state).await?;
+        Ok(DiffSide {
+            repository,
+            state,
+            node: linked.node,
+        })
+    }
+}
+
+/// The link mounts the walk over the whole tree holds on reaching a path, as it replaces them on
+/// crossing each link.
+#[derive(Clone, Copy)]
+enum WalkMounts {
+    /// Those of the links the two trees hold, collected at the root.
+    Root,
+    /// Those of the links below the last link the from tree holds that the walk crossed, in the
+    /// linked trees of both sides.
+    Linked,
+    /// None, the last link crossed being one only the current tree holds.
+    Empty,
+}
+
+/// The sides a walk compares below a path, each entering the link it holds there, which
+/// `from_link` and `current_link` name. Where only the from side holds one, both compare its
+/// linked tree, so that what the linked tree tracks is not found new.
+pub(crate) async fn cross_links(
+    from: DiffSide,
+    current: DiffSide,
+    from_link: Option<&NodeLink>,
+    current_link: Option<&NodeLink>,
+) -> Result<(DiffSide, DiffSide), StateError> {
+    let from = match from_link {
+        Some(link) => from.enter(link).await?,
+        None => from,
+    };
+    let current = match current_link {
+        Some(link) => current.enter(link).await?,
+        None if from_link.is_some() => from.clone(),
+        None => current,
+    };
+    Ok((from, current))
+}
+
+/// The link mounts below `path` in the trees two sides crossed into, at `from_node` and
+/// `current_node`: what the walk below them steps around. A tree both sides pin to one revision
+/// at one node is read once, as each side holds its own copy of it.
+pub(crate) async fn collect_crossed_mounts(
+    from: &DiffSide,
+    from_node: NodeID,
+    current: &DiffSide,
+    current_node: NodeID,
+    path: &RelativePath,
+) -> Result<Vec<LinkMountInfo>, StateError> {
+    let mut trees = Vec::with_capacity(2);
+    if from_node.is_valid_or_root_node_id() {
+        trees.push((&from.state, &from.repository, from_node));
+    }
+    let same = current_node == from_node
+        && current.repository.id == from.repository.id
+        && current.state.revision() == from.state.revision();
+    if current_node.is_valid_or_root_node_id() && !same {
+        trees.push((&current.state, &current.repository, current_node));
+    }
+    collect_link_mounts(&trees, path).await
+}
+
+/// What a diff scoped to a path compares, as [`scoped_roots`] answers it.
+struct ScopedRoots {
+    from: NodeMapping,
+    current: NodeMapping,
+    link_mounts: Vec<LinkMountInfo>,
+    chain_root: ChainRoot,
+}
+
+/// What the working tree holds at a link mount.
+enum MountOnDisk {
+    Directory,
+    File,
+    /// Nothing, or nothing a walk descends into or compares as a file.
+    Missing,
+}
+
+/// What the working tree holds at `mount`, as the walk finds it: a listing leaves out a symbolic
+/// link above the path's end, where the walk reads a listing, but not at it.
+async fn mount_on_disk(
+    repository: &RepositoryContext,
+    mount: &str,
+    at_path: bool,
+) -> Result<MountOnDisk, StateError> {
+    let Ok(mount) = RelativePath::from_str(mount);
+    let absolute = mount
+        .to_absolute_path(repository.require_path()?)
+        .forward::<StateError>("placing the mount below the root")?;
+    let driver = lore_io::IoDriver::global();
+    let stat = if at_path {
+        driver.stat(absolute).await
+    } else {
+        driver.symlink_stat(absolute).await
+    };
+    Ok(match stat {
+        Ok(stat) if stat.kind == lore_io::StatKind::Directory => MountOnDisk::Directory,
+        Ok(stat) if stat.kind == lore_io::StatKind::File => MountOnDisk::File,
+        _ => MountOnDisk::Missing,
+    })
+}
+
+/// What a diff scoped to `path` compares, as the walk over the whole tree compares it on reaching
+/// `path`: the roots on each side, the link mounts below them, and where a marking walk adds the
+/// directories leading to a path the from tree lacks. `None` where that walk reports nothing under
+/// `path`.
+///
+/// The path is resolved one link at a time, deciding each link it crosses or ends at as the walk
+/// does on meeting it ([`cross_links`]), and what the working tree holds at its mount:
+///
+/// - A mount of a link the from tree holds that the working tree does not hold as a directory
+///   keeps its link, decided before the linked tree is read, since a mount stays absent while its
+///   linked repository cannot be read. The path at a mount the working tree holds as a file names
+///   the link itself.
+/// - Where the from tree holds nothing at a link only the current tree holds, a directory the
+///   working tree holds there belongs to the linked repository if the walk's mounts name the
+///   link, and is new to both sides otherwise, as a file there is.
+/// - Where the from tree holds a node at a link only the current tree holds and the working tree
+///   no directory, the from tree's node is compared alone, or against the link where the path
+///   ends at a file the working tree holds there.
+/// - Where the from tree holds a file at the path and the working tree a directory, the file is
+///   replaced as the walk replaces a node whose type changed. Where it holds one above the path,
+///   a marking walk stays out of the directory and a reporting one finds it new.
+///
+/// Boxed by its caller: it runs once per named path, and inline it would widen the future of
+/// every diff and status scan by its own.
+async fn scoped_roots(
+    from: FilesystemDiffTree,
+    current: FilesystemDiffTree,
+    path: &RelativePath,
+    intent: FilesystemDiffIntent,
+) -> Result<Option<ScopedRoots>, StateError> {
+    let mut from_side = DiffSide {
+        repository: from.repository.clone(),
+        state: from.state.clone(),
+        node: ROOT_NODE,
+    };
+    let mut current_side = DiffSide {
+        repository: current.repository.clone(),
+        state: current.state.clone(),
+        node: ROOT_NODE,
+    };
+    let mut mounts = WalkMounts::Root;
+    let mut offset = 0;
+    let (from_end, current_end) = loop {
+        let rest = path.as_str().get(offset..).unwrap_or_default();
+        let current_end = current_side.stop(rest).await?;
+        let limit = current_end.link().map_or(rest.len(), |(length, _)| length);
+        let from_end = from_side.stop(&rest[..limit]).await?;
+        let (length, from_link, current_link) = match (from_end.link(), current_end.link()) {
+            (Some((length, from_link)), current_link) => (
+                length,
+                Some(from_link),
+                current_link
+                    .filter(|(mount, _)| *mount == length)
+                    .map(|(_, link)| link),
+            ),
+            (None, Some((length, current_link))) => (length, None, Some(current_link)),
+            (None, None) => break (from_end, current_end),
+        };
+        let mount = &path.as_str()[..offset + length];
+        let at_path = offset + length == path.len();
+        if from_link.is_none() {
+            if matches!(from_end.at, Stop::Missing) {
+                let listed = !matches!(mounts, WalkMounts::Empty);
+                if listed
+                    && matches!(
+                        mount_on_disk(&from.repository, mount, at_path).await?,
+                        MountOnDisk::Directory
+                    )
+                {
+                    return Ok(None);
+                }
+                break (from_end, PathStop::NONE);
+            }
+            from_side.node = from_end.node;
+            let directory = from_side
+                .state
+                .node(from_side.repository.clone(), from_side.node)
+                .await?
+                .is_directory();
+            match mount_on_disk(&from.repository, mount, at_path).await? {
+                MountOnDisk::Directory if directory => {}
+                MountOnDisk::Directory if at_path => break (from_end, PathStop::NONE),
+                MountOnDisk::Directory if intent.marks_dirty() => return Ok(None),
+                MountOnDisk::Directory => break (PathStop::NONE, PathStop::NONE),
+                MountOnDisk::File if at_path => break (from_end, current_end),
+                MountOnDisk::File | MountOnDisk::Missing => {
+                    current_side.node = INVALID_NODE;
+                    offset += length + 1;
+                    continue;
+                }
+            }
+        } else {
+            match mount_on_disk(&from.repository, mount, at_path).await? {
+                MountOnDisk::Directory => {}
+                MountOnDisk::File if at_path => break (from_end, current_end),
+                MountOnDisk::File | MountOnDisk::Missing => return Ok(None),
+            }
+        }
+        (from_side, current_side) = cross_links(
+            from_side,
+            current_side,
+            from_link.as_ref(),
+            current_link.as_ref(),
+        )
+        .await?;
+        mounts = if from_link.is_some() {
+            WalkMounts::Linked
+        } else {
+            WalkMounts::Empty
+        };
+        offset += length + 1;
+    };
+
+    if intent.marks_dirty()
+        && matches!(from_end.at, Stop::Missing)
+        && from_end.node.is_valid_or_root_node_id()
+        && !from_side
+            .state
+            .node(from_side.repository.clone(), from_end.node)
+            .await?
+            .is_directory()
+    {
+        return Ok(None);
+    }
+    let from_node = from_end.named();
+    let current_node = current_end.named();
+    let link_mounts = match mounts {
+        WalkMounts::Root => {
+            collect_link_mounts(
+                &[
+                    (&from.state, &from.repository, ROOT_NODE),
+                    (&current.state, &current.repository, ROOT_NODE),
+                ],
+                &RelativePath::new(),
+            )
+            .await?
+        }
+        WalkMounts::Linked => {
+            collect_crossed_mounts(&from_side, from_node, &current_side, current_node, path).await?
+        }
+        WalkMounts::Empty => Vec::new(),
+    };
+    let skip = u32::try_from(offset.min(path.len())).internal("measuring the scoped path")?;
+    Ok(Some(ScopedRoots {
+        chain_root: ChainRoot {
+            node: from_side.node,
+            skip,
+        },
+        from: NodeMapping {
+            repository: from_side.repository,
+            state: from_side.state,
+            path: path.clone(),
+            node: from_node,
+        },
+        current: NodeMapping {
+            repository: current_side.repository,
+            state: current_side.state,
+            path: path.clone(),
+            node: current_node,
+        },
+        link_mounts,
+    }))
+}
+
 /// Calculate the set of changes between two revision states and emit them
 /// into `changes`. Streams raw `Add` / `Delete` / `Keep` records as discovered
 /// — does **not** run the post-walk move-coalescing or path-sort fixup that
@@ -7784,11 +8173,8 @@ pub struct LayerMountInfo {
 /// can detect "this filesystem directory is a link, not a fresh add" with a single
 /// linear `find` instead of an async block-walk per directory.
 ///
-/// Only `mount_path` is needed today because the link-mount handling skips
-/// recursion entirely (the link is the parent-tree change; its content is
-/// owned by the linked repository). If we later want the walker to recurse
-/// into a linked state for some operation, extend this struct rather than
-/// re-introducing the per-directory `find_node_link` lookup.
+/// Only `mount_path` is needed: the walk tells a mount from a directory only the working tree
+/// holds by its path, and crosses into a link it holds through the link node itself.
 pub struct LinkMountInfo {
     /// Parent-relative mount path of the link node (e.g. `"libs/shared"`).
     pub mount_path: RelativePath,
@@ -7888,10 +8274,10 @@ fn walk_filter_mode(filter_mode: FilterMode, intent: FilesystemDiffIntent) -> Fi
 /// Resolves `path` on both sides and diffs the filesystem under it through
 /// `operation`, appending a change per difference to `changes`.
 ///
-/// Resolution reads the trees alone, so a filesystem implementation is handed roots it
-/// never has to follow a link to find. The filter is asked about `path` as what the working tree
-/// holds there, else as the node `from` holds, a link as a directory, and as a directory where
-/// neither holds anything.
+/// Resolution reads the trees, and the working tree only at each link mount `path` reaches, so
+/// a filesystem implementation is handed roots it never has to follow a link to find. The filter
+/// is asked about `path` as what the working tree holds there, else as the node `from` holds, a
+/// link as a directory, and as a directory where neither holds anything.
 ///
 /// `layer_mounts` is consulted only by the parent's walk to switch context when crossing
 /// into a configured layer. Pass an empty Arc for non-layer-aware callers; the
@@ -7967,18 +8353,15 @@ pub(crate) async fn diff_filesystem_queuing(
         None => FilterStates::ROOT,
     };
 
-    let link_mounts = Arc::new(
-        collect_link_mounts(
+    let Some(path) = path else {
+        let link_mounts = collect_link_mounts(
             &[
                 (&state_from, &repository_from, ROOT_NODE),
                 (&state_current, &repository_current, ROOT_NODE),
             ],
             &RelativePath::new(),
         )
-        .await?,
-    );
-
-    let Some(path) = path else {
+        .await?;
         return Ok(diff_with(
             operation,
             FilesystemDiffContext {
@@ -7998,64 +8381,47 @@ pub(crate) async fn diff_filesystem_queuing(
                 filesystem_path: RelativePath::new(),
                 states,
                 from_states: states,
-                asks_path: false,
+                named_path: None,
                 filter_mode,
                 intent,
                 layer_mounts,
-                link_mounts,
+                link_mounts: Arc::new(link_mounts),
                 discards,
             },
         ));
     };
 
-    let node_link_from = state_from
-        .find_node_link(repository_from.clone(), path.as_str())
-        .await
-        .unwrap_or(NodeLink {
-            node: INVALID_NODE,
-            repository: repository_from.id,
-            revision: state_from.revision(),
-        });
-    let (repository_from, state_from) = node_link_from
-        .resolve(repository_from.clone(), state_from.clone())
-        .await?;
-
-    let node_link_to = state_current
-        .find_node_link(repository_current.clone(), path.as_str())
-        .await
-        .unwrap_or(NodeLink {
-            node: INVALID_NODE,
-            repository: repository_current.id,
-            revision: state_current.revision(),
-        });
-    let (repository_current, state_current) = node_link_to
-        .resolve(repository_current.clone(), state_current.clone())
-        .await?;
+    let Some(roots) = Box::pin(scoped_roots(
+        FilesystemDiffTree {
+            repository: repository_from,
+            state: state_from,
+        },
+        FilesystemDiffTree {
+            repository: repository_current,
+            state: state_current,
+        },
+        &path,
+        intent,
+    ))
+    .await?
+    else {
+        return Ok(ChangeStream::nothing());
+    };
 
     Ok(diff_with(
         operation,
         FilesystemDiffContext {
             operation: operation.clone(),
-            from: NodeMapping {
-                repository: repository_from,
-                state: state_from,
-                path: path.clone(),
-                node: node_link_from.node,
-            },
-            current: NodeMapping {
-                repository: repository_current,
-                state: state_current,
-                path: path.clone(),
-                node: node_link_to.node,
-            },
+            from: roots.from,
+            current: roots.current,
             filesystem_path: path,
             states,
             from_states: states,
-            asks_path: true,
+            named_path: Some(roots.chain_root),
             filter_mode,
             intent,
             layer_mounts,
-            link_mounts,
+            link_mounts: Arc::new(roots.link_mounts),
             discards,
         },
     ))
@@ -8169,7 +8535,7 @@ pub async fn diff_filesystem_subtree(
             filesystem_path,
             states,
             from_states: states,
-            asks_path: false,
+            named_path: None,
             filter_mode,
             intent,
             layer_mounts,
@@ -8212,7 +8578,9 @@ struct FileDiffContext {
     from_node: Option<Node>,
     /// Parent directory node for a newly added leaf. `Some` from the directory
     /// walk (the directory being walked), which is correct even across a
-    /// link/layer boundary; `None` for a single-file path, resolved by path.
+    /// link/layer boundary, from a single-file path whose walk found or added
+    /// the directories leading to it, and from a named directory that replaces a
+    /// file, the file's parent; `None` otherwise, resolved by path.
     parent_node_id: Option<NodeID>,
     /// When true, set Dirty on modified files and clear Dirty on retained files inline.
     intent: FilesystemDiffIntent,

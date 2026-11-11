@@ -1493,7 +1493,8 @@ struct ScanTarget {
     /// The path, or `None` for the whole repository.
     path: Option<RelativePath>,
     /// Whether its scan creates the directory nodes above it that the tree lacks: only the
-    /// working tree holds the path, and the filter keeps it.
+    /// working tree holds the path, the filter keeps it, and the deepest node the tree holds on
+    /// it is a directory, short of any link.
     creates_ancestors: bool,
 }
 
@@ -1581,10 +1582,33 @@ fn resolve_scan_target(
     report_ignored: bool,
 ) -> impl Future<Output = Option<ScanTarget>> + Send {
     async move {
-        let tracked = state
-            .find_node_link(repository.clone(), path.as_str())
+        let (tracked, missing_below) = match state
+            .find_to_link(&repository, ROOT_NODE, path.as_str(), false)
             .await
-            .is_ok_and(|node_link| node_link.is_valid());
+        {
+            Ok(state::PathStop {
+                at: state::Stop::End,
+                ..
+            }) => (true, None),
+            Ok(
+                stop @ state::PathStop {
+                    at: state::Stop::Link(_),
+                    ..
+                },
+            ) => (
+                state
+                    .find_relative_from(repository.clone(), path.as_str(), stop)
+                    .await
+                    .is_ok_and(|(node_link, _)| node_link.is_valid()),
+                None,
+            ),
+            Ok(state::PathStop {
+                at: state::Stop::Missing,
+                node,
+                ..
+            }) => (false, Some(node)),
+            Err(_) => (false, None),
+        };
         if tracked {
             return Some(ScanTarget {
                 path: Some(path),
@@ -1613,9 +1637,20 @@ fn resolve_scan_target(
             info.is_some_and(|info| info.is_dir()),
             FilterMode::Full,
         );
+        // The directories leading to a path below a link mount belong to the linked tree, where
+        // its own scan adds them, and none is added below a file. A path that cannot be read
+        // through is left to its own scan too, which fails on it as this would.
+        let creates_ancestors = !excluded
+            && match missing_below {
+                Some(node) => state
+                    .node(repository.clone(), node)
+                    .await
+                    .is_ok_and(|node| node.is_directory()),
+                None => false,
+            };
         Some(ScanTarget {
             path: Some(path),
-            creates_ancestors: !excluded,
+            creates_ancestors,
         })
     }
 }

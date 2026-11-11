@@ -1782,7 +1782,7 @@ fn an_attach_and_an_add_beside_an_eviction() {
 }
 
 /// The product's chains, a scan's and `lore dirty`'s, and the scan's chain through its op, to the
-/// held `q/r` beside an eviction, failing at their find, the only step they take: wherever one
+/// held `q/r` beside an eviction, failing at their find, the step each takes first: wherever one
 /// fails, no second `q/r` is added, closure kept; where it does not, it answers `q/r`. The model
 /// holds the op's answer to its reads.
 #[test]

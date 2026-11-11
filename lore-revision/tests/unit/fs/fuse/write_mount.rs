@@ -663,16 +663,6 @@ async fn a_build_shaped_burst_creates_and_renames_two_thousand_files() {
     m.unmount().await;
 }
 
-/// Each path's action in `reported`, as status lists it.
-fn actions(
-    reported: std::collections::BTreeMap<String, (lore_revision::interface::LoreFileAction, bool)>,
-) -> Vec<(String, lore_revision::interface::LoreFileAction)> {
-    reported
-        .into_iter()
-        .map(|(path, (action, _))| (path, action))
-        .collect()
-}
-
 /// An ordinary clone versions no symlink: its status walk skips one (`file_list_item`), so a new
 /// symlink is no change, and a tracked file a symlink replaced reads as deleted. A virtual clone
 /// matches this (the tests below).
@@ -706,7 +696,7 @@ async fn an_ordinary_clone_sees_no_symlink_and_a_file_a_symlink_replaced_as_dele
     let reported = staged_state::status_files(ordinary, true).await;
 
     assert_eq!(
-        actions(reported),
+        crate::helper::test_status_actions(reported),
         vec![("a.txt".to_string(), LoreFileAction::Delete)]
     );
 }
@@ -736,8 +726,8 @@ async fn a_symlink_made_through_the_mount_is_no_change() {
             let at = lore_revision::util::path::RelativePath::new_from_initial_path("dir/link")
                 .expect("path");
             assert_eq!(
-                actions(
-                    staged_state::status_files_at(
+                crate::helper::test_status_actions(
+                    crate::helper::test_status_files_at(
                         instance.command_context(&fs, None),
                         Some(vec![at]),
                         false
@@ -792,14 +782,14 @@ async fn a_tracked_file_a_symlink_replaced_reads_as_deleted() {
                 .ino;
 
             assert_eq!(
-                actions(status_of(&instance, &fs).await),
+                crate::helper::test_status_actions(status_of(&instance, &fs).await),
                 vec![("a.txt".to_string(), LoreFileAction::Delete)]
             );
             let at = lore_revision::util::path::RelativePath::new_from_initial_path("a.txt")
                 .expect("path");
             assert_eq!(
-                actions(
-                    staged_state::status_files_at(
+                crate::helper::test_status_actions(
+                    crate::helper::test_status_files_at(
                         instance.command_context(&fs, None),
                         Some(vec![at]),
                         false
@@ -898,7 +888,7 @@ async fn a_symlink_in_a_directory_made_through_the_mount_is_no_change() {
                 .expect("symlink");
 
             assert_eq!(
-                actions(status_of(&instance, &fs).await),
+                crate::helper::test_status_actions(status_of(&instance, &fs).await),
                 vec![
                     ("made".to_string(), LoreFileAction::Add),
                     ("made/f.txt".to_string(), LoreFileAction::Add)
@@ -948,7 +938,7 @@ async fn a_symlink_below_a_directory_made_through_the_mount_is_no_change() {
                 .expect("symlink");
 
             assert_eq!(
-                actions(status_of(&instance, &fs).await),
+                crate::helper::test_status_actions(status_of(&instance, &fs).await),
                 vec![
                     ("made".to_string(), LoreFileAction::Add),
                     ("made/sub".to_string(), LoreFileAction::Add),
@@ -996,7 +986,7 @@ async fn a_symlink_in_a_directory_replacing_a_tracked_file_is_no_change() {
                 .expect("symlink");
 
             assert_eq!(
-                actions(status_of(&instance, &fs).await),
+                crate::helper::test_status_actions(status_of(&instance, &fs).await),
                 vec![
                     ("x".to_string(), LoreFileAction::Add),
                     ("x/f.txt".to_string(), LoreFileAction::Add)
@@ -1758,7 +1748,7 @@ async fn a_forced_sync_keeps_a_symlink_where_the_target_changes_a_tracked_file()
             let link = lookup_path(&fs, "dir/f.txt").await.expect("dir/f.txt");
             assert_eq!(link_target(&fs, link).await, b"local.txt");
             assert_eq!(
-                actions(status_of(&instance, &fs).await),
+                crate::helper::test_status_actions(status_of(&instance, &fs).await),
                 vec![
                     ("dir/f.txt".to_string(), LoreFileAction::Delete),
                     ("dir/local.txt".to_string(), LoreFileAction::Add)

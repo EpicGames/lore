@@ -186,10 +186,7 @@ async fn verify_no_local_changes_under_link(
     state_staged: Arc<State>,
     link_path: &RelativePath,
 ) -> Result<(), LinkError> {
-    // TODO(vri): narrow this to `link_path` once a scoped diff works.
-    // `find_relative_node_link` returns a mount as the parent's own link node,
-    // so `diff_filesystem` has nothing to resolve and walks a node with no
-    // children, reporting every file under the mount as added.
+    // TODO(vri): narrow this to `link_path`.
     let changes = state::diff_filesystem(
         operation,
         FilesystemDiffTree {

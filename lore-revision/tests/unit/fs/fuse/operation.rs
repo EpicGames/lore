@@ -1277,7 +1277,7 @@ impl Working {
     /// [`Self::status`] of `at` alone, or of the whole tree for `None`.
     async fn status_at(&self, at: Option<&str>) -> BTreeMap<String, (LoreFileAction, bool)> {
         let token = RepositoryWriteToken::acquire(&self.path).await;
-        staged_state::status_files_at(
+        crate::helper::test_status_files_at(
             self.command_context(&self.fs, Some(token)),
             at.map(|at| vec![path(at)]),
             false,
@@ -1365,7 +1365,7 @@ impl Working {
             filesystem_path: path(at),
             states: FilterStates::ROOT,
             from_states: FilterStates::ROOT,
-            asks_path: false,
+            named_path: None,
             filter_mode: FilterMode::Full,
             intent,
             layer_mounts: Arc::new(Vec::new()),

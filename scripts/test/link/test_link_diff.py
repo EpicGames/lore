@@ -3,7 +3,7 @@
 import os
 
 import pytest
-from link_helpers import make_repo, parse_revision_diff
+from link_helpers import make_parent_with_link, make_repo, parse_revision_diff
 from lore_parsers import parse_status_json
 from thin_client import (
     ACTION_ADD,
@@ -412,6 +412,67 @@ def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
         f"lore file diff must include the removed file's content as a deletion."
         f"\nOutput:\n{output}"
     )
+
+
+def _changed_paths(diff_output: str) -> list[str]:
+    """The working tree paths `lore file diff` output reports changed, sorted."""
+    return sorted(
+        line[4:]
+        for line in diff_output.splitlines()
+        if line.startswith("+++ ") and line != "+++ /dev/null"
+    )
+
+
+def _status_entries(repo, path: str) -> list[tuple[str, str]]:
+    """The (path, action) pairs of an unstaged `lore status` scoped to `path`, sorted."""
+    return sorted(
+        (entry["path"].replace("\\", "/"), entry["action"])
+        for entry in parse_status_json(repo.status(path, unstaged=True, json=True))
+    )
+
+
+@pytest.mark.smoke
+def test_link_diff_scoped_to_mount_matches_unscoped_over_a_nested_link(
+    new_lore_repo,
+):
+    """A link added inside a linked repository is reported the same way by a
+    diff scoped to the outer mount as by a diff over the whole parent, and a
+    status scoped to the outer mount reports nothing while it is untouched and
+    an edit inside the nested link under its full mount path.
+    """
+    outer_mount = "libs/b"
+    outer_file = f"{outer_mount}/b-root.txt"
+    nested_file = f"{outer_mount}/nested/c-data/inner.txt"
+
+    parent_repo, _ = make_parent_with_link(
+        new_lore_repo, outer_mount, {"b-root.txt": "b\n"}
+    )
+    pre_nested_revision = parent_repo.branch_info().local_latest
+    repo_c = make_repo(new_lore_repo, {"c-data/inner.txt": "c v1\n"})
+    parent_repo.link_add(f"{outer_mount}/nested", repo_c.get_id(), "/")
+    parent_repo.commit("Link C inside B")
+    parent_repo.push()
+    assert _status_entries(parent_repo, outer_mount) == []
+
+    parent_repo.write_files({outer_file: "b edited\n"})
+
+    unscoped = _changed_paths(
+        parent_repo.file_diff(source=pre_nested_revision, no_pager=True)
+    )
+    scoped = _changed_paths(
+        parent_repo.file_diff(
+            paths=outer_mount, source=pre_nested_revision, no_pager=True
+        )
+    )
+    assert scoped == [outer_file]
+    assert scoped == [path for path in unscoped if path.startswith(f"{outer_mount}/")]
+
+    parent_repo.write_files({nested_file: "locally modified\n"})
+
+    assert _status_entries(parent_repo, outer_mount) == [
+        (outer_file, "keep"),
+        (nested_file, "keep"),
+    ]
 
 
 @pytest.mark.smoke
