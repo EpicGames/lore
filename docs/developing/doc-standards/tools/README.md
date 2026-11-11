@@ -231,7 +231,7 @@ The cache lives at `.lycheecache` in the repo root and persists between runs. Th
 
 Lore docs under `docs/` are public-facing. The `exclude` list in `lychee.toml` does **not** include internal-org hostnames (sponsor-org GitHub Enterprise, internal wikis, internal infrastructure subdomains). An internal link appearing under `docs/` is a failure by design — replace it with a public link or remove it before merge.
 
-The `exclude` list only carries non-org-revealing placeholders: `localhost`/loopback (tutorials reference these intentionally) and `example.com` (canon samples). Internal doc trees not present in the public repository are handled automatically by `scripts/docs-lint.sh`.
+The `exclude` list only carries non-org-revealing entries: `localhost`/loopback (tutorials reference these intentionally), `example.com` (canon samples), and the access-gated Unreal Engine source repository on GitHub, which returns 404 until the reader links their Epic Games and GitHub accounts. Internal doc trees not present in the public repository are handled automatically by `scripts/docs-lint.sh`.
 
 ### Advanced scoped scans
 

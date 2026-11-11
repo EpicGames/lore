@@ -1,11 +1,7 @@
----
-title: Getting started with Lore for Unreal Editor
-description: Connect an Unreal Engine 5.9 Preview project to Lore, submit an asset, and try Lore commands through the Unreal MCP.
----
-
 # Getting started with Lore for Unreal Editor
 
-> **Note:** The Lore plugin for Unreal Editor is available as experimental beginning with the first preview release of Unreal Engine 5.9. Its source is available as part of the [Unreal Engine](https://github.com/EpicGames/UnrealEngine) project.
+> [!NOTE]
+> The Lore plugin for Unreal Editor is available as experimental beginning with the first preview release of Unreal Engine 5.9. Its source is part of the [Unreal Engine repository on GitHub](https://github.com/EpicGames/UnrealEngine). If the link returns 404, [link your Epic Games and GitHub accounts](https://www.unrealengine.com/ue-on-github) first.
 
 This tutorial helps you (or your agent) get Lore up and running alongside an Unreal Engine project. It walks you through:
 
@@ -21,6 +17,7 @@ Before getting started, you'll need:
 
 - Unreal Engine 5.9 Preview 1 or later
 - An Unreal Engine project that you want to version control with Lore
+- For step 6, an agent with MCP support, connected to the Unreal MCP server
 
 ## Steps
 
@@ -43,6 +40,9 @@ host = "127.0.0.1"
 [server.http]
 host = "127.0.0.1"
 ```
+
+> [!WARNING]
+> With `trust_unsigned_identity = true`, any caller can claim any identity. Binding every listener to `127.0.0.1` keeps other machines out, but any process on your computer can still connect. Use this setting only on a single-user development computer, never on a shared server. See [Unsigned identity](../reference/lore-server-config.md#unsigned-identity).
 
 These settings accept the identity names supplied by clients and keep the server accessible only on your computer. Start the server with that configuration and keep it running while you use the editor.
 
@@ -74,7 +74,7 @@ This tutorial uses a server on your own computer. To clone an existing remote re
 
 ### 3. Choose the files to track
 
-Create an [ignore file](../glossary.md#ignore-file) named `.loreignore` in the project folder, beside `.uproject` and `.lore`. Make sure the filename does not end in `.txt`.
+Create an [ignore file](../glossary.md#ignore-file) named `.loreignore` in the project folder, beside `.uproject` and `.lore`. Make sure the filename doesn't end in `.txt`.
 
 Use this starting point for Unreal Engine project files:
 
@@ -175,10 +175,10 @@ After submitting, the editor reports **All Saved** and **At Latest**.
 | Symptom | What to check |
 | --- | --- |
 | **Lore is missing from the provider list** | Enable the Lore plugin in **Edit > Plugins** and restart the editor. |
-| **The editor cannot find a repository** | Create or clone the repository in the folder containing the `.uproject` file. |
-| **The server is unavailable** | Check that it is running and that the health check returns `200 OK`. |
+| **The editor can't find a repository** | Create or clone the repository in the folder containing the `.uproject` file. |
+| **The server is unavailable** | Check that it's running and that the health check returns `200 OK`. |
 | **The wrong CLI version runs** | Check which Lore installation your tools use. |
-| **Generated files appear in the submission** | Check `.loreignore`. Ignore rules do not remove files already tracked. |
+| **Generated files appear in the submission** | Check `.loreignore`. Ignore rules don't remove files already tracked. |
 
 ## See also
 

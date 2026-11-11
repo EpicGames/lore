@@ -92,4 +92,9 @@ exclude = [
     # anchor-generation keeps them, so fragment links to those headings are
     # reported as not found. The anchors are valid in the rendered site.
     "quickstart\\.md#step-[0-9]+-",
+
+    # The Unreal Engine source repository is public but access-gated: GitHub
+    # returns 404 unless the reader has linked their Epic Games and GitHub
+    # accounts. Docs that link it also link the account-linking page.
+    "^https://github\\.com/EpicGames/UnrealEngine(/|$)",
 ]
