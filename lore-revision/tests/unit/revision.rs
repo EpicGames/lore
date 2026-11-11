@@ -36,6 +36,59 @@ fn path(text: &str) -> RelativePath {
     RelativePath::new_from_initial_path(text).expect("valid path")
 }
 
+/// A path compared with another path respelled at some of its names orders as it orders against
+/// the respelled path built in full, where a name keeps its length and where it changes it, where
+/// the two differ inside a name or after it, and where one is a prefix of the other.
+#[test]
+fn a_path_orders_against_a_respelled_path_as_against_the_built_one() {
+    let spelled = "Dir/\u{212A}/Sub/c.txt";
+    let kelvin = spelled.find('\u{212A}').expect("the Kelvin sign");
+    let sub = spelled.find("Sub").expect("the inner directory");
+    for names in [
+        vec![],
+        vec![(0, 3, "dir")],
+        vec![(kelvin, kelvin + 3, "k")],
+        vec![
+            (0, 3, "DIR"),
+            (kelvin, kelvin + 3, "K"),
+            (sub, sub + 3, "sub"),
+        ],
+    ] {
+        let mut built = String::new();
+        let mut copied = 0;
+        for &(start, end, name) in &names {
+            built.push_str(&spelled[copied..start]);
+            built.push_str(name);
+            copied = end;
+        }
+        built.push_str(&spelled[copied..]);
+        let candidates = [
+            "",
+            "D",
+            "Dir",
+            "dir/",
+            built.as_str(),
+            &built[..built.len() - 1],
+            &format!("{built}x"),
+            &format!("{built}/d.txt"),
+            &built.replace("c.txt", "b.txt"),
+            &built.replace("c.txt", "d.txt"),
+            "Dir/\u{212A}/Sub",
+            "dir/k/sub/c.txt",
+            "DIR/K/sub/c.txt",
+            "Dir/\u{212A}/Sub/c.txt",
+            "\u{212A}",
+        ];
+        for candidate in candidates {
+            assert_eq!(
+                cmp_respelled(candidate, spelled, &names),
+                candidate.cmp(built.as_str()),
+                "{candidate:?} against {built:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn is_below_accepts_only_paths_inside_the_mount() {
     assert!(is_below(&path("shared"), &path("shared/a.txt")));

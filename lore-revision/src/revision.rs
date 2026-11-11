@@ -17,6 +17,7 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::RevisionListIdentifier;
 use serde::Serialize;
+use smallvec::SmallVec;
 use tokio::join;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -464,6 +465,7 @@ pub async fn diff3_with_source_cap(
             conflicts: mut joined_conflicts,
             mut target_changes,
             target_moves,
+            renamed_alike,
             target_replacements,
             source_consumed,
         } = Box::pin(join_target_walk(
@@ -495,6 +497,7 @@ pub async fn diff3_with_source_cap(
             &mut joined_changes,
             &mut target_changes,
             target_moves,
+            renamed_alike,
             &mut joined_conflicts,
             include_same,
         )
@@ -886,12 +889,7 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
     (state_base, state_target): (&Arc<State>, &Arc<State>),
     include_same: bool,
 ) -> Result<Joined, StateError> {
-    let mut source_moves: Vec<usize> = (0..source_changes.len())
-        .filter(|&index| source_changes[index].relocated_from().is_some())
-        .collect();
-    source_moves.sort_unstable_by(|&lhs, &rhs| {
-        relocation_source(&source_changes[lhs]).cmp(relocation_source(&source_changes[rhs]))
-    });
+    let source_moves = relocated_indices(source_changes, |_| true);
 
     let mut joined = Joined::new(source_changes.len());
     loop {
@@ -966,10 +964,12 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
 }
 
 /// Whether `change` leaves its node where it stood with the content it held, which a walk reports
-/// where only the file ID differs.
+/// where only the file ID differs, or puts another file holding that content where a rename of a
+/// directory above it carried the node.
 fn is_file_id_only_churn(change: &NodeChange) -> bool {
     change.action != FileAction::Delete
-        && change.relocated_from().is_none()
+        && (change.relocated_from().is_none()
+            || (is_carried(change) && change.from.address.context != change.to.address.context))
         && !change.from.address.hash.is_zero()
         && change.from.address.hash == change.to.address.hash
 }
@@ -980,35 +980,80 @@ fn relocation_source(change: &NodeChange) -> &str {
     change.relocated_from().map_or("", RelativePath::as_str)
 }
 
+/// The indices of the changes `select` picks among those of `changes` that leave their node at
+/// another path, sorted by the path each leaves.
+fn relocated_indices(changes: &[NodeChange], select: impl Fn(&NodeChange) -> bool) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..changes.len())
+        .filter(|&index| changes[index].relocated_from().is_some() && select(&changes[index]))
+        .collect();
+    indices.sort_unstable_by(|&lhs, &rhs| {
+        relocation_source(&changes[lhs]).cmp(relocation_source(&changes[rhs]))
+    });
+    indices
+}
+
 /// The index of the change standing at `path` among `changes`, sorted by path, or the index it
 /// would stand at.
 fn index_at(changes: &[NodeChange], path: &str) -> Result<usize, usize> {
     changes.binary_search_by(|change| change.path().as_str().cmp(path))
 }
 
-/// [`index_at`] for the path `prefix` followed by `rest`, without joining the two.
-fn index_at_joined(changes: &[NodeChange], prefix: &str, rest: &str) -> Result<usize, usize> {
-    changes.binary_search_by(|change| {
-        let path = change.path().as_str().as_bytes();
-        let (front, back) = path.split_at(path.len().min(prefix.len()));
-        front
-            .cmp(prefix.as_bytes())
-            .then_with(|| back.cmp(rest.as_bytes()))
+/// The indices of the changes in `changes`, sorted by path, that stand below `ancestor`.
+fn indices_below(changes: &[NodeChange], ancestor: &str) -> std::ops::Range<usize> {
+    let order = |change: &NodeChange| below_order(change.path().as_str(), ancestor);
+    changes.partition_point(|change| order(change).is_lt())
+        ..changes.partition_point(|change| order(change).is_le())
+}
+
+/// How `path` orders against the paths below `ancestor`, in the order of paths: `Less` where it
+/// orders before every one of them, `Equal` where it is one, and `Greater` where it orders after.
+fn below_order(path: &str, ancestor: &str) -> std::cmp::Ordering {
+    let path = path.as_bytes();
+    let (prefix, rest) = path.split_at(path.len().min(ancestor.len()));
+    prefix.cmp(ancestor.as_bytes()).then_with(|| {
+        rest.first()
+            .map_or(std::cmp::Ordering::Less, |b| b.cmp(&b'/'))
     })
 }
 
-/// The indices of the changes in `changes`, sorted by path, that stand below `ancestor`.
-fn indices_below(changes: &[NodeChange], ancestor: &str) -> std::ops::Range<usize> {
-    let order = |change: &NodeChange| {
-        let path = change.path().as_str().as_bytes();
-        let (prefix, rest) = path.split_at(path.len().min(ancestor.len()));
-        prefix.cmp(ancestor.as_bytes()).then_with(|| {
-            rest.first()
-                .map_or(std::cmp::Ordering::Less, |b| b.cmp(&b'/'))
-        })
-    };
-    changes.partition_point(|change| order(change).is_lt())
-        ..changes.partition_point(|change| order(change).is_le())
+/// How `candidate` orders against `spelled` with the name at each range of `names`, in order,
+/// replaced by the name given with it: bytes compared as `str` orders them.
+#[lore_macro::test_pub]
+fn cmp_respelled(
+    candidate: &str,
+    spelled: &str,
+    names: &[(usize, usize, &str)],
+) -> std::cmp::Ordering {
+    let mut rest = candidate.as_bytes();
+    let mut copied = 0;
+    for &(start, end, name) in names {
+        for piece in [&spelled[copied..start], name] {
+            if let Some(order) = take_piece(&mut rest, piece) {
+                return order;
+            }
+        }
+        copied = end;
+    }
+    take_piece(&mut rest, &spelled[copied..]).unwrap_or(if rest.is_empty() {
+        std::cmp::Ordering::Equal
+    } else {
+        std::cmp::Ordering::Greater
+    })
+}
+
+/// Takes `piece` off the start of `rest` where `rest` starts with it, or answers how `rest`
+/// orders against a string starting with `piece`.
+fn take_piece(rest: &mut &[u8], piece: &str) -> Option<std::cmp::Ordering> {
+    let piece = piece.as_bytes();
+    let length = rest.len().min(piece.len());
+    match rest[..length].cmp(&piece[..length]) {
+        std::cmp::Ordering::Equal if rest.len() < piece.len() => Some(std::cmp::Ordering::Less),
+        std::cmp::Ordering::Equal => {
+            *rest = &rest[length..];
+            None
+        }
+        order => Some(order),
+    }
 }
 
 /// Whether `change` changes what a node other than a directory holds: its content or its mode.
@@ -1040,6 +1085,14 @@ fn moves_alike(source: &NodeChange, target: &NodeChange) -> bool {
     source
         .relocated_from()
         .is_some_and(|from| relocation_source(target) == from.as_str())
+}
+
+/// Whether the two changes, which move one node from one path, put it at one place in the merged
+/// tree: one name in one directory, which the two spell as their sides do, ignoring case. The two
+/// spellings are one where the renames of the directories above it agree.
+fn moves_to_one_place(source: &NodeChange, target: &NodeChange) -> bool {
+    source.path().as_lowercase_str() == target.path().as_lowercase_str()
+        && source.path().name() == target.path().name()
 }
 
 /// Whether `target` holds, at its path, the node `source` takes from where it stood.
@@ -1078,9 +1131,9 @@ fn push_conflict(
 }
 
 /// What is left to apply of the source's move where the target made the same move: the source's
-/// edit, as a change of the node where the target holds it. `None` where the source left the node
-/// as it was or as the target holds it, or moved a directory, unless `include_same` asks for the
-/// changes the two sides make alike.
+/// edit, as a change of the node where the target holds it, standing where the source's change
+/// stands. `None` where the source left the node as it was or as the target holds it, or moved a
+/// directory, unless `include_same` asks for the changes the two sides make alike.
 fn onto_target_move(
     source: &NodeChange,
     target: &NodeChange,
@@ -1094,18 +1147,344 @@ fn onto_target_move(
     change.action = FileAction::Keep;
     change.from = on_target(&source.from, &target.to, target.path());
     if !edited {
-        change.to = on_target(&source.to, &target.to, target.path());
+        change.to = on_target(&source.to, &target.to, source.path());
     }
     Some(change)
 }
 
-/// Puts `side` where a move of the directory at `from` to `to` puts it, where it stands below
-/// `from`.
-fn move_below(side: &mut change::NodeChangeState, from: &RelativePath, to: &RelativePath) {
-    if let Some(rest) = side.mapping.path.below(from)
-        && !rest.is_empty()
+/// Whether `change` changes its node where it stands, at another path than the node stood at only
+/// because a rename of a directory above the node changed the path, rather than moving the node.
+fn is_carried(change: &NodeChange) -> bool {
+    change.action == FileAction::Keep && change.relocated_from().is_some()
+}
+
+/// Settles `source`, a change that leaves its node at another path, with `target`, the target's
+/// change of the node at the path the target holds it at. A delete, a replacement, and an edit of
+/// a file the source edits too conflict, and a source change that leaves the content as it was
+/// takes the target's. Answers whether the two conflict.
+fn settle_with_target_change(
+    source: &mut NodeChange,
+    target: &NodeChange,
+    conflicts: &mut Vec<(NodeChange, NodeChange)>,
+) -> bool {
+    if target.action == FileAction::Delete || replaces(target) || edits_both(source, target) {
+        push_conflict(conflicts, source.clone(), target.clone());
+        return true;
+    }
+    if source.from.address.hash == source.to.address.hash {
+        source.from = on_target(&source.from, &target.to, target.path());
+        source.to = on_target(&source.to, &target.to, &source.to.mapping.path);
+    }
+    false
+}
+
+/// Whether `change` renames a directory only in case.
+fn renames_directory(change: &NodeChange) -> bool {
+    change.action == FileAction::Move
+        && change.to.flags.is_directory()
+        && change.is_case_only_move()
+}
+
+/// The indices of the changes of `changes` that rename a directory only in case, sorted by the
+/// folded path each renames, each with no conflict marked.
+fn renames_by_folded_path(changes: &[NodeChange]) -> Vec<(usize, bool)> {
+    in_folded_order(
+        changes,
+        (0..changes.len())
+            .filter(|&index| renames_directory(&changes[index]))
+            .map(|index| (index, false))
+            .collect(),
+        |&(index, _)| index,
+    )
+}
+
+/// `order`, whose entries name changes of `changes` by the index `index` reads from each, sorted by
+/// the folded path of the change each names.
+fn in_folded_order<T>(
+    changes: &[NodeChange],
+    mut order: Vec<T>,
+    index: impl Fn(&T) -> usize,
+) -> Vec<T> {
+    order.sort_unstable_by(|lhs, rhs| {
+        changes[index(lhs)]
+            .path()
+            .as_lowercase_str()
+            .cmp(changes[index(rhs)].path().as_lowercase_str())
+    });
+    order
+}
+
+/// Where among `renames`, indices among `changes` as [`renames_by_folded_path`] answers them, the
+/// rename of the directory at `folded`, a path in folded form, stands.
+fn rename_position(
+    changes: &[NodeChange],
+    renames: &[(usize, bool)],
+    folded: &str,
+) -> Option<usize> {
+    renames
+        .binary_search_by(|&(index, _)| changes[index].path().as_lowercase_str().cmp(folded))
+        .ok()
+}
+
+/// The rename among `renames`, indices among `changes` as [`renames_by_folded_path`] answers them,
+/// of the directory at `folded`, a path in folded form, with whether it conflicts.
+fn rename_at<'a>(
+    changes: &'a [NodeChange],
+    renames: &[(usize, bool)],
+    folded: &str,
+) -> Option<(&'a NodeChange, bool)> {
+    rename_position(changes, renames, folded).map(|at| (&changes[renames[at].0], renames[at].1))
+}
+
+/// Marks the rename of `changes[index]` among `renames` as one that conflicts, where it is one.
+fn mark_rename_conflict(changes: &[NodeChange], renames: &mut [(usize, bool)], index: usize) {
+    if let Some(at) = rename_position(changes, renames, changes[index].path().as_lowercase_str())
+        && renames[at].0 == index
     {
-        side.mapping.path = to.join(rest);
+        renames[at].1 = true;
+    }
+}
+
+/// The spelling [`DirectoryRenames::spell`] gives a path.
+#[derive(Clone, Copy)]
+enum Spelling {
+    /// The source's tree's: each directory the source renames as the source names it, and each
+    /// one the target renames as the base does.
+    Source,
+    /// The target's tree's: each directory the target renames as the target names it, and each
+    /// one the source renames as the base does.
+    Target,
+    /// The merged tree's: each directory a side renames as that side names it. A directory whose
+    /// rename conflicts has no merged name.
+    Merged,
+}
+
+/// A directory above a path whose rename conflicts, which leaves the path no merged spelling.
+struct ConflictedRename;
+
+/// The two sides' renames of directories, each of which changes only case: the source's as indices
+/// among its changes and the target's as indices among its moves, each sorted by the folded path
+/// it renames, with whether the rename conflicts. A path in any side's spelling folds to the
+/// folded paths of the renames above it. Both sides renaming one directory to one name is one
+/// rename that conflicts with neither, and names the directory so in every spelling.
+struct DirectoryRenames {
+    source: Vec<(usize, bool)>,
+    target: Vec<(usize, bool)>,
+    /// The renames both sides make alike that the join took as one, the target's changes, sorted
+    /// by folded path.
+    alike: Vec<NodeChange>,
+    /// The indices of the target's changes that leave their node where it stood, sorted by folded
+    /// path, where the source renames a directory.
+    targets: Vec<usize>,
+}
+
+/// The renames of a pairing where neither side renames a directory.
+static NO_RENAMES: DirectoryRenames = DirectoryRenames {
+    source: Vec::new(),
+    target: Vec::new(),
+    alike: Vec::new(),
+    targets: Vec::new(),
+};
+
+impl DirectoryRenames {
+    /// The renames of `sources`, of `target_moves` and those both sides make alike, `alike`, none
+    /// marked as conflicting, with `targets` in folded order where the source renames a
+    /// directory, or `None` where neither side renames one.
+    fn of(
+        sources: &[NodeChange],
+        targets: &[NodeChange],
+        target_moves: &[NodeChange],
+        mut alike: Vec<NodeChange>,
+    ) -> Option<Box<Self>> {
+        let source = renames_by_folded_path(sources);
+        alike.sort_unstable_by(|lhs, rhs| {
+            lhs.path()
+                .as_lowercase_str()
+                .cmp(rhs.path().as_lowercase_str())
+        });
+        let renames = DirectoryRenames {
+            alike,
+            targets: if source.is_empty() {
+                Vec::new()
+            } else {
+                in_folded_order(targets, (0..targets.len()).collect(), |&index| index)
+            },
+            source,
+            target: renames_by_folded_path(target_moves),
+        };
+        (!renames.is_empty()).then(|| Box::new(renames))
+    }
+
+    /// The positions among [`Self::targets`] of the target's changes, among `targets`, that stand
+    /// below `ancestor`, a path in folded form.
+    fn targets_below(&self, targets: &[NodeChange], ancestor: &str) -> std::ops::Range<usize> {
+        let order =
+            |&index: &usize| below_order(targets[index].path().as_lowercase_str(), ancestor);
+        self.targets.partition_point(|index| order(index).is_lt())
+            ..self.targets.partition_point(|index| order(index).is_le())
+    }
+
+    /// `path` with each directory above it that a side renames named as `spelling` names it,
+    /// matched ignoring case at every level, or `None` where `path` names each so already. Fails
+    /// with [`ConflictedRename`] only for [`Spelling::Merged`].
+    ///
+    /// At most one lookup in each side's renames per directory above `path`. Allocates only where
+    /// a name changes, and takes the folded form `path` holds.
+    fn spell(
+        &self,
+        sources: &[NodeChange],
+        target_moves: &[NodeChange],
+        path: &RelativePath,
+        spelling: Spelling,
+    ) -> Result<Option<RelativePath>, ConflictedRename> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let mut respelled: Option<String> = None;
+        let mut copied = 0;
+        let spelled = path.as_str();
+        for (start, end, name) in self.names(sources, target_moves, path, spelling) {
+            let name = name?;
+            if name != &spelled[start..end] {
+                let out = respelled.get_or_insert_with(|| String::with_capacity(spelled.len()));
+                out.push_str(&spelled[copied..start]);
+                out.push_str(name);
+                copied = end;
+            }
+        }
+        Ok(respelled.map(|mut out| {
+            out.push_str(&spelled[copied..]);
+            path.respelled(out)
+        }))
+    }
+
+    /// Whether a directory above `path` has a rename that conflicts, which leaves `path` no merged
+    /// spelling. Builds no path.
+    fn conflicts_above(
+        &self,
+        sources: &[NodeChange],
+        target_moves: &[NodeChange],
+        path: &RelativePath,
+    ) -> bool {
+        !self.is_empty()
+            && self
+                .names(sources, target_moves, path, Spelling::Merged)
+                .any(|(_, _, name)| name.is_err())
+    }
+
+    /// The index among `changes`, sorted by path, of the change standing at `path` as `spelling`
+    /// spells it, or `None` where none stands there or `path` has no such spelling. Builds no
+    /// path: the change's paths are compared with `path` and the names `spelling` gives the
+    /// directories above it.
+    fn find_spelled(
+        &self,
+        sources: &[NodeChange],
+        target_moves: &[NodeChange],
+        changes: &[NodeChange],
+        path: &RelativePath,
+        spelling: Spelling,
+    ) -> Option<usize> {
+        let spelled = path.as_str();
+        let mut names: SmallVec<[(usize, usize, &str); 4]> = SmallVec::new();
+        if !self.is_empty() {
+            for (start, end, name) in self.names(sources, target_moves, path, spelling) {
+                let name = name.ok()?;
+                if name != &spelled[start..end] {
+                    names.push((start, end, name));
+                }
+            }
+        }
+        if names.is_empty() {
+            return index_at(changes, spelled).ok();
+        }
+        changes
+            .binary_search_by(|change| cmp_respelled(change.path().as_str(), spelled, &names))
+            .ok()
+    }
+
+    /// Whether neither side renames a directory.
+    fn is_empty(&self) -> bool {
+        self.source.is_empty() && self.target.is_empty() && self.alike.is_empty()
+    }
+
+    /// Each directory above `path` that a side renames: where its name stands in `path`, and the
+    /// name `spelling` gives it.
+    fn names<'a>(
+        &'a self,
+        sources: &'a [NodeChange],
+        target_moves: &'a [NodeChange],
+        path: &'a RelativePath,
+        spelling: Spelling,
+    ) -> impl Iterator<Item = (usize, usize, Result<&'a str, ConflictedRename>)> + 'a {
+        let (spelled, folded) = (path.as_str(), path.as_lowercase_str());
+        spelled
+            .match_indices('/')
+            .zip(folded.match_indices('/'))
+            .scan(0, |start, ((end, _), (folded_end, _))| {
+                let name_start = std::mem::replace(start, end + 1);
+                Some((name_start, end, folded_end))
+            })
+            .filter_map(move |(start, end, folded_end)| {
+                self.name(sources, target_moves, &folded[..folded_end], spelling)
+                    .transpose()
+                    .map(|name| (start, end, name))
+            })
+    }
+
+    /// The name `spelling` gives the directory at `folded`, a path in folded form, where a side
+    /// renames it.
+    fn name<'a>(
+        &'a self,
+        sources: &'a [NodeChange],
+        target_moves: &'a [NodeChange],
+        folded: &str,
+        spelling: Spelling,
+    ) -> Result<Option<&'a str>, ConflictedRename> {
+        if let Ok(at) = self
+            .alike
+            .binary_search_by(|rename| rename.path().as_lowercase_str().cmp(folded))
+        {
+            return Ok(Some(self.alike[at].path().name()));
+        }
+        let source = (sources, &self.source[..]);
+        let target = (target_moves, &self.target[..]);
+        let (own, other) = match spelling {
+            Spelling::Source => (source, target),
+            Spelling::Target => (target, source),
+            Spelling::Merged => {
+                return match (
+                    rename_at(source.0, source.1, folded),
+                    rename_at(target.0, target.1, folded),
+                ) {
+                    (Some((rename, false)), None) | (None, Some((rename, false))) => {
+                        Ok(Some(rename.path().name()))
+                    }
+                    (Some((source, false)), Some((target, false)))
+                        if source.path().name() == target.path().name() =>
+                    {
+                        Ok(Some(source.path().name()))
+                    }
+                    (None, None) => Ok(None),
+                    _ => Err(ConflictedRename),
+                };
+            }
+        };
+        Ok(match rename_at(own.0, own.1, folded) {
+            Some((rename, _)) => Some(rename.path().name()),
+            None => rename_at(other.0, other.1, folded)
+                .map(|(rename, _)| rename.from.mapping.path.name()),
+        })
+    }
+
+    /// Marks the source's rename at `index` among `sources` as one that conflicts, where it is one.
+    fn mark_source_conflict(&mut self, sources: &[NodeChange], index: usize) {
+        mark_rename_conflict(sources, &mut self.source, index);
+    }
+
+    /// Marks the target's rename at `index` among `target_moves` as one that conflicts, where it
+    /// is one.
+    fn mark_target_conflict(&mut self, target_moves: &[NodeChange], index: usize) {
+        mark_rename_conflict(target_moves, &mut self.target, index);
     }
 }
 
@@ -1120,6 +1499,8 @@ struct Joined {
     target_changes: Vec<NodeChange>,
     /// The target's changes no source change stands with, which leave their node at another path.
     target_moves: Vec<NodeChange>,
+    /// The target's renames of directories, each only in case, that the source makes alike.
+    renamed_alike: Vec<NodeChange>,
     /// The target's replacements of a file with a directory and of a directory with a file, once
     /// for each change that walks one.
     target_replacements: Vec<Replacement>,
@@ -1135,15 +1516,17 @@ impl Joined {
             conflicts: Vec::new(),
             target_changes: Vec::new(),
             target_moves: Vec::new(),
+            renamed_alike: Vec::new(),
             target_replacements: Vec::new(),
             source_consumed: vec![false; source_count],
         }
     }
 
     /// Joins `target_change` with the source's change at `at`, its index among `source_changes`
-    /// by path. The same move on both sides conflicts only where both edit the file. Any other
-    /// pair conflicts where [`is_conflict`] says so, and a pair that leaves the path alike keeps
-    /// the source's change only for `include_same`.
+    /// by path. The same move on both sides conflicts only where both edit the file, and is kept
+    /// in [`Self::renamed_alike`] where it renames a directory only in case. Any other pair
+    /// conflicts where [`is_conflict`] says so, and a pair that leaves the path alike keeps the
+    /// source's change only for `include_same`.
     #[lore_macro::test_pub]
     async fn join(
         &mut self,
@@ -1165,10 +1548,13 @@ impl Joined {
         if moves_alike(source_change, &target_change) {
             if edits_both(source_change, &target_change) {
                 push_conflict(&mut self.conflicts, source_change.clone(), target_change);
-            } else if let Some(change) =
-                onto_target_move(source_change, &target_change, include_same)
-            {
+                return Ok(());
+            }
+            if let Some(change) = onto_target_move(source_change, &target_change, include_same) {
                 self.changes.push(change);
+            }
+            if renames_directory(&target_change) {
+                self.renamed_alike.push(target_change);
             }
         } else if is_conflict(source_change, &target_change, true).await? {
             push_conflict(&mut self.conflicts, source_change.clone(), target_change);
@@ -1213,36 +1599,52 @@ async fn settle_moved(
 /// path, which the join by path does not reach: a move, or a node below a directory a move renamed.
 ///
 /// `sources` are the source's changes, `targets` the target's that leave their node where it
-/// stood, and `target_moves` the target's that leave it elsewhere. None of the target's moves is
-/// emitted, since the target holds them already. A change one side made to a node the other moved
-/// follows the node:
+/// stood, `target_moves` the target's that leave it elsewhere, and `renamed_alike` the target's
+/// renames of directories that the join took as one with the source's. None of the target's moves
+/// is emitted, since the target holds them already. A change one side made to a node the other
+/// moved follows the node:
 ///
 /// - Where one side moves a file and the other edits it, the edit stands where the move put the
 ///   file, and a move that leaves the content as it was carries the other side's content.
 /// - Where both sides change what a file holds, its content or its mode, where one side moves a
 ///   node and the other deletes or replaces it, and where the two move it to different paths, the
-///   pair conflicts.
+///   pair conflicts. Two moves of a node to one place in the merged tree are one move, however
+///   each side spells the directories above it.
 /// - The target's changes below a directory the source moves travel with the directory, and the
 ///   source's changes below one the target moves are put where the target put it. A walk reports a
 ///   directory as moved where a rename changes only its case; a directory moved to another name
 ///   reaches the diff as a delete and an add, and the files below it as moves.
-/// - A change put at another path is checked against the other side's change at that path, as the
-///   join checks the two sides' changes at one path.
+/// - A change of a node below a directory such a rename moved is a change of the node where the
+///   rename put it, not a move of it. It pairs with the other side's change of the node as an edit
+///   does. A source change below the target's renames, and one that follows a target move, stands
+///   where the merged tree holds the node: each directory above it named as the side that renames
+///   it names it ([`DirectoryRenames`]).
+/// - A change put at another path is checked against the other side's change at that path,
+///   spelled as that side's tree spells it, as the join checks the two sides' changes at one path.
 async fn pair_moved_nodes(
     sources: &mut Vec<NodeChange>,
     targets: &mut Vec<NodeChange>,
     target_moves: Vec<NodeChange>,
+    renamed_alike: Vec<NodeChange>,
     conflicts: &mut Vec<(NodeChange, NodeChange)>,
     include_same: bool,
 ) -> Result<(), StateError> {
     if target_moves.is_empty()
+        && renamed_alike.is_empty()
         && !sources
             .iter()
             .any(|change| change.relocated_from().is_some())
     {
         return Ok(());
     }
-    let mut pairing = MovePairing::new(sources, targets, target_moves, conflicts, include_same);
+    let mut pairing = MovePairing::new(
+        sources,
+        targets,
+        target_moves,
+        renamed_alike,
+        conflicts,
+        include_same,
+    );
     pairing.pair_source_moves();
     pairing.carry_target_changes().await?;
     let mut retargeted = pairing.pair_target_moves();
@@ -1254,8 +1656,9 @@ async fn pair_moved_nodes(
 }
 
 /// The two sides' changes [`pair_moved_nodes`] pairs, sorted by path, the target's moves, sorted by
-/// the path each leaves, which of them a pairing has used up, and whether the diff lists the
-/// changes the two sides make alike.
+/// the path each leaves, which of them a pairing has used up, whether the diff lists the changes
+/// the two sides make alike, and the two sides' renames of directories, where either side renames
+/// one. The renames are boxed, which keeps them out of the future of every diff that pairs moves.
 struct MovePairing<'a> {
     sources: &'a mut Vec<NodeChange>,
     targets: &'a mut Vec<NodeChange>,
@@ -1265,6 +1668,7 @@ struct MovePairing<'a> {
     target_gone: Vec<bool>,
     target_move_paired: Vec<bool>,
     include_same: bool,
+    renames: Option<Box<DirectoryRenames>>,
 }
 
 impl<'a> MovePairing<'a> {
@@ -1272,6 +1676,7 @@ impl<'a> MovePairing<'a> {
         sources: &'a mut Vec<NodeChange>,
         targets: &'a mut Vec<NodeChange>,
         mut target_moves: Vec<NodeChange>,
+        renamed_alike: Vec<NodeChange>,
         conflicts: &'a mut Vec<(NodeChange, NodeChange)>,
         include_same: bool,
     ) -> Self {
@@ -1283,6 +1688,7 @@ impl<'a> MovePairing<'a> {
             source_gone: vec![false; sources.len()],
             target_gone: vec![false; targets.len()],
             target_move_paired: vec![false; target_moves.len()],
+            renames: DirectoryRenames::of(sources, targets, &target_moves, renamed_alike),
             sources,
             targets,
             target_moves,
@@ -1291,73 +1697,160 @@ impl<'a> MovePairing<'a> {
         }
     }
 
+    /// The two sides' renames of directories.
+    fn renames(&self) -> &DirectoryRenames {
+        self.renames.as_deref().unwrap_or(&NO_RENAMES)
+    }
+
+    /// `path` spelled as `spelling` asks through the two sides' renames of directories, or `None`
+    /// where it is spelled so already or has no merged spelling.
+    fn spell(&self, path: &RelativePath, spelling: Spelling) -> Option<RelativePath> {
+        self.renames()
+            .spell(self.sources, &self.target_moves, path, spelling)
+            .ok()
+            .flatten()
+    }
+
+    /// Whether a directory above `path` has a rename that conflicts.
+    fn conflicts_above(&self, path: &RelativePath) -> bool {
+        self.renames()
+            .conflicts_above(self.sources, &self.target_moves, path)
+    }
+
+    /// The index among `changes`, sorted by path, of the change at `path` as `spelling` spells it
+    /// through the two sides' renames of directories, as [`DirectoryRenames::find_spelled`] finds
+    /// it.
+    fn find(
+        &self,
+        changes: &[NodeChange],
+        path: &RelativePath,
+        spelling: Spelling,
+    ) -> Option<usize> {
+        self.renames()
+            .find_spelled(self.sources, &self.target_moves, changes, path, spelling)
+    }
+
     /// Pairs each source change that leaves its node at another path with what the target made of
-    /// the node at the path it stood at. A target move of it elsewhere conflicts, as do a delete, a
-    /// replacement, and an edit of a file the source edits too. A source move that leaves the
-    /// content as it was takes the target's.
+    /// the node at the path it stood at, and marks the renames of directories that conflict.
+    ///
+    /// - A target change of the node where it stood, or where a rename of a directory above it
+    ///   carried it, settles with the source's as [`settle_with_target_change`] settles the two.
+    ///   Where either stands below a directory whose rename conflicts, the two conflict instead,
+    ///   as the merged tree spells the directory neither way.
+    /// - A target move of the node elsewhere conflicts with a source move of it, unless the two
+    ///   put it at one place in the merged tree: the same move on both sides, which settles as the
+    ///   join settles it.
+    /// - A source change a rename carried, against a target move, is left to
+    ///   [`Self::pair_target_moves`].
     fn pair_source_moves(&mut self) {
         for index in 0..self.sources.len() {
             let from = relocation_source(&self.sources[index]);
             if from.is_empty() {
                 continue;
             }
-            if let Ok(other) = self
+            let (gone, conflicted) = if let Ok(other) = self
                 .target_moves
                 .binary_search_by(|target| relocation_source(target).cmp(from))
             {
+                let (source, target) = (&self.sources[index], &self.target_moves[other]);
+                if !is_carried(target) && is_carried(source) {
+                    continue;
+                }
                 self.target_move_paired[other] = true;
-                push_conflict(
-                    self.conflicts,
-                    self.sources[index].clone(),
-                    self.target_moves[other].clone(),
-                );
-                self.source_gone[index] = true;
+                if is_carried(target) {
+                    let gone = if self.conflicts_above(source.path())
+                        || self.conflicts_above(target.path())
+                    {
+                        push_conflict(self.conflicts, source.clone(), target.clone());
+                        true
+                    } else {
+                        let target = &self.target_moves[other];
+                        settle_with_target_change(&mut self.sources[index], target, self.conflicts)
+                    };
+                    (gone, gone)
+                } else if moves_to_one_place(source, target) {
+                    self.settle_same_move(index, other)
+                } else {
+                    push_conflict(self.conflicts, source.clone(), target.clone());
+                    if let Some(renames) = self.renames.as_deref_mut() {
+                        renames.mark_target_conflict(&self.target_moves, other);
+                    }
+                    (true, true)
+                }
             } else if let Ok(other) = index_at(self.targets, from) {
                 self.target_gone[other] = true;
-                let (source, target) = (&self.sources[index], &self.targets[other]);
-                if target.action == FileAction::Delete
-                    || replaces(target)
-                    || edits_both(source, target)
-                {
-                    push_conflict(self.conflicts, source.clone(), target.clone());
-                    self.source_gone[index] = true;
-                } else if source.from.address.hash == source.to.address.hash {
-                    let from = on_target(&source.from, &target.to, target.path());
-                    let to = on_target(&source.to, &target.to, &source.to.mapping.path);
-                    let source = &mut self.sources[index];
-                    source.from = from;
-                    source.to = to;
-                }
+                let gone = settle_with_target_change(
+                    &mut self.sources[index],
+                    &self.targets[other],
+                    self.conflicts,
+                );
+                (gone, gone)
+            } else {
+                (false, false)
+            };
+            self.source_gone[index] = gone;
+            if conflicted && let Some(renames) = self.renames.as_deref_mut() {
+                renames.mark_source_conflict(self.sources, index);
             }
         }
     }
 
-    /// Puts each target change below a directory the source moves where the source put the
-    /// directory, and settles it with the source's change at the path it lands at as
-    /// [`settle_moved`] does. The target's change is not emitted, since the target holds it, and
-    /// is copied only where it lands on a source change.
+    /// Settles the source's change at `index` with the target's move at `other`, which put one node
+    /// at one place in the merged tree, as the join settles a move both sides make: the two
+    /// conflict where both edit the file, and otherwise what is left of the source's change is what
+    /// [`onto_target_move`] leaves, standing where the source's change stands, so the source's
+    /// changes keep their order by path, and the target's move's other half is taken up. Answers
+    /// whether the source's change is used up, and whether the two conflict.
+    fn settle_same_move(&mut self, index: usize, other: usize) -> (bool, bool) {
+        let (source, target) = (&self.sources[index], &self.target_moves[other]);
+        if edits_both(source, target) {
+            push_conflict(self.conflicts, source.clone(), target.clone());
+            return (true, true);
+        }
+        let left = onto_target_move(source, target, self.include_same);
+        self.take_move_half(other);
+        match left {
+            Some(change) => {
+                self.sources[index] = change;
+                (false, false)
+            }
+            None => (true, false),
+        }
+    }
+
+    /// Takes up the target's change where the target's move at `index` put its node, the move's
+    /// other half, which the target holds already.
+    fn take_move_half(&mut self, index: usize) {
+        if let Ok(half) = index_at(self.targets, self.target_moves[index].path().as_str()) {
+            self.target_gone[half] = true;
+        }
+    }
+
+    /// Puts each target change below a directory the source moves, found ignoring case, where the
+    /// source's tree spells it, through the renames of both sides, and settles it with the source's
+    /// change at that path as [`settle_moved`] does. The target's change is not emitted, since the
+    /// target holds it, and is copied only where it lands on a source change.
     async fn carry_target_changes(&mut self) -> Result<(), StateError> {
         for index in 0..self.sources.len() {
             let source = &self.sources[index];
             if self.source_gone[index] || !source.to.flags.is_directory() {
                 continue;
             }
-            let Some(from) = source.relocated_from().cloned() else {
+            let Some(from) = source.relocated_from() else {
                 continue;
             };
-            let to = source.path().clone();
-            for other in indices_below(self.targets, from.as_str()) {
+            let below = self
+                .renames()
+                .targets_below(self.targets, from.as_lowercase_str());
+            for position in below {
+                let other = self.renames().targets[position];
                 if self.target_gone[other] {
                     continue;
                 }
                 self.target_gone[other] = true;
-                let rest = &self.targets[other].path().as_str()[from.as_str().len()..];
-                let Ok(at) = index_at_joined(self.sources, to.as_str(), rest) else {
+                let Some((at, target)) = self.landing(other) else {
                     continue;
                 };
-                let mut target = self.targets[other].clone();
-                move_below(&mut target.from, &from, &to);
-                move_below(&mut target.to, &from, &to);
                 settle_moved(
                     self.sources,
                     &mut self.source_gone,
@@ -1372,26 +1865,68 @@ impl<'a> MovePairing<'a> {
         Ok(())
     }
 
-    /// Pairs each target move the source did not make as well with the source's change at the path
-    /// the node stood at. A delete, a replacement, and an edit of a file the target edits too
-    /// conflict, a delete where the move put the node, and the source's changes below a directory
-    /// it deletes wait for that conflict. The source's change follows the move to where it put the
-    /// node where the move leaves the content as it was, or where the diff lists the changes the
-    /// two sides make alike, and gives way to the move otherwise. Answers the indices of the
-    /// source changes put at another path, which move once every pair is found, as finding one
-    /// reads the sources by path.
+    /// Where the target's change at `other` lands among the source's changes: the index of the
+    /// source's change at the path the source's tree spells it at, and the target's change put
+    /// there. `None` where the source changed nothing there.
+    fn landing(&self, other: usize) -> Option<(usize, NodeChange)> {
+        let target = &self.targets[other];
+        let landed = self.spell(target.path(), Spelling::Source);
+        let at = index_at(
+            self.sources,
+            landed.as_ref().unwrap_or(target.path()).as_str(),
+        )
+        .ok()?;
+        let mut moved = target.clone();
+        for side in [&mut moved.from, &mut moved.to] {
+            let spelled = if side.mapping.path == *target.path() {
+                landed.clone()
+            } else {
+                self.spell(&side.mapping.path, Spelling::Source)
+            };
+            if let Some(path) = spelled {
+                side.mapping.path = path;
+            }
+        }
+        Some((at, moved))
+    }
+
+    /// Pairs each target move the source did not make as well with the source's change of the
+    /// node: at the path the node stood at, or where a rename of a directory above it carried it.
+    /// Answers the indices of the source changes put at another path, which move once every pair
+    /// is found, as finding one reads the sources by path.
+    ///
+    /// - A delete, a replacement, and an edit of a file the target edits too conflict with the
+    ///   move, a delete where the move put the node. The source's changes below a directory it
+    ///   deletes wait for that conflict.
+    /// - Where the move leaves the content as it was, or where the diff lists the changes the two
+    ///   sides make alike, the source's change follows the move, as
+    ///   [`Self::follow_destination`] says where to, or conflicts with it. The target's change
+    ///   where the move put the node, the move's other half, goes with the change that follows.
+    /// - Any other source change gives way to the move.
     fn pair_target_moves(&mut self) -> Vec<usize> {
+        if self.target_moves.is_empty() {
+            return Vec::new();
+        }
+        let carried = relocated_indices(self.sources, is_carried);
         let mut followed = Vec::new();
         for index in 0..self.target_moves.len() {
             if self.target_move_paired[index] {
                 continue;
             }
             let target = &self.target_moves[index];
-            let Ok(other) = index_at(self.sources, relocation_source(target)) else {
-                continue;
+            let from = relocation_source(target);
+            let other = match index_at(self.sources, from) {
+                Ok(other) if self.sources[other].relocated_from().is_none() => other,
+                Ok(_) => continue,
+                Err(_) => match carried
+                    .binary_search_by(|&source| relocation_source(&self.sources[source]).cmp(from))
+                {
+                    Ok(found) => carried[found],
+                    Err(_) => continue,
+                },
             };
             let source = &self.sources[other];
-            if self.source_gone[other] || source.relocated_from().is_some() {
+            if self.source_gone[other] {
                 continue;
             }
             if source.action == FileAction::Delete {
@@ -1406,22 +1941,51 @@ impl<'a> MovePairing<'a> {
                 push_conflict(self.conflicts, source.clone(), target.clone());
                 self.source_gone[other] = true;
             } else if self.include_same || target.from.address.hash == target.to.address.hash {
-                followed.push((other, index));
+                if let Some(destination) = self.follow_destination(other, index) {
+                    followed.push((other, index, destination));
+                } else {
+                    let (source, target) = (&self.sources[other], &self.target_moves[index]);
+                    push_conflict(self.conflicts, source.clone(), target.clone());
+                    self.source_gone[other] = true;
+                }
             } else {
                 self.source_gone[other] = true;
             }
         }
         followed
             .into_iter()
-            .map(|(other, index)| {
+            .map(|(other, index, destination)| {
                 let target = &self.target_moves[index];
                 let from = on_target(&self.sources[other].from, &target.to, target.path());
+                self.take_move_half(index);
                 let source = &mut self.sources[other];
                 source.from = from;
-                source.to.mapping.path = target.path().clone();
+                source.to.mapping.path = destination;
                 other
             })
             .collect()
+    }
+
+    /// Where the source change at `other` follows the target move at `index` to: the move's
+    /// destination as the merged tree spells it. `None` where the two conflict instead: where the
+    /// source changed the destination as well, with another change than this one, as an edit at
+    /// both ends of a move does, and where the source's change or the destination stands below a
+    /// directory whose rename conflicts, which leaves it no merged spelling.
+    fn follow_destination(&self, other: usize, index: usize) -> Option<RelativePath> {
+        let moved_to = self.target_moves[index].path();
+        if self.conflicts_above(self.sources[other].path()) || self.conflicts_above(moved_to) {
+            return None;
+        }
+        if self
+            .find(self.sources, moved_to, Spelling::Source)
+            .is_some_and(|at| at != other)
+        {
+            return None;
+        }
+        Some(
+            self.spell(moved_to, Spelling::Merged)
+                .unwrap_or_else(|| moved_to.clone()),
+        )
     }
 
     /// Takes the `from` side of each directory the source deletes from the target's tree, which
@@ -1445,47 +2009,64 @@ impl<'a> MovePairing<'a> {
         }
     }
 
-    /// Puts each side of a source change below directories the target moves where the target put
-    /// the deepest of them, adding the source changes whose own path that moves to `retargeted`.
+    /// Spells both sides of each source change through both sides' renames of directories, where
+    /// the target renames one, alone or alike with the source: the side the node stood at as the
+    /// target's tree spells it, and the side it stands at as the merged tree does, where it has a
+    /// merged spelling. Where the source renames no directory, the two spellings of one path are
+    /// one, which is built once. Adds to `retargeted` the source changes whose own path that moves,
+    /// and those below a directory whose rename conflicts, which the target's tree may spell
+    /// otherwise.
     fn follow_target_directory_moves(&mut self, retargeted: &mut Vec<usize>) {
-        self.target_moves
-            .retain(|target| target.to.flags.is_directory());
-        if self.target_moves.is_empty() {
+        if self.renames().target.is_empty() && self.renames().alike.is_empty() {
             return;
         }
-        for (index, source) in self.sources.iter_mut().enumerate() {
+        for index in 0..self.sources.len() {
             if self.source_gone[index] {
                 continue;
             }
-            let resolves_from = source.action == FileAction::Delete;
-            let mut moved = false;
-            for (is_from, side) in [(true, &mut source.from), (false, &mut source.to)] {
-                let path = side.mapping.path.as_str();
-                let Some((end, other)) = path.match_indices('/').rev().find_map(|(end, _)| {
-                    self.target_moves
-                        .binary_search_by(|target| relocation_source(target).cmp(&path[..end]))
-                        .ok()
-                        .map(|other| (end, other))
-                }) else {
-                    continue;
-                };
-                side.mapping.path = self.target_moves[other].path().join(&path[end + 1..]);
-                moved |= is_from == resolves_from;
-            }
+            let source = &self.sources[index];
+            let from = self.spell(&source.from.mapping.path, Spelling::Target);
+            let (to, waits) = if self.renames().source.is_empty()
+                && source.to.mapping.path == source.from.mapping.path
+            {
+                (from.clone(), false)
+            } else {
+                match self.renames().spell(
+                    self.sources,
+                    &self.target_moves,
+                    &source.to.mapping.path,
+                    Spelling::Merged,
+                ) {
+                    Ok(to) => (to, false),
+                    Err(ConflictedRename) => (None, true),
+                }
+            };
+            let moved = if source.action == FileAction::Delete {
+                from.is_some()
+            } else {
+                to.is_some() || waits
+            };
             if moved {
                 retargeted.push(index);
+            }
+            let source = &mut self.sources[index];
+            if let Some(from) = from {
+                source.from.mapping.path = from;
+            }
+            if let Some(to) = to {
+                source.to.mapping.path = to;
             }
         }
     }
 
-    /// Settles each source change put at another path with the target's change at that path as
-    /// [`settle_moved`] does.
+    /// Settles each source change put at another path with the target's change where the target's
+    /// tree spells that path, as [`settle_moved`] does.
     async fn check_retargeted(&mut self, retargeted: Vec<usize>) -> Result<(), StateError> {
         for index in retargeted {
             if self.source_gone[index] {
                 continue;
             }
-            let Ok(other) = index_at(self.targets, self.sources[index].path().as_str()) else {
+            let Some(other) = self.target_at(index) else {
                 continue;
             };
             if self.target_gone[other] {
@@ -1503,6 +2084,12 @@ impl<'a> MovePairing<'a> {
             .await?;
         }
         Ok(())
+    }
+
+    /// The index of the target's change, among those that leave their node where it stood, at the
+    /// path of the source's change at `index` as the target's tree spells it.
+    fn target_at(&self, index: usize) -> Option<usize> {
+        self.find(self.targets, self.sources[index].path(), Spelling::Target)
     }
 
     /// Drops the changes a pairing used up.

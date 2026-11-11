@@ -35,7 +35,7 @@ import pytest
 import status_util
 from error_types import CommitFailed
 from status_util import verify_operations_in_status, Operation
-from test_utils import posix_join, to_posix
+from test_utils import posix_join, to_posix, working_tree_files
 from lore_parsers import parse_status_json
 
 from lore import Lore, FileDescription
@@ -3668,6 +3668,96 @@ class TestMoveMerge:
                 )
         assert files == {moved_path(path) for path in base}
         with joined.open_file(moved_path("Dir/a.txt"), "r") as f:
+            assert f.read() == content
+        status = parse_status_json(joined.status(offline=True, json=True))
+        assert [entry for entry in status if entry.get("flagConflict")] == [], status
+
+    @pytest.mark.smoke
+    @pytest.mark.parametrize(
+        "operation",
+        ["merge", "sync", "cherry-pick", "revert", "fast-forward-merge"],
+    )
+    @pytest.mark.parametrize("shape", ["within", "into"])
+    def test_an_edit_below_a_case_only_rename_against_a_move_keeps_all(
+        self, new_lore_repo, operation, shape
+    ):
+        """Each operation that joins two lines of history keeps all three changes where one
+        line renames a directory only in case and edits a file, and the other moves that file
+        within the directory or into it: the file stands where the move put it, below the
+        directory's new spelling, with the edit, and nothing conflicts. A revert of the rename
+        and the edit takes both back and keeps the move."""
+        repo: Lore = new_lore_repo()
+        repo.make_dirs("Dir")
+        for path in ["Dir/a.txt", "Dir/b.txt", "Top.txt"]:
+            with repo.open_file(path, "w") as f:
+                f.write(f"{path}\n")
+        repo.stage(scan=True, offline=True)
+        repo.commit("Base", offline=True)
+        repo.push()
+
+        within = shape == "within"
+        edited = "dir/a.txt" if within else "Top.txt"
+
+        def moved(directory: str) -> tuple[str, str]:
+            if within:
+                return f"{directory}/a.txt", f"{directory}/z.txt"
+            return "Top.txt", f"{directory}/Top.txt"
+
+        def rename_and_edit(instance: Lore):
+            instance.move("Dir", "dir")
+            instance.file_stage_move("Dir", "dir", offline=True)
+            with instance.open_file(edited, "w") as f:
+                f.write("edited\n")
+            instance.file_stage(edited, offline=True)
+            instance.commit("Rename and edit", offline=True)
+
+        def move(instance: Lore, directory: str = "Dir"):
+            source, destination = moved(directory)
+            instance.move(source, destination)
+            instance.file_stage_move(source, destination, offline=True)
+            instance.commit("Move", offline=True)
+
+        joined = repo
+        directory, content = "dir", "edited\n"
+        if operation == "merge":
+            repo.branch_create("feature", offline=True)
+            rename_and_edit(repo)
+            repo.branch_switch("main", offline=True)
+            move(repo)
+            repo.branch_merge("feature", offline=True)
+        elif operation == "sync":
+            clone = repo.clone()
+            move(repo)
+            repo.push()
+            rename_and_edit(clone)
+            clone.sync()
+            joined = clone
+        elif operation == "cherry-pick":
+            repo.branch_create("feature", offline=True)
+            rename_and_edit(repo)
+            picked = repo.history(branch="feature", offline=True)[-1].signature
+            repo.branch_switch("main", offline=True)
+            move(repo)
+            repo.revision_cherry_pick(revision=picked, message="Pick", offline=True)
+        elif operation == "revert":
+            rename_and_edit(repo)
+            reverted = repo.history(offline=True)[-1].signature
+            move(repo, "dir")
+            repo.revision_revert(revision=reverted, message="Revert", offline=True)
+            directory = "Dir"
+            content = "Dir/a.txt\n" if within else "Top.txt\n"
+        else:
+            clone = repo.clone()
+            move(clone)
+            clone.push()
+            rename_and_edit(repo)
+            repo.push(fast_forward_merge=True)
+            joined = repo.clone()
+
+        _, destination = moved(directory)
+        kept = [f"{directory}/b.txt", "Top.txt" if within else f"{directory}/a.txt"]
+        assert working_tree_files(joined) == sorted(kept + [destination])
+        with joined.open_file(destination, "r") as f:
             assert f.read() == content
         status = parse_status_json(joined.status(offline=True, json=True))
         assert [entry for entry in status if entry.get("flagConflict")] == [], status

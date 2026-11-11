@@ -3,11 +3,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_revision::change::NodeChange;
 use lore_revision::commit::merge_tree_changes;
 use lore_revision::filter::FilterMode;
 use lore_revision::lore::RepositoryId;
@@ -15,6 +17,7 @@ use lore_revision::node::*;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::DiffResult;
 use lore_revision::revision::diff3_collect;
+use lore_revision::state::LinkPin;
 use lore_revision::state::State;
 use lore_revision::state::apply_tree_changes;
 use lore_revision::state::diff_collect;
@@ -32,7 +35,7 @@ use crate::helper::test_store_create;
 
 const KELVIN: &str = "\u{212A}.txt";
 
-/// The repository the link at `Mount` points into.
+/// The repository the link at `Mount` of the base points into, which no test commits to.
 const MOUNT_REPOSITORY: uuid::Uuid =
     uuid::Uuid::from_u128(0x0192_6f3c_5d10_7a2b_8c4e_1f2a_3b4c_5d6e);
 
@@ -339,25 +342,70 @@ async fn files_after(
     edits: &[Edit],
 ) -> BTreeMap<String, Content> {
     let base = base(repository).await;
+    files(&tree_on(repository, base, edits).await)
+}
+
+/// The tree of the revision `base` with `edits` made on it.
+async fn tree_on(
+    repository: &Arc<RepositoryContext>,
+    base: Hash,
+    edits: &[Edit],
+) -> BTreeMap<String, Content> {
     let revision = edited(repository, base, edits).await;
-    files(&contents(repository, &*revision_state(repository, revision).await).await)
+    contents(repository, &*revision_state(repository, revision).await).await
+}
+
+/// Asserts that `diff` has no conflicts and that none of its changes, nor any path of the tree a
+/// fast-forward merge of it stores, spells a directory with a name of `stale`, and that the stored
+/// tree holds the paths of `expected`, with what `expected` holds at `at`.
+async fn assert_merged_spelling(
+    repository: &Arc<RepositoryContext>,
+    diff: &DiffResult,
+    expected: &BTreeMap<String, Content>,
+    at: &str,
+    stale: &[&str],
+) {
+    let spells_stale = |path: &str| path.split('/').any(|name| stale.contains(&name));
+    let context = format!("{:?}", outcome(diff));
+    assert!(diff.conflicts.is_empty(), "{context}");
+    assert!(
+        !diff
+            .changes
+            .iter()
+            .any(|change| spells_stale(change.path().as_str())),
+        "{context}"
+    );
+    let merged = contents(
+        repository,
+        &*revision_state(repository, apply(repository, diff).await).await,
+    )
+    .await;
+    let context = format!("{context}: {merged:?}");
+    assert!(!merged.keys().any(|path| spells_stale(path)), "{context}");
+    assert!(merged.keys().eq(expected.keys()), "{context}");
+    assert_eq!(merged.get(at), expected.get(at), "{context}");
+}
+
+/// Each change of `changes` by its action, the path it stands at and the path its node stood at.
+fn walked(changes: &[NodeChange]) -> Vec<String> {
+    changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{:?} {} <- {}",
+                change.action,
+                change.path(),
+                change.from.mapping.path
+            )
+        })
+        .collect()
 }
 
 /// Each change of `diff` by its action, the path it stands at and the path its node stood at, and
 /// each conflict by the paths of its two changes, the source's first.
 fn outcome(diff: &DiffResult) -> (Vec<String>, Vec<(String, String)>) {
     (
-        diff.changes
-            .iter()
-            .map(|change| {
-                format!(
-                    "{:?} {} <- {}",
-                    change.action,
-                    change.path(),
-                    change.from.mapping.path
-                )
-            })
-            .collect(),
+        walked(&diff.changes),
         diff.conflicts
             .iter()
             .map(|(source, target)| (source.path().to_string(), target.path().to_string()))
@@ -657,32 +705,43 @@ async fn edits_on_both_sides_conflict_whether_or_not_one_side_moved() {
 }
 
 /// A change of a moved file's mode on one side and an edit of it on the other conflict, the same
-/// move on both sides included, as two edits of the file do.
+/// move on both sides included, as two edits of the file do. So do the two for a file below a
+/// directory renamed only in case.
 #[tokio::test]
 async fn a_mode_change_against_an_edit_of_a_moved_file_conflicts() {
     run(|repository| async move {
-        for moved in &MOVES[..2] {
+        for moved in [&MOVES[0], &MOVES[1], &MOVES[3]] {
             let (file, moved_file) = (moved.file, moved.file_moved);
-            let movement = Edit::Move(file, moved_file);
-            for (source, target, conflict) in [
+            let movement = Edit::Move(moved.from, moved.to);
+            let renamed = format!("Move {} <- {}", moved.to, moved.from);
+            let source_renames = if moved.from == file {
+                vec![]
+            } else {
+                vec![renamed]
+            };
+            for (source, target, changes, conflict) in [
                 (
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
                     vec![movement, Edit::Write(moved_file, 3)],
+                    vec![],
                     (moved_file, moved_file),
                 ),
                 (
                     vec![movement, Edit::Write(moved_file, 2)],
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
+                    vec![],
                     (moved_file, moved_file),
                 ),
                 (
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
                     vec![Edit::Write(file, 3)],
+                    source_renames.clone(),
                     (moved_file, file),
                 ),
                 (
                     vec![Edit::Write(file, 2)],
                     vec![movement, Edit::Chmod(moved_file, 0o755)],
+                    vec![],
                     (file, moved_file),
                 ),
             ] {
@@ -690,7 +749,7 @@ async fn a_mode_change_against_an_edit_of_a_moved_file_conflicts() {
                 assert_eq!(
                     outcome(&diff),
                     (
-                        vec![],
+                        changes,
                         vec![(conflict.0.to_string(), conflict.1.to_string())]
                     ),
                     "{source:?} against {target:?}"
@@ -961,7 +1020,8 @@ async fn edits_on_both_sides_of_the_same_move_conflict() {
 }
 
 /// The same case-only rename of a directory on both sides, with an edit below it on one side, is
-/// the edit alone: neither side changes the directory itself.
+/// the edit alone, of the file where the target's tree holds it: neither side changes the
+/// directory itself.
 #[tokio::test]
 async fn the_same_case_only_rename_of_a_directory_on_both_sides_is_the_edit_below_it() {
     run(|repository| async move {
@@ -977,10 +1037,48 @@ async fn the_same_case_only_rename_of_a_directory_on_both_sides_is_the_edit_belo
         assert_eq!(
             outcome(&diff),
             (
-                vec!["Keep Dir/sub/c.txt <- Dir/Sub/c.txt".to_string()],
+                vec!["Keep Dir/sub/c.txt <- Dir/sub/c.txt".to_string()],
                 vec![]
             )
         );
+    })
+    .await;
+}
+
+/// A move, a delete and a rename below a directory both sides rename only in case to one name
+/// take their node from where the target's tree holds it, whether or not the diff lists the
+/// changes the two sides make alike.
+#[tokio::test]
+async fn a_change_below_a_rename_both_sides_make_takes_its_node_where_the_target_holds_it() {
+    run(|repository| async move {
+        for (source, target, expected) in [
+            (
+                vec![RENAME_SUB, Edit::Move("Dir/sub/c.txt", "Dir/sub/d.txt")],
+                vec![RENAME_SUB],
+                "Move Dir/sub/d.txt <- Dir/sub/c.txt",
+            ),
+            (
+                vec![RENAME_SUB, Edit::Delete("Dir/sub/c.txt")],
+                vec![RENAME_SUB],
+                "Delete Dir/sub/c.txt <- Dir/sub/c.txt",
+            ),
+            (
+                vec![RENAME_DIR, Edit::Move("dir/Sub", "dir/sub")],
+                vec![RENAME_DIR],
+                "Move dir/sub <- dir/Sub",
+            ),
+        ] {
+            for include_same in [false, true] {
+                let diff = diff_with(&repository, &source, &target, include_same).await;
+                let (changes, conflicts) = outcome(&diff);
+                let context = format!("{source:?} against {target:?}, include_same {include_same}");
+                assert!(conflicts.is_empty(), "{context}: {conflicts:?}");
+                assert!(
+                    changes.iter().any(|change| change == expected),
+                    "{context}: {changes:?}"
+                );
+            }
+        }
     })
     .await;
 }
@@ -1158,13 +1256,14 @@ async fn assert_merge_stores_a_commit(
 /// A fast-forward merge stores the tree a commit of the source's edits on the target stores, for
 /// an edit, a move across directories, a rename that only changes case of a file and of a
 /// directory, the latter on a tree hashed under the rule folding case too, a rename of a link, a
-/// delete and an add, a directory the merge empties, an added directory, and a moved file's mode.
+/// delete and an add, a directory the merge empties, an added directory, a moved file's mode, and
+/// the mode of a file below a directory renamed only in case.
 #[tokio::test]
 async fn a_fast_forward_merge_stores_the_tree_a_commit_stores() {
     run(|repository| async move {
         let base = base(&repository).await;
         let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
-        let cases: [&[Edit]; 9] = [
+        let cases: [&[Edit]; 10] = [
             &[Edit::Write("Dir/Sub/c.txt", 2), Edit::Write("File.txt", 4)],
             &[Edit::Move("Dir/a.txt", "Dir/Sub/a.txt")],
             &[Edit::Move("File.txt", "file.txt")],
@@ -1177,6 +1276,7 @@ async fn a_fast_forward_merge_stores_the_tree_a_commit_stores() {
                 Edit::Move("File.txt", "Moved.txt"),
                 Edit::Chmod("Moved.txt", 0o755),
             ],
+            &[RENAME_SUB, Edit::Chmod("Dir/sub/c.txt", 0o755)],
         ];
         for edits in cases {
             assert_merge_stores_a_commit(&repository, base, target, edits).await;
@@ -1351,15 +1451,20 @@ async fn a_case_only_move_of_a_directory_alone_in_its_directory_takes_its_new_na
 }
 
 /// An edit of a file the target moves onto a path the source also changed conflicts where the file
-/// stood and where the move put it, as it does with no move: the edit cannot follow the move.
+/// stood and where the move put it, as it does with no move: the edit cannot follow the move. A
+/// rename of the directory that only changes case, which the move moves within or into, leaves the
+/// path the source changed in the source's spelling where the source renames, and the move's
+/// destination in the target's where the target does.
 #[tokio::test]
 async fn an_edit_against_a_move_onto_a_path_the_source_changed_conflicts_at_both() {
     run(|repository| async move {
-        for (source, target, conflicts) in [
+        let renamed = vec!["Move Dir/sub <- Dir/Sub"];
+        for (source, target, changes, conflicts) in [
             (
                 vec![Edit::Write("Dir/a.txt", 2), Edit::Add("Dir/z.txt", 5)],
                 vec![Edit::Move("Dir/a.txt", "Dir/z.txt")],
-                ["Dir/a.txt", "Dir/z.txt"],
+                vec![],
+                vec![("Dir/a.txt", "Dir/a.txt"), ("Dir/z.txt", "Dir/z.txt")],
             ),
             (
                 vec![Edit::Write("Dir/a.txt", 2), Edit::Write("Dir/b.txt", 3)],
@@ -1368,18 +1473,57 @@ async fn an_edit_against_a_move_onto_a_path_the_source_changed_conflicts_at_both
                     Edit::Delete("Dir/b.txt"),
                     Edit::Move("Dir/a.txt", "Dir/b.txt"),
                 ],
-                ["Dir/a.txt", "Dir/b.txt"],
+                vec![],
+                vec![("Dir/a.txt", "Dir/a.txt"), ("Dir/b.txt", "Dir/b.txt")],
+            ),
+            (
+                vec![
+                    RENAME_SUB,
+                    Edit::Write("Dir/sub/c.txt", 2),
+                    Edit::Add("Dir/sub/d.txt", 5),
+                ],
+                vec![Edit::Move("Dir/Sub/c.txt", "Dir/Sub/d.txt")],
+                renamed.clone(),
+                vec![
+                    ("Dir/sub/c.txt", "Dir/Sub/d.txt"),
+                    ("Dir/sub/d.txt", "Dir/sub/d.txt"),
+                ],
+            ),
+            (
+                vec![
+                    RENAME_SUB,
+                    Edit::Write("File.txt", 2),
+                    Edit::Add("Dir/sub/File.txt", 5),
+                ],
+                vec![Edit::Move("File.txt", "Dir/Sub/File.txt")],
+                renamed.clone(),
+                vec![
+                    ("Dir/sub/File.txt", "Dir/sub/File.txt"),
+                    ("File.txt", "Dir/Sub/File.txt"),
+                ],
+            ),
+            (
+                vec![
+                    Edit::Write("Dir/Sub/c.txt", 2),
+                    Edit::Add("Dir/Sub/d.txt", 5),
+                ],
+                vec![RENAME_SUB, Edit::Move("Dir/sub/c.txt", "Dir/sub/d.txt")],
+                vec![],
+                vec![
+                    ("Dir/Sub/c.txt", "Dir/sub/d.txt"),
+                    ("Dir/sub/d.txt", "Dir/sub/d.txt"),
+                ],
             ),
         ] {
-            let (changes, mut paired) = outcome(&diff(&repository, &source, &target).await);
+            let (found, mut paired) = outcome(&diff(&repository, &source, &target).await);
             paired.sort();
             assert_eq!(
-                (changes, paired),
+                (found, paired),
                 (
-                    vec![],
+                    changes.iter().map(|change| change.to_string()).collect(),
                     conflicts
                         .iter()
-                        .map(|path| (path.to_string(), path.to_string()))
+                        .map(|(source, target)| (source.to_string(), target.to_string()))
                         .collect()
                 ),
                 "{source:?} against {target:?}"
@@ -1452,6 +1596,743 @@ async fn a_directory_delete_against_a_case_only_rename_conflicts_on_the_director
     .await;
 }
 
+/// The case-only rename of `Dir/Sub` the tests below make on one side.
+const RENAME_SUB: Edit = Edit::Move("Dir/Sub", "Dir/sub");
+
+/// What the tests below make on either side of [`RENAME_SUB`]: the file the renaming side edits,
+/// where the other side moves that file from and to, and where the merged tree holds it. The moves
+/// take the file out of the directory's old spelling or into it.
+const ACROSS_THE_RENAME: [(&str, &str, &str, &str); 3] = [
+    (
+        "Dir/sub/c.txt",
+        "Dir/Sub/c.txt",
+        "Dir/Sub/d.txt",
+        "Dir/sub/d.txt",
+    ),
+    ("Dir/sub/c.txt", "Dir/Sub/c.txt", "Dir/d.txt", "Dir/d.txt"),
+    (
+        "File.txt",
+        "File.txt",
+        "Dir/Sub/File.txt",
+        "Dir/sub/File.txt",
+    ),
+];
+
+/// An edit of a file on the side that renames a directory only in case, against the other side's
+/// move of the file out of the directory or into it, takes the rename, the move and the edit,
+/// whichever side renames: the paths of the merged tree are those of the three made one after
+/// another, and the moved file holds the edit.
+#[tokio::test]
+async fn an_edit_against_a_move_across_a_case_only_rename_takes_all() {
+    run(|repository| async move {
+        for (edited, from, to, merged_at) in ACROSS_THE_RENAME {
+            let movement = Edit::Move(from, to);
+            for (source, target, version) in [
+                (vec![RENAME_SUB, Edit::Write(edited, 2)], vec![movement], 2),
+                (vec![movement], vec![RENAME_SUB, Edit::Write(edited, 3)], 3),
+            ] {
+                let merged = files(&merge(&repository, &source, &target).await);
+                let expected = files_after(
+                    &repository,
+                    &[
+                        RENAME_SUB,
+                        Edit::Move(edited, merged_at),
+                        Edit::Write(merged_at, version),
+                    ],
+                )
+                .await;
+                let context = format!("{source:?} against {target:?}: {merged:?}");
+                assert!(merged.keys().eq(expected.keys()), "{context}");
+                assert_eq!(
+                    merged.get(merged_at),
+                    Some(&content(version, 0o644)),
+                    "{context}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// Edits of one file on both sides conflict where one side renames a directory only in case and
+/// the other moves the file out of the directory or into it, whichever side renames.
+#[tokio::test]
+async fn edits_against_a_move_across_a_case_only_rename_conflict() {
+    run(|repository| async move {
+        for (edited, from, to, _) in ACROSS_THE_RENAME {
+            let renaming = |version| vec![RENAME_SUB, Edit::Write(edited, version)];
+            let moving = |version| vec![Edit::Move(from, to), Edit::Write(to, version)];
+            for (source, target, conflict) in [
+                (renaming(2), moving(3), (edited, to)),
+                (moving(2), renaming(3), (to, edited)),
+            ] {
+                let diff = diff(&repository, &source, &target).await;
+                assert_eq!(
+                    outcome(&diff).1,
+                    vec![(conflict.0.to_string(), conflict.1.to_string())],
+                    "{source:?} against {target:?}: {:?}",
+                    outcome(&diff)
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// The case-only rename of `Dir` the tests below make on one side.
+const RENAME_DIR: Edit = Edit::Move("Dir", "dir");
+
+/// What the tests below make on the two sides where one renames `Dir` only in case and the other
+/// `Dir/Sub`: the edits of the side that edits a file, those of the side that moves it into
+/// `Dir/Sub` or within it, and the file and where the move puts it, both in the merged spelling.
+type NestedRenames = ([Edit; 2], [Edit; 2], &'static str, &'static str);
+
+/// The edits [`NestedRenames`] describes, for each side renaming either directory.
+const NESTED_RENAMES: [NestedRenames; 4] = [
+    (
+        [RENAME_SUB, Edit::Write("File.txt", 2)],
+        [RENAME_DIR, Edit::Move("File.txt", "dir/Sub/File.txt")],
+        "File.txt",
+        "dir/sub/File.txt",
+    ),
+    (
+        [RENAME_SUB, Edit::Write("Dir/sub/c.txt", 2)],
+        [RENAME_DIR, Edit::Move("dir/Sub/c.txt", "dir/Sub/d.txt")],
+        "dir/sub/c.txt",
+        "dir/sub/d.txt",
+    ),
+    (
+        [RENAME_DIR, Edit::Write("File.txt", 2)],
+        [RENAME_SUB, Edit::Move("File.txt", "Dir/sub/File.txt")],
+        "File.txt",
+        "dir/sub/File.txt",
+    ),
+    (
+        [RENAME_DIR, Edit::Write("dir/Sub/c.txt", 2)],
+        [RENAME_SUB, Edit::Move("Dir/sub/c.txt", "Dir/sub/d.txt")],
+        "dir/sub/c.txt",
+        "dir/sub/d.txt",
+    ),
+];
+
+/// An edit on one side against the other side's move of the file into `Dir/Sub` or within it, where
+/// one side renames `Dir` only in case and the other `Dir/Sub`, whichever side renames which and
+/// whichever side edits: the moved file stands below both new spellings, with the edit, and no
+/// change and no path of the merged tree spells either old one.
+#[tokio::test]
+async fn an_edit_against_a_move_across_nested_case_only_renames_takes_all() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        for (editing, moving, edited, merged_at) in NESTED_RENAMES {
+            let expected = tree_on(
+                &repository,
+                base,
+                &[
+                    RENAME_DIR,
+                    Edit::Move("dir/Sub", "dir/sub"),
+                    Edit::Move(edited, merged_at),
+                    Edit::Write(merged_at, 2),
+                ],
+            )
+            .await;
+            for (source, target) in [(editing, moving), (moving, editing)] {
+                let diff = diff(&repository, &source, &target).await;
+                assert_merged_spelling(&repository, &diff, &expected, merged_at, &["Dir", "Sub"])
+                    .await;
+            }
+        }
+    })
+    .await;
+}
+
+/// An edit below directories each side renames only in case, one side `Dir` and the other
+/// `Dir/Sub`, stands below both new spellings, whichever side renames which: the change is the
+/// edit at the merged spelling of the file, of the file where the target holds it.
+#[tokio::test]
+async fn an_edit_below_case_only_renames_on_both_sides_stands_below_both() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let expected = tree_on(
+            &repository,
+            base,
+            &[
+                RENAME_DIR,
+                Edit::Move("dir/Sub", "dir/sub"),
+                Edit::Write("dir/sub/c.txt", 2),
+            ],
+        )
+        .await;
+        for (source, target, changes) in [
+            (
+                vec![RENAME_DIR, Edit::Write("dir/Sub/c.txt", 2)],
+                vec![RENAME_SUB],
+                ["Move dir <- Dir", "Keep dir/sub/c.txt <- Dir/sub/c.txt"],
+            ),
+            (
+                vec![RENAME_SUB, Edit::Write("Dir/sub/c.txt", 2)],
+                vec![RENAME_DIR],
+                [
+                    "Move dir/sub <- dir/Sub",
+                    "Keep dir/sub/c.txt <- dir/Sub/c.txt",
+                ],
+            ),
+        ] {
+            let diff = diff(&repository, &source, &target).await;
+            assert_eq!(
+                outcome(&diff),
+                (
+                    changes.iter().map(|change| change.to_string()).collect(),
+                    vec![]
+                ),
+                "{source:?} against {target:?}"
+            );
+            assert_merged_spelling(
+                &repository,
+                &diff,
+                &expected,
+                "dir/sub/c.txt",
+                &["Dir", "Sub"],
+            )
+            .await;
+        }
+    })
+    .await;
+}
+
+/// [`base`] with a directory `Deep` in `Dir/Sub`, holding `e.txt` at version 1.
+async fn deep_base(repository: &Arc<RepositoryContext>) -> Hash {
+    let base = base(repository).await;
+    let state = revision_state(repository, base).await;
+    let sub = node_at(repository, &state, "Dir/Sub").await;
+    let deep = add(&state, repository.clone(), sub, directory("Deep"), "Deep").await;
+    add(
+        &state,
+        repository.clone(),
+        deep,
+        file_at("e.txt", 1),
+        "e.txt",
+    )
+    .await;
+    commit(repository, &state, base, branch_id()).await
+}
+
+/// Three directories, one inside the next, renamed only in case on alternating sides: one side
+/// renames `Dir` and `Dir/Sub/Deep`, the other `Dir/Sub`. An edit of a file in `Deep` on one side
+/// stands below the three new spellings, where the other side only renames and where it moves the
+/// file within `Deep`, whichever side edits.
+#[tokio::test]
+async fn an_edit_below_case_only_renames_alternating_over_three_levels_stands_below_all() {
+    run(|repository| async move {
+        let base = deep_base(&repository).await;
+        let outer = [RENAME_DIR, Edit::Move("dir/Sub/Deep", "dir/Sub/deep")];
+        let inner = [RENAME_SUB];
+        let renames = [
+            RENAME_DIR,
+            Edit::Move("dir/Sub", "dir/sub"),
+            Edit::Move("dir/sub/Deep", "dir/sub/deep"),
+        ];
+        for (editing, other, merged_at) in [
+            (
+                [&outer[..], &[Edit::Write("dir/Sub/deep/e.txt", 2)]].concat(),
+                vec![RENAME_SUB],
+                "dir/sub/deep/e.txt",
+            ),
+            (
+                [&inner[..], &[Edit::Write("Dir/sub/Deep/e.txt", 2)]].concat(),
+                outer.to_vec(),
+                "dir/sub/deep/e.txt",
+            ),
+            (
+                [&outer[..], &[Edit::Write("dir/Sub/deep/e.txt", 2)]].concat(),
+                [
+                    &inner[..],
+                    &[Edit::Move("Dir/sub/Deep/e.txt", "Dir/sub/Deep/f.txt")],
+                ]
+                .concat(),
+                "dir/sub/deep/f.txt",
+            ),
+            (
+                [&inner[..], &[Edit::Write("Dir/sub/Deep/e.txt", 2)]].concat(),
+                [
+                    &outer[..],
+                    &[Edit::Move("dir/Sub/deep/e.txt", "dir/Sub/deep/f.txt")],
+                ]
+                .concat(),
+                "dir/sub/deep/f.txt",
+            ),
+        ] {
+            let mut edits = renames.to_vec();
+            if merged_at != "dir/sub/deep/e.txt" {
+                edits.push(Edit::Move("dir/sub/deep/e.txt", merged_at));
+            }
+            edits.push(Edit::Write(merged_at, 2));
+            let expected = tree_on(&repository, base, &edits).await;
+            for (source, target) in [(&editing, &other), (&other, &editing)] {
+                let source_revision = edited(&repository, base, source).await;
+                let target_revision = edited(&repository, base, target).await;
+                let diff = diff3_collect(
+                    repository.clone(),
+                    base,
+                    source_revision,
+                    target_revision,
+                    None,
+                    false,
+                )
+                .await
+                .expect("diffing the revisions");
+                assert_merged_spelling(
+                    &repository,
+                    &diff,
+                    &expected,
+                    merged_at,
+                    &["Dir", "Sub", "Deep"],
+                )
+                .await;
+            }
+        }
+    })
+    .await;
+}
+
+/// An edit of a file against the other side's rename of its directory that only changes case,
+/// where that side also deleted the file and added it again with the same content, follows the
+/// rename with no conflict, as it merges where no rename comes with it: the file stands below the
+/// new spelling with the edit.
+#[tokio::test]
+async fn an_edit_against_a_case_only_rename_that_adds_the_file_again_follows_the_rename() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let deleted = edited(
+            &repository,
+            base,
+            &[RENAME_SUB, Edit::Delete("Dir/sub/c.txt")],
+        )
+        .await;
+        let target = edited(&repository, deleted, &[Edit::Add("Dir/sub/c.txt", 1)]).await;
+        let source = edited(&repository, base, &[Edit::Write("Dir/Sub/c.txt", 2)]).await;
+        let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+            .await
+            .expect("diffing the revisions");
+        assert_eq!(
+            outcome(&diff),
+            (
+                vec!["Keep Dir/sub/c.txt <- Dir/sub/c.txt".to_string()],
+                vec![]
+            )
+        );
+        let merged = files(
+            &contents(
+                &repository,
+                &*revision_state(&repository, apply(&repository, &diff).await).await,
+            )
+            .await,
+        );
+        assert_eq!(
+            merged.get("Dir/sub/c.txt"),
+            Some(&content(2, 0o644)),
+            "{merged:?}"
+        );
+    })
+    .await;
+}
+
+/// A file deleted and added again with the content it held, below a directory the same side renames
+/// only in case, is no change, as it is no change where no rename comes with it: the diff lists
+/// nothing of it, whichever side makes it. The other side's change of the file merges with the
+/// rename, an edit where that side renames `Dir/Sub` only in case as well and a move within the
+/// renamed directory.
+#[tokio::test]
+async fn a_file_added_again_below_a_case_only_rename_is_no_change() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        for (renaming, added_at, other, expected_edits, at, changes) in [
+            (
+                RENAME_DIR,
+                "dir/Sub/c.txt",
+                vec![RENAME_SUB, Edit::Write("Dir/sub/c.txt", 2)],
+                vec![
+                    RENAME_DIR,
+                    Edit::Move("dir/Sub", "dir/sub"),
+                    Edit::Write("dir/sub/c.txt", 2),
+                ],
+                "dir/sub/c.txt",
+                [
+                    &["Move dir <- Dir"][..],
+                    &[
+                        "Move dir/sub <- dir/Sub",
+                        "Keep dir/sub/c.txt <- dir/Sub/c.txt",
+                    ],
+                ],
+            ),
+            (
+                RENAME_SUB,
+                "Dir/sub/c.txt",
+                vec![Edit::Move("Dir/Sub/c.txt", "Dir/Sub/d.txt")],
+                vec![RENAME_SUB, Edit::Move("Dir/sub/c.txt", "Dir/sub/d.txt")],
+                "Dir/sub/d.txt",
+                [
+                    &["Move Dir/sub <- Dir/Sub"][..],
+                    &["Move Dir/sub/d.txt <- Dir/sub/c.txt"],
+                ],
+            ),
+        ] {
+            let deleted = edited(&repository, base, &[renaming, Edit::Delete(added_at)]).await;
+            let added_again = edited(&repository, deleted, &[Edit::Add(added_at, 1)]).await;
+            let other = edited(&repository, base, &other).await;
+            let expected = tree_on(&repository, base, &expected_edits).await;
+            for ((source, target), changes) in [(added_again, other), (other, added_again)]
+                .into_iter()
+                .zip(changes)
+            {
+                let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+                    .await
+                    .expect("diffing the revisions");
+                assert_eq!(
+                    outcome(&diff),
+                    (
+                        changes.iter().map(|change| change.to_string()).collect(),
+                        vec![]
+                    )
+                );
+                assert_merged_spelling(&repository, &diff, &expected, at, &[]).await;
+            }
+        }
+    })
+    .await;
+}
+
+/// Renames of one directory to different spellings that only change case conflict, and edits of a
+/// file below it on both sides conflict as well. An edit on one side alone leaves the directory's
+/// conflict, the target's standing in the target and the source's at the source's spelling. An
+/// edit on the source's side against the target's move of the file, within the directory or out of
+/// it, waits for the directory's conflict, and so does a move on the source's side against the
+/// target's edit: the two conflict, as the merged tree spells the directory neither way.
+#[tokio::test]
+async fn renames_of_a_directory_to_different_spellings_conflict() {
+    run(|repository| async move {
+        let other = Edit::Move("Dir/Sub", "Dir/SUB");
+        let directories = ("Dir/sub", "Dir/SUB");
+        for (source, target, changes, conflicts) in [
+            (
+                vec![RENAME_SUB, Edit::Write("Dir/sub/c.txt", 2)],
+                vec![other, Edit::Write("Dir/SUB/c.txt", 3)],
+                vec![],
+                vec![directories, ("Dir/sub/c.txt", "Dir/SUB/c.txt")],
+            ),
+            (
+                vec![RENAME_SUB, Edit::Write("Dir/sub/c.txt", 2)],
+                vec![other],
+                vec!["Keep Dir/sub/c.txt <- Dir/SUB/c.txt"],
+                vec![directories],
+            ),
+            (
+                vec![RENAME_SUB],
+                vec![other, Edit::Write("Dir/SUB/c.txt", 3)],
+                vec![],
+                vec![directories],
+            ),
+            (
+                vec![RENAME_SUB, Edit::Write("Dir/sub/c.txt", 2)],
+                vec![other, Edit::Move("Dir/SUB/c.txt", "Dir/SUB/d.txt")],
+                vec!["Add Dir/SUB/d.txt <- Dir/SUB/d.txt"],
+                vec![directories, ("Dir/sub/c.txt", "Dir/SUB/d.txt")],
+            ),
+            (
+                vec![RENAME_SUB, Edit::Write("Dir/sub/c.txt", 2)],
+                vec![other, Edit::Move("Dir/SUB/c.txt", "Dir/d.txt")],
+                vec![],
+                vec![directories, ("Dir/sub/c.txt", "Dir/d.txt")],
+            ),
+            (
+                vec![RENAME_SUB, Edit::Move("Dir/sub/c.txt", "Dir/sub/d.txt")],
+                vec![other, Edit::Write("Dir/SUB/c.txt", 3)],
+                vec![],
+                vec![directories, ("Dir/sub/d.txt", "Dir/SUB/c.txt")],
+            ),
+        ] {
+            assert_eq!(
+                outcome(&diff(&repository, &source, &target).await),
+                (
+                    changes.iter().map(|change| change.to_string()).collect(),
+                    conflicts
+                        .iter()
+                        .map(|(source, target)| (source.to_string(), target.to_string()))
+                        .collect()
+                ),
+                "{source:?} against {target:?}"
+            );
+        }
+    })
+    .await;
+}
+
+/// The same rename that only changes case, of a directory or of a file, on both sides is one move,
+/// where one side also renames a directory above it only in case, whichever side does and whether
+/// or not the diff lists the changes the two sides make alike: the merge takes both renames with no
+/// conflict, and a move within the directory on one side still takes the other side's edit.
+#[tokio::test]
+async fn the_same_case_only_rename_below_another_rename_merges() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        let both = [RENAME_DIR, Edit::Move("dir/Sub", "dir/sub")];
+        for (renaming_both, renaming_one, expected_edits, at, stale) in [
+            (
+                both.to_vec(),
+                vec![RENAME_SUB],
+                both.to_vec(),
+                "dir/sub/c.txt",
+                &["Dir", "Sub"][..],
+            ),
+            (
+                [&both[..], &[Edit::Write("dir/sub/c.txt", 2)]].concat(),
+                vec![RENAME_SUB, Edit::Move("Dir/sub/c.txt", "Dir/sub/d.txt")],
+                [
+                    &both[..],
+                    &[
+                        Edit::Move("dir/sub/c.txt", "dir/sub/d.txt"),
+                        Edit::Write("dir/sub/d.txt", 2),
+                    ],
+                ]
+                .concat(),
+                "dir/sub/d.txt",
+                &["Dir", "Sub"],
+            ),
+            (
+                vec![RENAME_DIR, Edit::Move("dir/a.txt", "dir/A.txt")],
+                vec![Edit::Move("Dir/a.txt", "Dir/A.txt")],
+                vec![RENAME_DIR, Edit::Move("dir/a.txt", "dir/A.txt")],
+                "dir/A.txt",
+                &["Dir", "a.txt"],
+            ),
+        ] {
+            let expected = tree_on(&repository, base, &expected_edits).await;
+            for (source, target) in [
+                (&renaming_both, &renaming_one),
+                (&renaming_one, &renaming_both),
+            ] {
+                for include_same in [false, true] {
+                    let diff = diff_with(&repository, source, target, include_same).await;
+                    assert_merged_spelling(&repository, &diff, &expected, at, stale).await;
+                }
+            }
+        }
+    })
+    .await;
+}
+
+/// The same move of a file on both sides, within `Dir/Sub` or into it, is one move where one side
+/// also renames `Dir` or `Dir/Sub` above the destination only in case, whichever side renames and
+/// whether or not the diff lists the changes the two sides make alike: the merge takes the rename
+/// and the move with no conflict. Where the target renames and the diff lists no alike changes, it
+/// lists nothing at the destination.
+#[tokio::test]
+async fn the_same_move_below_a_case_only_rename_on_one_side_merges() {
+    run(|repository| async move {
+        let base = base(&repository).await;
+        for (rename, (dir, sub), stale) in [
+            (RENAME_DIR, ("dir", "Sub"), "Dir"),
+            (RENAME_SUB, ("Dir", "sub"), "Sub"),
+        ] {
+            let at = |name: &str| leaked(format!("{dir}/{sub}/{name}"));
+            for (from, name) in [("Dir/Sub/c.txt", "d.txt"), ("File.txt", "File.txt")] {
+                let renaming = [
+                    rename,
+                    Edit::Move(
+                        leaked(from.replace("Dir/Sub", &format!("{dir}/{sub}"))),
+                        at(name),
+                    ),
+                ];
+                let moving = [Edit::Move(from, leaked(format!("Dir/Sub/{name}")))];
+                let expected = tree_on(&repository, base, &renaming).await;
+                for (source, target) in [(&renaming[..], &moving[..]), (&moving[..], &renaming[..])]
+                {
+                    for include_same in [false, true] {
+                        let diff = diff_with(&repository, source, target, include_same).await;
+                        assert_merged_spelling(&repository, &diff, &expected, at(name), &[stale])
+                            .await;
+                        let changes = outcome(&diff).0;
+                        let folded = at(name).to_lowercase();
+                        assert!(
+                            include_same
+                                || std::ptr::eq(source.as_ptr(), renaming.as_ptr())
+                                || !changes
+                                    .iter()
+                                    .any(|change| change.to_lowercase().contains(&folded)),
+                            "the target's own change stands at {folded}: {changes:?}"
+                        );
+                    }
+                }
+            }
+        }
+    })
+    .await;
+}
+
+/// Two adds at one place below a directory the two sides rename only in case to different names,
+/// with the directory below it renamed alike, conflict at the add as well as at the renames, whether
+/// or not the diff lists the changes the two sides make alike: the target's add is found where the
+/// target's tree spells the path.
+#[tokio::test]
+async fn adds_at_one_place_below_conflicting_case_only_renames_conflict() {
+    run(|repository| async move {
+        let renaming = |dir: &'static str, version| {
+            [
+                Edit::Move("Dir", dir),
+                Edit::Move(leaked(format!("{dir}/Sub")), leaked(format!("{dir}/sub"))),
+                Edit::Add(leaked(format!("{dir}/sub/new.txt")), version),
+            ]
+        };
+        let (lower, upper) = (renaming("dir", 2), renaming("DIR", 3));
+        for (source, target) in [(&lower, &upper), (&upper, &lower)] {
+            for include_same in [false, true] {
+                let diff = diff_with(&repository, source, target, include_same).await;
+                let (changes, conflicts) = outcome(&diff);
+                let context = format!("include_same {include_same}: {changes:?} {conflicts:?}");
+                assert!(
+                    !changes.iter().any(|change| change.contains("new.txt")),
+                    "{context}"
+                );
+                let conflicts_at = |name: &str| {
+                    conflicts.iter().any(|(source, target)| {
+                        source.to_lowercase().ends_with(name)
+                            && target.to_lowercase().ends_with(name)
+                    })
+                };
+                assert!(conflicts_at("dir") && conflicts_at("/new.txt"), "{context}");
+            }
+        }
+    })
+    .await;
+}
+
+/// An add on each side at one place below directories renamed only in case conflicts, whether or
+/// not the diff lists the changes the two sides make alike: where the source renames `Dir` and
+/// `Dir/Sub` and the target neither, where each side renames one of the two, where both rename
+/// `Dir` alike and the source `Dir/Sub` too, and where the add stands in `Dir` while the source
+/// renames both and the target `Dir/Sub` alike.
+#[tokio::test]
+async fn adds_at_one_place_below_nested_case_only_renames_conflict() {
+    run(|repository| async move {
+        let both = [RENAME_DIR, Edit::Move("dir/Sub", "dir/sub")];
+        for (source, target) in [
+            (
+                [&both[..], &[Edit::Add("dir/sub/new.txt", 2)]].concat(),
+                vec![Edit::Add("Dir/Sub/new.txt", 3)],
+            ),
+            (
+                vec![Edit::Add("Dir/Sub/new.txt", 2)],
+                [&both[..], &[Edit::Add("dir/sub/new.txt", 3)]].concat(),
+            ),
+            (
+                vec![RENAME_DIR, Edit::Add("dir/Sub/new.txt", 2)],
+                vec![RENAME_SUB, Edit::Add("Dir/sub/new.txt", 3)],
+            ),
+            (
+                vec![RENAME_SUB, Edit::Add("Dir/sub/new.txt", 2)],
+                vec![RENAME_DIR, Edit::Add("dir/Sub/new.txt", 3)],
+            ),
+            (
+                [&both[..], &[Edit::Add("dir/sub/new.txt", 2)]].concat(),
+                vec![RENAME_DIR, Edit::Add("dir/Sub/new.txt", 3)],
+            ),
+            (
+                vec![RENAME_DIR, Edit::Add("dir/Sub/new.txt", 2)],
+                [&both[..], &[Edit::Add("dir/sub/new.txt", 3)]].concat(),
+            ),
+            (
+                [&both[..], &[Edit::Add("dir/new.txt", 2)]].concat(),
+                vec![RENAME_SUB, Edit::Add("Dir/new.txt", 3)],
+            ),
+            (
+                vec![RENAME_SUB, Edit::Add("Dir/new.txt", 2)],
+                [&both[..], &[Edit::Add("dir/new.txt", 3)]].concat(),
+            ),
+        ] {
+            for include_same in [false, true] {
+                let diff = diff_with(&repository, &source, &target, include_same).await;
+                let (changes, conflicts) = outcome(&diff);
+                let context = format!(
+                    "{source:?} against {target:?}, include_same {include_same}: {changes:?} \
+                     {conflicts:?}"
+                );
+                assert!(
+                    !changes.iter().any(|change| change.contains("new.txt")),
+                    "{context}"
+                );
+                assert!(
+                    matches!(
+                        &conflicts[..],
+                        [(source, target)] if source.ends_with("/new.txt") && target.ends_with("/new.txt")
+                    ),
+                    "{context}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
+/// Where the source changes so much that the 3-way diff walks the target unfiltered, an edit below
+/// a directory one side renames only in case, against the other side's move of the file, is still
+/// one change of the file, whichever side renames.
+#[tokio::test]
+async fn an_edit_below_a_case_only_rename_against_a_move_is_one_change_without_the_target_filter() {
+    run(|repository| async move {
+        let movement = Edit::Move("Dir/Sub/c.txt", "Dir/Sub/d.txt");
+        for (source, target, changes, version) in [
+            (
+                vec![
+                    Edit::Bulk(10_000),
+                    RENAME_SUB,
+                    Edit::Write("Dir/sub/c.txt", 2),
+                ],
+                vec![movement],
+                vec![
+                    "Move Dir/sub <- Dir/Sub",
+                    "Keep Dir/sub/d.txt <- Dir/Sub/d.txt",
+                ],
+                2,
+            ),
+            (
+                vec![Edit::Bulk(10_000), movement],
+                vec![RENAME_SUB, Edit::Write("Dir/sub/c.txt", 3)],
+                vec!["Move Dir/sub/d.txt <- Dir/sub/c.txt"],
+                3,
+            ),
+        ] {
+            let diff = diff(&repository, &source, &target).await;
+            let (found, conflicts) = outcome(&diff);
+            let found: Vec<String> = found
+                .into_iter()
+                .filter(|change| !change.contains("Bulk"))
+                .collect();
+            let context = format!("{source:?} against {target:?}");
+            assert_eq!(
+                (found, conflicts),
+                (
+                    changes.iter().map(|change| change.to_string()).collect(),
+                    vec![]
+                ),
+                "{context}"
+            );
+            let merged = files(
+                &contents(
+                    &repository,
+                    &*revision_state(&repository, apply(&repository, &diff).await).await,
+                )
+                .await,
+            );
+            assert_eq!(
+                merged.get("Dir/sub/d.txt"),
+                Some(&content(version, 0o644)),
+                "{context}"
+            );
+            assert!(!merged.contains_key("Dir/sub/c.txt"), "{context}");
+        }
+    })
+    .await;
+}
+
 /// Edits against several moves on the other side each follow their move, however the paths the
 /// moves put the files at sort among the source's changes.
 #[tokio::test]
@@ -1477,8 +2358,8 @@ async fn edits_against_several_moves_each_follow_their_move() {
     .await;
 }
 
-/// A link to the root of the revision `pin` of the repository the link at `Mount` points into.
-fn link_to(pin: Hash) -> Node {
+/// A link named `Mount` to the root of the revision `pin` of the repository `linked`.
+fn link_to(linked: uuid::Uuid, pin: Hash) -> Node {
     Node {
         flags: NodeFlags::Link.bits(),
         mode: 0o755,
@@ -1486,13 +2367,23 @@ fn link_to(pin: Hash) -> Node {
         child: ROOT_NODE,
         address: Address {
             hash: pin,
-            context: Context::from(MOUNT_REPOSITORY),
+            context: Context::from(linked),
         },
         ..Default::default()
     }
 }
 
-/// A revision of the repository the link at `Mount` points into, holding `l.txt` and `name`.
+/// The repository a test's links point into: one of its own, as a commit uploading what another
+/// test's commit to the same repository uploads at the same time waits on that upload, which goes
+/// to the other test's store.
+async fn linked_repository(
+    repository: &Arc<RepositoryContext>,
+) -> (uuid::Uuid, Arc<RepositoryContext>) {
+    let id = uuid::Uuid::now_v7();
+    (id, repository.to_link_context(RepositoryId::from(id)).await)
+}
+
+/// A revision of the repository `linked`, holding `l.txt` and `name`.
 async fn linked_revision(linked: &Arc<RepositoryContext>, name: &str) -> Hash {
     let state = State::new();
     for name in ["l.txt", name] {
@@ -1504,7 +2395,17 @@ async fn linked_revision(linked: &Arc<RepositoryContext>, name: &str) -> Hash {
 /// The revision renaming the link of `base` at `Mount` to `mount` and pinning it to `pin`.
 async fn renamed_and_pinned(repository: &Arc<RepositoryContext>, base: Hash, pin: Hash) -> Hash {
     let state = revision_state(repository, base).await;
-    let link = node_at(repository, &state, "Mount").await;
+    stage_renamed_and_pinned(repository, &state, LinkPin::Revision(pin)).await;
+    commit(repository, &state, base, branch_id()).await
+}
+
+/// Renames the link of `state` at `Mount` to `mount` and gives it `pin`, staged.
+async fn stage_renamed_and_pinned(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    pin: LinkPin,
+) {
+    let link = node_at(repository, state, "Mount").await;
     state
         .node_move_staged(
             repository.clone(),
@@ -1517,11 +2418,7 @@ async fn renamed_and_pinned(repository: &Arc<RepositoryContext>, base: Hash, pin
         .await
         .expect("renaming the link");
     state
-        .node_set_link_target(
-            repository,
-            link,
-            lore_revision::state::LinkPin::Revision(pin),
-        )
+        .node_set_link_target(repository, link, pin)
         .await
         .expect("pinning the link");
     state
@@ -1535,7 +2432,6 @@ async fn renamed_and_pinned(repository: &Arc<RepositoryContext>, base: Hash, pin
         )
         .await
         .expect("staging the pin");
-    commit(repository, &state, base, branch_id()).await
 }
 
 /// The same rename of a link that only changes case on both sides conflicts where the two pin it to
@@ -1544,9 +2440,7 @@ async fn renamed_and_pinned(repository: &Arc<RepositoryContext>, base: Hash, pin
 #[tokio::test]
 async fn the_same_case_only_rename_of_a_link_conflicts_where_the_pins_differ() {
     run(|repository| async move {
-        let linked = repository
-            .to_link_context(RepositoryId::from(MOUNT_REPOSITORY))
-            .await;
+        let (id, linked) = linked_repository(&repository).await;
         let base_pin = linked_revision(&linked, "base.txt").await;
         let (source_pin, target_pin) = (
             linked_revision(&linked, "x.txt").await,
@@ -1557,7 +2451,7 @@ async fn the_same_case_only_rename_of_a_link_conflicts_where_the_pins_differ() {
             &state,
             repository.clone(),
             ROOT_NODE,
-            link_to(base_pin),
+            link_to(id, base_pin),
             "Mount",
         )
         .await;
@@ -1580,4 +2474,716 @@ async fn the_same_case_only_rename_of_a_link_conflicts_where_the_pins_differ() {
         }
     })
     .await;
+}
+
+/// The walk of `repository` from `from` to `to`.
+async fn walk(
+    repository: &Arc<RepositoryContext>,
+    from: Arc<State>,
+    to: Arc<State>,
+) -> Vec<NodeChange> {
+    diff_collect(
+        repository.clone(),
+        from,
+        repository.clone(),
+        to,
+        None,
+        FilterMode::Full,
+    )
+    .await
+    .expect("walking the revisions")
+}
+
+/// A link below a directory renamed only in case, mounting another node of the revision it pins on
+/// the side that renames, is that side's change of the link where the rename put it: the diff lists
+/// it, and a fast-forward merge takes the rename and the mount.
+#[tokio::test]
+async fn a_link_remounted_below_a_case_only_rename_is_a_change() {
+    run(|repository| async move {
+        let (id, linked) = linked_repository(&repository).await;
+        let linked_state = State::new();
+        for name in ["first.txt", "second.txt"] {
+            add(
+                &linked_state,
+                linked.clone(),
+                ROOT_NODE,
+                file_at(name, 4),
+                name,
+            )
+            .await;
+        }
+        let pin = commit(&linked, &linked_state, Hash::default(), branch_id()).await;
+        let pinned = revision_state(&linked, pin).await;
+        let first = node_at(&linked, &pinned, "first.txt").await;
+        let second = node_at(&linked, &pinned, "second.txt").await;
+        let state = revision_state(&repository, base(&repository).await).await;
+        let sub = node_at(&repository, &state, "Dir/Sub").await;
+        let link = Node {
+            name_hash: hash_string("Link"),
+            child: first,
+            ..link_to(id, pin)
+        };
+        add(&state, repository.clone(), sub, link, "Link").await;
+        let base = commit(&repository, &state, base(&repository).await, branch_id()).await;
+        let state =
+            revision_state(&repository, edited(&repository, base, &[RENAME_SUB]).await).await;
+        let link = node_at(&repository, &state, "Dir/sub/Link").await;
+        let address = Address {
+            hash: pin,
+            context: Context::from(id),
+        };
+        state
+            .node_set_link_target(
+                &repository,
+                link,
+                LinkPin::Whole {
+                    address,
+                    child: second,
+                },
+            )
+            .await
+            .expect("mounting another node");
+        state
+            .node_mark(
+                &repository,
+                link,
+                lore_revision::state::Mark::staged_and_dirty(
+                    NodeFlags::StagedModify,
+                    NodeFlags::DirtyModify,
+                ),
+            )
+            .await
+            .expect("staging the mount");
+        let source = commit(&repository, &state, base, branch_id()).await;
+        let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
+        let diff = diff3_collect(repository.clone(), base, source, target, None, false)
+            .await
+            .expect("diffing the revisions");
+        assert_eq!(
+            outcome(&diff),
+            (
+                vec![
+                    "Move Dir/sub <- Dir/Sub".to_string(),
+                    "Keep Dir/sub/Link <- Dir/Sub/Link".to_string(),
+                ],
+                vec![]
+            )
+        );
+        let merged = contents(
+            &repository,
+            &*revision_state(&repository, apply(&repository, &diff).await).await,
+        )
+        .await;
+        assert_eq!(
+            merged.get("Dir/sub/Link").and_then(|link| link.3),
+            Some((Context::from(id), second)),
+            "{merged:?}"
+        );
+    })
+    .await;
+}
+
+/// A link renamed only in case and given another target is one change where the walk does not
+/// descend into the linked repository: pinned to another revision where the reader may not read the
+/// linked repository, mounting another node of the revision it pins, and staged, pinned to the
+/// revision it pins, with nothing staged below it. For the first two, the 3-way diff lists it once
+/// and a fast-forward merge takes the rename and the target.
+#[tokio::test]
+async fn a_link_renamed_only_in_case_and_repinned_is_one_change_where_the_walk_stops_at_it() {
+    run(|repository| async move {
+        let (id, linked) = linked_repository(&repository).await;
+        let pin = linked_revision(&linked, "x.txt").await;
+        let state = State::new();
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            link_to(id, pin),
+            "Mount",
+        )
+        .await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file_at("Other.txt", 1),
+            "Other.txt",
+        )
+        .await;
+        let base = commit(&repository, &state, Hash::default(), branch_id()).await;
+        let target = edited(&repository, base, &[Edit::Write("Other.txt", 3)]).await;
+        let repinned = LinkPin::Revision(linked_revision(&linked, "y.txt").await);
+        let remounted = LinkPin::Whole {
+            address: Address {
+                hash: pin,
+                context: Context::from(id),
+            },
+            child: node_at(&linked, &*revision_state(&linked, pin).await, "x.txt").await,
+        };
+        let unreadable = Arc::new(
+            repository
+                .to_filter_context(repository.filter.clone())
+                .with_link_read(Arc::new(|_| false)),
+        );
+        let renamed = vec!["Move mount <- Mount".to_string()];
+        for (reader, pin) in [(unreadable, repinned), (repository.clone(), remounted)] {
+            let source_state = revision_state(&reader, base).await;
+            stage_renamed_and_pinned(&reader, &source_state, pin).await;
+            let source = commit(&reader, &source_state, base, branch_id()).await;
+            let source_state = revision_state(&reader, source).await;
+            let link = source_state
+                .node(
+                    reader.clone(),
+                    node_at(&reader, &source_state, "mount").await,
+                )
+                .await
+                .expect("reading the link");
+            assert_eq!(
+                walked(&walk(&reader, revision_state(&reader, base).await, source_state).await),
+                renamed
+            );
+            let diff = diff3_collect(reader.clone(), base, source, target, None, false)
+                .await
+                .expect("diffing the revisions");
+            assert_eq!(outcome(&diff), (renamed.clone(), vec![]));
+            let merged = contents(
+                &reader,
+                &*revision_state(&reader, apply(&reader, &diff).await).await,
+            )
+            .await;
+            assert_eq!(
+                merged.get("mount"),
+                Some(&(
+                    link.address.hash,
+                    0,
+                    0o755,
+                    link.mount_source()
+                        .map(|source| (link.address.context, source))
+                ))
+            );
+            assert!(!merged.contains_key("Mount"), "{merged:?}");
+            assert_eq!(merged.get("Other.txt"), Some(&content(3, 0o644)));
+        }
+        let staged = revision_state(&repository, base).await;
+        stage_renamed_and_pinned(&repository, &staged, LinkPin::Revision(pin)).await;
+        assert_eq!(
+            walked(&walk(&repository, revision_state(&repository, base).await, staged).await),
+            renamed
+        );
+    })
+    .await;
+}
+
+/// How one side of a generated case renames `Dir` or `Dir/Sub`: not at all, or only in case to the
+/// lowercase or the uppercase spelling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Respelling {
+    Kept,
+    Lower,
+    Upper,
+}
+
+/// What one side of a generated case does below `Dir/Sub`: nothing, an edit of `c.txt`, an add of
+/// `new.txt`, a delete of `c.txt`, a move of `c.txt` within the directory or out of both, a move
+/// of `File.txt` into the directory, or a rename of `c.txt` only in case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Below {
+    Nothing,
+    Edit,
+    Add,
+    Delete,
+    MoveWithin,
+    MoveOut,
+    MoveIn,
+    RenameFile,
+}
+
+impl Below {
+    /// Every change below `Dir/Sub` a generated case makes.
+    const ALL: [Below; 8] = [
+        Below::Nothing,
+        Below::Edit,
+        Below::Add,
+        Below::Delete,
+        Below::MoveWithin,
+        Below::MoveOut,
+        Below::MoveIn,
+        Below::RenameFile,
+    ];
+
+    /// The edit this makes below `dir/sub`, as the side spells the two, writing and adding content
+    /// `version`.
+    fn edit(self, dir: &str, sub: &str, version: u64) -> Option<Edit> {
+        let at = |name: &str| leaked(format!("{dir}/{sub}/{name}"));
+        match self {
+            Below::Nothing => None,
+            Below::Edit => Some(Edit::Write(at("c.txt"), version)),
+            Below::Add => Some(Edit::Add(at("new.txt"), version)),
+            Below::Delete => Some(Edit::Delete(at("c.txt"))),
+            Below::MoveWithin => Some(Edit::Move(at("c.txt"), at("d.txt"))),
+            Below::MoveOut => Some(Edit::Move(at("c.txt"), "Out.txt")),
+            Below::MoveIn => Some(Edit::Move("File.txt", at("File.txt"))),
+            Below::RenameFile => Some(Edit::Move(at("c.txt"), at("C.txt"))),
+        }
+    }
+
+    /// Whether this moves a file.
+    fn moves(self) -> bool {
+        matches!(
+            self,
+            Below::MoveWithin | Below::MoveOut | Below::MoveIn | Below::RenameFile
+        )
+    }
+
+    /// Whether this moves `c.txt`.
+    fn moves_c(self) -> bool {
+        self.moves() && self != Below::MoveIn
+    }
+
+    /// The names of the files this changes, at either end of a move.
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            Below::Nothing => &[],
+            Below::Edit | Below::Delete => &["c.txt"],
+            Below::Add => &["new.txt"],
+            Below::MoveWithin => &["c.txt", "d.txt"],
+            Below::MoveOut => &["c.txt", "Out.txt"],
+            Below::MoveIn => &["File.txt"],
+            Below::RenameFile => &["c.txt", "C.txt"],
+        }
+    }
+
+    /// Whether what `source` and `target` do below one spelling of `Dir/Sub` conflicts: two adds
+    /// at one path, two edits of `c.txt`, an edit and a delete of it, a delete and a move of it, or
+    /// two moves of it to different places.
+    fn conflicts(source: Below, target: Below) -> bool {
+        match (source, target) {
+            (Below::Add, Below::Add)
+            | (Below::Edit, Below::Edit | Below::Delete)
+            | (Below::Delete, Below::Edit) => true,
+            (Below::Delete, other) | (other, Below::Delete) => other.moves_c(),
+            (lhs, rhs) => lhs != rhs && lhs.moves_c() && rhs.moves_c(),
+        }
+    }
+}
+
+/// One side of a generated case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Side {
+    dir: Respelling,
+    sub: Respelling,
+    below: Below,
+}
+
+/// `path` for the life of the test, as [`Edit`] holds its paths.
+fn leaked(path: String) -> &'static str {
+    Box::leak(path.into_boxed_str())
+}
+
+impl Side {
+    /// The names this side gives `Dir` and `Sub`.
+    fn names(self) -> (&'static str, &'static str) {
+        let dir = match self.dir {
+            Respelling::Kept => "Dir",
+            Respelling::Lower => "dir",
+            Respelling::Upper => "DIR",
+        };
+        let sub = match self.sub {
+            Respelling::Kept => "Sub",
+            Respelling::Lower => "sub",
+            Respelling::Upper => "SUB",
+        };
+        (dir, sub)
+    }
+
+    /// The edits this side makes on the base, writing and adding content `version`.
+    fn edits(self, version: u64) -> Vec<Edit> {
+        let (dir, sub) = self.names();
+        let mut edits = renamed_to(dir, sub);
+        edits.extend(self.below.edit(dir, sub, version));
+        edits
+    }
+}
+
+/// The edits renaming `Dir` to `dir` and `Dir/Sub` to `dir/sub`, where either changes.
+fn renamed_to(dir: &'static str, sub: &'static str) -> Vec<Edit> {
+    let mut edits = Vec::new();
+    if dir != "Dir" {
+        edits.push(Edit::Move("Dir", dir));
+    }
+    if sub != "Sub" {
+        edits.push(Edit::Move(
+            leaked(format!("{dir}/Sub")),
+            leaked(format!("{dir}/{sub}")),
+        ));
+    }
+    edits
+}
+
+/// The edits whose tree a merge of `source` and `target` stores, where nothing conflicts: the
+/// merged renames, then what each side does below them, spelled as the merged tree spells them,
+/// the source's at content 2 and the target's at content 3. A change both sides make is made
+/// once, and the moves come last, so that a move takes the content an edit gives the file.
+fn merged_edits(
+    (dir, sub): (&'static str, &'static str),
+    source: Below,
+    target: Below,
+) -> Vec<Edit> {
+    let mut belows = vec![(source, 2)];
+    if target != source {
+        belows.push((target, 3));
+    }
+    belows.sort_by_key(|(below, _)| below.moves());
+    let mut edits = renamed_to(dir, sub);
+    edits.extend(
+        belows
+            .into_iter()
+            .filter_map(|(below, version)| below.edit(dir, sub, version)),
+    );
+    edits
+}
+
+/// The name a merged tree gives a directory that `source` and `target` name so: the side's that
+/// renames it, or `None` where both rename it to different names.
+fn merged_name(
+    (source, renamed_by_source): (&'static str, bool),
+    (target, renamed_by_target): (&'static str, bool),
+) -> Option<&'static str> {
+    match (renamed_by_source, renamed_by_target) {
+        (true, true) if source != target => None,
+        (true, _) => Some(source),
+        _ => Some(target),
+    }
+}
+
+/// The cross product of how two sides rename `Dir` and `Dir/Sub` only in case, neither, one, or
+/// both alike or to different spellings, and what each does below them. Each case is diffed with
+/// and without the changes the two sides make alike listed, and with the sides exchanged, and each
+/// of the three diffs is checked against what the case expects:
+///
+/// - Where the sides rename a directory to different spellings, the diff conflicts on that
+///   directory. Where the changes below conflict, as [`Below::conflicts`] says, it conflicts at a
+///   path of the files they change. Otherwise it has no conflict. Each of its conflicts stands at
+///   the files the changes below touch, or on a directory the two rename to different spellings.
+/// - A diff with no conflict merges into the tree [`merged_edits`] make on the base: the same
+///   paths, each directory spelled as the side that renames it spells it, and the same content at
+///   every file.
+/// - In a diff with no conflict, no change stands below a directory the merged tree doesn't hold,
+///   and no move or delete other than the target's own takes its node from below a directory the
+///   target's tree doesn't hold.
+/// - Listing the changes the two sides make alike adds only changes that keep or delete their
+///   node, drops only the target's own changes, and leaves the same conflicts, their paths
+///   compared ignoring case.
+///
+/// Every case of the product runs: 25 pairs of renames by 64 pairs of changes below them. A case
+/// that panics fails with its two sides named.
+#[tokio::test]
+async fn merges_below_case_only_renames_keep_their_invariants() {
+    run(|repository| async move {
+        use Respelling::*;
+        let base = base(&repository).await;
+        let renames = [
+            (Kept, Kept),
+            (Lower, Kept),
+            (Kept, Lower),
+            (Lower, Lower),
+            (Lower, Upper),
+        ];
+        let mut cache = Trees::default();
+        let mut failures = Vec::new();
+        for (dir_source, dir_target) in renames {
+            for (sub_source, sub_target) in renames {
+                for source_below in Below::ALL {
+                    for target_below in Below::ALL {
+                        let source = Side {
+                            dir: dir_source,
+                            sub: sub_source,
+                            below: source_below,
+                        };
+                        let target = Side {
+                            dir: dir_target,
+                            sub: sub_target,
+                            below: target_below,
+                        };
+                        let checked = std::panic::AssertUnwindSafe(check_merge_invariants(
+                            &repository,
+                            base,
+                            &mut cache,
+                            (source, target),
+                        ))
+                        .catch_unwind()
+                        .await;
+                        let failure = match checked {
+                            Ok(checked) => checked.err(),
+                            Err(panic) => Some(format!(
+                                "panics: {}",
+                                panic
+                                    .downcast_ref::<String>()
+                                    .map(String::as_str)
+                                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                                    .unwrap_or_default()
+                            )),
+                        };
+                        if let Some(failure) = failure {
+                            failures.push(format!("{source:?} against {target:?}: {failure}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} cases fail:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    })
+    .await;
+}
+
+/// The renames and the changes below them a merge with no conflict stores the tree of.
+type MergedCase = ((&'static str, &'static str), Below, Below);
+
+/// The revisions and the trees [`merges_below_case_only_renames_keep_their_invariants`] builds,
+/// each built once.
+#[derive(Default)]
+struct Trees {
+    revisions: std::collections::HashMap<(Side, u64), Hash>,
+    contents: std::collections::HashMap<Hash, BTreeMap<String, Content>>,
+    merged: std::collections::HashMap<MergedCase, BTreeMap<String, Content>>,
+}
+
+impl Trees {
+    /// The revision `side` makes on `base`, writing and adding content `version`.
+    async fn revision(
+        &mut self,
+        repository: &Arc<RepositoryContext>,
+        base: Hash,
+        side: Side,
+        version: u64,
+    ) -> Hash {
+        if let Some(revision) = self.revisions.get(&(side, version)) {
+            return *revision;
+        }
+        let revision = edited(repository, base, &side.edits(version)).await;
+        self.revisions.insert((side, version), revision);
+        revision
+    }
+
+    /// The tree of `revision`.
+    async fn contents(
+        &mut self,
+        repository: &Arc<RepositoryContext>,
+        revision: Hash,
+    ) -> BTreeMap<String, Content> {
+        if let Some(tree) = self.contents.get(&revision) {
+            return tree.clone();
+        }
+        let tree = contents(repository, &*revision_state(repository, revision).await).await;
+        self.contents.insert(revision, tree.clone());
+        tree
+    }
+
+    /// The tree a merge of `case` stores, as [`merged_edits`] makes it on `base`.
+    async fn merged(
+        &mut self,
+        repository: &Arc<RepositoryContext>,
+        base: Hash,
+        case: MergedCase,
+    ) -> BTreeMap<String, Content> {
+        if let Some(tree) = self.merged.get(&case) {
+            return tree.clone();
+        }
+        let (names, source, target) = case;
+        let tree = tree_on(repository, base, &merged_edits(names, source, target)).await;
+        self.merged.insert(case, tree.clone());
+        tree
+    }
+}
+
+/// What [`merges_below_case_only_renames_keep_their_invariants`] checks of one case: `Err` with
+/// what fails.
+async fn check_merge_invariants(
+    repository: &Arc<RepositoryContext>,
+    base: Hash,
+    trees: &mut Trees,
+    (source, target): (Side, Side),
+) -> Result<(), String> {
+    let source_revision = trees.revision(repository, base, source, 2).await;
+    let target_revision = trees.revision(repository, base, target, 3).await;
+    let diff_of = async |from: Hash, onto: Hash, include_same: bool| {
+        diff3_collect(repository.clone(), base, from, onto, None, include_same)
+            .await
+            .expect("diffing the revisions")
+    };
+    let merged_of = async |diff: &DiffResult| {
+        contents(
+            repository,
+            &*revision_state(repository, apply(repository, diff).await).await,
+        )
+        .await
+    };
+    let without = diff_of(source_revision, target_revision, false).await;
+    let with = diff_of(source_revision, target_revision, true).await;
+    let exchanged = diff_of(target_revision, source_revision, false).await;
+    let (changes, conflicts) = outcome(&without);
+    let (changes_alike, conflicts_alike) = outcome(&with);
+    let context = format!("{changes:?} {conflicts:?}");
+
+    let (source_dir, source_sub) = source.names();
+    let (target_dir, target_sub) = target.names();
+    let dir = merged_name(
+        (source_dir, source.dir != Respelling::Kept),
+        (target_dir, target.dir != Respelling::Kept),
+    );
+    let sub = merged_name(
+        (source_sub, source.sub != Respelling::Kept),
+        (target_sub, target.sub != Respelling::Kept),
+    );
+    let below_conflicts = Below::conflicts(source.below, target.below);
+    let names = [source.below.names(), target.below.names()].concat();
+    for (diff, name) in [
+        (&without, "the diff"),
+        (&with, "the diff listing alike changes"),
+        (&exchanged, "the diff of the sides exchanged"),
+    ] {
+        let conflicts = outcome(diff).1;
+        let conflicts_on = |at: &dyn Fn(&str) -> bool| {
+            conflicts
+                .iter()
+                .any(|(source, target)| at(source) && at(target))
+        };
+        if dir.is_none() && !conflicts_on(&|path| path.to_lowercase() == "dir") {
+            return Err(format!(
+                "{name} has no conflict on Dir: {conflicts:?}: {context}"
+            ));
+        }
+        if dir.is_some() && sub.is_none() && !conflicts_on(&|path| path.to_lowercase() == "dir/sub")
+        {
+            return Err(format!(
+                "{name} has no conflict on Dir/Sub: {conflicts:?}: {context}"
+            ));
+        }
+        let at_files = |path: &str| names.contains(&path.rsplit('/').next().unwrap_or(path));
+        if below_conflicts && !conflicts_on(&at_files) {
+            return Err(format!(
+                "{name} has no conflict at {names:?}: {conflicts:?}: {context}"
+            ));
+        }
+        if dir.is_some() && sub.is_some() && !below_conflicts && !conflicts.is_empty() {
+            return Err(format!("{name} conflicts: {conflicts:?}: {context}"));
+        }
+        let expected_at = |path: &str| {
+            let folded = path.to_lowercase();
+            at_files(path)
+                || (dir.is_none() && folded == "dir")
+                || (sub.is_none() && folded == "dir/sub")
+        };
+        if let Some(stray) = conflicts
+            .iter()
+            .find(|(source, target)| !expected_at(source) || !expected_at(target))
+        {
+            return Err(format!(
+                "{name} conflicts at {stray:?}: {conflicts:?}: {context}"
+            ));
+        }
+    }
+    let sorted = |conflicts: &[(String, String)]| {
+        let mut sorted = conflicts.to_vec();
+        sorted.sort();
+        sorted
+    };
+    let folded = |conflicts: &[(String, String)]| {
+        sorted(
+            &conflicts
+                .iter()
+                .map(|(source, target)| (source.to_lowercase(), target.to_lowercase()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    if folded(&conflicts) != folded(&conflicts_alike) {
+        return Err(format!(
+            "listing alike changes conflicts otherwise: {conflicts_alike:?} against {context}"
+        ));
+    }
+    if let Some(extra) = changes_alike.iter().find(|change| {
+        !changes.contains(change) && !change.starts_with("Keep ") && !change.starts_with("Delete ")
+    }) {
+        return Err(format!("listing alike changes adds {extra}: {context}"));
+    }
+    let is_targets_own = |change: &NodeChange| {
+        change.from.mapping.state.revision() == base
+            && change.to.mapping.state.revision() == target_revision
+    };
+    let targets_own = walked(
+        &without
+            .changes
+            .iter()
+            .filter(|change| is_targets_own(change))
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    if let Some(missing) = changes
+        .iter()
+        .find(|change| !changes_alike.contains(change) && !targets_own.contains(change))
+    {
+        return Err(format!("listing alike changes drops {missing}: {context}"));
+    }
+    let (Some(dir), Some(sub)) = (dir, sub) else {
+        return Ok(());
+    };
+    if below_conflicts {
+        return Ok(());
+    }
+
+    let target_tree = trees.contents(repository, target_revision).await;
+    let expected = trees
+        .merged(repository, base, ((dir, sub), source.below, target.below))
+        .await;
+    for (diff, name) in [
+        (&without, "the diff"),
+        (&with, "the diff listing alike changes"),
+    ] {
+        for change in &diff.changes {
+            let stands_below = |path: &str, tree: &BTreeMap<String, Content>| {
+                path.match_indices('/')
+                    .map(|(end, _)| path[..end].to_string())
+                    .find(|above| !tree.contains_key(above))
+            };
+            if change.action != lore_revision::change::FileAction::Delete
+                && let Some(above) = stands_below(change.path().as_str(), &expected)
+            {
+                return Err(format!(
+                    "{name} puts {} below {above}, which the merged tree doesn't hold: {context}",
+                    change.path()
+                ));
+            }
+            if matches!(
+                change.action,
+                lore_revision::change::FileAction::Move | lore_revision::change::FileAction::Delete
+            ) && !is_targets_own(change)
+                && let Some(above) = stands_below(change.from.mapping.path.as_str(), &target_tree)
+            {
+                return Err(format!(
+                    "{name} takes {} from below {above}, which the target's tree doesn't hold: \
+                     {context}",
+                    change.from.mapping.path
+                ));
+            }
+        }
+    }
+    for (diff, name) in [
+        (&without, "the diff"),
+        (&with, "the diff listing alike changes"),
+        (&exchanged, "the diff of the sides exchanged"),
+    ] {
+        let merged = merged_of(diff).await;
+        if files(&merged) != files(&expected) || !merged.keys().eq(expected.keys()) {
+            return Err(format!(
+                "{name} merges {merged:?}, not {expected:?}: {:?}",
+                outcome(diff)
+            ));
+        }
+    }
+    Ok(())
 }

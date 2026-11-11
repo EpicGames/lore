@@ -1587,7 +1587,8 @@ async fn add_change_for_paired_nodes(
                 is_staged_merge_conflict && to_type == LoreNodeType::Directory;
             let settles_from = flags.contains(DiffFlags::SettlesFrom)
                 && (from_node.is_dirty_add() || from_node.is_staged_delete());
-            if !mode_equal || is_rename || conflicted_directory || settles_from {
+            let node_reported = !mode_equal || is_rename || conflicted_directory || settles_from;
+            if node_reported {
                 lore_trace!(
                     "Diff node {subpath} directory mode change from {from_mode} to {to_mode}, {action:?}|modify"
                 );
@@ -1662,15 +1663,17 @@ async fn add_change_for_paired_nodes(
                                  for linked repository {link_repository_id}"
                             );
                         }
-                        emit_change(
-                            from.clone(),
-                            to.clone(),
-                            action,
-                            measured,
-                            changes,
-                            filter_mode,
-                        )
-                        .await?;
+                        if !node_reported {
+                            emit_change(
+                                from.clone(),
+                                to.clone(),
+                                action,
+                                measured,
+                                changes,
+                                filter_mode,
+                            )
+                            .await?;
+                        }
                     } else if flags.contains(DiffFlags::LeavesLinkPins) {
                         lore_debug!("Diff node {subpath} pin left to the link registry");
                     } else {

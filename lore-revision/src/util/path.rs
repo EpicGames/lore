@@ -667,6 +667,22 @@ impl RelativePath {
         &self.data.path_lower[self.start_lower as usize..self.end_lower as usize]
     }
 
+    /// `spelled`, a spelling of this path that differs from it in case alone, as a path. Takes this
+    /// path's lowercase form rather than folding `spelled` again.
+    pub(crate) fn respelled(&self, spelled: String) -> RelativePath {
+        debug_assert!(
+            spelled
+                .parse::<RelativePath>()
+                .is_ok_and(|path| path.as_lowercase_str() == self.as_lowercase_str()),
+            "{spelled} differs from {self} in more than case"
+        );
+        RelativePathBuf {
+            path: spelled,
+            path_lower: self.as_lowercase_str().to_owned(),
+        }
+        .freeze()
+    }
+
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePath, PathError> {
         RelativePathBuf::new_from_initial_path(name).map(|p| p.freeze())
     }
