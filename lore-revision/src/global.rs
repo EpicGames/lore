@@ -57,9 +57,12 @@ pub fn get_global_data_dir() -> Result<PathBuf, GlobalConfigError> {
 
 pub const CONFIG: &str = "config.toml";
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct DefaultSharedStoreConfigValue {
     pub path_to_store: String,
+    /// Keys this version doesn't know, with their values, written back on save.
+    #[serde(flatten)]
+    unknown_keys: toml::Table,
 }
 
 /// Settings for the Lore service process, under `[service]`.
@@ -85,12 +88,19 @@ pub struct ServiceConfig {
     /// is using it, so that the next command reuses it rather than connecting
     /// again. Unset is [`DEFAULT_IDLE_CONNECTION_TIMEOUT`].
     pub idle_connection_timeout: Option<u64>,
+    /// Keys this version doesn't know, with their values, written back on save.
+    #[serde(flatten)]
+    unknown_keys: toml::Table,
 }
 
 /// How long the service keeps an unused connection open when
 /// `[service] idle_connection_timeout` is unset.
 pub const DEFAULT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
+/// The user-level `config.toml`, which keeps the keys it doesn't know at every level.
+///
+/// A key renamed later can't read its old name through `#[serde(alias)]`: an older Lore keeps
+/// the new key and writes the old one beside it, and an alias refuses both being present.
 #[lore_macro::test_pub]
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 #[serde(default)]
@@ -100,6 +110,9 @@ pub struct GlobalConfig {
     #[serde(alias = "use_global_store_automatically")]
     pub use_shared_store_automatically: Option<bool>,
     pub service: ServiceConfig,
+    /// Keys this version doesn't know, with their values, written back on save.
+    #[serde(flatten)]
+    unknown_keys: toml::Table,
 }
 
 impl GlobalConfig {
@@ -120,22 +133,21 @@ impl GlobalConfig {
             suggested_shared_store_path_for_remote_url(remote_url)
         }
     }
+    /// Sets the default shared store directory for `remote_url`, keeping the entry's other keys.
     pub fn set_default_path_for_remote_url(
         &mut self,
         remote_url: &str,
         default: impl AsRef<Path>,
     ) -> Result<(), GlobalConfigError> {
-        let normalized_url = normalize_remote_url(remote_url).to_owned();
-        self.default_shared_stores.insert(
-            normalized_url,
-            DefaultSharedStoreConfigValue {
-                path_to_store: default
-                    .as_ref()
-                    .to_str()
-                    .ok_or(GlobalConfigError::internal("bad path"))?
-                    .to_owned(),
-            },
-        );
+        let path_to_store = default
+            .as_ref()
+            .to_str()
+            .ok_or_else(|| GlobalConfigError::internal("bad path"))?
+            .to_owned();
+        self.default_shared_stores
+            .entry(normalize_remote_url(remote_url).to_owned())
+            .or_default()
+            .path_to_store = path_to_store;
         Ok(())
     }
     pub fn use_shared_store_automatically(&self) -> bool {

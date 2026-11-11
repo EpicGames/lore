@@ -132,6 +132,8 @@ The file is optional; when it's absent, Lore uses the defaults below.
 
 `config.toml` sits beside `cli.toml` in the same OS user config directory (`~/.config/lore/config.toml` on a typical Linux setup), and holds settings that apply to every repository rather than to one. It is optional. Don't confuse it with the per-repository `config.toml` documented above, which lives in a repository's `.lore/` folder.
 
+Lore rewrites this file when a command changes a setting in it, such as `lore service set-executable`. It keeps every key and table it doesn't know, such as a setting that a newer version of Lore added. It doesn't keep comments or the order of keys.
+
 ### `[service]` table
 
 | Field | Type | Default | Description |
