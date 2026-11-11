@@ -15,6 +15,8 @@ use base64::prelude::BASE64_STANDARD;
 use base64::prelude::Engine as _;
 use lore_base::directories::project_directory;
 use lore_base::env::AUTH_PATH_VAR;
+use lore_base::env::AUTH_STORE_VAR;
+use lore_base::env::AuthStore;
 use lore_base::error::Disconnected;
 use lore_base::error::NotAuthenticated;
 use lore_base::error::TokenNotFound;
@@ -158,7 +160,7 @@ fn base_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
     {
         let path = PathBuf::from(path);
         if create_dir {
-            fs::create_dir_all(path.as_path()).map_err(|e| {
+            create_store_dir(path.as_path()).map_err(|e| {
                 lore_warn!("Failed to find base path: {e}");
                 TokenStoreError::internal_with_context(e, "Failed to find base path")
             })?;
@@ -170,12 +172,25 @@ fn base_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
         project_directory().ok_or_else(|| TokenStoreError::internal("Failed to find base path"))?;
     let path = path.config_local_dir();
     if create_dir {
-        fs::create_dir_all(path).map_err(|e| {
+        create_store_dir(path).map_err(|e| {
             lore_warn!("Failed to find base path: {e}");
             TokenStoreError::internal_with_context(e, "Failed to find base path")
         })?;
     }
     Ok(path.to_path_buf())
+}
+
+/// Creates the token store directory `path` and its missing parents, on Unix readable and writable
+/// by its owner alone whatever the umask, so that no other account can put a store file in it.
+fn create_store_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 /// Path to the token store. Earlier versions used `tokens.toml` in the same
@@ -300,12 +315,19 @@ pub async fn reset_tokens() -> Result<(), TokenStoreError> {
     Ok(())
 }
 
-/// Open options for the store files. On Windows the share mode admits
+/// Open options for the store files. On Unix a file they create is readable
+/// by its owner alone, whatever the umask, and a link in place of a store file
+/// is refused rather than followed. On Windows the share mode admits
 /// concurrent readers but denies other writers for as long as the file is
-/// open, excluding even processes that do not take the store lock.
+/// open, excluding even processes that do not take the store lock, and a new
+/// file takes its directory's access list.
 fn store_open_options() -> fs::OpenOptions {
-    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -413,31 +435,53 @@ fn store_token_map(_guard: &FSLock, token_map: &TokenMap) -> Result<(), TokenSto
         })
 }
 
-fn use_secure_store() -> bool {
-    if let Ok(store) = std::env::var("LORE_AUTH_STORE") {
-        store != "fallback"
-    } else {
-        true
-    }
+/// Where the encryption key lives: what `LORE_AUTH_STORE` names, and the secure store where it is
+/// unset, blank or names neither store. A call relayed to the service reads its caller's value, and
+/// never the service's own, so a caller that made no choice uses the secure store. Outside a call
+/// the process's own value applies, which a secure store that failed to take a key switches to the
+/// fallback.
+fn auth_store() -> AuthStore {
+    lore_base::env::var(AUTH_STORE_VAR)
+        .and_then(|store| AuthStore::from_var(&store))
+        .unwrap_or(AuthStore::Secure)
 }
 
-fn store_fallback_path(name: &str, create_dir: bool) -> Result<PathBuf, TokenStoreError> {
-    let path = base_path(create_dir)?;
-    Ok(path.join(format!("sec-{name}")))
+/// The fallback file of the secret `name`, in the token store directory `directory`.
+fn store_fallback_path(directory: &Path, name: &str) -> PathBuf {
+    directory.join(format!("sec-{name}"))
 }
 
 static KEYRING_ENTRIES: OnceLock<RwLock<HashMap<String, Arc<keyring_core::Entry>>>> =
     OnceLock::new();
 
-/// In-memory cache of the loaded encryption keys, keyed by the directory of the
-/// token store each protects.
+/// In-memory cache of the loaded encryption keys, keyed by the token store directory and the store
+/// that keeps the key.
 ///
 /// A key is invariant for the lifetime of its secure-store entry, so it is read
 /// once per token store: a fallback key lives beside its store, and a process
 /// carrying out calls for other processes reads the store each caller names.
 /// Nonces are drawn at random per seal and travel with the sealed token, so
 /// nothing here has to be written back.
-static ENCRYPTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
+static ENCRYPTION_CACHE: OnceLock<Mutex<HashMap<KeyLocation, Vec<u8>>>> = OnceLock::new();
+
+/// Where the encryption key of a token store is kept, evaluated once per key load so that the
+/// key is read, written and cached for one location.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct KeyLocation {
+    /// The directory of the token store the key protects, which holds the fallback file.
+    directory: PathBuf,
+    store: AuthStore,
+}
+
+impl KeyLocation {
+    /// The key location of the token store this call reads.
+    fn current() -> Result<Self, TokenStoreError> {
+        Ok(Self {
+            directory: base_path(false)?,
+            store: auth_store(),
+        })
+    }
+}
 
 const SECURE_STORE_MSG: &str =
     "Failed to store secret in secure storage, encryption key will be stored in plain text";
@@ -1265,20 +1309,23 @@ fn open_token(key: &[u8], token: &str) -> Result<String, TokenStoreError> {
     })
 }
 
-/// Returns the cached encryption key, loading it from the secure store on
-/// first use.
+/// Returns the cached encryption key, loading it from the store its location names on first use.
+///
+/// The location is evaluated once the cache is locked, so the wait for the lock holds none of it,
+/// and the load, a cold path run on a cache miss alone, is boxed: inline, it would make every
+/// future awaiting a key as large as the load's.
 async fn get_token_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
-    let path = cache_key();
     let mut keys = ENCRYPTION_CACHE.get_or_init(Default::default).lock().await;
-    if let Some(key) = keys.get(&path) {
+    let location = KeyLocation::current()?;
+    if let Some(key) = keys.get(&location) {
         return Ok(key.clone());
     }
-    let key = load_or_init_encryption_key().await?;
-    keys.insert(path, key.clone());
+    let key = Box::pin(load_or_init_encryption_key(&location)).await?;
+    keys.insert(location, key.clone());
     Ok(key)
 }
 
-/// Loads the encryption key from the secure store.
+/// Loads the encryption key kept at `location`.
 ///
 /// A new key is generated (which resets every stored token, since they can no
 /// longer be opened) only when the store reports that no key is there, or that
@@ -1286,10 +1333,13 @@ async fn get_token_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
 /// error instead: treating a denied or cancelled keychain prompt as "no key"
 /// would rotate the key and log every other lore process out.
 ///
+/// The new key is stored before the tokens are reset, so a key that can't be stored leaves them as
+/// they are.
+///
 /// Callers must serialize this with respect to other writers — it is intended
 /// to be invoked only while holding the [`ENCRYPTION_CACHE`] lock.
-async fn load_or_init_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
-    let stored = get_secret_from_store(ENCRYPTION_KEY_TARGET).await?;
+async fn load_or_init_encryption_key(location: &KeyLocation) -> Result<Vec<u8>, TokenStoreError> {
+    let stored = get_secret_from_store(ENCRYPTION_KEY_TARGET, location).await?;
     if let Some(key) = stored.as_deref().and_then(encryption_key_from_stored) {
         return Ok(key);
     }
@@ -1299,8 +1349,8 @@ async fn load_or_init_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
     );
 
     let key = generate_encryption_key()?;
+    set_secret_in_store(ENCRYPTION_KEY_TARGET, key.clone(), location).await?;
     reset_tokens().await?;
-    set_secret_in_store(ENCRYPTION_KEY_TARGET, key.clone()).await?;
 
     Ok(key)
 }
@@ -1327,13 +1377,16 @@ fn secret_absent(
     }
 }
 
-/// Reads a secret from the OS secure store, if there is a usable one.
+/// Reads a secret from the OS secure store, if `store` selects it and there is a usable one.
 ///
 /// `Ok(None)` means the store holds no such secret, or that no secure store is
 /// available at all; `Err` carries the failure of a store that exists but
 /// could not be read, for [`secret_absent`] to weigh.
-async fn secret_from_secure_store(target: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
-    if !use_secure_store() {
+async fn secret_from_secure_store(
+    target: &str,
+    store: AuthStore,
+) -> Result<Option<Vec<u8>>, TokenStoreError> {
+    if store != AuthStore::Secure {
         return Ok(None);
     }
     let Ok(entry) = keyring_entry(target) else {
@@ -1364,22 +1417,109 @@ async fn secret_from_secure_store(target: &str) -> Result<Option<Vec<u8>>, Token
     }
 }
 
+/// Makes the fallback secret file `file`, at `path`, readable by its owner alone before it is
+/// written, whatever directory holds it: mode 0600 on Unix, and on Windows an access list of
+/// its own, not inherited from the directory, granting the owner alone.
+fn restrict_to_owner(file: &fs::File, path: &Path) -> Result<(), TokenStoreError> {
+    #[cfg(unix)]
+    let restricted = {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = path;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+    };
+    #[cfg(windows)]
+    let restricted = {
+        let _ = file;
+        restrict_to_owner_windows(path)
+    };
+    restricted.map_err(|e| {
+        lore_warn!("Failed to restrict the fallback secret file: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to restrict the fallback secret file")
+    })
+}
+
+/// Gives the file at `path` a protected access list with one entry: full access for its owner.
+#[cfg(windows)]
+fn restrict_to_owner_windows(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::ACL;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::Authorization::SDDL_REVISION_1;
+    use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
+    use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::GetSecurityDescriptorDacl;
+    use windows_sys::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Security::PSECURITY_DESCRIPTOR;
+
+    // D: access list, P: protected from inheritance, one entry allowing full access (FA) to the
+    // owner (OW).
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)".encode_utf16().chain(Some(0)).collect();
+    let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    // SAFETY: both strings are NUL-terminated and outlive the calls; the descriptor the first call
+    // allocates is read by the next two and freed once, after them.
+    unsafe {
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let result = if GetSecurityDescriptorDacl(
+            descriptor,
+            &mut present,
+            &mut dacl,
+            &mut defaulted,
+        ) == 0
+        {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let status = SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null(),
+            );
+            if status == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(std::io::Error::from_raw_os_error(status as i32))
+            }
+        };
+        LocalFree(descriptor);
+        result
+    }
+}
+
 /// Reads a secret from the secure store, falling back to the on-disk copy.
 ///
 /// `Ok(None)` means the secret is genuinely absent from both — see
 /// [`secret_absent`] for how an unreadable secure store is distinguished from
 /// an empty one.
-async fn get_secret_from_store(target: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
-    let secure_store_error = match secret_from_secure_store(target).await {
+async fn get_secret_from_store(
+    target: &str,
+    location: &KeyLocation,
+) -> Result<Option<Vec<u8>>, TokenStoreError> {
+    let secure_store_error = match secret_from_secure_store(target, location.store).await {
         Ok(Some(secret)) => return Ok(Some(secret)),
         Ok(None) => None,
         Err(err) => Some(err),
     };
 
-    let path = store_fallback_path(target, false).map_err(|e| {
-        lore_warn!("Failed to make fallback path: {e}");
-        TokenStoreError::internal_with_context(e, "Failed to make fallback path")
-    })?;
+    let path = store_fallback_path(&location.directory, target);
     if !path.exists() {
         return secret_absent(secure_store_error);
     }
@@ -1415,8 +1555,12 @@ async fn get_secret_from_store(target: &str) -> Result<Option<Vec<u8>>, TokenSto
     Ok(Some(secret))
 }
 
-async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<(), TokenStoreError> {
-    if use_secure_store()
+async fn set_secret_in_store(
+    target: &str,
+    secret: Vec<u8>,
+    location: &KeyLocation,
+) -> Result<(), TokenStoreError> {
+    if location.store == AuthStore::Secure
         && let Ok(entry) = keyring_entry(target)
     {
         let stored = {
@@ -1441,30 +1585,73 @@ async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<(), TokenS
         // threads. Redirecting subsequent reads to the fallback file is worth
         // that risk here: the alternative is silently losing the secret.
         unsafe {
-            std::env::set_var("LORE_AUTH_STORE", "fallback");
+            std::env::set_var(AUTH_STORE_VAR, AuthStore::Fallback.as_var());
         }
     }
 
-    let path = store_fallback_path(target, true).map_err(|e| {
+    create_store_dir(&location.directory).map_err(|e| {
         lore_warn!("Failed to make fallback path: {e}");
         TokenStoreError::internal_with_context(e, "Failed to make fallback path")
     })?;
-    let _guard = lock_store_file(path.as_path()).await?;
-    let mut options = store_open_options();
-    options.create(true).write(true);
-    let mut secret_file = options.open(path.as_path()).map_err(|e| {
-        lore_warn!("Failed to write secret to fallback path: {e}");
-        TokenStoreError::internal_with_context(e, "Failed to write secret to fallback path")
-    })?;
-    secret_file
-        .set_len(0)
-        .and_then(|()| secret_file.write_all(&secret))
-        .map_err(|e| {
-            lore_warn!("Failed to write secret to fallback path: {e}");
-            TokenStoreError::internal_with_context(e, "Failed to write secret to fallback path")
-        })?;
+    let path = store_fallback_path(&location.directory, target);
+    let guard = lock_store_file(path.as_path()).await?;
+    let written = path.clone();
+    // The lock moves to the write, so it is held until the write ends though this future is
+    // dropped first.
+    lore_base::lore_spawn_blocking!(move || {
+        let _guard = guard;
+        write_fallback_file(&written, &secret)
+    })
+    .await
+    .map_err(|e| {
+        TokenStoreError::internal_with_context(e, "Fallback secret write task failed")
+    })??;
     lore_trace!("Stored secret in insecure fallback path {}", path.display());
     Ok(())
+}
+
+/// Writes `secret` to the fallback file at `path` whole or not at all: to a temporary file beside it,
+/// made readable by its owner alone before anything is written, flushed to disk and then renamed
+/// over `path`, and the directory flushed after it where the platform allows. A temporary file a
+/// failure leaves is removed. The caller holds the file's lock, and runs this on a blocking thread.
+fn write_fallback_file(path: &Path, secret: &[u8]) -> Result<(), TokenStoreError> {
+    let failed = |e: std::io::Error| {
+        lore_warn!("Failed to write secret to fallback path: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to write secret to fallback path")
+    };
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".new");
+    let temporary = PathBuf::from(temporary);
+    let written = write_and_rename(&temporary, path, secret, failed);
+    if written.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    written?;
+    #[cfg(unix)]
+    if let Some(directory) = path.parent()
+        && let Err(err) = fs::File::open(directory).and_then(|directory| directory.sync_all())
+    {
+        lore_warn!("Failed to flush the fallback secret's directory: {err}");
+    }
+    Ok(())
+}
+
+/// The steps of [`write_fallback_file`] that leave `temporary` behind when one fails.
+fn write_and_rename(
+    temporary: &Path,
+    path: &Path,
+    secret: &[u8],
+    failed: impl Fn(std::io::Error) -> TokenStoreError,
+) -> Result<(), TokenStoreError> {
+    let mut options = store_open_options();
+    options.create(true).write(true).truncate(true);
+    let mut file = options.open(temporary).map_err(&failed)?;
+    restrict_to_owner(&file, temporary)?;
+    file.write_all(secret)
+        .and_then(|()| file.sync_all())
+        .map_err(&failed)?;
+    drop(file);
+    fs::rename(temporary, path).map_err(failed)
 }
 
 /// Draws a new key. A failure here is propagated rather than ignored: the

@@ -2165,7 +2165,7 @@ mod tests {
                 "test-user".to_string(),
             )
             .with_environment(lore_base::env::CallEnvironment {
-                values: [Some(global.display().to_string()), None],
+                values: [Some(global.display().to_string()), None, None],
             }),
         )
     }

@@ -4380,9 +4380,9 @@ typedef struct lore_global_args_t {
   uint64_t store_keep_alive_seconds;
   // Force sync data to storage media during store flush
   uint8_t sync_data;
-  // Cache fragment payloads fetched from remote in the local store. Without
-  // this only state fragments and fragments flagged for local cache priority
-  // are retained
+  // Cache fragment payloads fetched from remote, and those written, in the local store, as
+  // a repository's `[store] cache_payloads` does for every command. Without either only state
+  // fragments and fragments flagged for local cache priority are retained
   uint8_t cache;
   // Authentication token to use instead of the one held in the secure token
   // store. Authorization tokens are exchanged from it as they are needed.

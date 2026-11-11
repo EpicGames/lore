@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_revision::interface::LoreGlobalArgs;
+use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::StoreConfig;
+use lore_revision::repository::cache_disabled;
 use lore_revision::repository::incremental_gc_options;
 
 /// The default GC caps that back the automatic incremental GC on writes when a
@@ -34,4 +37,30 @@ fn read_only_op_never_spawns_incremental_gc() {
     let options = incremental_gc_options(true, false, None);
     assert!(options.max_capacity.is_none());
     assert!(options.max_size.is_none());
+}
+
+/// Whether a plain instance with `[store]` text `store` leaves fetched content out of the store,
+/// for a command that asks to cache or not.
+fn cache_disabled_for(store: &str, cache: bool) -> bool {
+    let config: RepositoryConfig = toml::from_str(store).expect("the config must parse");
+    let globals = LoreGlobalArgs {
+        cache: cache.into(),
+        ..LoreGlobalArgs::default()
+    };
+    cache_disabled(&globals, &config)
+}
+
+/// `[store] cache_payloads = true` keeps fetched content; unset or false leaves it out, and
+/// `--cache` keeps it either way.
+#[test]
+fn cache_payloads_sets_whether_fetched_content_is_kept() {
+    for (store, disabled) in [
+        ("[store]\ncache_payloads = true\n", false),
+        ("[store]\ncache_payloads = false\n", true),
+        ("[store]\n", true),
+        ("", true),
+    ] {
+        assert_eq!(cache_disabled_for(store, false), disabled, "{store:?}");
+        assert!(!cache_disabled_for(store, true), "--cache with {store:?}");
+    }
 }

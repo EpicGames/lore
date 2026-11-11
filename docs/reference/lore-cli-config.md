@@ -57,12 +57,13 @@ The `[store]` table tunes the repository's local stores — the on-disk immutabl
 | `max_size` | integer (bytes) | `10737418240` (10 GiB) | Maximum total size of the local immutable store's packfiles. Above it, compaction evicts the least recently used content toward 70% of it and rewrites packfiles to reclaim the space. |
 | `compaction_delay` | integer (seconds) | `50` | Interval before a background compaction pass starts from the beginning. A pass that an earlier command stopped after its first step resumes as soon as the store opens. |
 | `verify_write` | Boolean | unset (behaves as `false`) | Verify each write by reading the data back and rehashing it. |
+| `cache_payloads` | Boolean | unset (behaves as `false`) | Keep the content of files commands fetch from the remote, and of those they write, in the store. Instances that share a store want this, so a second instance at the same revision reads the content locally instead of fetching it again. |
 
 A command that finds the store over a limit as it loads it starts a pass at once rather than after the interval.
 
 Eviction removes only content the remote also holds, which Lore fetches again when it's next read. Content held only locally, such as commits not yet pushed, counts toward both limits but is never evicted. Once it fills about 70% of a limit, eviction removes the remote content cached beside it. The store keeps its packfiles in 256 groups, and compaction rewrites a group's packfiles only once at least 10% of their bytes are no longer referenced.
 
-The **Default** column shows the value `lore repository create` and `lore clone` write into a freshly generated `config.toml`. A new repository's `[store]` table already contains every field at these values, so editing the file means changing values that are already present rather than adding missing ones.
+The **Default** column shows the value `lore repository create` and `lore clone` write into a freshly generated `config.toml`. A new repository's `[store]` table already contains every field but `verify_write` and `cache_payloads` at these values, so editing the file means changing values that are already present rather than adding missing ones.
 
 #### `verify_write`
 
@@ -180,6 +181,21 @@ If none of those resolve, starting a service fails and names both places one can
 idle_connection_timeout = 600
 ```
 
+### `[auth]` table
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `store` | `secure` or `fallback` | `secure` | Where the token store's encryption key is kept: `secure` for the operating system's secure store, `fallback` for a file beside the token store, which the store writes for its owner alone to read (on Unix, mode 0600; on Windows, an access list of its own granting its owner). Any other value is an error. `fallback` suits machines where nothing can answer a secure-store prompt, such as build agents, and binaries rebuilt with a new signature, which the secure store treats as new applications. |
+| `path` | string | unset | Directory holding the token store, in place of the per-user default. A relative path is relative to the directory that holds `config.toml`, whatever directory you run a command from. |
+
+`LORE_AUTH_STORE` and `LORE_AUTH_PATH` override them for a single command. `LORE_AUTH_STORE` takes the same two values, and a blank variable counts as unset. A command carried out by the service uses the choice of the process you ran, and the secure store where that process made none.
+
+Only the `lore` command applies `[auth]`. A program that links the Lore library uses the two variables alone.
+
+A token store directory holds the logins of one key, so `fallback` needs a directory of its own, from `path` or `LORE_AUTH_PATH`: without one, a command stops with an error rather than replacing the key of the default token store, which programs using the secure store share. Changing `store` for a directory can lose its logins: going to `fallback`, they're reset, and going to `secure`, those the secure store's key didn't seal can't be opened.
+
+A user-level `config.toml` that can't be read, isn't TOML, or holds an `[auth]` table that doesn't parse stops every `lore` command with an error naming the file. Other tables don't affect it.
+
 ### Giving a run its own service
 
 | Variable | Effect |
@@ -237,7 +253,7 @@ max_capacity = 10000000   # fragments
 eviction_delay = 60
 ```
 
-A repository created by `lore repository create` or `lore clone` already has every `[store]` field populated at its written default, so you edit values that are already present. The `[store]` example above is shown trimmed for clarity.
+A repository created by `lore repository create` or `lore clone` already has every `[store]` field but `verify_write` and `cache_payloads` populated at its written default, so you edit values that are already present. The `[store]` example above is shown trimmed for clarity.
 
 ### Use a shared store
 

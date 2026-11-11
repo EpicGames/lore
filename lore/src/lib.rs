@@ -35,6 +35,8 @@ pub use lore_base::version::LORE_LIBRARY_VERSION;
 /// Whole crate rather than a prelude: `#[error_set]` expands to paths rooted at the crate, so a
 /// consumer aliases this into scope as `lore_error_set`.
 pub use lore_error_set as error_set;
+pub use lore_revision::global::AuthSettings;
+pub use lore_revision::global::load_auth_settings;
 
 /// Time allowed for each wait shutdown drives from a synchronous caller: the drains before the
 /// runtime shutdown, whose timeout in `lore_revision::interface::shutdown` it matches, and the

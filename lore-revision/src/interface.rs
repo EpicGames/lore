@@ -711,9 +711,9 @@ pub struct LoreGlobalArgs {
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
-    /// Cache fragment payloads fetched from remote in the local store. Without
-    /// this only state fragments and fragments flagged for local cache priority
-    /// are retained
+    /// Cache fragment payloads fetched from remote, and those written, in the local store, as
+    /// a repository's `[store] cache_payloads` does for every command. Without either only state
+    /// fragments and fragments flagged for local cache priority are retained
     pub cache: u8,
     /// Authentication token to use instead of the one held in the secure token
     /// store. Authorization tokens are exchanged from it as they are needed.

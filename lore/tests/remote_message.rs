@@ -79,7 +79,7 @@ async fn message_to_server_to_and_from_bytes() {
         LoreString::from_str("def"),
     ]);
     let environment = CallEnvironment {
-        values: [Some("/tmp/global".to_string()), None],
+        values: [Some("/tmp/global".to_string()), None, None],
     };
     let message = MessageToServer {
         globals: LoreGlobalArgs {

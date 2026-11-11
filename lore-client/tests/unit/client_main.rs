@@ -59,3 +59,28 @@ fn trusting_the_remote_and_fast_flush_reach_the_globals() {
         );
     }
 }
+
+/// The `[auth]` settings are set for the variables the environment leaves unset or blank, and
+/// left alone for those it sets.
+#[test]
+fn the_auth_settings_fill_only_unset_or_blank_variables() {
+    use std::ffi::OsString;
+
+    use lore_client::client_main::auth_variables_to_set;
+
+    let settings = lore::AuthSettings {
+        store: None,
+        path: Some("/tokens".into()),
+    };
+    let filled = vec![("LORE_AUTH_PATH", OsString::from("/tokens"))];
+    assert_eq!(auth_variables_to_set(&settings, |_| None), filled, "unset");
+    assert_eq!(
+        auth_variables_to_set(&settings, |_| Some(OsString::new())),
+        filled,
+        "blank"
+    );
+    assert!(
+        auth_variables_to_set(&settings, |_| Some(OsString::from("/mine"))).is_empty(),
+        "set"
+    );
+}

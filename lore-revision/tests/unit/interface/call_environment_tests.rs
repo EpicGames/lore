@@ -4,6 +4,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use lore_base::env::AUTH_PATH_VAR;
+use lore_base::env::AUTH_STORE_VAR;
 use lore_base::env::CallEnvironment;
 use lore_base::env::GLOBAL_PATH_VAR;
 use lore_base::runtime::LORE_CONTEXT;
@@ -22,7 +23,7 @@ fn context(environment: Option<CallEnvironment>) -> Arc<dyn Any + Send + Sync> {
 #[tokio::test]
 async fn a_relayed_call_reads_its_callers_environment() {
     let environment = CallEnvironment {
-        values: [Some("/caller/global".to_string()), None],
+        values: [Some("/caller/global".to_string()), None, None],
     };
 
     let (global, auth) = LORE_CONTEXT
@@ -61,7 +62,7 @@ async fn a_local_call_reads_this_processes_environment() {
 #[tokio::test]
 async fn a_task_a_relayed_call_spawns_reads_its_environment() {
     let environment = CallEnvironment {
-        values: [None, Some("/caller/auth".to_string())],
+        values: [None, Some("/caller/auth".to_string()), None],
     };
 
     let auth = LORE_CONTEXT
@@ -75,6 +76,23 @@ async fn a_task_a_relayed_call_spawns_reads_its_environment() {
     assert_eq!(auth.as_deref(), Some("/caller/auth"));
 }
 
+/// A relayed call carries its caller's choice of where the token store keeps its key, so a
+/// service started under another configuration follows the caller's.
+#[tokio::test]
+async fn a_relayed_call_reads_its_callers_token_store_choice() {
+    let environment = CallEnvironment {
+        values: [None, None, Some("fallback".to_string())],
+    };
+
+    let store = LORE_CONTEXT
+        .scope(context(Some(environment)), async {
+            lore_base::env::var(AUTH_STORE_VAR)
+        })
+        .await;
+
+    assert_eq!(store.as_deref(), Some("fallback"));
+}
+
 /// The context a mount is built under, the service's for a relayed caller, reads the caller's
 /// environment, so the mount finds the credentials its caller finds, under the service's globals.
 #[cfg(target_os = "linux")]
@@ -86,7 +104,7 @@ async fn a_serving_context_reads_its_callers_environment_under_the_services_glob
     };
     let service = ExecutionContext::new_client(globals, EventDispatcher::new(None));
     let serving: Arc<dyn Any + Send + Sync> = Arc::new(service.serving(CallEnvironment {
-        values: [None, Some("/caller/auth".to_string())],
+        values: [None, Some("/caller/auth".to_string()), None],
     }));
 
     let (global, auth, correlation_id) = LORE_CONTEXT

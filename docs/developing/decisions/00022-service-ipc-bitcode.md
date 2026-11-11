@@ -48,6 +48,10 @@ it in place of its own, so a call finds the configuration and credentials it wou
 the caller's process. What the service caches from a token store, the tokens and the connections
 and authorizations obtained with them, it keys by that store.
 
+**Amended 2026-11-09:** a call also carries `LORE_AUTH_STORE`, unset included, so a call whose caller
+chose no store uses the secure store rather than the one the service's own environment names. The
+service keys a cached encryption key by the token store and the store that keeps the key.
+
 ### Consequences
 
 - Good, because every call relays, including the storage calls that carry buffers.

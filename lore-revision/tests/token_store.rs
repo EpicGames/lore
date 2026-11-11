@@ -688,7 +688,7 @@ mod tests {
         Arc::new(
             ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
                 .with_environment(CallEnvironment {
-                    values: [None, Some(auth_dir.display().to_string())],
+                    values: [None, Some(auth_dir.display().to_string()), None],
                 }),
         )
     }
@@ -835,6 +835,399 @@ mod tests {
             }))
             .await
             .expect("Task failure");
+    }
+
+    /// A call that keeps its key in the file `sec-tokenstore_encryption_key` of a new token store
+    /// directory, with the directory's guard and the key file's path.
+    fn fallback_key_call() -> (Arc<ExecutionContext>, TempDir, std::path::PathBuf) {
+        let store_dir = generate_tempdir();
+        let key_file = store_dir.child("sec-tokenstore_encryption_key");
+        let fallback = Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [
+                        None,
+                        Some(store_dir.display().to_string()),
+                        Some("fallback".to_string()),
+                    ],
+                }),
+        );
+        (fallback, store_dir, key_file)
+    }
+
+    /// The mode of `file`'s permission bits.
+    #[cfg(unix)]
+    #[allow(clippy::disallowed_methods)]
+    fn mode_of(file: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(file)
+            .expect("the key file exists")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// A key file the token store writes is readable by its owner alone, even one an earlier
+    /// version left readable by others.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The fixture writes the key file directly, as an earlier version would have.
+    #[allow(clippy::disallowed_methods)]
+    async fn the_fallback_key_file_is_restricted_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (fallback, _store_dir, key_file) = fallback_key_call();
+
+        // A file readable by everyone that holds no usable key, so the store writes a new one.
+        std::fs::write(&key_file, [7u8; 3]).expect("Failed to write the key file");
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644))
+            .expect("Failed to widen the key file");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(fallback, async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "owner-only", "token", vec![])
+                    .await
+                    .expect("Failed to store token");
+                assert_eq!(
+                    std::fs::read(&key_file).expect("the key file exists").len(),
+                    32,
+                    "the store wrote a new key"
+                );
+                assert_eq!(
+                    mode_of(&key_file),
+                    0o600,
+                    "the written key is the owner's alone"
+                );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// A call carrying `store` for the token store in `store_dir`, a fresh directory.
+    fn store_call(store: Option<&str>) -> (Arc<ExecutionContext>, TempDir, std::path::PathBuf) {
+        let store_dir = generate_tempdir();
+        let key_file = store_dir.child("sec-tokenstore_encryption_key");
+        let call = Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [
+                        None,
+                        Some(store_dir.display().to_string()),
+                        store.map(str::to_string),
+                    ],
+                }),
+        );
+        (call, store_dir, key_file)
+    }
+
+    /// Restores this process's `LORE_AUTH_STORE` when dropped.
+    struct ProcessAuthStore(Option<String>);
+
+    impl ProcessAuthStore {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var("LORE_AUTH_STORE").ok();
+            // SAFETY: the tests of this binary run one at a time under `sequential_mutex_lock`.
+            unsafe { std::env::set_var("LORE_AUTH_STORE", value) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for ProcessAuthStore {
+        fn drop(&mut self) {
+            // SAFETY: as in `set`.
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var("LORE_AUTH_STORE", value),
+                    None => std::env::remove_var("LORE_AUTH_STORE"),
+                }
+            }
+        }
+    }
+
+    /// A relayed call that makes no store choice, or chooses the secure store, keeps its key in the
+    /// secure store though the process carrying it out has `LORE_AUTH_STORE=fallback`.
+    #[tokio::test]
+    async fn a_relayed_call_without_a_store_choice_ignores_the_services_choice() {
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let _process = ProcessAuthStore::set("fallback");
+
+        for store in [None, Some("secure")] {
+            let (call, _store_dir, key_file) = store_call(store);
+            #[allow(clippy::disallowed_methods)]
+            runtime()
+                .spawn(LORE_CONTEXT.scope(call, async move {
+                    token_store::store_user_token(AUTH_ENDPOINT, "relayed", "token", vec![])
+                        .await
+                        .expect("Failed to store token");
+                    assert!(
+                        !key_file.exists(),
+                        "a call carrying {store:?} keeps no key file"
+                    );
+                }))
+                .await
+                .expect("Task failure");
+        }
+    }
+
+    /// Calls choosing the secure store and the fallback for one token store directory each use the
+    /// key their choice keeps, not one cached for the other.
+    #[tokio::test]
+    // The fixture writes the fallback key directly.
+    #[allow(clippy::disallowed_methods)]
+    async fn a_store_choice_has_a_key_of_its_own_for_one_directory() {
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (secure, store_dir, key_file) = store_call(Some("secure"));
+        let fallback = Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [
+                        None,
+                        Some(store_dir.display().to_string()),
+                        Some("fallback".to_string()),
+                    ],
+                }),
+        );
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(secure.clone(), async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "secure-user", "token-s", vec![])
+                    .await
+                    .expect("Failed to store token");
+            }))
+            .await
+            .expect("Task failure");
+        std::fs::write(&key_file, [7u8; 32]).expect("Failed to write the fallback key");
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(fallback, async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "fallback-user", "token-f", vec![])
+                    .await
+                    .expect("Failed to store token");
+            }))
+            .await
+            .expect("Task failure");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(secure, async move {
+                let identities = token_store::load_all_identities(true)
+                    .await
+                    .expect("Failed to load identities");
+                let sealed_by_fallback = identities
+                    .iter()
+                    .find(|identity| identity.user_id == "fallback-user")
+                    .expect("the fallback call's identity is stored");
+                assert!(
+                    sealed_by_fallback.token.is_empty(),
+                    "the secure key doesn't open what the fallback key sealed"
+                );
+            }))
+            .await
+            .expect("Task failure");
+        assert_eq!(
+            std::fs::read(&key_file).expect("the key file exists"),
+            [7u8; 32],
+            "the fallback call kept its key"
+        );
+    }
+
+    /// Reading a key from its file leaves the file as it is, though others can read it: the file
+    /// is restricted only when the store writes it.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The fixture writes the key file directly, as an earlier version would have.
+    #[allow(clippy::disallowed_methods)]
+    async fn reading_the_fallback_key_leaves_its_file_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (fallback, _store_dir, key_file) = fallback_key_call();
+        std::fs::write(&key_file, [7u8; 32]).expect("Failed to write the key file");
+        std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o644))
+            .expect("Failed to widen the key file");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(fallback, async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "reader", "token", vec![])
+                    .await
+                    .expect("Failed to store token");
+                assert_eq!(
+                    std::fs::read(&key_file).expect("the key file exists"),
+                    [7u8; 32],
+                    "the store used the key it read"
+                );
+                assert_eq!(mode_of(&key_file), 0o644, "a read leaves the permissions");
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// A temporary key file an interrupted write left, readable by others, is made its owner's
+    /// alone before the next key is written into it.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn a_left_temporary_key_file_is_restricted_before_it_is_written() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (fallback, store_dir, key_file) = fallback_key_call();
+        let temporary = store_dir.child("sec-tokenstore_encryption_key.new");
+        std::fs::write(&temporary, b"left").expect("Failed to write the temporary file");
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o644))
+            .expect("Failed to widen the temporary file");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(fallback, async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "after", "token", vec![])
+                    .await
+                    .expect("Failed to store token");
+                assert_eq!(mode_of(&key_file), 0o600, "the key is its owner's alone");
+                assert!(!temporary.exists(), "the temporary file became the key");
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// A link in place of the fallback key file is refused rather than followed, and its target
+    /// is left as it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn a_link_in_place_of_the_fallback_key_is_refused() {
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (fallback, store_dir, key_file) = fallback_key_call();
+        let target = store_dir.child("elsewhere");
+        std::fs::write(&target, b"not a key").expect("Failed to write the link target");
+        std::os::unix::fs::symlink(&target, &key_file).expect("Failed to link the key file");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(fallback, async move {
+                let stored =
+                    token_store::store_user_token(AUTH_ENDPOINT, "linked", "token", vec![]).await;
+                assert!(stored.is_err(), "the store refuses the link");
+                assert_eq!(
+                    std::fs::read(&target).expect("the link target"),
+                    b"not a key",
+                    "the link target is left as it is"
+                );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// The token store directory the store creates is its owner's alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_new_token_store_directory_is_its_owners_alone() {
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (fallback, store_dir, _key_file) = fallback_key_call();
+        let nested = store_dir.child("nested");
+        let call = Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [
+                        None,
+                        Some(nested.display().to_string()),
+                        Some("fallback".to_string()),
+                    ],
+                }),
+        );
+        drop(fallback);
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(call, async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "nested", "token", vec![])
+                    .await
+                    .expect("Failed to store token");
+                assert_eq!(
+                    mode_of(&nested),
+                    0o700,
+                    "the directory is its owner's alone"
+                );
+            }))
+            .await
+            .expect("Task failure");
+    }
+
+    /// A new key that can't be written leaves the token store as it is: the tokens are reset only
+    /// once the key that replaces theirs is on disk.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::disallowed_methods)]
+    async fn a_key_that_cannot_be_written_resets_no_token() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Safety: `geteuid` takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: root writes into a directory it cannot write to");
+            return;
+        }
+        let _lock = sequential_mutex_lock().await;
+        let (_execution, _auth_dir) = setup_test_env().await;
+        let (fallback, store_dir, key_file) = fallback_key_call();
+        let token_store_file = store_dir.child("tokenstore.toml");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(fallback.clone(), async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "kept", "token", vec![])
+                    .await
+                    .expect("Failed to store token");
+            }))
+            .await
+            .expect("Task failure");
+        let stored = std::fs::read(&token_store_file).expect("the token store");
+        std::fs::remove_file(&key_file).expect("Failed to remove the key file");
+        std::fs::set_permissions(store_dir.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("Failed to make the directory read-only");
+
+        // A fresh directory name for the key cache: the key of `store_dir` is cached.
+        let moved = store_dir.child("..").join(
+            store_dir
+                .path()
+                .file_name()
+                .expect("the directory has a name"),
+        );
+        let reread = Arc::new(
+            ExecutionContext::new_client(Default::default(), EventDispatcher::new(None))
+                .with_environment(CallEnvironment {
+                    values: [
+                        None,
+                        Some(moved.display().to_string()),
+                        Some("fallback".to_string()),
+                    ],
+                }),
+        );
+        let result = runtime()
+            .spawn(LORE_CONTEXT.scope(reread, async move {
+                token_store::store_user_token(AUTH_ENDPOINT, "other", "token", vec![]).await
+            }))
+            .await
+            .expect("Task failure");
+
+        std::fs::set_permissions(store_dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("Failed to make the directory writable again");
+        assert!(result.is_err(), "the new key can't be written");
+        assert_eq!(
+            std::fs::read(&token_store_file).expect("the token store"),
+            stored,
+            "the token store is left as it is"
+        );
     }
 
     #[tokio::test]

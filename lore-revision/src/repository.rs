@@ -238,6 +238,11 @@ pub struct StoreConfig {
     pub max_size: Option<usize>,
     pub compaction_delay: Option<usize>,
     pub verify_write: Option<bool>,
+    /// Keep the content of files commands fetch from the remote, and of those they write, in the
+    /// store. Instances that share a store with others want this, so a second instance at the same
+    /// revision reads content locally rather than fetching all of it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_payloads: Option<bool>,
 }
 
 impl StoreConfig {
@@ -249,6 +254,7 @@ impl StoreConfig {
             max_size: Some(10 * 1024 * 1024 * 1024),
             compaction_delay: Some(50),
             verify_write: None,
+            cache_payloads: None,
         }
     }
 
@@ -259,6 +265,7 @@ impl StoreConfig {
             max_size: Some(10 * 1024 * 1024 * 1024),
             compaction_delay: Some(50),
             verify_write: None,
+            cache_payloads: None,
         }
     }
 
@@ -3511,10 +3518,17 @@ pub fn is_valid_name(name: &str) -> bool {
 }
 
 /// Whether a context for an instance with `config` leaves fetched content out of the local
-/// store: unless the command asks to cache, only virtual instances keep it, since their
-/// files are read back through the store rather than from disk.
+/// store: unless the command asks to cache or the config's `[store] cache_payloads` does, only
+/// virtual instances keep it, since their files are read back through the store rather than
+/// from disk.
+#[lore_macro::test_pub]
 fn cache_disabled(global: &LoreGlobalArgs, config: &RepositoryConfig) -> bool {
-    !(global.cache() || config.vfs_type().is_virtual())
+    let cache_payloads = config
+        .store
+        .as_ref()
+        .and_then(|store| store.cache_payloads)
+        .unwrap_or_default();
+    !(global.cache() || config.vfs_type().is_virtual() || cache_payloads)
 }
 
 pub async fn create_local(

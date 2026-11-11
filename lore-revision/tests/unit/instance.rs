@@ -107,7 +107,7 @@ enum External {
 /// A call whose global data directory is `global`, so no test touches the real one.
 fn execution_in(global: &Path) -> Arc<ExecutionContext> {
     let environment = CallEnvironment {
-        values: [Some(global.display().to_string()), None],
+        values: [Some(global.display().to_string()), None, None],
     };
     Arc::new(
         ExecutionContext::new_client_with_user_id(

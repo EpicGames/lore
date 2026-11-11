@@ -25,6 +25,34 @@ fn runs_the_service(command: &LoreCommands) -> bool {
     )
 }
 
+/// Sets the variables the token store reads, `LORE_AUTH_STORE` and `LORE_AUTH_PATH`, from the
+/// global configuration's `[auth]` settings, leaving any the environment already sets to a value
+/// that isn't blank.
+///
+/// # Safety
+///
+/// It sets environment variables, so no other thread may exist while it runs.
+unsafe fn apply_auth_settings(settings: &lore::AuthSettings) {
+    for (name, value) in auth_variables_to_set(settings, |name| std::env::var_os(name)) {
+        // SAFETY: the caller guarantees that no other thread exists.
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
+/// The variables of `settings` to set, given the value `current` reads for each: those it reads as
+/// unset or blank.
+#[lore_macro::test_pub]
+fn auth_variables_to_set(
+    settings: &lore::AuthSettings,
+    current: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    settings
+        .variables()
+        .into_iter()
+        .filter(|(name, _)| current(name).is_none_or(|set| set.is_empty()))
+        .collect()
+}
+
 pub fn client_main() -> ExitCode {
     #[cfg(target_family = "windows")]
     // safety: safe Win32 call; no invariants to uphold
@@ -47,6 +75,15 @@ pub fn client_main() -> ExitCode {
         let _ = cmd.print_help();
         return ExitCode::from(2);
     };
+
+    match lore::load_auth_settings() {
+        // SAFETY: no thread has been started yet.
+        Ok(settings) => unsafe { apply_auth_settings(&settings) },
+        Err(err) => {
+            crate::eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
 
     let log_config = match logging::log_config_from_args(&cli) {
         Ok(config) => config,

@@ -44,7 +44,7 @@ fn execution_in(global: &Path) -> Arc<ExecutionContext> {
 /// A call as [`execution_in`] makes it, with `globals`.
 fn execution_with(global: &Path, globals: LoreGlobalArgs) -> Arc<ExecutionContext> {
     let environment = CallEnvironment {
-        values: [Some(global.display().to_string()), None],
+        values: [Some(global.display().to_string()), None, None],
     };
     Arc::new(
         ExecutionContext::new_client_with_user_id(
