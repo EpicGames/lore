@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use lore_revision::cluster::peer::Locality;
+use lore_revision::store::composite::ReadReplicaSelection;
 use lore_server::plugins::PluginRegistry;
 use lore_server::settings::*;
 use lore_server::store::resolve_plugin_config_with_fallback;
@@ -1257,6 +1260,55 @@ fn test_hook_settings_disabled_by_default() {
             .unwrap(),
         "value"
     );
+}
+
+#[test]
+fn composite_read_replica_selection_reads_each_mode() {
+    for (config, selection) in [
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"fan_out\"",
+            ReadReplicaSelection::FanOut,
+        ),
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"round_robin\"",
+            ReadReplicaSelection::RoundRobin,
+        ),
+    ] {
+        let settings: CompositeStoreSettings =
+            toml::from_str(config).expect("composite settings should deserialize");
+        assert_eq!(settings.read_replica_selection, Some(selection));
+    }
+}
+
+#[test]
+fn composite_read_replica_selection_rejects_an_unknown_mode() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nread_replica_selection = \"random\"");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_tries_are_read() {
+    let settings: CompositeStoreSettings = toml::from_str(
+        "local.mode = \"local\"\nround_robin_max_tries = 3\nround_robin_try_limit_ms = 25",
+    )
+    .expect("composite settings should deserialize");
+    assert_eq!(settings.round_robin_max_tries, NonZeroUsize::new(3));
+    assert_eq!(settings.round_robin_try_limit_ms, NonZeroU64::new(25));
+}
+
+#[test]
+fn composite_round_robin_max_tries_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_max_tries = 0");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_try_limit_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_try_limit_ms = 0");
+    assert!(result.is_err());
 }
 
 #[test]

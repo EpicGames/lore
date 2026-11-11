@@ -16,6 +16,7 @@ use lore_revision::branch::CachedRevisionItem;
 use lore_revision::branch::CachedRevisionListHeader;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
 use lore_revision::environment::EnvironmentConfig;
+use lore_revision::store::composite::ReadReplicaSelection;
 use lore_revision::util::time::RetrySettings;
 use lore_storage::hash;
 use lore_storage::hash::StringHash;
@@ -928,6 +929,15 @@ pub struct CompositeStoreSettings {
     /// durable store. Absent enables it.
     pub record_copy_out_of_band: Option<bool>,
     pub durable_store_delay_ms: Option<u64>,
+    /// Which read replicas a read that misses locally is sent to. Absent fans out to every one.
+    pub read_replica_selection: Option<ReadReplicaSelection>,
+    /// How many read replicas a round robin read tries, capped at the number of read replicas.
+    /// Absent uses [`DEFAULT_ROUND_ROBIN_MAX_TRIES`](lore_revision::store::composite::DEFAULT_ROUND_ROBIN_MAX_TRIES).
+    pub round_robin_max_tries: Option<NonZeroUsize>,
+    /// How long a round robin read waits on one read replica before trying the next, in
+    /// milliseconds, at least 1. Absent uses
+    /// [`DEFAULT_ROUND_ROBIN_TRY_LIMIT`](lore_revision::store::composite::DEFAULT_ROUND_ROBIN_TRY_LIMIT).
+    pub round_robin_try_limit_ms: Option<NonZeroU64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -4,12 +4,15 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::pin::pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::task::Poll;
 use std::time::Duration;
 
 use opentelemetry::metrics::Gauge;
@@ -36,8 +39,10 @@ use lore_telemetry::observe::ObserveResult;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use pin_project::pin_project;
+use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
+use tokio::task::Id;
 use tokio::task::JoinError;
 use tokio::time::Sleep;
 
@@ -87,6 +92,19 @@ impl ReplicaType {
             ReplicaType::Write => "write",
         }
     }
+}
+
+/// Which read replicas a read that misses locally is sent to.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadReplicaSelection {
+    /// Every read replica.
+    #[default]
+    FanOut,
+    /// Read replicas one after another, up to the max tries, from the next position in rotation
+    /// over the current read replica list, each until it fails to settle the read or passes the
+    /// per-try limit.
+    RoundRobin,
 }
 
 type InflightGetsKey = (Partition, Address);
@@ -244,6 +262,12 @@ fn can_put_use_copy(resolved: &StoreMatchResult, hash: Hash) -> Option<(Partitio
     Some((resolved.partition, resolved.source_address(hash)))
 }
 
+/// Default for how many read replicas a round robin read tries.
+pub const DEFAULT_ROUND_ROBIN_MAX_TRIES: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+
+/// Default for how long a round robin read waits on one read replica before trying the next.
+pub const DEFAULT_ROUND_ROBIN_TRY_LIMIT: Duration = Duration::from_millis(50);
+
 /// Default number of permits for the `cache_metadata` semaphore.
 pub const DEFAULT_QUERY_CACHE_SEMAPHORE_SIZE: usize = 1000;
 
@@ -278,6 +302,9 @@ pub struct CompositeStoreBuilder {
     /// Whether a copy is recorded beyond the durable store. `None` enables it — see
     /// [`Self::with_record_copy_out_of_band`].
     record_copy_out_of_band: Option<bool>,
+    read_replica_selection: ReadReplicaSelection,
+    round_robin_max_tries: Option<NonZeroUsize>,
+    round_robin_try_limit: Option<Duration>,
 }
 
 impl CompositeStoreBuilder {
@@ -378,6 +405,26 @@ impl CompositeStoreBuilder {
         Ok(self)
     }
 
+    /// Which read replicas a read that misses locally is sent to. Defaults to
+    /// [`ReadReplicaSelection::FanOut`].
+    pub fn with_read_replica_selection(mut self, selection: ReadReplicaSelection) -> Self {
+        self.read_replica_selection = selection;
+        self
+    }
+
+    /// How many read replicas a round robin read tries, one after another, and how long it waits on
+    /// each before trying the next. `None` uses [`DEFAULT_ROUND_ROBIN_MAX_TRIES`] and
+    /// [`DEFAULT_ROUND_ROBIN_TRY_LIMIT`].
+    pub fn with_round_robin_tries(
+        mut self,
+        max_tries: Option<NonZeroUsize>,
+        try_limit: Option<Duration>,
+    ) -> Self {
+        self.round_robin_max_tries = max_tries;
+        self.round_robin_try_limit = try_limit;
+        self
+    }
+
     pub fn with_durable_delay(mut self, duration: Duration) -> Self {
         self.durable_delay = duration;
         self
@@ -412,7 +459,7 @@ impl CompositeStoreBuilder {
         let provider = CompositeStoreInstrumentProvider;
         Ok(CompositeStore {
             local: Arc::new(local),
-            read_replicas: self.read_replicas.into(),
+            read_replicas: RwLock::new(self.read_replicas.into()),
             write_replicas: self.write_replicas.into(),
             durable,
             durable_delay: self.durable_delay,
@@ -421,6 +468,16 @@ impl CompositeStoreBuilder {
             cache_metadata_semaphore,
             local_metadata_only: self.local_metadata_only,
             record_copy_out_of_band: self.record_copy_out_of_band.unwrap_or(true),
+            read_replica_selection: self.read_replica_selection,
+            round_robin_max_tries: self
+                .round_robin_max_tries
+                .unwrap_or(DEFAULT_ROUND_ROBIN_MAX_TRIES),
+            round_robin_try_limit: self
+                .round_robin_try_limit
+                .unwrap_or(DEFAULT_ROUND_ROBIN_TRY_LIMIT),
+            // A `u32` start keeps the count far from the `usize` wrap, which breaks the even
+            // spread.
+            read_replica_rotation: AtomicUsize::new(rand::random::<u32>() as usize),
             peers_refreshed_guard: Semaphore::new(1),
             peer_replica_builder: self.peer_replica_builder,
             topology_subscription: None.into(),
@@ -532,8 +589,9 @@ fn without_content(output: &CompositeGetOutput) -> CompositeGetOutput {
 /// A store that is able to propagate read and write operations to local, durable and replica stores.
 ///
 /// Read immutable operations try local store first, if no required match is made it then goes wide
-/// and reads from read durable store and read replicas. First successful result will be early returned.
-/// A result from either is cached in the local store, whichever answered.
+/// and reads from read durable store and the read replicas [`ReadReplicaSelection`] chooses. First
+/// successful result will be early returned. A result from either is cached in the local store,
+/// whichever answered.
 ///
 /// Write immutable operations will block on writing to the write durable store.
 /// It will then detach spawn tasks to cache data in local store and write replicas.
@@ -547,14 +605,17 @@ fn without_content(output: &CompositeGetOutput) -> CompositeGetOutput {
 pub struct CompositeStore {
     /// Local store, always exist
     local: Arc<LocalTarget>,
-    /// Look aside read replicas
-    read_replicas: RwLock<Vec<ReplicationTarget>>,
+    /// Look aside read replicas, swapped whole on change so a read can keep the list it started
+    /// with after it releases the lock.
+    read_replicas: RwLock<Arc<[ReplicationTarget]>>,
     /// Look aside write replicas
     write_replicas: RwLock<Vec<ReplicationTarget>>,
     /// Durable read store
     durable: DurableTarget,
-    /// How long durable store reads wait for the read replicas to answer first. The wait ends
-    /// early once every read replica has missed or failed, and is skipped when there are none.
+    /// How long durable store reads wait for the read replicas to answer first, counted from the
+    /// start of the read. The wait ends early once every replica query the read sent has ended
+    /// without settling it and no round robin try is left to start. It is skipped when there are
+    /// no read replicas.
     durable_delay: Duration,
     /// Flag if local store is durable
     local_durable: bool,
@@ -568,6 +629,15 @@ pub struct CompositeStore {
     /// Whether a copy the durable store accepted is also recorded locally and at the write
     /// replicas. Off leaves the durable store the only holder of the destination association.
     record_copy_out_of_band: bool,
+    read_replica_selection: ReadReplicaSelection,
+    /// How many read replicas a round robin read tries, at most.
+    round_robin_max_tries: NonZeroUsize,
+    /// How long a round robin read waits on one try before starting the next.
+    round_robin_try_limit: Duration,
+    /// Counts round robin reads. A read takes the entry at this count modulo the length of the
+    /// read replica list it holds, so a refresh that shortens the list cannot put it out of range.
+    /// It starts at a random count, so the first read replica chosen does not depend on list order.
+    read_replica_rotation: AtomicUsize,
 
     peer_replica_builder: Option<Arc<dyn ReplicaFactory>>,
     peers_refreshed_guard: Semaphore,
@@ -585,13 +655,15 @@ pub struct ReevaluatePeersSummary {
     pub lost_peers: HashSet<PeerInfo>,
 }
 
-/// Container representing a typical composite store operation,
-/// where many requests are fanned out to durable and replica targets.
+/// Container representing a typical composite store operation, where requests are sent to the
+/// durable store and to read replicas.
 ///
-/// Replicas are spawned on the unpinned operation and results drained once it is pinned, so
-/// every replica is spawned before the first call to [`Self::next`].
+/// Fan-out replicas are spawned on the unpinned operation and results drained once it is pinned,
+/// so every one is spawned before the first call to [`Self::next`]. Round robin tries start one at
+/// a time, as [`Tries`] describes.
+#[lore_macro::test_pub]
 #[pin_project]
-struct CompositeOperation<H, D>
+struct CompositeOperation<H, D, F>
 where
     H: 'static,
 {
@@ -602,9 +674,76 @@ where
     /// Started when the operation is built. `None` when there is no durable query.
     #[pin]
     deadline: Option<Sleep>,
+    /// Round robin tries, where a second try can start. Boxed so that a read without them does not
+    /// carry their state and timer in its future.
+    tries: Option<Pin<Box<Tries<F>>>>,
 }
 
-impl<H, D> CompositeOperation<H, D>
+/// The tries of a round robin read, over the read replica list as it was when the read started.
+/// The first starts when the operation is built, and each next one when the current try's result
+/// has been returned and the next result is asked for, or when the current try passes its limit.
+/// A try past its limit keeps running.
+#[lore_macro::test_pub]
+#[pin_project]
+struct Tries<F> {
+    read_replicas: Arc<[ReplicationTarget]>,
+    /// Builds the query sent to a read replica.
+    query: F,
+    /// The list position of the next try, before wrapping on the list length.
+    position: usize,
+    /// Tries not started yet.
+    left: usize,
+    /// How long a try runs before the next one starts.
+    limit: Duration,
+    /// The try started last. Its result moves the read on to the next try.
+    current: Option<Id>,
+    /// The last result returned came from the current try.
+    move_on: bool,
+    /// When the current try is passed over for the next. `None` when no try is left to start.
+    #[pin]
+    deadline: Option<Sleep>,
+}
+
+impl<F> Tries<F> {
+    /// Starts the next try, if one is left, and sets when it is passed over.
+    fn start_next<H, R>(
+        self: Pin<&mut Self>,
+        queries: &mut DetachingJoinSet<(bool, Result<H, StoreError>)>,
+    ) where
+        H: Send + 'static,
+        F: Fn(Arc<dyn ImmutableStore>) -> R,
+        R: Future<Output = Result<H, StoreError>> + Send + 'static,
+    {
+        let mut this = self.project();
+        let position = *this.position % this.read_replicas.len().max(1);
+        let Some(replica) = this.read_replicas.get(position).filter(|_| *this.left > 0) else {
+            this.deadline.set(None);
+            return;
+        };
+        let query = (this.query)(replica.store());
+        *this.current = Some(lore_spawn!(queries, query.map(|result| (false, result))).id());
+        *this.position += 1;
+        *this.left -= 1;
+        let deadline = (*this.left > 0).then(|| tokio::time::sleep(*this.limit));
+        this.deadline.set(deadline);
+    }
+
+    fn poll_deadline(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        match self.project().deadline.as_pin_mut() {
+            Some(deadline) => deadline.poll(cx),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// What a [`CompositeOperation`] waits for.
+enum OperationEvent<T> {
+    Joined(Option<Result<(Id, T), JoinError>>),
+    TryLimit,
+    DurableDelay,
+}
+
+impl<H, D, F> CompositeOperation<H, D, F>
 where
     H: Send + 'static,
     D: Future<Output = Result<H, StoreError>> + Send + 'static,
@@ -618,7 +757,52 @@ where
             queries: DetachingJoinSet::default(),
             durable,
             deadline,
+            tries: None,
         }
+    }
+
+    /// An operation that tries up to `count` read replicas of `read_replicas` one after another,
+    /// from list position `start`, each for at most `limit` before the next starts, and starts
+    /// the first. `count` must not exceed the list length.
+    ///
+    /// The try state is boxed only for two or more tries; one try is a single replica query, as
+    /// the last try has no limit. The box is on a cold path: a round robin operation is built only
+    /// when a read misses locally.
+    fn with_tries<R>(
+        durable: Option<(Duration, D)>,
+        read_replicas: &Arc<[ReplicationTarget]>,
+        start: usize,
+        count: usize,
+        limit: Duration,
+        query: F,
+    ) -> Self
+    where
+        F: Fn(Arc<dyn ImmutableStore>) -> R,
+        R: Future<Output = Result<H, StoreError>> + Send + 'static,
+    {
+        debug_assert!(count <= read_replicas.len());
+        let mut operation = Self::new(durable);
+        if count < 2 {
+            if count == 1
+                && let Some(replica) = read_replicas.get(start)
+            {
+                operation.spawn_replica(query(replica.store()));
+            }
+            return operation;
+        }
+        let mut tries = Box::pin(Tries {
+            read_replicas: Arc::clone(read_replicas),
+            query,
+            position: start,
+            left: count,
+            limit,
+            current: None,
+            move_on: false,
+            deadline: None,
+        });
+        tries.as_mut().start_next(&mut operation.queries);
+        operation.tries = Some(tries);
+        operation
     }
 
     fn spawn_replica(
@@ -632,28 +816,65 @@ where
     /// Waits for the next query to finish, yielding whether it came from the durable store
     /// alongside its result.
     ///
-    /// Asking for the next result once every replica result has been returned spawns the
-    /// durable query. Do not call this again after a result that settles the operation.
-    async fn next(
+    /// Asking for the next result after one from the current try starts the next try. Asking for
+    /// it once every replica result has been returned and no try is left spawns the durable
+    /// query. Do not call this again after a result that settles the operation.
+    async fn next<R>(
         self: Pin<&mut Self>,
-    ) -> Option<Result<(bool, Result<H, StoreError>), JoinError>> {
+    ) -> Option<Result<(bool, Result<H, StoreError>), JoinError>>
+    where
+        F: Fn(Arc<dyn ImmutableStore>) -> R,
+        R: Future<Output = Result<H, StoreError>> + Send + 'static,
+    {
         let mut this = self.project();
+        if let Some(tries) = this.tries.as_mut()
+            && std::mem::take(tries.as_mut().project().move_on)
+        {
+            tries.as_mut().start_next(this.queries);
+        }
         loop {
-            let deadline = match this.deadline.as_mut().as_pin_mut() {
-                Some(deadline) if this.durable.is_some() => deadline,
-                _ => return this.queries.join_next().await,
-            };
-            let joined = tokio::select! {
-                // An already available replica result may settle the operation, so it takes
-                // precedence over a deadline that expires at the same time.
-                biased;
-                joined = this.queries.join_next() => joined,
-                () = deadline => None,
-            };
-            match joined {
-                Some(joined) => return Some(joined),
-                // The deadline passed, or every replica result has been returned.
-                None => {
+            let has_durable = this.durable.is_some();
+            // An already available result may settle the operation, so it takes precedence over
+            // a deadline that expires at the same time.
+            let event = std::future::poll_fn(|cx| {
+                if let Poll::Ready(joined) = this.queries.poll_join_next_with_id(cx) {
+                    return Poll::Ready(OperationEvent::Joined(joined));
+                }
+                if let Some(tries) = this.tries.as_mut()
+                    && tries.as_mut().poll_deadline(cx).is_ready()
+                {
+                    return Poll::Ready(OperationEvent::TryLimit);
+                }
+                if has_durable
+                    && let Some(deadline) = this.deadline.as_mut().as_pin_mut()
+                    && deadline.poll(cx).is_ready()
+                {
+                    return Poll::Ready(OperationEvent::DurableDelay);
+                }
+                Poll::Pending
+            })
+            .await;
+            match event {
+                OperationEvent::Joined(Some(joined)) => {
+                    if let Some(tries) = this.tries.as_mut() {
+                        let id = joined.as_ref().map_or_else(JoinError::id, |(id, _)| *id);
+                        let tries = tries.as_mut().project();
+                        *tries.move_on = *tries.current == Some(id);
+                    }
+                    return Some(joined.map(|(_, output)| output));
+                }
+                OperationEvent::Joined(None) => {
+                    // Every spawned query has been returned, and no try is left.
+                    let query = this.durable.take()?;
+                    let queries = &mut *this.queries;
+                    lore_spawn!(queries, query.map(|result| (true, result)));
+                }
+                OperationEvent::TryLimit => {
+                    if let Some(tries) = this.tries.as_mut() {
+                        tries.as_mut().start_next(this.queries);
+                    }
+                }
+                OperationEvent::DurableDelay => {
                     if let Some(query) = this.durable.take() {
                         let queries = &mut *this.queries;
                         lore_spawn!(queries, query.map(|result| (true, result)));
@@ -671,6 +892,21 @@ impl CompositeStore {
 
     pub fn durable(&self) -> Arc<dyn ImmutableStore> {
         self.durable.target.clone()
+    }
+
+    /// Which read replicas a read that misses locally is sent to.
+    pub fn read_replica_selection(&self) -> ReadReplicaSelection {
+        self.read_replica_selection
+    }
+
+    /// How many read replicas a round robin read tries, at most.
+    pub fn round_robin_max_tries(&self) -> NonZeroUsize {
+        self.round_robin_max_tries
+    }
+
+    /// How long a round robin read waits on one try before starting the next.
+    pub fn round_robin_try_limit(&self) -> Duration {
+        self.round_robin_try_limit
     }
 
     /// The payload writes to the local tier in flight and the bytes they hold, as the gauges
@@ -756,7 +992,11 @@ impl CompositeStore {
                         }
                     };
                     write.retain(retain_peer);
-                    read.retain(retain_peer);
+                    let mut new_read: Vec<ReplicationTarget> = read
+                        .iter()
+                        .filter(|replica| retain_peer(replica))
+                        .cloned()
+                        .collect();
 
                     // add new targets
                     for result in new_target_results {
@@ -766,7 +1006,7 @@ impl CompositeStore {
                                     write.push(write_target);
                                 }
                                 if let Some(read_target) = targets.read {
-                                    read.push(read_target);
+                                    new_read.push(read_target);
                                 }
                             }
                             // don't let one bad apple ruin the bunch. There is still value in having the other
@@ -777,6 +1017,7 @@ impl CompositeStore {
                             }
                         }
                     }
+                    *read = new_read.into();
                 }
             }
             lore_debug!(
@@ -824,7 +1065,7 @@ impl CompositeStore {
     }
 
     pub async fn clone_read_replicas(&self) -> Vec<ReplicationTarget> {
-        self.read_replicas.read().await.clone()
+        self.read_replicas.read().await.to_vec()
     }
 
     pub async fn clone_write_replicas(&self) -> Vec<ReplicationTarget> {
@@ -855,26 +1096,53 @@ impl CompositeStore {
         }
     }
 
-    /// Builds the fan-out of one read. `durable_query` builds the durable query from the durable
-    /// store, and `replica_query` builds the query sent to each read replica.
-    async fn fan_out_read<H, D, R>(
+    /// Builds the remote read of one read that missed locally. `durable_query` builds the durable
+    /// query from the durable store, and `replica_query` builds the query sent to a read replica:
+    /// to each one in fan-out mode, or to each round robin try.
+    ///
+    /// The read takes the read replica list as it is when it starts. Each round robin read takes
+    /// one turn of the rotation, whatever the number of tries it makes.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn remote_read<H, D, F, R>(
         &self,
         durable_query: impl FnOnce(Arc<dyn ImmutableStore>) -> D,
-        replica_query: impl Fn(Arc<dyn ImmutableStore>) -> R,
-    ) -> CompositeOperation<H, D>
+        replica_query: F,
+    ) -> impl Future<Output = CompositeOperation<H, D, F>>
     where
         H: Send + 'static,
         D: Future<Output = Result<H, StoreError>> + Send + 'static,
+        F: Fn(Arc<dyn ImmutableStore>) -> R,
         R: Future<Output = Result<H, StoreError>> + Send + 'static,
     {
         let durable = (!self.local_durable)
             .then(|| (self.durable_delay, durable_query(self.durable.store())));
-        let read_replicas = self.read_replicas.read().await;
-        let mut operation = CompositeOperation::new(durable);
-        for replica in read_replicas.iter() {
-            operation.spawn_replica(replica_query(replica.store()));
+        async move {
+            let read_replicas = self.read_replicas.read().await;
+            match self.read_replica_selection {
+                ReadReplicaSelection::FanOut => {
+                    let mut operation = CompositeOperation::new(durable);
+                    for replica in read_replicas.iter() {
+                        operation.spawn_replica(replica_query(replica.store()));
+                    }
+                    operation
+                }
+                ReadReplicaSelection::RoundRobin => {
+                    let start = self.read_replica_rotation.fetch_add(1, Ordering::Relaxed)
+                        % read_replicas.len().max(1);
+                    let count = self.round_robin_max_tries.get().min(read_replicas.len());
+                    CompositeOperation::with_tries(
+                        durable,
+                        &read_replicas,
+                        start,
+                        count,
+                        self.round_robin_try_limit,
+                        replica_query,
+                    )
+                }
+            }
         }
-        operation
     }
 
     /// The result of a read the local store missed, from the durable store or a replica, and the
@@ -887,8 +1155,8 @@ impl CompositeStore {
         address: Address,
         durable_confirmed: bool,
     ) -> Result<(CompositeGetOutput, Option<LocalFill>), StoreError> {
-        let mut fan_out = pin!(
-            self.fan_out_read(
+        let mut remote = pin!(
+            self.remote_read(
                 |store| async move {
                     store
                         .get(partition, address)
@@ -906,7 +1174,7 @@ impl CompositeStore {
         );
 
         let mut error_to_return = StoreError::from(AddressNotFound::from(address));
-        while let Some(join_result) = fan_out.as_mut().next().await {
+        while let Some(join_result) = remote.as_mut().next().await {
             let Ok((is_durable, query_result)) = join_result else {
                 continue;
             };
@@ -974,8 +1242,8 @@ impl CompositeStore {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        let mut fan_out = pin!(
-            self.fan_out_read(
+        let mut remote = pin!(
+            self.remote_read(
                 |store| async move {
                     store
                         .get_metadata(partition, address)
@@ -994,7 +1262,7 @@ impl CompositeStore {
 
         let mut best_result = CompositeStoreHit::Miss(StoreGetData::default());
 
-        while let Some(join_result) = fan_out.as_mut().next().await {
+        while let Some(join_result) = remote.as_mut().next().await {
             let Ok((is_durable, query_result)) = join_result else {
                 continue;
             };
@@ -1318,10 +1586,15 @@ impl ImmutableStore for CompositeStore {
         local_available && durable_available
     }
 
-    /// Local first, then one fan-out for whatever the local store left below a full match. Every
+    /// Local first, then one remote read, to the durable store and the read replicas
+    /// [`ReadReplicaSelection`] chooses, for whatever the local store left below a full match. Every
     /// responder is merged rather than raced: a store that establishes a better level than another
     /// keeps it, so a cache in front of a durable store can supply the partition match the durable
     /// store below it declines to establish.
+    ///
+    /// In both modes every replica query asks about the whole batch the local store left below a
+    /// full match, so a later round robin try also asks about addresses an earlier try already
+    /// matched fully.
     async fn query(
         self: Arc<Self>,
         partition: Partition,
@@ -1332,7 +1605,7 @@ impl ImmutableStore for CompositeStore {
 
         // A local store that cannot answer is not a failed resolve. Papering over one store being
         // unavailable is what a composite is for, so its error leaves every address unresolved and
-        // the fan-out below answers them.
+        // the remote read below answers them.
         if let Err(error) = self
             .local
             .store()
@@ -1364,8 +1637,8 @@ impl ImmutableStore for CompositeStore {
                 .collect::<Vec<_>>(),
         );
 
-        let mut fan_out = pin!(
-            self.fan_out_read(
+        let mut remote = pin!(
+            self.remote_read(
                 |store| {
                     let pending = pending.clone();
                     async move {
@@ -1387,7 +1660,7 @@ impl ImmutableStore for CompositeStore {
         );
 
         let mut failure = None;
-        while let Some(join_result) = fan_out.as_mut().next().await {
+        while let Some(join_result) = remote.as_mut().next().await {
             let (is_durable_result, resolved) = match join_result {
                 Ok(joined) => joined,
                 Err(error) => {
@@ -1453,16 +1726,16 @@ impl ImmutableStore for CompositeStore {
         CompositeStoreHit::Mixed(()).into_counted_result(&self.instruments.counter_query)
     }
 
-    /// Local first, then durable and read replicas in parallel. Like `query`, read replicas are
-    /// consulted so that edge-region replicas can answer without a cross-region round trip to the
-    /// durable store. Durable is the source of truth: when it responds the remaining replica
-    /// futures are dropped.
+    /// Local first, then the read replicas [`ReadReplicaSelection`] chooses, with the durable store
+    /// as `durable_delay` describes. Like `query`, read replicas are consulted so that edge-region
+    /// replicas can answer without a cross-region round trip to the durable store. Durable is the
+    /// source of truth: when it responds the remaining replica queries are detached.
     ///
     /// A representation that had to come from elsewhere is written back to the local store without
     /// its payload, so the next caller finds it in process.
     ///
-    /// Callers that miss locally on the same partition and address while a fan-out is already in
-    /// flight wait on that one rather than starting their own, and every one of them observes the
+    /// Callers that miss locally on the same partition and address while a remote read is already
+    /// in flight wait on that one rather than starting their own, and every one of them observes the
     /// same outcome, success or failure.
     async fn get_metadata(
         self: Arc<Self>,

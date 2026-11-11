@@ -1535,7 +1535,14 @@ async fn configure_composite_store(
             settings.cache_metadata.unwrap_or_default(),
             settings.cache_metadata_semaphore_size,
         )
-        .with_record_copy_out_of_band(settings.record_copy_out_of_band);
+        .with_record_copy_out_of_band(settings.record_copy_out_of_band)
+        .with_read_replica_selection(settings.read_replica_selection.unwrap_or_default())
+        .with_round_robin_tries(
+            settings.round_robin_max_tries,
+            settings
+                .round_robin_try_limit_ms
+                .map(|limit| Duration::from_millis(limit.get())),
+        );
 
     let store = Box::pin(configure_composite_substore(
         registry,
@@ -1628,6 +1635,12 @@ async fn configure_composite_store(
     }
 
     let store = Arc::new(composite_store_builder.build()?);
+    info!(
+        read_replica_selection = ?store.read_replica_selection(),
+        round_robin_max_tries = store.round_robin_max_tries(),
+        round_robin_try_limit = ?store.round_robin_try_limit(),
+        "Composite store read replicas"
+    );
 
     if let Some(topology) = &topology {
         store
